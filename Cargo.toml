@@ -1,0 +1,44 @@
+[package]
+name = "mantissa"
+version = "0.1.0"
+authors = ["Alexandre Beslic"]
+license = "MIT/Apache-2.0"
+description = "Decentralized cluster management"
+homepage = "https://mantissa.io"
+repository = "https://github.com/abronan/mantissa"
+readme = "README.md"
+build = "build.rs"
+edition = "2021"
+
+[build-dependencies]
+capnpc = "0.18.0"
+
+[dependencies]
+clap = { version = "~4.4.2", features = ["derive"] }
+tabwriter = "1.3.0"
+
+# boringtun is used for inter-cluster communication via wireguard.
+boringtun = "0.6.0"
+
+# used to fetch cpu system level information.
+cpuid = { git = "https://github.com/abronan/rust-cpuid.git", branch = "support_0.4.0" }
+
+# sled is used as our storage engine for the cluster state.
+sled = { git = "https://github.com/spacejam/sled.git", branch = "project_bloodstone" }
+
+# crdt based structures useful for state replication and conflict resolution.
+merkle-search-tree = "0.6.0"
+crdt_tree = "0.0.16"
+melda = "0.2.3"
+crdts = "7.3.2"
+
+# capnproto
+capnp = "0.18.1"
+capnp-rpc = "0.18.0"
+capnp-futures = "0.18.0"
+
+sys-info = "0.9.1"
+log = "0.4"
+
+[features]
+default = []
