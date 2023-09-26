@@ -39,6 +39,7 @@ capnp-futures = "0.18.0"
 
 sys-info = "0.9.1"
 log = "0.4"
+dirs = "5.0.1"
 
 [features]
 default = []

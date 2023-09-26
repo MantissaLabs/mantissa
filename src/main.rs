@@ -59,6 +59,11 @@ fn main() {
         .map(|()| log::set_max_level(LevelFilter::Info))
         .unwrap();
 
+    let mut mantissa_path = dirs::home_dir().expect("Unable to determine home directory.");
+    mantissa_path.push(".mantissa");
+
+    let db: sled::Db = sled::open(mantissa_path).unwrap();
+
     let matches = cli::init(Command::new("mantissa")).get_matches();
 
     match matches.subcommand() {
