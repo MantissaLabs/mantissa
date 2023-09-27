@@ -2,10 +2,12 @@ extern crate clap;
 extern crate log;
 
 mod cli;
+mod hash;
 
 use clap::Command;
 use clap::Parser;
 use log::{LevelFilter, Metadata, Record};
+use merkle_search_tree::MerkleSearchTree;
 
 pub mod server_capnp {
     include!(concat!(env!("OUT_DIR"), "/server_capnp.rs"));
@@ -63,6 +65,15 @@ fn main() {
     mantissa_path.push(".mantissa");
 
     let db: sled::Db = sled::open(mantissa_path).unwrap();
+
+    // MerkleSearchTree only stores the hash of the value given. It must then be stored
+    // independently into a chosen method for key/value storage.
+    let mut node_a = MerkleSearchTree::new_with_hasher(hash::DeterministicHasher::new());
+    node_a.upsert("clusterA", &());
+    node_a.upsert("clusterB", &());
+
+    // Here, the values could be stored into sled along with their keys. The MerkleSearchTree
+    // is only but a representation to compute hash and diffs for efficient state propagation.
 
     let matches = cli::init(Command::new("mantissa")).get_matches();
 

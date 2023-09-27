@@ -41,5 +41,8 @@ sys-info = "0.9.1"
 log = "0.4"
 dirs = "5.0.1"
 
+# used for fully deterministic hashing across platforms and compiler versions (XXHash).
+twox-hash = "1.6.3"
+
 [features]
 default = []
