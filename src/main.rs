@@ -2,7 +2,6 @@ extern crate clap;
 extern crate log;
 
 mod cli;
-mod hash;
 
 use clap::Command;
 use clap::Parser;
@@ -68,9 +67,9 @@ fn main() {
 
     // MerkleSearchTree only stores the hash of the value given. It must then be stored
     // independently into a chosen method for key/value storage.
-    let mut node_a = MerkleSearchTree::new_with_hasher(hash::DeterministicHasher::new());
-    node_a.upsert("clusterA", &());
-    node_a.upsert("clusterB", &());
+    let mut node_a = MerkleSearchTree::default();
+    node_a.upsert("clusterA", &30);
+    node_a.upsert("clusterB", &40);
 
     // Here, the values could be stored into sled along with their keys. The MerkleSearchTree
     // is only but a representation to compute hash and diffs for efficient state propagation.
