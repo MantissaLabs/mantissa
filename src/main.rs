@@ -5,8 +5,25 @@ mod cli;
 
 use clap::Command;
 use clap::Parser;
+use crdts::MVReg;
 use log::{LevelFilter, Metadata, Record};
 use merkle_search_tree::MerkleSearchTree;
+
+use bincode::serialize;
+use serde::Serialize;
+use std::hash::{Hash, Hasher};
+
+pub struct HashableMVReg<V, A: Ord>(pub MVReg<V, A>);
+
+impl<V: Serialize, A: Ord + Serialize> Hash for HashableMVReg<V, A> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Serialize the entire MVReg using bincode
+        let bytes = serialize(&self.0).expect("Failed to serialize MVReg");
+
+        // Hash the serialized bytes
+        state.write(&bytes);
+    }
+}
 
 pub mod server_capnp {
     include!(concat!(env!("OUT_DIR"), "/server_capnp.rs"));
@@ -63,13 +80,28 @@ fn main() {
     let mut mantissa_path = dirs::home_dir().expect("Unable to determine home directory.");
     mantissa_path.push(".mantissa");
 
+    let reg: MVReg<String, i32> = MVReg::new();
+    let hashable_mvreg = HashableMVReg(reg);
+    let read_ctx = hashable_mvreg.0.read();
+
+    let add_ctx = read_ctx.derive_add_ctx(123);
+    hashable_mvreg.0.write("Value".to_string(), add_ctx);
+
     let db: sled::Db = sled::open(mantissa_path).unwrap();
 
     // MerkleSearchTree only stores the hash of the value given. It must then be stored
     // independently into a chosen method for key/value storage.
     let mut node_a = MerkleSearchTree::default();
-    node_a.upsert("clusterA", &30);
-    node_a.upsert("clusterB", &40);
+    node_a.upsert("clusterA", &hashable_mvreg);
+
+    println!("root hash: {}", node_a.root_hash().to_string());
+
+    let keys = node_a.node_iter().map(|v| *v.key()).collect::<Vec<_>>();
+
+    println!("{:?}", keys.as_slice());
+
+    // The Merkle Search Tree construct embeds multiple other CRDTs, for example
+    //
 
     // Here, the values could be stored into sled along with their keys. The MerkleSearchTree
     // is only but a representation to compute hash and diffs for efficient state propagation.
