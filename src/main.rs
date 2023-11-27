@@ -68,33 +68,32 @@ fn main() {
     let mut mantissa_path = dirs::home_dir().expect("Unable to determine home directory.");
     mantissa_path.push(".mantissa");
 
-    let reg: MVReg<String, i32> = MVReg::new();
-    let hashable_mvreg = HashableMVReg(reg);
-    let read_ctx = hashable_mvreg.0.read();
-
-    let add_ctx = read_ctx.derive_add_ctx(123);
-    hashable_mvreg.0.write("Value222".to_string(), add_ctx);
-
     let db: sled::Db = sled::open(mantissa_path).unwrap();
+
+    // Creating an MVReg and store a value in there.
+    let actor_id = 0;
+    let mut mvreg = HashableMVReg::new();
+    mvreg.write("Hello, CRDT!".to_string(), actor_id);
+    mvreg.write("Hey, yo!".to_string(), actor_id);
 
     // MerkleSearchTree only stores the hash of the value given. It must then be stored
     // independently into a chosen method for key/value storage.
-    let mut node_a: MerkleSearchTree<String, _, hash::XXHash128Wrapper> =
+    let mut tree: MerkleSearchTree<String, _, hash::XXHash128Wrapper> =
         MerkleSearchTree::new_with_hasher(hash::XXHash128Wrapper::new());
 
-    node_a.upsert("clusterA".to_string(), &hashable_mvreg);
+    tree.upsert("my_key".to_string(), &mvreg);
 
-    println!("root hash: {}", node_a.root_hash().to_string());
+    println!("root hash: {}", tree.root_hash().to_string());
 
-    let keys = node_a
+    let keys = tree
         .node_iter()
         .map(|v| v.key().to_string())
         .collect::<Vec<_>>();
 
     println!("{:?}", keys.as_slice());
 
-    // The Merkle Search Tree construct embeds multiple other CRDTs, for example
-    //
+    // The Merkle Search Tree construct embeds multiple other CRDTs, for example an MVReg,
+    // or a LWW Register to track causality.
 
     // Here, the values could be stored into sled along with their keys. The MerkleSearchTree
     // is only but a representation to compute hash and diffs for efficient state propagation.
