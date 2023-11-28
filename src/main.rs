@@ -4,6 +4,7 @@ extern crate log;
 mod cli;
 mod hash;
 mod hash_mvreg;
+mod node;
 
 use clap::Command;
 use clap::Parser;
