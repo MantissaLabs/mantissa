@@ -6,11 +6,12 @@ mod hash;
 mod hash_mvreg;
 mod node;
 
+use bincode::{deserialize, serialize};
 use clap::Command;
 use clap::Parser;
-use crdts::MVReg;
 use log::{LevelFilter, Metadata, Record};
 use merkle_search_tree::MerkleSearchTree;
+use std::error::Error;
 
 use crate::hash_mvreg::HashableMVReg;
 
@@ -61,7 +62,7 @@ impl log::Log for MantissaLogger {
 
 static LOGGER: MantissaLogger = MantissaLogger;
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     log::set_logger(&LOGGER)
         .map(|()| log::set_max_level(LevelFilter::Info))
         .unwrap();
@@ -82,7 +83,9 @@ fn main() {
     let mut tree: MerkleSearchTree<String, _, hash::XXHash128Wrapper> =
         MerkleSearchTree::new_with_hasher(hash::XXHash128Wrapper::new());
 
-    tree.upsert("my_key".to_string(), &mvreg);
+    let key = "my_key".to_string();
+
+    tree.upsert(key.clone(), &mvreg);
 
     println!("root hash: {}", tree.root_hash().to_string());
 
@@ -95,14 +98,25 @@ fn main() {
 
     // The Merkle Search Tree construct embeds multiple other CRDTs, for example an MVReg,
     // or a LWW Register to track causality.
+    //
+
+    let serialized_mvreg = serialize(&mvreg)?;
 
     // Here, the values could be stored into sled along with their keys. The MerkleSearchTree
     // is only but a representation to compute hash and diffs for efficient state propagation.
+    db.insert(key.clone(), serialized_mvreg)?;
+
+    // Confirm that the key is stored within Sled
+    if let Some(serialized_data) = db.get(key.clone())? {
+        let deserialized_mvreg: HashableMVReg<String, i32> = deserialize(&serialized_data)?;
+
+        println!("{:?}", deserialized_mvreg);
+    }
 
     let matches = cli::init(Command::new("mantissa")).get_matches();
 
     match matches.subcommand() {
-        Some(("bootstrap", _bootstrap_matches)) => {}
+        Some(("bootstrap", _bootstrap_matches)) => Ok(()),
         _ => unreachable!(),
     }
 }

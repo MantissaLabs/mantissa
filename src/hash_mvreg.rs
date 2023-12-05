@@ -1,9 +1,10 @@
-use crdts::ctx::{AddCtx, ReadCtx};
+use crdts::ctx::ReadCtx;
 use crdts::{CmRDT, MVReg};
+use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HashableMVReg<T, A: Ord + Debug> {
     mvreg: MVReg<T, A>,
 }
