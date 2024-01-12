@@ -4,15 +4,15 @@ use twox_hash::xxh3::{Hash128, HasherExt};
 
 // Define a wrapper around Hash128 to implement the necessary traits.
 #[derive(Default, Clone)]
-pub struct XXHash128Wrapper(Hash128);
+pub struct XXHash128(Hash128);
 
-impl XXHash128Wrapper {
+impl XXHash128 {
     pub fn new() -> Self {
-        XXHash128Wrapper(Hash128::default())
+        XXHash128(Hash128::default())
     }
 }
 
-impl<T> Hasher<16, T> for XXHash128Wrapper
+impl<T> Hasher<16, T> for XXHash128
 where
     T: Hash,
 {
