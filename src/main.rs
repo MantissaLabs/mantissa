@@ -3,7 +3,6 @@ extern crate log;
 
 mod cli;
 mod hash;
-mod hash_map;
 mod hash_mvreg;
 mod node;
 mod store;
@@ -49,6 +48,8 @@ struct Opts {
 
 struct MantissaLogger;
 
+static LOGGER: MantissaLogger = MantissaLogger;
+
 impl log::Log for MantissaLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
         metadata.level() <= log::Level::Info
@@ -63,8 +64,6 @@ impl log::Log for MantissaLogger {
     fn flush(&self) {}
 }
 
-static LOGGER: MantissaLogger = MantissaLogger;
-
 /// A Node describes informations regarding a host in the Mantissa network.
 struct Node {
     pub id: u64,
@@ -78,14 +77,29 @@ struct Node {
 struct Cluster {
     pub id: u128,
     pub nodes: MerkleSearchTree<String, Node, hash::XXHash128>,
+    pub nodes_tracking: MerkleSearchTree<String, String, hash::XXHash128>,
 }
 
 struct Topology {
     pub clusters: HashMap<String, MerkleSearchTree<String, Cluster, hash::XXHash128>>,
 
-    /// The sampling method defines the method used to construct the overlay topology,
-    /// using the Tman algorithm.
-    pub sampling_method: String,
+    // This tracks the set of root hashes stored into separate Merkle Search Trees.
+    // Since we use a single MST per node to keep track of the topology.
+    pub cluster_root_hash_tracking: MerkleSearchTree<String, String, hash::XXHash128>,
+
+    /// The peer sampling method defines the method used to construct the overlay
+    /// topology, using the Tman algorithm.
+    pub peer_sampling_method: PeerSamplingMethod,
+}
+
+/// PeerSamplingMethod is the method used to build the topology based on criterias.
+/// For example, using `Latency`, nodes will connect to neighbors with the least
+/// round-trip latency.
+enum PeerSamplingMethod {
+    Id,
+    Manhattan,
+    Latency,
+    Localization,
 }
 
 /// Mantissa is the whole encompassing struct containing all cluster information

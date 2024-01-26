@@ -42,14 +42,19 @@ On the other hand, the MerkleSearchTree should only contain hashes of the keys a
 
 A strategy that could be achieved is to use a single MerkleSearchTree to track a single CRDT Map for a given node. Each node would create a new MST tracking the state updates for each of the node in the neighborhood. This way we can calculate the diff on each keys and values and store thousands of entries efficiently.
 
-The cost is to manage potentially thousands of MSTs for each node, taking into account that we might need other MSTs to track other type of objects, or the topology itself.
+The cost is to manage potentially thousands of MSTs for each node, taking into account that we might need other MSTs to track other types of objects, or the topology itself.
+
+The potential downside is that tracking thousands of MSTs also means tracking thousands of root hashes to send across peers. But this could be mitigated by
+created a side MST which is there only to track root hashes of all other MSTs.
+For example it could be using Vector Clock CRDT in order to track causality
+of events and root hash updates such that the latest root hash is always synchronized with other nodes.
 
 The following attempts at tracking the amount of MSTs to keep track of:
 
 - On startup:
     - Initialize one MST for topology
     - Initialize an MST for the node and local workload information
-- On splice: split the topology MST into two MSTs or more as required
+- On splice: split the topology MST into two MSTs or more as required (challenge: how does the split work and how fast can it proceed)x
 - On topology change:
     - Add one or more MSTs for each node that have been added to the topology
     - Remove MSTs for nodes that have been removed
