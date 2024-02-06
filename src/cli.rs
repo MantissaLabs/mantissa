@@ -1,7 +1,7 @@
 use clap::{Arg, ArgAction, Command};
 
-pub fn init(command: Command) -> Command {
-    command
+pub fn init() -> Command {
+    Command::new("Mantissa")
         .about("decentralized cluster management")
         .version("0.0.1")
         .subcommand_required(true)
