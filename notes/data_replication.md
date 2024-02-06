@@ -58,3 +58,8 @@ The following attempts at tracking the amount of MSTs to keep track of:
 - On topology change:
     - Add one or more MSTs for each node that have been added to the topology
     - Remove MSTs for nodes that have been removed
+
+
+## Store
+
+To make data management easier for each abstraction (node/cluster/topology/etc.), we would need to create some sort of Store trait that takes a MerkleSearchTree and a Sled underlying storage. This would mean that we are managing potentially hundreds or thousands of Sled storage, which is not that bad of an idea considering the high churn of nodes: a node leaving the network would be as simple as removing its underlying Sled store to garbage collect its values. The potential downside is memory and cpu requirement, since using thousands of sleds store could affect the node processing capacity.

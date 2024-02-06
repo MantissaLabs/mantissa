@@ -109,6 +109,13 @@ struct Mantissa {
     topology: Topology,
 }
 
+/// Config for the node topology on a Mantissa cluster, which is spread amongst all nodes.
+/// Changes to this config could have widespread consequences to the cluster stability and
+/// data propagation latency.
+struct TopologyConfig {
+    fanout: u8,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     log::set_logger(&LOGGER)
         .map(|()| log::set_max_level(LevelFilter::Info))

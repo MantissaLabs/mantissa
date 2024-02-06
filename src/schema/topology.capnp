@@ -64,6 +64,11 @@ struct NodeInfo {
   timetable @5 :Ousterhout.Timetable;
   # The schedule table of the node, which represents
   # its current availabilities to welcome processes.
+
+  rootHash @6 :Text;
+  # The root hash of the tracking merkle search tree.
+  # It is used for Anti-Antropy and syncing data between
+  # nodes.
 }
 
 struct NodeList {
