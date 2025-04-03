@@ -27,9 +27,9 @@ cpuid = { git = "https://github.com/abronan/rust-cpuid.git", branch = "support_0
 sled = { git = "https://github.com/spacejam/sled.git", branch = "project_bloodstone" }
 
 # crdt based structures useful for state replication and conflict resolution.
-merkle-search-tree = "0.6.0"
+merkle-search-tree = "0.8.0"
 crdt_tree = "0.0.16"
-melda = "0.2.3"
+# melda = "0.2.3"
 crdts = "7.3.2"
 
 # Serialization

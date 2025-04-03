@@ -1,4 +1,4 @@
-use crdts::CmRDT;
+use crdts::{CmRDT, VClock};
 use merkle_search_tree::MerkleSearchTree;
 
 #[derive(Debug)]
@@ -26,9 +26,12 @@ pub trait CRDTStore<V: CmRDT, P> {
     fn merge(payload: P) -> Result<(), CRDTStoreError>;
 }
 
-pub trait AntiEntropy {
-    fn sync();
+struct Node {
+    // Store contains all of the keys and values of a given node in the network.
+    store: Store<String, VClock<String>>,
 }
+
+// TODO: Where to we put the tracking MerkleSearchTree?
 
 /// Represents the underlying storage for objects in the cluster. It is essentially
 /// a key/value storage with diff tracking using a MerkleSearchTree.

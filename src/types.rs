@@ -40,7 +40,7 @@ pub enum PeerSamplingMethod {
     Localization,
 }
 
-/// Mantissa is the whole encompassing struct containing all cluster information
+/// Mantissa is the all encompassing struct containing all cluster information
 pub struct Mantissa {
     /// We define the topology as a hashmap whose key defines the cluster, the value
     /// being a MerkleSearchTree containing hashes of various clusters.

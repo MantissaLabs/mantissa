@@ -2,7 +2,9 @@
 
 ## Merkle Tree Search
 
-We use the [MerkleSearchTree](https://docs.rs/merkle-search-tree/latest/merkle_search_tree) crate to store the data in a Merkle Tree structure. This allows us to have a deterministic hash of the data and to easily check if the data is the same on different nodes.
+We use the [MerkleSearchTree](https://docs.rs/merkle-search-tree/latest/merkle_search_tree) crate
+to store the data in a Merkle Tree structure. This allows us to have a deterministic hash of the
+data and to easily check if the data is the same on different nodes.
 
 Only the keys are stored, values are hashed and their content must be stored in a separate key/value store.
 
@@ -52,13 +54,12 @@ of events and root hash updates such that the latest root hash is always synchro
 The following attempts at tracking the amount of MSTs to keep track of:
 
 - On startup:
-    - Initialize one MST for topology
-    - Initialize an MST for the node and local workload information
+  - Initialize one MST for topology
+  - Initialize an MST for the node and local workload information
 - On splice: split the topology MST into two MSTs or more as required (challenge: how does the split work and how fast can it proceed)x
 - On topology change:
-    - Add one or more MSTs for each node that have been added to the topology
-    - Remove MSTs for nodes that have been removed
-
+  - Add one or more MSTs for each node that have been added to the topology
+  - Remove MSTs for nodes that have been removed
 
 ## Store
 
