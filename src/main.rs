@@ -11,6 +11,7 @@ mod types;
 use bincode::{deserialize, serialize};
 use clap::Parser;
 use log::{LevelFilter, Metadata, Record};
+use merkle_search_tree::builder::Builder;
 use merkle_search_tree::MerkleSearchTree;
 use redb::{Database, TableDefinition};
 use std::error::Error;
@@ -91,8 +92,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             // MerkleSearchTree only stores the hash of the value given. It must then be stored
             // independently into a chosen method for key/value storage.
+            let builder = Builder::default();
+
+            let builder_with_hasher = builder.with_hasher(hash::XXHash128::new());
+
             let mut tree: MerkleSearchTree<String, _, hash::XXHash128> =
-                MerkleSearchTree::new_with_hasher(hash::XXHash128::new());
+                builder_with_hasher.build();
 
             let key = "my_key".to_string();
 
