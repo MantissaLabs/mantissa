@@ -12,6 +12,7 @@ use bincode::{deserialize, serialize};
 use clap::Parser;
 use log::{LevelFilter, Metadata, Record};
 use merkle_search_tree::MerkleSearchTree;
+use redb::{Database, TableDefinition};
 use std::error::Error;
 
 use crate::hash_mvreg::HashableMVReg;
@@ -49,6 +50,8 @@ struct MantissaLogger;
 
 static LOGGER: MantissaLogger = MantissaLogger;
 
+const REGISTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("registers");
+
 impl log::Log for MantissaLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
         metadata.level() <= log::Level::Info
@@ -71,7 +74,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut mantissa_path = dirs::home_dir().expect("Unable to determine home directory.");
     mantissa_path.push(".mantissa");
 
-    let db: sled::Db = sled::open(mantissa_path).unwrap();
+    std::fs::create_dir_all(&mantissa_path).expect("Failed to create .mantissa directory");
+
+    mantissa_path.push("mantissa.redb");
+
+    let db = Database::create(mantissa_path).expect("Failed to create database");
 
     let matches = cli::init().get_matches();
 
@@ -106,13 +113,22 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let serialized_mvreg = serialize(&mvreg)?;
 
-            // Here, the values could be stored into sled along with their keys. The MerkleSearchTree
+            // Here, the values could be stored into redb along with their keys. The MerkleSearchTree
             // is only but a representation to compute hash and diffs for efficient state propagation.
-            db.insert(key.clone(), serialized_mvreg)?;
+            let write_txn = db.begin_write()?;
+            {
+                let mut table = write_txn.open_table(REGISTERS)?;
+                table.insert("my_key", serialized_mvreg.as_slice())?;
+            }
+            write_txn.commit()?;
 
-            // Confirm that the key is stored within Sled
-            if let Some(serialized_data) = db.get(key.clone())? {
-                let deserialized_mvreg: HashableMVReg<String, i32> = deserialize(&serialized_data)?;
+            // Confirm that the key is stored within Redb
+            let read_txn = db.begin_read()?;
+            let table = read_txn.open_table(REGISTERS)?;
+
+            if let Some(serialized_data) = table.get("my_key")? {
+                let deserialized_mvreg: HashableMVReg<String, i32> =
+                    deserialize(&serialized_data.value())?;
 
                 println!("{:?}", deserialized_mvreg);
             }

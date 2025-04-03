@@ -23,8 +23,8 @@ boringtun = "0.6.0"
 # used to fetch cpu system level information.
 cpuid = { git = "https://github.com/abronan/rust-cpuid.git", branch = "support_0.4.0" }
 
-# sled is used as our storage engine for the cluster state.
-sled = { git = "https://github.com/spacejam/sled.git", branch = "project_bloodstone" }
+# redb is used as our storage engine for the cluster state.
+redb = "2.4.0"
 
 # crdt based structures useful for state replication and conflict resolution.
 merkle-search-tree = "0.8.0"

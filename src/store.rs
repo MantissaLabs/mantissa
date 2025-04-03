@@ -31,7 +31,7 @@ struct Node {
     store: Store<String, VClock<String>>,
 }
 
-// TODO: Where to we put the tracking MerkleSearchTree?
+// TODO: Where do we put the tracking MerkleSearchTree?
 
 /// Represents the underlying storage for objects in the cluster. It is essentially
 /// a key/value storage with diff tracking using a MerkleSearchTree.
@@ -40,6 +40,6 @@ struct Store<K, V: CmRDT> {
     /// between nodes in the cluster.
     diff: MerkleSearchTree<K, V>,
 
-    /// The underlying Sled storage/tree.
-    store: sled::Db,
+    /// The underlying redb storage/tree.
+    store: redb::Database,
 }
