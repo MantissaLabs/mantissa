@@ -1,3 +1,4 @@
+use crate::container::Container;
 use crdts::{CmRDT, Orswot, VClock};
 use merkle_search_tree::MerkleSearchTree;
 
@@ -49,7 +50,7 @@ struct Node {
     // store: Store<String, MVReg<NodeData, String>>,
     store: Store<String, VClock<String>>,
     // Orswot might be suited for tracking containers additions and removals.
-    // containers: Store<String, Orswot<Container, String>>,
+    containers: Store<String, Orswot<Container, String>>,
 }
 
 // TODO: Where do we put the tracking MerkleSearchTree?

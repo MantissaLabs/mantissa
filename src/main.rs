@@ -2,6 +2,7 @@ extern crate clap;
 extern crate log;
 
 mod cli;
+pub mod container;
 mod hash;
 mod hash_mvreg;
 mod node;
