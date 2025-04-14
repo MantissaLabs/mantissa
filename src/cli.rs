@@ -1,15 +1,14 @@
 use clap::{Arg, ArgAction, Command};
 
 pub fn init() -> Command {
-    Command::new("Mantissa")
-        .about("decentralized cluster management")
+    Command::new("mantissa")
         .version("0.0.1")
+        .about("Decentralized job orchestration and cluster management")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .author("Mantissa Labs")
         .arg(
             Arg::new("config")
-                .global(true)
                 .short('c')
                 .long("config")
                 .value_name("CONFIG")
@@ -36,25 +35,125 @@ pub fn init() -> Command {
                 .value_name("MACHINE-NAME")
                 .help("Sets the name of the machine"),
         )
-        .arg(Arg::new("v").short('v').help("Sets the level of verbosity"))
+        .arg(
+            Arg::new("v")
+                .short('v')
+                .action(ArgAction::Count)
+                .help("Sets the level of verbosity"),
+        )
         .subcommand(
             Command::new("bootstrap")
                 .about("Bootstrap a single machine cluster")
                 .arg(
                     Arg::new("debug")
                         .short('d')
-                        .long("debug")
                         .help("print debug information verbosely")
-                        .action(ArgAction::Set)
-                        .num_args(1..),
+                        .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("info")
+                .about("Get system information on a machine")
+                .arg(
+                    Arg::new("debug")
+                        .short('d')
+                        .help("print debug information verbosely")
+                        .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("link")
+                .about("Link a node to an existing cluster")
+                .arg(
+                    Arg::new("debug")
+                        .short('d')
+                        .help("print debug information verbosely")
+                        .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("nodes")
+                .about("Nodes subcommands")
+                .arg_required_else_help(true)
+                .alias("n")
+                .subcommand(
+                    Command::new("list")
+                        .about("List nodes in a cluster")
+                        .alias("ls")
+                        .arg(
+                            Arg::new("cluster")
+                                .help("the cluster to list nodes from")
+                                .index(1),
+                        ),
+                ),
+        )
+        .subcommand(
+            Command::new("tasks")
+                .about("Tasks subcommands")
+                .alias("t")
+                .subcommand(
+                    Command::new("list")
+                        .about("List tasks in a cluster")
+                        .alias("ls")
+                        .arg(
+                            Arg::new("cluster")
+                                .help("the cluster to list tasks for")
+                                .index(1),
+                        ),
+                ),
+        )
+        .subcommand(
+            Command::new("submit")
+                .about("Submit a job to the cluster")
+                .arg(
+                    Arg::new("input")
+                        .help("the description of the task to deploy in .yml format")
+                        .index(1)
+                        .required(true),
                 )
                 .arg(
-                    Arg::new("info")
-                        .long("info")
-                        .short('i')
-                        .help("view package information")
-                        .action(ArgAction::Set)
-                        .num_args(1..),
+                    Arg::new("debug")
+                        .short('d')
+                        .help("print debug information verbosely")
+                        .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("merge")
+                .about("Merge one or more existing clusters together")
+                .arg(
+                    Arg::new("origin")
+                        .help("the first cluster")
+                        .index(1)
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("destination")
+                        .help("the second cluster")
+                        .index(2)
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("debug")
+                        .short('d')
+                        .help("print debug information verbosely")
+                        .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("split")
+                .about("Split an existing cluster into multiple sub-clusters")
+                .arg(
+                    Arg::new("cluster")
+                        .help("the cluster to split into multiple sub-clusters")
+                        .index(1)
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("debug")
+                        .short('d')
+                        .help("print debug information verbosely")
+                        .action(ArgAction::SetTrue),
                 ),
         )
 }

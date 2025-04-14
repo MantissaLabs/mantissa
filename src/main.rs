@@ -5,6 +5,7 @@ mod cli;
 pub mod container;
 mod hash;
 mod hash_mvreg;
+pub mod monitor;
 mod node;
 mod store;
 mod types;
