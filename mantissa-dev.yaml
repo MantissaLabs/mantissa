@@ -1,5 +1,6 @@
+# mantissa-dev
+
 arch: "aarch64"
-name: "mantissa-dev"
 vmType: "qemu"
 cpus: 8
 memory: "16GiB"
@@ -9,32 +10,22 @@ images:
   - location: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2"
     arch: "aarch64"
 
+mountType: "9p"
 mounts:
-  - location: "~/hack/mantissa"
-    mountPoint: "/mnt/mantissa"
+  - location: "~"
     writable: true
-    fsType: "virtiofs"
-    options:
-      - "noatime"
 
 # To configure the terminal with ghostty:
-#   infocmp -x | ssh -i ~/.lima/_config/user -p <port> <username>@127.0.0.1 -- tic -x -
+#   infocmp -x | ssh -i ~/.lima/_config/user -p 7183 <username>@127.0.0.1 -- tic -x -
 ssh:
-  localPort: 60022
-
-portForwards:
-  - guest: 22
-    host: 2222
+  localPort: 7183
 
 provision:
-  - mode: system
-    script: |
-      set -euxo pipefail
-      apt-get update && apt-get upgrade -y
-      apt-get install -y build-essential curl git
   - mode: user
     script: |
       set -euxo pipefail
+      sudo apt-get update && sudo apt-get upgrade -y
+      sudo apt-get install -y build-essential curl git capnproto
       # Install rustup and Rust toolchain if not already installed.
       if ! command -v rustup >/dev/null 2>&1; then
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
