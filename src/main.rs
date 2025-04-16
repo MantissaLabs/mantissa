@@ -7,6 +7,7 @@ mod hash;
 mod hash_mvreg;
 pub mod monitor;
 mod node;
+mod server;
 mod store;
 mod types;
 
@@ -69,7 +70,8 @@ impl log::Log for MantissaLogger {
     fn flush(&self) {}
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     log::set_logger(&LOGGER)
         .map(|()| log::set_max_level(LevelFilter::Info))
         .unwrap();
@@ -86,7 +88,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let matches = cli::init().get_matches();
 
     match matches.subcommand() {
-        Some(("bootstrap", _bootstrap_matches)) => {
+        Some(("bootstrap", _)) => {
+            let server = server::Server::new();
+
+            server.start().await;
+        }
+        Some(("link", _)) => {
             // Creating an MVReg and store a value in there.
             let mut mvreg = HashableMVReg::new();
             mvreg.write("Hello, CRDT!".to_string(), 0);
@@ -139,9 +146,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 println!("{:?}", deserialized_mvreg);
             }
-
-            Ok(())
         }
         _ => unreachable!(),
-    }
+    };
+
+    Ok(())
 }
