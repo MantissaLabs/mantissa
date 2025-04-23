@@ -12,6 +12,8 @@ edition = "2021"
 
 [build-dependencies]
 capnpc = "0.21.0"
+aya-build = { git = "https://github.com/aya-rs/aya" }
+anyhow = "1"
 
 [dependencies]
 clap = { version = "~4.4.2", features = ["derive", "cargo"] }
@@ -52,7 +54,7 @@ capnp-futures = "0.21.0"
 sysinfo = "0.34.2"
 log = "0.4"
 dirs = "5.0.1"
-anyhow = "1.0.97"
+anyhow = "1"
 
 # used for fully deterministic hashing across platforms and compiler versions (XXHash).
 twox-hash = "1.6.3"

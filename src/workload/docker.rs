@@ -366,7 +366,6 @@ impl ContainerManager for DockerContainerManager {
         Ok(container_info)
     }
 
-    // Add this implementation to DockerContainerManager:
     async fn pull_image(&self, image: &str) -> ContainerResult<()> {
         debug!("Pulling image: {}", image);
 
