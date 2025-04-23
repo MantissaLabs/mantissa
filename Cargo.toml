@@ -18,6 +18,9 @@ clap = { version = "~4.4.2", features = ["derive", "cargo"] }
 chrono = { version = "0.4", features = ["serde"] }
 tabwriter = "1"
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1.88"
+thiserror = "2.0.12"
+futures = "0.3.31"
 
 # Container / MicroVMs / Workload management
 bollard = "0.18.1"
@@ -29,7 +32,7 @@ snow = "0.9.6"
 raw-cpuid = "11.5.0"
 
 # redb is used as our storage engine for the cluster state.
-redb = "2.4.0"
+redb = "2.5.0"
 
 # crdt based structures useful for state replication and conflict resolution.
 merkle-search-tree = "0.8.0"

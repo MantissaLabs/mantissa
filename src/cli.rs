@@ -42,8 +42,8 @@ pub fn init() -> Command {
                 .help("Sets the level of verbosity"),
         )
         .subcommand(
-            Command::new("bootstrap")
-                .about("Bootstrap a single machine cluster")
+            Command::new("init")
+                .about("Initialize a single machine cluster")
                 .arg(
                     Arg::new("debug")
                         .short('d')
