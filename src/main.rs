@@ -95,11 +95,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let matches = cli::init().get_matches();
 
+    let address = matches
+        .get_one::<String>("listen")
+        .map(|s| s.as_str())
+        .unwrap_or("127.0.0.1:6578")
+        .to_string();
+
     match matches.subcommand() {
         Some(("init", _)) => {
-            let server = server::Server::new();
+            let server = server::ServerImpl::new(address);
 
-            server.start().await;
+            let err = server.start().await;
+            if let Err(err) = err {
+                eprintln!("Failed to start server: {}", err);
+            }
         }
         Some(("info", _)) => {
             // Please note that we use "new_all" to ensure that all lists of
