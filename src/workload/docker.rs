@@ -4,7 +4,6 @@
 //! using the Bollard Docker API.
 
 use std::collections::HashMap;
-use std::error::Error;
 use std::time::Duration;
 
 use bollard::container::{

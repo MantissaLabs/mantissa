@@ -1,15 +1,16 @@
+use crate::gossip::Gossip;
+use crate::gossip_capnp::gossip::Client as GossipClient;
 use crate::server_capnp::server;
-use crate::server_capnp::server::Server;
-
+use crate::topology_capnp::topology::Client as TopologyClient;
 use capnp::capability::Promise;
 use capnp::Error;
-use capnp_rpc::{pry, rpc_twoparty_capnp, twoparty, RpcSystem};
-
+use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::{AsyncReadExt, FutureExt};
-use std::net::ToSocketAddrs;
 
 #[derive(Clone)]
 pub struct ServerImpl {
+    pub gossip_client: GossipClient,
+    pub topology_client: TopologyClient,
     addr: String,
 }
 
@@ -23,6 +24,7 @@ impl server::Server for ServerImpl {
         _params: server::GetTopologyParams,
         mut results: server::GetTopologyResults,
     ) -> Promise<(), Error> {
+        results.get().set_topology(self.topology_client.clone());
         Promise::ok(())
     }
 
@@ -47,6 +49,7 @@ impl server::Server for ServerImpl {
         _params: server::GetGossipParams,
         mut results: server::GetGossipResults,
     ) -> Promise<(), Error> {
+        results.get().set_gossip(self.gossip_client.clone());
         Promise::ok(())
     }
 }
@@ -56,8 +59,16 @@ impl ServerImpl {
     ///
     /// Returns the server and the memberlist actions to execute
     /// in a gossip loop.
-    pub fn new(addr: impl Into<String>) -> Self {
-        Self { addr: addr.into() }
+    pub fn new(
+        gossip_client: GossipClient,
+        topology_client: TopologyClient,
+        addr: impl Into<String>,
+    ) -> Self {
+        Self {
+            gossip_client,
+            topology_client,
+            addr: addr.into(),
+        }
     }
 
     /// Starts the server, bootstrapping all necessary sub-components
@@ -65,13 +76,13 @@ impl ServerImpl {
         tokio::task::LocalSet::new()
             .run_until(async move {
                 let listener = tokio::net::TcpListener::bind(&self.addr).await?;
+
                 println!("Server listening on {}", &self.addr);
 
-                let server_handle: server::Client = capnp_rpc::new_client(ServerImpl {
-                    addr: self.addr.clone(),
-                });
+                let server_handle: server::Client = capnp_rpc::new_client(self);
 
                 println!("Server running");
+
                 loop {
                     let (stream, _) = listener.accept().await?;
                     stream.set_nodelay(true)?;

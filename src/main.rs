@@ -4,25 +4,30 @@ extern crate sysinfo;
 
 mod cli;
 pub mod container;
+mod gossip;
 mod hash;
 mod hash_mvreg;
 pub mod monitor;
 mod node;
 mod server;
 mod store;
+mod topology;
 mod types;
 mod workload;
 
 use bincode::{deserialize, serialize};
 use clap::Parser;
+use gossip::{Channels, Message};
 use log::{LevelFilter, Metadata, Record};
 use merkle_search_tree::builder::Builder;
 use merkle_search_tree::MerkleSearchTree;
 use redb::{Database, TableDefinition};
-use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Mutex;
 use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 use sysinfo::{Components, Disks, Networks, System};
+use topology::TopologyEvent;
 use workload::docker::{
     ContainerManager, DockerContainerManager, RestartPolicyConfig, RestartPolicyType,
 };
@@ -103,7 +108,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match matches.subcommand() {
         Some(("init", _)) => {
-            let server = server::ServerImpl::new(address);
+            let (topology_tx, topology_rx) = tokio::sync::mpsc::channel::<TopologyEvent>(128);
+
+            // Build gossip capability
+            let gossip = gossip::Gossip {
+                chans: Channels {
+                    topology_events: topology_tx,
+                },
+            };
+            let gossip_client = capnp_rpc::new_client(gossip);
+
+            // Build topology component.
+            let topology = topology::Topology::new(topology_rx);
+            let topology_client = capnp_rpc::new_client(topology);
+
+            let server = server::ServerImpl::new(gossip_client, topology_client, address);
 
             let err = server.start().await;
             if let Err(err) = err {
