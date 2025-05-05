@@ -1,3 +1,4 @@
+use crate::gossip_capnp::gossip::Client as GossipClient;
 use crate::topology_capnp::{topology, topology_event};
 use capnp::{capability::Promise, Error};
 use tokio::sync::mpsc::Receiver;
@@ -5,6 +6,11 @@ use tokio::sync::mpsc::Receiver;
 pub struct Topology {
     rx: Receiver<TopologyEvent>,
     known_nodes: std::collections::HashMap<u64, String>,
+}
+
+pub struct PeerHandle {
+    pub address: String,
+    pub client: GossipClient,
 }
 
 /// Actions to apply to the memberlist.

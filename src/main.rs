@@ -27,7 +27,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use sysinfo::{Components, Disks, Networks, System};
-use topology::TopologyEvent;
+use tokio::task::LocalSet;
+use topology::{PeerHandle, TopologyEvent};
 use workload::docker::{
     ContainerManager, DockerContainerManager, RestartPolicyConfig, RestartPolicyType,
 };
@@ -108,26 +109,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match matches.subcommand() {
         Some(("init", _)) => {
-            let (topology_tx, topology_rx) = tokio::sync::mpsc::channel::<TopologyEvent>(128);
+            let local = LocalSet::new();
 
-            // Build gossip capability
-            let gossip = gossip::Gossip {
-                chans: Channels {
-                    topology_events: topology_tx,
-                },
-            };
-            let gossip_client = capnp_rpc::new_client(gossip);
+            local
+                .run_until(async {
+                    // TODO: define where gossip_rx will be used.
+                    let (gossip_tx, gossip_rx) = tokio::sync::mpsc::channel::<Message>(128);
+                    let (topology_tx, topology_rx) =
+                        tokio::sync::mpsc::channel::<TopologyEvent>(128);
 
-            // Build topology component.
-            let topology = topology::Topology::new(topology_rx);
-            let topology_client = capnp_rpc::new_client(topology);
+                    // Build gossip capability
+                    let gossip = gossip::Gossip {
+                        chans: Channels {
+                            topology_events: topology_tx,
+                        },
+                    };
+                    let gossip_client = capnp_rpc::new_client(gossip);
 
-            let server = server::ServerImpl::new(gossip_client, topology_client, address);
+                    // Build topology component.
+                    let topology = topology::Topology::new(topology_rx);
+                    let topology_client = capnp_rpc::new_client(topology);
 
-            let err = server.start().await;
-            if let Err(err) = err {
-                eprintln!("Failed to start server: {}", err);
-            }
+                    // FIXME: placeholder peer list
+                    let peers: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
+
+                    tokio::task::spawn_local(async move {
+                        gossip::start(gossip_rx, peers).await;
+                    });
+
+                    let server = server::ServerImpl::new(gossip_client, topology_client, address);
+
+                    let err = server.start().await;
+                    if let Err(err) = err {
+                        eprintln!("Failed to start server: {}", err);
+                    };
+                })
+                .await
         }
         Some(("info", _)) => {
             // Please note that we use "new_all" to ensure that all lists of

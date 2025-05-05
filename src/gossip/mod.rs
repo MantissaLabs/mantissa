@@ -15,8 +15,10 @@ use capnp::message::Builder;
 use capnp::Error;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
+use topology::PeerHandle;
 
 /// The Gossip action list
 ///
@@ -77,4 +79,40 @@ impl gossip::Server for Gossip {
 
         Promise::ok(())
     }
+}
+
+// This method receives messages to gossip to neighbors in the network.
+pub async fn start(mut event_rx: Receiver<Message>, peers: Arc<Mutex<Vec<PeerHandle>>>) {
+    use tokio::time::{interval, Duration};
+    let mut ticker = interval(Duration::from_secs(1));
+    let mut buffer = Vec::new();
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if !buffer.is_empty() {
+                    let peers_guard = peers.lock().unwrap();
+                    for peer in peers_guard.iter() {
+                        if let Err(e) = send_gossip(&buffer, peer).await {
+                            eprintln!("Gossip to {} failed: {:?}", peer.address, e);
+                        }
+                    }
+                    buffer.clear();
+                }
+            }
+
+            Some(msg) = event_rx.recv() => {
+                buffer.push(msg);
+            }
+
+            // channel closed
+            else => break,
+        }
+    }
+}
+
+async fn send_gossip(messages: &[Message], peer: &PeerHandle) -> Result<(), capnp::Error> {
+    // Build gossip client using peer information or use readily available client
+    // and build message to send (list of messages) via Builder.
+    Ok(())
 }
