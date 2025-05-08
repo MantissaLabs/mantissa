@@ -15,6 +15,20 @@ pub struct ServerImpl {
 }
 
 impl server::Server for ServerImpl {
+    /// Get all capabilities.
+    fn get_capabilities(
+        &mut self,
+        _params: server::GetCapabilitiesParams,
+        mut results: server::GetCapabilitiesResults,
+    ) -> Promise<(), capnp::Error> {
+        let mut caps = results.get().init_caps();
+
+        caps.set_gossip(self.gossip_client.clone());
+        caps.set_topology(self.topology_client.clone());
+
+        Promise::ok(())
+    }
+
     /// Get the topology capability.
     ///
     /// We usually call this method when we want to have access to the
@@ -25,18 +39,6 @@ impl server::Server for ServerImpl {
         mut results: server::GetTopologyResults,
     ) -> Promise<(), Error> {
         results.get().set_topology(self.topology_client.clone());
-        Promise::ok(())
-    }
-
-    /// Get the delegate capability.
-    ///
-    /// We usually call this method when we want to have access to the
-    /// delegate service (task management and scheduling).
-    fn get_delegate(
-        &mut self,
-        _params: server::GetDelegateParams,
-        mut results: server::GetDelegateResults,
-    ) -> Promise<(), Error> {
         Promise::ok(())
     }
 

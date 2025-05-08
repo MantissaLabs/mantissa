@@ -2,13 +2,19 @@
 
 using Gossip = import "gossip.capnp";
 using Topology = import "topology.capnp";
-using Delegate = import "delegate.capnp";
 
 interface Server {
     # Server is the top level interface tying all the services together.
     # Access to a given service is granted only if a node has proper permission.
 
-    getGossip @0 () -> (gossip: Gossip.Gossip);
-    getTopology @1 () -> (topology: Topology.Topology);
-    getDelegate @2 () -> (delegate: Delegate.Delegate);
+    # One-call bootstrap to get all capabilities
+    getCapabilities @0 () -> (caps :Capabilities);
+
+    getGossip @1 () -> (gossip: Gossip.Gossip);
+    getTopology @2 () -> (topology: Topology.Topology);
+}
+
+struct Capabilities {
+  gossip @0 :Gossip.Gossip;
+  topology @1 :Topology.Topology;
 }

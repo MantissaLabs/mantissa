@@ -1,4 +1,6 @@
 use crate::gossip_capnp::gossip::Client as GossipClient;
+use crate::gossip_capnp::gossip_message;
+use crate::server_capnp::server;
 use crate::topology_capnp::{topology, topology_event};
 use capnp::{capability::Promise, Error};
 use tokio::sync::mpsc::Receiver;
@@ -16,13 +18,14 @@ pub struct PeerHandle {
 /// Actions to apply to the memberlist.
 ///
 /// These actions could apply to one or many nodes.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum TopologyEvent {
     NodeJoined {
         id: u64,
         hostname: String,
         address: String,
         root_hash: String,
+        client: server::Client,
     },
     NodeLeft {
         id: u64,
@@ -48,6 +51,7 @@ impl Topology {
                     address,
                     hostname,
                     root_hash,
+                    client,
                 } => {
                     println!("[Topology] Node joined: {id} at {address}");
                     self.known_nodes.insert(id, address);
@@ -105,6 +109,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
     let hostname = node.get_hostname()?.to_str()?.to_string();
     let address = node.get_addr()?.to_str()?.to_string();
     let root_hash = node.get_root_hash()?.to_str()?.to_string();
+    let client = node.get_handle()?;
 
     let event = match reader.get_event()? {
         EventType::Add => TopologyEvent::NodeJoined {
@@ -112,10 +117,56 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             hostname,
             address,
             root_hash,
+            client,
         },
         EventType::Remove => TopologyEvent::NodeLeft { id },
         EventType::Suspect => TopologyEvent::NodeSuspect { id },
     };
 
     Ok(event)
+}
+
+pub fn add_event(
+    list: &mut capnp::struct_list::Builder<gossip_message::Owned>,
+    index: u32,
+    event: &TopologyEvent,
+) {
+    let mut msg = list.reborrow().get(index);
+
+    match event {
+        TopologyEvent::NodeJoined {
+            id,
+            hostname,
+            address,
+            root_hash,
+            client,
+        } => {
+            let mut topo = msg.init_topology();
+
+            topo.set_event(topology_event::EventType::Add);
+            let mut node = topo.init_node();
+
+            node.set_id(*id);
+            node.set_hostname(hostname);
+            node.set_addr(address);
+            node.set_root_hash(root_hash);
+
+            // Set the handle as a Cap’n Proto client
+            node.set_handle(client.clone());
+        }
+
+        TopologyEvent::NodeLeft { id } => {
+            let mut topo = msg.init_topology();
+            topo.set_event(topology_event::EventType::Remove);
+            let mut node = topo.init_node();
+            node.set_id(*id);
+        }
+
+        TopologyEvent::NodeSuspect { id } => {
+            let mut topo = msg.init_topology();
+            topo.set_event(topology_event::EventType::Suspect);
+            let mut node = topo.init_node();
+            node.set_id(*id);
+        }
+    }
 }
