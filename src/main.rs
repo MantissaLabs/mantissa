@@ -16,6 +16,7 @@ mod topology;
 mod types;
 mod workload;
 
+use anyhow::{Context, Result};
 use bincode::{deserialize, serialize};
 use clap::Parser;
 use gossip::{Channels, Message};
@@ -28,6 +29,7 @@ use merkle_search_tree::builder::Builder;
 use merkle_search_tree::MerkleSearchTree;
 use redb::{Database, TableDefinition};
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
@@ -73,14 +75,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map(|()| log::set_max_level(LevelFilter::Info))
         .unwrap();
 
-    let mut mantissa_path = dirs::home_dir().expect("Unable to determine home directory.");
-    mantissa_path.push(".mantissa");
-
-    std::fs::create_dir_all(&mantissa_path).expect("Failed to create .mantissa directory");
-
-    mantissa_path.push("mantissa.redb");
-
-    let db = Database::create(mantissa_path).expect("Failed to create database");
+    // Initialize database.
+    let home_dir = dirs::home_dir().ok_or("Unable to determine home directory.")?;
+    let db = init_database(home_dir)?;
 
     let matches = cli::init().get_matches();
 
@@ -284,4 +281,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     Ok(())
+}
+
+fn init_database(base_path: PathBuf) -> Result<Database> {
+    let mut db_path = base_path;
+    db_path.push(".mantissa");
+
+    std::fs::create_dir_all(&db_path).context("Failed to create .mantissa directory")?;
+
+    db_path.push("mantissa.redb");
+
+    let db = Database::create(&db_path)
+        .with_context(|| format!("Failed to create database at {:?}", db_path))?;
+
+    Ok(db)
 }
