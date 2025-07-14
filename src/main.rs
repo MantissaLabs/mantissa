@@ -7,6 +7,7 @@ pub mod container;
 mod gossip;
 mod hash;
 mod hash_mvreg;
+mod includes;
 pub mod monitor;
 mod node;
 mod server;
@@ -18,6 +19,10 @@ mod workload;
 use bincode::{deserialize, serialize};
 use clap::Parser;
 use gossip::{Channels, Message};
+use includes::{
+    delegate_capnp, gossip_capnp, ousterhout_capnp, server_capnp, stat_capnp, topology_capnp,
+    utils_capnp,
+};
 use log::{LevelFilter, Metadata, Record};
 use merkle_search_tree::builder::Builder;
 use merkle_search_tree::MerkleSearchTree;
@@ -34,28 +39,6 @@ use workload::docker::{
 };
 
 use crate::hash_mvreg::HashableMVReg;
-
-pub mod server_capnp {
-    include!(concat!(env!("OUT_DIR"), "/server_capnp.rs"));
-}
-pub mod delegate_capnp {
-    include!(concat!(env!("OUT_DIR"), "/delegate_capnp.rs"));
-}
-pub mod gossip_capnp {
-    include!(concat!(env!("OUT_DIR"), "/gossip_capnp.rs"));
-}
-pub mod topology_capnp {
-    include!(concat!(env!("OUT_DIR"), "/topology_capnp.rs"));
-}
-pub mod ousterhout_capnp {
-    include!(concat!(env!("OUT_DIR"), "/ousterhout_capnp.rs"));
-}
-pub mod stat_capnp {
-    include!(concat!(env!("OUT_DIR"), "/stat_capnp.rs"));
-}
-pub mod utils_capnp {
-    include!(concat!(env!("OUT_DIR"), "/utils_capnp.rs"));
-}
 
 #[derive(Parser)]
 struct Opts {
