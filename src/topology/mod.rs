@@ -2,8 +2,8 @@ use crate::gossip_capnp::gossip::Client as GossipClient;
 use crate::gossip_capnp::gossip_message;
 use crate::server_capnp::server;
 use crate::topology_capnp::{topology, topology_event};
+use async_channel::Receiver;
 use capnp::{capability::Promise, Error};
-use tokio::sync::mpsc::Receiver;
 
 pub struct Topology {
     rx: Receiver<TopologyEvent>,
@@ -44,25 +44,33 @@ impl Topology {
     }
 
     pub async fn run(&mut self) {
-        while let Some(event) = self.rx.recv().await {
-            match event {
-                TopologyEvent::NodeJoined {
-                    id,
-                    address,
-                    hostname,
-                    root_hash,
-                    client,
-                } => {
-                    println!("[Topology] Node joined: {id} at {address}");
-                    self.known_nodes.insert(id, address);
+        loop {
+            match self.rx.recv().await {
+                Ok(event) => {
+                    match event {
+                        TopologyEvent::NodeJoined {
+                            id,
+                            address,
+                            hostname,
+                            root_hash,
+                            client,
+                        } => {
+                            println!("[Topology] Node joined: {id} at {address}");
+                            self.known_nodes.insert(id, address);
+                        }
+                        TopologyEvent::NodeLeft { id } => {
+                            println!("[Topology] Node left: {id}");
+                            self.known_nodes.remove(&id);
+                        }
+                        TopologyEvent::NodeSuspect { id } => {
+                            println!("[Topology] Heartbeat from: {id}");
+                            // update heartbeat timestamp if tracking
+                        }
+                    }
                 }
-                TopologyEvent::NodeLeft { id } => {
-                    println!("[Topology] Node left: {id}");
-                    self.known_nodes.remove(&id);
-                }
-                TopologyEvent::NodeSuspect { id } => {
-                    println!("[Topology] Heartbeat from: {id}");
-                    // update heartbeat timestamp if tracking
+                Err(async_channel::RecvError) => {
+                    eprintln!("topology channel closed!");
+                    break;
                 }
             }
         }

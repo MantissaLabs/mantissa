@@ -10,14 +10,13 @@ use crate::gossip_capnp::gossip_message::Which::*;
 use crate::gossip_capnp::message_list as ActionList;
 use crate::topology;
 use crate::topology::TopologyEvent;
+use async_channel::{Receiver, Sender};
 use capnp::capability::Promise;
 use capnp::message::Builder;
 use capnp::Error;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::Receiver;
-use tokio::sync::mpsc::Sender;
 use topology::PeerHandle;
 
 /// The Gossip action list
@@ -101,7 +100,7 @@ pub async fn start(mut event_rx: Receiver<Message>, peers: Arc<Mutex<Vec<PeerHan
                 }
             }
 
-            Some(msg) = event_rx.recv() => {
+            Ok(msg) = event_rx.recv() => {
                 buffer.push(msg);
             }
 

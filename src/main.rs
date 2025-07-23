@@ -94,9 +94,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             local
                 .run_until(async {
                     // TODO: define where gossip_rx will be used.
-                    let (gossip_tx, gossip_rx) = tokio::sync::mpsc::channel::<Message>(128);
-                    let (topology_tx, topology_rx) =
-                        tokio::sync::mpsc::channel::<TopologyEvent>(128);
+                    let (gossip_tx, gossip_rx) = async_channel::bounded(128);
+                    let (topology_tx, topology_rx) = async_channel::bounded(128);
 
                     // Build gossip capability
                     let gossip = gossip::Gossip {
