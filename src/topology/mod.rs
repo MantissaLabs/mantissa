@@ -98,20 +98,25 @@ impl topology::Server for TopologyRPC {
         // Send event to Topology loop.
         Promise::from_future(async move {
             let request = params.get()?.get_node()?;
-            let id = request.get_id();
-            let address = request.get_addr()?.to_string()?;
-            let hostname = request.get_hostname()?.to_string()?;
-            let root_hash = request.get_root_hash()?.to_string()?;
-            let client = request.get_handle()?;
 
-            tx.send(TopologyEvent::NodeJoined {
-                id,
-                address,
-                hostname,
-                client,
-                root_hash,
-            })
-            .await;
+            let topology_event = TopologyEvent::NodeJoined {
+                id: request.get_id(),
+                address: request.get_addr()?.to_string()?,
+                hostname: request.get_hostname()?.to_string()?,
+                root_hash: request.get_root_hash()?.to_string()?,
+                client: request.get_handle()?,
+            };
+
+            match tx.send(topology_event).await {
+                Ok(()) => {
+                    // Successfully enqueued the event — nothing more to do.
+                }
+                Err(e) => {
+                    // The receiver has been dropped (channel closed).
+                    eprintln!("Failed to send TopologyEvent::NodeJoined: {}", e);
+                    // Deal with the error appropriately, e.g., retry or log.
+                }
+            }
 
             Ok(())
         })
@@ -142,18 +147,14 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
 
     let node = reader.get_node()?;
     let id = node.get_id();
-    let hostname = node.get_hostname()?.to_str()?.to_string();
-    let address = node.get_addr()?.to_str()?.to_string();
-    let root_hash = node.get_root_hash()?.to_str()?.to_string();
-    let client = node.get_handle()?;
 
     let event = match reader.get_event()? {
         EventType::Add => TopologyEvent::NodeJoined {
-            id,
-            hostname,
-            address,
-            root_hash,
-            client,
+            id: id,
+            hostname: node.get_hostname()?.to_str()?.to_string(),
+            address: node.get_addr()?.to_str()?.to_string(),
+            root_hash: node.get_root_hash()?.to_str()?.to_string(),
+            client: node.get_handle()?,
         },
         EventType::Remove => TopologyEvent::NodeLeft { id },
         EventType::Suspect => TopologyEvent::NodeSuspect { id },
