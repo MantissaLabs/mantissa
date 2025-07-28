@@ -8,7 +8,7 @@ fn main() {
         .unwrap();
     capnpc::CompilerCommand::new()
         .src_prefix("src/schema")
-        .file("src/schema/delegate.capnp")
+        .file("src/schema/node.capnp")
         .run()
         .unwrap();
     capnpc::CompilerCommand::new()

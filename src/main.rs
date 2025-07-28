@@ -21,7 +21,7 @@ use bincode::{deserialize, serialize};
 use clap::Parser;
 use gossip::{Channels, Message};
 use includes::{
-    delegate_capnp, gossip_capnp, ousterhout_capnp, server_capnp, stat_capnp, topology_capnp,
+    gossip_capnp, node_capnp, ousterhout_capnp, server_capnp, stat_capnp, topology_capnp,
     utils_capnp,
 };
 use log::{LevelFilter, Metadata, Record};
@@ -89,11 +89,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match matches.subcommand() {
         Some(("init", _)) => {
-            let local = LocalSet::new();
-
-            local
+            // TODO: create an init_server or Server::init()
+            LocalSet::new()
                 .run_until(async {
-                    // TODO: define where gossip_rx will be used.
+                    // TODO: define where gossip_tx will be used.
                     let (gossip_tx, gossip_rx) = async_channel::bounded(128);
                     let (topology_tx, topology_rx) = async_channel::bounded(128);
 

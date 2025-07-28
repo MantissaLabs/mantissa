@@ -5,29 +5,45 @@ using Ousterhout = import "ousterhout.capnp";
 using Stat = import "stat.capnp";
 using Utils = import "utils.capnp";
 
-interface Delegate {
-  # Delegate describes calls that are used to schedule tasks.
-  # The server creates handles from the neighbors list to call
-  # relevant methods.
-
+# Node contains informations about the worker node as well as
+# its capabilities, which are used to schedule and execute tasks.
+interface Node {
+  # Returns informations about the node, its resource usage, etc.
   info @0 () -> (info :Stat.System);
-  # Return informations on the agent.
 
-  book @1 (req :Ousterhout.SlotRequest) -> (alloc :Ousterhout.Allocation);
+  # Returns a handle to the scheduler component of the node, used
+  # to book resources in order to execute a task.
+  scheduler @1 () -> (sched :Scheduler);
+
+  # Returns a handle to the executor, used to run tasks given a
+  # description and resource allocation.
+  executor @2 () -> (exec :Executor);
+}
+
+# Executor takes tasks descriptions and runs them on the local machine.
+interface Executor {
+  # Executes a workload from a given order.
+  run @0 (workload: Ousterhout.Workload) -> ();
+
+  # List tasks running on the node.
+  list @1 () -> (tasks :TaskList);
+}
+
+interface NodeStats {
+  info @0 () -> (info :Stat.System);
+}
+
+# Scheduler describes calls that are used to schedule and cancel tasks.
+interface Scheduler {
   # Book slots. Takes a vector of slots in parameter with necessary workload
   # informations. Returns a promise of allocation.
+  book @0 (req :Ousterhout.SlotRequest) -> (alloc :Ousterhout.Allocation);
 
-  free @2 (req :Ousterhout.SlotRequest) -> ();
   # Free slots. Takes a vector of slots to release.
+  free @1 (req :Ousterhout.SlotRequest) -> ();
 
-  schedule @3 (workload: Ousterhout.Workload) -> (allocation :Ousterhout.Allocation);
   # Schedules a task.
-
-  run @4 (workload: Ousterhout.Workload) -> ();
-  # Executes a workload from a given order.
-
-  list @5 () -> (tasks :TaskList);
-  # List tasks running on the delegate.
+  schedule @2 (workload: Ousterhout.Workload) -> (allocation :Ousterhout.Allocation);
 }
 
 struct TaskList {

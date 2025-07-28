@@ -1,8 +1,8 @@
 pub mod server_capnp {
     include!(concat!(env!("OUT_DIR"), "/server_capnp.rs"));
 }
-pub mod delegate_capnp {
-    include!(concat!(env!("OUT_DIR"), "/delegate_capnp.rs"));
+pub mod node_capnp {
+    include!(concat!(env!("OUT_DIR"), "/node_capnp.rs"));
 }
 pub mod gossip_capnp {
     include!(concat!(env!("OUT_DIR"), "/gossip_capnp.rs"));
