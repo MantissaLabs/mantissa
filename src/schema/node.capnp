@@ -1,7 +1,7 @@
 @0xde292e0f854316dc;
 
 using Topology = import "topology.capnp";
-using Ousterhout = import "ousterhout.capnp";
+using Scheduling = import "scheduling.capnp";
 using Stat = import "stat.capnp";
 using Utils = import "utils.capnp";
 
@@ -24,7 +24,7 @@ interface Node {
 interface Executor {
   # Executor takes tasks descriptions and runs them on the local machine.
 
-  run @0 (workload: Ousterhout.Workload) -> ();
+  run @0 (workload: Scheduling.Workload) -> ();
   # Executes a workload from a given order.
 
   list @1 () -> (tasks :TaskList);
@@ -40,14 +40,14 @@ interface NodeStats {
 interface Scheduler {
   # Scheduler describes calls that are used to schedule and cancel tasks.
 
-  book @0 (req :Ousterhout.SlotRequest) -> (alloc :Ousterhout.Allocation);
+  book @0 (req :Scheduling.SlotRequest) -> (alloc :Scheduling.Allocation);
   # Book slots. Takes a vector of slots in parameter with necessary workload
   # informations. Returns a promise of allocation.
 
-  free @1 (req :Ousterhout.SlotRequest) -> ();
+  free @1 (req :Scheduling.SlotRequest) -> ();
   # Free slots. Takes a vector of slots to release.
 
-  schedule @2 (workload: Ousterhout.Workload) -> (allocation :Ousterhout.Allocation);
+  schedule @2 (workload: Scheduling.Workload) -> (allocation :Scheduling.Allocation);
   # Schedules a task.
 }
 

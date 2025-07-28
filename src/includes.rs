@@ -10,8 +10,8 @@ pub mod gossip_capnp {
 pub mod topology_capnp {
     include!(concat!(env!("OUT_DIR"), "/topology_capnp.rs"));
 }
-pub mod ousterhout_capnp {
-    include!(concat!(env!("OUT_DIR"), "/ousterhout_capnp.rs"));
+pub mod scheduling_capnp {
+    include!(concat!(env!("OUT_DIR"), "/scheduling_capnp.rs"));
 }
 pub mod stat_capnp {
     include!(concat!(env!("OUT_DIR"), "/stat_capnp.rs"));

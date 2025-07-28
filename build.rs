@@ -23,7 +23,7 @@ fn main() {
         .unwrap();
     capnpc::CompilerCommand::new()
         .src_prefix("src/schema")
-        .file("src/schema/ousterhout.capnp")
+        .file("src/schema/scheduling.capnp")
         .run()
         .unwrap();
     capnpc::CompilerCommand::new()

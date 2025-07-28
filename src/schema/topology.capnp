@@ -1,6 +1,6 @@
 @0xb4a5acd2fc1e5d0b;
 
-using Ousterhout = import "ousterhout.capnp";
+using Scheduling = import "scheduling.capnp";
 using Server = import "server.capnp";
 using Stat = import "stat.capnp";
 
@@ -61,7 +61,7 @@ struct NodeInfo {
   stats @4 :Stat.System;
   # Machine resource usage.
 
-  timetable @5 :Ousterhout.Timetable;
+  timetable @5 :Scheduling.Timetable;
   # The schedule table of the node, which represents
   # its current availabilities to welcome processes.
 

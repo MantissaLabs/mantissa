@@ -21,7 +21,7 @@ use bincode::{deserialize, serialize};
 use clap::Parser;
 use gossip::{Channels, Message};
 use includes::{
-    gossip_capnp, node_capnp, ousterhout_capnp, server_capnp, stat_capnp, topology_capnp,
+    gossip_capnp, node_capnp, scheduling_capnp, server_capnp, stat_capnp, topology_capnp,
     utils_capnp,
 };
 use log::{LevelFilter, Metadata, Record};
