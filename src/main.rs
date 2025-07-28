@@ -89,40 +89,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match matches.subcommand() {
         Some(("init", _)) => {
-            // TODO: create an init_server or Server::init()
-            LocalSet::new()
-                .run_until(async {
-                    // TODO: define where gossip_tx will be used.
-                    let (gossip_tx, gossip_rx) = async_channel::bounded(128);
-                    let (topology_tx, topology_rx) = async_channel::bounded(128);
+            let local = LocalSet::new();
 
-                    // Build gossip capability
-                    let gossip = gossip::Gossip {
-                        chans: Channels {
-                            topology_events: topology_tx,
-                        },
-                    };
-                    let gossip_client = capnp_rpc::new_client(gossip);
+            let (gossip_tx, gossip_rx) = async_channel::bounded(128);
+            let (topology_tx, topology_rx) = async_channel::bounded(128);
 
-                    // Build topology component.
-                    let topology = topology::Topology::new(topology_rx);
-                    let topology_client = capnp_rpc::new_client(topology);
+            // FIXME: Placeholder peer list.
+            let peers: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
 
-                    // FIXME: placeholder peer list
-                    let peers: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
+            let gossip = gossip::Gossip {
+                chans: Channels {
+                    topology_events: topology_tx.clone(),
+                },
+            };
+            let gossip_client = capnp_rpc::new_client(gossip);
 
-                    tokio::task::spawn_local(async move {
-                        gossip::start(gossip_rx, peers).await;
-                    });
+            // Our regular Topology
+            let mut topology = topology::Topology::new(topology_rx);
 
-                    let server = server::ServerImpl::new(gossip_client, topology_client, address);
+            let topology_rpc = topology::TopologyRPC {
+                tx: topology_tx.clone(),
+            };
+            let topology_client = capnp_rpc::new_client(topology_rpc);
 
-                    let err = server.start().await;
-                    if let Err(err) = err {
-                        eprintln!("Failed to start server: {}", err);
-                    };
-                })
-                .await
+            // Start gossip loop.
+            local.spawn_local(async move {
+                tokio::task::spawn_local(async move {
+                    gossip::start(gossip_rx, peers).await;
+                });
+            });
+
+            // Start topology management component.
+            local.spawn_local(async move {
+                tokio::task::spawn_local(async move {
+                    topology.run().await;
+                });
+            });
+
+            // Start server.
+            local.spawn_local(async move {
+                let server = server::ServerImpl::new(gossip_client, topology_client, address);
+                if let Err(e) = server.start().await {
+                    eprintln!("server error: {}", e);
+                }
+            });
+
+            // FIXME: Don't run indefinitely, create stop conditions.
+            local.run_until(std::future::pending::<()>()).await;
         }
         Some(("info", _)) => {
             // Please note that we use "new_all" to ensure that all lists of

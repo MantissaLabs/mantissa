@@ -75,35 +75,30 @@ impl ServerImpl {
 
     /// Starts the server, bootstrapping all necessary sub-components
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
-        tokio::task::LocalSet::new()
-            .run_until(async move {
-                let listener = tokio::net::TcpListener::bind(&self.addr).await?;
+        let listener = tokio::net::TcpListener::bind(&self.addr).await?;
 
-                println!("Server listening on {}", &self.addr);
+        println!("Server listening on {}", &self.addr);
 
-                let server_handle: server::Client = capnp_rpc::new_client(self);
+        let server_handle: server::Client = capnp_rpc::new_client(self);
 
-                println!("Server running");
+        println!("Server running");
 
-                loop {
-                    let (stream, _) = listener.accept().await?;
-                    stream.set_nodelay(true)?;
-                    let (reader, writer) =
-                        tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
+        loop {
+            let (stream, _) = listener.accept().await?;
+            stream.set_nodelay(true)?;
+            let (reader, writer) =
+                tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
 
-                    let network = twoparty::VatNetwork::new(
-                        reader,
-                        writer,
-                        rpc_twoparty_capnp::Side::Server,
-                        Default::default(),
-                    );
+            let network = twoparty::VatNetwork::new(
+                reader,
+                writer,
+                rpc_twoparty_capnp::Side::Server,
+                Default::default(),
+            );
 
-                    let rpc_system =
-                        RpcSystem::new(Box::new(network), Some(server_handle.clone().client));
+            let rpc_system = RpcSystem::new(Box::new(network), Some(server_handle.clone().client));
 
-                    tokio::task::spawn_local(Box::pin(rpc_system.map(|_| ())));
-                }
-            })
-            .await
+            tokio::task::spawn_local(Box::pin(rpc_system.map(|_| ())));
+        }
     }
 }

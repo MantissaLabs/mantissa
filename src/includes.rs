@@ -1,21 +1,7 @@
-pub mod server_capnp {
-    include!(concat!(env!("OUT_DIR"), "/server_capnp.rs"));
-}
-pub mod node_capnp {
-    include!(concat!(env!("OUT_DIR"), "/node_capnp.rs"));
-}
-pub mod gossip_capnp {
-    include!(concat!(env!("OUT_DIR"), "/gossip_capnp.rs"));
-}
-pub mod topology_capnp {
-    include!(concat!(env!("OUT_DIR"), "/topology_capnp.rs"));
-}
-pub mod scheduling_capnp {
-    include!(concat!(env!("OUT_DIR"), "/scheduling_capnp.rs"));
-}
-pub mod stat_capnp {
-    include!(concat!(env!("OUT_DIR"), "/stat_capnp.rs"));
-}
-pub mod utils_capnp {
-    include!(concat!(env!("OUT_DIR"), "/utils_capnp.rs"));
-}
+capnp::generated_code!(pub mod server_capnp);
+capnp::generated_code!(pub mod node_capnp);
+capnp::generated_code!(pub mod gossip_capnp);
+capnp::generated_code!(pub mod topology_capnp);
+capnp::generated_code!(pub mod scheduling_capnp);
+capnp::generated_code!(pub mod stat_capnp);
+capnp::generated_code!(pub mod utils_capnp);

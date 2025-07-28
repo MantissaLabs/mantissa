@@ -2,9 +2,16 @@ use crate::gossip_capnp::gossip::Client as GossipClient;
 use crate::gossip_capnp::gossip_message;
 use crate::server_capnp::server;
 use crate::topology_capnp::{topology, topology_event};
-use async_channel::Receiver;
+use async_channel::{Receiver, Sender};
 use capnp::{capability::Promise, Error};
+use capnp_rpc::pry;
+use snow::params;
 
+pub struct TopologyRPC {
+    pub tx: Sender<TopologyEvent>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Topology {
     rx: Receiver<TopologyEvent>,
     known_nodes: std::collections::HashMap<u64, String>,
@@ -77,7 +84,7 @@ impl Topology {
     }
 }
 
-impl topology::Server for Topology {
+impl topology::Server for TopologyRPC {
     /// Join the cluster and adds our client handle to the `Memberlist`
     /// Returns an instance of `Membership` to the caller to track its
     /// status.
@@ -86,7 +93,28 @@ impl topology::Server for Topology {
         params: topology::JoinParams,
         mut results: topology::JoinResults,
     ) -> Promise<(), Error> {
-        Promise::ok(())
+        let tx = self.tx.clone();
+
+        let request = pry!(pry!(params.get()).get_node());
+        let id = request.get_id();
+        let address = pry!(pry!(request.get_addr()).to_string());
+        let hostname = pry!(pry!(request.get_hostname()).to_string());
+        let root_hash = pry!(pry!(request.get_root_hash()).to_string());
+        let client = pry!(request.get_handle());
+
+        // Send event to Topology loop.
+        Promise::from_future(async move {
+            tx.send(TopologyEvent::NodeJoined {
+                id,
+                address,
+                hostname,
+                client,
+                root_hash,
+            })
+            .await;
+
+            Ok(())
+        })
     }
 
     /// Leave the cluster.

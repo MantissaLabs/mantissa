@@ -50,9 +50,9 @@ serde = { version = "1.0.190", features = ["derive"] }
 bincode = "1.3.3"
 
 # capnproto
-capnp = "0.21.0"
-capnp-rpc = "0.21.0"
-capnp-futures = "0.21.0"
+capnp = "0.21.4"
+capnp-rpc = "0.21"
+capnp-futures = "0.21"
 
 sysinfo = "0.34.2"
 log = "0.4"
