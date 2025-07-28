@@ -95,15 +95,15 @@ impl topology::Server for TopologyRPC {
     ) -> Promise<(), Error> {
         let tx = self.tx.clone();
 
-        let request = pry!(pry!(params.get()).get_node());
-        let id = request.get_id();
-        let address = pry!(pry!(request.get_addr()).to_string());
-        let hostname = pry!(pry!(request.get_hostname()).to_string());
-        let root_hash = pry!(pry!(request.get_root_hash()).to_string());
-        let client = pry!(request.get_handle());
-
         // Send event to Topology loop.
         Promise::from_future(async move {
+            let request = params.get()?.get_node()?;
+            let id = request.get_id();
+            let address = request.get_addr()?.to_string()?;
+            let hostname = request.get_hostname()?.to_string()?;
+            let root_hash = request.get_root_hash()?.to_string()?;
+            let client = request.get_handle()?;
+
             tx.send(TopologyEvent::NodeJoined {
                 id,
                 address,
