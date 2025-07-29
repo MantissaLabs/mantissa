@@ -3,6 +3,7 @@ extern crate log;
 extern crate sysinfo;
 
 mod cli;
+mod client;
 pub mod container;
 mod gossip;
 mod hash;
@@ -41,11 +42,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map(|()| log::set_max_level(LevelFilter::Info))
         .unwrap();
 
-    // Initialize database.
-    let home_dir = dirs::home_dir().ok_or("Unable to determine home directory.")?;
-    let db = init_database(home_dir)?;
-
     let matches = cli::init().get_matches();
+
+    let anchor = matches
+        .get_one::<String>("listen")
+        .map(|s| s.as_str())
+        .unwrap_or("127.0.0.1:6578")
+        .to_string();
 
     let address = matches
         .get_one::<String>("listen")
@@ -55,18 +58,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match matches.subcommand() {
         Some(("init", _)) => {
+            // TODO: Initialize DB when starting server.
             server::start(address).await;
         }
 
         Some(("info", _)) => {
-            info::print().await;
+            // info::print().await;
+            client::node::info(&anchor).await?
         }
 
         Some(("submit", _)) => {
-            workload::task::submit().await;
+            workload::task::submit().await?;
         }
 
         Some(("link", _)) => {
+            // Initialize database.
+            let home_dir = dirs::home_dir().ok_or("Unable to determine home directory.")?;
+            let db = init_database(home_dir)?;
+
             // Creating an MVReg and store a value in there.
             let mut mvreg = HashableMVReg::new();
             mvreg.write("Hello, CRDT!".to_string(), 0);

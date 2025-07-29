@@ -2,6 +2,7 @@
 
 using Gossip = import "gossip.capnp";
 using Topology = import "topology.capnp";
+using Node = import "node.capnp";
 
 interface Server {
     # Server is the top level interface tying all the services together.
@@ -12,6 +13,7 @@ interface Server {
 
     getGossip @1 () -> (gossip: Gossip.Gossip);
     getTopology @2 () -> (topology: Topology.Topology);
+    getNodeStats @3 () -> (node: Node.NodeStats);
 }
 
 struct Capabilities {

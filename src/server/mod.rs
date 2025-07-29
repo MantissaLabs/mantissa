@@ -16,6 +16,8 @@ use tokio::task::LocalSet;
 pub struct ServerImpl {
     pub gossip_client: GossipClient,
     pub topology_client: TopologyClient,
+    // TODO: Wire the Node stats client to return node information.
+    // pub node_client: NodeStatsClient,
     addr: String,
 }
 
