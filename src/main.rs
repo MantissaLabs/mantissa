@@ -19,7 +19,6 @@ mod workload;
 use anyhow::{Context, Result};
 use bincode::{deserialize, serialize};
 use clap::Parser;
-use gossip::{Channels, Message};
 use includes::{
     gossip_capnp, node_capnp, scheduling_capnp, server_capnp, stat_capnp, topology_capnp,
     utils_capnp,
@@ -28,14 +27,11 @@ use log::{LevelFilter, Metadata, Record};
 use merkle_search_tree::builder::Builder;
 use merkle_search_tree::MerkleSearchTree;
 use redb::{Database, TableDefinition};
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Duration;
-use std::{collections::HashMap, sync::Arc};
 use sysinfo::{Components, Disks, Networks, System};
-use tokio::task::LocalSet;
-use topology::{PeerHandle, TopologyEvent};
 use workload::docker::{
     ContainerManager, DockerContainerManager, RestartPolicyConfig, RestartPolicyType,
 };
@@ -89,54 +85,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match matches.subcommand() {
         Some(("init", _)) => {
-            let local = LocalSet::new();
-
-            let (gossip_tx, gossip_rx) = async_channel::bounded(128);
-            let (topology_tx, topology_rx) = async_channel::bounded(128);
-
-            // FIXME: Placeholder peer list.
-            let peers: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
-
-            let gossip = gossip::Gossip {
-                chans: Channels {
-                    topology_events: topology_tx.clone(),
-                },
-            };
-            let gossip_client = capnp_rpc::new_client(gossip);
-
-            // Our regular Topology
-            let mut topology = topology::Topology::new(topology_rx);
-
-            let topology_rpc = topology::TopologyRPC {
-                tx: topology_tx.clone(),
-            };
-            let topology_client = capnp_rpc::new_client(topology_rpc);
-
-            // Start gossip loop.
-            local.spawn_local(async move {
-                tokio::task::spawn_local(async move {
-                    gossip::start(gossip_rx, peers).await;
-                });
-            });
-
-            // Start topology management component.
-            local.spawn_local(async move {
-                tokio::task::spawn_local(async move {
-                    topology.run().await;
-                });
-            });
-
-            // Start server.
-            local.spawn_local(async move {
-                let server = server::ServerImpl::new(gossip_client, topology_client, address);
-                if let Err(e) = server.start().await {
-                    eprintln!("server error: {}", e);
-                }
-            });
-
-            // FIXME: Don't run indefinitely, create stop conditions.
-            local.run_until(std::future::pending::<()>()).await;
+            server::start(address).await;
         }
+
         Some(("info", _)) => {
             // Please note that we use "new_all" to ensure that all lists of
             // CPUs and processes are filled!

@@ -64,6 +64,9 @@ impl Topology {
                         } => {
                             println!("[Topology] Node joined: {id} at {address}");
                             self.known_nodes.insert(id, address);
+
+                            // TODO: broadcast event to other components that may be
+                            // interested in the event.
                         }
                         TopologyEvent::NodeLeft { id } => {
                             println!("[Topology] Node left: {id}");

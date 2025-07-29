@@ -1,11 +1,16 @@
-use crate::gossip::Gossip;
+use std::sync::{Arc, Mutex};
+
+use crate::gossip;
 use crate::gossip_capnp::gossip::Client as GossipClient;
 use crate::server_capnp::server;
+use crate::topology::PeerHandle;
 use crate::topology_capnp::topology::Client as TopologyClient;
+use crate::{gossip::Gossip, topology};
 use capnp::capability::Promise;
 use capnp::Error;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::{AsyncReadExt, FutureExt};
+use tokio::task::LocalSet;
 
 #[derive(Clone)]
 pub struct ServerImpl {
@@ -101,4 +106,55 @@ impl ServerImpl {
             tokio::task::spawn_local(Box::pin(rpc_system.map(|_| ())));
         }
     }
+}
+
+// Start the server and other components like gossip, scheduler, and topology.
+pub async fn start(addr: String) {
+    let local = LocalSet::new();
+
+    let (gossip_tx, gossip_rx) = async_channel::bounded(128);
+    let (topology_tx, topology_rx) = async_channel::bounded(128);
+
+    // FIXME: Placeholder peer list.
+    let peers: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let gossip = gossip::Gossip {
+        chans: gossip::Channels {
+            topology_events: topology_tx.clone(),
+        },
+    };
+    let gossip_client = capnp_rpc::new_client(gossip);
+
+    // Our regular Topology
+    let mut topology = topology::Topology::new(topology_rx);
+
+    let topology_rpc = topology::TopologyRPC {
+        tx: topology_tx.clone(),
+    };
+    let topology_client = capnp_rpc::new_client(topology_rpc);
+
+    // Start gossip loop.
+    local.spawn_local(async move {
+        tokio::task::spawn_local(async move {
+            gossip::start(gossip_rx, peers).await;
+        });
+    });
+
+    // Start topology management component.
+    local.spawn_local(async move {
+        tokio::task::spawn_local(async move {
+            topology.run().await;
+        });
+    });
+
+    // Start server.
+    local.spawn_local(async move {
+        let server = ServerImpl::new(gossip_client, topology_client, addr);
+        if let Err(e) = server.start().await {
+            eprintln!("server error: {}", e);
+        }
+    });
+
+    // FIXME: Don't run indefinitely, create stop conditions.
+    local.run_until(std::future::pending::<()>()).await;
 }
