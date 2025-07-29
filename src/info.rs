@@ -1,8 +1,9 @@
+use anyhow::Result;
 use sysinfo::{Components, Disks, Networks, System};
 
 // TODO: Temporary, remove after defining a proper object for resource
 // information gathering.
-pub async fn print() {
+pub async fn print() -> Result<()> {
     // Please note that we use "new_all" to ensure that all lists of
     // CPUs and processes are filled!
     let mut sys = System::new_all();
@@ -25,6 +26,7 @@ pub async fn print() {
 
     // Number of CPUs:
     println!("NB CPUs: {}", sys.cpus().len());
+    println!("CPU Brand: {}", sys.cpus()[0].brand());
 
     // We display all disks' information:
     println!("=> disks:");
@@ -52,4 +54,6 @@ pub async fn print() {
     for component in &components {
         println!("{component:?}");
     }
+
+    Ok(())
 }
