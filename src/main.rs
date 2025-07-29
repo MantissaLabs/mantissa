@@ -9,6 +9,7 @@ mod hash;
 mod hash_mvreg;
 mod includes;
 mod info;
+mod logger;
 pub mod monitor;
 mod node;
 mod server;
@@ -19,12 +20,11 @@ mod workload;
 
 use anyhow::{Context, Result};
 use bincode::{deserialize, serialize};
-use clap::Parser;
 use includes::{
     gossip_capnp, node_capnp, scheduling_capnp, server_capnp, stat_capnp, topology_capnp,
     utils_capnp,
 };
-use log::{LevelFilter, Metadata, Record};
+use log::LevelFilter;
 use merkle_search_tree::builder::Builder;
 use merkle_search_tree::MerkleSearchTree;
 use redb::{Database, TableDefinition};
@@ -38,36 +38,11 @@ use workload::docker::{
 
 use crate::hash_mvreg::HashableMVReg;
 
-#[derive(Parser)]
-struct Opts {
-    /// Sets a custom config file
-    #[clap(short, long, default_value = "default.conf")]
-    config: String,
-}
-
-struct MantissaLogger;
-
-static LOGGER: MantissaLogger = MantissaLogger;
-
 const REGISTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("registers");
-
-impl log::Log for MantissaLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= log::Level::Info
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            println!("{} - {}", record.level(), record.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    log::set_logger(&LOGGER)
+    log::set_logger(&logger::LOGGER)
         .map(|()| log::set_max_level(LevelFilter::Info))
         .unwrap();
 

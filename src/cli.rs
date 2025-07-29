@@ -1,4 +1,11 @@
-use clap::{Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, Parser};
+
+#[derive(Parser)]
+struct Opts {
+    /// Sets a custom config file
+    #[clap(short, long, default_value = "default.conf")]
+    config: String,
+}
 
 pub fn init() -> Command {
     Command::new("mantissa")
