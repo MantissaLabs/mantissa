@@ -28,13 +28,8 @@ use log::LevelFilter;
 use merkle_search_tree::builder::Builder;
 use merkle_search_tree::MerkleSearchTree;
 use redb::{Database, TableDefinition};
-use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
-use std::time::Duration;
-use workload::docker::{
-    ContainerManager, DockerContainerManager, RestartPolicyConfig, RestartPolicyType,
-};
 
 use crate::hash_mvreg::HashableMVReg;
 
@@ -66,52 +61,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(("info", _)) => {
             info::print().await;
         }
+
         Some(("submit", _)) => {
-            // Initialize the container manager
-            let container_manager = DockerContainerManager::new().await?;
-
-            // Pull the image first
-            container_manager.pull_image("nginx:latest").await?;
-
-            // Create a new container
-            let container_id = container_manager
-                .create_container(
-                    "my-nginx-container",
-                    "nginx:latest",
-                    None,
-                    None,
-                    None,
-                    Some(RestartPolicyConfig {
-                        name: RestartPolicyType::Always,
-                        max_retry_count: None,
-                    }),
-                )
-                .await?;
-
-            // Start the container
-            container_manager.start_container(&container_id).await?;
-            println!("Container started: {}", container_id);
-
-            // List all running containers
-            let mut filters = HashMap::new();
-            filters.insert("status".to_string(), vec!["running".to_string()]);
-
-            let containers = container_manager.list_containers(Some(filters)).await?;
-            for container in containers {
-                println!("Running container: {} ({})", container.name, container.id);
-            }
-
-            // Stop the container after 5 seconds
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            container_manager
-                .stop_container(&container_id, Some(Duration::from_secs(10)))
-                .await?;
-
-            // Remove the container
-            container_manager
-                .remove_container(&container_id, false, true)
-                .await?;
+            workload::task::submit().await;
         }
+
         Some(("link", _)) => {
             // Creating an MVReg and store a value in there.
             let mut mvreg = HashableMVReg::new();
