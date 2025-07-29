@@ -31,12 +31,6 @@ interface Executor {
   # List tasks running on the node.
 }
 
-interface NodeStats {
-  # NodeStats contains informations about the node, its resource usage, etc.
-
-  info @0 () -> (info :Stat.System);
-}
-
 interface Scheduler {
   # Scheduler describes calls that are used to schedule and cancel tasks.
 
