@@ -44,22 +44,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let matches = cli::init().get_matches();
 
-    let anchor = matches
+    let anchor: String = matches
         .get_one::<String>("listen")
-        .map(|s| s.as_str())
-        .unwrap_or("127.0.0.1:6578")
-        .to_string();
+        .expect("has a default")
+        .clone();
 
-    let address = matches
-        .get_one::<String>("listen")
-        .map(|s| s.as_str())
-        .unwrap_or("127.0.0.1:6578")
-        .to_string();
+    let listen: String = matches
+        .get_one::<String>("address")
+        .expect("has a default")
+        .clone();
 
     match matches.subcommand() {
         Some(("init", _)) => {
             // TODO: Initialize DB when starting server.
-            server::start(address).await;
+            server::start(listen).await;
         }
 
         Some(("info", _)) => {

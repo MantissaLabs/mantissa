@@ -26,6 +26,7 @@ pub fn init() -> Command {
                 .short('l')
                 .long("listen")
                 .value_name("LISTEN-ADDRESS")
+                .default_value("127.0.0.1:6578")
                 .help("Sets the listen address"),
         )
         .arg(
@@ -33,6 +34,7 @@ pub fn init() -> Command {
                 .short('a')
                 .long("anchor")
                 .value_name("ANCHOR")
+                .default_value("127.0.0.1:6578")
                 .help("Sets the anchor address to join the network of nodes"),
         )
         .arg(
