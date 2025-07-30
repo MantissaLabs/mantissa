@@ -1,3 +1,12 @@
+use node::info::System;
+
+/// This structure defines the delegate in charge of booking slots
+/// running tasks on the machine.
+pub struct Node {
+    system_info: System,
+    // engine: Rc<Engine>,
+}
+
 // NodeState contains all of the node transitions during its lifetime.
 // Change in state could occur when receiving messages from other peers,
 // or performing actions like joining or leaving the cluster.

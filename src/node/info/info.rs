@@ -1,12 +1,12 @@
-use sys_info::*;
+use sysinfo::{CpuRefreshKind, Disks, RefreshKind, System};
 
 /// # Description:
 ///
 /// This structure contains System wide informations about the machine
 /// such as the operating systems details, hardware components, load, etc.
-#[derive(Clone)]
-pub struct System {
-    pub device_ip: &'static str,
+pub struct NodeInfo {
+    sys: System,
+    pub device_ip: Option<String>,
     pub os_info: Option<OS>,
     pub hostname: Option<String>,
     pub cpu_info: Option<Cpu>,
@@ -18,29 +18,28 @@ pub struct System {
 /// # Description:
 ///
 /// This structure defines the client handle for a network member.
-#[derive(Clone, Default)]
 pub struct OS {
-    pub os_release: String,
-    pub os_kind: String,
+    pub os_name: String,
+    pub os_version: String,
+    pub kernel_version: String,
 }
 
 /// # Description:
 ///
 /// Holds general CPU informations.
-#[derive(Clone, Default)]
 pub struct Cpu {
     /// CPU vendor string, for example *GenuineIntel*.
-    pub vendor: String,
+    pub vendor: Option<String>,
 
     /// Brand string, for example *Intel(R) Core(TM) i5-2410M CPU @
     /// 2.30GHz*.
-    pub brand: String,
+    pub brand: Option<String>,
 
     /// Brief CPU codename, such as *Sandy Bridge (Core i5)*.
-    pub codename: String,
+    pub codename: Option<String>,
 
     /// CPU frequency (in MHz).
-    pub frequency: Option<i32>,
+    pub frequency: Option<u64>,
 
     /// Number of physical cores of the current CPU.
     pub num_cores: i32,
@@ -49,7 +48,7 @@ pub struct Cpu {
     pub num_logical_cpus: i32,
 
     /// Total number of logical processors.
-    pub total_logical_cpus: i32,
+    pub total_logical_cpus: Option<i32>,
 
     /// L1 data cache size in kB. `Some(0)` if the CPU lacks cache, `None`
     /// if it couldn't be determined.
@@ -78,40 +77,23 @@ pub struct Load {
     pub fifteen: f64,
 }
 
-#[derive(Clone, Default)]
 pub struct Memory {
     pub total: u64,
     pub free: u64,
-    pub avail: u64,
-
-    pub buffers: u64,
-    pub cached: u64,
+    pub available: u64,
+    pub used: u64,
 
     pub swap_total: u64,
+    pub swap_used: u64,
     pub swap_free: u64,
 }
 
-#[derive(Clone, Default)]
 pub struct Disk {
     pub total: u64,
     pub free: u64,
 }
 
-impl Default for System {
-    fn default() -> Self {
-        System {
-            device_ip: "",
-            os_info: None,
-            hostname: None,
-            cpu_info: None,
-            load_info: None,
-            mem_info: None,
-            disk_info: None,
-        }
-    }
-}
-
-impl System {
+impl NodeInfo {
     pub fn collect(&mut self) {
         self.get_cpu_frequency();
         self.get_cpu_info();
@@ -120,6 +102,90 @@ impl System {
         self.get_load_avg();
         self.get_memory_info();
         self.get_os_info();
+    }
+
+    pub fn new() -> Self {
+        let sys = System::new_all();
+        NodeInfo {
+            sys,
+            device_ip: None,
+            load_info: None,
+            mem_info: None,
+            disk_info: None,
+            os_info: None,
+            hostname: None,
+            cpu_info: None,
+        }
+    }
+
+    pub fn get_hostname(&self) -> String {
+        match System::host_name() {
+            Some(hostname) => hostname,
+            None => String::from("Unknown"),
+        }
+    }
+
+    pub fn get_cpu_frequency(&self) -> u64 {
+        for cpu in self.sys.cpus() {
+            return cpu.frequency();
+        }
+
+        0
+    }
+
+    pub fn get_load_avg(&mut self) {
+        // static method returning the 1/5/15-minute load averages
+        let avg = System::load_average();
+        self.load_info = Some(Load {
+            one: avg.one,
+            five: avg.five,
+            fifteen: avg.fifteen,
+        });
+    }
+
+    pub fn get_memory_info(&mut self) {
+        let total = self.sys.total_memory();
+        let free = self.sys.free_memory();
+        let available = self.sys.available_memory();
+        let used = self.sys.used_memory();
+        let swap_total = self.sys.total_swap();
+        let swap_used = self.sys.used_swap();
+        let swap_free = self.sys.free_swap();
+
+        self.mem_info = Some(Memory {
+            total,
+            free,
+            available,
+            used,
+            swap_total,
+            swap_used,
+            swap_free,
+        });
+    }
+
+    pub fn get_disk_info(&mut self) {
+        let mut total = 0;
+        let mut free = 0;
+
+        let disks = Disks::new_with_refreshed_list();
+        for disk in &disks {
+            total += disk.total_space();
+            free += disk.available_space();
+        }
+
+        self.disk_info = Some(Disk { total, free });
+    }
+
+    pub fn get_os_info(&mut self) {
+        let os_name = System::name().unwrap_or(String::from("Unknown"));
+        let os_version = System::os_version().unwrap_or(String::from("Unknown"));
+        let kernel_version = System::kernel_version().unwrap_or(String::from("Unknown"));
+
+        self.os_info = Some(OS {
+            os_name,
+            os_version,
+            kernel_version,
+        });
     }
 
     /// Returns the CPU specs of the machine with the model, number of
@@ -144,18 +210,43 @@ impl System {
             println!("libcpuid is not installed on the machine, cannot collet cpu specs..");
             self.cpu_info = None;
             return;
+        } else {
+            let mut sys = System::new_with_specifics(
+                RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
+            );
+
+            sys.refresh_cpu_all();
+
+            let cpus = sys.cpus();
+            let model = cpus.first().map(|cpu| cpu.brand().to_string()).unwrap();
+            let logical: i32 = cpus.len() as i32;
+            let physical: i32 = System::physical_core_count().unwrap_or(cpus.len()) as i32;
+
+            self.cpu_info = Some(Cpu {
+                vendor: None,
+                brand: Some(model),
+                codename: None,
+                frequency: None,
+                num_cores: physical,
+                num_logical_cpus: logical,
+                total_logical_cpus: Some(logical),
+                l1_data_cache: None,
+                l1_instruction_cache: None,
+                l2_cache: None,
+                l3_cache: None,
+            })
         }
 
         match ::cpuid::identify() {
             Ok(info) => {
                 self.cpu_info = Some(Cpu {
-                    vendor: info.vendor,
-                    brand: info.brand,
-                    codename: info.codename,
-                    frequency: self.get_cpu_frequency(),
+                    vendor: Some(info.vendor),
+                    brand: Some(info.brand),
+                    codename: Some(info.codename),
+                    frequency: Some(self.get_cpu_frequency()),
                     num_cores: info.num_cores,
                     num_logical_cpus: info.num_logical_cpus,
-                    total_logical_cpus: info.total_logical_cpus,
+                    total_logical_cpus: Some(info.total_logical_cpus),
                     l1_data_cache: info.l1_data_cache,
                     l1_instruction_cache: info.l1_instruction_cache,
                     l2_cache: info.l2_cache,
@@ -163,150 +254,6 @@ impl System {
                 })
             }
             Err(_) => self.cpu_info = None,
-        }
-    }
-
-    /// Gets the CPU frequency of the machine.
-    ///
-    /// # Remarks
-    ///
-    /// This only works if `libcpuid` is present on the machine, otherwise
-    /// we return `None` and ignore the frequency for further use of the
-    /// delegate.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// match get_cpu_frequency() {
-    ///     Some(frequency) => println!("cpu frequency: {}", frequency),
-    ///     None => println!("can't collect cpu frequency on the machine"),
-    /// }
-    /// ```
-    pub fn get_cpu_frequency(&self) -> Option<i32> {
-        if !::cpuid::is_present() {
-            println!("libcpuid is not present on the machine, cannot collet cpu frequency..");
-            return None;
-        }
-
-        ::cpuid::clock_frequency()
-    }
-
-    /// Gets the average load of the machine.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// match get_load() {
-    ///     Some(load) => println!("avg load: {}", load.one),
-    ///     None => println!("can't collect load average on the machine"),
-    /// }
-    /// ```
-    pub fn get_load_avg(&mut self) {
-        match loadavg() {
-            Ok(load) => {
-                self.load_info = Some(Load {
-                    one: load.one,
-                    five: load.five,
-                    fifteen: load.fifteen,
-                })
-            }
-            Err(_) => self.load_info = None,
-        }
-    }
-
-    /// Gets the memory usage of the machine.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// match get_memory_info() {
-    ///     Some(mem) => println!("available memory: {}", mem.avail),
-    ///     None => println!("can't collect memory usage on the machine"),
-    /// }
-    /// ```
-    pub fn get_memory_info(&mut self) {
-        match mem_info() {
-            Ok(mem) => {
-                self.mem_info = Some(Memory {
-                    avail: mem.avail,
-                    buffers: mem.buffers,
-                    cached: mem.cached,
-                    free: mem.free,
-                    swap_free: mem.swap_free,
-                    swap_total: mem.swap_total,
-                    total: mem.total,
-                })
-            }
-            Err(_) => self.mem_info = None,
-        }
-    }
-
-    /// Gets the disk usage of the machine.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// match get_disk_info() {
-    ///     Some(disk) => println!("free disk space: {}", disk.free),
-    ///     None => println!("can't collect disk usage on the machine"),
-    /// }
-    /// ```
-    pub fn get_disk_info(&mut self) {
-        match disk_info() {
-            Ok(disk) => {
-                self.disk_info = Some(Disk {
-                    free: disk.free,
-                    total: disk.total,
-                })
-            }
-            Err(_) => self.disk_info = None,
-        }
-    }
-
-    /// Get the operating system informations.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// match get_os_info() {
-    ///     Some(os) => println!("operating system type: {}", os.type),
-    ///     None => println!("can't collect operating system informations"),
-    /// }
-    /// ```
-    pub fn get_os_info(&mut self) {
-        let release: String;
-        let kind: String;
-
-        match os_release() {
-            Ok(r) => release = r,
-            Err(_) => release = String::new(),
-        }
-
-        match os_type() {
-            Ok(k) => kind = k,
-            Err(_) => kind = String::new(),
-        }
-
-        self.os_info = Some(OS {
-            os_release: release,
-            os_kind: kind,
-        })
-    }
-
-    /// Get the hostname of the machine.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// match get_hostname() {
-    ///     Some(hostname) => println!("hostname: {}", hostname),
-    ///     None => println!("can't find hostname for the machine"),
-    /// }
-    /// ```
-    pub fn get_hostname(&mut self) {
-        match hostname() {
-            Ok(hostname) => self.hostname = Some(hostname),
-            Err(_) => self.hostname = None,
         }
     }
 }

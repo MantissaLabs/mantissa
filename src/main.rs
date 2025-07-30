@@ -9,7 +9,6 @@ mod gossip;
 mod hash;
 mod hash_mvreg;
 mod includes;
-mod info;
 mod logger;
 pub mod monitor;
 mod node;
@@ -31,7 +30,6 @@ use merkle_search_tree::MerkleSearchTree;
 use redb::{Database, TableDefinition};
 use std::error::Error;
 use std::path::PathBuf;
-use sysinfo::{CpuRefreshKind, RefreshKind, System};
 
 use crate::hash_mvreg::HashableMVReg;
 
@@ -62,22 +60,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Some(("info", _)) => {
-            // 1) Build a System that only gathers CPU info:
-            let mut sys = System::new_with_specifics(
-                RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
-            );
-
-            sys.refresh_cpu_all();
-
-            let cpus = sys.cpus();
-
-            let model = cpus.first().map(|cpu| cpu.brand()).unwrap_or("Unknown CPU");
-            println!("CPU Model: {}", model);
-
-            println!("Logical cores: {}", cpus.len());
-            let physical = System::physical_core_count().unwrap_or(cpus.len());
-            println!("Physical cores: {}", physical);
-
             client::node::info(&anchor).await?;
         }
 
