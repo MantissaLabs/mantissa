@@ -31,6 +31,7 @@ use merkle_search_tree::MerkleSearchTree;
 use redb::{Database, TableDefinition};
 use std::error::Error;
 use std::path::PathBuf;
+use sysinfo::{CpuRefreshKind, RefreshKind, System};
 
 use crate::hash_mvreg::HashableMVReg;
 
@@ -50,7 +51,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .clone();
 
     let listen: String = matches
-        .get_one::<String>("address")
+        .get_one::<String>("listen")
         .expect("has a default")
         .clone();
 
@@ -61,8 +62,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Some(("info", _)) => {
-            // info::print().await;
-            client::node::info(&anchor).await?
+            // 1) Build a System that only gathers CPU info:
+            let mut sys = System::new_with_specifics(
+                RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
+            );
+
+            sys.refresh_cpu_all();
+
+            let cpus = sys.cpus();
+
+            let model = cpus.first().map(|cpu| cpu.brand()).unwrap_or("Unknown CPU");
+            println!("CPU Model: {}", model);
+
+            println!("Logical cores: {}", cpus.len());
+            let physical = System::physical_core_count().unwrap_or(cpus.len());
+            println!("Physical cores: {}", physical);
+
+            client::node::info(&anchor).await?;
         }
 
         Some(("submit", _)) => {
