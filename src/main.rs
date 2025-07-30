@@ -60,12 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Some(("info", _)) => {
-            tokio::task::LocalSet::new()
-                .run_until(async move {
-                    client::node::info(&anchor).await?;
-                    Ok::<(), Box<dyn std::error::Error>>(())
-                })
-                .await?;
+            client::node::info(&anchor).await?;
         }
 
         Some(("submit", _)) => {
