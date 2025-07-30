@@ -2,6 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::gossip;
 use crate::gossip_capnp::gossip::Client as GossipClient;
+use crate::node::node;
+use crate::node_capnp::node::Client as NodeClient;
 use crate::server_capnp::server;
 use crate::topology::PeerHandle;
 use crate::topology_capnp::topology::Client as TopologyClient;
@@ -16,8 +18,7 @@ use tokio::task::LocalSet;
 pub struct ServerImpl {
     pub gossip_client: GossipClient,
     pub topology_client: TopologyClient,
-    // TODO: Tie in to node client and return the capability
-    // pub node_client: NodeClient,
+    pub node_client: NodeClient,
     addr: String,
 }
 
@@ -61,6 +62,19 @@ impl server::Server for ServerImpl {
         results.get().set_gossip(self.gossip_client.clone());
         Promise::ok(())
     }
+
+    /// Get the node capability.
+    ///
+    /// We usually call this method when we want to have access to the
+    /// node service (node information, with resource usage/load, containers running, etc.).
+    fn get_node(
+        &mut self,
+        _params: server::GetNodeParams,
+        mut results: server::GetNodeResults,
+    ) -> Promise<(), Error> {
+        results.get().set_node(self.node_client.clone());
+        Promise::ok(())
+    }
 }
 
 impl ServerImpl {
@@ -71,11 +85,13 @@ impl ServerImpl {
     pub fn new(
         gossip_client: GossipClient,
         topology_client: TopologyClient,
+        node_client: NodeClient,
         addr: impl Into<String>,
     ) -> Self {
         Self {
             gossip_client,
             topology_client,
+            node_client,
             addr: addr.into(),
         }
     }
@@ -114,6 +130,10 @@ impl ServerImpl {
 pub async fn start(addr: String) {
     let local = LocalSet::new();
 
+    let mut node = node::Node::new();
+    node.collect_system_info();
+    let node_client = capnp_rpc::new_client(node);
+
     let (gossip_tx, gossip_rx) = async_channel::bounded(128);
     let (topology_tx, topology_rx) = async_channel::bounded(128);
 
@@ -151,7 +171,7 @@ pub async fn start(addr: String) {
 
     // Start server.
     local.spawn_local(async move {
-        let server = ServerImpl::new(gossip_client, topology_client, addr);
+        let server = ServerImpl::new(gossip_client, topology_client, node_client, addr);
         if let Err(e) = server.start().await {
             eprintln!("server error: {}", e);
         }

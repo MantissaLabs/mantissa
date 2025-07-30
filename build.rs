@@ -28,7 +28,7 @@ fn main() {
         .unwrap();
     capnpc::CompilerCommand::new()
         .src_prefix("src/schema")
-        .file("src/schema/stat.capnp")
+        .file("src/schema/info.capnp")
         .run()
         .unwrap();
     capnpc::CompilerCommand::new()

@@ -13,7 +13,7 @@ interface Server {
 
     getGossip @1 () -> (gossip: Gossip.Gossip);
     getTopology @2 () -> (topology: Topology.Topology);
-    getNodeStats @3 () -> (node: Node.Node);
+    getNode @3 () -> (node: Node.Node);
 }
 
 struct Capabilities {

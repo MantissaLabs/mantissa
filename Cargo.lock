@@ -553,14 +553,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cpuid"
-version = "0.1.1"
-source = "git+https://github.com/abronan/rust-cpuid.git?branch=support_0.4.0#a0f33d6aa93e5c1c5e9efadd5279645cc6c3c3f3"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1369,7 +1361,6 @@ dependencies = [
  "capnpc",
  "chrono",
  "clap",
- "cpuid",
  "crdt_tree",
  "crdts 7.3.2",
  "dirs",

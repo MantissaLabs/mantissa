@@ -21,7 +21,7 @@ mod workload;
 use anyhow::{Context, Result};
 use bincode::{deserialize, serialize};
 use includes::{
-    gossip_capnp, node_capnp, scheduling_capnp, server_capnp, stat_capnp, topology_capnp,
+    gossip_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, topology_capnp,
     utils_capnp,
 };
 use log::LevelFilter;
@@ -60,7 +60,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Some(("info", _)) => {
-            client::node::info(&anchor).await?;
+            tokio::task::LocalSet::new()
+                .run_until(async move {
+                    client::node::info(&anchor).await?;
+                    Ok::<(), Box<dyn std::error::Error>>(())
+                })
+                .await?;
         }
 
         Some(("submit", _)) => {

@@ -27,5 +27,7 @@ pub async fn get_client(server: &str) -> Result<Client, Error> {
     let mut rpc_system = RpcSystem::new(rpc_network, None);
     let client: Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
 
+    tokio::task::spawn_local(rpc_system);
+
     Ok(client)
 }

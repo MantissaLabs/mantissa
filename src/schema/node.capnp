@@ -2,14 +2,14 @@
 
 using Topology = import "topology.capnp";
 using Scheduling = import "scheduling.capnp";
-using Stat = import "stat.capnp";
+using Info = import "info.capnp";
 using Utils = import "utils.capnp";
 
 interface Node {
   # Node contains informations about the worker node as well as
   # its capabilities, which are used to schedule and execute tasks.
 
-  info @0 () -> (info :Stat.System);
+  info @0 () -> (info :Info.Info);
   # Returns informations about the node, its resource usage, etc.
 
   scheduler @1 () -> (sched :Scheduler);

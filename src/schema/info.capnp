@@ -1,6 +1,6 @@
 @0xc92570816b69a86f;
 
-struct System {
+struct Info {
   cpu @0 :Cpu;
   # cores describes the number of CPU cores available on the machine.
 
@@ -24,7 +24,7 @@ struct Cpu {
   vendor @0 :Text;
   brand @1 :Text;
   codename @2 :Text;
-  frequency @3 :Int32;
+  frequency @3 :UInt64;
   numCores @4 :Int32;
   logicalCpus @5 :Int32;
   totalLogicalCpus @6 :Int32;
@@ -35,8 +35,9 @@ struct Cpu {
 }
 
 struct OperatingSystem {
-  release @0 :Text;
-  type @1 : Text;
+  name @0 :Text;
+  version @1 :Text;
+  kernelVersion @2 :Text;
 }
 
 struct Memory {

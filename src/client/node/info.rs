@@ -4,7 +4,7 @@ use anyhow::Error;
 pub async fn info(server_address: &str) -> Result<(), Error> {
     let client = common::get_client(server_address).await?;
 
-    let request = client.get_node_stats_request();
+    let request = client.get_node_request();
     let node = request.send().pipeline.get_node();
     let request = node.info_request();
 
@@ -16,8 +16,9 @@ pub async fn info(server_address: &str) -> Result<(), Error> {
 
     let os = info.get_os()?;
     println!("Operating System:");
-    println!("  release: {:?}", os.get_release()?);
-    println!("  type: {:?}", os.get_type()?);
+    println!("  name: {:?}", os.get_name()?);
+    println!("  version: {:?}", os.get_version()?);
+    println!("  kernel_version: {:?}", os.get_kernel_version()?);
 
     let cpu = info.get_cpu()?;
     println!("CPU:");

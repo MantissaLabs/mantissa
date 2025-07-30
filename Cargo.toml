@@ -54,7 +54,6 @@ capnp = "0.21.4"
 capnp-rpc = "0.21"
 capnp-futures = "0.21"
 
-cpuid = { git = "https://github.com/abronan/rust-cpuid.git", branch = "support_0.4.0" }
 sysinfo = "0.36.1"
 log = "0.4"
 dirs = "5.0.1"

@@ -2,7 +2,7 @@
 
 using Scheduling = import "scheduling.capnp";
 using Server = import "server.capnp";
-using Stat = import "stat.capnp";
+using Info = import "info.capnp";
 
 interface Membership {
   yield @0 () -> ();
@@ -58,7 +58,7 @@ struct NodeInfo {
   addr @3 :Text;
   # IP address of the machine.
 
-  stats @4 :Stat.System;
+  info @4 :Info.Info;
   # Machine resource usage.
 
   timetable @5 :Scheduling.Timetable;

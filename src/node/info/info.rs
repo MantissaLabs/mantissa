@@ -6,6 +6,15 @@ use sysinfo::{CpuRefreshKind, Disks, RefreshKind, System};
 /// such as the operating systems details, hardware components, load, etc.
 pub struct NodeInfo {
     sys: System,
+    pub info: Info,
+}
+
+/// # Description:
+///
+/// This structure contains System wide informations about the machine
+/// such as the operating systems details, hardware components, load, etc.
+#[derive(Clone, Debug)]
+pub struct Info {
     pub device_ip: Option<String>,
     pub os_info: Option<OS>,
     pub hostname: Option<String>,
@@ -18,6 +27,7 @@ pub struct NodeInfo {
 /// # Description:
 ///
 /// This structure defines the client handle for a network member.
+#[derive(Clone, Debug)]
 pub struct OS {
     pub os_name: String,
     pub os_version: String,
@@ -27,6 +37,7 @@ pub struct OS {
 /// # Description:
 ///
 /// Holds general CPU informations.
+#[derive(Clone, Debug)]
 pub struct Cpu {
     /// CPU vendor string, for example *GenuineIntel*.
     pub vendor: Option<String>,
@@ -67,7 +78,7 @@ pub struct Cpu {
     pub l3_cache: Option<i32>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug)]
 pub struct Load {
     /// Average load within one minute.
     pub one: f64,
@@ -77,6 +88,7 @@ pub struct Load {
     pub fifteen: f64,
 }
 
+#[derive(Clone, Debug)]
 pub struct Memory {
     pub total: u64,
     pub free: u64,
@@ -88,6 +100,7 @@ pub struct Memory {
     pub swap_free: u64,
 }
 
+#[derive(Clone, Debug)]
 pub struct Disk {
     pub total: u64,
     pub free: u64,
@@ -106,15 +119,18 @@ impl NodeInfo {
 
     pub fn new() -> Self {
         let sys = System::new_all();
+
         NodeInfo {
             sys,
-            device_ip: None,
-            load_info: None,
-            mem_info: None,
-            disk_info: None,
-            os_info: None,
-            hostname: None,
-            cpu_info: None,
+            info: Info {
+                device_ip: None,
+                load_info: None,
+                mem_info: None,
+                disk_info: None,
+                os_info: None,
+                hostname: None,
+                cpu_info: None,
+            },
         }
     }
 
@@ -136,7 +152,7 @@ impl NodeInfo {
     pub fn get_load_avg(&mut self) {
         // static method returning the 1/5/15-minute load averages
         let avg = System::load_average();
-        self.load_info = Some(Load {
+        self.info.load_info = Some(Load {
             one: avg.one,
             five: avg.five,
             fifteen: avg.fifteen,
@@ -152,7 +168,7 @@ impl NodeInfo {
         let swap_used = self.sys.used_swap();
         let swap_free = self.sys.free_swap();
 
-        self.mem_info = Some(Memory {
+        self.info.mem_info = Some(Memory {
             total,
             free,
             available,
@@ -173,7 +189,7 @@ impl NodeInfo {
             free += disk.available_space();
         }
 
-        self.disk_info = Some(Disk { total, free });
+        self.info.disk_info = Some(Disk { total, free });
     }
 
     pub fn get_os_info(&mut self) {
@@ -181,7 +197,7 @@ impl NodeInfo {
         let os_version = System::os_version().unwrap_or(String::from("Unknown"));
         let kernel_version = System::kernel_version().unwrap_or(String::from("Unknown"));
 
-        self.os_info = Some(OS {
+        self.info.os_info = Some(OS {
             os_name,
             os_version,
             kernel_version,
@@ -206,54 +222,29 @@ impl NodeInfo {
     /// }
     /// ```
     pub fn get_cpu_info(&mut self) {
-        if !::cpuid::is_present() {
-            println!("libcpuid is not installed on the machine, cannot collet cpu specs..");
-            self.cpu_info = None;
-            return;
-        } else {
-            let mut sys = System::new_with_specifics(
-                RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
-            );
+        let mut sys = System::new_with_specifics(
+            RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
+        );
 
-            sys.refresh_cpu_all();
+        sys.refresh_cpu_all();
 
-            let cpus = sys.cpus();
-            let model = cpus.first().map(|cpu| cpu.brand().to_string()).unwrap();
-            let logical: i32 = cpus.len() as i32;
-            let physical: i32 = System::physical_core_count().unwrap_or(cpus.len()) as i32;
+        let cpus = sys.cpus();
+        let model = cpus.first().map(|cpu| cpu.brand().to_string()).unwrap();
+        let logical: i32 = cpus.len() as i32;
+        let physical: i32 = System::physical_core_count().unwrap_or(cpus.len()) as i32;
 
-            self.cpu_info = Some(Cpu {
-                vendor: None,
-                brand: Some(model),
-                codename: None,
-                frequency: None,
-                num_cores: physical,
-                num_logical_cpus: logical,
-                total_logical_cpus: Some(logical),
-                l1_data_cache: None,
-                l1_instruction_cache: None,
-                l2_cache: None,
-                l3_cache: None,
-            })
-        }
-
-        match ::cpuid::identify() {
-            Ok(info) => {
-                self.cpu_info = Some(Cpu {
-                    vendor: Some(info.vendor),
-                    brand: Some(info.brand),
-                    codename: Some(info.codename),
-                    frequency: Some(self.get_cpu_frequency()),
-                    num_cores: info.num_cores,
-                    num_logical_cpus: info.num_logical_cpus,
-                    total_logical_cpus: Some(info.total_logical_cpus),
-                    l1_data_cache: info.l1_data_cache,
-                    l1_instruction_cache: info.l1_instruction_cache,
-                    l2_cache: info.l2_cache,
-                    l3_cache: info.l3_cache,
-                })
-            }
-            Err(_) => self.cpu_info = None,
-        }
+        self.info.cpu_info = Some(Cpu {
+            vendor: None,
+            brand: Some(model),
+            codename: None,
+            frequency: None,
+            num_cores: physical,
+            num_logical_cpus: logical,
+            total_logical_cpus: Some(logical),
+            l1_data_cache: None,
+            l1_instruction_cache: None,
+            l2_cache: None,
+            l3_cache: None,
+        })
     }
 }
