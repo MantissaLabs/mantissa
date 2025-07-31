@@ -92,6 +92,7 @@ pub fn init() -> Command {
                         .arg(
                             Arg::new("cluster")
                                 .help("the cluster to list nodes from")
+                                .default_missing_value("")
                                 .index(1),
                         ),
                 ),

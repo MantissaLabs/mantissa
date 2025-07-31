@@ -141,6 +141,7 @@ impl topology::Server for TopologyRPC {
         _params: topology::ListParams,
         mut results: topology::ListResults,
     ) -> Promise<(), Error> {
+        println!("Listing nodes...");
         Promise::ok(())
     }
 }

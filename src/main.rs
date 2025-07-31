@@ -63,6 +63,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             client::node::info(&anchor).await?;
         }
 
+        Some(("nodes", nodes_matches)) => match nodes_matches.subcommand() {
+            Some(("list", list_matches)) => {
+                let cluster: &str = list_matches
+                    .get_one::<String>("cluster")
+                    .map(String::as_str)
+                    .unwrap_or("");
+
+                client::node::list(&anchor, &cluster).await?;
+            }
+            _ => {
+                let _ = nodes_matches.subcommand_name();
+            }
+        },
+
         Some(("submit", _)) => {
             workload::task::submit().await?;
         }
