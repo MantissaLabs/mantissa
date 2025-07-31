@@ -5,7 +5,10 @@ using Server = import "server.capnp";
 using Info = import "info.capnp";
 
 interface Membership {
-  yield @0 () -> ();
+  sync @0 () -> (state: ClusterState);
+  # Used by new members to synchronize with cluster state.
+
+  yield @1 () -> ();
   # Yields the membership.
 }
 
@@ -40,6 +43,10 @@ struct TopologyEvent {
       remove @1;
       suspect @2;
   }
+}
+
+struct ClusterState {
+  # TODO: Define what is in this struct
 }
 
 struct NodeInfo {

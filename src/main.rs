@@ -55,7 +55,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match matches.subcommand() {
         Some(("init", _)) => {
-            // TODO: Initialize DB when starting server.
             server::start(listen).await;
         }
 
@@ -82,63 +81,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Some(("link", _)) => {
-            // Initialize database.
-            let home_dir = dirs::home_dir().ok_or("Unable to determine home directory.")?;
-            let db = init_database(home_dir)?;
+            // TODO: Start this in the background.
+            server::start(listen).await;
 
-            // Creating an MVReg and store a value in there.
-            let mut mvreg = HashableMVReg::new();
-            mvreg.write("Hello, CRDT!".to_string(), 0);
-            mvreg.write("Hey, yo!".to_string(), 1);
-
-            // MerkleSearchTree only stores the hash of the value given. It must then be stored
-            // independently into a chosen method for key/value storage.
-            let builder = Builder::default();
-
-            let builder_with_hasher = builder.with_hasher(hash::XXHash128::new());
-
-            let mut tree: MerkleSearchTree<String, _, hash::XXHash128> =
-                builder_with_hasher.build();
-
-            let key = "my_key".to_string();
-
-            tree.upsert(key.clone(), &mvreg);
-
-            println!("root hash: {}", tree.root_hash().to_string());
-
-            let keys = tree
-                .node_iter()
-                .map(|v| v.key().to_string())
-                .collect::<Vec<_>>();
-
-            println!("{:?}", keys.as_slice());
-
-            // The Merkle Search Tree construct embeds multiple other CRDTs, for example an MVReg,
-            // or a LWW Register to track causality.
+            // Link afterwards
+            // client::node::link(&anchor).await?;
             //
-
-            let serialized_mvreg = serialize(&mvreg)?;
-
-            // Here, the values could be stored into redb along with their keys. The MerkleSearchTree
-            // is only but a representation to compute hash and diffs for efficient state propagation.
-            let write_txn = db.begin_write()?;
-            {
-                let mut table = write_txn.open_table(REGISTERS)?;
-                table.insert("my_key", serialized_mvreg.as_slice())?;
-            }
-            write_txn.commit()?;
-
-            // Confirm that the key is stored within Redb
-            let read_txn = db.begin_read()?;
-            let table = read_txn.open_table(REGISTERS)?;
-
-            if let Some(serialized_data) = table.get("my_key")? {
-                let deserialized_mvreg: HashableMVReg<String, i32> =
-                    deserialize(&serialized_data.value())?;
-
-                println!("{:?}", deserialized_mvreg);
-            }
+            // Open question: Should this be done in server::start()?
         }
+
         _ => unreachable!(),
     };
 
@@ -157,4 +108,63 @@ fn init_database(base_path: PathBuf) -> Result<Database> {
         .with_context(|| format!("Failed to create database at {:?}", db_path))?;
 
     Ok(db)
+}
+
+fn test_merkle_tree() -> Result<(), Box<dyn Error>> {
+    // Initialize database.
+    let home_dir = dirs::home_dir().ok_or("Unable to determine home directory.")?;
+    let db = init_database(home_dir)?;
+
+    // Creating an MVReg and store a value in there.
+    let mut mvreg = HashableMVReg::new();
+    mvreg.write("Hello, CRDT!".to_string(), 0);
+    mvreg.write("Hey, yo!".to_string(), 1);
+
+    // MerkleSearchTree only stores the hash of the value given. It must then be stored
+    // independently into a chosen method for key/value storage.
+    let builder = Builder::default();
+
+    let builder_with_hasher = builder.with_hasher(hash::XXHash128::new());
+
+    let mut tree: MerkleSearchTree<String, _, hash::XXHash128> = builder_with_hasher.build();
+
+    let key = "my_key".to_string();
+
+    tree.upsert(key.clone(), &mvreg);
+
+    println!("root hash: {}", tree.root_hash().to_string());
+
+    let keys = tree
+        .node_iter()
+        .map(|v| v.key().to_string())
+        .collect::<Vec<_>>();
+
+    println!("{:?}", keys.as_slice());
+
+    // The Merkle Search Tree construct embeds multiple other CRDTs, for example an MVReg,
+    // or a LWW Register to track causality.
+    //
+
+    let serialized_mvreg = serialize(&mvreg)?;
+
+    // Here, the values could be stored into redb along with their keys. The MerkleSearchTree
+    // is only but a representation to compute hash and diffs for efficient state propagation.
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(REGISTERS)?;
+        table.insert("my_key", serialized_mvreg.as_slice())?;
+    }
+    write_txn.commit()?;
+
+    // Confirm that the key is stored within Redb
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(REGISTERS)?;
+
+    if let Some(serialized_data) = table.get("my_key")? {
+        let deserialized_mvreg: HashableMVReg<String, i32> = deserialize(&serialized_data.value())?;
+
+        println!("{:?}", deserialized_mvreg);
+    }
+
+    Ok(())
 }
