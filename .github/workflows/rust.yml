@@ -18,7 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
-      - name: Install capnproto
-        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Install Cap’n Proto
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto libcapnp-dev
       - run: cargo build --verbose
       - run: cargo test --verbose
