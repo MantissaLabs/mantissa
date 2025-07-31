@@ -4,19 +4,19 @@ using Scheduling = import "scheduling.capnp";
 using Server = import "server.capnp";
 using Info = import "info.capnp";
 
-interface Membership {
-  sync @0 () -> (state: ClusterState);
-  # Used by new members to synchronize with cluster state.
+interface ClusterSync {
+  write @0 (chunk :Data) -> stream;
+  # Writes a chunk of bytes.
 
-  yield @1 () -> ();
-  # Yields the membership.
+  end @1 ();
+  # Indicates that no more chunks will be written.
 }
 
 interface Topology {
   # Topology defines operations to join or leave a
   # pool of servers.
 
-  join @0 (node :NodeInfo) -> (membership :Membership);
+  join @0 (node :NodeInfo) -> (sync :ClusterSync);
   # Join an existing pool of servers.
 
   leave @1 () -> ();
