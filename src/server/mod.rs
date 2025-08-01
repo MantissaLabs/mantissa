@@ -167,16 +167,12 @@ pub async fn start(addr: String) {
 
     // Start gossip loop.
     local.spawn_local(async move {
-        tokio::task::spawn_local(async move {
-            gossip::start(gossip_rx, peers).await;
-        });
+        gossip::start(gossip_rx, peers).await;
     });
 
     // Start topology management component.
     local.spawn_local(async move {
-        tokio::task::spawn_local(async move {
-            topology.run().await;
-        });
+        topology.run().await;
     });
 
     // Start server.
