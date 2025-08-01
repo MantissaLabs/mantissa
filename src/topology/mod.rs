@@ -1,20 +1,21 @@
+use std::sync::{Arc, RwLock};
+
 use crate::gossip_capnp::gossip::Client as GossipClient;
 use crate::gossip_capnp::gossip_message;
 use crate::server_capnp::server;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::{Receiver, Sender};
 use capnp::{capability::Promise, Error};
-use capnp_rpc::pry;
-use snow::params;
 
 pub struct TopologyRPC {
     pub tx: Sender<TopologyEvent>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Topology {
     rx: Receiver<TopologyEvent>,
     known_nodes: std::collections::HashMap<u64, String>,
+    peers: Arc<RwLock<Vec<PeerHandle>>>,
 }
 
 pub struct PeerHandle {
@@ -47,11 +48,12 @@ impl Topology {
         Self {
             rx,
             known_nodes: std::collections::HashMap::new(),
+            peers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
     // The run loop receives incoming events from TopologyRPC, since Capnproto doesn't
-    // allow clients to be send/sync, we have to make that separation.
+    // allow clients to be send+sync, we have to make that separation.
     pub async fn run(&mut self) {
         loop {
             match self.rx.recv().await {
