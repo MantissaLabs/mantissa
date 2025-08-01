@@ -18,7 +18,8 @@ mod topology;
 mod types;
 mod workload;
 
-use anyhow::{Context, Result};
+use crate::hash_mvreg::HashableMVReg;
+use anyhow::Result;
 use bincode::{deserialize, serialize};
 use includes::{
     gossip_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, topology_capnp,
@@ -31,8 +32,6 @@ use redb::{Database, TableDefinition};
 use std::error::Error;
 use std::path::PathBuf;
 use tokio::task::LocalSet;
-
-use crate::hash_mvreg::HashableMVReg;
 
 const REGISTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("registers");
 
@@ -100,24 +99,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn init_database(base_path: PathBuf) -> Result<Database> {
-    let mut db_path = base_path;
-    db_path.push(".mantissa");
-
-    std::fs::create_dir_all(&db_path).context("Failed to create .mantissa directory")?;
-
-    db_path.push("mantissa.redb");
-
-    let db = Database::create(&db_path)
-        .with_context(|| format!("Failed to create database at {:?}", db_path))?;
-
-    Ok(db)
-}
-
 fn test_merkle_tree() -> Result<(), Box<dyn Error>> {
     // Initialize database.
     let home_dir = dirs::home_dir().ok_or("Unable to determine home directory.")?;
-    let db = init_database(home_dir)?;
+    let db = store::db::init_database(home_dir)?;
 
     // Creating an MVReg and store a value in there.
     let mut mvreg = HashableMVReg::new();
@@ -155,14 +140,14 @@ fn test_merkle_tree() -> Result<(), Box<dyn Error>> {
     // is only but a representation to compute hash and diffs for efficient state propagation.
     let write_txn = db.begin_write()?;
     {
-        let mut table = write_txn.open_table(REGISTERS)?;
+        let mut table = write_txn.open_table(store::db::REGISTERS)?;
         table.insert("my_key", serialized_mvreg.as_slice())?;
     }
     write_txn.commit()?;
 
     // Confirm that the key is stored within Redb
     let read_txn = db.begin_read()?;
-    let table = read_txn.open_table(REGISTERS)?;
+    let table = read_txn.open_table(store::db::REGISTERS)?;
 
     if let Some(serialized_data) = table.get("my_key")? {
         let deserialized_mvreg: HashableMVReg<String, i32> = deserialize(&serialized_data.value())?;
