@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Some(("info", _)) => {
-            client::node::info(&anchor).await?;
+            local.run_until(client::node::info(&anchor)).await?;
         }
 
         Some(("nodes", nodes_matches)) => match nodes_matches.subcommand() {
@@ -72,7 +72,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .map(String::as_str)
                     .unwrap_or("");
 
-                client::node::list(&anchor, &cluster).await?;
+                local
+                    .run_until(client::node::list(&anchor, &cluster))
+                    .await?;
             }
             _ => {
                 let _ = nodes_matches.subcommand_name();

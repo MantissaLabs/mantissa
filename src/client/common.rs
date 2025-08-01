@@ -3,6 +3,9 @@ use anyhow::Error;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::AsyncReadExt;
 
+// Used to get a client connection with Capn'proto.
+// At the moment, any method using `get_client` *needs* to be run in a tokio task,
+// otherwise this will panic.
 pub async fn get_client(server: &str) -> Result<Client, Error> {
     use std::net::ToSocketAddrs;
 
