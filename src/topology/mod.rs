@@ -50,6 +50,8 @@ impl Topology {
         }
     }
 
+    // The run loop receives incoming events from TopologyRPC, since Capnproto doesn't
+    // allow clients to be send/sync, we have to make that separation.
     pub async fn run(&mut self) {
         loop {
             match self.rx.recv().await {

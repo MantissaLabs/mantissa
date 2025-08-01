@@ -19,7 +19,14 @@ pub struct ServerImpl {
     pub gossip_client: GossipClient,
     pub topology_client: TopologyClient,
     pub node_client: NodeClient,
-    addr: String,
+    config: Config,
+}
+
+// TODO: Fill config with anchor nodes and other bootstraping information.
+#[derive(Clone)]
+pub struct Config {
+    listen_addr: String,
+    anchors: Vec<String>,
 }
 
 impl server::Server for ServerImpl {
@@ -92,15 +99,18 @@ impl ServerImpl {
             gossip_client,
             topology_client,
             node_client,
-            addr: addr.into(),
+            config: Config {
+                listen_addr: addr.into(),
+                anchors: Vec::new(),
+            },
         }
     }
 
     /// Starts the server, bootstrapping all necessary sub-components
-    pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
-        let listener = tokio::net::TcpListener::bind(&self.addr).await?;
+    pub async fn start_rpc(self) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind(&self.config.listen_addr).await?;
 
-        println!("Server listening on {}", &self.addr);
+        println!("Server listening on {}", &self.config.listen_addr);
 
         let server_handle: server::Client = capnp_rpc::new_client(self);
 
@@ -172,7 +182,7 @@ pub async fn start(addr: String) {
     // Start server.
     local.spawn_local(async move {
         let server = ServerImpl::new(gossip_client, topology_client, node_client, addr);
-        if let Err(e) = server.start().await {
+        if let Err(e) = server.start_rpc().await {
             eprintln!("server error: {}", e);
         }
     });
