@@ -138,8 +138,6 @@ impl ServerImpl {
 
 // Start the server and other components like gossip, scheduler, and topology.
 pub async fn start(addr: String) {
-    let local = LocalSet::new();
-
     let mut node = node::Node::new();
     node.collect_system_info();
     let node_client = capnp_rpc::new_client(node);
@@ -166,23 +164,18 @@ pub async fn start(addr: String) {
     let topology_client = capnp_rpc::new_client(topology_rpc);
 
     // Start gossip loop.
-    local.spawn_local(async move {
+    tokio::task::spawn_local(async move {
         gossip::start(gossip_rx, peers).await;
     });
 
     // Start topology management component.
-    local.spawn_local(async move {
+    tokio::task::spawn_local(async move {
         topology.run().await;
     });
 
     // Start server.
-    local.spawn_local(async move {
-        let server = ServerImpl::new(gossip_client, topology_client, node_client, addr);
-        if let Err(e) = server.start_rpc().await {
-            eprintln!("server error: {}", e);
-        }
-    });
-
-    // FIXME: Don't run indefinitely, create stop conditions.
-    local.run_until(std::future::pending::<()>()).await;
+    let server = ServerImpl::new(gossip_client, topology_client, node_client, addr);
+    if let Err(e) = server.start_rpc().await {
+        eprintln!("server error: {}", e);
+    }
 }

@@ -30,6 +30,7 @@ use merkle_search_tree::MerkleSearchTree;
 use redb::{Database, TableDefinition};
 use std::error::Error;
 use std::path::PathBuf;
+use tokio::task::LocalSet;
 
 use crate::hash_mvreg::HashableMVReg;
 
@@ -40,6 +41,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     log::set_logger(&logger::LOGGER)
         .map(|()| log::set_max_level(LevelFilter::Info))
         .unwrap();
+
+    let local = LocalSet::new();
 
     let matches = cli::init().get_matches();
 
@@ -55,7 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match matches.subcommand() {
         Some(("init", _)) => {
-            server::start(listen).await;
+            local.run_until(server::start(listen)).await;
         }
 
         Some(("info", _)) => {
@@ -81,8 +84,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Some(("link", _)) => {
-            // TODO: Start this in the background.
-            server::start(listen).await;
+            local.run_until(server::start(listen)).await;
 
             // Link afterwards
             // client::node::link(&anchor).await?;
