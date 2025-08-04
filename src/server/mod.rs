@@ -5,20 +5,19 @@ use crate::gossip_capnp::gossip::Client as GossipClient;
 use crate::node::node;
 use crate::node_capnp::node::Client as NodeClient;
 use crate::server_capnp::server;
-use crate::topology::PeerHandle;
+use crate::topology;
+use crate::topology::{PeerHandle, Topology};
 use crate::topology_capnp::topology::Client as TopologyClient;
-use crate::{gossip::Gossip, topology};
 use capnp::capability::Promise;
 use capnp::Error;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::{AsyncReadExt, FutureExt};
-use tokio::task::LocalSet;
 
-#[derive(Clone)]
 pub struct ServerImpl {
     pub gossip_client: GossipClient,
     pub topology_client: TopologyClient,
     pub node_client: NodeClient,
+
     config: Config,
 }
 

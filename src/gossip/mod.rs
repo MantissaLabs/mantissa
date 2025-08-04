@@ -9,11 +9,14 @@ use crate::gossip_capnp::gossip;
 use crate::gossip_capnp::gossip_message::Which::*;
 use crate::gossip_capnp::message_list as ActionList;
 use crate::topology;
+use crate::topology::peer_provider::PeerProvider;
 use crate::topology::TopologyEvent;
 use async_channel::{Receiver, Sender};
 use capnp::capability::Promise;
 use capnp::message::Builder;
 use capnp::Error;
+use rand::rng;
+use rand::seq::IndexedRandom;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -114,4 +117,13 @@ async fn send_gossip(messages: &[Message], peer: &PeerHandle) -> Result<(), capn
     // Build gossip client using peer information or use readily available client
     // and build message to send (list of messages) via Builder.
     Ok(())
+}
+
+pub async fn fanout_sample<P>(provider: &P, fanout: usize) -> Vec<PeerHandle>
+where
+    P: PeerProvider + Send + Sync,
+{
+    let peers = provider.get_peers().await;
+    let mut rng = rng();
+    peers.choose_multiple(&mut rng, fanout).cloned().collect()
 }

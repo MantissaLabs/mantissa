@@ -16,7 +16,7 @@ interface Topology {
   # Topology defines operations to join or leave a
   # pool of servers.
 
-  join @0 (node :NodeInfo) -> (sync :ClusterSync);
+  join @0 (link :JoinRequest) -> (sync :ClusterSync);
   # Join an existing pool of servers.
 
   leave @1 () -> ();
@@ -47,6 +47,12 @@ struct TopologyEvent {
 
 struct ClusterState {
   # TODO: Define what is in this struct
+}
+
+struct JoinRequest {
+  anchor @0 :Text;
+  # IP address of the anchor node we'd like this node to join.
+  # This node could be part of an existing cluster or not.
 }
 
 struct NodeInfo {

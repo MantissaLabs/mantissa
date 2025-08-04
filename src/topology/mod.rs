@@ -1,11 +1,14 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
-use crate::gossip_capnp::gossip::Client as GossipClient;
 use crate::gossip_capnp::gossip_message;
 use crate::server_capnp::server;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::{Receiver, Sender};
 use capnp::{capability::Promise, Error};
+
+pub mod peer_provider;
+pub mod peers;
 
 pub struct TopologyRPC {
     pub tx: Sender<TopologyEvent>,
@@ -18,9 +21,13 @@ pub struct Topology {
     peers: Arc<RwLock<Vec<PeerHandle>>>,
 }
 
+#[derive(Clone)]
 pub struct PeerHandle {
+    pub id: u64,
+    pub hostname: String,
     pub address: String,
-    pub client: GossipClient,
+    pub root_hash: String,
+    pub client: server::Client,
 }
 
 /// Actions to apply to the memberlist.
@@ -67,7 +74,18 @@ impl Topology {
                             client,
                         } => {
                             println!("[Topology] Node joined: {id} at {address}");
-                            self.known_nodes.insert(id, address);
+                            self.known_nodes.insert(id, address.clone());
+
+                            let handle = PeerHandle {
+                                id,
+                                address,
+                                hostname,
+                                root_hash,
+                                client,
+                            };
+
+                            let mut guard = self.peers.write().await;
+                            guard.push(handle);
 
                             // TODO: broadcast event to other components that may be
                             // interested in the event.
@@ -103,27 +121,12 @@ impl topology::Server for TopologyRPC {
         let tx = self.tx.clone();
 
         // Send event to Topology loop.
+        // TODO: We need to do the link via the Server because it owns
+        // the Server Capnp client.
         Promise::from_future(async move {
-            let request = params.get()?.get_node()?;
+            let request = params.get()?.get_link()?;
 
-            let topology_event = TopologyEvent::NodeJoined {
-                id: request.get_id(),
-                address: request.get_addr()?.to_string()?,
-                hostname: request.get_hostname()?.to_string()?,
-                root_hash: request.get_root_hash()?.to_string()?,
-                client: request.get_handle()?,
-            };
-
-            match tx.send(topology_event).await {
-                Ok(()) => {
-                    // Successfully enqueued the event — nothing more to do.
-                }
-                Err(e) => {
-                    // The receiver has been dropped (channel closed).
-                    eprintln!("Failed to send TopologyEvent::NodeJoined: {}", e);
-                    // Deal with the error appropriately, e.g., retry or log.
-                }
-            }
+            // Send join to server which owns the Server client handle.
 
             Ok(())
         })

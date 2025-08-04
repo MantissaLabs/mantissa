@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let matches = cli::init().get_matches();
 
     let anchor: String = matches
-        .get_one::<String>("listen")
+        .get_one::<String>("anchor")
         .expect("has a default")
         .clone();
 
@@ -78,12 +78,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Some(("link", _)) => {
-            local.run_until(server::start(listen)).await;
-
-            // Link afterwards
-            // client::node::link(&anchor).await?;
-            //
-            // Open question: Should this be done in server::start()?
+            client::node::link(&listen, &anchor).await?;
         }
 
         _ => unreachable!(),
