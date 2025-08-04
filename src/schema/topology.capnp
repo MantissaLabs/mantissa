@@ -3,13 +3,17 @@
 using Scheduling = import "scheduling.capnp";
 using Server = import "server.capnp";
 using Info = import "info.capnp";
+using Sync = import "sync.capnp";
 
 interface ClusterSync {
   write @0 (chunk :Data) -> stream;
   # Writes a chunk of bytes.
+  # Reconstructs or merges the stream into the local CRDT/MST structure.
 
   end @1 ();
   # Indicates that no more chunks will be written.
+  # Once end() is received, it rehashes that subtree and re-evaluates
+  # its cluster root.
 }
 
 interface Topology {

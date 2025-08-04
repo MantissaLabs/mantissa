@@ -36,6 +36,11 @@ fn main() {
         .file("src/schema/utils.capnp")
         .run()
         .unwrap();
+    capnpc::CompilerCommand::new()
+        .src_prefix("src/schema")
+        .file("src/schema/sync.capnp")
+        .run()
+        .unwrap();
 
     // TODO: Compile BPF programs
 }

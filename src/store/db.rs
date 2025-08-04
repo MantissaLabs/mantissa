@@ -69,6 +69,8 @@ fn test_merkle_tree() -> Result<(), Box<dyn Error>> {
     }
     write_txn.commit()?;
 
+    // tree.serialise_page_ranges();
+
     // Confirm that the key is stored within Redb
     let read_txn = db.begin_read()?;
     let table = read_txn.open_table(REGISTERS)?;

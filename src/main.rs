@@ -19,8 +19,8 @@ mod types;
 mod workload;
 
 use includes::{
-    gossip_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, topology_capnp,
-    utils_capnp,
+    gossip_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
+    topology_capnp, utils_capnp,
 };
 
 use anyhow::Result;
