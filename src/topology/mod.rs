@@ -2,10 +2,13 @@ use std::rc::Rc;
 
 use tokio::sync::RwLock;
 
+use crate::client::common;
 use crate::gossip_capnp::gossip_message;
 use crate::server_capnp::server;
+use crate::topology_capnp::node_info as NodeInfo;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
+use capnp::message::Builder;
 use capnp::{capability::Promise, Error};
 
 pub mod peer_provider;
@@ -13,6 +16,7 @@ pub mod peers;
 
 #[derive(Clone)]
 pub struct Topology {
+    addr: String,
     rx: Receiver<TopologyEvent>,
     known_nodes: std::collections::HashMap<u64, String>,
     peers: Rc<RwLock<Vec<PeerHandle>>>,
@@ -48,8 +52,9 @@ pub enum TopologyEvent {
 }
 
 impl Topology {
-    pub fn new(rx: Receiver<TopologyEvent>) -> Self {
+    pub fn new(addr: String, rx: Receiver<TopologyEvent>) -> Self {
         Self {
+            addr,
             rx,
             known_nodes: std::collections::HashMap::new(),
             peers: Rc::new(RwLock::new(Vec::new())),
@@ -114,11 +119,40 @@ impl topology::Server for Topology {
         params: topology::JoinParams,
         mut results: topology::JoinResults,
     ) -> Promise<(), Error> {
+        let self_addr = self.addr.clone();
+
         Promise::from_future(async move {
             let request = params.get()?.get_link()?;
 
-            // if link address == own address -> return error cannot join own address
-            // else build client on link address and get_topology() then call join on it.
+            let anchor = request
+                .get_anchor()?
+                .to_string()
+                .expect("expect anchor address");
+
+            if anchor == self_addr {
+                return Err(capnp::Error::failed("cannot join own address".to_string()));
+            }
+
+            let client = common::get_client(anchor.as_str()).await.map_err(|e| {
+                capnp::Error::failed(format!("could not connect to anchor {}: {}", anchor, e))
+            })?;
+
+            let request = client.get_topology_request();
+            let topology = request.send().pipeline.get_topology();
+            let mut request = topology.register_node_request();
+
+            let mut builder = Builder::new_default();
+
+            // Build link message.
+            let mut node_info = builder.init_root::<NodeInfo::Builder>();
+            // TODO: Build node info message.
+            // node_info.set_addr(value);
+            // etc.
+
+            // TODO: Do something with the response.
+            let response = request.send().promise.await?;
+
+            println!("Request sent");
 
             // Find a way to send back a Server handle to the caller.
             //
@@ -126,6 +160,16 @@ impl topology::Server for Topology {
 
             Ok(())
         })
+    }
+
+    /// Registers a node to our memberlist.
+    fn register_node(
+        &mut self,
+        _params: topology::RegisterNodeParams,
+        mut results: topology::RegisterNodeResults,
+    ) -> Promise<(), Error> {
+        println!("Received request to register node");
+        Promise::ok(())
     }
 
     /// Leave the cluster.

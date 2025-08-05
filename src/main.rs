@@ -78,7 +78,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Some(("link", _)) => {
-            client::node::link(&listen, &anchor).await?;
+            local
+                .run_until(client::node::link(&listen, &anchor))
+                .await?;
         }
 
         _ => unreachable!(),

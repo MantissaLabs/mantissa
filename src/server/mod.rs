@@ -189,7 +189,7 @@ pub async fn start(addr: String) {
     let gossip_client = capnp_rpc::new_client(gossip);
 
     // Build topology object and RPC client.
-    let mut topology = topology::Topology::new(topology_rx);
+    let mut topology = topology::Topology::new(addr.clone(), topology_rx);
     let topology_client = capnp_rpc::new_client(topology.clone());
 
     // Start gossip loop.

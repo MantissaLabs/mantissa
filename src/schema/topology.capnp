@@ -9,13 +9,18 @@ interface Topology {
   # Topology defines operations to join or leave a
   # pool of servers.
 
-  join @0 (link :JoinRequest) -> (sync :Sync.Sync);
-  # Join an existing pool of servers.
+  join @0 (link :JoinRequest) -> ();
+  # Join an existing pool of servers using an anchor address.
+  # This method signals the intent to join. The next step is
+  # to register the node.
 
-  leave @1 () -> ();
+  registerNode @1 (info :NodeInfo) -> (sync :Sync.Sync);
+  # Register the node to a remote server.
+
+  leave @2 () -> ();
   # Leave the pool.
 
-  list @2 () -> (nodes :NodeList);
+  list @3 () -> (nodes :NodeList);
   # List machines in the cluster.
 }
 
