@@ -6,7 +6,7 @@ use crate::node::node;
 use crate::node_capnp::node::Client as NodeClient;
 use crate::server_capnp::server;
 use crate::topology;
-use crate::topology::{PeerHandle, Topology};
+use crate::topology::PeerHandle;
 use crate::topology_capnp::topology::Client as TopologyClient;
 use capnp::capability::Promise;
 use capnp::Error;

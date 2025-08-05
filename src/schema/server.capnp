@@ -19,4 +19,5 @@ interface Server {
 struct Capabilities {
   gossip @0 :Gossip.Gossip;
   topology @1 :Topology.Topology;
+  node @2 :Node.Node;
 }

@@ -12,17 +12,15 @@ pub async fn link(server_address: &str, join_address: &str) -> Result<(), Box<dy
 
     let mut builder = Builder::new_default();
 
-    {
-        let builder = &mut builder;
-        let mut link = builder.init_root::<JoinRequest::Builder>();
-
-        link.set_anchor(join_address);
-    }
+    // Build link message.
+    let mut link = builder.init_root::<JoinRequest::Builder>();
+    link.set_anchor(join_address);
 
     let _ = request
         .get()
         .set_link(builder.get_root::<JoinRequest::Builder>()?.into_reader());
 
+    // TODO: Do something with the response.
     let response = request.send().promise.await?;
 
     // TODO: Synchronize with ClusterSync interface?
