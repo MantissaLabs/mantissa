@@ -188,13 +188,9 @@ pub async fn start(addr: String) {
     };
     let gossip_client = capnp_rpc::new_client(gossip);
 
-    // Our regular Topology
+    // Build topology object and RPC client.
     let mut topology = topology::Topology::new(topology_rx);
-
-    let topology_rpc = topology::TopologyRPC {
-        tx: topology_tx.clone(),
-    };
-    let topology_client = capnp_rpc::new_client(topology_rpc);
+    let topology_client = capnp_rpc::new_client(topology.clone());
 
     // Start gossip loop.
     tokio::task::spawn_local(async move {

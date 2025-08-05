@@ -1,24 +1,21 @@
-use std::sync::Arc;
+use std::rc::Rc;
+
 use tokio::sync::RwLock;
 
 use crate::gossip_capnp::gossip_message;
 use crate::server_capnp::server;
 use crate::topology_capnp::{topology, topology_event};
-use async_channel::{Receiver, Sender};
+use async_channel::Receiver;
 use capnp::{capability::Promise, Error};
 
 pub mod peer_provider;
 pub mod peers;
 
-pub struct TopologyRPC {
-    pub tx: Sender<TopologyEvent>,
-}
-
 #[derive(Clone)]
 pub struct Topology {
     rx: Receiver<TopologyEvent>,
     known_nodes: std::collections::HashMap<u64, String>,
-    peers: Arc<RwLock<Vec<PeerHandle>>>,
+    peers: Rc<RwLock<Vec<PeerHandle>>>,
 }
 
 #[derive(Clone)]
@@ -55,12 +52,11 @@ impl Topology {
         Self {
             rx,
             known_nodes: std::collections::HashMap::new(),
-            peers: Arc::new(RwLock::new(Vec::new())),
+            peers: Rc::new(RwLock::new(Vec::new())),
         }
     }
 
-    // The run loop receives incoming events from TopologyRPC, since Capnproto doesn't
-    // allow clients to be send+sync, we have to make that separation.
+    // The run loop receives incoming events from Gossip.
     pub async fn run(&mut self) {
         loop {
             match self.rx.recv().await {
@@ -109,7 +105,7 @@ impl Topology {
     }
 }
 
-impl topology::Server for TopologyRPC {
+impl topology::Server for Topology {
     /// Join the cluster and adds our client handle to the `Memberlist`
     /// Returns an instance of `Membership` to the caller to track its
     /// status.
@@ -118,15 +114,15 @@ impl topology::Server for TopologyRPC {
         params: topology::JoinParams,
         mut results: topology::JoinResults,
     ) -> Promise<(), Error> {
-        let tx = self.tx.clone();
-
-        // Send event to Topology loop.
-        // TODO: We need to do the link via the Server because it owns
-        // the Server Capnp client.
         Promise::from_future(async move {
             let request = params.get()?.get_link()?;
 
-            // Send join to server which owns the Server client handle.
+            // if link address == own address -> return error cannot join own address
+            // else build client on link address and get_topology() then call join on it.
+
+            // Find a way to send back a Server handle to the caller.
+            //
+            // Once we have received a successful response -> send handle to the sync component.
 
             Ok(())
         })
