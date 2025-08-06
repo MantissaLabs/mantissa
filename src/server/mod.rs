@@ -189,8 +189,20 @@ pub async fn start(addr: String) {
     let gossip_client = capnp_rpc::new_client(gossip);
 
     // Build topology object and RPC client.
-    let mut topology = topology::Topology::new(addr.clone(), topology_rx);
-    let topology_client = capnp_rpc::new_client(topology.clone());
+    let raw_topology = topology::Topology::new(addr.clone(), topology_rx);
+    let topology_client: TopologyClient = capnp_rpc::new_client(raw_topology.clone());
+
+    let server = ServerImpl::new()
+        .with_gossip(gossip_client)
+        .with_topology(topology_client.clone())
+        .with_node(node_client)
+        .with_config(Config::new().with_listen_addr(addr.clone()).build())
+        .build();
+
+    let server_client: ServerClient = capnp_rpc::new_client(server.clone());
+
+    raw_topology.set_server_handle(server_client.clone());
+    let mut topology = raw_topology.clone();
 
     // Start gossip loop.
     tokio::task::spawn_local(async move {
@@ -201,13 +213,6 @@ pub async fn start(addr: String) {
     tokio::task::spawn_local(async move {
         topology.run().await;
     });
-
-    let server = ServerImpl::new()
-        .with_gossip(gossip_client)
-        .with_topology(topology_client)
-        .with_node(node_client)
-        .with_config(Config::new().with_listen_addr(addr).build())
-        .build();
 
     if let Err(e) = server.start_rpc().await {
         eprintln!("server error: {}", e);

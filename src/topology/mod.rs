@@ -1,14 +1,14 @@
 use crate::client::common;
 use crate::gossip_capnp::gossip_message;
 use crate::server_capnp::server;
-use crate::topology_capnp::node_info as NodeInfo;
+use crate::server_capnp::server::Client as ServerClient;
 use crate::topology_capnp::node_list as NodeList;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
-use capnp::message::Builder;
 use capnp::{capability::Promise, Error};
 use log::info;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::RwLock;
 
 pub mod peer_provider;
@@ -19,6 +19,7 @@ pub struct Topology {
     addr: String,
     rx: Receiver<TopologyEvent>,
     peers: Arc<RwLock<Vec<PeerHandle>>>,
+    server_handle: Arc<Mutex<Option<ServerClient>>>,
 }
 
 #[derive(Clone)]
@@ -56,7 +57,18 @@ impl Topology {
             addr,
             rx,
             peers: Arc::new(RwLock::new(Vec::new())),
+            server_handle: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn set_server_handle(&self, handle: ServerClient) {
+        let mut guard = self.server_handle.lock().unwrap();
+        *guard = Some(handle);
+    }
+
+    pub fn get_server_handle(&self) -> Option<ServerClient> {
+        let guard = self.server_handle.lock().unwrap();
+        guard.clone()
     }
 
     // The run loop receives incoming events from Gossip.
@@ -117,6 +129,12 @@ impl topology::Server for Topology {
     ) -> Promise<(), Error> {
         let self_addr = self.addr.clone();
 
+        let handle = self.get_server_handle();
+        if handle.is_none() {
+            return Promise::err(capnp::Error::failed("server handle not set".into()));
+        }
+        let server_handle = handle.unwrap();
+
         Promise::from_future(async move {
             let request = params.get()?.get_link()?;
 
@@ -137,22 +155,17 @@ impl topology::Server for Topology {
             let topology = request.send().pipeline.get_topology();
             let mut request = topology.register_node_request();
 
-            let mut builder = Builder::new_default();
-
-            // Build link message.
-            let mut node_info = builder.init_root::<NodeInfo::Builder>();
-            // TODO: Build node info message.
-            // node_info.set_addr(value);
-            // etc.
+            // Build info message.
+            let mut info = request.get().init_info();
+            info.set_id(13132431); // Placeholder ID
+            info.set_hostname("mantissa"); // Placeholder hostname
+            info.set_addr("127.0.0.1:6578"); // Placeholder address
+            info.set_handle(server_handle);
 
             // TODO: Do something with the response.
             let response = request.send().promise.await?;
 
             println!("Request sent");
-
-            // Find a way to send back a Server handle to the caller.
-            //
-            // Once we have received a successful response -> send handle to the sync component.
 
             Ok(())
         })
@@ -223,10 +236,9 @@ impl topology::Server for Topology {
         Promise::from_future(async move {
             let guard = peers.read().await;
 
-            let mut message = capnp::message::Builder::new_default();
-            let list: NodeList::Builder = message.init_root();
+            let list_builder = results.get().init_nodes();
 
-            let mut node_list = list.init_nodes(guard.len() as u32);
+            let mut node_list = list_builder.init_nodes(guard.len() as u32);
 
             for (i, peer) in guard.iter().enumerate() {
                 let mut node = node_list.reborrow().get(i as u32);
@@ -237,10 +249,6 @@ impl topology::Server for Topology {
                 node.set_root_hash(&peer.root_hash);
                 node.set_handle(peer.client.clone());
             }
-
-            let _ = results
-                .get()
-                .set_nodes(message.get_root::<NodeList::Builder>()?.into_reader());
 
             Ok(())
         })
