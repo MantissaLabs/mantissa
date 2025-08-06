@@ -9,7 +9,6 @@ use log::info;
 use std::cell::OnceCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::Mutex;
 use tokio::sync::RwLock;
 
 pub mod peer_provider;
