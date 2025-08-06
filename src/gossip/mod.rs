@@ -13,7 +13,6 @@ use crate::topology::peer_provider::PeerProvider;
 use crate::topology::TopologyEvent;
 use async_channel::{Receiver, Sender};
 use capnp::capability::Promise;
-use capnp::message::Builder;
 use capnp::Error;
 use rand::rng;
 use rand::seq::IndexedRandom;

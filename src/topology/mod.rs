@@ -2,7 +2,6 @@ use crate::client::common;
 use crate::gossip_capnp::gossip_message;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
-use crate::topology_capnp::node_list as NodeList;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
 use capnp::{capability::Promise, Error};
@@ -16,9 +15,17 @@ pub mod peers;
 
 #[derive(Clone)]
 pub struct Topology {
+    // Address of the node.
+    // FIXME: To be replaced with full NodeInfo struct.
     addr: String,
+
+    // Node event receiver, from gossiping or other components.
     rx: Receiver<TopologyEvent>,
+
+    // The list of peers in our topology.
     peers: Arc<RwLock<Vec<PeerHandle>>>,
+
+    // The capability handle for the server. To be sent to peers.
     server_handle: Arc<Mutex<Option<ServerClient>>>,
 }
 
@@ -62,13 +69,13 @@ impl Topology {
     }
 
     pub fn set_server_handle(&self, handle: ServerClient) {
-        let mut guard = self.server_handle.lock().unwrap();
-        *guard = Some(handle);
+        let mut server_handle = self.server_handle.lock().unwrap();
+        *server_handle = Some(handle);
     }
 
     pub fn get_server_handle(&self) -> Option<ServerClient> {
-        let guard = self.server_handle.lock().unwrap();
-        guard.clone()
+        let server_handle = self.server_handle.lock().unwrap();
+        server_handle.clone()
     }
 
     // The run loop receives incoming events from Gossip.
@@ -94,8 +101,8 @@ impl Topology {
                                 client,
                             };
 
-                            let mut guard = self.peers.write().await;
-                            guard.push(handle);
+                            let mut peers = self.peers.write().await;
+                            peers.push(handle);
 
                             // TODO: broadcast event to other components that may be
                             // interested in the event.
@@ -125,7 +132,7 @@ impl topology::Server for Topology {
     fn join(
         &mut self,
         params: topology::JoinParams,
-        mut results: topology::JoinResults,
+        mut _results: topology::JoinResults,
     ) -> Promise<(), Error> {
         let self_addr = self.addr.clone();
 
@@ -206,8 +213,8 @@ impl topology::Server for Topology {
                 client: handle,
             };
 
-            let mut guard = peers.write().await;
-            guard.push(handle);
+            let mut peers = peers.write().await;
+            peers.push(handle);
 
             Ok(())
         })
@@ -217,7 +224,7 @@ impl topology::Server for Topology {
     fn leave(
         &mut self,
         _params: topology::LeaveParams,
-        mut results: topology::LeaveResults,
+        mut _results: topology::LeaveResults,
     ) -> Promise<(), Error> {
         Promise::ok(())
     }
@@ -234,13 +241,13 @@ impl topology::Server for Topology {
         let peers = self.peers.clone();
 
         Promise::from_future(async move {
-            let guard = peers.read().await;
+            let peers = peers.read().await;
 
             let list_builder = results.get().init_nodes();
 
-            let mut node_list = list_builder.init_nodes(guard.len() as u32);
+            let mut node_list = list_builder.init_nodes(peers.len() as u32);
 
-            for (i, peer) in guard.iter().enumerate() {
+            for (i, peer) in peers.iter().enumerate() {
                 let mut node = node_list.reborrow().get(i as u32);
 
                 node.set_id(peer.id);
@@ -281,7 +288,7 @@ pub fn add_event(
     index: u32,
     event: &TopologyEvent,
 ) {
-    let mut msg = list.reborrow().get(index);
+    let msg = list.reborrow().get(index);
 
     match event {
         TopologyEvent::NodeJoined {
