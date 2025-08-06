@@ -6,6 +6,8 @@ use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
 use capnp::{capability::Promise, Error};
 use log::info;
+use std::cell::OnceCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::RwLock;
@@ -26,7 +28,7 @@ pub struct Topology {
     peers: Arc<RwLock<Vec<PeerHandle>>>,
 
     // The capability handle for the server. To be sent to peers.
-    server_handle: Arc<Mutex<Option<ServerClient>>>,
+    server_handle: Rc<OnceCell<ServerClient>>,
 }
 
 #[derive(Clone)]
@@ -64,18 +66,16 @@ impl Topology {
             addr,
             rx,
             peers: Arc::new(RwLock::new(Vec::new())),
-            server_handle: Arc::new(Mutex::new(None)),
+            server_handle: std::rc::Rc::new(OnceCell::new()),
         }
     }
 
-    pub fn set_server_handle(&self, handle: ServerClient) {
-        let mut server_handle = self.server_handle.lock().unwrap();
-        *server_handle = Some(handle);
+    pub fn set_server_handle(&self, handle: ServerClient) -> Result<(), ServerClient> {
+        self.server_handle.set(handle)
     }
 
     pub fn get_server_handle(&self) -> Option<ServerClient> {
-        let server_handle = self.server_handle.lock().unwrap();
-        server_handle.clone()
+        self.server_handle.get().cloned()
     }
 
     // The run loop receives incoming events from Gossip.
