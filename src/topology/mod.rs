@@ -1,15 +1,15 @@
-use std::rc::Rc;
-
-use tokio::sync::RwLock;
-
 use crate::client::common;
 use crate::gossip_capnp::gossip_message;
 use crate::server_capnp::server;
 use crate::topology_capnp::node_info as NodeInfo;
+use crate::topology_capnp::node_list as NodeList;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
 use capnp::message::Builder;
 use capnp::{capability::Promise, Error};
+use log::info;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 pub mod peer_provider;
 pub mod peers;
@@ -18,8 +18,7 @@ pub mod peers;
 pub struct Topology {
     addr: String,
     rx: Receiver<TopologyEvent>,
-    known_nodes: std::collections::HashMap<u64, String>,
-    peers: Rc<RwLock<Vec<PeerHandle>>>,
+    peers: Arc<RwLock<Vec<PeerHandle>>>,
 }
 
 #[derive(Clone)]
@@ -56,8 +55,7 @@ impl Topology {
         Self {
             addr,
             rx,
-            known_nodes: std::collections::HashMap::new(),
-            peers: Rc::new(RwLock::new(Vec::new())),
+            peers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -75,7 +73,6 @@ impl Topology {
                             client,
                         } => {
                             println!("[Topology] Node joined: {id} at {address}");
-                            self.known_nodes.insert(id, address.clone());
 
                             let handle = PeerHandle {
                                 id,
@@ -93,7 +90,6 @@ impl Topology {
                         }
                         TopologyEvent::NodeLeft { id } => {
                             println!("[Topology] Node left: {id}");
-                            self.known_nodes.remove(&id);
                         }
                         TopologyEvent::NodeSuspect { id } => {
                             println!("[Topology] Heartbeat from: {id}");
@@ -165,11 +161,43 @@ impl topology::Server for Topology {
     /// Registers a node to our memberlist.
     fn register_node(
         &mut self,
-        _params: topology::RegisterNodeParams,
-        mut results: topology::RegisterNodeResults,
+        params: topology::RegisterNodeParams,
+        mut _results: topology::RegisterNodeResults,
     ) -> Promise<(), Error> {
         println!("Received request to register node");
-        Promise::ok(())
+
+        let peers = self.peers.clone();
+
+        Promise::from_future(async move {
+            let node = params.get()?.get_info()?;
+
+            let id = node.get_id();
+            let address = node.get_addr()?.to_string().expect("expected address");
+            let hostname = node.get_hostname()?.to_string().expect("expected hostname");
+            let root_hash = node
+                .get_root_hash()?
+                .to_string()
+                .expect("expected root hash");
+            let handle = node.get_handle()?;
+
+            info!(
+                "member with address: <{:?}> attempts at joining the cluster",
+                address
+            );
+
+            let handle = PeerHandle {
+                id,
+                address,
+                hostname,
+                root_hash,
+                client: handle,
+            };
+
+            let mut guard = peers.write().await;
+            guard.push(handle);
+
+            Ok(())
+        })
     }
 
     /// Leave the cluster.
@@ -189,7 +217,33 @@ impl topology::Server for Topology {
         mut results: topology::ListResults,
     ) -> Promise<(), Error> {
         println!("Listing nodes...");
-        Promise::ok(())
+
+        let peers = self.peers.clone();
+
+        Promise::from_future(async move {
+            let guard = peers.read().await;
+
+            let mut message = capnp::message::Builder::new_default();
+            let list: NodeList::Builder = message.init_root();
+
+            let mut node_list = list.init_nodes(guard.len() as u32);
+
+            for (i, peer) in guard.iter().enumerate() {
+                let mut node = node_list.reborrow().get(i as u32);
+
+                node.set_id(peer.id);
+                node.set_addr(&peer.address);
+                node.set_hostname(&peer.hostname);
+                node.set_root_hash(&peer.root_hash);
+                node.set_handle(peer.client.clone());
+            }
+
+            let _ = results
+                .get()
+                .set_nodes(message.get_root::<NodeList::Builder>()?.into_reader());
+
+            Ok(())
+        })
     }
 }
 
