@@ -19,7 +19,7 @@ pub enum NodeState {
     JoiningCluster,
 
     // Node has joined the cluster but has not synchronized its state
-    PartiallySynchronized,
+    Synchronizing,
 
     // Node is fully synchronized and participating in the cluster
     Active,

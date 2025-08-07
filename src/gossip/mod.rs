@@ -57,33 +57,41 @@ impl gossip::Server for Gossip {
         params: gossip::GossipParams,
         _results: gossip::GossipResults,
     ) -> Promise<(), Error> {
-        let msgs = params.get().unwrap().get_messages();
+        let tx = self.chans.topology_events.clone();
 
-        for msg in msgs.unwrap().get_messages().unwrap().iter() {
-            match msg.reborrow().which().expect("failed to read variant") {
-                Void(_) => {}
-                Topology(Ok(reader)) => {
-                    if let Ok(owned) = topology::read_topology_event(reader) {
-                        self.chans.topology_events.send(owned);
-                    } else {
-                        eprintln!("Failed to convert topology event");
+        Promise::from_future(async move {
+            let msgs = params.get().unwrap().get_messages();
+
+            for msg in msgs.unwrap().get_messages().unwrap().iter() {
+                match msg.reborrow().which().expect("failed to read variant") {
+                    Void(_) => {}
+                    Topology(Ok(reader)) => {
+                        if let Ok(event) = topology::read_topology_event(reader) {
+                            // Send event to topology events channel.
+                            tx.send(event).await.map_err(|e| {
+                                capnp::Error::failed(format!(
+                                    "Couldn't sent event to topology: {e}"
+                                ))
+                            })?;
+                        } else {
+                            eprintln!("Failed to convert topology event");
+                        }
+                    }
+                    Topology(Err(e)) => {
+                        eprintln!("Error reading topology: {:?}", e);
+                    }
+                    _ => {
+                        eprintln!("Unhandled message variant");
                     }
                 }
-                Topology(Err(e)) => {
-                    eprintln!("Error reading topology: {:?}", e);
-                }
-                _ => {
-                    eprintln!("Unhandled message variant");
-                }
             }
-        }
-
-        Promise::ok(())
+            Ok(())
+        })
     }
 }
 
 // This method receives messages to gossip to neighbors in the network.
-pub async fn start(mut event_rx: Receiver<Message>, peers: Arc<Mutex<Vec<PeerHandle>>>) {
+pub async fn start(event_rx: Receiver<Message>, peers: Arc<Mutex<Vec<PeerHandle>>>) {
     use tokio::time::{interval, Duration};
     let mut ticker = interval(Duration::from_secs(1));
     let mut buffer = Vec::new();
