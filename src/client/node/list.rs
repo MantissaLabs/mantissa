@@ -5,7 +5,7 @@ use std::io::Write;
 use tabwriter::TabWriter;
 
 pub async fn list(server_address: &str, _cluster: &str) -> Result<(), Box<dyn Error>> {
-    let client = common::get_client(server_address).await?;
+    let client = common::get_client_secure(server_address, "").await?;
 
     let request = client.get_topology_request();
     let topology = request.send().pipeline.get_topology();

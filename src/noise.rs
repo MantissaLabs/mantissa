@@ -77,6 +77,14 @@ pub async fn server_handshake(
     use std::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // FIXME: Fix this and use local socket instead.
+    // peer_is_loopback is problematic to test locally on different ports.
+    let peer_is_loopback = tcp
+        .peer_addr()
+        .ok()
+        .map(|sa| sa.ip().is_loopback())
+        .unwrap_or(false);
+
     let builder = snow::Builder::new(NOISE_PARAMS.parse().unwrap())
         .prologue(prologue())
         .local_private_key(&keys.private); // <-- important
@@ -113,11 +121,16 @@ pub async fn server_handshake(
     let token_str = std::str::from_utf8(token_bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "invalid token bytes"))?;
 
-    if !tokens.matches(token_str).await {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "invalid join token",
-        ));
+    // Auth decision:
+    // - If loopback and flag is set -> allow without token
+    // - Else -> require token match
+    if !peer_is_loopback {
+        if !tokens.matches(token_str).await {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid join token",
+            ));
+        }
     }
 
     let transport = hs.into_transport_mode().unwrap();

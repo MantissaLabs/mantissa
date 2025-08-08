@@ -2,6 +2,7 @@ use crate::client::common;
 use crate::gossip_capnp::gossip_message;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
+use crate::token::TokenStore;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
 use capnp::{capability::Promise, Error};
@@ -19,6 +20,8 @@ pub struct Topology {
     // Address of the node.
     // FIXME: To be replaced with full NodeInfo struct.
     addr: String,
+
+    token_store: TokenStore,
 
     // Node event receiver, from gossiping or other components.
     rx: Receiver<TopologyEvent>,
@@ -60,12 +63,13 @@ pub enum TopologyEvent {
 }
 
 impl Topology {
-    pub fn new(addr: String, rx: Receiver<TopologyEvent>) -> Self {
+    pub fn new(addr: String, rx: Receiver<TopologyEvent>, token_store: TokenStore) -> Self {
         Self {
             addr,
             rx,
             peers: Arc::new(RwLock::new(Vec::new())),
             server_handle: std::rc::Rc::new(OnceCell::new()),
+            token_store,
         }
     }
 
@@ -263,6 +267,37 @@ impl topology::Server for Topology {
                 node.set_handle(peer.client.clone());
             }
 
+            Ok(())
+        })
+    }
+
+    /// Returns the current join token for other nodes to use
+    /// to join the cluster from this node.
+    fn show_token(
+        &mut self,
+        _params: topology::ShowTokenParams,
+        mut results: topology::ShowTokenResults,
+    ) -> Promise<(), Error> {
+        let store: TokenStore = self.token_store.clone();
+
+        Promise::from_future(async move {
+            let token = store.current().await.unwrap_or_default();
+            results.get().set_token(&token);
+            Ok(())
+        })
+    }
+
+    /// Rotates the token used to join the cluster.
+    fn rotate_token(
+        &mut self,
+        _params: topology::RotateTokenParams,
+        mut results: topology::RotateTokenResults,
+    ) -> Promise<(), Error> {
+        let store: TokenStore = self.token_store.clone();
+
+        Promise::from_future(async move {
+            let new_token = store.rotate().await;
+            results.get().set_token(&new_token);
             Ok(())
         })
     }

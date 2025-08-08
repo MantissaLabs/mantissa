@@ -78,6 +78,13 @@ pub fn init() -> Command {
                         .short('d')
                         .help("print debug information verbosely")
                         .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("join-token")
+                        .long("join-token")
+                        .value_name("TOKEN")
+                        .help("Join token to authenticate with the remote anchor")
+                        .num_args(1),
                 ),
         )
         .subcommand(
@@ -96,6 +103,13 @@ pub fn init() -> Command {
                                 .index(1),
                         ),
                 ),
+        )
+        .subcommand(
+            Command::new("token")
+                .about("Token subcommands")
+                .arg_required_else_help(true)
+                .subcommand(Command::new("show").about("Shows the join token on this node"))
+                .subcommand(Command::new("rotate").about("Rotates the token on the node")),
         )
         .subcommand(
             Command::new("tasks")

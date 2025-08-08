@@ -3,8 +3,12 @@ use crate::topology_capnp::join_request as JoinRequest;
 use capnp::message::Builder;
 use std::error::Error;
 
-pub async fn link(server_address: &str, join_address: &str) -> Result<(), Box<dyn Error>> {
-    let client = common::get_client(server_address).await?;
+pub async fn link(
+    server_address: &str,
+    join_address: &str,
+    join_token: &str,
+) -> Result<(), Box<dyn Error>> {
+    let client = common::get_client_secure(server_address, join_token).await?;
 
     let request = client.get_topology_request();
     let topology = request.send().pipeline.get_topology();
@@ -15,6 +19,7 @@ pub async fn link(server_address: &str, join_address: &str) -> Result<(), Box<dy
     // Build link message.
     let mut link = builder.init_root::<JoinRequest::Builder>();
     link.set_anchor(join_address);
+    link.set_join_token(join_token);
 
     let _ = request
         .get()

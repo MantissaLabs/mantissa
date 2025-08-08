@@ -75,13 +75,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         },
 
+        Some(("token", token_matches)) => match token_matches.subcommand() {
+            Some(("show", _)) => {
+                local.run_until(client::token::show(&anchor)).await?;
+            }
+            Some(("rotate", _)) => {
+                local.run_until(client::token::rotate(&anchor)).await?;
+            }
+            _ => {
+                let _ = token_matches.subcommand_name();
+            }
+        },
+
         Some(("submit", _)) => {
             workload::task::submit().await?;
         }
 
-        Some(("link", _)) => {
+        Some(("link", link_matches)) => {
+            let join_token: String = link_matches
+                .get_one::<String>("join-token")
+                .expect("has a default")
+                .clone();
+
             local
-                .run_until(client::node::link(&listen, &anchor))
+                .run_until(client::node::link(&listen, &anchor, &join_token))
                 .await?;
         }
 

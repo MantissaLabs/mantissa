@@ -22,6 +22,12 @@ interface Topology {
 
   list @3 () -> (nodes :NodeList);
   # List machines in the cluster.
+
+  showToken @4 () -> (token :Text);
+  # Show the token for other nodes to use during join.
+
+  rotateToken @5 () -> (token :Text);
+  # Rotates the token for the node, invalidates existing token.
 }
 
 struct TopologyEvent {

@@ -25,6 +25,7 @@ pub struct ServerImpl {
     pub topology_client: Option<TopologyClient>,
     pub node_client: Option<NodeClient>,
 
+    token_store: Option<TokenStore>,
     config: Option<config::Config>,
 }
 
@@ -96,6 +97,7 @@ impl Default for ServerImpl {
             gossip_client: None,
             topology_client: None,
             node_client: None,
+            token_store: None,
             config: None,
         }
     }
@@ -113,8 +115,6 @@ impl ServerImpl {
     /// Starts the server, bootstrapping all necessary sub-components
     pub async fn start_rpc(self) -> Result<(), Box<dyn std::error::Error>> {
         let config = self.config.as_ref().unwrap();
-
-        let token_store = TokenStore::new(config.join_token.clone());
 
         let listener = tokio::net::TcpListener::bind(config.listen_addr.clone()).await?;
 
@@ -148,8 +148,7 @@ impl ServerImpl {
         let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
         println!("Server listening (secure) on {}", config.listen_addr);
 
-        // FIXME: The join token is empty for now, fix this.
-        let token_store = TokenStore::new(config.join_token.clone());
+        let token_store = self.token_store.as_ref().cloned().unwrap_or_default();
 
         let server_handle: server::Client = capnp_rpc::new_client(self);
 
@@ -160,8 +159,8 @@ impl ServerImpl {
             let (stream, _peer) = listener.accept().await?;
             stream.set_nodelay(true)?;
             let server_handle_clone = server_handle.clone();
-            let tokens = token_store.clone();
             let keys = keys_arc.clone();
+            let tokens = token_store.clone();
 
             tokio::task::spawn_local(async move {
                 match crate::noise::server_handshake(stream, tokens, &keys).await {
@@ -169,22 +168,30 @@ impl ServerImpl {
                         let (reader, writer) =
                             tokio_util::compat::TokioAsyncReadCompatExt::compat(noise_stream)
                                 .split();
+
                         let network = capnp_rpc::twoparty::VatNetwork::new(
                             futures::io::BufReader::new(reader),
                             futures::io::BufWriter::new(writer),
                             capnp_rpc::rpc_twoparty_capnp::Side::Server,
                             Default::default(),
                         );
-                        let mut rpc_system = capnp_rpc::RpcSystem::new(
+
+                        let rpc_system = capnp_rpc::RpcSystem::new(
                             Box::new(network),
                             Some(server_handle_clone.client),
                         );
+
                         rpc_system.await;
                     }
                     Err(e) => eprintln!("Noise handshake/token failed: {e}"),
                 }
             });
         }
+    }
+
+    pub fn with_token_store(&mut self, token_store: TokenStore) -> &mut ServerImpl {
+        self.token_store = Some(token_store);
+        self
     }
 
     pub fn with_topology(&mut self, topology_client: TopologyClient) -> &mut ServerImpl {
@@ -226,6 +233,10 @@ pub async fn start(addr: String) {
     // FIXME: Placeholder peer list.
     let peers: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // The join token store for this node.
+    let token_store = TokenStore::new(None);
+    token_store.generate().await;
+
     let gossip = gossip::Gossip {
         chans: gossip::Channels {
             topology_events: topology_tx.clone(),
@@ -234,13 +245,14 @@ pub async fn start(addr: String) {
     let gossip_client = capnp_rpc::new_client(gossip);
 
     // Build topology object and RPC client.
-    let raw_topology = topology::Topology::new(addr.clone(), topology_rx);
+    let raw_topology = topology::Topology::new(addr.clone(), topology_rx, token_store.clone());
     let topology_client: TopologyClient = capnp_rpc::new_client(raw_topology.clone());
 
     let server = ServerImpl::new()
         .with_gossip(gossip_client)
         .with_topology(topology_client.clone())
         .with_node(node_client)
+        .with_token_store(token_store)
         .with_config(Config::new().with_listen_addr(addr.clone()).build())
         .build();
 
