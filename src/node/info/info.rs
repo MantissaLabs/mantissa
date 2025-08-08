@@ -134,10 +134,10 @@ impl NodeInfo {
         }
     }
 
-    pub fn get_hostname(&self) -> String {
+    pub fn get_hostname(&mut self) {
         match System::host_name() {
-            Some(hostname) => hostname,
-            None => String::from("Unknown"),
+            Some(hostname) => self.info.hostname = Some(hostname),
+            None => self.info.hostname = Some(String::from("Unknown")),
         }
     }
 
