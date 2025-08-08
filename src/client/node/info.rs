@@ -2,7 +2,7 @@ use crate::client::common;
 use std::error::Error;
 
 pub async fn info(server_address: &str) -> Result<(), Box<dyn Error>> {
-    let client = common::get_client(server_address).await?;
+    let client = common::get_client_secure(server_address, "").await?;
 
     let request = client.get_node_request();
     let node = request.send().pipeline.get_node();

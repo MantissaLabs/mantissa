@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 mod config;
 
-use crate::gossip;
 use crate::gossip_capnp::gossip::Client as GossipClient;
 use crate::node::node;
 use crate::node_capnp::node::Client as NodeClient;
@@ -11,6 +10,7 @@ use crate::server_capnp::server::Client as ServerClient;
 use crate::topology;
 use crate::topology::PeerHandle;
 use crate::topology_capnp::topology::Client as TopologyClient;
+use crate::{gossip, token::TokenStore};
 use capnp::capability::Promise;
 use capnp::Error;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
@@ -96,7 +96,6 @@ impl Default for ServerImpl {
             gossip_client: None,
             topology_client: None,
             node_client: None,
-
             config: None,
         }
     }
@@ -114,6 +113,8 @@ impl ServerImpl {
     /// Starts the server, bootstrapping all necessary sub-components
     pub async fn start_rpc(self) -> Result<(), Box<dyn std::error::Error>> {
         let config = self.config.as_ref().unwrap();
+
+        let token_store = TokenStore::new(config.join_token.clone());
 
         let listener = tokio::net::TcpListener::bind(config.listen_addr.clone()).await?;
 
@@ -139,6 +140,50 @@ impl ServerImpl {
             let rpc_system = RpcSystem::new(Box::new(network), Some(server_handle.clone().client));
 
             tokio::task::spawn_local(Box::pin(rpc_system.map(|_| ())));
+        }
+    }
+
+    pub async fn start_rpc_secure(self) -> Result<(), Box<dyn std::error::Error>> {
+        let config = self.config.as_ref().unwrap();
+        let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
+        println!("Server listening (secure) on {}", config.listen_addr);
+
+        // FIXME: The join token is empty for now, fix this.
+        let token_store = TokenStore::new(config.join_token.clone());
+
+        let server_handle: server::Client = capnp_rpc::new_client(self);
+
+        let keys = crate::noise::generate_noise_keys(); // or load from disk
+        let keys_arc = std::sync::Arc::new(keys);
+
+        loop {
+            let (stream, _peer) = listener.accept().await?;
+            stream.set_nodelay(true)?;
+            let server_handle_clone = server_handle.clone();
+            let tokens = token_store.clone();
+            let keys = keys_arc.clone();
+
+            tokio::task::spawn_local(async move {
+                match crate::noise::server_handshake(stream, tokens, &keys).await {
+                    Ok(noise_stream) => {
+                        let (reader, writer) =
+                            tokio_util::compat::TokioAsyncReadCompatExt::compat(noise_stream)
+                                .split();
+                        let network = capnp_rpc::twoparty::VatNetwork::new(
+                            futures::io::BufReader::new(reader),
+                            futures::io::BufWriter::new(writer),
+                            capnp_rpc::rpc_twoparty_capnp::Side::Server,
+                            Default::default(),
+                        );
+                        let mut rpc_system = capnp_rpc::RpcSystem::new(
+                            Box::new(network),
+                            Some(server_handle_clone.client),
+                        );
+                        rpc_system.await;
+                    }
+                    Err(e) => eprintln!("Noise handshake/token failed: {e}"),
+                }
+            });
         }
     }
 
@@ -214,7 +259,7 @@ pub async fn start(addr: String) {
         topology.run().await;
     });
 
-    if let Err(e) = server.start_rpc().await {
+    if let Err(e) = server.start_rpc_secure().await {
         eprintln!("server error: {}", e);
     }
 }

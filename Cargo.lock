@@ -1355,6 +1355,7 @@ dependencies = [
  "aya-build",
  "bincode",
  "bollard",
+ "bytes",
  "capnp",
  "capnp-futures",
  "capnp-rpc",
