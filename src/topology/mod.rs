@@ -147,15 +147,22 @@ impl topology::Server for Topology {
             let anchor = request
                 .get_anchor()?
                 .to_string()
-                .expect("expect anchor address");
+                .expect("expected anchor address");
+
+            let join_token = request
+                .get_join_token()?
+                .to_string()
+                .expect("expected join token");
 
             if anchor == self_addr {
                 return Err(capnp::Error::failed("cannot join own address".to_string()));
             }
 
-            let client = common::get_client(anchor.as_str()).await.map_err(|e| {
-                capnp::Error::failed(format!("could not connect to anchor {}: {}", anchor, e))
-            })?;
+            let client = common::get_client_secure(anchor.as_str(), join_token.as_str())
+                .await
+                .map_err(|e| {
+                    capnp::Error::failed(format!("could not connect to anchor {}: {}", anchor, e))
+                })?;
 
             let request = client.get_topology_request();
             let topology = request.send().pipeline.get_topology();

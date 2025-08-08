@@ -51,6 +51,9 @@ struct JoinRequest {
   anchor @0 :Text;
   # IP address of the anchor node we'd like this node to join.
   # This node could be part of an existing cluster or not.
+
+  joinToken @1 :Text;
+  # Token used to authenticate the join request.
 }
 
 struct NodeInfo {
