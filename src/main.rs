@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match matches.subcommand() {
         Some(("init", _)) => {
-            local.run_until(server::start(listen)).await;
+            local.run_until(server::start(listen)).await?;
         }
 
         Some(("info", _)) => {

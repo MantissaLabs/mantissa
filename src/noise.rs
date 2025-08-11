@@ -1,20 +1,38 @@
 use futures::lock::Mutex;
+use getrandom::getrandom;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::{fs, io, path::Path};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::token::TokenStore;
 
 pub struct NoiseKeys {
-    pub private: Vec<u8>,
-    pub public: Vec<u8>,
+    pub private: StaticSecret,
+    pub public: PublicKey,
 }
 
-pub fn generate_noise_keys() -> NoiseKeys {
-    let builder = snow::Builder::new("Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
-    let kp = builder.generate_keypair().unwrap();
-    NoiseKeys {
-        private: kp.private,
-        public: kp.public,
+impl NoiseKeys {
+    pub fn from_private_bytes(secret: [u8; 32]) -> Self {
+        let priv_key = StaticSecret::from(secret);
+        let pub_key = PublicKey::from(&priv_key);
+        Self {
+            private: priv_key,
+            public: pub_key,
+        }
+    }
+
+    pub fn to_private_bytes(&self) -> [u8; 32] {
+        self.private.to_bytes()
+    }
+
+    pub fn public_bytes(&self) -> [u8; 32] {
+        self.public.to_bytes()
+    }
+
+    pub fn public_slice(&self) -> &[u8; 32] {
+        self.public.as_bytes()
     }
 }
 
@@ -29,14 +47,16 @@ fn prologue() -> &'static [u8] {
 pub async fn client_handshake(
     tcp: tokio::net::TcpStream,
     token: &str,
-    keys: &NoiseKeys, // <-- new
+    keys: &NoiseKeys,
 ) -> std::io::Result<tokio::io::DuplexStream> {
     use std::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    let pk_bytes = keys.private.to_bytes();
+
     let builder = snow::Builder::new(NOISE_PARAMS.parse().unwrap())
         .prologue(prologue())
-        .local_private_key(&keys.private); // <-- important
+        .local_private_key(&pk_bytes);
 
     let mut hs = builder
         .build_initiator()
@@ -66,11 +86,10 @@ pub async fn client_handshake(
     Ok(spawn_noise_pump(rd, wr, transport)) // your existing pump
 }
 
-// --- SERVER ---
 pub async fn server_handshake(
     tcp: tokio::net::TcpStream,
     tokens: TokenStore,
-    keys: &NoiseKeys, // <-- new
+    keys: &NoiseKeys,
 ) -> std::io::Result<tokio::io::DuplexStream> {
     use std::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -83,9 +102,11 @@ pub async fn server_handshake(
         .map(|sa| sa.ip().is_loopback())
         .unwrap_or(false);
 
+    let pk_bytes = keys.private.to_bytes();
+
     let builder = snow::Builder::new(NOISE_PARAMS.parse().unwrap())
         .prologue(prologue())
-        .local_private_key(&keys.private); // <-- important
+        .local_private_key(&pk_bytes);
 
     let mut hs = builder
         .build_responder()
@@ -238,4 +259,66 @@ fn spawn_noise_pump(
     });
 
     app_side
+}
+
+/// Prefer `/var/lib/mantissa/noise.key`; fallback to `~/.mantissa/noise.key`.
+pub fn resolve_noise_key_path() -> io::Result<PathBuf> {
+    let primary = PathBuf::from("/var/lib/mantissa/noise.key");
+
+    // Try to ensure the system dir exists; if we can create it, we likely can write the key there.
+    if let Some(parent) = primary.parent() {
+        match fs::create_dir_all(parent) {
+            Ok(_) => return Ok(primary),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => { /* fall back */ }
+            Err(e) => {
+                // If it failed for another reason (e.g., read-only FS), also fall back.
+                eprintln!(
+                    "warn: cannot use {} ({e}); falling back to HOME",
+                    parent.display()
+                );
+            }
+        }
+    }
+
+    // Fallback: ~/.mantissa/noise.key
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+    let mut p = PathBuf::from(home);
+    p.push(".mantissa");
+    fs::create_dir_all(&p)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
+    }
+    p.push("noise.key");
+    Ok(p)
+}
+
+/// Load a 32-byte private key from `path`, or generate and persist a new one.
+/// Derives the public key every time.
+pub fn load_or_generate_noise_keys(path: impl AsRef<Path>) -> io::Result<NoiseKeys> {
+    let path = path.as_ref();
+    let private_bytes = if path.exists() {
+        let bytes = fs::read(path)?;
+        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "noise private key must be 32 bytes",
+            )
+        })?;
+        arr
+    } else {
+        let mut sk = [0u8; 32];
+        getrandom(&mut sk)?;
+        fs::write(path, &sk)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+        sk
+    };
+
+    Ok(NoiseKeys::from_private_bytes(private_bytes))
 }

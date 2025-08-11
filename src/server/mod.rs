@@ -5,6 +5,7 @@ mod config;
 use crate::gossip_capnp::gossip::Client as GossipClient;
 use crate::node::node;
 use crate::node_capnp::node::Client as NodeClient;
+use crate::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
 use crate::topology;
@@ -27,6 +28,7 @@ pub struct ServerImpl {
 
     token_store: Option<TokenStore>,
     config: Option<config::Config>,
+    noise_keys: Option<Arc<NoiseKeys>>,
 }
 
 impl server::Server for ServerImpl {
@@ -99,6 +101,7 @@ impl Default for ServerImpl {
             node_client: None,
             token_store: None,
             config: None,
+            noise_keys: None,
         }
     }
 }
@@ -149,17 +152,15 @@ impl ServerImpl {
         println!("Server listening (secure) on {}", config.listen_addr);
 
         let token_store = self.token_store.as_ref().cloned().unwrap_or_default();
+        let keys = self.noise_keys.as_ref().expect("noise keys").clone();
 
         let server_handle: server::Client = capnp_rpc::new_client(self);
-
-        let keys = crate::noise::generate_noise_keys(); // or load from disk
-        let keys_arc = std::sync::Arc::new(keys);
 
         loop {
             let (stream, _peer) = listener.accept().await?;
             stream.set_nodelay(true)?;
             let server_handle_clone = server_handle.clone();
-            let keys = keys_arc.clone();
+            let keys = keys.clone();
             let tokens = token_store.clone();
 
             tokio::task::spawn_local(async move {
@@ -214,6 +215,11 @@ impl ServerImpl {
         self
     }
 
+    pub fn with_noise_keys(&mut self, keys: Arc<NoiseKeys>) -> &mut ServerImpl {
+        self.noise_keys = Some(keys);
+        self
+    }
+
     pub fn build(&mut self) -> ServerImpl {
         let server_client = capnp_rpc::new_client(self.clone());
         self.server_client = Some(server_client);
@@ -222,13 +228,16 @@ impl ServerImpl {
 }
 
 // Start the server and other components like gossip, scheduler, and topology.
-pub async fn start(addr: String) {
+pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut node = node::Node::new();
     node.collect_system_info();
     let node_client = capnp_rpc::new_client(node);
 
     let (gossip_tx, gossip_rx) = async_channel::bounded(128);
     let (topology_tx, topology_rx) = async_channel::bounded(128);
+
+    let keys_path = resolve_noise_key_path()?;
+    let keys = Arc::new(load_or_generate_noise_keys(keys_path)?);
 
     // FIXME: Placeholder peer list.
     let peers: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
@@ -245,7 +254,8 @@ pub async fn start(addr: String) {
     let gossip_client = capnp_rpc::new_client(gossip);
 
     // Build topology object and RPC client.
-    let raw_topology = topology::Topology::new(addr.clone(), topology_rx, token_store.clone());
+    let raw_topology =
+        topology::Topology::new(addr.clone(), topology_rx, token_store.clone(), keys.public);
     let topology_client: TopologyClient = capnp_rpc::new_client(raw_topology.clone());
 
     let server = ServerImpl::new()
@@ -253,6 +263,7 @@ pub async fn start(addr: String) {
         .with_topology(topology_client.clone())
         .with_node(node_client)
         .with_token_store(token_store)
+        .with_noise_keys(keys.clone())
         .with_config(Config::new().with_listen_addr(addr.clone()).build())
         .build();
 
@@ -271,7 +282,6 @@ pub async fn start(addr: String) {
         topology.run().await;
     });
 
-    if let Err(e) = server.start_rpc_secure().await {
-        eprintln!("server error: {}", e);
-    }
+    server.start_rpc_secure().await?;
+    Ok(())
 }

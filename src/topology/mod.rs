@@ -1,5 +1,6 @@
 use crate::client::common;
 use crate::gossip_capnp::gossip_message;
+use crate::node::identity::{peer_id_from_public, PeerId};
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
 use crate::token::TokenStore;
@@ -11,6 +12,7 @@ use std::cell::OnceCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use x25519_dalek::PublicKey;
 
 pub mod peer_provider;
 pub mod peers;
@@ -31,6 +33,13 @@ pub struct Topology {
 
     // The capability handle for the server. To be sent to peers.
     server_handle: Rc<OnceCell<ServerClient>>,
+
+    // The public key of the node.
+    public_key: PublicKey,
+
+    // The peer ID derived from the public key.
+    // FIXME: detangle from the u64 id defined in Capnproto Node struct.
+    peer_id: PeerId,
 }
 
 #[derive(Clone)]
@@ -65,13 +74,20 @@ pub enum TopologyEvent {
 }
 
 impl Topology {
-    pub fn new(addr: String, rx: Receiver<TopologyEvent>, token_store: TokenStore) -> Self {
+    pub fn new(
+        addr: String,
+        rx: Receiver<TopologyEvent>,
+        token_store: TokenStore,
+        public: PublicKey,
+    ) -> Self {
         Self {
             addr,
             rx,
             peers: Arc::new(RwLock::new(Vec::new())),
             server_handle: std::rc::Rc::new(OnceCell::new()),
             token_store,
+            public_key: public,
+            peer_id: peer_id_from_public(&public),
         }
     }
 
@@ -150,6 +166,8 @@ impl topology::Server for Topology {
             return Promise::err(capnp::Error::failed("server handle not set".into()));
         }
         let server_handle = handle.unwrap();
+        let public_key = self.public_key.clone().to_bytes();
+        let id = self.peer_id.clone();
 
         Promise::from_future(async move {
             let request = params.get()?.get_link()?;
@@ -184,6 +202,7 @@ impl topology::Server for Topology {
             info.set_hostname("mantissa"); // Placeholder hostname
             info.set_addr("127.0.0.1:6578"); // Placeholder address
             info.set_handle(server_handle);
+            info.set_public_key(&public_key);
 
             // TODO: Do something with the response.
             let response = request.send().promise.await?;
@@ -218,8 +237,8 @@ impl topology::Server for Topology {
             let public_key = node.get_public_key()?;
 
             info!(
-                "member with address: <{:?}> attempts at joining the cluster",
-                address
+                "member with address: <{:?}>> attempts at joining the cluster",
+                address,
             );
 
             let handle = PeerHandle {

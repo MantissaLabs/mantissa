@@ -1,7 +1,11 @@
-use crate::{noise::client_handshake, server_capnp::server::Client};
+use crate::{
+    noise::{client_handshake, load_or_generate_noise_keys},
+    server_capnp::server::Client,
+};
 use anyhow::Error;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::{AsyncReadExt, FutureExt};
+use std::sync::Arc;
 
 // Used to get a client connection with Capn'proto.
 // At the moment, any method using `get_client` *needs* to be run in a tokio task,
@@ -48,7 +52,8 @@ pub async fn get_client_secure(addr: &str, token: &str) -> Result<Client, capnp:
         .map_err(|e| capnp::Error::failed(format!("tcp connect: {e}")))?;
     tcp.set_nodelay(true).ok();
 
-    let keys = crate::noise::generate_noise_keys(); // or load client's static if you want it stable
+    let keys_path = crate::noise::resolve_noise_key_path()?;
+    let keys = Arc::new(load_or_generate_noise_keys(keys_path)?);
     let noise_stream = client_handshake(tcp, token, &keys)
         .await
         .map_err(|e| capnp::Error::failed(format!("noise: {e}")))?;
