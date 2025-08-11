@@ -40,6 +40,7 @@ pub struct PeerHandle {
     pub address: String,
     pub root_hash: String,
     pub client: server::Client,
+    pub noise_static_pub: Vec<u8>,
 }
 
 /// Actions to apply to the memberlist.
@@ -53,6 +54,7 @@ pub enum TopologyEvent {
         address: String,
         root_hash: String,
         client: server::Client,
+        noise_static_pub: Vec<u8>,
     },
     NodeLeft {
         id: u64,
@@ -95,6 +97,7 @@ impl Topology {
                             hostname,
                             root_hash,
                             client,
+                            noise_static_pub,
                         } => {
                             println!("[Topology] Node joined: {id} at {address}");
 
@@ -104,6 +107,7 @@ impl Topology {
                                 hostname,
                                 root_hash,
                                 client,
+                                noise_static_pub: noise_static_pub.to_vec(),
                             };
 
                             let mut peers = self.peers.write().await;
@@ -211,6 +215,7 @@ impl topology::Server for Topology {
                 .to_string()
                 .expect("expected root hash");
             let handle = node.get_handle()?;
+            let public_key = node.get_public_key()?;
 
             info!(
                 "member with address: <{:?}> attempts at joining the cluster",
@@ -223,6 +228,7 @@ impl topology::Server for Topology {
                 hostname,
                 root_hash,
                 client: handle,
+                noise_static_pub: public_key.to_vec(),
             };
 
             let mut peers = peers.write().await;
@@ -318,6 +324,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             address: node.get_addr()?.to_str()?.to_string(),
             root_hash: node.get_root_hash()?.to_str()?.to_string(),
             client: node.get_handle()?,
+            noise_static_pub: node.get_public_key()?.to_vec(),
         },
         EventType::Remove => TopologyEvent::NodeLeft { id },
         EventType::Suspect => TopologyEvent::NodeSuspect { id },
@@ -340,6 +347,7 @@ pub fn add_event(
             address,
             root_hash,
             client,
+            noise_static_pub,
         } => {
             let mut topo = msg.init_topology();
 
@@ -350,6 +358,7 @@ pub fn add_event(
             node.set_hostname(hostname);
             node.set_addr(address);
             node.set_root_hash(root_hash);
+            node.set_public_key(noise_static_pub);
 
             // Set the handle as a Cap’n Proto client
             node.set_handle(client.clone());

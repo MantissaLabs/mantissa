@@ -89,6 +89,9 @@ struct NodeInfo {
   # The root hash of the tracking merkle search tree.
   # It is used for Anti-Antropy and syncing data between
   # nodes.
+
+  publicKey @7 :Data;
+  # Noise public key.
 }
 
 struct NodeList {

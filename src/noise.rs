@@ -6,10 +6,7 @@ use crate::token::TokenStore;
 
 pub struct NoiseKeys {
     pub private: Vec<u8>,
-    // Not needed for now since we can derive a public key from the private key.
-    // We can support E2E encryption only with the private key and join token.
-    // This simplifies the setup and reduces the risk of key exposure.
-    // pub public: Vec<u8>,
+    pub public: Vec<u8>,
 }
 
 pub fn generate_noise_keys() -> NoiseKeys {
@@ -17,6 +14,7 @@ pub fn generate_noise_keys() -> NoiseKeys {
     let kp = builder.generate_keypair().unwrap();
     NoiseKeys {
         private: kp.private,
+        public: kp.public,
     }
 }
 
@@ -120,6 +118,9 @@ pub async fn server_handshake(
     let token_bytes = &out[..payload_len];
     let token_str = std::str::from_utf8(token_bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "invalid token bytes"))?;
+
+    // TODO: Use Admission Trait to check whether the member is already registered
+    // or not, and if not, register them using their public key.
 
     // Auth decision:
     // - If loopback and flag is set -> allow without token
