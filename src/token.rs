@@ -18,7 +18,7 @@ impl TokenStore {
         }
     }
 
-    /// Generate a brand-new token `MNTSSA-1-<base32lower_nopad>` and store it.
+    /// Generate a brand-new token `MNTISA-1-<base32lower_nopad>` and store it.
     pub async fn generate(&self) -> String {
         let token = generate_token();
         *self.inner.write().await = token.clone();
@@ -47,7 +47,7 @@ impl TokenStore {
     }
 }
 
-/// Produce `MNTSSA-1-<longtoken>` where `<longtoken>` is base32 (lowercase, no padding).
+/// Produce `MNTISA-1-<longtoken>` where `<longtoken>` is base32 (lowercase, no padding).
 fn generate_token() -> String {
     let mut bytes = [0u8; 48];
     getrandom(&mut bytes).expect("CSPRNG failed");
