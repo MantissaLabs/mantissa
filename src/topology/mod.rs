@@ -73,6 +73,8 @@ impl Topology {
         }
     }
 
+    // Sets the server handle for the topology component. Returns an error if the handle
+    // has already been set.
     pub fn set_server_handle(&self, handle: ServerClient) -> Result<(), ServerClient> {
         self.server_handle.set(handle)
     }

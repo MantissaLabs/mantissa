@@ -3,7 +3,7 @@ use getrandom::getrandom;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-const TOKEN_PREFIX: &str = "MNTSSA-1-";
+const TOKEN_PREFIX: &str = "MNTISA-1-";
 
 #[derive(Clone, Default)]
 pub struct TokenStore {
