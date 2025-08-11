@@ -200,7 +200,7 @@ impl topology::Server for Topology {
             let mut info = request.get().init_info();
             info.set_id(13132431); // Placeholder ID
             info.set_hostname("mantissa"); // Placeholder hostname
-            info.set_addr("127.0.0.1:6578"); // Placeholder address
+            info.set_addr("127.0.0.1:6578"); // FIXME: Placeholder address, change this to test removal of loopback bypass.
             info.set_handle(server_handle);
             info.set_public_key(&public_key);
 
