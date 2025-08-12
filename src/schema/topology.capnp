@@ -62,15 +62,20 @@ struct JoinRequest {
   # Token used to authenticate the join request.
 }
 
+
+struct NodeId {
+  bytes @0 :Data;  # exactly 16 bytes (enforce in code)
+}
+
 struct NodeInfo {
   # A Machine. Can be any process taking part
   # in the system throughout the cluster lifetime.
 
-  handle @0 :Server.Server;
-  # Interface to contact the node back.
+  id @0 :NodeId;
+  # ID of the node.
 
-  id @1 :UInt64;
-  # Id of the node, it must be unique.
+  handle @1 :Server.Server;
+  # Interface to contact the node back.
 
   hostname @2 :Text;
   # Hostname of the node.

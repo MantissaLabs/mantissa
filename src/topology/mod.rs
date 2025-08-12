@@ -1,6 +1,7 @@
 use crate::client::common;
 use crate::gossip_capnp::gossip_message;
 use crate::node::address::{compute_advertise_ip, extract_port};
+use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::{peer_id_from_public, PeerId};
 use crate::node::node::Node;
 use crate::server_capnp::server;
@@ -14,6 +15,7 @@ use std::cell::OnceCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
 pub mod peer_provider;
@@ -49,7 +51,7 @@ pub struct Topology {
 
 #[derive(Clone)]
 pub struct PeerHandle {
-    pub id: u64,
+    pub id: Uuid,
     pub hostname: String,
     pub address: String,
     pub root_hash: String,
@@ -63,7 +65,7 @@ pub struct PeerHandle {
 #[derive(Clone)]
 pub enum TopologyEvent {
     NodeJoined {
-        id: u64,
+        id: Uuid,
         hostname: String,
         address: String,
         root_hash: String,
@@ -71,10 +73,10 @@ pub enum TopologyEvent {
         noise_static_pub: Vec<u8>,
     },
     NodeLeft {
-        id: u64,
+        id: Uuid,
     },
     NodeSuspect {
-        id: u64,
+        id: Uuid,
     },
 }
 
@@ -168,6 +170,7 @@ impl topology::Server for Topology {
     ) -> Promise<(), Error> {
         let self_addr = self.addr.clone();
         let hostname = self.node.system_info.info.hostname.clone().unwrap();
+        let id = self.node.id.clone();
 
         let handle = self.get_server_handle();
         if handle.is_none() {
@@ -175,7 +178,6 @@ impl topology::Server for Topology {
         }
         let server_handle = handle.unwrap();
         let public_key = self.public_key.clone().to_bytes();
-        let id = self.peer_id.clone();
 
         Promise::from_future(async move {
             let request = params.get()?.get_link()?;
@@ -211,7 +213,7 @@ impl topology::Server for Topology {
 
             // Build info message.
             let mut info = request.get().init_info();
-            info.set_id(13132431); // Placeholder ID
+            set_node_id(info.reborrow().init_id(), &id);
             info.set_hostname(hostname);
             info.set_addr(advertise);
             info.set_handle(server_handle);
@@ -239,7 +241,7 @@ impl topology::Server for Topology {
         Promise::from_future(async move {
             let node = params.get()?.get_info()?;
 
-            let id = node.get_id();
+            let id = read_node_id(node.reborrow().get_id()?)?;
             let address = node.get_addr()?.to_string().expect("expected address");
             let hostname = node.get_hostname()?.to_string().expect("expected hostname");
             let root_hash = node
@@ -300,7 +302,7 @@ impl topology::Server for Topology {
             for (i, peer) in peers.iter().enumerate() {
                 let mut node = node_list.reborrow().get(i as u32);
 
-                node.set_id(peer.id);
+                set_node_id(node.reborrow().init_id(), &peer.id);
                 node.set_addr(&peer.address);
                 node.set_hostname(&peer.hostname);
                 node.set_root_hash(&peer.root_hash);
@@ -347,7 +349,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
     use topology_event::EventType;
 
     let node = reader.get_node()?;
-    let id = node.get_id();
+    let id = read_node_id(node.get_id()?)?;
 
     let event = match reader.get_event()? {
         EventType::Add => TopologyEvent::NodeJoined {
@@ -386,7 +388,7 @@ pub fn add_event(
             topo.set_event(topology_event::EventType::Add);
             let mut node = topo.init_node();
 
-            node.set_id(*id);
+            set_node_id(node.reborrow().init_id(), &id);
             node.set_hostname(hostname);
             node.set_addr(address);
             node.set_root_hash(root_hash);
@@ -400,14 +402,14 @@ pub fn add_event(
             let mut topo = msg.init_topology();
             topo.set_event(topology_event::EventType::Remove);
             let mut node = topo.init_node();
-            node.set_id(*id);
+            set_node_id(node.reborrow().init_id(), &id);
         }
 
         TopologyEvent::NodeSuspect { id } => {
             let mut topo = msg.init_topology();
             topo.set_event(topology_event::EventType::Suspect);
             let mut node = topo.init_node();
-            node.set_id(*id);
+            set_node_id(node.reborrow().init_id(), &id);
         }
     }
 }

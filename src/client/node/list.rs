@@ -1,4 +1,5 @@
 use crate::client::common;
+use crate::node::id::{id_sort_key_uuid_bytes, id_string};
 use crate::topology_capnp::node_info::Reader as NodeInfo;
 use std::error::Error;
 use std::io::Write;
@@ -18,17 +19,16 @@ pub async fn list(server_address: &str, _cluster: &str) -> Result<(), Box<dyn Er
     writeln!(&mut tw, "ID\tHOSTNAME\tENDPOINT").unwrap();
 
     let mut list: Vec<NodeInfo> = reader.get_nodes()?.iter().collect();
-    list.sort_by_key(|n| n.get_id());
+    list.sort_by_key(id_sort_key_uuid_bytes);
 
     for n in &list {
         writeln!(
             &mut tw,
-            "{}\t{:?}\t{:?}",
-            n.get_id(),
-            n.get_hostname()?,
-            n.get_addr()?
-        )
-        .unwrap();
+            "{}\t{}\t{}",
+            id_string(n)?,
+            n.get_hostname()?.to_str()?,
+            n.get_addr()?.to_str()?
+        )?;
     }
 
     tw.flush().unwrap();
