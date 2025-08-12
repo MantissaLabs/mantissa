@@ -37,7 +37,7 @@ fn test_merkle_tree() -> Result<(), Box<dyn Error>> {
     // independently into a chosen method for key/value storage.
     let builder = Builder::default();
 
-    let builder_with_hasher = builder.with_hasher(hash::XXHash128::new());
+    let builder_with_hasher = builder.with_hasher(hash::XXHash128);
 
     let mut tree: MerkleSearchTree<String, _, hash::XXHash128> = builder_with_hasher.build();
 
