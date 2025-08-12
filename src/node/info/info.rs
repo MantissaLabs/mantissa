@@ -1,11 +1,13 @@
+use std::rc::Rc;
 use sysinfo::{CpuRefreshKind, Disks, RefreshKind, System};
 
 /// # Description:
 ///
 /// This structure contains System wide informations about the machine
 /// such as the operating systems details, hardware components, load, etc.
+#[derive(Clone, Debug)]
 pub struct NodeInfo {
-    sys: System,
+    sys: Rc<System>,
     pub info: Info,
 }
 
@@ -121,7 +123,7 @@ impl NodeInfo {
         let sys = System::new_all();
 
         NodeInfo {
-            sys,
+            sys: Rc::new(sys),
             info: Info {
                 device_ip: None,
                 load_info: None,

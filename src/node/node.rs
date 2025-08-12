@@ -51,8 +51,9 @@ pub enum NodeState {
 
 /// This structure defines the delegate in charge of booking slots
 /// running tasks on the machine.
+#[derive(Clone, Debug)]
 pub struct Node {
-    system_info: NodeInfo,
+    pub system_info: NodeInfo,
     // engine: Rc<Engine>,
 }
 

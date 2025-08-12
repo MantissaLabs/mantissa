@@ -2,6 +2,7 @@ use crate::client::common;
 use crate::gossip_capnp::gossip_message;
 use crate::node::address::{compute_advertise_ip, extract_port};
 use crate::node::identity::{peer_id_from_public, PeerId};
+use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
 use crate::token::TokenStore;
@@ -25,6 +26,9 @@ pub struct Topology {
     addr: String,
 
     token_store: TokenStore,
+
+    // NodeInfo struct.
+    node: Node,
 
     // Node event receiver, from gossiping or other components.
     rx: Receiver<TopologyEvent>,
@@ -80,6 +84,7 @@ impl Topology {
         rx: Receiver<TopologyEvent>,
         token_store: TokenStore,
         public: PublicKey,
+        node: Node,
     ) -> Self {
         Self {
             addr,
@@ -89,6 +94,7 @@ impl Topology {
             token_store,
             public_key: public,
             peer_id: peer_id_from_public(&public),
+            node: node,
         }
     }
 
@@ -161,6 +167,7 @@ impl topology::Server for Topology {
         mut _results: topology::JoinResults,
     ) -> Promise<(), Error> {
         let self_addr = self.addr.clone();
+        let hostname = self.node.system_info.info.hostname.clone().unwrap();
 
         let handle = self.get_server_handle();
         if handle.is_none() {
@@ -205,7 +212,7 @@ impl topology::Server for Topology {
             // Build info message.
             let mut info = request.get().init_info();
             info.set_id(13132431); // Placeholder ID
-            info.set_hostname("mantissa"); // Placeholder hostname
+            info.set_hostname(hostname);
             info.set_addr(advertise);
             info.set_handle(server_handle);
             info.set_public_key(&public_key);

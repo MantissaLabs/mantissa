@@ -238,7 +238,7 @@ impl ServerImpl {
 pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut node = node::Node::new();
     node.collect_system_info();
-    let node_client = capnp_rpc::new_client(node);
+    let node_client = capnp_rpc::new_client(node.clone());
 
     let (gossip_tx, gossip_rx) = async_channel::bounded(128);
     let (topology_tx, topology_rx) = async_channel::bounded(128);
@@ -261,8 +261,13 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     let gossip_client = capnp_rpc::new_client(gossip);
 
     // Build topology object and RPC client.
-    let raw_topology =
-        topology::Topology::new(addr.clone(), topology_rx, token_store.clone(), keys.public);
+    let raw_topology = topology::Topology::new(
+        addr.clone(),
+        topology_rx,
+        token_store.clone(),
+        keys.public,
+        node,
+    );
     let topology_client: TopologyClient = capnp_rpc::new_client(raw_topology.clone());
 
     let server = ServerImpl::new()
