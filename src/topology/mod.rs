@@ -1,5 +1,6 @@
 use crate::client::common;
 use crate::gossip_capnp::gossip_message;
+use crate::node::address::{compute_advertise_ip, extract_port};
 use crate::node::identity::{peer_id_from_public, PeerId};
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
@@ -186,6 +187,11 @@ impl topology::Server for Topology {
                 return Err(capnp::Error::failed("cannot join own address".to_string()));
             }
 
+            let local_listen_port: u16 = extract_port(self_addr.as_str())?;
+
+            let advertise_ip = compute_advertise_ip(None, Some(anchor.as_str()))?;
+            let advertise = format!("{}:{}", advertise_ip, local_listen_port);
+
             let client = common::get_client_secure(anchor.as_str(), join_token.as_str())
                 .await
                 .map_err(|e| {
@@ -200,7 +206,7 @@ impl topology::Server for Topology {
             let mut info = request.get().init_info();
             info.set_id(13132431); // Placeholder ID
             info.set_hostname("mantissa"); // Placeholder hostname
-            info.set_addr("127.0.0.1:6578"); // FIXME: Placeholder address, change this to test removal of loopback bypass.
+            info.set_addr(advertise);
             info.set_handle(server_handle);
             info.set_public_key(&public_key);
 

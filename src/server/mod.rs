@@ -158,6 +158,13 @@ impl ServerImpl {
 
         loop {
             let (stream, _peer) = listener.accept().await?;
+
+            // TODO: Should we get the peer address from the stream and pass that down
+            // to Topology?
+            // let local_sa = stream.local_addr().ok(); // e.g., 192.168.104.3:6578
+            // let peer_sa = stream.peer_addr().ok();
+            // println!("local: {:?} / peer: {:?}", local_sa, peer_sa);
+
             stream.set_nodelay(true)?;
             let server_handle_clone = server_handle.clone();
             let keys = keys.clone();
