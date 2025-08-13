@@ -10,8 +10,10 @@ use crate::token::TokenStore;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
 use capnp::{capability::Promise, Error};
+use crdts::{CmRDT, MVReg, Map as CrdtMap};
 use log::info;
 use std::cell::OnceCell;
+use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -20,6 +22,9 @@ use x25519_dalek::PublicKey;
 
 pub mod peer_provider;
 pub mod peers;
+
+type ActorId = Uuid;
+type PeerMap = CrdtMap<Uuid, MVReg<PeerHandle, ActorId>, ActorId>;
 
 #[derive(Clone)]
 pub struct Topology {
@@ -36,7 +41,7 @@ pub struct Topology {
     rx: Receiver<TopologyEvent>,
 
     // The list of peers in our topology.
-    peers: Arc<RwLock<Vec<PeerHandle>>>,
+    peers: Arc<RwLock<PeerMap>>,
 
     // The capability handle for the server. To be sent to peers.
     server_handle: Rc<OnceCell<ServerClient>>,
@@ -57,6 +62,19 @@ pub struct PeerHandle {
     pub root_hash: String,
     pub client: server::Client,
     pub noise_static_pub: Vec<u8>,
+}
+
+impl fmt::Debug for PeerHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Don’t print the capability; show useful fields only.
+        f.debug_struct("PeerHandle")
+            .field("id", &self.id)
+            .field("hostname", &self.hostname)
+            .field("address", &self.address)
+            .field("root_hash", &self.root_hash)
+            .field("noise_static_pub_len", &self.noise_static_pub.len())
+            .finish()
+    }
 }
 
 /// Actions to apply to the memberlist.
@@ -91,7 +109,7 @@ impl Topology {
         Self {
             addr,
             rx,
-            peers: Arc::new(RwLock::new(Vec::new())),
+            peers: Arc::new(RwLock::new(CrdtMap::new())),
             server_handle: std::rc::Rc::new(OnceCell::new()),
             token_store,
             public_key: public,
@@ -135,14 +153,22 @@ impl Topology {
                                 noise_static_pub: noise_static_pub.to_vec(),
                             };
 
+                            // Write to map.
                             let mut peers = self.peers.write().await;
-                            peers.push(handle);
+                            let add_ctx = peers.read_ctx().derive_add_ctx(self.node.id);
+                            let op = peers.update(id, add_ctx, |reg, ctx| reg.write(handle, ctx));
+                            peers.apply(op);
 
                             // TODO: broadcast event to other components that may be
                             // interested in the event.
                         }
                         TopologyEvent::NodeLeft { id } => {
                             println!("[Topology] Node left: {id}");
+
+                            let mut peers = self.peers.write().await;
+                            let rm_ctx = peers.read_ctx().derive_rm_ctx();
+                            let op = peers.rm(id, rm_ctx);
+                            peers.apply(op);
                         }
                         TopologyEvent::NodeSuspect { id } => {
                             println!("[Topology] Heartbeat from: {id}");
@@ -237,6 +263,7 @@ impl topology::Server for Topology {
         println!("Received request to register node");
 
         let peers = self.peers.clone();
+        let actor = self.node.id;
 
         Promise::from_future(async move {
             let node = params.get()?.get_info()?;
@@ -265,8 +292,10 @@ impl topology::Server for Topology {
                 noise_static_pub: public_key.to_vec(),
             };
 
-            let mut peers = peers.write().await;
-            peers.push(handle);
+            let mut map = peers.write().await;
+            let add_ctx = map.read_ctx().derive_add_ctx(actor);
+            let op = map.update(id, add_ctx, |reg, ctx| reg.write(handle, ctx));
+            map.apply(op);
 
             Ok(())
         })
@@ -293,15 +322,23 @@ impl topology::Server for Topology {
         let peers = self.peers.clone();
 
         Promise::from_future(async move {
-            let peers = peers.read().await;
+            let map = peers.read().await;
+
+            // Snapshot one representative value per MVReg.
+            let mut peers: Vec<PeerHandle> = Vec::new();
+            for val_ctx in map.values() {
+                let reg = val_ctx.val;
+                let vals = reg.read();
+                if let Some(ph) = vals.val.last().cloned() {
+                    peers.push(ph);
+                }
+            }
 
             let list_builder = results.get().init_nodes();
-
             let mut node_list = list_builder.init_nodes(peers.len() as u32);
 
-            for (i, peer) in peers.iter().enumerate() {
+            for (i, peer) in peers.into_iter().enumerate() {
                 let mut node = node_list.reborrow().get(i as u32);
-
                 set_node_id(node.reborrow().init_id(), &peer.id);
                 node.set_addr(&peer.address);
                 node.set_hostname(&peer.hostname);
