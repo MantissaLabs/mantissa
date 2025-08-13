@@ -2,7 +2,7 @@ use crate::client::common;
 use crate::gossip_capnp::gossip_message;
 use crate::node::address::{compute_advertise_ip, extract_port};
 use crate::node::id::{read_node_id, set_node_id};
-use crate::node::identity::{peer_id_from_public, PeerId};
+use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
 use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
@@ -61,7 +61,7 @@ pub struct PeerHandle {
     pub address: String,
     pub root_hash: String,
     pub client: server::Client,
-    pub noise_static_pub: Vec<u8>,
+    pub noise_static_pub: PublicKey,
 }
 
 impl fmt::Debug for PeerHandle {
@@ -72,7 +72,10 @@ impl fmt::Debug for PeerHandle {
             .field("hostname", &self.hostname)
             .field("address", &self.address)
             .field("root_hash", &self.root_hash)
-            .field("noise_static_pub_len", &self.noise_static_pub.len())
+            .field(
+                "noise_static_pub_len",
+                &self.noise_static_pub.to_bytes().len(),
+            )
             .finish()
     }
 }
@@ -88,7 +91,7 @@ pub enum TopologyEvent {
         address: String,
         root_hash: String,
         client: server::Client,
-        noise_static_pub: Vec<u8>,
+        noise_static_pub: PublicKey,
     },
     NodeLeft {
         id: Uuid,
@@ -121,7 +124,47 @@ impl Topology {
     // Sets the server handle for the topology component. Returns an error if the handle
     // has already been set.
     pub fn set_server_handle(&self, handle: ServerClient) -> Result<(), ServerClient> {
-        self.server_handle.set(handle)
+        let res = self.server_handle.set(handle.clone());
+        if res.is_ok() {
+            let peers = self.peers.clone();
+            let id = self.node.id;
+            let hostname = self
+                .node
+                .system_info
+                .info
+                .hostname
+                .clone()
+                .unwrap_or_default();
+
+            let advertise = self.get_advertise_address();
+            let root_hash = String::new(); // TODO: put real local root hash
+            let public_key = self.public_key;
+
+            let local = PeerHandle {
+                id,
+                hostname,
+                address: advertise,
+                root_hash,
+                client: handle,
+                noise_static_pub: public_key,
+            };
+
+            tokio::task::spawn_local(async move {
+                let mut map = peers.write().await;
+                let ctx = map.read_ctx().derive_add_ctx(id);
+                let op = map.update(id, ctx, |reg, ctx| reg.write(local, ctx));
+                map.apply(op);
+            });
+        }
+        res
+    }
+
+    // TODO: Handle error cases
+    pub fn get_advertise_address(&self) -> String {
+        let local_listen_port: u16 = extract_port(self.addr.clone().as_str()).unwrap();
+        let advertise_ip = compute_advertise_ip(None, None).unwrap();
+        let advertise = format!("{}:{}", advertise_ip, local_listen_port);
+        advertise
     }
 
     pub fn get_server_handle(&self) -> Option<ServerClient> {
@@ -150,7 +193,7 @@ impl Topology {
                                 hostname,
                                 root_hash,
                                 client,
-                                noise_static_pub: noise_static_pub.to_vec(),
+                                noise_static_pub,
                             };
 
                             // Write to map.
@@ -204,6 +247,7 @@ impl topology::Server for Topology {
         }
         let server_handle = handle.unwrap();
         let public_key = self.public_key.clone().to_bytes();
+        let advertise = self.get_advertise_address();
 
         Promise::from_future(async move {
             let request = params.get()?.get_link()?;
@@ -221,11 +265,6 @@ impl topology::Server for Topology {
             if anchor == self_addr {
                 return Err(capnp::Error::failed("cannot join own address".to_string()));
             }
-
-            let local_listen_port: u16 = extract_port(self_addr.as_str())?;
-
-            let advertise_ip = compute_advertise_ip(None, Some(anchor.as_str()))?;
-            let advertise = format!("{}:{}", advertise_ip, local_listen_port);
 
             let client = common::get_client_secure(anchor.as_str(), join_token.as_str())
                 .await
@@ -283,13 +322,15 @@ impl topology::Server for Topology {
                 address,
             );
 
+            let pubkey = pubkey_from_slice(public_key).expect("expect valid public key");
+
             let handle = PeerHandle {
                 id,
                 address,
                 hostname,
                 root_hash,
                 client: handle,
-                noise_static_pub: public_key.to_vec(),
+                noise_static_pub: pubkey,
             };
 
             let mut map = peers.write().await;
@@ -387,6 +428,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
 
     let node = reader.get_node()?;
     let id = read_node_id(node.get_id()?)?;
+    let pubkey = pubkey_from_slice(node.get_public_key()?).expect("Failed to parse public key");
 
     let event = match reader.get_event()? {
         EventType::Add => TopologyEvent::NodeJoined {
@@ -395,7 +437,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             address: node.get_addr()?.to_str()?.to_string(),
             root_hash: node.get_root_hash()?.to_str()?.to_string(),
             client: node.get_handle()?,
-            noise_static_pub: node.get_public_key()?.to_vec(),
+            noise_static_pub: pubkey,
         },
         EventType::Remove => TopologyEvent::NodeLeft { id },
         EventType::Suspect => TopologyEvent::NodeSuspect { id },
@@ -429,7 +471,7 @@ pub fn add_event(
             node.set_hostname(hostname);
             node.set_addr(address);
             node.set_root_hash(root_hash);
-            node.set_public_key(noise_static_pub);
+            node.set_public_key(&noise_static_pub.to_bytes());
 
             // Set the handle as a Cap’n Proto client
             node.set_handle(client.clone());
