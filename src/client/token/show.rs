@@ -1,7 +1,7 @@
 use crate::client::{common, config::ClientConfig};
-use std::error::Error;
+use anyhow::Result;
 
-pub async fn show(cfg: &ClientConfig) -> Result<(), Box<dyn Error>> {
+pub async fn show(cfg: &ClientConfig) -> Result<()> {
     let client = common::get_client_auto(cfg).await?;
 
     let request = client.get_topology_request();

@@ -1,18 +1,23 @@
 use crate::{
+    client::errors::ClientConnectError,
     net::unix_socket::candidate_unix_socket_paths,
     noise::{client_handshake, load_or_generate_noise_keys},
     server_capnp::server::Client,
 };
-use capnp::Error as CapnpError;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::{AsyncReadExt, FutureExt};
-use std::sync::Arc;
+use std::{
+    fs, io,
+    os::unix::fs::FileTypeExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::net::UnixStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-// Used to get a client connection with Capn'proto.
-// At the moment, any method using `get_client` *needs* to be run in a tokio task,
-// otherwise this will panic.
+/// Used to get a client connection with Capn'proto.
+/// At the moment, any method using `get_client` *needs* to be run in a tokio task,
+/// otherwise this will panic.
 pub async fn get_client_secure(addr: &str, token: &str) -> Result<Client, capnp::Error> {
     use std::net::ToSocketAddrs;
     let sock = addr
@@ -47,11 +52,8 @@ pub async fn get_client_secure(addr: &str, token: &str) -> Result<Client, capnp:
     Ok(client)
 }
 
-// Explicit socket for local communication.
-pub async fn get_client_unix_path(path: std::path::PathBuf) -> Result<Client, CapnpError> {
-    let stream = UnixStream::connect(path)
-        .await
-        .map_err(|e| CapnpError::failed(e.to_string()))?;
+/// Shared helper to build a client from a connected UnixStream
+async fn client_from_unix_stream(stream: UnixStream) -> Result<Client, ClientConnectError> {
     let (reader, writer) = stream.compat().split();
     let network = twoparty::VatNetwork::new(
         reader,
@@ -65,38 +67,64 @@ pub async fn get_client_unix_path(path: std::path::PathBuf) -> Result<Client, Ca
     Ok(client)
 }
 
-// Auto socket: try /var/run, /run, $XDG_RUNTIME_DIR, /tmp
-pub async fn get_client_unix_auto() -> Result<Client, CapnpError> {
-    let mut last = None;
-    for p in candidate_unix_socket_paths() {
-        match UnixStream::connect(&p).await {
-            Ok(stream) => {
-                let (reader, writer) = stream.compat().split();
-                let network = twoparty::VatNetwork::new(
-                    reader,
-                    writer,
-                    rpc_twoparty_capnp::Side::Client,
-                    Default::default(),
-                );
-                let mut rpc = RpcSystem::new(Box::new(network), None);
-                let client: Client = rpc.bootstrap(rpc_twoparty_capnp::Side::Server);
-                tokio::task::spawn_local(rpc.map(|_| ()));
-                return Ok(client);
-            }
-            Err(e) => last = Some(e),
+fn classify_path_not_socket(path: &Path) -> Option<ClientConnectError> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if !meta.file_type().is_socket() {
+            return Some(ClientConnectError::LocalSocketNotASocket {
+                path: path.to_path_buf(),
+            });
         }
     }
-    Err(CapnpError::failed(format!(
-        "no local mantissa.sock found: last error: {last:?}"
-    )))
+    None
 }
 
-// Used for local client command -> mantissa process communication.
+/// Explicit socket for local communication.
+pub async fn get_client_unix_path(path: PathBuf) -> Result<Client, ClientConnectError> {
+    if let Some(e) = classify_path_not_socket(&path) {
+        return Err(e);
+    }
+
+    match UnixStream::connect(&path).await {
+        Ok(stream) => client_from_unix_stream(stream).await,
+        Err(e) => {
+            use io::ErrorKind::*;
+            Err(match e.kind() {
+                NotFound => ClientConnectError::LocalSocketNotFound { tried: vec![path] },
+                PermissionDenied => ClientConnectError::LocalSocketPermissionDenied { path },
+                ConnectionRefused => ClientConnectError::LocalSocketRefused { path },
+                _ => ClientConnectError::LocalSocketOther { path, source: e },
+            })
+        }
+    }
+}
+
+/// Get local socket client, either use explicitly provided socket path
+/// or auto-discover.
 pub async fn get_client_auto(
     cfg: &crate::client::config::ClientConfig,
-) -> Result<Client, CapnpError> {
+) -> Result<Client, ClientConnectError> {
     if let Some(ref p) = cfg.socket {
         return get_client_unix_path(p.clone()).await;
     }
-    get_client_unix_auto().await
+
+    // Auto discover local socket.
+    let mut tried: Vec<PathBuf> = Vec::new();
+    for p in candidate_unix_socket_paths() {
+        tried.push(p.clone());
+        if let Some(e) = classify_path_not_socket(&p) {
+            return Err(e);
+        }
+        match UnixStream::connect(&p).await {
+            Ok(stream) => return client_from_unix_stream(stream).await,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(ClientConnectError::LocalSocketPermissionDenied { path: p })
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                return Err(ClientConnectError::LocalSocketRefused { path: p })
+            }
+            Err(e) => return Err(ClientConnectError::LocalSocketOther { path: p, source: e }),
+        }
+    }
+    Err(ClientConnectError::LocalSocketNotFound { tried })
 }

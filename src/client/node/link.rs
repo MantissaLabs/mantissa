@@ -1,10 +1,10 @@
 use crate::client::common;
 use crate::client::config::ClientConfig;
 use crate::topology_capnp::join_request as JoinRequest;
+use anyhow::Result;
 use capnp::message::Builder;
-use std::error::Error;
 
-pub async fn link(cfg: &ClientConfig) -> Result<(), Box<dyn Error>> {
+pub async fn link(cfg: &ClientConfig) -> Result<()> {
     let client = common::get_client_auto(cfg).await?;
 
     let request = client.get_topology_request();
