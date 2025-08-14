@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 mod config;
 
 use crate::gossip_capnp::gossip::Client as GossipClient;
+use crate::net::unix_socket::start_unix_socket_server_auto;
 use crate::node::node;
 use crate::node_capnp::node::Client as NodeClient;
 use crate::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
@@ -146,55 +147,56 @@ impl ServerImpl {
         }
     }
 
-    pub async fn start_rpc_secure(self) -> Result<(), Box<dyn std::error::Error>> {
-        let config = self.config.as_ref().unwrap();
-        let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
-        println!("Server listening (secure) on {}", config.listen_addr);
+    // in impl ServerImpl
+    pub async fn start_daemon(
+        self,
+        enable_unix_socket: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Extract what we need *before* consuming self in new_client(self)
+        let cfg = self.config.as_ref().expect("config");
+        let listen_addr = cfg.listen_addr.clone();
 
         let token_store = self.token_store.as_ref().cloned().unwrap_or_default();
-        let keys = self.noise_keys.as_ref().expect("noise keys").clone();
+        let noise_keys = self.noise_keys.as_ref().expect("noise keys").clone();
 
-        let server_handle: server::Client = capnp_rpc::new_client(self);
+        // Turn the server impl into a Cap'n Proto capability
+        let server_handle: crate::server_capnp::server::Client = capnp_rpc::new_client(self);
 
-        loop {
-            let (stream, _peer) = listener.accept().await?;
-
-            // TODO: Should we get the peer address from the stream and pass that down
-            // to Topology?
-            // let local_sa = stream.local_addr().ok(); // e.g., 192.168.104.3:6578
-            // let peer_sa = stream.peer_addr().ok();
-            // println!("local: {:?} / peer: {:?}", local_sa, peer_sa);
-
-            stream.set_nodelay(true)?;
-            let server_handle_clone = server_handle.clone();
-            let keys = keys.clone();
-            let tokens = token_store.clone();
-
+        // Spawn TCP secure listener
+        let tcp_task = {
+            let server_handle = server_handle.clone();
+            let token_store = token_store.clone();
+            let noise_keys = noise_keys.clone();
             tokio::task::spawn_local(async move {
-                match crate::noise::server_handshake(stream, tokens, &keys).await {
-                    Ok(noise_stream) => {
-                        let (reader, writer) =
-                            tokio_util::compat::TokioAsyncReadCompatExt::compat(noise_stream)
-                                .split();
-
-                        let network = capnp_rpc::twoparty::VatNetwork::new(
-                            futures::io::BufReader::new(reader),
-                            futures::io::BufWriter::new(writer),
-                            capnp_rpc::rpc_twoparty_capnp::Side::Server,
-                            Default::default(),
-                        );
-
-                        let rpc_system = capnp_rpc::RpcSystem::new(
-                            Box::new(network),
-                            Some(server_handle_clone.client),
-                        );
-
-                        rpc_system.await;
-                    }
-                    Err(e) => eprintln!("Noise handshake/token failed: {e}"),
+                if let Err(e) = crate::net::tcp_secure::start_tcp_secure_listener(
+                    listen_addr,
+                    server_handle,
+                    token_store,
+                    noise_keys,
+                )
+                .await
+                {
+                    eprintln!("TCP secure listener error: {e}");
                 }
-            });
-        }
+            })
+        };
+
+        // Spawn UnixSocket listener (optional)
+        let unix_task = if enable_unix_socket {
+            let server_handle = server_handle.clone();
+            tokio::task::spawn_local(async move {
+                match start_unix_socket_server_auto(server_handle).await {
+                    Ok(p) => eprintln!("UnixSocket ready at {}", p.display()),
+                    Err(e) => eprintln!("UnixSocket listener error: {e}"),
+                }
+            })
+        } else {
+            tokio::task::spawn_local(async {})
+        };
+
+        // TODO: Run forever for now, find a way to stop these gracefully.
+        let _ = tokio::join!(tcp_task, unix_task);
+        Ok(())
     }
 
     pub fn with_token_store(&mut self, token_store: TokenStore) -> &mut ServerImpl {
@@ -294,6 +296,5 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
         topology.run().await;
     });
 
-    server.start_rpc_secure().await?;
-    Ok(())
+    server.start_daemon(true).await
 }

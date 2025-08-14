@@ -1,12 +1,13 @@
 use crate::client::common;
+use crate::client::config::ClientConfig;
 use crate::node::id::{id_sort_key_uuid_bytes, id_string};
 use crate::topology_capnp::node_info::Reader as NodeInfo;
 use std::error::Error;
 use std::io::Write;
 use tabwriter::TabWriter;
 
-pub async fn list(server_address: &str, _cluster: &str) -> Result<(), Box<dyn Error>> {
-    let client = common::get_client_secure(server_address, "").await?;
+pub async fn list(cfg: &ClientConfig) -> Result<(), Box<dyn Error>> {
+    let client = common::get_client_auto(cfg).await?;
 
     let request = client.get_topology_request();
     let topology = request.send().pipeline.get_topology();

@@ -30,14 +30,6 @@ pub fn init() -> Command {
                 .help("Sets the listen address"),
         )
         .arg(
-            Arg::new("anchor")
-                .short('a')
-                .long("anchor")
-                .value_name("ANCHOR")
-                .default_value("0.0.0.0:6578")
-                .help("Sets the anchor address to join the network of nodes"),
-        )
-        .arg(
             Arg::new("name")
                 .short('n')
                 .long("name")
@@ -74,10 +66,12 @@ pub fn init() -> Command {
             Command::new("link")
                 .about("Link a node to an existing cluster")
                 .arg(
-                    Arg::new("debug")
-                        .short('d')
-                        .help("print debug information verbosely")
-                        .action(ArgAction::SetTrue),
+                    Arg::new("anchor")
+                        .short('a')
+                        .long("anchor")
+                        .value_name("ANCHOR")
+                        .default_value("0.0.0.0:6578")
+                        .help("Sets the anchor address to join the network of nodes"),
                 )
                 .arg(
                     Arg::new("join-token")
@@ -85,6 +79,12 @@ pub fn init() -> Command {
                         .value_name("TOKEN")
                         .help("Join token to authenticate with the remote anchor")
                         .num_args(1),
+                )
+                .arg(
+                    Arg::new("debug")
+                        .short('d')
+                        .help("print debug information verbosely")
+                        .action(ArgAction::SetTrue),
                 ),
         )
         .subcommand(

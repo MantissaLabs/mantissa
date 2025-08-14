@@ -11,6 +11,7 @@ mod hash_mvreg;
 mod includes;
 mod logger;
 pub mod monitor;
+mod net;
 mod node;
 mod noise;
 mod server;
@@ -30,6 +31,8 @@ use log::LevelFilter;
 use std::error::Error;
 use tokio::task::LocalSet;
 
+use crate::client::config::ClientConfig;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     log::set_logger(&logger::LOGGER)
@@ -40,15 +43,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let matches = cli::init().get_matches();
 
-    let anchor: String = matches
-        .get_one::<String>("anchor")
-        .expect("has a default")
-        .clone();
-
     let listen: String = matches
         .get_one::<String>("listen")
         .expect("has a default")
         .clone();
+
+    let mut cfg = ClientConfig::default();
 
     match matches.subcommand() {
         Some(("init", _)) => {
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Some(("info", _)) => {
-            local.run_until(client::node::info(&anchor)).await?;
+            local.run_until(client::node::info(&cfg)).await?;
         }
 
         Some(("nodes", nodes_matches)) => match nodes_matches.subcommand() {
@@ -66,9 +66,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .map(String::as_str)
                     .unwrap_or("");
 
-                local
-                    .run_until(client::node::list(&anchor, &cluster))
-                    .await?;
+                cfg.cluster = Some(cluster.to_string());
+
+                local.run_until(client::node::list(&cfg)).await?;
             }
             _ => {
                 let _ = nodes_matches.subcommand_name();
@@ -77,10 +77,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         Some(("token", token_matches)) => match token_matches.subcommand() {
             Some(("show", _)) => {
-                local.run_until(client::token::show(&anchor)).await?;
+                local.run_until(client::token::show(&cfg)).await?;
             }
             Some(("rotate", _)) => {
-                local.run_until(client::token::rotate(&anchor)).await?;
+                local.run_until(client::token::rotate(&cfg)).await?;
             }
             _ => {
                 let _ = token_matches.subcommand_name();
@@ -97,9 +97,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .expect("has a default")
                 .clone();
 
-            local
-                .run_until(client::node::link(&listen, &anchor, &join_token))
-                .await?;
+            let anchor: String = link_matches
+                .get_one::<String>("anchor")
+                .expect("has a default")
+                .clone();
+
+            cfg.join_token = Some(join_token.clone());
+            cfg.anchor = Some(anchor.clone());
+
+            local.run_until(client::node::link(&cfg)).await?;
         }
 
         _ => unreachable!(),
