@@ -135,9 +135,7 @@ pub async fn server_handshake(
     // TODO: Use Admission Trait to check whether the member is already registered
     // or not, and if not, register them using their public key.
 
-    // Auth decision:
-    // - If loopback and flag is set -> allow without token
-    // - Else -> require token match
+    // If token isn't matching, fail the handshake.
     if !tokens.matches(token_str).await {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
