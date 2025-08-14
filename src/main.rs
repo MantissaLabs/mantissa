@@ -21,95 +21,83 @@ mod topology;
 mod types;
 mod workload;
 
+use clap::Parser;
 use includes::{
     gossip_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
     topology_capnp, utils_capnp,
 };
 
 use anyhow::Result;
-use log::LevelFilter;
 use std::error::Error;
 use tokio::task::LocalSet;
 
-use crate::client::config::ClientConfig;
+use crate::{
+    cli::{Command, MantissaCli, NodesCommand, TasksCommand, TokenCommand},
+    client::config::ClientConfig,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     log::set_logger(&logger::LOGGER)
-        .map(|()| log::set_max_level(LevelFilter::Info))
+        .map(|()| log::set_max_level(log::LevelFilter::Info))
         .unwrap();
 
     let local = LocalSet::new();
+    let args = MantissaCli::parse();
 
-    let matches = cli::init().get_matches();
-
-    let listen: String = matches
-        .get_one::<String>("listen")
-        .expect("has a default")
-        .clone();
+    // Global listen address (only used by `init`/daemon start)
+    let listen = args.listen.clone();
 
     let mut cfg = ClientConfig::default();
 
-    match matches.subcommand() {
-        Some(("init", _)) => {
+    match args.cmd {
+        Command::Init(_init) => {
             local.run_until(server::start(listen)).await?;
         }
 
-        Some(("info", _)) => {
+        Command::Info(_info) => {
             local.run_until(client::node::info(&cfg)).await?;
         }
 
-        Some(("nodes", nodes_matches)) => match nodes_matches.subcommand() {
-            Some(("list", list_matches)) => {
-                let cluster: &str = list_matches
-                    .get_one::<String>("cluster")
-                    .map(String::as_str)
-                    .unwrap_or("");
-
-                cfg.cluster = Some(cluster.to_string());
-
+        Command::Nodes { cmd } => match cmd {
+            NodesCommand::List(n) => {
+                cfg.cluster = n.cluster.clone();
                 local.run_until(client::node::list(&cfg)).await?;
             }
-            _ => {
-                let _ = nodes_matches.subcommand_name();
+        },
+
+        Command::Token { cmd } => match cmd {
+            TokenCommand::Show => local.run_until(client::token::show(&cfg)).await?,
+            TokenCommand::Rotate => local.run_until(client::token::rotate(&cfg)).await?,
+        },
+
+        Command::Tasks { cmd } => match cmd {
+            TasksCommand::List(t) => {
+                eprintln!("tasks list: {:?}", t.cluster);
             }
         },
 
-        Some(("token", token_matches)) => match token_matches.subcommand() {
-            Some(("show", _)) => {
-                local.run_until(client::token::show(&cfg)).await?;
-            }
-            Some(("rotate", _)) => {
-                local.run_until(client::token::rotate(&cfg)).await?;
-            }
-            _ => {
-                let _ = token_matches.subcommand_name();
-            }
-        },
-
-        Some(("submit", _)) => {
+        Command::Submit(s) => {
+            // e.g., workload::task::submit(&s.input).await?;
             workload::task::submit().await?;
         }
 
-        Some(("link", link_matches)) => {
-            let join_token: String = link_matches
-                .get_one::<String>("join-token")
-                .expect("has a default")
-                .clone();
-
-            let anchor: String = link_matches
-                .get_one::<String>("anchor")
-                .expect("has a default")
-                .clone();
-
-            cfg.join_token = Some(join_token.clone());
-            cfg.anchor = Some(anchor.clone());
-
+        Command::Link(l) => {
+            cfg.join_token = l.join_token.clone();
+            cfg.anchor = Some(l.anchor.clone());
             local.run_until(client::node::link(&cfg)).await?;
         }
 
-        _ => unreachable!(),
-    };
+        Command::Merge(m) => {
+            // e.g., client::cluster::merge(&cfg, &m.origin, &m.destination).await?;
+            eprintln!("merge {} -> {}", m.origin, m.destination);
+        }
+
+        Command::Split(s) => {
+            // e.g., client::cluster::split(&cfg, &s.cluster).await?;
+            eprintln!("split {}", s.cluster);
+        }
+    }
 
     Ok(())
 }
