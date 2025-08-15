@@ -7,7 +7,7 @@ use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
 use crate::token::TokenStore;
-use crate::topology_capnp::{topology, topology_event};
+use crate::topology_capnp::{topology, topology_event, NodeStatus};
 use async_channel::Receiver;
 use capnp::{capability::Promise, Error};
 use crdts::{CmRDT, MVReg, Map as CrdtMap};
@@ -385,6 +385,7 @@ impl topology::Server for Topology {
                 node.set_hostname(&peer.hostname);
                 node.set_root_hash(&peer.root_hash);
                 node.set_handle(peer.client.clone());
+                node.set_health(NodeStatus::Alive);
             }
 
             Ok(())
