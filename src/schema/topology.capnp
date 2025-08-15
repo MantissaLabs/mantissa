@@ -4,6 +4,7 @@ using Scheduling = import "scheduling.capnp";
 using Server = import "server.capnp";
 using Info = import "info.capnp";
 using Sync = import "sync.capnp";
+using Health = import "health.capnp";
 
 interface Topology {
   # Topology defines operations to join or leave a
@@ -67,24 +68,6 @@ struct NodeId {
   bytes @0 :Data;  # exactly 16 bytes (enforce in code)
 }
 
-enum NodeStatus {
-  unknown @0;
-  # default before any heartbeat observed
-
-  alive @1;
-  # heartbeats within expected window
-
-  suspect @2;
-  # consecutive misses over threshold (e.g., >= 3), not yet declared down
-
-  down @3;
-  # unreachable beyond failure timeout / reconnection budget
-
-  degraded @4;
-  # reachable but persistent digest/root mismatch beyond grace window
-  # (useful to signal "needs anti-entropy" without marking it down)
-}
-
 struct NodeInfo {
   # A Machine. Can be any process taking part
   # in the system throughout the cluster lifetime.
@@ -116,7 +99,7 @@ struct NodeInfo {
   publicKey @7 :Data;
   # Noise public key.
 
-  health @8 :NodeStatus;
+  health @8 :Health.NodeStatus;
   # Health status of the node.
 }
 

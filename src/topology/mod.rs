@@ -1,5 +1,6 @@
 use crate::client::common;
 use crate::gossip_capnp::gossip_message;
+use crate::health_capnp::NodeStatus;
 use crate::node::address::{compute_advertise_ip, extract_port};
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
@@ -7,7 +8,7 @@ use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
 use crate::token::TokenStore;
-use crate::topology_capnp::{topology, topology_event, NodeStatus};
+use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
 use capnp::{capability::Promise, Error};
 use crdts::{CmRDT, MVReg, Map as CrdtMap};

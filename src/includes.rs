@@ -6,3 +6,4 @@ capnp::generated_code!(pub mod scheduling_capnp);
 capnp::generated_code!(pub mod info_capnp);
 capnp::generated_code!(pub mod utils_capnp);
 capnp::generated_code!(pub mod sync_capnp);
+capnp::generated_code!(pub mod health_capnp);

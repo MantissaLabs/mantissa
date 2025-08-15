@@ -23,7 +23,7 @@ mod workload;
 
 use clap::Parser;
 use includes::{
-    gossip_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
+    gossip_capnp, health_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
     topology_capnp, utils_capnp,
 };
 
