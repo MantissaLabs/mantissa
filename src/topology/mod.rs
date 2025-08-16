@@ -7,13 +7,16 @@ use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
 use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
+use crate::store::crdt::peers::PeersCrdt;
+use crate::store::Store;
 use crate::token::TokenStore;
+use crate::topology::peers::types::PeerValue;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
 use capnp::{capability::Promise, Error};
-use crdts::{CmRDT, MVReg, Map as CrdtMap};
 use log::info;
 use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,25 +27,25 @@ use x25519_dalek::PublicKey;
 pub mod peer_provider;
 pub mod peers;
 
-type ActorId = Uuid;
-type PeerMap = CrdtMap<Uuid, MVReg<PeerHandle, ActorId>, ActorId>;
+pub type HandleMap = Arc<RwLock<HashMap<Uuid, server::Client>>>;
 
 #[derive(Clone)]
-pub struct Topology {
+pub struct Topology<S: Store + 'static> {
     // Address of the node.
     // FIXME: To be replaced with full NodeInfo struct.
     addr: String,
 
     token_store: TokenStore,
 
-    // NodeInfo struct.
+    // NodeInfo struct for our local node.
     node: Node,
 
     // Node event receiver, from gossiping or other components.
     rx: Receiver<TopologyEvent>,
 
-    // The list of peers in our topology.
-    peers: Arc<RwLock<PeerMap>>,
+    peers: PeersCrdt,
+
+    handles: HandleMap, // ephemeral capabilities
 
     // The capability handle for the server. To be sent to peers.
     server_handle: Rc<OnceCell<ServerClient>>,
@@ -53,6 +56,9 @@ pub struct Topology {
     // The peer ID derived from the public key.
     // FIXME: detangle from the u64 id defined in Capnproto Node struct.
     peer_id: PeerId,
+
+    // Peer storage
+    store: Arc<S>,
 }
 
 #[derive(Clone)]
@@ -102,19 +108,22 @@ pub enum TopologyEvent {
     },
 }
 
-impl Topology {
+impl<S: Store + 'static> Topology<S> {
     pub fn new(
         addr: String,
         rx: Receiver<TopologyEvent>,
         token_store: TokenStore,
         public: PublicKey,
         node: Node,
+        store: Arc<S>,
     ) -> Self {
         Self {
             addr,
             rx,
-            peers: Arc::new(RwLock::new(CrdtMap::new())),
+            store,
+            peers: PeersCrdt::new(node.id),
             server_handle: std::rc::Rc::new(OnceCell::new()),
+            handles: Arc::new(RwLock::new(HashMap::new())),
             token_store,
             public_key: public,
             peer_id: peer_id_from_public(&public),
@@ -128,6 +137,8 @@ impl Topology {
         let res = self.server_handle.set(handle.clone());
         if res.is_ok() {
             let peers = self.peers.clone();
+            let store = self.store.clone();
+            let handles = self.handles.clone();
             let id = self.node.id;
             let hostname = self
                 .node
@@ -141,20 +152,34 @@ impl Topology {
             let root_hash = String::new(); // TODO: put real local root hash
             let public_key = self.public_key;
 
-            let local = PeerHandle {
-                id,
-                hostname,
-                address: advertise,
-                root_hash,
-                client: handle,
-                noise_static_pub: public_key,
+            let v = PeerValue {
+                address: advertise.clone(),
+                hostname: hostname.clone(),
+                noise_static_pub: public_key.to_bytes(),
             };
 
             tokio::task::spawn_local(async move {
-                let mut map = peers.write().await;
-                let ctx = map.read_ctx().derive_add_ctx(id);
-                let op = map.update(id, ctx, |reg, ctx| reg.write(local, ctx));
-                map.apply(op);
+                handles.write().await.insert(id, handle);
+
+                // Only upsert/persist if we are NOT already present
+                let exists = peers.get(&id).await.is_some();
+                if !exists {
+                    peers.upsert(id, v.clone()).await;
+
+                    if let Err(e) = store.upsert_peer(id, &v).await {
+                        log::warn!("failed to persist local peer: {e}");
+                    }
+                }
+
+                // Persist a copy of our local node info out-of-band (handy for restarts)
+                let _ = store
+                    .store_local_node(&crate::store::local::LocalNodeInfo {
+                        id,
+                        hostname,
+                        address: advertise,
+                        noise_static_pub: v.noise_static_pub,
+                    })
+                    .await;
             });
         }
         res
@@ -188,20 +213,17 @@ impl Topology {
                         } => {
                             println!("[Topology] Node joined: {id} at {address}");
 
-                            let handle = PeerHandle {
-                                id,
-                                address,
+                            let v = PeerValue {
+                                address: address,
                                 hostname,
-                                root_hash,
-                                client,
-                                noise_static_pub,
+                                noise_static_pub: noise_static_pub.to_bytes(),
                             };
 
-                            // Write to map.
-                            let mut peers = self.peers.write().await;
-                            let add_ctx = peers.read_ctx().derive_add_ctx(self.node.id);
-                            let op = peers.update(id, add_ctx, |reg, ctx| reg.write(handle, ctx));
-                            peers.apply(op);
+                            self.peers.upsert(id, v.clone()).await;
+                            self.store
+                                .upsert_peer(id, &v)
+                                .await
+                                .map_err(|e| capnp::Error::failed(e.to_string()));
 
                             // TODO: broadcast event to other components that may be
                             // interested in the event.
@@ -209,10 +231,11 @@ impl Topology {
                         TopologyEvent::NodeLeft { id } => {
                             println!("[Topology] Node left: {id}");
 
-                            let mut peers = self.peers.write().await;
-                            let rm_ctx = peers.read_ctx().derive_rm_ctx();
-                            let op = peers.rm(id, rm_ctx);
-                            peers.apply(op);
+                            self.peers.remove(&id).await;
+                            self.store
+                                .remove_peer(id)
+                                .await
+                                .map_err(|e| capnp::Error::failed(e.to_string()));
                         }
                         TopologyEvent::NodeSuspect { id } => {
                             println!("[Topology] Heartbeat from: {id}");
@@ -227,9 +250,37 @@ impl Topology {
             }
         }
     }
+
+    /// Load persisted peers into the CRDT on startup.
+    pub async fn load_from_store(&self) -> std::io::Result<()> {
+        let rows = self.store.load_peers().await?;
+        for (id, val) in rows {
+            self.peers.upsert(id, val).await;
+        }
+        Ok(())
+    }
+
+    pub async fn register_peer_persisted(
+        &self,
+        id: Uuid,
+        val: PeerValue,
+        handle: server::Client,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.peers.upsert(id, val.clone()).await;
+        self.store.upsert_peer(id, &val).await?;
+        self.handles.write().await.insert(id, handle);
+        Ok(())
+    }
+
+    pub async fn remove_peer_persisted(&self, id: Uuid) -> Result<(), Box<dyn std::error::Error>> {
+        self.peers.remove(&id).await;
+        self.store.remove_peer(id).await?;
+        self.handles.write().await.remove(&id);
+        Ok(())
+    }
 }
 
-impl topology::Server for Topology {
+impl<S: Store + 'static> topology::Server for Topology<S> {
     /// Join the cluster and adds our client handle to the `Memberlist`
     /// Returns an instance of `Membership` to the caller to track its
     /// status.
@@ -286,7 +337,7 @@ impl topology::Server for Topology {
             info.set_public_key(&public_key);
 
             // TODO: Do something with the response.
-            let response = request.send().promise.await?;
+            let _response = request.send().promise.await?;
 
             println!("Request sent");
 
@@ -303,7 +354,8 @@ impl topology::Server for Topology {
         println!("Received request to register node");
 
         let peers = self.peers.clone();
-        let actor = self.node.id;
+        let store = self.store.clone();
+        let handles = self.handles.clone();
 
         Promise::from_future(async move {
             let node = params.get()?.get_info()?;
@@ -325,19 +377,20 @@ impl topology::Server for Topology {
 
             let pubkey = pubkey_from_slice(public_key).expect("expect valid public key");
 
-            let handle = PeerHandle {
-                id,
-                address,
+            let v = PeerValue {
+                address: address,
                 hostname,
-                root_hash,
-                client: handle,
-                noise_static_pub: pubkey,
+                noise_static_pub: pubkey.to_bytes(),
             };
 
-            let mut map = peers.write().await;
-            let add_ctx = map.read_ctx().derive_add_ctx(actor);
-            let op = map.update(id, add_ctx, |reg, ctx| reg.write(handle, ctx));
-            map.apply(op);
+            // Set the capability for that peer
+            handles.write().await.insert(id, handle);
+
+            peers.upsert(id, v.clone()).await;
+            store
+                .upsert_peer(id, &v)
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()));
 
             Ok(())
         })
@@ -362,31 +415,28 @@ impl topology::Server for Topology {
         println!("Listing nodes...");
 
         let peers = self.peers.clone();
+        let handles = self.handles.clone();
 
         Promise::from_future(async move {
-            let map = peers.read().await;
-
-            // Snapshot one representative value per MVReg.
-            let mut peers: Vec<PeerHandle> = Vec::new();
-            for val_ctx in map.values() {
-                let reg = val_ctx.val;
-                let vals = reg.read();
-                if let Some(ph) = vals.val.last().cloned() {
-                    peers.push(ph);
-                }
-            }
+            let peers = peers.all().await;
 
             let list_builder = results.get().init_nodes();
             let mut node_list = list_builder.init_nodes(peers.len() as u32);
 
-            for (i, peer) in peers.into_iter().enumerate() {
+            let handles_read = handles.read().await;
+
+            for (i, (id, peer)) in peers.into_iter().enumerate() {
                 let mut node = node_list.reborrow().get(i as u32);
-                set_node_id(node.reborrow().init_id(), &peer.id);
+                set_node_id(node.reborrow().init_id(), &id);
                 node.set_addr(&peer.address);
                 node.set_hostname(&peer.hostname);
-                node.set_root_hash(&peer.root_hash);
-                node.set_handle(peer.client.clone());
+                node.set_public_key(&peer.noise_static_pub);
                 node.set_health(NodeStatus::Alive);
+                // node.set_root_hash(&peer.root_hash);
+
+                if let Some(h) = handles_read.get(&id) {
+                    node.set_handle(h.clone());
+                }
             }
 
             Ok(())

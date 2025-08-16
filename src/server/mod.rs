@@ -9,6 +9,9 @@ use crate::node_capnp::node::Client as NodeClient;
 use crate::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
+use crate::store::path::default_db_path;
+use crate::store::peer_store::RedbStore;
+use crate::store::Store;
 use crate::topology;
 use crate::topology::PeerHandle;
 use crate::topology_capnp::topology::Client as TopologyClient;
@@ -251,6 +254,16 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     // FIXME: Placeholder peer list.
     let peers: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // Initialize peer store.
+    let db_path = default_db_path();
+    let store = Arc::new(RedbStore::open_or_create(db_path)?);
+
+    let self_id = store.load_or_create_node_id().await?;
+
+    // Set the ID on the Node and restore it. Since it is used by Topology, we don't
+    // want duplicates of the node with different IDs.
+    node.id = self_id;
+
     // The join token store for this node.
     let token_store = TokenStore::new(None);
     token_store.generate().await;
@@ -269,6 +282,7 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
         token_store.clone(),
         keys.public,
         node,
+        store,
     );
     let topology_client: TopologyClient = capnp_rpc::new_client(raw_topology.clone());
 
@@ -283,6 +297,9 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
 
     let server_client: ServerClient = capnp_rpc::new_client(server.clone());
 
+    // Load peers from store.
+    // TODO: This should be hidden inside topology.
+    raw_topology.load_from_store().await?;
     raw_topology.set_server_handle(server_client.clone());
     let mut topology = raw_topology.clone();
 
