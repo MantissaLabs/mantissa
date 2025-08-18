@@ -1,4 +1,4 @@
-use crate::{store::crdt::mvreg_snapshot::MvRegSnapshot, topology::peers::types::PeerValue};
+use crate::{store::crdt::mvreg::MvRegSnapshot, topology::peers::types::PeerValue};
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 

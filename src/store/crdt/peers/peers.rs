@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crdts::ctx::ReadCtx;
 use crdts::{CmRDT, MVReg, Map};
 
-use crate::store::crdt::mvreg_snapshot::MvRegSnapshot;
+use crate::store::crdt::mvreg::MvRegSnapshot;
 use crate::topology::peers::types::PeerValue;
 
 pub type Actor = Uuid;

@@ -1,4 +1,2 @@
-mod mst_entry;
-mod mvreg_snapshot;
+mod mvreg;
 pub mod peers;
-pub mod peers_mst;

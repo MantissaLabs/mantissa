@@ -3,8 +3,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::hash::XXHash128;
-use crate::store::crdt::mst_entry::PeerEntry;
-use crate::store::crdt::mvreg_snapshot::MvRegSnapshot;
+use crate::store::crdt::mvreg::MvRegSnapshot;
+use crate::store::crdt::peers::entry::PeerEntry;
 use crate::topology::peers::types::PeerValue;
 
 use merkle_search_tree::builder::Builder;
