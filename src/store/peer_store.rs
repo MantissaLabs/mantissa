@@ -175,19 +175,51 @@ impl Store for RedbStore {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("join error: {e}")))?
     }
 
-    async fn store_tombstone(&self, id: Uuid, ts: u64) -> io::Result<()> {
+    async fn store_tombstone(&self, id: Uuid) -> std::io::Result<u64> {
         let db = self.db.clone();
         let key = id.to_string();
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&ts.to_be_bytes());
+
         tokio::task::spawn_blocking(move || {
-            let w = db.begin_write().map_err(into_io)?;
+            let wtxn = db.begin_write().map_err(into_io)?;
+
+            // Read current tomb_seq in its own scope (drop guard & table)
+            let next: u64 = {
+                let meta = wtxn.open_table(META).map_err(into_io)?;
+                // AccessGuard borrows `meta`, keep it in a tighter scope.
+                let current = {
+                    let maybe = meta.get("tomb_seq").map_err(into_io)?;
+                    if let Some(guard) = maybe {
+                        let bytes = guard.value();
+                        let mut arr = [0u8; 8];
+                        if bytes.len() == 8 {
+                            arr.copy_from_slice(bytes);
+                        }
+                        u64::from_be_bytes(arr)
+                    } else {
+                        0
+                    }
+                };
+                current.saturating_add(1)
+            };
+
+            let next_bytes = next.to_be_bytes();
+
+            //  Write bumped tomb_seq (fresh table handle, no outstanding borrows)
             {
-                let mut t = w.open_table(TOMBS).map_err(into_io)?;
-                t.insert(key.as_str(), &buf[..]).map_err(into_io)?;
+                let mut meta = wtxn.open_table(META).map_err(into_io)?;
+                meta.insert("tomb_seq", &next_bytes[..]).map_err(into_io)?;
             }
-            w.commit().map_err(into_io)?;
-            Ok::<_, io::Error>(())
+
+            // Write (id -> ts) tombstone ----
+            {
+                let mut tombs = wtxn.open_table(TOMBS).map_err(into_io)?;
+                tombs
+                    .insert(key.as_str(), &next_bytes[..])
+                    .map_err(into_io)?;
+            }
+
+            wtxn.commit().map_err(into_io)?;
+            Ok::<_, std::io::Error>(next)
         })
         .await
         .map_err(|e| into_io(format!("join error: {e}")))?
