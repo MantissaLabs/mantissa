@@ -1,21 +1,21 @@
 @0xb4a5acd2fc1e5d0b;
 
-using Scheduling = import "scheduling.capnp";
-using Server = import "server.capnp";
-using Info = import "info.capnp";
-using Sync = import "sync.capnp";
-using Health = import "health.capnp";
+using import "scheduling.capnp".Timetable;
+using import "server.capnp".Server;
+using import "info.capnp".Info;
+using import "sync.capnp".Sync;
+using import "health.capnp".NodeStatus;
 
 interface Topology {
   # Topology defines operations to join or leave a
   # pool of servers.
 
-  join @0 (link :JoinRequest) -> ();
+  join @0 (link :JoinRequest) -> (resp :JoinResponse);
   # Join an existing pool of servers using an anchor address.
   # This method signals the intent to join. The next step is
   # to register the node.
 
-  registerNode @1 (info :NodeInfo) -> (sync :Sync.Sync);
+  registerNode @1 (info :NodeInfo) -> (sync :Sync);
   # Register the node to a remote server.
 
   leave @2 () -> ();
@@ -63,6 +63,10 @@ struct JoinRequest {
   # Token used to authenticate the join request.
 }
 
+struct JoinResponse {
+  error @0 :Text;
+}
+
 
 struct NodeId {
   bytes @0 :Data;  # exactly 16 bytes (enforce in code)
@@ -75,7 +79,7 @@ struct NodeInfo {
   id @0 :NodeId;
   # ID of the node.
 
-  handle @1 :Server.Server;
+  handle @1 :Server;
   # Interface to contact the node back.
 
   hostname @2 :Text;
@@ -84,10 +88,10 @@ struct NodeInfo {
   addr @3 :Text;
   # IP address of the machine.
 
-  info @4 :Info.Info;
+  info @4 :Info;
   # Machine resource usage.
 
-  timetable @5 :Scheduling.Timetable;
+  timetable @5 :Timetable;
   # The schedule table of the node, which represents
   # its current availabilities to welcome processes.
 
@@ -99,7 +103,7 @@ struct NodeInfo {
   publicKey @7 :Data;
   # Noise public key.
 
-  health @8 :Health.NodeStatus;
+  health @8 :NodeStatus;
   # Health status of the node.
 }
 

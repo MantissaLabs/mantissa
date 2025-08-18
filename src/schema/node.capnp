@@ -1,15 +1,15 @@
 @0xde292e0f854316dc;
 
-using Topology = import "topology.capnp";
+using import "topology.capnp".NodeInfo;
 using Scheduling = import "scheduling.capnp";
-using Info = import "info.capnp";
-using Utils = import "utils.capnp";
+using import "info.capnp".Info;
+using import "utils.capnp".Date;
 
 interface Node {
   # Node contains informations about the worker node as well as
   # its capabilities, which are used to schedule and execute tasks.
 
-  info @0 () -> (info :Info.Info);
+  info @0 () -> (info :Info);
   # Returns informations about the node, its resource usage, etc.
 
   scheduler @1 () -> (sched :Scheduler);
@@ -69,10 +69,10 @@ struct TaskInfo {
   image @4 :Text;
   # The image used if the process is a container.
 
-  created @5 :Utils.Date;
+  created @5 :Date;
   # Date on which the task was created.
 
-  machine @6 :Topology.NodeInfo;
+  machine @6 :NodeInfo;
   # Machine the task is running on. Used when listing
   # tasks from another node.
 

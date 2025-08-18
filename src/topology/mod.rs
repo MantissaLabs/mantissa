@@ -339,6 +339,11 @@ impl<S: Store + 'static> topology::Server for Topology<S> {
             // TODO: Do something with the response.
             let _response = request.send().promise.await?;
 
+            // Send signal to synchronize data with anchor node (fetch the Sync capability),
+            // and start:
+            // - heartbeat background task
+            // - gossip loop
+
             println!("Request sent");
 
             Ok(())

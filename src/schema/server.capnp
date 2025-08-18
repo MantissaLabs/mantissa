@@ -1,8 +1,8 @@
 @0xc6bf7606b8c44bc3;
 
-using Gossip = import "gossip.capnp";
-using Topology = import "topology.capnp";
-using Node = import "node.capnp";
+using import "gossip.capnp".Gossip;
+using import "topology.capnp".Topology;
+using import "node.capnp".Node;
 
 interface Server {
     # Server is the top level interface tying all the services together.
@@ -11,13 +11,13 @@ interface Server {
     # One-call bootstrap to get all capabilities
     getCapabilities @0 () -> (caps :Capabilities);
 
-    getGossip @1 () -> (gossip: Gossip.Gossip);
-    getTopology @2 () -> (topology: Topology.Topology);
-    getNode @3 () -> (node: Node.Node);
+    getGossip @1 () -> (gossip: Gossip);
+    getTopology @2 () -> (topology: Topology);
+    getNode @3 () -> (node: Node);
 }
 
 struct Capabilities {
-  gossip @0 :Gossip.Gossip;
-  topology @1 :Topology.Topology;
-  node @2 :Node.Node;
+  gossip @0 :Gossip;
+  topology @1 :Topology;
+  node @2 :Node;
 }
