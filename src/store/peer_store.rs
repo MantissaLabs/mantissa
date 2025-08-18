@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peers");
+const TOMBS: TableDefinition<&str, &[u8]> = TableDefinition::new("tombstones");
 
 #[derive(Clone)]
 pub struct RedbStore {
@@ -23,14 +24,13 @@ impl RedbStore {
         } else {
             Database::create(path).map_err(into_io)?
         };
-
-        // ensure table exists
         {
-            let wtxn = db.begin_write().map_err(into_io)?;
-            wtxn.open_table(PEERS).map_err(into_io)?;
-            wtxn.commit().map_err(into_io)?;
+            let w = db.begin_write().map_err(into_io)?;
+            w.open_table(PEERS).map_err(into_io)?;
+            w.open_table(META).map_err(into_io)?;
+            w.open_table(TOMBS).map_err(into_io)?;
+            w.commit().map_err(into_io)?;
         }
-
         Ok(Self { db: Arc::new(db) })
     }
 
@@ -173,5 +173,62 @@ impl Store for RedbStore {
         })
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("join error: {e}")))?
+    }
+
+    async fn store_tombstone(&self, id: Uuid, ts: u64) -> io::Result<()> {
+        let db = self.db.clone();
+        let key = id.to_string();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&ts.to_be_bytes());
+        tokio::task::spawn_blocking(move || {
+            let w = db.begin_write().map_err(into_io)?;
+            {
+                let mut t = w.open_table(TOMBS).map_err(into_io)?;
+                t.insert(key.as_str(), &buf[..]).map_err(into_io)?;
+            }
+            w.commit().map_err(into_io)?;
+            Ok::<_, io::Error>(())
+        })
+        .await
+        .map_err(|e| into_io(format!("join error: {e}")))?
+    }
+
+    async fn remove_tombstone(&self, id: Uuid) -> io::Result<()> {
+        let db = self.db.clone();
+        let key = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let w = db.begin_write().map_err(into_io)?;
+            {
+                let mut t = w.open_table(TOMBS).map_err(into_io)?;
+                let _ = t.remove(key.as_str()).map_err(into_io)?;
+            }
+            w.commit().map_err(into_io)?;
+            Ok::<_, io::Error>(())
+        })
+        .await
+        .map_err(|e| into_io(format!("join error: {e}")))?
+    }
+
+    async fn load_tombstones(&self) -> io::Result<Vec<(Uuid, u64)>> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let r = db.begin_read().map_err(into_io)?;
+            let t = r.open_table(TOMBS).map_err(into_io)?;
+            let mut out = Vec::new();
+            for kv in t.iter().map_err(into_io)? {
+                let (k, v) = kv.map_err(into_io)?;
+                let id = Uuid::parse_str(k.value())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                let bytes = v.value();
+                if bytes.len() == 8 {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(bytes);
+                    out.push((id, u64::from_be_bytes(arr)));
+                }
+            }
+            Ok::<_, io::Error>(out)
+        })
+        .await
+        .map_err(|e| into_io(format!("join error: {e}")))?
     }
 }

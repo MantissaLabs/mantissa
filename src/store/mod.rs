@@ -22,4 +22,8 @@ pub trait Store: Send + Sync {
     async fn load_or_create_node_id(&self) -> Result<Uuid>;
     async fn load_local_node(&self) -> Result<Option<LocalNodeInfo>>;
     async fn store_local_node(&self, info: &LocalNodeInfo) -> Result<()>;
+
+    async fn store_tombstone(&self, id: Uuid, ts: u64) -> Result<()>;
+    async fn remove_tombstone(&self, id: Uuid) -> Result<()>;
+    async fn load_tombstones(&self) -> Result<Vec<(Uuid, u64)>>;
 }

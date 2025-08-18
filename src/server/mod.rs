@@ -300,6 +300,7 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     // Load peers from store.
     // TODO: This should be hidden inside topology.
     raw_topology.load_from_store().await?;
+    raw_topology.restore_peers().await?;
     raw_topology.set_server_handle(server_client.clone());
     let mut topology = raw_topology.clone();
 

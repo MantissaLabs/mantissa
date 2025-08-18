@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 pub type NodeId = uuid::Uuid;
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct PeerValue {
     pub address: String,
     pub hostname: String,

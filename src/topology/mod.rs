@@ -8,6 +8,7 @@ use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
 use crate::store::crdt::peers::PeersCrdt;
+use crate::store::crdt::peers_mst::PeersMst;
 use crate::store::Store;
 use crate::token::TokenStore;
 use crate::topology::peers::types::PeerValue;
@@ -44,6 +45,9 @@ pub struct Topology<S: Store + 'static> {
     rx: Receiver<TopologyEvent>,
 
     peers: PeersCrdt,
+
+    // Merkle Search Tree used to track peers.
+    peers_mst: PeersMst,
 
     handles: HandleMap, // ephemeral capabilities
 
@@ -122,6 +126,7 @@ impl<S: Store + 'static> Topology<S> {
             rx,
             store,
             peers: PeersCrdt::new(node.id),
+            peers_mst: PeersMst::new(),
             server_handle: std::rc::Rc::new(OnceCell::new()),
             handles: Arc::new(RwLock::new(HashMap::new())),
             token_store,
@@ -131,12 +136,20 @@ impl<S: Store + 'static> Topology<S> {
         }
     }
 
+    pub async fn restore_peers(&self) -> std::io::Result<()> {
+        let actives = self.peers.all_snapshots().await;
+        let tombstones = self.store.load_tombstones().await?;
+        self.peers_mst.rebuild(actives, tombstones).await;
+        Ok(())
+    }
+
     // Sets the server handle for the topology component. Returns an error if the handle
     // has already been set.
     pub fn set_server_handle(&self, handle: ServerClient) -> Result<(), ServerClient> {
         let res = self.server_handle.set(handle.clone());
         if res.is_ok() {
             let peers = self.peers.clone();
+            let peers_mst = self.peers_mst.clone();
             let store = self.store.clone();
             let handles = self.handles.clone();
             let id = self.node.id;
@@ -168,6 +181,11 @@ impl<S: Store + 'static> Topology<S> {
 
                     if let Err(e) = store.upsert_peer(id, &v).await {
                         log::warn!("failed to persist local peer: {e}");
+                    }
+
+                    // Update Merkle Search Tree.
+                    if let Some(snap) = peers.snapshot_for(&id).await {
+                        peers_mst.upsert_active(id, &snap).await;
                     }
                 }
 
@@ -359,6 +377,7 @@ impl<S: Store + 'static> topology::Server for Topology<S> {
         println!("Received request to register node");
 
         let peers = self.peers.clone();
+        let peers_mst = self.peers_mst.clone();
         let store = self.store.clone();
         let handles = self.handles.clone();
 
@@ -397,6 +416,11 @@ impl<S: Store + 'static> topology::Server for Topology<S> {
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()));
 
+            // Update Merkle Search Tree.
+            if let Some(snap) = peers.snapshot_for(&id).await {
+                peers_mst.upsert_active(id, &snap).await;
+            }
+
             Ok(())
         })
     }
@@ -410,6 +434,19 @@ impl<S: Store + 'static> topology::Server for Topology<S> {
         // TODO: Contact any node in the peers list other than ourselves and
         // send a leave request. Needs to be done after gossip is implemented
         // and we sync the peers list with the anchor node.
+        //
+        // Also: Remove from the store and the Merkle Search Tree.
+        //
+        // choose a monotonic timestamp (Lamport or time); here, coarse monotonic u64
+        // let ts = self.lamport_clock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        //
+        // 1) write tombstone (persist and MST)
+        // self.store.store_tombstone(id, ts).await?;
+        // self.peers_mst.tombstone(id, ts).await;
+        //
+        // 2) apply CRDT remove + persist peer removal
+        // self.peers.remove(&id).await;
+        // self.store.remove_peer(id).await?;
 
         Promise::ok(())
     }

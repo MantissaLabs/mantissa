@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crdts::ctx::ReadCtx;
 use crdts::{CmRDT, MVReg, Map};
 
+use crate::store::crdt::mvreg_snapshot::MvRegSnapshot;
 use crate::topology::peers::types::PeerValue;
 
 pub type Actor = Uuid;
@@ -82,6 +83,25 @@ impl PeersCrdt {
             if let Some(v) = rc_reg.val.into_iter().min() {
                 out.push((*id_ref, v)); // deref &Uuid -> Uuid
             }
+        }
+        out
+    }
+
+    pub async fn snapshot_for(&self, id: &uuid::Uuid) -> Option<MvRegSnapshot<PeerValue>> {
+        let m = self.inner.read().await;
+        let rc_map = m.get(id);
+        let Some(reg) = rc_map.val else { return None };
+        let rc_reg = reg.read();
+        Some(MvRegSnapshot::from_unsorted(rc_reg.val))
+    }
+
+    pub async fn all_snapshots(&self) -> Vec<(uuid::Uuid, MvRegSnapshot<PeerValue>)> {
+        let m = self.inner.read().await;
+        let mut out = Vec::new();
+        for rc in m.iter() {
+            let (id_ref, reg_ref) = rc.val;
+            let rc_reg = reg_ref.read();
+            out.push((*id_ref, MvRegSnapshot::from_unsorted(rc_reg.val)));
         }
         out
     }
