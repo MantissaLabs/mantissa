@@ -402,6 +402,10 @@ impl<S: Store + 'static> topology::Server for Topology<S> {
         _params: topology::LeaveParams,
         mut _results: topology::LeaveResults,
     ) -> Promise<(), Error> {
+        // TODO: Contact any node in the peers list other than ourselves and
+        // send a leave request. Needs to be done after gossip is implemented
+        // and we sync the peers list with the anchor node.
+
         Promise::ok(())
     }
 
