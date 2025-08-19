@@ -1,2 +1,4 @@
+pub mod crdt;
+pub mod mst;
 mod mvreg;
-pub mod peers;
+pub mod uuid_key;

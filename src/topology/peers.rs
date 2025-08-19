@@ -11,22 +11,28 @@ use x25519_dalek::PublicKey;
 #[async_trait(?Send)]
 impl<S: Store + 'static> PeerProvider for Topology<S> {
     async fn get_peers(&self) -> Vec<PeerHandle> {
-        let rows = self.peers.all().await;
-        let handles_guard = self.handles.read().await;
+        let rows = self.peers.all_snapshots().await;
 
+        let handles_guard = self.handles.read().await;
         let mut out = Vec::with_capacity(rows.len());
-        for (id, v) in rows {
-            if let Some(h) = handles_guard.get(&id) {
-                out.push(PeerHandle {
-                    id,
-                    address: v.address.clone(),
-                    hostname: v.hostname.clone(),
-                    client: h.clone(),
-                    noise_static_pub: PublicKey::from(v.noise_static_pub),
-                    root_hash: Default::default(), // TODO: set to proper value and last known root_hash
-                });
+
+        for (id, snap) in rows {
+            // choose a deterministic representative from the MVReg
+            if let Some(v) = snap.as_slice().last().cloned() {
+                if let Some(h) = handles_guard.get(&id) {
+                    out.push(PeerHandle {
+                        id,
+                        address: v.address,
+                        hostname: v.hostname,
+                        client: h.clone(),
+                        noise_static_pub: PublicKey::from(v.noise_static_pub),
+                        // TODO: insert root_hash when we track it.
+                        root_hash: Default::default(),
+                    });
+                }
             }
         }
+
         out
     }
 }

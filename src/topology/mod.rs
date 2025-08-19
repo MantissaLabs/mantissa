@@ -1,5 +1,6 @@
 use crate::client::common;
 use crate::gossip_capnp::gossip_message;
+use crate::hash::XXHash128;
 use crate::health_capnp::NodeStatus;
 use crate::node::address::{compute_advertise_ip, extract_port};
 use crate::node::id::{read_node_id, set_node_id};
@@ -7,8 +8,9 @@ use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
 use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
-use crate::store::crdt::peers::mst::PeersMst;
-use crate::store::crdt::peers::peers::PeersCrdt;
+use crate::store::crdt::crdt::KvCrdt;
+use crate::store::crdt::mst::{Entry, KvMst};
+use crate::store::crdt::uuid_key::UuidKey;
 use crate::store::Store;
 use crate::token::TokenStore;
 use crate::topology::peers::types::PeerValue;
@@ -29,6 +31,12 @@ pub mod peer_provider;
 pub mod peers;
 
 pub type HandleMap = Arc<RwLock<HashMap<Uuid, server::Client>>>;
+
+pub type Actor = Uuid;
+pub type PeerKey = UuidKey;
+pub type PeerEntry = Entry<PeerValue>;
+pub type PeersMst = KvMst<PeerKey, PeerValue, XXHash128>;
+pub type PeersCrdt = KvCrdt<Uuid, PeerValue, Actor>;
 
 pub struct Topology<S: Store + 'static> {
     // Address of the node.
@@ -136,9 +144,24 @@ impl<S: Store + 'static> Topology<S> {
     }
 
     pub async fn restore_peers(&self) -> std::io::Result<()> {
+        // From CRDT: Vec<(Uuid, MvRegSnapshot<PeerValue>)>
         let actives = self.peers.all_snapshots().await;
+
+        // From store: Vec<(Uuid, u64)>
         let tombstones = self.store.load_tombstones().await?;
-        self.peers_mst.rebuild(actives, tombstones).await;
+
+        // Convert Uuid -> PeerKey for the MST
+        let actives_k: Vec<(PeerKey, _)> = actives
+            .into_iter()
+            .map(|(id, snap)| (PeerKey::from(id), snap))
+            .collect();
+
+        let tombs_k: Vec<(PeerKey, u64)> = tombstones
+            .into_iter()
+            .map(|(id, ts)| (PeerKey::from(id), ts))
+            .collect();
+
+        self.peers_mst.rebuild(actives_k, tombs_k).await;
         Ok(())
     }
 
@@ -292,7 +315,7 @@ impl<S: Store + 'static> Topology<S> {
 
         // Update MST with snapshot
         if let Some(snap) = self.peers.snapshot_for(&id).await {
-            self.peers_mst.upsert_active(id, &snap).await;
+            self.peers_mst.upsert_active(id.into(), &snap).await;
         }
 
         // Clear any old tombstone for this key
@@ -305,7 +328,7 @@ impl<S: Store + 'static> Topology<S> {
 
     pub async fn remove_peer(&self, id: Uuid) -> Result<(), Box<dyn std::error::Error>> {
         let ts = self.store.store_tombstone(id).await?;
-        self.peers_mst.tombstone(id, ts).await;
+        self.peers_mst.tombstone(id.into(), ts).await;
 
         self.peers.remove(&id).await;
         self.store.remove_peer(id).await?;
@@ -456,21 +479,27 @@ impl<S: Store + 'static> topology::Server for Topology<S> {
         let handles = self.handles.clone();
 
         Promise::from_future(async move {
-            let peers = peers.all().await;
+            let peers_snapshots = peers.all_snapshots().await;
 
             let list_builder = results.get().init_nodes();
-            let mut node_list = list_builder.init_nodes(peers.len() as u32);
+            let mut node_list = list_builder.init_nodes(peers_snapshots.len() as u32);
 
             let handles_read = handles.read().await;
 
-            for (i, (id, peer)) in peers.into_iter().enumerate() {
+            for (i, (id, snap)) in peers_snapshots.into_iter().enumerate() {
                 let mut node = node_list.reborrow().get(i as u32);
                 set_node_id(node.reborrow().init_id(), &id);
-                node.set_addr(&peer.address);
-                node.set_hostname(&peer.hostname);
-                node.set_public_key(&peer.noise_static_pub);
+
+                // Choose a deterministic representative value from the MVReg (max after sort).
+                if let Some(val) = snap.as_slice().last().cloned() {
+                    node.set_addr(&val.address);
+                    node.set_hostname(&val.hostname);
+                    node.set_public_key(&val.noise_static_pub);
+                    // node.set_root_hash(&val.root_hash);
+                }
+
+                // TODO: compute real status; placeholder for now:
                 node.set_health(NodeStatus::Alive);
-                // node.set_root_hash(&peer.root_hash);
 
                 if let Some(h) = handles_read.get(&id) {
                     node.set_handle(h.clone());

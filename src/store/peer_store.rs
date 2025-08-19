@@ -58,6 +58,7 @@ impl Store for RedbStore {
 
             let mut out = Vec::new();
             let iter = table.iter().map_err(into_io)?;
+
             for res in iter {
                 let (k, v) = res.map_err(into_io)?;
                 let id = uuid::Uuid::parse_str(k.value())
@@ -65,6 +66,7 @@ impl Store for RedbStore {
                 let val = RedbStore::deserialize_value(v.value())?;
                 out.push((id, val));
             }
+
             Ok::<_, io::Error>(out)
         })
         .await
@@ -101,10 +103,8 @@ impl Store for RedbStore {
             let wtxn = db.begin_write().map_err(into_io)?;
 
             {
-                // table borrow limited to this block
                 let mut table = wtxn.open_table(PEERS).map_err(into_io)?;
                 let _ = table.remove(key.as_str()).map_err(into_io)?;
-                // table drops here
             }
 
             wtxn.commit().map_err(into_io)?;
@@ -118,6 +118,7 @@ impl Store for RedbStore {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let rtxn = db.begin_read().map_err(into_io)?;
+
             if let Ok(t) = rtxn.open_table(META) {
                 if let Ok(Some(v)) = t.get("node_id") {
                     let s = v.value();
@@ -132,12 +133,15 @@ impl Store for RedbStore {
 
             let new_id = uuid::Uuid::now_v7();
             let mut wtxn = db.begin_write().map_err(into_io)?;
+
             {
                 let mut t = wtxn.open_table(META).map_err(into_io)?;
                 let id_slice: &[u8] = new_id.as_bytes();
                 t.insert("node_id", id_slice).map_err(into_io)?;
             }
+
             wtxn.commit().map_err(into_io)?;
+
             Ok::<_, std::io::Error>(new_id)
         })
         .await
@@ -146,6 +150,7 @@ impl Store for RedbStore {
 
     async fn load_local_node(&self) -> io::Result<Option<LocalNodeInfo>> {
         let db = self.db.clone();
+
         tokio::task::spawn_blocking(move || {
             let rtxn = db.begin_read().map_err(into_io)?;
             let t = rtxn.open_table(META).map_err(into_io)?;
@@ -162,6 +167,7 @@ impl Store for RedbStore {
     async fn store_local_node(&self, info: &LocalNodeInfo) -> io::Result<()> {
         let db = self.db.clone();
         let bytes = bincode::serialize(info).map_err(into_io)?;
+
         tokio::task::spawn_blocking(move || {
             let wtxn = db.begin_write().map_err(into_io)?;
             {
@@ -182,9 +188,10 @@ impl Store for RedbStore {
         tokio::task::spawn_blocking(move || {
             let wtxn = db.begin_write().map_err(into_io)?;
 
-            // Read current tomb_seq in its own scope (drop guard & table)
+            // Read current tomb_seq in its own scope.
             let next: u64 = {
                 let meta = wtxn.open_table(META).map_err(into_io)?;
+
                 // AccessGuard borrows `meta`, keep it in a tighter scope.
                 let current = {
                     let maybe = meta.get("tomb_seq").map_err(into_io)?;
@@ -204,13 +211,13 @@ impl Store for RedbStore {
 
             let next_bytes = next.to_be_bytes();
 
-            //  Write bumped tomb_seq (fresh table handle, no outstanding borrows)
+            //  Write bumped tomb_seq
             {
                 let mut meta = wtxn.open_table(META).map_err(into_io)?;
                 meta.insert("tomb_seq", &next_bytes[..]).map_err(into_io)?;
             }
 
-            // Write (id -> ts) tombstone ----
+            // Write (id -> ts) tombstone
             {
                 let mut tombs = wtxn.open_table(TOMBS).map_err(into_io)?;
                 tombs
@@ -228,6 +235,7 @@ impl Store for RedbStore {
     async fn remove_tombstone(&self, id: Uuid) -> io::Result<()> {
         let db = self.db.clone();
         let key = id.to_string();
+
         tokio::task::spawn_blocking(move || {
             let w = db.begin_write().map_err(into_io)?;
             {
@@ -247,6 +255,7 @@ impl Store for RedbStore {
             let r = db.begin_read().map_err(into_io)?;
             let t = r.open_table(TOMBS).map_err(into_io)?;
             let mut out = Vec::new();
+
             for kv in t.iter().map_err(into_io)? {
                 let (k, v) = kv.map_err(into_io)?;
                 let id = Uuid::parse_str(k.value())
@@ -258,6 +267,7 @@ impl Store for RedbStore {
                     out.push((id, u64::from_be_bytes(arr)));
                 }
             }
+
             Ok::<_, io::Error>(out)
         })
         .await
