@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod crdt;
 pub mod mst;
 mod mvreg;

@@ -1,6 +1,5 @@
 use crate::client::common;
 use crate::gossip_capnp::gossip_message;
-use crate::hash::XXHash128;
 use crate::health_capnp::NodeStatus;
 use crate::node::address::{compute_advertise_ip, extract_port};
 use crate::node::id::{read_node_id, set_node_id};
@@ -8,12 +7,10 @@ use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
 use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
-use crate::store::crdt::crdt::KvCrdt;
-use crate::store::crdt::mst::{Entry, KvMst};
 use crate::store::crdt::uuid_key::UuidKey;
-use crate::store::Store;
+use crate::store::peer_store::PeersStore;
 use crate::token::TokenStore;
-use crate::topology::peers::types::PeerValue;
+use crate::topology::peers::PeerValue;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
 use capnp::{capability::Promise, Error};
@@ -32,13 +29,7 @@ pub mod peers;
 
 pub type HandleMap = Arc<RwLock<HashMap<Uuid, server::Client>>>;
 
-pub type Actor = Uuid;
-pub type PeerKey = UuidKey;
-pub type PeerEntry = Entry<PeerValue>;
-pub type PeersMst = KvMst<PeerKey, PeerValue, XXHash128>;
-pub type PeersCrdt = KvCrdt<Uuid, PeerValue, Actor>;
-
-pub struct Topology<S: Store + 'static> {
+pub struct Topology {
     // Address of the node.
     // FIXME: To be replaced with full NodeInfo struct.
     addr: String,
@@ -51,10 +42,7 @@ pub struct Topology<S: Store + 'static> {
     // Node event receiver, from gossiping or other components.
     rx: Receiver<TopologyEvent>,
 
-    peers: PeersCrdt,
-
-    // Merkle Search Tree used to track peers.
-    peers_mst: PeersMst,
+    peers: Arc<PeersStore>,
 
     handles: HandleMap, // ephemeral capabilities
 
@@ -67,9 +55,6 @@ pub struct Topology<S: Store + 'static> {
     // The peer ID derived from the public key.
     // FIXME: detangle from the u64 id defined in Capnproto Node struct.
     peer_id: PeerId,
-
-    // Peer storage
-    store: Arc<S>,
 }
 
 #[derive(Clone)]
@@ -119,107 +104,79 @@ pub enum TopologyEvent {
     },
 }
 
-impl<S: Store + 'static> Topology<S> {
+impl Topology {
     pub fn new(
         addr: String,
         rx: Receiver<TopologyEvent>,
         token_store: TokenStore,
         public: PublicKey,
         node: Node,
-        store: Arc<S>,
-    ) -> Self {
-        Self {
+        db: redb::Database,
+    ) -> Result<Self, Error> {
+        let peers = PeersStore::open(db, node.id)?;
+
+        Ok(Self {
             addr,
             rx,
-            store,
-            peers: PeersCrdt::new(node.id),
-            peers_mst: PeersMst::new(),
+            peers: Arc::new(peers),
             server_handle: std::rc::Rc::new(OnceCell::new()),
             handles: Arc::new(RwLock::new(HashMap::new())),
             token_store,
             public_key: public,
             peer_id: peer_id_from_public(&public),
             node: node,
-        }
+        })
     }
 
-    pub async fn restore_peers(&self) -> std::io::Result<()> {
-        // From CRDT: Vec<(Uuid, MvRegSnapshot<PeerValue>)>
-        let actives = self.peers.all_snapshots().await;
+    pub fn set_server_handle(&self, handle: server::Client) -> Result<(), server::Client> {
+        let handles = self.handles.clone();
+        let local_id = self.node.id;
+        let public_key = self.public_key;
 
-        // From store: Vec<(Uuid, u64)>
-        let tombstones = self.store.load_tombstones().await?;
+        // also ensure our own peer-entry exists in the store
+        let peers = self.peers.clone();
+        let advertise = self.get_advertise_address();
+        let host = self
+            .node
+            .system_info
+            .info
+            .hostname
+            .clone()
+            .unwrap_or_default();
 
-        // Convert Uuid -> PeerKey for the MST
-        let actives_k: Vec<(PeerKey, _)> = actives
-            .into_iter()
-            .map(|(id, snap)| (PeerKey::from(id), snap))
-            .collect();
+        // Setting it twice returns an error, we should handle
+        // this gracefully.
+        self.server_handle.set(handle.clone());
 
-        let tombs_k: Vec<(PeerKey, u64)> = tombstones
-            .into_iter()
-            .map(|(id, ts)| (PeerKey::from(id), ts))
-            .collect();
+        tokio::task::spawn_local(async move {
+            handles.write().await.insert(local_id, handle);
 
-        self.peers_mst.rebuild(actives_k, tombs_k).await;
-        Ok(())
-    }
+            let key = UuidKey::from(local_id);
 
-    // Sets the server handle for the topology component. Returns an error if the handle
-    // has already been set.
-    pub fn set_server_handle(&self, handle: ServerClient) -> Result<(), ServerClient> {
-        let res = self.server_handle.set(handle.clone());
-        if res.is_ok() {
-            let topology = self.clone();
-
-            let peers = self.peers.clone();
-            let store = self.store.clone();
-            let id = self.node.id;
-            let hostname = self
-                .node
-                .system_info
-                .info
-                .hostname
-                .clone()
-                .unwrap_or_default();
-
-            let advertise = self.get_advertise_address();
-            let root_hash = String::new(); // TODO: put real local root hash
-            let public_key = self.public_key;
-
-            let v = PeerValue {
-                address: advertise.clone(),
-                hostname: hostname.clone(),
-                noise_static_pub: public_key.to_bytes(),
-            };
-
-            tokio::task::spawn_local(async move {
-                // Only upsert/persist if we are not already present in
-                // the peers list, after loading state from the store.
-                let exists = peers.get(&id).await.is_some();
-                if !exists {
-                    let result = topology
-                        .register_peer(id, &v, handle)
-                        .await
-                        .map_err(|e| capnp::Error::failed(e.to_string()));
-
-                    if result.is_err() {
-                        println!("Failed to register peer: {}", result.err().unwrap());
-                    }
-                }
-
-                // Persist a copy of our local node info out-of-band (handy for restarts)
-                let _ = store
-                    .store_local_node(&crate::store::local::LocalNodeInfo {
-                        id,
-                        hostname,
+            // If peer does not exist, create our own PeerValue.
+            match peers.exists(&key) {
+                Ok(false) => {
+                    let v = PeerValue {
                         address: advertise,
-                        noise_static_pub: v.noise_static_pub,
-                    })
-                    .await;
-            });
-        }
-        res
+                        hostname: host,
+                        noise_static_pub: public_key.to_bytes(),
+                    };
+
+                    if let Err(e) = peers.upsert(&key, v).await {
+                        log::warn!("failed to upsert self peer: {e}");
+                    }
+
+                    // TODO: store local node to retrieve information on restart.
+                    // Figure out the store situation and have a non generic store.
+                }
+                Ok(true) => {} // nothing to do
+                Err(e) => log::warn!("exists(self) failed: {e}"),
+            }
+
+            // MST updated by store.upsert
+        });
+
+        Ok(())
     }
 
     // TODO: Handle error cases
@@ -256,18 +213,14 @@ impl<S: Store + 'static> Topology<S> {
                                 noise_static_pub: noise_static_pub.to_bytes(),
                             };
 
-                            let result = self
-                                .register_peer(id, &v, client)
-                                .await
-                                .map_err(|e| capnp::Error::failed(e.to_string()));
-
-                            if result.is_err() {
-                                println!("Failed to register peer: {}", result.err().unwrap());
+                            if let Err(e) = self.register_peer(id, &v, client).await {
+                                println!("Failed to register peer: {}", e);
                             }
 
                             // TODO: broadcast event to other components that may be
                             // interested in the event.
                         }
+
                         TopologyEvent::NodeLeft { id } => {
                             println!("[Topology] Node left: {id}");
 
@@ -280,6 +233,7 @@ impl<S: Store + 'static> Topology<S> {
                                 println!("Failed to remove peer: {}", result.err().unwrap());
                             }
                         }
+
                         TopologyEvent::NodeSuspect { id } => {
                             println!("[Topology] Heartbeat from: {id}");
                             // update heartbeat timestamp if tracking
@@ -294,13 +248,8 @@ impl<S: Store + 'static> Topology<S> {
         }
     }
 
-    /// Load persisted peers into the CRDT on startup.
-    pub async fn load_from_store(&self) -> std::io::Result<()> {
-        let rows = self.store.load_peers().await?;
-        for (id, val) in rows {
-            self.peers.upsert(id, val).await;
-        }
-        Ok(())
+    pub async fn restore_peers(&self) -> std::io::Result<()> {
+        self.peers.rebuild_mst_from_disk().await
     }
 
     pub async fn register_peer(
@@ -309,36 +258,18 @@ impl<S: Store + 'static> Topology<S> {
         val: &PeerValue,
         handle: server::Client,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.peers.upsert(id, val.clone()).await;
-        self.store.upsert_peer(id, val).await?;
+        self.peers.upsert(&UuidKey::from(id), val.clone()).await?;
         self.handles.write().await.insert(id, handle);
-
-        // Update MST with snapshot
-        if let Some(snap) = self.peers.snapshot_for(&id).await {
-            self.peers_mst.upsert_active(id.into(), &snap).await;
-        }
-
-        // Clear any old tombstone for this key
-        if let Err(e) = self.store.remove_tombstone(id).await {
-            log::debug!("remove_tombstone({id}) ignored: {e}");
-        }
-
         Ok(())
     }
 
     pub async fn remove_peer(&self, id: Uuid) -> Result<(), Box<dyn std::error::Error>> {
-        let ts = self.store.store_tombstone(id).await?;
-        self.peers_mst.tombstone(id.into(), ts).await;
-
-        self.peers.remove(&id).await;
-        self.store.remove_peer(id).await?;
-        self.handles.write().await.remove(&id);
-
+        self.peers.remove(&UuidKey::from(id));
         Ok(())
     }
 }
 
-impl<S: Store + 'static> topology::Server for Topology<S> {
+impl topology::Server for Topology {
     /// Join the cluster and adds our client handle to the `Memberlist`
     /// Returns an instance of `Membership` to the caller to track its
     /// status.
@@ -479,26 +410,27 @@ impl<S: Store + 'static> topology::Server for Topology<S> {
         let handles = self.handles.clone();
 
         Promise::from_future(async move {
-            let peers_snapshots = peers.all_snapshots().await;
+            let (actives, _) = peers
+                .load_all()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             let list_builder = results.get().init_nodes();
-            let mut node_list = list_builder.init_nodes(peers_snapshots.len() as u32);
+            let mut node_list = list_builder.init_nodes(actives.len() as u32);
 
             let handles_read = handles.read().await;
 
-            for (i, (id, snap)) in peers_snapshots.into_iter().enumerate() {
+            for (i, (k, snap)) in actives.into_iter().enumerate() {
+                let id = k.to_uuid();
                 let mut node = node_list.reborrow().get(i as u32);
                 set_node_id(node.reborrow().init_id(), &id);
 
-                // Choose a deterministic representative value from the MVReg (max after sort).
                 if let Some(val) = snap.as_slice().last().cloned() {
                     node.set_addr(&val.address);
                     node.set_hostname(&val.hostname);
                     node.set_public_key(&val.noise_static_pub);
-                    // node.set_root_hash(&val.root_hash);
                 }
 
-                // TODO: compute real status; placeholder for now:
+                // TODO real health; placeholder:
                 node.set_health(NodeStatus::Alive);
 
                 if let Some(h) = handles_read.get(&id) {
@@ -542,7 +474,7 @@ impl<S: Store + 'static> topology::Server for Topology<S> {
     }
 }
 
-impl<S: Store + 'static> Clone for Topology<S> {
+impl Clone for Topology {
     fn clone(&self) -> Self {
         Self {
             addr: self.addr.clone(),
@@ -550,8 +482,6 @@ impl<S: Store + 'static> Clone for Topology<S> {
             rx: self.rx.clone(),
             peers: self.peers.clone(),
             handles: self.handles.clone(),
-            peers_mst: self.peers_mst.clone(),
-            store: self.store.clone(),
             token_store: self.token_store.clone(),
             node: self.node.clone(),
             public_key: self.public_key,

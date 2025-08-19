@@ -1,19 +1,12 @@
-use std::path::PathBuf;
+use std::{fs, io, path::PathBuf};
 
-pub fn default_db_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("MANTISSA_DATA_DIR") {
-        return PathBuf::from(dir).join("state.redb");
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = dirs::home_dir() {
-        return home.join("Library/Application Support/Mantissa/state.redb");
-    }
-    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
-        return PathBuf::from(xdg).join("mantissa/state.redb");
-    }
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".local/state/mantissa/state.redb");
-    }
-    // last resort
-    std::env::temp_dir().join("mantissa-state.redb")
+pub fn default_db_path() -> io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+
+    let dir = home.join(".mantissa");
+    fs::create_dir_all(&dir)?;
+
+    Ok(dir.join("state.redb"))
 }

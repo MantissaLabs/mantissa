@@ -1,7 +1,3 @@
-use std::sync::{Arc, Mutex};
-
-mod config;
-
 use crate::gossip_capnp::gossip::Client as GossipClient;
 use crate::net::unix_socket::start_unix_socket_server_auto;
 use crate::node::node;
@@ -9,9 +5,8 @@ use crate::node_capnp::node::Client as NodeClient;
 use crate::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
+use crate::store::local::load_or_create_node_id;
 use crate::store::path::default_db_path;
-use crate::store::peer_store::RedbStore;
-use crate::store::Store;
 use crate::topology;
 use crate::topology::PeerHandle;
 use crate::topology_capnp::topology::Client as TopologyClient;
@@ -21,6 +16,10 @@ use capnp::Error;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use config::Config;
 use futures::{AsyncReadExt, FutureExt};
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
+
+mod config;
 
 #[derive(Clone)]
 pub struct ServerImpl {
@@ -254,11 +253,12 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     // FIXME: Placeholder peer list.
     let peers: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // Initialize peer store.
-    let db_path = default_db_path();
-    let store = Arc::new(RedbStore::open_or_create(db_path)?);
+    // redb database
+    let db_path = default_db_path()?;
+    let db = redb::Database::create(db_path)?;
 
-    let self_id = store.load_or_create_node_id().await?;
+    // Persistent local node id
+    let self_id: Uuid = load_or_create_node_id(&db)?;
 
     // Set the ID on the Node and restore it. Since it is used by Topology, we don't
     // want duplicates of the node with different IDs.
@@ -282,8 +282,8 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
         token_store.clone(),
         keys.public,
         node,
-        store,
-    );
+        db,
+    )?;
     let topology_client: TopologyClient = capnp_rpc::new_client(raw_topology.clone());
 
     let server = ServerImpl::new()
@@ -297,9 +297,7 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
 
     let server_client: ServerClient = capnp_rpc::new_client(server.clone());
 
-    // Load peers from store.
-    // TODO: This should be hidden inside topology.
-    raw_topology.load_from_store().await?;
+    // Load/restore peers (rebuild MST from disk)
     raw_topology.restore_peers().await?;
     raw_topology.set_server_handle(server_client.clone());
     let mut topology = raw_topology.clone();
