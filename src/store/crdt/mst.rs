@@ -1,8 +1,10 @@
 use crate::store::crdt::adapter::RegAdapter;
+use crate::store::crdt::table_set::TableSet;
 use merkle_search_tree::digest::Hasher as MstHasher;
 use merkle_search_tree::{builder::Builder, MerkleSearchTree};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable};
 use serde::{Deserialize, Serialize};
+use std::marker::PhantomData;
 use std::{hash::Hash, io, sync::Arc};
 use tokio::sync::RwLock;
 
@@ -13,29 +15,16 @@ pub enum Entry<S> {
     Deleted { ts: u64 },
 }
 
-const T_VALUES: TableDefinition<&'static [u8], &'static [u8]> = TableDefinition::new("values");
-const T_TOMBS: TableDefinition<&'static [u8], u64> = TableDefinition::new("tombs");
-const T_META: TableDefinition<&'static str, u64> = TableDefinition::new("meta");
-
 #[inline]
 fn into_io<E: std::error::Error>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e.to_string())
-}
-
-fn create_tables(db: &Database) -> io::Result<()> {
-    let w = db.begin_write().map_err(into_io)?;
-    let _ = w.open_table(T_VALUES).map_err(into_io)?;
-    let _ = w.open_table(T_TOMBS).map_err(into_io)?;
-    let _ = w.open_table(T_META).map_err(into_io)?;
-    w.commit().map_err(into_io)?;
-    Ok(())
 }
 
 /// Generic CRDT + MST store.
 /// - Durable per-key CRDT registers in redb.
 /// - Durable tombstones (for removes).
 /// - In-memory MST over (Key, Entry<Snapshot>).
-pub struct CrdtMstStore<C, H>
+pub struct CrdtMstStore<C, H, T>
 where
     C: RegAdapter,
     C::Key: AsRef<[u8]>,
@@ -46,13 +35,15 @@ where
         + Send
         + Sync
         + 'static,
+    T: TableSet,
 {
     db: Database,
     actor: C::Actor,
     mst: Arc<RwLock<MerkleSearchTree<C::Key, Entry<C::Snapshot>, H>>>,
+    _tables: PhantomData<T>,
 }
 
-impl<C, H> CrdtMstStore<C, H>
+impl<C, H, T> CrdtMstStore<C, H, T>
 where
     C: RegAdapter,
     C::Key: AsRef<[u8]>,
@@ -63,17 +54,30 @@ where
         + Send
         + Sync
         + 'static,
+    T: TableSet,
 {
     pub fn open(db: Database, actor: C::Actor) -> io::Result<Self> {
-        create_tables(&db)?;
-        let builder = Builder::default().with_hasher(H::default());
-        let mst = Arc::new(RwLock::new(builder.build()));
-        Ok(Self { db, actor, mst })
+        // Ensure (or create) the domain tables
+        let w = db.begin_write().map_err(into_io)?;
+        let _ = w.open_table(T::values()).map_err(into_io)?;
+        let _ = w.open_table(T::tombs()).map_err(into_io)?;
+        let _ = w.open_table(T::meta()).map_err(into_io)?;
+        w.commit().map_err(into_io)?;
+
+        let mst = Arc::new(RwLock::new(
+            Builder::default().with_hasher(H::default()).build(),
+        ));
+        Ok(Self {
+            db,
+            actor,
+            mst,
+            _tables: PhantomData,
+        })
     }
 
     pub fn exists(&self, k: &C::Key) -> std::io::Result<bool> {
         let r = self.db.begin_read().map_err(into_io)?;
-        let t = r.open_table(T_VALUES).map_err(into_io)?;
+        let t = r.open_table(T::values()).map_err(into_io)?;
         let kb = Self::enc_key(k)?;
         Ok(t.get(kb.as_slice()).map_err(into_io)?.is_some())
     }
@@ -101,8 +105,8 @@ where
     /// Rebuild the in-memory MST from durable registers + tombstones.
     pub async fn rebuild_mst_from_disk(&self) -> io::Result<()> {
         let r = self.db.begin_read().map_err(into_io)?;
-        let values = r.open_table(T_VALUES).map_err(into_io)?;
-        let tombs = r.open_table(T_TOMBS).map_err(into_io)?;
+        let values = r.open_table(T::values()).map_err(into_io)?;
+        let tombs = r.open_table(T::tombs()).map_err(into_io)?;
 
         let mut actives: Vec<(C::Key, C::Snapshot)> = Vec::new();
         {
@@ -143,7 +147,7 @@ where
         // Read current register
         let current: Option<C::Reg> = {
             let r = self.db.begin_read().map_err(into_io)?;
-            let t = r.open_table(T_VALUES).map_err(into_io)?;
+            let t = r.open_table(T::values()).map_err(into_io)?;
             let kb = Self::enc_key(k)?;
             if let Some(row) = t.get(kb.as_slice()).map_err(into_io)? {
                 Some(Self::dec_reg(row.value())?)
@@ -160,7 +164,7 @@ where
         {
             let mut w = self.db.begin_write().map_err(into_io)?;
             {
-                let mut values = w.open_table(T_VALUES).map_err(into_io)?;
+                let mut values = w.open_table(T::values()).map_err(into_io)?;
                 let kb = Self::enc_key(k)?;
                 let rb = Self::enc_reg(&new_reg)?;
                 values
@@ -168,7 +172,7 @@ where
                     .map_err(into_io)?;
             }
             {
-                let mut tombs = w.open_table(T_TOMBS).map_err(into_io)?;
+                let mut tombs = w.open_table(T::tombs()).map_err(into_io)?;
                 let kb = Self::enc_key(k)?;
                 let _ = tombs.remove(kb.as_slice()).map_err(into_io)?;
             }
@@ -186,7 +190,7 @@ where
         let mut w = self.db.begin_write().map_err(into_io)?;
 
         let ts = {
-            let mut meta = w.open_table(T_META).map_err(into_io)?;
+            let mut meta = w.open_table(T::meta()).map_err(into_io)?;
             let next = match meta.get("tomb_seq").map_err(into_io)? {
                 Some(g) => g.value().saturating_add(1), // value(): u64 (Copy) — no '*'
                 None => 1,
@@ -197,14 +201,14 @@ where
 
         // delete the register row.
         {
-            let mut values = w.open_table(T_VALUES).map_err(into_io)?;
+            let mut values = w.open_table(T::values()).map_err(into_io)?;
             let kb = Self::enc_key(k)?;
             let _ = values.remove(kb.as_slice()).map_err(into_io)?;
         }
 
         // write the tombstone.
         {
-            let mut tombs = w.open_table(T_TOMBS).map_err(into_io)?;
+            let mut tombs = w.open_table(T::tombs()).map_err(into_io)?;
             let kb = Self::enc_key(k)?;
             tombs.insert(kb.as_slice(), &ts).map_err(into_io)?;
         }
@@ -221,8 +225,8 @@ where
     /// Dump durable (key, snapshot) and (key, tombstone) — useful for anti-entropy or external rebuilds.
     pub fn load_all(&self) -> io::Result<(Vec<(C::Key, C::Snapshot)>, Vec<(C::Key, u64)>)> {
         let r = self.db.begin_read().map_err(into_io)?;
-        let values = r.open_table(T_VALUES).map_err(into_io)?;
-        let tombs = r.open_table(T_TOMBS).map_err(into_io)?;
+        let values = r.open_table(T::values()).map_err(into_io)?;
+        let tombs = r.open_table(T::tombs()).map_err(into_io)?;
 
         let mut actives = Vec::new();
         {
