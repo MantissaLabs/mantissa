@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 
 use crate::store::crdt::mvreg;
 
+#[derive(Clone)]
 pub struct KvCrdt<K, V, A>
 where
     K: Ord + Clone + Hash,
@@ -13,20 +14,6 @@ where
 {
     inner: Arc<RwLock<Map<K, MVReg<V, A>, A>>>,
     actor: A,
-}
-
-impl<K, V, A> Clone for KvCrdt<K, V, A>
-where
-    K: Ord + Clone + Hash,
-    V: Clone + Ord + Debug,
-    A: Clone + Ord + Hash + Debug,
-{
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            actor: self.actor.clone(),
-        }
-    }
 }
 
 impl<K, V, A> KvCrdt<K, V, A>
