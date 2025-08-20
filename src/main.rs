@@ -7,7 +7,6 @@ mod client;
 pub mod container;
 mod gossip;
 mod hash;
-mod hash_mvreg;
 mod includes;
 mod logger;
 pub mod monitor;
