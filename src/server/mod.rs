@@ -1,15 +1,14 @@
-use crate::gossip_capnp::gossip::Client as GossipClient;
+use crate::includes::sync_capnp;
 use crate::net::unix_socket::start_unix_socket_server_auto;
 use crate::node::node;
-use crate::node_capnp::node::Client as NodeClient;
 use crate::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
 use crate::server_capnp::server;
-use crate::server_capnp::server::Client as ServerClient;
 use crate::store::local::load_or_create_node_id;
 use crate::store::path::default_db_path;
+use crate::store::peer_store::{open_peers_store, PeersStore};
+use crate::sync::SyncService;
 use crate::topology;
 use crate::topology::PeerHandle;
-use crate::topology_capnp::topology::Client as TopologyClient;
 use crate::{gossip, token::TokenStore};
 use capnp::capability::Promise;
 use capnp::Error;
@@ -18,6 +17,12 @@ use config::Config;
 use futures::{AsyncReadExt, FutureExt};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+use crate::gossip_capnp::gossip::Client as GossipClient;
+use crate::node_capnp::node::Client as NodeClient;
+use crate::server_capnp::server::Client as ServerClient;
+use crate::sync_capnp::sync::Client as SyncClient;
+use crate::topology_capnp::topology::Client as TopologyClient;
 
 mod config;
 
@@ -28,6 +33,7 @@ pub struct ServerImpl {
     pub gossip_client: Option<GossipClient>,
     pub topology_client: Option<TopologyClient>,
     pub node_client: Option<NodeClient>,
+    pub sync_client: Option<SyncClient>,
 
     token_store: Option<TokenStore>,
     config: Option<config::Config>,
@@ -45,6 +51,7 @@ impl server::Server for ServerImpl {
 
         caps.set_gossip(self.gossip_client.as_ref().unwrap().clone());
         caps.set_topology(self.topology_client.as_ref().unwrap().clone());
+        caps.set_sync(self.sync_client.as_ref().unwrap().clone());
 
         Promise::ok(())
     }
@@ -93,6 +100,21 @@ impl server::Server for ServerImpl {
             .set_node(self.node_client.as_ref().unwrap().clone());
         Promise::ok(())
     }
+
+    /// Get the sync capability.
+    ///
+    /// We usually call this method when we want to have access to the
+    /// sync service (anti-entropy, syncing data across nodes).
+    fn get_sync(
+        &mut self,
+        _params: server::GetSyncParams,
+        mut results: server::GetSyncResults,
+    ) -> Promise<(), Error> {
+        results
+            .get()
+            .set_sync(self.sync_client.as_ref().unwrap().clone());
+        Promise::ok(())
+    }
 }
 
 impl Default for ServerImpl {
@@ -101,6 +123,7 @@ impl Default for ServerImpl {
             server_client: None,
             gossip_client: None,
             topology_client: None,
+            sync_client: None,
             node_client: None,
             token_store: None,
             config: None,
@@ -216,6 +239,11 @@ impl ServerImpl {
         self
     }
 
+    pub fn with_sync(&mut self, sync_client: SyncClient) -> &mut ServerImpl {
+        self.sync_client = Some(sync_client);
+        self
+    }
+
     pub fn with_node(&mut self, node_client: NodeClient) -> &mut ServerImpl {
         self.node_client = Some(node_client);
         self
@@ -255,7 +283,7 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
 
     // redb database
     let db_path = default_db_path()?;
-    let db = redb::Database::create(db_path)?;
+    let db = Arc::new(redb::Database::create(db_path)?);
 
     // Persistent local node id
     let self_id: Uuid = load_or_create_node_id(&db)?;
@@ -263,6 +291,12 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     // Set the ID on the Node and restore it. Since it is used by Topology, we don't
     // want duplicates of the node with different IDs.
     node.id = self_id;
+
+    // Create peers store.
+    let peers_store: PeersStore = open_peers_store(db.clone(), node.id)?;
+    peers_store.rebuild_mst_from_disk().await?;
+    peers_store.debug_dump_root("startup").await;
+    peers_store.debug_dump_ranges("startup", 5).await;
 
     // The join token store for this node.
     let token_store = TokenStore::new(None);
@@ -282,13 +316,17 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
         token_store.clone(),
         keys.public,
         node,
-        db,
+        peers_store.clone(),
     )?;
     let topology_client: TopologyClient = capnp_rpc::new_client(raw_topology.clone());
+
+    let sync_service = SyncService::new(peers_store.clone());
+    let sync_client: sync_capnp::sync::Client = capnp_rpc::new_client(sync_service);
 
     let server = ServerImpl::new()
         .with_gossip(gossip_client)
         .with_topology(topology_client.clone())
+        .with_sync(sync_client.clone())
         .with_node(node_client)
         .with_token_store(token_store)
         .with_noise_keys(keys.clone())
@@ -298,7 +336,6 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     let server_client: ServerClient = capnp_rpc::new_client(server.clone());
 
     // Load/restore peers (rebuild MST from disk)
-    raw_topology.restore_peers().await?;
     raw_topology.set_server_handle(server_client.clone());
     let mut topology = raw_topology.clone();
 

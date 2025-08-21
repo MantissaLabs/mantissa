@@ -1,8 +1,40 @@
 @0x8559383d2dee7751;
 
-interface StreamSync {
-  write @0 (chunk :Data) -> stream;
-  # Writes a chunk of bytes.
+enum Domain {
+  peers @0;
+  containers @1;
+  networks @2;
+  storage @3;
+}
+
+struct PageRange {
+  start @0 :Data;
+  end   @1 :Data;
+  hash  @2 :Data;
+}
+
+struct PageRangeSummary {
+  ranges @0 :List(PageRange);
+}
+
+struct DeltaChunk {
+  regs  @0 :List(RegItem);
+  tombs @1 :List(TombItem);
+}
+
+struct RegItem {
+  key @0 :Data;  # raw key bytes
+  reg @1 :Data;  # bincode(MVReg<...>)
+}
+
+struct TombItem {
+  key @0 :Data;  # raw key bytes
+  ts  @1 :UInt64;
+}
+
+interface DeltaSink {
+  pushChunk @0 (chunk :DeltaChunk) -> stream;
+  # Server pushes chunks to this sink, library enforces backpressure.
   # Reconstructs or merges the stream into the local CRDT/MST structure.
 
   end @1 ();
@@ -12,55 +44,11 @@ interface StreamSync {
 }
 
 interface Sync {
-  # Sync deals with the anti-entropy mechanism and Merkle Search Tree
-  # root hash exchange with the ClusterSync mechanism.
+  getRoot @0 (domain :Domain) -> (rootHex :Text);
 
-  getSummary @0 () -> (summary :ClusterSyncSummary);
-  # Get the root_hash summary for the whole cluster/state on the remote node.
+  getRanges @1 (domain :Domain) -> (summary :PageRangeSummary);
 
-  getNamespaceDiff @1 (namespace :Text, ranges :PageRangeList) -> (response :DiffRequestResponse);
-  # Get the serialized page ranges (diff) for the given namespace.
-
-  getClusterSync @2 (namespace :Text) -> (stream :StreamSync);
-  # Synchronizes the data for the given namespace.
-}
-
-struct PageRangeList {
-  ranges @0 :List(PageRange);
-}
-
-struct DiffRequestResponse {}
-
-struct ClusterSyncSummary {
-  clusterRootHash @0 :Data;
-
-
-  namespaces @1 :List(NamespaceRootHash);
-  # List of root_hashes per namespace. Depending on the comparison of page ranges
-  # from the cluster root_hash, it gives the signal to the client to compare the
-  # relevant namespaces that have been updated in between.
-}
-
-struct NamespaceRootHash {
-  name @0 :Text;
-  # Name of the namespace.
-
-  rootHash @1 :Data;
-  # root_hash of the MST tracking that namespace.
-}
-
-struct PageRangeSummary {
-  ranges @0: List(PageRange);
-  # Result of serialise_page_ranges() from MerkleSearchTree construct.
-}
-
-struct PageRange {
-  start @0: Text;
-  # Start of the key range (inclusive).
-
-  end @1: Text;
-  # End of the key range.
-
-  hash @2: Data;
-  # Hash over that key range (used for diffing)
+  # Client passes ranges it wants, and a DeltaSink it implements locally.
+  # Server streams chunks into that sink and calls end() when done.
+  openDelta @2 (domain :Domain, want :PageRangeSummary, sink :DeltaSink);
 }

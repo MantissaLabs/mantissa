@@ -1,9 +1,11 @@
 use crdts::ctx::ReadCtx;
-use crdts::{CmRDT, MVReg};
+use crdts::{CmRDT, CvRDT, MVReg};
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::{fmt::Debug, hash::Hash};
 
 use crate::store::crdt::mvreg::MvRegSnapshot;
+use crate::store::crdt::uuid_key::UuidKey;
 
 /// Register-centric adapter (works great for MVReg, Orswot, etc.).
 pub trait RegAdapter {
@@ -20,18 +22,23 @@ pub trait RegAdapter {
 
     /// Deterministic snapshot from a register (for MST hashing).
     fn snapshot_reg(reg: &Self::Reg) -> Self::Snapshot;
+
+    fn key_to_bytes(k: &Self::Key) -> Vec<u8>;
+    fn key_from_bytes(b: &[u8]) -> io::Result<Self::Key>;
+
+    /// Merge current and incoming registers into one.
+    fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg;
 }
 
 /// MVReg adapter with a canonical (sorted) snapshot (requires Value: Ord).
 pub struct MvRegAdapterSorted<K, V, A>(std::marker::PhantomData<(K, V, A)>);
 
-impl<K, V, A> RegAdapter for MvRegAdapterSorted<K, V, A>
+impl<V, A> RegAdapter for MvRegAdapterSorted<UuidKey, V, A>
 where
-    K: Ord + Clone + Hash + Serialize + for<'de> Deserialize<'de>,
     V: Clone + Debug + Hash + Ord + Serialize + for<'de> Deserialize<'de>,
     A: Clone + Ord + Hash + Debug + Serialize + for<'de> Deserialize<'de>,
 {
-    type Key = K;
+    type Key = UuidKey;
     type Actor = A;
     type Reg = MVReg<V, A>;
     type Value = V;
@@ -49,5 +56,23 @@ where
     fn snapshot_reg(reg: &Self::Reg) -> Self::Snapshot {
         let rc: ReadCtx<Vec<V>, A> = reg.read();
         MvRegSnapshot::from_unsorted(rc.val)
+    }
+
+    fn key_to_bytes(k: &Self::Key) -> Vec<u8> {
+        k.as_ref().to_vec()
+    }
+
+    fn key_from_bytes(b: &[u8]) -> io::Result<Self::Key> {
+        UuidKey::try_from(b)
+    }
+
+    fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg {
+        match current {
+            Some(mut c) => {
+                c.merge(incoming);
+                c
+            }
+            None => incoming,
+        }
     }
 }

@@ -3,6 +3,7 @@
 using import "gossip.capnp".Gossip;
 using import "topology.capnp".Topology;
 using import "node.capnp".Node;
+using import "sync.capnp".Sync;
 
 interface Server {
     # Server is the top level interface tying all the services together.
@@ -14,10 +15,12 @@ interface Server {
     getGossip @1 () -> (gossip: Gossip);
     getTopology @2 () -> (topology: Topology);
     getNode @3 () -> (node: Node);
+    getSync @4 () -> (sync: Sync);
 }
 
 struct Capabilities {
   gossip @0 :Gossip;
   topology @1 :Topology;
   node @2 :Node;
+  sync @3 :Sync;
 }

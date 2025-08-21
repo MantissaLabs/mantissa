@@ -1,6 +1,7 @@
 use crate::store::crdt::mst::CrdtMstStore;
 use crate::store::crdt::table_set::TableSet;
 use crate::store::crdt::uuid_key::UuidKey;
+use std::sync::Arc;
 use uuid::Uuid;
 
 // Hasher for MST leaves/keys (your existing implementation)
@@ -22,5 +23,12 @@ impl TableSet for PeerTables {
 }
 
 // PeersStore = generic CRDT+MST store specialized for peers
-pub type PeersStore =
+pub type PeersStoreInner =
     CrdtMstStore<MvRegAdapterSorted<UuidKey, PeerValue, Uuid>, XXHash128, PeerTables>;
+
+pub type PeersStore = Arc<PeersStoreInner>;
+
+pub fn open_peers_store(db: Arc<redb::Database>, actor: uuid::Uuid) -> std::io::Result<PeersStore> {
+    let inner = PeersStoreInner::open(db, actor)?;
+    Ok(Arc::new(inner))
+}

@@ -15,6 +15,7 @@ mod node;
 mod noise;
 mod server;
 mod store;
+mod sync;
 mod token;
 mod topology;
 mod types;
