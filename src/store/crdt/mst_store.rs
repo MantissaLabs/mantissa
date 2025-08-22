@@ -1,20 +1,42 @@
+use crate::hash::HashBytes;
 use crate::store::crdt::adapter::RegAdapter;
 use crate::store::crdt::table_set::TableSet;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use bincode;
 use merkle_search_tree::digest::Hasher as MstHasher;
 use merkle_search_tree::{builder::Builder, MerkleSearchTree};
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::Hasher;
 use std::marker::PhantomData;
 use std::{hash::Hash, io, sync::Arc};
 use tokio::sync::RwLock;
 
 /// Leaf value for MST.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum Entry<S> {
     Active(S),
     Deleted { ts: u64 },
+}
+
+// Canonical hashing: tag byte + payload in a fixed-endian encoding
+impl<S> Hash for Entry<S>
+where
+    S: Hash,
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Entry::Active(s) => {
+                state.write_u8(0);
+                s.hash(state); // uses the canonical impl above for MvRegSnapshot<T>
+            }
+            Entry::Deleted { ts } => {
+                state.write_u8(1);
+                state.write_u64(*ts);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -126,6 +148,9 @@ where
             }
         }
 
+        // sort by key to lock the insertion order
+        actives.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
+
         let mut tomb_list: Vec<(C::Key, u64)> = Vec::new();
         {
             let mut it = tombs.iter().map_err(into_io)?;
@@ -135,6 +160,9 @@ where
                 tomb_list.push((k, ts));
             }
         }
+
+        // also sort tombstones by key
+        tomb_list.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
 
         let builder = Builder::default().with_hasher(H::default());
         let mut tree = builder.build();
@@ -417,10 +445,6 @@ where
         Ok((regs_out, tmbs_out))
     }
 
-    pub fn to_wire_reg(&self, r: &C::Reg) -> io::Result<Vec<u8>> {
-        Self::enc_reg(r)
-    }
-
     /// Wire → full register.
     pub fn from_wire_reg(&self, b: &[u8]) -> io::Result<C::Reg> {
         bincode::deserialize(b).map_err(into_io)
@@ -434,10 +458,6 @@ where
     #[inline]
     fn dec_key(bytes: &[u8]) -> io::Result<C::Key> {
         C::key_from_bytes(bytes)
-    }
-
-    pub fn to_wire_key(&self, k: &C::Key) -> Vec<u8> {
-        C::key_to_bytes(k)
     }
 
     pub fn from_wire_key(&self, b: &[u8]) -> io::Result<C::Key> {
@@ -466,6 +486,154 @@ where
                 &h[..std::cmp::min(6, h.len())],
             );
         }
+    }
+
+    pub async fn merge_register(&self, k: &C::Key, incoming: &C::Reg) -> std::io::Result<()> {
+        // Read current
+        let current: Option<C::Reg> = {
+            let r = self.db.begin_read().map_err(into_io)?;
+            let t = r.open_table(T::values()).map_err(into_io)?;
+            let kb = Self::enc_key(k);
+            if let Some(row) = t.get(kb.as_slice()).map_err(into_io)? {
+                Some(Self::dec_reg(row.value())?)
+            } else {
+                None
+            }
+        };
+
+        // Merge (owned)
+        let merged = C::merge_regs(current, incoming.clone());
+        let snap = C::snapshot_reg(&merged);
+
+        // Write back + clear tombstone
+        {
+            let w = self.db.begin_write().map_err(into_io)?;
+            {
+                let mut values = w.open_table(T::values()).map_err(into_io)?;
+                let kb = Self::enc_key(k);
+                let rb = Self::enc_reg(&merged)?;
+                values
+                    .insert(kb.as_slice(), rb.as_slice())
+                    .map_err(into_io)?;
+            }
+            {
+                let mut tombs = w.open_table(T::tombs()).map_err(into_io)?;
+                let kb = Self::enc_key(k);
+                let _ = tombs.remove(kb.as_slice()).map_err(into_io)?;
+            }
+            w.commit().map_err(into_io)?;
+        }
+
+        // Update MST
+        let mut t = self.mst.write().await;
+        t.upsert(k.clone(), &Entry::Active(snap));
+        Ok(())
+    }
+
+    #[inline]
+    pub fn to_wire_key(&self, k: &C::Key) -> Vec<u8> {
+        k.as_ref().to_vec()
+    }
+
+    #[inline]
+    pub fn key_from_wire(&self, b: &[u8]) -> io::Result<C::Key>
+    where
+        for<'a> C::Key: TryFrom<&'a [u8]>,
+        for<'a> <C::Key as TryFrom<&'a [u8]>>::Error: std::fmt::Display,
+    {
+        C::Key::try_from(b).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    #[inline]
+    pub fn to_wire_reg(&self, r: &C::Reg) -> io::Result<Vec<u8>> {
+        bincode::serialize(r).map_err(into_io)
+    }
+
+    #[inline]
+    pub fn reg_from_wire(&self, bytes: &[u8]) -> io::Result<C::Reg> {
+        bincode::deserialize(bytes).map_err(into_io)
+    }
+
+    /// Apply an inbound tombstone (idempotent, monotonic).
+    pub async fn apply_tombstone(&self, k: &C::Key, ts: u64) -> io::Result<()> {
+        // write/remove in redb
+        let w = self.db.begin_write().map_err(into_io)?;
+        {
+            // delete any register row for this key
+            let mut values = w.open_table(T::values()).map_err(into_io)?;
+            let kb = Self::enc_key(k);
+            let _ = values.remove(kb.as_slice()).map_err(into_io)?;
+        }
+        {
+            // upsert tombstone with max(existing, ts)
+            let mut tombs = w.open_table(T::tombs()).map_err(into_io)?;
+            let kb = Self::enc_key(k);
+            let next_ts = match tombs.get(kb.as_slice()).map_err(into_io)? {
+                Some(g) => g.value().max(ts),
+                None => ts,
+            };
+            tombs.insert(kb.as_slice(), &next_ts).map_err(into_io)?;
+        }
+        w.commit().map_err(into_io)?;
+
+        // reflect in MST
+        let mut t = self.mst.write().await;
+        t.upsert(k.clone(), &Entry::Deleted { ts });
+        Ok(())
+    }
+
+    /// Print the exact byte stream we hash per leaf Entry (canonical).
+    pub fn debug_dump_leaf_bytes_from_store(&self) -> io::Result<()> {
+        let (actives, tombs) = self.load_all()?; // (Vec<(Key, Snapshot)>, Vec<(Key, u64)>)
+
+        println!("[LEAVES] actives:");
+        for (k, snap) in actives {
+            let mut sink = HashBytes::default();
+            Entry::Active(snap).hash(&mut sink);
+            println!(
+                "  key={:?} bytes(base64)={}",
+                k.as_ref(),
+                B64.encode(&sink.as_slice())
+            );
+        }
+
+        println!("[LEAVES] tombstones:");
+        for (k, ts) in tombs {
+            let mut sink = HashBytes::default();
+
+            // Tell the compiler which Entry<S> we mean:
+            let e: Entry<C::Snapshot> = Entry::Deleted { ts };
+            e.hash(&mut sink);
+
+            println!(
+                "  key={:?} bytes(base64)={}",
+                k.as_ref(),
+                B64.encode(sink.as_slice())
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Print MST page ranges + hashes (what serialise_page_ranges() sees).
+    pub async fn debug_dump_mst_ranges(&self) -> io::Result<()> {
+        let t = self.mst.write().await;
+        let Some(ranges) = t.serialise_page_ranges() else {
+            println!("[MST] ranges: <empty>");
+            return Ok(());
+        };
+
+        println!("[MST] ranges: {}", ranges.len());
+        for (i, pr) in ranges.iter().enumerate() {
+            println!(
+                "  [{:03}] start={:?} end={:?} hash(base64)={}",
+                i,
+                pr.start(),
+                pr.end(),
+                B64.encode(pr.hash().as_ref())
+            );
+        }
+        Ok(())
     }
 }
 

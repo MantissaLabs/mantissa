@@ -1390,6 +1390,7 @@ dependencies = [
  "async-trait",
  "aya",
  "aya-build",
+ "base64",
  "bincode",
  "blake3",
  "bollard",

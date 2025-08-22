@@ -12,10 +12,16 @@ impl<T> MvRegSnapshot<T> {
         T: Ord,
     {
         vals.sort();
+        vals.dedup();
         Self { vals }
     }
 
-    pub fn new_sorted(vals: Vec<T>) -> Self {
+    pub fn new_sorted(mut vals: Vec<T>) -> Self
+    where
+        T: Ord,
+    {
+        vals.sort();
+        vals.dedup();
         Self { vals }
     }
 

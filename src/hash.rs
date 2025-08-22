@@ -4,7 +4,18 @@ use twox_hash::{xxhash3_128, XxHash64};
 
 /// Collects the byte stream produced by `T: Hash`.
 #[derive(Default, Clone)]
-struct HashBytes(Vec<u8>);
+pub struct HashBytes(Vec<u8>);
+
+impl HashBytes {
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+    #[inline]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+}
 
 impl std::hash::Hasher for HashBytes {
     fn write(&mut self, bytes: &[u8]) {

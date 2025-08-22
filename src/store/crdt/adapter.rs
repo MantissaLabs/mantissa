@@ -5,7 +5,7 @@ use std::io;
 use std::{fmt::Debug, hash::Hash};
 
 use crate::store::crdt::mvreg::MvRegSnapshot;
-use crate::store::crdt::uuid_key::UuidKey;
+use crate::store::crdt::uuid_key::{UuidKey, UuidKeyParseError};
 
 /// Register-centric adapter (works great for MVReg, Orswot, etc.).
 pub trait RegAdapter {
@@ -32,6 +32,12 @@ pub trait RegAdapter {
 
 /// MVReg adapter with a canonical (sorted) snapshot (requires Value: Ord).
 pub struct MvRegAdapterSorted<K, V, A>(std::marker::PhantomData<(K, V, A)>);
+
+impl From<UuidKeyParseError> for io::Error {
+    fn from(e: UuidKeyParseError) -> Self {
+        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+    }
+}
 
 impl<V, A> RegAdapter for MvRegAdapterSorted<UuidKey, V, A>
 where
@@ -63,7 +69,7 @@ where
     }
 
     fn key_from_bytes(b: &[u8]) -> io::Result<Self::Key> {
-        UuidKey::try_from(b)
+        UuidKey::try_from(b).map_err(Into::into)
     }
 
     fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg {

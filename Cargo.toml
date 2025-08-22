@@ -69,6 +69,7 @@ anyhow = "1"
 # used for fully deterministic hashing across platforms and compiler versions (XXHash).
 twox-hash = "2.1.1"
 once_cell = "1.21.3"
+base64 = "0.22.1"
 
 [features]
 default = []

@@ -297,6 +297,8 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     peers_store.rebuild_mst_from_disk().await?;
     peers_store.debug_dump_root("startup").await;
     peers_store.debug_dump_ranges("startup", 5).await;
+    peers_store.debug_dump_leaf_bytes_from_store();
+    peers_store.debug_dump_mst_ranges();
 
     // The join token store for this node.
     let token_store = TokenStore::new(None);

@@ -14,54 +14,23 @@ impl DeltaSinkImpl {
 impl delta_sink::Server for DeltaSinkImpl {
     fn push_chunk(&mut self, params: delta_sink::PushChunkParams) -> Promise<(), capnp::Error> {
         let peers = self.peers.clone();
-
-        println!("push_chunks called");
-
         Promise::from_future(async move {
-            let chunk = params.get()?.get_chunk()?;
+            let c = params.get()?.get_chunk()?;
 
-            // Decode registers
-            let regs = {
-                let lst = chunk.get_regs()?;
-                let mut out = Vec::with_capacity(lst.len() as usize);
-                for i in 0..lst.len() {
-                    let it = lst.get(i);
-                    let key_bytes = it.get_key()?;
-                    let reg_bytes = it.get_reg()?;
-                    let key = peers
-                        .from_wire_key(key_bytes)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    let reg = peers
-                        .from_wire_reg(reg_bytes)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    out.push((key, reg));
-                }
-                out
-            };
+            // registers
+            for it in c.get_regs()?.iter() {
+                let k = peers.key_from_wire(it.get_key()?)?;
+                let r = peers.reg_from_wire(it.get_reg()?)?;
+                peers.merge_register(&k, &r).await?;
+            }
 
-            // Decode tombstones
-            let tombs = {
-                let lst = chunk.get_tombs()?;
-                let mut out = Vec::with_capacity(lst.len() as usize);
-                for i in 0..lst.len() {
-                    let it = lst.get(i);
-                    let key_bytes = it.get_key()?;
-                    let ts = it.get_ts();
-                    let key = peers
-                        .from_wire_key(key_bytes)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    out.push((key, ts));
-                }
-                out
-            };
+            // tombstones
+            for it in c.get_tombs()?.iter() {
+                let k = peers.key_from_wire(it.get_key()?)?;
+                let ts = it.get_ts();
+                peers.apply_tombstone(&k, ts).await?;
+            }
 
-            log::debug!("delta chunk: {} regs, {} tombs", regs.len(), tombs.len());
-            println!("delta chunk: {} regs, {} tombs", regs.len(), tombs.len());
-
-            // Apply to store
-            peers
-                .apply_delta_chunk(regs, tombs)
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
             Ok(())
         })
     }
