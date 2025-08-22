@@ -2,7 +2,7 @@ use crate::{store::peer_store::PeersStore, sync_capnp::delta_sink};
 use capnp::capability::Promise;
 
 pub struct DeltaSinkImpl {
-    peers: PeersStore, // already Arc
+    peers: PeersStore,
 }
 
 impl DeltaSinkImpl {

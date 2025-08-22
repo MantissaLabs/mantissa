@@ -65,7 +65,7 @@ impl sync::Server for SyncService {
                         .await
                         .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-                    let mut out = results.get().init_summary();
+                    let out = results.get().init_summary();
                     capnp_fill_ranges::<UuidKey>(&owned, out)?;
                     Ok(())
                 }

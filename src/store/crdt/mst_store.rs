@@ -330,7 +330,7 @@ where
 
             let merged = C::merge_regs(current, incoming);
 
-            let mut w = self.db.begin_write().map_err(into_io)?;
+            let w = self.db.begin_write().map_err(into_io)?;
             {
                 let mut tv = w.open_table(T::values()).map_err(into_io)?;
                 let kb = Self::enc_key(&k);

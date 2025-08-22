@@ -295,6 +295,8 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     // Create peers store.
     let peers_store: PeersStore = open_peers_store(db.clone(), node.id)?;
     peers_store.rebuild_mst_from_disk().await?;
+
+    // Debug mst store.
     peers_store.debug_dump_root("startup").await;
     peers_store.debug_dump_ranges("startup", 5).await;
     peers_store.debug_dump_leaf_bytes_from_store();
