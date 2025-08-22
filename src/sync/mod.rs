@@ -97,11 +97,6 @@ impl sync::Server for SyncService {
                     tombs.len()
                 );
 
-                // Export exact ranges
-                let (regs, tombs) = peers
-                    .export_delta_for_owned(&want)
-                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
                 // Pre-encode to wire bytes
                 let mut regs_wire: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(regs.len());
                 for (k, r) in regs {
