@@ -23,6 +23,27 @@ pub struct SyncService {
 }
 
 impl sync::Server for SyncService {
+    fn get_root(
+        &mut self,
+        params: sync::GetRootParams,
+        mut results: sync::GetRootResults,
+    ) -> Promise<(), capnp::Error> {
+        let peers = self.peers.clone();
+        Promise::from_future(async move {
+            match params.get()?.get_domain()? {
+                Domain::Peers => {
+                    let root = peers.root_hex().await;
+                    let mut out = results.get();
+                    out.set_root_hex(&root);
+                    Ok(())
+                }
+                _ => Err(capnp::Error::unimplemented(
+                    "domain not implemented".to_string(),
+                )),
+            }
+        })
+    }
+
     fn get_ranges(
         &mut self,
         params: sync::GetRangesParams,
@@ -77,15 +98,20 @@ impl sync::Server for SyncService {
                     }
                 }
 
-                // Convert PageRangeSummary -> Vec<OwnedPageRange>
-                let want = owned_ranges_from_capnp::<UuidKey>(p.get_want()?)?;
-
                 println!("open_delta: received");
                 peers.debug_dump_root("server.before.open_delta").await;
                 peers.debug_dump_ranges("server.before.open_delta", 5).await;
 
+                // Client sends the delta ranges it needs, not its full summary.
                 let want = owned_ranges_from_capnp::<UuidKey>(p.get_want()?)?;
                 println!("open_delta: want ranges = {}", want.len());
+
+                // If there's no delta to send, end immediately.
+                if want.is_empty() {
+                    println!("open_delta: no ranges requested; exporting regs=0, tombs=0");
+                    p.get_sink()?.end_request().send().promise.await?;
+                    return Ok(());
+                }
 
                 let (regs, tombs) = peers
                     .export_delta_for_owned(&want)

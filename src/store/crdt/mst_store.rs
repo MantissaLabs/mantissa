@@ -39,7 +39,7 @@ where
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct OwnedPageRange {
     start: Vec<u8>,
     end: Vec<u8>,

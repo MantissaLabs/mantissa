@@ -335,6 +335,19 @@ impl topology::Server for Topology {
             let sync_resp = client.get_sync_request().send().promise.await?;
             let sync_cap = sync_resp.get()?.get_sync()?;
 
+            // Bypass sync if roots are equal.
+            let mut gr = sync_cap.get_root_request();
+            gr.get().set_domain(crate::sync_capnp::Domain::Peers);
+            let resp = gr.send().promise.await?;
+
+            let remote_root: String = resp.get()?.get_root_hex()?.to_string()?;
+            let local_root = peers.root_hex().await;
+
+            if remote_root == local_root {
+                println!("sync: roots equal; skipping delta");
+                return Ok(());
+            }
+
             let mut ranges = sync_cap.get_ranges_request();
             ranges.get().set_domain(crate::sync_capnp::Domain::Peers);
 
