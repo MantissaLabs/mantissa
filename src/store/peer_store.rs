@@ -1,4 +1,4 @@
-use crate::store::crdt::mst::CrdtMstStore;
+use crate::store::crdt::mst_store::CrdtMstStore;
 use crate::store::crdt::table_set::TableSet;
 use crate::store::crdt::uuid_key::UuidKey;
 use std::sync::Arc;

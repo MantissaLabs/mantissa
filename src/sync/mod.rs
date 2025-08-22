@@ -1,7 +1,7 @@
 use crate::{
     store::{
         crdt::{
-            mst::{capnp_fill_ranges, owned_ranges_from_capnp},
+            mst_store::{capnp_fill_ranges, owned_ranges_from_capnp},
             uuid_key::UuidKey,
         },
         peer_store::PeersStore,

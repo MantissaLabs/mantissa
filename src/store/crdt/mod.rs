@@ -1,7 +1,5 @@
 pub mod adapter;
-pub mod crdt;
-mod key;
-pub mod mst;
+pub mod mst_store;
 mod mvreg;
 pub mod table_set;
 pub mod uuid_key;

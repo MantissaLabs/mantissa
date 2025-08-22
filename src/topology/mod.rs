@@ -7,7 +7,7 @@ use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
 use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
-use crate::store::crdt::mst::{
+use crate::store::crdt::mst_store::{
     capnp_fill_ranges, compute_want_from_owned, owned_ranges_from_capnp,
 };
 use crate::store::crdt::uuid_key::UuidKey;

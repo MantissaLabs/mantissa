@@ -1,4 +1,3 @@
-use crate::store::crdt::key::KeyFromSlice;
 use serde::{Deserialize, Serialize};
 use std::io;
 use uuid::Uuid;
@@ -40,13 +39,6 @@ impl UuidKey {
 
     pub fn to_uuid(self) -> Uuid {
         Uuid::from_bytes(self.0)
-    }
-}
-
-impl KeyFromSlice for UuidKey {
-    fn from_slice(b: &[u8]) -> Self {
-        let arr: [u8; 16] = b.try_into().expect("UuidKey requires 16 bytes");
-        Self(arr)
     }
 }
 

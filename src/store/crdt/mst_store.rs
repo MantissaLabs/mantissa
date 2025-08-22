@@ -1,9 +1,6 @@
 use crate::store::crdt::adapter::RegAdapter;
-use crate::store::crdt::key::KeyFromSlice;
 use crate::store::crdt::table_set::TableSet;
 use bincode;
-use merkle_search_tree::diff::diff as mst_diff;
-use merkle_search_tree::diff::{DiffRange, PageRange};
 use merkle_search_tree::digest::Hasher as MstHasher;
 use merkle_search_tree::{builder::Builder, MerkleSearchTree};
 use redb::ReadableTable;
@@ -32,32 +29,9 @@ fn into_io<E: std::error::Error>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e.to_string())
 }
 
-pub fn ranges_to_bytes(ranges: &[OwnedPageRange]) -> io::Result<Vec<u8>> {
-    bincode::serialize(ranges).map_err(into_io)
-}
-
-pub fn ranges_from_bytes(bytes: &[u8]) -> io::Result<Vec<OwnedPageRange>> {
-    bincode::deserialize(bytes).map_err(into_io)
-}
-
 // convert dec_key(K) → raw key bytes (the same shape MST uses in ranges)
 fn key_raw_bytes<C: RegAdapter>(k: &C::Key) -> Vec<u8> {
     C::key_to_bytes(k) // your adapter’s K → &[u8] → Vec<u8>
-}
-
-impl OwnedPageRange {
-    fn from_page_range<K>(r: &PageRange<K>) -> Self
-    where
-        K: AsRef<[u8]>,
-    {
-        // PageRange exposes borrowed bounds/hashes; copy into owned bytes.
-        // Hash type implements AsRef<[u8]> in the MST crate.
-        Self {
-            start: r.start().as_ref().to_vec(),
-            end: r.end().as_ref().to_vec(),
-            hash: r.hash().as_ref().to_vec(),
-        }
-    }
 }
 
 /// Generic CRDT + MST store.
@@ -67,7 +41,7 @@ impl OwnedPageRange {
 pub struct CrdtMstStore<C, H, T>
 where
     C: RegAdapter,
-    C::Key: AsRef<[u8]> + KeyFromSlice + std::fmt::Debug,
+    C::Key: AsRef<[u8]> + std::fmt::Debug,
     H: MstHasher<16, C::Key>
         + MstHasher<16, Entry<C::Snapshot>>
         + Default
@@ -86,7 +60,7 @@ where
 impl<C, H, T> CrdtMstStore<C, H, T>
 where
     C: RegAdapter,
-    C::Key: AsRef<[u8]> + KeyFromSlice + std::fmt::Debug,
+    C::Key: AsRef<[u8]> + std::fmt::Debug,
     H: MstHasher<16, C::Key>
         + MstHasher<16, Entry<C::Snapshot>>
         + Default
@@ -195,7 +169,7 @@ where
 
         // Write register, clear tombstone
         {
-            let mut w = self.db.begin_write().map_err(into_io)?;
+            let w = self.db.begin_write().map_err(into_io)?;
             {
                 let mut values = w.open_table(T::values()).map_err(into_io)?;
                 let kb = Self::enc_key(k);
@@ -220,7 +194,7 @@ where
 
     /// Remove key (write tombstone + delete value), returns tombstone seq.
     pub async fn remove(&self, k: &C::Key) -> io::Result<u64> {
-        let mut w = self.db.begin_write().map_err(into_io)?;
+        let w = self.db.begin_write().map_err(into_io)?;
 
         let ts = {
             let mut meta = w.open_table(T::meta()).map_err(into_io)?;
@@ -282,6 +256,8 @@ where
     }
 
     /// Replace the in-memory MST (e.g., after applying remote diffs).
+    /// This is usually done incrementally, but this method exists if
+    /// we want to rebuild the entire MST for other reasons.
     pub async fn rebuild_mst<Ia, It>(&self, actives: Ia, tombs: It)
     where
         Ia: IntoIterator<Item = (C::Key, C::Snapshot)>,
@@ -302,56 +278,6 @@ where
     pub async fn root_hex(&self) -> String {
         let mut t = self.mst.write().await; // root_hash needs &mut internally
         t.root_hash().to_string()
-    }
-
-    /// Export the *full registers* + tombstones for keys that lie within the given delta page ranges.
-    ///
-    /// Input: delta_ranges_bytes from `mst_diff_ranges_bytes`.
-    /// Output: vectors you can stream in chunks via Cap'n Proto (`read(maxItems)`).
-    ///
-    /// NOTE: this does *precise* range selection using redb's range iteration.
-    pub fn export_delta_for_ranges(
-        &self,
-        delta_ranges_bytes: &[u8],
-    ) -> io::Result<(Vec<(C::Key, C::Reg)>, Vec<(C::Key, u64)>)> {
-        let delta: Vec<OwnedPageRange> =
-            bincode::deserialize(delta_ranges_bytes).map_err(into_io)?;
-
-        let r = self.db.begin_read().map_err(into_io)?;
-        let values = r.open_table(T::values()).map_err(into_io)?;
-        let tombs = r.open_table(T::tombs()).map_err(into_io)?;
-
-        let mut regs: Vec<(C::Key, C::Reg)> = Vec::new();
-        for rng in &delta {
-            let mut it = values
-                .range(rng.start.as_slice()..=rng.end.as_slice())
-                .map_err(into_io)?;
-            while let Some(Ok((k_guard, v_guard))) = it.next() {
-                let k = Self::dec_key(k_guard.value())?;
-                let reg = Self::dec_reg(v_guard.value())?;
-                regs.push((k, reg));
-            }
-        }
-
-        let mut ts: Vec<(C::Key, u64)> = Vec::new();
-        for rng in &delta {
-            let mut it = tombs
-                .range(rng.start.as_slice()..=rng.end.as_slice())
-                .map_err(into_io)?;
-            while let Some(Ok((k_guard, ts_guard))) = it.next() {
-                let k = Self::dec_key(k_guard.value())?;
-                ts.push((k, ts_guard.value()));
-            }
-        }
-
-        // Dedup (overlapping ranges)
-        regs.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
-        regs.dedup_by(|(ka, _), (kb, _)| ka == kb);
-
-        ts.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
-        ts.dedup_by(|(ka, _), (kb, _)| ka == kb);
-
-        Ok((regs, ts))
     }
 
     /// Receiver: apply one chunk (merge + persist), *no* MST rebuild here.
@@ -393,7 +319,7 @@ where
 
         // Persist tombstones (and optionally remove value rows to save space)
         for (k, ts_val) in tombs {
-            let mut w = self.db.begin_write().map_err(into_io)?;
+            let w = self.db.begin_write().map_err(into_io)?;
             {
                 let mut tt = w.open_table(T::tombs()).map_err(into_io)?;
                 let kb = Self::enc_key(&k);
@@ -416,7 +342,7 @@ where
     }
 
     pub async fn mst_ranges_owned(&self) -> std::io::Result<Vec<OwnedPageRange>> {
-        let mut t = self.mst.write().await;
+        let t = self.mst.write().await;
 
         // Option<Vec<PageRange<'_, K>>> → Vec<...>
         let prs = t.serialise_page_ranges().unwrap_or_default();
@@ -432,20 +358,6 @@ where
             .collect();
 
         Ok(out)
-    }
-
-    /// Old friend: serialize ranges as bincode<Vec<OwnedPageRange>>
-    pub async fn mst_ranges_bytes(&self) -> io::Result<Vec<u8>> {
-        let owned = self.mst_ranges_owned().await?;
-        ranges_to_bytes(&owned)
-    }
-
-    /// Compute want = diff(remote, local) and serialize as bincode<Vec<OwnedPageRange>>
-    pub async fn mst_diff_ranges_bytes(&self, theirs_bytes: &[u8]) -> io::Result<Vec<u8>> {
-        let remote = ranges_from_bytes(theirs_bytes)?;
-        let local = self.mst_ranges_owned().await?;
-        let want = compute_want_from_owned(&remote, &local);
-        ranges_to_bytes(&want)
     }
 
     /// Export exact delta for requested owned ranges:
@@ -538,7 +450,7 @@ where
     }
 
     pub async fn debug_dump_ranges(&self, label: &str, limit: usize) {
-        let mut t = self.mst.write().await;
+        let t = self.mst.write().await;
         let prs = t.serialise_page_ranges().unwrap_or_default();
         println!("[MST] {label}: {} ranges", prs.len());
         for (i, pr) in prs.iter().take(limit).enumerate() {
