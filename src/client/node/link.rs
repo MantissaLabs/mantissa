@@ -1,7 +1,7 @@
 use crate::client::common;
 use crate::client::config::ClientConfig;
 use crate::topology_capnp::join_request as JoinRequest;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use capnp::message::Builder;
 
 pub async fn link(cfg: &ClientConfig) -> Result<()> {
@@ -22,10 +22,19 @@ pub async fn link(cfg: &ClientConfig) -> Result<()> {
         .get()
         .set_link(builder.get_root::<JoinRequest::Builder>()?.into_reader());
 
-    // TODO: Do something with the response.
     let response = request.send().promise.await?;
+    let join_resp = response.get()?.get_resp()?;
+    let err = join_resp.get_error()?.to_string()?;
 
-    // TODO: Synchronize with ClusterSync interface?
+    if !err.is_empty() {
+        eprintln!("join failed: {err}");
+        bail!(err);
+    }
+
+    println!(
+        "join succeeded via {}",
+        cfg.anchor.as_deref().unwrap_or("<unknown anchor>")
+    );
 
     Ok(())
 }

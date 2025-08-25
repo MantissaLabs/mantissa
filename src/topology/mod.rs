@@ -7,12 +7,9 @@ use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
 use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
-use crate::store::crdt::mst_store::{
-    capnp_fill_ranges, compute_want_from_owned, owned_ranges_from_capnp,
-};
 use crate::store::crdt::uuid_key::UuidKey;
 use crate::store::peer_store::PeersStore;
-use crate::sync::delta::DeltaSinkImpl;
+use crate::sync::delta::sync_peers_after_join;
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
 use crate::topology_capnp::{topology, topology_event};
@@ -278,7 +275,7 @@ impl topology::Server for Topology {
     fn join(
         &mut self,
         params: topology::JoinParams,
-        mut _results: topology::JoinResults,
+        mut results: topology::JoinResults,
     ) -> Promise<(), Error> {
         let self_addr = self.addr.clone();
         let hostname = self.node.system_info.info.hostname.clone().unwrap();
@@ -306,6 +303,9 @@ impl topology::Server for Topology {
                 .to_string()
                 .expect("expected join token");
 
+            let mut out = results.get();
+            let mut resp = out.reborrow().init_resp();
+
             if anchor == self_addr {
                 return Err(capnp::Error::failed("cannot join own address".to_string()));
             }
@@ -328,77 +328,22 @@ impl topology::Server for Topology {
             info.set_handle(server_handle);
             info.set_public_key(&public_key);
 
-            // TODO: Do something with the response (Success/Error).
-            let _response = request.send().promise.await?;
-
-            // Get Sync capability now that we are added to the cluster.
-            let sync_resp = client.get_sync_request().send().promise.await?;
-            let sync_cap = sync_resp.get()?.get_sync()?;
-
-            // Bypass sync if roots are equal.
-            let mut gr = sync_cap.get_root_request();
-            gr.get().set_domain(crate::sync_capnp::Domain::Peers);
-            let resp = gr.send().promise.await?;
-
-            let remote_root: String = resp.get()?.get_root_hex()?.to_string()?;
-            let local_root = peers.root_hex().await;
-
-            if remote_root == local_root {
-                println!("sync: roots equal; skipping delta");
+            // Await register result, if the server rejected the token, surface it here.
+            if let Err(e) = request.send().promise.await {
+                resp.set_error(&format!("registration failed: {}", e));
                 return Ok(());
             }
 
-            let mut ranges = sync_cap.get_ranges_request();
-            ranges.get().set_domain(crate::sync_capnp::Domain::Peers);
-
-            // Get remote ranges
-            let ranges_resp = ranges.send().promise.await?;
-            let remote_owned =
-                owned_ranges_from_capnp::<UuidKey>(ranges_resp.get()?.get_summary()?)?;
-
-            // Remote ranges fetched into `remote_owned`
-            println!("client: fetched remote ranges = {}", remote_owned.len());
-
-            // Local ranges
-            let local_owned = peers
-                .mst_ranges_owned()
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            println!("client: local ranges = {}", local_owned.len());
-
-            // Compute the diff
-            let want_owned = compute_want_from_owned(&remote_owned, &local_owned);
-            println!("client: want ranges = {}", want_owned.len());
-
-            // TODO/REMOVE: dump roots/ranges around this point
-            peers
-                .debug_dump_root("client.local.before_open_delta")
-                .await;
-            peers
-                .debug_dump_ranges("client.local.before_open_delta", 5)
-                .await;
-
-            // stream request to fetch the delta for Peers domain
-            let sink_client = capnp_rpc::new_client(DeltaSinkImpl::new(peers.clone()));
-            let mut od = sync_cap.open_delta_request();
-            {
-                let mut p = od.get();
-                p.set_domain(crate::sync_capnp::Domain::Peers);
-                let want_builder = p.reborrow().init_want();
-                capnp_fill_ranges::<UuidKey>(&want_owned, want_builder)?;
-                p.set_sink(sink_client);
-            }
-
-            println!("opening delta stream…");
-            od.send().promise.await?;
-            println!("delta stream finished.");
+            // Get Sync capability (pipeline) and spawn background sync.
+            // Note: we do not await here. This returns a capability we can use
+            // inside a same-thread task (capabilities are !Send).
+            let sync_cap = client.get_sync_request().send().pipeline.get_sync();
+            tokio::task::spawn_local(sync_peers_after_join(peers.clone(), sync_cap));
 
             // Send signal to synchronize data with anchor node (fetch the Sync capability),
             // and start:
             // - heartbeat background task
             // - gossip loop
-
-            println!("Request sent");
 
             Ok(())
         })
