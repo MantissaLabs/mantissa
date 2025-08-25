@@ -310,7 +310,7 @@ impl topology::Server for Topology {
                 return Err(capnp::Error::failed("cannot join own address".to_string()));
             }
 
-            let client = common::get_client_secure(anchor.as_str(), join_token.as_str())
+            let client = common::get_client_secure(anchor.as_str())
                 .await
                 .map_err(|e| {
                     capnp::Error::failed(format!("could not connect to anchor {}: {}", anchor, e))
@@ -327,6 +327,9 @@ impl topology::Server for Topology {
             info.set_addr(advertise);
             info.set_handle(server_handle);
             info.set_public_key(&public_key);
+
+            // Set the join token.
+            request.get().set_token(join_token.as_str());
 
             let reg = request.send().promise.await?;
             let resp = reg.get()?.get_resp()?;
@@ -366,12 +369,20 @@ impl topology::Server for Topology {
         params: topology::RegisterNodeParams,
         mut results: topology::RegisterNodeResults,
     ) -> Promise<(), Error> {
-        println!("Received request to register node");
-
         let topology = self.clone();
 
         Promise::from_future(async move {
-            let node = params.get()?.get_info()?;
+            let params = params.get()?;
+            let node = params.get_info()?;
+            let token = params
+                .get_token()?
+                .to_string()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            // Reject request to join if the token is invalid.
+            if !topology.token_store.matches(&token).await {
+                return Err(capnp::Error::failed("invalid join token".to_string()));
+            }
 
             let id = read_node_id(node.reborrow().get_id()?)?;
             let address = node.get_addr()?.to_string().expect("expected address");

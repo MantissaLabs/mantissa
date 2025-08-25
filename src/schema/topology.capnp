@@ -15,7 +15,7 @@ interface Topology {
   # This method signals the intent to join. The next step is
   # to register the node.
 
-  registerNode @1 (info :NodeInfo) -> (resp :RegisterNodeResponse);
+  registerNode @1 (info :NodeInfo, token :Text) -> (resp :RegisterNodeResponse);
   # Register the node to a remote server.
 
   leave @2 () -> ();

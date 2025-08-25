@@ -18,7 +18,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 /// Used to get a client connection with Capn'proto.
 /// At the moment, any method using `get_client` *needs* to be run in a tokio task,
 /// otherwise this will panic.
-pub async fn get_client_secure(addr: &str, token: &str) -> Result<Client, capnp::Error> {
+pub async fn get_client_secure(addr: &str) -> Result<Client, capnp::Error> {
     use std::net::ToSocketAddrs;
     let sock = addr
         .to_socket_addrs()
@@ -33,7 +33,7 @@ pub async fn get_client_secure(addr: &str, token: &str) -> Result<Client, capnp:
 
     let keys_path = crate::noise::resolve_noise_key_path()?;
     let keys = Arc::new(load_or_generate_noise_keys(keys_path)?);
-    let noise_stream = client_handshake(tcp, token, &keys)
+    let noise_stream = client_handshake(tcp, &keys)
         .await
         .map_err(|e| capnp::Error::failed(format!("noise: {e}")))?;
 

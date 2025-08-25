@@ -180,8 +180,6 @@ impl ServerImpl {
         // Extract what we need *before* consuming self in new_client(self)
         let cfg = self.config.as_ref().expect("config");
         let listen_addr = cfg.listen_addr.clone();
-
-        let token_store = self.token_store.as_ref().cloned().unwrap_or_default();
         let noise_keys = self.noise_keys.as_ref().expect("noise keys").clone();
 
         // Turn the server impl into a Cap'n Proto capability
@@ -190,13 +188,11 @@ impl ServerImpl {
         // Spawn TCP secure listener
         let tcp_task = {
             let server_handle = server_handle.clone();
-            let token_store = token_store.clone();
             let noise_keys = noise_keys.clone();
             tokio::task::spawn_local(async move {
                 if let Err(e) = crate::net::tcp_secure::start_tcp_secure_listener(
                     listen_addr,
                     server_handle,
-                    token_store,
                     noise_keys,
                 )
                 .await

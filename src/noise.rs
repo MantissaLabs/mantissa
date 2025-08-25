@@ -6,8 +6,6 @@ use std::{fs, io, path::Path};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::token::TokenStore;
-
 pub struct NoiseKeys {
     pub private: StaticSecret,
     pub public: PublicKey,
@@ -46,14 +44,12 @@ fn prologue() -> &'static [u8] {
 
 pub async fn client_handshake(
     tcp: tokio::net::TcpStream,
-    token: &str,
     keys: &NoiseKeys,
 ) -> std::io::Result<tokio::io::DuplexStream> {
     use std::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let pk_bytes = keys.private.to_bytes();
-
     let builder = snow::Builder::new(NOISE_PARAMS.parse().unwrap())
         .prologue(prologue())
         .local_private_key(&pk_bytes);
@@ -61,6 +57,7 @@ pub async fn client_handshake(
     let mut hs = builder
         .build_initiator()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
     let (mut rd, mut wr) = tcp.into_split();
 
     // -> e
@@ -78,24 +75,22 @@ pub async fn client_handshake(
         )
     })?;
 
-    // -> s, se, payload=token (encrypted)
-    let n = hs.write_message(token.as_bytes(), &mut out).unwrap();
+    // -> s, se    (no app payload here)
+    let n = hs.write_message(&[], &mut out).unwrap();
     wr.write_all(&out[..n]).await?;
 
     let transport = hs.into_transport_mode().unwrap();
-    Ok(spawn_noise_pump(rd, wr, transport)) // your existing pump
+    Ok(spawn_noise_pump(rd, wr, transport))
 }
 
 pub async fn server_handshake(
     tcp: tokio::net::TcpStream,
-    tokens: TokenStore,
     keys: &NoiseKeys,
 ) -> std::io::Result<tokio::io::DuplexStream> {
     use std::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let pk_bytes = keys.private.to_bytes();
-
     let builder = snow::Builder::new(NOISE_PARAMS.parse().unwrap())
         .prologue(prologue())
         .local_private_key(&pk_bytes);
@@ -120,28 +115,14 @@ pub async fn server_handshake(
     let n = hs.write_message(&[], &mut out).unwrap();
     wr.write_all(&out[..n]).await?;
 
-    // <- s, se, payload=token
+    // <- s, se   (no app payload expected)
     let nread = rd.read(&mut inb).await?;
-    let payload_len = hs.read_message(&inb[..nread], &mut out).map_err(|e| {
+    hs.read_message(&inb[..nread], &mut out).map_err(|e| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("handshake failed: {e}"),
         )
     })?;
-    let token_bytes = &out[..payload_len];
-    let token_str = std::str::from_utf8(token_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "invalid token bytes"))?;
-
-    // TODO: Use Admission Trait to check whether the member is already registered
-    // or not, and if not, register them using their public key.
-
-    // If token isn't matching, fail the handshake.
-    if !tokens.matches(token_str).await {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "invalid join token",
-        ));
-    }
 
     let transport = hs.into_transport_mode().unwrap();
     Ok(spawn_noise_pump(rd, wr, transport))
