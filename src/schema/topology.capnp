@@ -15,7 +15,7 @@ interface Topology {
   # This method signals the intent to join. The next step is
   # to register the node.
 
-  registerNode @1 (info :NodeInfo) -> (sync :Sync);
+  registerNode @1 (info :NodeInfo) -> (resp :RegisterNodeResponse);
   # Register the node to a remote server.
 
   leave @2 () -> ();
@@ -29,6 +29,14 @@ interface Topology {
 
   rotateToken @5 () -> (token :Text);
   # Rotates the token for the node, invalidates existing token.
+}
+
+struct RegisterNodeResponse {
+  error @0 :Text;
+  # empty on success
+
+  sync @1 :Sync;
+  # only set on success
 }
 
 struct TopologyEvent {

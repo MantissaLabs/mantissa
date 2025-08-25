@@ -328,16 +328,27 @@ impl topology::Server for Topology {
             info.set_handle(server_handle);
             info.set_public_key(&public_key);
 
-            // Await register result, if the server rejected the token, surface it here.
-            if let Err(e) = request.send().promise.await {
-                resp.set_error(&format!("registration failed: {}", e));
+            let reg = request.send().promise.await?;
+            let resp = reg.get()?.get_resp()?;
+            let err = resp.get_error()?.to_string()?;
+            if !err.is_empty() {
+                // Surface error to CLI JoinResponse.
+                let mut out = results.get().init_resp();
+                out.set_error(&err);
                 return Ok(());
             }
 
-            // Get Sync capability (pipeline) and spawn background sync.
+            // Get Sync capability: prefer the one returned, else fetch via client
+            let sync_cap = if resp.has_sync() {
+                resp.get_sync()?
+            } else {
+                let s = client.get_sync_request().send().promise.await?;
+                s.get()?.get_sync()?
+            };
+
+            // Spawn background sync.
             // Note: we do not await here. This returns a capability we can use
             // inside a same-thread task (capabilities are !Send).
-            let sync_cap = client.get_sync_request().send().pipeline.get_sync();
             tokio::task::spawn_local(sync_peers_after_join(peers.clone(), sync_cap));
 
             // Send signal to synchronize data with anchor node (fetch the Sync capability),
@@ -353,7 +364,7 @@ impl topology::Server for Topology {
     fn register_node(
         &mut self,
         params: topology::RegisterNodeParams,
-        mut _results: topology::RegisterNodeResults,
+        mut results: topology::RegisterNodeResults,
     ) -> Promise<(), Error> {
         println!("Received request to register node");
 
@@ -379,16 +390,26 @@ impl topology::Server for Topology {
 
             let pubkey = pubkey_from_slice(public_key).expect("expect valid public key");
 
-            let v = PeerValue {
+            let peer = PeerValue {
                 address: address,
                 hostname,
                 noise_static_pub: pubkey.to_bytes(),
             };
 
-            topology
-                .register_peer(id, &v, handle)
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            let mut err = String::new();
+            if let Err(e) = topology.register_peer(id, &peer, handle).await {
+                err = format!("registration failed: {e}");
+            }
+
+            let mut resp = results.get().init_resp();
+            resp.set_error(&err);
+
+            if err.is_empty() {
+                // Return a Sync capability bound to the same PeersStore.
+                let sync_srv = crate::sync::SyncService::new(topology.peers.clone());
+                let sync_client: crate::sync_capnp::sync::Client = capnp_rpc::new_client(sync_srv);
+                resp.set_sync(sync_client);
+            }
 
             Ok(())
         })
