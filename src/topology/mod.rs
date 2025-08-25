@@ -305,9 +305,6 @@ impl topology::Server for Topology {
                 .to_string()
                 .expect("expected join token");
 
-            let mut out = results.get();
-            let mut resp = out.reborrow().init_resp();
-
             if anchor == self_addr {
                 return Err(capnp::Error::failed("cannot join own address".to_string()));
             }
@@ -333,8 +330,8 @@ impl topology::Server for Topology {
             // Set the join token.
             request.get().set_token(join_token.as_str());
 
-            let reg = request.send().promise.await?;
-            let resp = reg.get()?.get_resp()?;
+            let register = request.send().promise.await?;
+            let resp = register.get()?.get_resp()?;
             let err = resp.get_error()?.to_string()?;
             if !err.is_empty() {
                 // Surface error to CLI JoinResponse.
@@ -389,6 +386,8 @@ impl topology::Server for Topology {
             }
 
             let id = read_node_id(node.reborrow().get_id()?)?;
+            let key = UuidKey::from(id);
+
             let address = node.get_addr()?.to_string().expect("expected address");
             let hostname = node.get_hostname()?.to_string().expect("expected hostname");
             let root_hash = node
@@ -411,18 +410,34 @@ impl topology::Server for Topology {
                 noise_static_pub: pubkey.to_bytes(),
             };
 
-            topology
-                .register_peer(id, &peer, handle)
-                .await
-                .map_err(|e| Error::failed(format!("registration failed: {e}")))?;
+            // If peers exists, return an "already joined" error. Otherwise,
+            // add and return Sync capability.
+            match topology.peers.exists(&key) {
+                Ok(true) => {
+                    let mut out = results.get().init_resp();
+                    out.set_error("already registered");
 
-            let sync_srv = SyncService::new(topology.peers.clone());
-            let sync_client: sync::Client = capnp_rpc::new_client(sync_srv);
+                    // We don't return any cap on failure.
+                    return Ok(());
+                }
+                Ok(false) => {
+                    topology
+                        .register_peer(id, &peer, handle)
+                        .await
+                        .map_err(|e| Error::failed(format!("registration failed: {e}")))?;
 
-            let mut resp = results.get().init_resp();
-            resp.set_sync(sync_client);
+                    // Include a Sync capability on success so the caller can start
+                    // delta state sync.
+                    let mut out = results.get().init_resp();
 
-            Ok(())
+                    let sync_srv = SyncService::new(topology.peers.clone());
+                    let sync_cap = capnp_rpc::new_client(sync_srv);
+
+                    out.set_sync(sync_cap);
+                    return Ok(());
+                }
+                Err(e) => return Err(capnp::Error::failed(e.to_string())),
+            }
         })
     }
 
