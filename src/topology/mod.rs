@@ -1,6 +1,7 @@
 use crate::client::common;
 use crate::gossip_capnp::gossip_message;
 use crate::health_capnp::NodeStatus;
+use crate::includes::sync_capnp::sync;
 use crate::node::address::{compute_advertise_ip, extract_port};
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
@@ -10,6 +11,7 @@ use crate::server_capnp::server::Client as ServerClient;
 use crate::store::crdt::uuid_key::UuidKey;
 use crate::store::peer_store::PeersStore;
 use crate::sync::delta::sync_peers_after_join;
+use crate::sync::SyncService;
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
 use crate::topology_capnp::{topology, topology_event};
@@ -381,7 +383,9 @@ impl topology::Server for Topology {
 
             // Reject request to join if the token is invalid.
             if !topology.token_store.matches(&token).await {
-                return Err(capnp::Error::failed("invalid join token".to_string()));
+                let mut resp = results.get().init_resp();
+                resp.set_error("invalid join token");
+                return Ok(());
             }
 
             let id = read_node_id(node.reborrow().get_id()?)?;
@@ -407,20 +411,16 @@ impl topology::Server for Topology {
                 noise_static_pub: pubkey.to_bytes(),
             };
 
-            let mut err = String::new();
-            if let Err(e) = topology.register_peer(id, &peer, handle).await {
-                err = format!("registration failed: {e}");
-            }
+            topology
+                .register_peer(id, &peer, handle)
+                .await
+                .map_err(|e| Error::failed(format!("registration failed: {e}")))?;
+
+            let sync_srv = SyncService::new(topology.peers.clone());
+            let sync_client: sync::Client = capnp_rpc::new_client(sync_srv);
 
             let mut resp = results.get().init_resp();
-            resp.set_error(&err);
-
-            if err.is_empty() {
-                // Return a Sync capability bound to the same PeersStore.
-                let sync_srv = crate::sync::SyncService::new(topology.peers.clone());
-                let sync_client: crate::sync_capnp::sync::Client = capnp_rpc::new_client(sync_srv);
-                resp.set_sync(sync_client);
-            }
+            resp.set_sync(sync_client);
 
             Ok(())
         })

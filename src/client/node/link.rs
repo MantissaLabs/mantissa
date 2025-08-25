@@ -1,7 +1,7 @@
 use crate::client::common;
 use crate::client::config::ClientConfig;
 use crate::topology_capnp::join_request as JoinRequest;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, Result};
 use capnp::message::Builder;
 
 pub async fn link(cfg: &ClientConfig) -> Result<()> {
@@ -27,8 +27,7 @@ pub async fn link(cfg: &ClientConfig) -> Result<()> {
     let err = join_resp.get_error()?.to_string()?;
 
     if !err.is_empty() {
-        eprintln!("join failed: {err}");
-        bail!(err);
+        return Err(anyhow!(err.to_string()));
     }
 
     println!(
