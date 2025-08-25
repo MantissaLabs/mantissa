@@ -80,7 +80,7 @@ pub async fn client_handshake(
     wr.write_all(&out[..n]).await?;
 
     let transport = hs.into_transport_mode().unwrap();
-    Ok(spawn_noise_pump(rd, wr, transport))
+    Ok(spawn_noise_io_bridge(rd, wr, transport))
 }
 
 pub async fn server_handshake(
@@ -125,109 +125,148 @@ pub async fn server_handshake(
     })?;
 
     let transport = hs.into_transport_mode().unwrap();
-    Ok(spawn_noise_pump(rd, wr, transport))
+    Ok(spawn_noise_io_bridge(rd, wr, transport))
 }
 
-fn spawn_noise_pump(
-    mut tcp_rd: tokio::net::tcp::OwnedReadHalf,
-    mut tcp_wr: tokio::net::tcp::OwnedWriteHalf,
+/// Spawn a Noise-protected I/O bridge between the TCP socket and an in-process
+/// duplex stream returned to the caller (the "application end").
+///
+/// Layout:
+///   - app_end  (returned)  <==== plaintext ====>  noise_end (internal)
+///   - Task A: TCP -> [len|ciphertext] -> decrypt -> write plaintext to app_end
+///   - Task B: read plaintext from app_end -> encrypt -> TCP [len|ciphertext]
+///
+/// Framing:
+///   Each encrypted frame on the wire is sent as:
+///     [u16 big-endian length][ciphertext bytes...]
+///
+/// Concurrency:
+///   `snow::TransportState` is not `Sync`, and its read/write operations mutate
+///   internal counters/nonces. We wrap it in `Arc<Mutex<_>>` and *share the same
+///   transport* across both directions to keep the Noise state coherent.
+fn spawn_noise_io_bridge(
+    mut tcp_reader: tokio::net::tcp::OwnedReadHalf,
+    mut tcp_writer: tokio::net::tcp::OwnedWriteHalf,
     transport: snow::TransportState,
 ) -> tokio::io::DuplexStream {
-    // app_side <-> pump_side
-    let (app_side, pump_side) = tokio::io::duplex(MAX_FRAME * 2);
+    // A bidirectional in-process pipe: one end for the application (`app_end`),
+    // the other end (`noise_end`) is used internally by the bridge tasks.
+    let (app_end, noise_end) = tokio::io::duplex(MAX_FRAME * 2);
 
-    // Split the pump end so each task owns exactly one half
-    let (mut pump_r, mut pump_w) = tokio::io::split(pump_side);
+    // Split the internal end so each task owns exactly one half.
+    // - `noise_writer`: Task A writes plaintext to the app (app will read it from `app_end`)
+    // - `noise_reader`: Task B reads plaintext from the app (app writes to `app_end`)
+    let (mut noise_reader, mut noise_writer) = tokio::io::split(noise_end);
 
-    // Share the Noise transport safely between tasks
+    // Share the Noise transport safely between the two tasks.
     let transport = Arc::new(Mutex::new(transport));
-    let t_read = transport.clone();
-    let t_write = transport.clone();
+    let transport_for_read = transport.clone(); // used by Task A (decrypt)
+    let transport_for_write = transport.clone(); // used by Task B (encrypt)
 
-    // Task 1: TCP -> decrypt -> app  (writes to pump_w)
+    // Task A: TCP -> decrypt -> app
+    //
+    // Reads length-prefixed ciphertext from the TCP socket, decrypts it with
+    // Noise, and forwards the resulting plaintext into `noise_writer` so the
+    // application can read it from `app_end`.
     tokio::spawn(async move {
-        let mut len_buf = [0u8; 2];
-        let mut cipher = vec![0u8; MAX_FRAME + 1024];
-        let mut plain = vec![0u8; MAX_FRAME + 1024];
+        let mut len_prefix = [0u8; 2];
+        let mut cipher_buf = vec![0u8; MAX_FRAME + 1024]; // headroom
+        let mut plain_buf = vec![0u8; MAX_FRAME + 1024];
 
         loop {
-            if tcp_rd.read_exact(&mut len_buf).await.is_err() {
-                let _ = pump_w.shutdown().await;
+            // Read the 2-byte length prefix.
+            if tcp_reader.read_exact(&mut len_prefix).await.is_err() {
+                let _ = noise_writer.shutdown().await;
                 break;
             }
-            let clen = u16::from_be_bytes(len_buf) as usize;
-            if clen > cipher.len() {
-                cipher.resize(clen, 0);
+            let clen = u16::from_be_bytes(len_prefix) as usize;
+
+            // Read encrypted payload.
+            if cipher_buf.len() < clen {
+                cipher_buf.resize(clen, 0);
             }
-            if tcp_rd.read_exact(&mut cipher[..clen]).await.is_err() {
-                let _ = pump_w.shutdown().await;
+            if tcp_reader
+                .read_exact(&mut cipher_buf[..clen])
+                .await
+                .is_err()
+            {
+                let _ = noise_writer.shutdown().await;
                 break;
             }
 
-            if plain.len() < clen {
-                plain.resize(clen, 0);
+            // Decrypt into plaintext.
+            if plain_buf.len() < clen {
+                plain_buf.resize(clen, 0);
             }
-            let n = {
-                let mut tr = t_read.lock().await;
-                match tr.read_message(&cipher[..clen], &mut plain) {
+            let n_plain = {
+                let mut t = transport_for_read.lock().await;
+                match t.read_message(&cipher_buf[..clen], &mut plain_buf) {
                     Ok(n) => n,
                     Err(_) => {
-                        let _ = pump_w.shutdown().await;
+                        let _ = noise_writer.shutdown().await;
                         break;
                     }
                 }
             };
 
-            if pump_w.write_all(&plain[..n]).await.is_err() {
-                let _ = pump_w.shutdown().await;
+            // Forward plaintext to the application side.
+            if noise_writer.write_all(&plain_buf[..n_plain]).await.is_err() {
+                let _ = noise_writer.shutdown().await;
                 break;
             }
         }
     });
 
-    // Task 2: app -> encrypt -> TCP (reads from pump_r)
+    // Task B: app -> encrypt -> TCP
+    //
+    // Reads plaintext from `noise_reader` (what the application writes to `app_end`),
+    // encrypts it with Noise, and writes length-prefixed ciphertext to the TCP socket.
     tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_FRAME];
-        let mut cipher = vec![0u8; MAX_FRAME + 16];
+        let mut plain_buf = vec![0u8; MAX_FRAME];
+        let mut cipher_buf = vec![0u8; MAX_FRAME + 16]; // AEAD overhead
 
         loop {
-            let n = match pump_r.read(&mut buf).await {
+            // Read plaintext from the application side.
+            let n_plain = match noise_reader.read(&mut plain_buf).await {
                 Ok(0) | Err(_) => {
-                    let _ = tcp_wr.shutdown().await;
+                    let _ = tcp_writer.shutdown().await;
                     break;
                 }
                 Ok(n) => n,
             };
-            let p = &buf[..n];
+            let plain = &plain_buf[..n_plain];
 
-            if cipher.len() < p.len() + 16 {
-                cipher.resize(p.len() + 16, 0);
+            // Encrypt with Noise.
+            if cipher_buf.len() < plain.len() + 16 {
+                cipher_buf.resize(plain.len() + 16, 0);
             }
             let clen = {
-                let mut tr = t_write.lock().await;
-                match tr.write_message(p, &mut cipher) {
+                let mut t = transport_for_write.lock().await;
+                match t.write_message(plain, &mut cipher_buf) {
                     Ok(n) => n,
                     Err(_) => {
-                        let _ = tcp_wr.shutdown().await;
+                        let _ = tcp_writer.shutdown().await;
                         break;
                     }
                 }
             };
 
+            // Write length prefix + ciphertext to the wire.
             let len_bytes = (clen as u16).to_be_bytes();
-            if tcp_wr.write_all(&len_bytes).await.is_err() {
+            if tcp_writer.write_all(&len_bytes).await.is_err() {
                 break;
             }
-            if tcp_wr.write_all(&cipher[..clen]).await.is_err() {
+            if tcp_writer.write_all(&cipher_buf[..clen]).await.is_err() {
                 break;
             }
-            if tcp_wr.flush().await.is_err() {
+            if tcp_writer.flush().await.is_err() {
                 break;
             }
         }
     });
 
-    app_side
+    // The application uses this end (plaintext in both directions).
+    app_end
 }
 
 /// Prefer `/var/lib/mantissa/noise.key`; fallback to `~/.mantissa/noise.key`.
