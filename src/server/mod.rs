@@ -12,9 +12,7 @@ use crate::topology::PeerHandle;
 use crate::{gossip, token::TokenStore};
 use capnp::capability::Promise;
 use capnp::Error;
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use config::Config;
-use futures::{AsyncReadExt, FutureExt};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -35,7 +33,6 @@ pub struct ServerImpl {
     pub node_client: Option<NodeClient>,
     pub sync_client: Option<SyncClient>,
 
-    token_store: Option<TokenStore>,
     config: Option<config::Config>,
     noise_keys: Option<Arc<NoiseKeys>>,
 }
@@ -125,7 +122,6 @@ impl Default for ServerImpl {
             topology_client: None,
             sync_client: None,
             node_client: None,
-            token_store: None,
             config: None,
             noise_keys: None,
         }
@@ -142,37 +138,6 @@ impl ServerImpl {
     }
 
     /// Starts the server, bootstrapping all necessary sub-components
-    pub async fn start_rpc(self) -> Result<(), Box<dyn std::error::Error>> {
-        let config = self.config.as_ref().unwrap();
-
-        let listener = tokio::net::TcpListener::bind(config.listen_addr.clone()).await?;
-
-        println!("Server listening on {}", config.listen_addr.clone());
-
-        let server_handle: server::Client = capnp_rpc::new_client(self);
-
-        println!("Server running");
-
-        loop {
-            let (stream, _) = listener.accept().await?;
-            stream.set_nodelay(true)?;
-            let (reader, writer) =
-                tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
-
-            let network = twoparty::VatNetwork::new(
-                reader,
-                writer,
-                rpc_twoparty_capnp::Side::Server,
-                Default::default(),
-            );
-
-            let rpc_system = RpcSystem::new(Box::new(network), Some(server_handle.clone().client));
-
-            tokio::task::spawn_local(Box::pin(rpc_system.map(|_| ())));
-        }
-    }
-
-    // in impl ServerImpl
     pub async fn start_daemon(
         self,
         enable_unix_socket: bool,
@@ -218,11 +183,6 @@ impl ServerImpl {
         // TODO: Run forever for now, find a way to stop these gracefully.
         let _ = tokio::join!(tcp_task, unix_task);
         Ok(())
-    }
-
-    pub fn with_token_store(&mut self, token_store: TokenStore) -> &mut ServerImpl {
-        self.token_store = Some(token_store);
-        self
     }
 
     pub fn with_topology(&mut self, topology_client: TopologyClient) -> &mut ServerImpl {
@@ -328,7 +288,6 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
         .with_topology(topology_client.clone())
         .with_sync(sync_client.clone())
         .with_node(node_client)
-        .with_token_store(token_store)
         .with_noise_keys(keys.clone())
         .with_config(Config::new().with_listen_addr(addr.clone()).build())
         .build();
