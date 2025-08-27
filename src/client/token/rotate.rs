@@ -1,8 +1,8 @@
-use crate::client::{common, config::ClientConfig};
+use crate::client::{config::ClientConfig, connection};
 use anyhow::Result;
 
 pub async fn rotate(cfg: &ClientConfig) -> Result<()> {
-    let client = common::get_local_session(cfg).await?;
+    let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_topology_request();
     let topology = request.send().pipeline.get_topology();

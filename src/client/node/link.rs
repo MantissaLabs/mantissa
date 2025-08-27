@@ -1,11 +1,11 @@
-use crate::client::common;
 use crate::client::config::ClientConfig;
+use crate::client::connection;
 use crate::topology_capnp::join_request as JoinRequest;
 use anyhow::{anyhow, Result};
 use capnp::message::Builder;
 
 pub async fn link(cfg: &ClientConfig) -> Result<()> {
-    let client = common::get_local_session(cfg).await?;
+    let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_topology_request();
     let topology = request.send().pipeline.get_topology();

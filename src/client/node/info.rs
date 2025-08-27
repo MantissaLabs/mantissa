@@ -1,8 +1,8 @@
-use crate::client::{common, config::ClientConfig};
+use crate::client::{config::ClientConfig, connection};
 use anyhow::Result;
 
 pub async fn info(cfg: &ClientConfig) -> Result<()> {
-    let client = common::get_local_session(cfg).await?;
+    let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_node_request();
     let node = request.send().pipeline.get_node();

@@ -1,4 +1,4 @@
-use crate::client::common;
+use crate::client::connection;
 use crate::gossip_capnp::gossip_message;
 use crate::health_capnp::NodeStatus;
 use crate::includes::sync_capnp::sync;
@@ -318,7 +318,7 @@ impl topology::Server for Topology {
                 return Err(capnp::Error::failed("cannot join own address".to_string()));
             }
 
-            let client = common::get_client_secure(anchor.as_str())
+            let client = connection::get_client_secure(anchor.as_str())
                 .await
                 .map_err(|e| {
                     capnp::Error::failed(format!("could not connect to anchor {}: {}", anchor, e))
