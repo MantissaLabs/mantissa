@@ -45,6 +45,10 @@ interface Scheduler {
   # Schedules a task.
 }
 
+struct NodeId {
+  bytes @0 :Data;  # exactly 16 bytes (enforce in code)
+}
+
 struct TaskList {
   tasks @0 :List(TaskInfo);
   # Contains a list of tasks running on a delegate.

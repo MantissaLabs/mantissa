@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use capnp::message::Builder;
 
 pub async fn link(cfg: &ClientConfig) -> Result<()> {
-    let client = common::get_client_auto(cfg).await?;
+    let client = common::get_local_session(cfg).await?;
 
     let request = client.get_topology_request();
     let topology = request.send().pipeline.get_topology();

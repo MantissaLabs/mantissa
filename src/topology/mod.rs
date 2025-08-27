@@ -9,20 +9,19 @@ use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
 use crate::store::crdt::uuid_key::UuidKey;
+use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::sync::delta::sync_peers_after_join;
-use crate::sync::SyncService;
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
 use capnp::{capability::Promise, Error};
-use log::info;
 use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::{fmt, io};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
@@ -46,6 +45,8 @@ pub struct Topology {
     rx: Receiver<TopologyEvent>,
 
     peers: PeersStore,
+
+    local_sessions: LocalSessionStore,
 
     handles: HandleMap, // ephemeral capabilities
 
@@ -115,6 +116,7 @@ impl Topology {
         public: PublicKey,
         node: Node,
         peers: PeersStore,
+        sessions: LocalSessionStore,
     ) -> Result<Self, Error> {
         Ok(Self {
             addr,
@@ -126,6 +128,7 @@ impl Topology {
             public_key: public,
             peer_id: peer_id_from_public(&public),
             node: node,
+            local_sessions: sessions,
         })
     }
 
@@ -264,8 +267,13 @@ impl Topology {
         Ok(())
     }
 
+    /// Return true if the peer `id` already exists in the peers store.
+    pub fn peer_exists(&self, id: Uuid) -> io::Result<bool> {
+        self.peers.exists(&UuidKey::from(id))
+    }
+
     pub async fn remove_peer(&self, id: Uuid) -> Result<(), Box<dyn std::error::Error>> {
-        self.peers.remove(&UuidKey::from(id));
+        self.peers.remove(&UuidKey::from(id)).await;
         Ok(())
     }
 }
@@ -283,6 +291,7 @@ impl topology::Server for Topology {
         let hostname = self.node.system_info.info.hostname.clone().unwrap();
         let id = self.node.id.clone();
         let peers = self.peers.clone();
+        let local_sessions = self.local_sessions.clone();
 
         let handle = self.get_server_handle();
         if handle.is_none() {
@@ -315,9 +324,7 @@ impl topology::Server for Topology {
                     capnp::Error::failed(format!("could not connect to anchor {}: {}", anchor, e))
                 })?;
 
-            let request = client.get_topology_request();
-            let topology = request.send().pipeline.get_topology();
-            let mut request = topology.register_node_request();
+            let mut request = client.register_node_request();
 
             // Build info message.
             let mut info = request.get().init_info();
@@ -331,21 +338,20 @@ impl topology::Server for Topology {
             request.get().set_token(join_token.as_str());
 
             let register = request.send().promise.await?;
-            let resp = register.get()?.get_resp()?;
-            let err = resp.get_error()?.to_string()?;
-            if !err.is_empty() {
-                // Surface error to CLI JoinResponse.
-                let mut out = results.get().init_resp();
-                out.set_error(&err);
-                return Ok(());
-            }
 
-            // Get Sync capability: prefer the one returned, else fetch via client
-            let sync_cap = if resp.has_sync() {
-                resp.get_sync()?
-            } else {
-                let s = client.get_sync_request().send().promise.await?;
-                s.get()?.get_sync()?
+            let session = register.get()?.get_session()?;
+            let ticket = register.get()?.get_ticket()?;
+            let peer_id = read_node_id(register.get()?.get_peer_id()?)?;
+
+            // Persist the local session for later resume if node restarts.
+            local_sessions
+                .put(peer_id, ticket)
+                .map_err(|e| Error::failed(format!("ticket persist failed: {e}")))?;
+
+            let sync_cap: sync::Client = {
+                let req = session.get_sync_request();
+                let resp = req.send().promise.await?;
+                resp.get()?.get_sync()?
             };
 
             // Spawn background sync.
@@ -362,85 +368,6 @@ impl topology::Server for Topology {
         })
     }
 
-    /// Registers a node to our memberlist.
-    fn register_node(
-        &mut self,
-        params: topology::RegisterNodeParams,
-        mut results: topology::RegisterNodeResults,
-    ) -> Promise<(), Error> {
-        let topology = self.clone();
-
-        Promise::from_future(async move {
-            let params = params.get()?;
-            let node = params.get_info()?;
-            let token = params
-                .get_token()?
-                .to_string()
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-            // Reject request to join if the token is invalid.
-            if !topology.token_store.matches(&token).await {
-                let mut resp = results.get().init_resp();
-                resp.set_error("invalid join token");
-                return Ok(());
-            }
-
-            let id = read_node_id(node.reborrow().get_id()?)?;
-            let key = UuidKey::from(id);
-
-            let address = node.get_addr()?.to_string().expect("expected address");
-            let hostname = node.get_hostname()?.to_string().expect("expected hostname");
-            let root_hash = node
-                .get_root_hash()?
-                .to_string()
-                .expect("expected root hash");
-            let handle = node.get_handle()?;
-            let public_key = node.get_public_key()?;
-
-            info!(
-                "member with address: <{:?}>> attempts at joining the cluster",
-                address,
-            );
-
-            let pubkey = pubkey_from_slice(public_key).expect("expect valid public key");
-
-            let peer = PeerValue {
-                address: address,
-                hostname,
-                noise_static_pub: pubkey.to_bytes(),
-            };
-
-            // If peers exists, return an "already joined" error. Otherwise,
-            // add and return Sync capability.
-            match topology.peers.exists(&key) {
-                Ok(true) => {
-                    let mut out = results.get().init_resp();
-                    out.set_error("already registered");
-
-                    // We don't return any cap on failure.
-                    return Ok(());
-                }
-                Ok(false) => {
-                    topology
-                        .register_peer(id, &peer, handle)
-                        .await
-                        .map_err(|e| Error::failed(format!("registration failed: {e}")))?;
-
-                    // Include a Sync capability on success so the caller can start
-                    // delta state sync.
-                    let mut out = results.get().init_resp();
-
-                    let sync_srv = SyncService::new(topology.peers.clone());
-                    let sync_cap = capnp_rpc::new_client(sync_srv);
-
-                    out.set_sync(sync_cap);
-                    return Ok(());
-                }
-                Err(e) => return Err(capnp::Error::failed(e.to_string())),
-            }
-        })
-    }
-
     /// Leave the cluster.
     fn leave(
         &mut self,
@@ -450,6 +377,11 @@ impl topology::Server for Topology {
         // TODO: Contact any node in the peers list other than ourselves and
         // send a leave request. Needs to be done after gossip is implemented
         // and we sync the peers list with the anchor node.
+
+        // At this point we need to remove the peers from our peers list and
+        // revoke its access and ticket to get a cluster session. The node has
+        // to go back through registration to get a new ticket if it wants
+        // to interact with the cluster again.
 
         Promise::ok(())
     }
@@ -464,7 +396,6 @@ impl topology::Server for Topology {
         println!("Listing nodes...");
 
         let peers = self.peers.clone();
-        let handles = self.handles.clone();
 
         Promise::from_future(async move {
             let (actives, _) = peers
@@ -473,8 +404,6 @@ impl topology::Server for Topology {
 
             let list_builder = results.get().init_nodes();
             let mut node_list = list_builder.init_nodes(actives.len() as u32);
-
-            let handles_read = handles.read().await;
 
             for (i, (k, snap)) in actives.into_iter().enumerate() {
                 let id = k.to_uuid();
@@ -489,10 +418,6 @@ impl topology::Server for Topology {
 
                 // TODO real health; placeholder:
                 node.set_health(NodeStatus::Alive);
-
-                if let Some(h) = handles_read.get(&id) {
-                    node.set_handle(h.clone());
-                }
             }
 
             Ok(())
@@ -543,6 +468,7 @@ impl Clone for Topology {
             node: self.node.clone(),
             public_key: self.public_key,
             server_handle: self.server_handle.clone(),
+            local_sessions: self.local_sessions.clone(),
         }
     }
 }

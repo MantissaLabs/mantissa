@@ -1,5 +1,6 @@
 @0xb4a5acd2fc1e5d0b;
 
+using Node = import "node.capnp";
 using import "scheduling.capnp".Timetable;
 using import "server.capnp".Server;
 using import "info.capnp".Info;
@@ -13,30 +14,20 @@ interface Topology {
   join @0 (link :JoinRequest) -> (resp :JoinResponse);
   # Join an existing pool of servers using an anchor address.
   # This method signals the intent to join. The next step is
-  # to register the node.
+  # to register the node on the Server interface which is
+  # gating access to a ClusterSession handle.
 
-  registerNode @1 (info :NodeInfo, token :Text) -> (resp :RegisterNodeResponse);
-  # Register the node to a remote server.
-
-  leave @2 () -> ();
+  leave @1 () -> ();
   # Leave the pool.
 
-  list @3 () -> (nodes :NodeList);
+  list @2 () -> (nodes :NodeList);
   # List machines in the cluster.
 
-  showToken @4 () -> (token :Text);
+  showToken @3 () -> (token :Text);
   # Show the token for other nodes to use during join.
 
-  rotateToken @5 () -> (token :Text);
+  rotateToken @4 () -> (token :Text);
   # Rotates the token for the node, invalidates existing token.
-}
-
-struct RegisterNodeResponse {
-  error @0 :Text;
-  # empty on success
-
-  sync @1 :Sync;
-  # only set on success
 }
 
 struct TopologyEvent {
@@ -75,16 +66,11 @@ struct JoinResponse {
   error @0 :Text;
 }
 
-
-struct NodeId {
-  bytes @0 :Data;  # exactly 16 bytes (enforce in code)
-}
-
 struct NodeInfo {
   # A Machine. Can be any process taking part
   # in the system throughout the cluster lifetime.
 
-  id @0 :NodeId;
+  id @0 :Node.NodeId;
   # ID of the node.
 
   handle @1 :Server;

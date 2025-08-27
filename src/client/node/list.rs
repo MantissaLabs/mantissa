@@ -7,7 +7,7 @@ use std::io::Write;
 use tabwriter::TabWriter;
 
 pub async fn list(cfg: &ClientConfig) -> Result<()> {
-    let client = common::get_client_auto(cfg).await?;
+    let client = common::get_local_session(cfg).await?;
 
     let request = client.get_topology_request();
     let topology = request.send().pipeline.get_topology();

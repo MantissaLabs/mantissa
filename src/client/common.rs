@@ -1,8 +1,9 @@
 use crate::{
     client::errors::ClientConnectError,
+    includes::server_capnp::cluster_session,
     net::unix_socket::candidate_unix_socket_paths,
     noise::{client_handshake, load_or_generate_noise_keys},
-    server_capnp::server::Client,
+    server_capnp::server,
 };
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::{AsyncReadExt, FutureExt};
@@ -18,7 +19,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 /// Used to get a client connection with Capn'proto.
 /// At the moment, any method using `get_client` *needs* to be run in a tokio task,
 /// otherwise this will panic.
-pub async fn get_client_secure(addr: &str) -> Result<Client, capnp::Error> {
+pub async fn get_client_secure(addr: &str) -> Result<server::Client, capnp::Error> {
     use std::net::ToSocketAddrs;
     let sock = addr
         .to_socket_addrs()
@@ -47,13 +48,15 @@ pub async fn get_client_secure(addr: &str) -> Result<Client, capnp::Error> {
     ));
 
     let mut rpc = RpcSystem::new(network, None);
-    let client: Client = rpc.bootstrap(rpc_twoparty_capnp::Side::Server);
+    let client: server::Client = rpc.bootstrap(rpc_twoparty_capnp::Side::Server);
     tokio::task::spawn_local(rpc.map(|_| ()));
     Ok(client)
 }
 
 /// Shared helper to build a client from a connected UnixStream
-async fn client_from_unix_stream(stream: UnixStream) -> Result<Client, ClientConnectError> {
+async fn client_from_unix_stream(
+    stream: UnixStream,
+) -> Result<cluster_session::Client, ClientConnectError> {
     let (reader, writer) = stream.compat().split();
     let network = twoparty::VatNetwork::new(
         reader,
@@ -62,7 +65,7 @@ async fn client_from_unix_stream(stream: UnixStream) -> Result<Client, ClientCon
         Default::default(),
     );
     let mut rpc = RpcSystem::new(Box::new(network), None);
-    let client: Client = rpc.bootstrap(rpc_twoparty_capnp::Side::Server);
+    let client: cluster_session::Client = rpc.bootstrap(rpc_twoparty_capnp::Side::Server);
     tokio::task::spawn_local(rpc.map(|_| ()));
     Ok(client)
 }
@@ -79,7 +82,9 @@ fn classify_path_not_socket(path: &Path) -> Option<ClientConnectError> {
 }
 
 /// Explicit socket for local communication.
-pub async fn get_client_unix_path(path: PathBuf) -> Result<Client, ClientConnectError> {
+pub async fn get_client_unix_path(
+    path: PathBuf,
+) -> Result<cluster_session::Client, ClientConnectError> {
     if let Some(e) = classify_path_not_socket(&path) {
         return Err(e);
     }
@@ -100,9 +105,9 @@ pub async fn get_client_unix_path(path: PathBuf) -> Result<Client, ClientConnect
 
 /// Get local socket client, either use explicitly provided socket path
 /// or auto-discover.
-pub async fn get_client_auto(
+pub async fn get_local_session(
     cfg: &crate::client::config::ClientConfig,
-) -> Result<Client, ClientConnectError> {
+) -> Result<cluster_session::Client, ClientConnectError> {
     if let Some(ref p) = cfg.socket {
         return get_client_unix_path(p.clone()).await;
     }

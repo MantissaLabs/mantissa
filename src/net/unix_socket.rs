@@ -1,3 +1,4 @@
+use crate::includes::server_capnp::cluster_session;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::{AsyncReadExt, TryFutureExt};
 use std::os::unix::fs::PermissionsExt;
@@ -32,8 +33,13 @@ fn prepare_socket_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// This method starts a Unix socket server using the provided server handle.
+/// One important thing to note is while the TCP server serves a Server handle,
+/// here we serve a ClusterSession handle to avoid the gating on token/session
+/// tickets. This way, only a local privileged user could connect and issue
+/// commands on the node/cluster.
 pub async fn start_unix_socket_server_auto(
-    server_handle: crate::server_capnp::server::Client,
+    server_handle: cluster_session::Client,
 ) -> io::Result<PathBuf> {
     let mut last_err: Option<io::Error> = None;
 
@@ -60,7 +66,7 @@ pub async fn start_unix_socket_server_auto(
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "no usable UnixSocket path")))
 }
 
-async fn accept_loop(listener: UnixListener, server_handle: crate::server_capnp::server::Client) {
+async fn accept_loop(listener: UnixListener, server_handle: cluster_session::Client) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
@@ -71,7 +77,10 @@ async fn accept_loop(listener: UnixListener, server_handle: crate::server_capnp:
     }
 }
 
-async fn handle_unix_conn(stream: UnixStream, server_handle: crate::server_capnp::server::Client) {
+async fn handle_unix_conn(
+    stream: UnixStream,
+    server_handle: crate::server_capnp::cluster_session::Client,
+) {
     let (reader, writer) = stream.compat().split();
 
     let network = twoparty::VatNetwork::new(

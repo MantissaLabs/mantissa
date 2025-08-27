@@ -2,7 +2,7 @@ use crate::client::{common, config::ClientConfig};
 use anyhow::Result;
 
 pub async fn show(cfg: &ClientConfig) -> Result<()> {
-    let client = common::get_client_auto(cfg).await?;
+    let client = common::get_local_session(cfg).await?;
 
     let request = client.get_topology_request();
     let topology = request.send().pipeline.get_topology();
