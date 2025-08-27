@@ -5,7 +5,6 @@ use crate::node_capnp::node;
 use capnp::capability::Promise;
 use capnp::message::Builder;
 use capnp::Error;
-use uuid::Uuid;
 
 // NodeState contains all of the node transitions during its lifetime.
 // Change in state could occur when receiving messages from other peers,
@@ -51,11 +50,13 @@ pub enum NodeState {
     Maintenance,
 }
 
+pub type NodeId = uuid::Uuid;
+
 /// This structure defines the delegate in charge of booking slots
 /// running tasks on the machine.
 #[derive(Clone, Debug)]
 pub struct Node {
-    pub id: Uuid,
+    pub id: NodeId,
     pub system_info: NodeInfo,
     // engine: Rc<Engine>,
 }

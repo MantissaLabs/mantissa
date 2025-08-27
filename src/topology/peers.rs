@@ -5,8 +5,6 @@ use x25519_dalek::PublicKey;
 
 use serde::{Deserialize, Serialize};
 
-pub type NodeId = uuid::Uuid;
-
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct PeerValue {
     pub address: String,
