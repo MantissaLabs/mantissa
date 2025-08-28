@@ -1,10 +1,11 @@
 use crate::includes::sync_capnp;
 use crate::net::unix_socket::start_unix_socket_server_auto;
-use crate::node::id::set_node_id;
+use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::pubkey_from_slice;
 use crate::node::{id, node};
 use crate::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
 use crate::server::auth::AuthStore;
+use crate::server::cred::{issue_credential, verify_credential, CRED_TTL_SECS};
 use crate::server::session::ClusterSessionImpl;
 use crate::server_capnp::server;
 use crate::store::local::load_or_create_node_id;
@@ -30,6 +31,7 @@ use crate::topology_capnp::topology::Client as TopologyClient;
 
 mod auth;
 mod config;
+mod cred;
 mod session;
 
 #[derive(Clone)]
@@ -46,6 +48,7 @@ pub struct ServerImpl {
     topology: Option<Topology>,
     token_store: Option<TokenStore>,
     session_store: Option<Rc<AuthStore>>,
+    local_sessions: Option<LocalSessionStore>,
 
     config: Option<config::Config>,
     noise_keys: Option<Arc<NoiseKeys>>,
@@ -59,6 +62,7 @@ impl server::Server for ServerImpl {
     ) -> Promise<(), capnp::Error> {
         let token_store = self.token_store.as_ref().unwrap().clone();
         let session_store = self.session_store.as_ref().unwrap().clone();
+        let local_sessions = self.local_sessions.as_ref().unwrap().clone();
 
         let topology = self.topology.as_ref().unwrap().clone();
 
@@ -68,6 +72,7 @@ impl server::Server for ServerImpl {
         let node_client = self.node_client.as_ref().unwrap().clone();
 
         let self_id = self.id;
+        let noise_keys = self.noise_keys.as_ref().unwrap().clone();
 
         Promise::from_future(async move {
             let p = params.get()?;
@@ -108,7 +113,7 @@ impl server::Server for ServerImpl {
             };
 
             topology
-                .register_peer(id, &peer, handle)
+                .register_peer(id, &peer, handle.clone())
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
@@ -117,14 +122,36 @@ impl server::Server for ServerImpl {
                 .issue_ticket(id)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
+            let noise_keys = noise_keys.clone();
+
+            let credential = issue_credential(&noise_keys, id, CRED_TTL_SECS)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
             let session =
                 ClusterSessionImpl::new(topology_client, sync_client, gossip_client, node_client);
             let session_client = capnp_rpc::new_client(session);
+
+            {
+                let mut req = handle.issue_ticket_request();
+                set_node_id(req.get().reborrow().init_peer_id(), &self_id);
+                match req.send().promise.await {
+                    Ok(resp) => {
+                        let ticket_from_joiner = resp.get()?.get_ticket()?;
+                        if let Err(e) = local_sessions.put(id, ticket_from_joiner) {
+                            eprintln!("warn: failed to store reciprocal ticket for {id}: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warn: reciprocal ticket request to joiner failed: {e}");
+                    }
+                }
+            }
 
             let mut out = results.get();
             out.set_session(session_client);
             out.set_ticket(&ticket);
             set_node_id(out.reborrow().init_peer_id(), &self_id);
+            out.set_credential(&credential);
 
             Ok(())
         })
@@ -167,6 +194,70 @@ impl server::Server for ServerImpl {
             Ok(())
         })
     }
+
+    fn get_with_credential(
+        &mut self,
+        params: server::GetWithCredentialParams,
+        mut results: server::GetWithCredentialResults,
+    ) -> Promise<(), capnp::Error> {
+        let session_store = self.session_store.as_ref().unwrap().clone();
+        let topology = self.topology.as_ref().unwrap().clone();
+
+        let topology_client = self.topology_client.as_ref().unwrap().clone();
+        let sync_client = self.sync_client.as_ref().unwrap().clone();
+        let gossip_client = self.gossip_client.as_ref().unwrap().clone();
+        let node_client = self.node_client.as_ref().unwrap().clone();
+
+        let noise_keys = self.noise_keys.as_ref().unwrap().clone();
+
+        Promise::from_future(async move {
+            let cred = params.get()?.get_credential()?;
+
+            // Verify (local issuer for now)
+            let peer_id = verify_credential(&noise_keys, cred)
+                .map_err(|e| capnp::Error::failed(format!("invalid credential: {e}")))?;
+
+            // Must exist in our peers store
+            if !topology
+                .peer_exists(peer_id)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?
+            {
+                return Err(capnp::Error::failed("peer not registered".to_string()));
+            }
+
+            // Mint a fresh ticket (so caller can resume later without a credential)
+            let ticket = session_store
+                .issue_ticket(peer_id)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            let session =
+                ClusterSessionImpl::new(topology_client, sync_client, gossip_client, node_client);
+            let session_client = capnp_rpc::new_client(session);
+
+            let mut out = results.get();
+            out.set_session(session_client);
+            out.set_ticket(&ticket);
+            crate::node::id::set_node_id(out.reborrow().init_peer_id(), &peer_id);
+            Ok(())
+        })
+    }
+
+    fn issue_ticket(
+        &mut self,
+        params: server::IssueTicketParams,
+        mut results: server::IssueTicketResults,
+    ) -> Promise<(), capnp::Error> {
+        let session_store = self.session_store.as_ref().unwrap().clone();
+
+        Promise::from_future(async move {
+            let peer_id = read_node_id(params.get()?.get_peer_id()?)?;
+            let ticket = session_store
+                .issue_ticket(peer_id)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            results.get().set_ticket(&ticket);
+            Ok(())
+        })
+    }
 }
 
 impl Default for ServerImpl {
@@ -183,6 +274,7 @@ impl Default for ServerImpl {
             token_store: None,
             session_store: None,
             topology: None,
+            local_sessions: None,
         }
     }
 }
@@ -305,6 +397,11 @@ impl ServerImpl {
         self
     }
 
+    pub fn with_local_sessions(&mut self, local: LocalSessionStore) -> &mut ServerImpl {
+        self.local_sessions = Some(local);
+        self
+    }
+
     pub fn build(&mut self) -> ServerImpl {
         let server_client = capnp_rpc::new_client(self.clone());
         self.server_client = Some(server_client);
@@ -388,6 +485,7 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
         .with_noise_keys(keys.clone())
         .with_token_store(token_store.clone())
         .with_session_store(session_store)
+        .with_local_sessions(local_sessions.clone())
         .with_config(Config::new().with_listen_addr(addr.clone()).build())
         .build();
 
@@ -406,6 +504,14 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     tokio::task::spawn_local(async move {
         topology.run().await;
     });
+
+    // Resume sessions (best-effort) using stored tickets.
+    {
+        let topology_resume = raw_topology.clone();
+        tokio::task::spawn_local(async move {
+            topology_resume.resume_sessions_on_boot().await;
+        });
+    }
 
     server.start_daemon(true).await
 }

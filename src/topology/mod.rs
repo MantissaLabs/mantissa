@@ -276,6 +276,80 @@ impl Topology {
         self.peers.remove(&UuidKey::from(id)).await;
         Ok(())
     }
+
+    /// Only attach a server handle (no upsert). Useful on session resume.
+    pub async fn attach_handle_only(&self, id: Uuid, handle: server::Client) {
+        self.handles.write().await.insert(id, handle);
+    }
+
+    /// Best-effort resume of sessions stored locally (tickets) after restart.
+    /// For each stored (peer, ticket):
+    ///  - look up the peer's current address from the persisted peers store,
+    ///  - connect securely to the peer's Server,
+    ///  - call getSession(ticket) to obtain a ClusterSession,
+    ///  - attach the server handle so higher-level code can use it.
+    pub async fn resume_sessions_on_boot(&self) {
+        println!("Resuming sessions with peers...");
+
+        // Build id -> address map, skipping our own ID.
+        let mut addr_map = std::collections::HashMap::<uuid::Uuid, String>::new();
+        if let Ok((actives, _tombs)) = self.peers.load_all() {
+            for (k, snap) in actives {
+                let id = k.to_uuid();
+
+                // Filter out our own ID to avoid connecting to ourselves.
+                if id == self.node.id {
+                    continue;
+                }
+
+                if let Some(val) = snap.as_slice().last().cloned() {
+                    // Also skip if address equals our own listen/advertise address.
+                    if val.address == self.addr {
+                        continue;
+                    }
+                    addr_map.insert(id, val.address);
+                }
+            }
+        }
+
+        // Walk local tickets and try to open sessions.
+        let entries = match self.local_sessions.list() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("resume: cannot list local session tickets: {e}");
+                return;
+            }
+        };
+
+        for (peer_id, ticket) in entries {
+            let Some(addr) = addr_map.get(&peer_id) else {
+                eprintln!("resume: peer {peer_id} has no known address; skipping");
+                continue;
+            };
+
+            match crate::client::connection::get_client_secure(addr).await {
+                Ok(client) => {
+                    let mut req = client.get_session_request();
+                    req.get().set_ticket(&ticket);
+                    match req.send().promise.await {
+                        Ok(resp) => match resp.get().and_then(|r| r.get_session()) {
+                            Ok(session) => {
+                                self.attach_handle_only(peer_id, client.clone()).await;
+                                let _ = session.ping_request().send().promise.await;
+
+                                println!("Session established with peer {peer_id} @ {addr}");
+                            }
+                            Err(e) => eprintln!("resume: decode failed for {peer_id}: {e}"),
+                        },
+                        Err(e) => {
+                            eprintln!("resume: get_session RPC failed for {peer_id} @ {addr}: {e}")
+                        }
+                    }
+                }
+                Err(e) => eprintln!("resume: connect to {addr} failed for {peer_id}: {e}"),
+            }
+        }
+    }
 }
 
 impl topology::Server for Topology {
