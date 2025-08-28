@@ -130,10 +130,10 @@ impl server::Server for ServerImpl {
         })
     }
 
-    fn resume_session(
+    fn get_session(
         &mut self,
-        params: server::ResumeSessionParams,
-        mut results: server::ResumeSessionResults,
+        params: server::GetSessionParams,
+        mut results: server::GetSessionResults,
     ) -> Promise<(), capnp::Error> {
         let session_store = self.session_store.as_ref().unwrap().clone();
 

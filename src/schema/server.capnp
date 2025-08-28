@@ -7,11 +7,14 @@ using import "sync.capnp".Sync;
 
 interface Server {
   registerNode @0 (info :Node.NodeInfo, token :Text) -> (session :ClusterSession, ticket :Data, peerId :Node.NodeId);
-  # First-time join. On failure, returns a capnp error.
+  # First-time join. Adding the node to the trusted set of peers if the token
+  # is valid. On failure, returns a capnp error.
 
-  resumeSession @1 (ticket :Data) -> (session :ClusterSession);
-  # Resume later using the ticket returned by registerNode.
-  # On failure (unknown/expired/not-registered), returns a capnp error.
+  getSession @1 (ticket :Data) -> (session :ClusterSession);
+  # Get a session given a ticket returned by registerNode or self-issued
+  # credentials if we are in the trusted set of peers and our information
+  # has propagated to other nodes. On failure (unknown/expired/not-registered),
+  # returns a capnp error.
 }
 
 interface ClusterSession {
