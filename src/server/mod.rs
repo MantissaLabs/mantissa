@@ -506,7 +506,7 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
 
     // Create session store.
     let session_store = AuthStore::new(db.clone())?;
-    let local_sessions = LocalSessionStore::new(db.clone())?;
+    let local_sessions = LocalSessionStore::open(db.clone(), &keys)?;
 
     // Create credential store.
     let local_credential_store = LocalCredentialStore::new(db.clone())?;
