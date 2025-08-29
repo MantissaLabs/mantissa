@@ -5,6 +5,7 @@ extern crate sysinfo;
 mod cli;
 mod client;
 pub mod container;
+mod crypto;
 mod gossip;
 mod hash;
 mod includes;

@@ -10,6 +10,9 @@ pub struct PeerValue {
     pub address: String,
     pub hostname: String,
     pub noise_static_pub: [u8; 32],
+
+    /// Verifying key for cluster credentials signing.
+    pub signing_pub: [u8; 32],
 }
 
 #[async_trait(?Send)]

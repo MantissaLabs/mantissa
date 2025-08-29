@@ -1,14 +1,15 @@
 use crate::includes::sync_capnp;
 use crate::net::unix_socket::start_unix_socket_server_auto;
-use crate::node::id::{read_node_id, set_node_id};
+use crate::node::id::set_node_id;
 use crate::node::identity::pubkey_from_slice;
 use crate::node::{id, node};
 use crate::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
 use crate::server::auth::AuthStore;
-use crate::server::cred::{issue_credential, verify_credential, CRED_TTL_SECS};
+use crate::server::credential::ClusterCredential;
 use crate::server::session::ClusterSessionImpl;
 use crate::server_capnp::server;
 use crate::store::local::load_or_create_node_id;
+use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::path::default_db_path;
 use crate::store::peer_store::{open_peers_store, PeersStore};
@@ -19,6 +20,8 @@ use crate::topology::{self, Topology};
 use crate::{gossip, token::TokenStore};
 use capnp::capability::Promise;
 use config::Config;
+use ed25519_dalek::SigningKey;
+use getrandom::getrandom;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -31,7 +34,7 @@ use crate::topology_capnp::topology::Client as TopologyClient;
 
 mod auth;
 mod config;
-mod cred;
+mod credential;
 mod session;
 
 #[derive(Clone)]
@@ -52,6 +55,7 @@ pub struct ServerImpl {
 
     config: Option<config::Config>,
     noise_keys: Option<Arc<NoiseKeys>>,
+    signing_key: Option<SigningKey>,
 }
 
 impl server::Server for ServerImpl {
@@ -73,6 +77,7 @@ impl server::Server for ServerImpl {
 
         let self_id = self.id;
         let noise_keys = self.noise_keys.as_ref().unwrap().clone();
+        let signing_key = self.signing_key.as_ref().unwrap().clone();
 
         Promise::from_future(async move {
             let p = params.get()?;
@@ -85,14 +90,14 @@ impl server::Server for ServerImpl {
                 return Err(capnp::Error::failed("invalid join token".to_string()));
             }
 
-            let id = id::read_node_id(info.get_id()?)?;
-            if id == self_id {
+            let joiner_id = id::read_node_id(info.get_id()?)?;
+            if joiner_id == self_id {
                 return Err(capnp::Error::failed("cannot join self".to_string()));
             }
 
             // Already registered?
             let exists = topology
-                .peer_exists(id)
+                .peer_exists(joiner_id)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             if exists {
@@ -106,52 +111,84 @@ impl server::Server for ServerImpl {
             let public_key = info.get_public_key()?;
             let pubkey = pubkey_from_slice(public_key).expect("expect valid public key");
 
+            let sk_vec = info.get_signing_key()?.to_vec();
+            let sk_arr: [u8; 32] = sk_vec.as_slice().try_into().map_err(|_| {
+                capnp::Error::failed("signing key must be exactly 32 bytes".to_string())
+            })?;
+
+            let signing_vk = ed25519_dalek::VerifyingKey::from_bytes(&sk_arr)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
             let peer = PeerValue {
                 address,
                 hostname,
                 noise_static_pub: pubkey.to_bytes(),
+                signing_pub: signing_vk.to_bytes(),
             };
 
             topology
-                .register_peer(id, &peer, handle.clone())
+                .register_peer(joiner_id, &peer, handle.clone())
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             // Issue session ticket.
             let ticket = session_store
-                .issue_ticket(id)
+                .issue_ticket(joiner_id)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             let noise_keys = noise_keys.clone();
 
-            let credential = issue_credential(&noise_keys, id, CRED_TTL_SECS)
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            let mut nonce = [0u8; 16];
+            getrandom(&mut nonce).map_err(|e| capnp::Error::failed(e.to_string()))?;
+            const TTL_SECS: u64 = 3600; // 1 hour (tune it)
+            let cred = ClusterCredential::sign(&signing_key, joiner_id, TTL_SECS, nonce);
+            let cred_bytes = cred.to_bytes().map_err(capnp::Error::failed)?;
 
             let session =
                 ClusterSessionImpl::new(topology_client, sync_client, gossip_client, node_client);
             let session_client = capnp_rpc::new_client(session);
 
+            // Get a reciprocal ticket from joining node. Happens in a retry loop because the joining
+            // node must sync before it could issue a ticket for our Node ID.
             {
-                let mut req = handle.issue_ticket_request();
-                set_node_id(req.get().reborrow().init_peer_id(), &self_id);
-                match req.send().promise.await {
-                    Ok(resp) => {
-                        let ticket_from_joiner = resp.get()?.get_ticket()?;
-                        if let Err(e) = local_sessions.put(id, ticket_from_joiner) {
-                            eprintln!("warn: failed to store reciprocal ticket for {id}: {e}");
+                let handle_for_retry = handle.clone();
+                let local_sessions_for_retry = local_sessions.clone();
+                let anchor_id = self_id;
+                let joiner_id_for_store = joiner_id;
+
+                tokio::task::spawn_local(async move {
+                    use tokio::time::{sleep, Duration};
+                    let mut delay_ms = 200u64;
+                    for _ in 0..8 {
+                        let mut req = handle_for_retry.issue_ticket_request();
+                        set_node_id(req.get().reborrow().init_peer_id(), &anchor_id);
+                        match req.send().promise.await {
+                            Ok(resp) => match resp.get() {
+                                Ok(r) => match r.get_ticket() {
+                                    Ok(ticket_from_joiner) => {
+                                        if let Err(e) = local_sessions_for_retry.put(joiner_id_for_store, ticket_from_joiner) {
+                                            eprintln!("warn: storing reciprocal ticket failed: {e}");
+                                        }
+                                        // success; stop retrying
+                                        break;
+                                    }
+                                    Err(e) => eprintln!("warn: reciprocal ticket read failed: {e}"),
+                                },
+                                Err(e) => eprintln!("warn: reciprocal ticket response failed: {e}"),
+                            },
+                            Err(e) => eprintln!("warn: reciprocal ticket request failed (likely not yet registered): {e}"),
                         }
+                        sleep(Duration::from_millis(delay_ms)).await;
+                        delay_ms = (delay_ms * 2).min(5_000);
                     }
-                    Err(e) => {
-                        eprintln!("warn: reciprocal ticket request to joiner failed: {e}");
-                    }
-                }
+                });
             }
 
             let mut out = results.get();
             out.set_session(session_client);
             out.set_ticket(&ticket);
             set_node_id(out.reborrow().init_peer_id(), &self_id);
-            out.set_credential(&credential);
+            out.set_credential(&cred_bytes);
 
             Ok(())
         })
@@ -208,36 +245,42 @@ impl server::Server for ServerImpl {
         let gossip_client = self.gossip_client.as_ref().unwrap().clone();
         let node_client = self.node_client.as_ref().unwrap().clone();
 
-        let noise_keys = self.noise_keys.as_ref().unwrap().clone();
+        let self_id = self.id;
 
         Promise::from_future(async move {
-            let cred = params.get()?.get_credential()?;
+            // 1) parse+verify the signed blob
+            let cred_bytes = params.get()?.get_credential()?;
+            let cred =
+                ClusterCredential::from_bytes_verified(cred_bytes).map_err(capnp::Error::failed)?;
 
-            // Verify (local issuer for now)
-            let peer_id = verify_credential(&noise_keys, cred)
-                .map_err(|e| capnp::Error::failed(format!("invalid credential: {e}")))?;
-
-            // Must exist in our peers store
+            // 2) must already know the subject as a registered peer
             if !topology
-                .peer_exists(peer_id)
+                .peer_exists(cred.subject)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?
             {
-                return Err(capnp::Error::failed("peer not registered".to_string()));
+                return Err(capnp::Error::failed(
+                    "peer not registered on this node".to_string(),
+                ));
             }
 
-            // Mint a fresh ticket (so caller can resume later without a credential)
+            // 3) mint a fresh ticket for the subject
             let ticket = session_store
-                .issue_ticket(peer_id)
+                .issue_ticket(cred.subject)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-            let session =
-                ClusterSessionImpl::new(topology_client, sync_client, gossip_client, node_client);
+            // 4) return session + ticket + our peer id (so caller can persist)
+            let session = crate::server::session::ClusterSessionImpl::new(
+                topology_client,
+                sync_client,
+                gossip_client,
+                node_client,
+            );
             let session_client = capnp_rpc::new_client(session);
 
             let mut out = results.get();
             out.set_session(session_client);
             out.set_ticket(&ticket);
-            crate::node::id::set_node_id(out.reborrow().init_peer_id(), &peer_id);
+            crate::node::id::set_node_id(out.reborrow().init_peer_id(), &self_id);
             Ok(())
         })
     }
@@ -248,12 +291,22 @@ impl server::Server for ServerImpl {
         mut results: server::IssueTicketResults,
     ) -> Promise<(), capnp::Error> {
         let session_store = self.session_store.as_ref().unwrap().clone();
+        let topology = self.topology.as_ref().unwrap().clone();
 
         Promise::from_future(async move {
-            let peer_id = read_node_id(params.get()?.get_peer_id()?)?;
+            let peer_id = crate::node::id::read_node_id(params.get()?.get_peer_id()?)?;
+
+            if !topology
+                .peer_exists(peer_id)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?
+            {
+                return Err(capnp::Error::failed("peer not registered".to_string()));
+            }
+
             let ticket = session_store
                 .issue_ticket(peer_id)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
             results.get().set_ticket(&ticket);
             Ok(())
         })
@@ -275,6 +328,7 @@ impl Default for ServerImpl {
             session_store: None,
             topology: None,
             local_sessions: None,
+            signing_key: None,
         }
     }
 }
@@ -402,6 +456,11 @@ impl ServerImpl {
         self
     }
 
+    pub fn with_signing_key(&mut self, sk: SigningKey) -> &mut ServerImpl {
+        self.signing_key = Some(sk);
+        self
+    }
+
     pub fn build(&mut self) -> ServerImpl {
         let server_client = capnp_rpc::new_client(self.clone());
         self.server_client = Some(server_client);
@@ -418,8 +477,14 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     let (gossip_tx, gossip_rx) = async_channel::bounded(128);
     let (topology_tx, topology_rx) = async_channel::bounded(128);
 
+    // Noise protocol keys.
     let keys_path = resolve_noise_key_path()?;
     let keys = Arc::new(load_or_generate_noise_keys(keys_path)?);
+
+    // Cluster credentials signing keys.
+    let sign_path = crate::crypto::signing::resolve_signing_key_path()?;
+    let sign_keys = crate::crypto::signing::load_or_generate_sign_keys(sign_path)?;
+    let signing_key = sign_keys.sk;
 
     // FIXME: Placeholder peer list.
     let peers: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
@@ -443,6 +508,9 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     let session_store = AuthStore::new(db.clone())?;
     let local_sessions = LocalSessionStore::new(db.clone())?;
 
+    // Create credential store.
+    let local_credential_store = LocalCredentialStore::new(db.clone())?;
+
     // Debug mst store.
     peers_store.debug_dump_root("startup").await;
     peers_store.debug_dump_ranges("startup", 5).await;
@@ -465,7 +533,9 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
         addr.clone(),
         topology_rx,
         token_store.clone(),
+        local_credential_store.clone(),
         keys.public,
+        signing_key.clone(),
         node,
         peers_store.clone(),
         local_sessions.clone(),
@@ -483,6 +553,7 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
         .with_node_client(node_client)
         .with_topology(raw_topology.clone())
         .with_noise_keys(keys.clone())
+        .with_signing_key(signing_key.clone())
         .with_token_store(token_store.clone())
         .with_session_store(session_store)
         .with_local_sessions(local_sessions.clone())

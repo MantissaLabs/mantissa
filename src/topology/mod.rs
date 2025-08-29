@@ -9,6 +9,7 @@ use crate::node::node::Node;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
 use crate::store::crdt::uuid_key::UuidKey;
+use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::sync::delta::sync_peers_after_join;
@@ -16,7 +17,9 @@ use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
 use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
+use capnp::data;
 use capnp::{capability::Promise, Error};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -48,6 +51,8 @@ pub struct Topology {
 
     local_sessions: LocalSessionStore,
 
+    local_credential_store: LocalCredentialStore,
+
     handles: HandleMap, // ephemeral capabilities
 
     // The capability handle for the server. To be sent to peers.
@@ -55,6 +60,9 @@ pub struct Topology {
 
     // The public key of the node.
     public_key: PublicKey,
+
+    // Credentials signing key.
+    signing_key: SigningKey,
 
     // The peer ID derived from the public key.
     // FIXME: detangle from the u64 id defined in Capnproto Node struct.
@@ -99,6 +107,7 @@ pub enum TopologyEvent {
         root_hash: String,
         client: server::Client,
         noise_static_pub: PublicKey,
+        signing_pub: VerifyingKey,
     },
     NodeLeft {
         id: Uuid,
@@ -113,7 +122,9 @@ impl Topology {
         addr: String,
         rx: Receiver<TopologyEvent>,
         token_store: TokenStore,
+        creds_store: LocalCredentialStore,
         public: PublicKey,
+        signing_key: SigningKey,
         node: Node,
         peers: PeersStore,
         sessions: LocalSessionStore,
@@ -126,9 +137,11 @@ impl Topology {
             handles: Arc::new(RwLock::new(HashMap::new())),
             token_store,
             public_key: public,
+            signing_key: signing_key,
             peer_id: peer_id_from_public(&public),
             node: node,
             local_sessions: sessions,
+            local_credential_store: creds_store,
         })
     }
 
@@ -136,6 +149,7 @@ impl Topology {
         let handles = self.handles.clone();
         let local_id = self.node.id;
         let public_key = self.public_key;
+        let verifying_key = self.signing_key.verifying_key().clone();
 
         // also ensure our own peer-entry exists in the store
         let peers = self.peers.clone();
@@ -164,6 +178,7 @@ impl Topology {
                         address: advertise,
                         hostname: host,
                         noise_static_pub: public_key.to_bytes(),
+                        signing_pub: verifying_key.to_bytes(),
                     };
 
                     if let Err(e) = peers.upsert(&key, v).await {
@@ -208,6 +223,7 @@ impl Topology {
                             root_hash,
                             client,
                             noise_static_pub,
+                            signing_pub,
                         } => {
                             println!("[Topology] Node joined: {id} at {address}");
 
@@ -215,6 +231,7 @@ impl Topology {
                                 address: address,
                                 hostname,
                                 noise_static_pub: noise_static_pub.to_bytes(),
+                                signing_pub: signing_pub.to_bytes(),
                             };
 
                             if let Err(e) = self.register_peer(id, &v, client).await {
@@ -366,6 +383,7 @@ impl topology::Server for Topology {
         let id = self.node.id.clone();
         let peers = self.peers.clone();
         let local_sessions = self.local_sessions.clone();
+        let local_creds = self.local_credential_store.clone();
 
         let handle = self.get_server_handle();
         if handle.is_none() {
@@ -374,6 +392,7 @@ impl topology::Server for Topology {
         let server_handle = handle.unwrap();
         let public_key = self.public_key.clone().to_bytes();
         let advertise = self.get_advertise_address();
+        let signing_vk_bytes = self.signing_key.verifying_key().to_bytes();
 
         Promise::from_future(async move {
             let request = params.get()?.get_link()?;
@@ -407,6 +426,7 @@ impl topology::Server for Topology {
             info.set_addr(advertise);
             info.set_handle(server_handle);
             info.set_public_key(&public_key);
+            info.set_signing_key(&signing_vk_bytes);
 
             // Set the join token.
             request.get().set_token(join_token.as_str());
@@ -416,11 +436,18 @@ impl topology::Server for Topology {
             let session = register.get()?.get_session()?;
             let ticket = register.get()?.get_ticket()?;
             let peer_id = read_node_id(register.get()?.get_peer_id()?)?;
+            let cred_blob = register.get()?.get_credential()?;
 
             // Persist the local session for later resume if node restarts.
             local_sessions
                 .put(peer_id, ticket)
                 .map_err(|e| Error::failed(format!("ticket persist failed: {e}")))?;
+
+            local_creds
+                .put(peer_id, cred_blob)
+                .map_err(|e| Error::failed(format!("credential persist failed: {e}")))?;
+
+            // TODO: Use credentials and fan out to other nodes.
 
             let sync_cap: sync::Client = {
                 let req = session.get_sync_request();
@@ -543,8 +570,18 @@ impl Clone for Topology {
             public_key: self.public_key,
             server_handle: self.server_handle.clone(),
             local_sessions: self.local_sessions.clone(),
+            signing_key: self.signing_key.clone(),
+            local_credential_store: self.local_credential_store.clone(),
         }
     }
+}
+
+fn verifying_key_from_data(d: data::Reader<'_>) -> Result<VerifyingKey, capnp::Error> {
+    let arr: [u8; 32] = d
+        .try_into()
+        .map_err(|_| capnp::Error::failed("ed25519 pubkey must be 32 bytes".to_string()))?;
+
+    VerifyingKey::from_bytes(&arr).map_err(|e| capnp::Error::failed(e.to_string()))
 }
 
 pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEvent, capnp::Error> {
@@ -553,6 +590,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
     let node = reader.get_node()?;
     let id = read_node_id(node.get_id()?)?;
     let pubkey = pubkey_from_slice(node.get_public_key()?).expect("Failed to parse public key");
+    let signing_pub = verifying_key_from_data(node.get_signing_key()?)?;
 
     let event = match reader.get_event()? {
         EventType::Add => TopologyEvent::NodeJoined {
@@ -562,6 +600,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             root_hash: node.get_root_hash()?.to_str()?.to_string(),
             client: node.get_handle()?,
             noise_static_pub: pubkey,
+            signing_pub: signing_pub,
         },
         EventType::Remove => TopologyEvent::NodeLeft { id },
         EventType::Suspect => TopologyEvent::NodeSuspect { id },
@@ -585,6 +624,7 @@ pub fn add_event(
             root_hash,
             client,
             noise_static_pub,
+            signing_pub,
         } => {
             let mut topo = msg.init_topology();
 
@@ -596,6 +636,7 @@ pub fn add_event(
             node.set_addr(address);
             node.set_root_hash(root_hash);
             node.set_public_key(&noise_static_pub.to_bytes());
+            node.set_signing_key(&signing_pub.to_bytes());
 
             // Set the handle as a Cap’n Proto client
             node.set_handle(client.clone());

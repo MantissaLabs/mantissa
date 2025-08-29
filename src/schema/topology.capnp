@@ -97,7 +97,10 @@ struct NodeInfo {
   publicKey @7 :Data;
   # Noise public key.
 
-  health @8 :NodeStatus;
+  signingKey @8 :Data;
+  # ed25519 verifying key (32 bytes)
+
+  health @9 :NodeStatus;
   # Health status of the node.
 }
 
