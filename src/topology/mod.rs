@@ -1,11 +1,13 @@
 use crate::client::connection;
 use crate::gossip_capnp::gossip_message;
 use crate::health_capnp::NodeStatus;
+use crate::includes::server_capnp::cluster_session;
 use crate::includes::sync_capnp::sync;
 use crate::node::address::{compute_advertise_ip, extract_port};
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
 use crate::node::node::Node;
+use crate::server::credential::ClusterCredential;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
 use crate::store::crdt::uuid_key::UuidKey;
@@ -20,12 +22,14 @@ use async_channel::Receiver;
 use capnp::data;
 use capnp::{capability::Promise, Error};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use getrandom::getrandom;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::{fmt, io};
 use tokio::sync::RwLock;
+use tokio::time::{interval, Duration};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
@@ -367,6 +371,143 @@ impl Topology {
             }
         }
     }
+
+    /// Connect to known peers and open a ClusterSession with each.
+    /// - Try local ticket via `getSession`.
+    /// - If no ticket (or it fails) and `signing_key` is provided,
+    ///   mint a short-lived ClusterCredential and call `getWithCredential`.
+    /// - On success, store the `Server` handle in `self.handles`
+    ///   and persist any new ticket returned.
+    pub async fn connect_known_peers(
+        &self,
+        signing_key: Option<&SigningKey>, // pass Some(sk) if you’ve enabled cluster-signed creds
+    ) -> Result<(), capnp::Error> {
+        // Snapshot peers from the store.
+        let (actives, _tombs) = self
+            .peers
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        for (k, snap) in actives {
+            let peer_id = k.to_uuid();
+
+            // 1) skip self
+            if peer_id == self.node.id {
+                continue;
+            }
+
+            // 2) skip if we already have a handle cached
+            if self.handles.read().await.contains_key(&peer_id) {
+                continue;
+            }
+
+            // 3) latest value for address/hostname/public key
+            let Some(val) = snap.as_slice().last().cloned() else {
+                continue;
+            };
+            let addr = val.address.clone();
+
+            // 4) dial the peer's Server
+            let server_client: server::Client = match connection::get_client_secure(&addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[connect] dial {addr} failed: {e}");
+                    continue;
+                }
+            };
+
+            // 5) try ticket first
+            let mut have_session: Option<cluster_session::Client> = None;
+            if let Ok(Some(ticket)) = self.local_sessions.get(peer_id) {
+                let mut req = server_client.get_session_request();
+                req.get().set_ticket(&ticket);
+                match req.send().promise.await {
+                    Ok(resp) => match resp.get()?.get_session() {
+                        Ok(sess) => {
+                            have_session = Some(sess);
+                        }
+                        Err(e) => {
+                            eprintln!("[connect] getSession ok but no session: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("[connect] getSession to {addr} failed: {e}");
+                    }
+                }
+            }
+
+            // 6) fallback: use cluster-signed credential if we can
+            if have_session.is_none() {
+                if let Some(sk) = signing_key {
+                    let mut nonce = [0u8; 16];
+                    if let Err(e) = getrandom(&mut nonce) {
+                        eprintln!("[connect] nonce gen failed for {addr}: {e}");
+                        continue;
+                    }
+                    // short TTL is fine; you’ll immediately get back a ticket to persist
+                    let ttl_secs = 10 * 60; // 10 minutes
+                    let cred = ClusterCredential::sign(sk, self.node.id, ttl_secs, nonce);
+                    let cred_bytes = match cred.to_bytes() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("[connect] cred serialize failed for {addr}: {e}");
+                            continue;
+                        }
+                    };
+
+                    let mut req = server_client.get_with_credential_request();
+                    req.get().set_credential(&cred_bytes);
+                    match req.send().promise.await {
+                        Ok(resp) => {
+                            // Session
+                            match resp.get()?.get_session() {
+                                Ok(sess) => {
+                                    have_session = Some(sess);
+                                }
+                                Err(e) => {
+                                    eprintln!("[connect] getWithCredential ok but no session: {e}");
+                                    continue;
+                                }
+                            }
+                            // Persist returned ticket for future fast resume
+                            let ticket = resp.get()?.get_ticket()?;
+                            if let Err(e) = self.local_sessions.put(peer_id, ticket) {
+                                eprintln!("[connect] failed to persist ticket from {addr}: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            println!("[connect] getWithCredential to {addr} failed: {e}");
+                            continue;
+                        }
+                    }
+                } else {
+                    // No signing key provided; can’t cred-bootstrap. Skip.
+                    eprintln!("[connect] no ticket and no signing key; skipping {}", addr);
+                }
+            }
+
+            // 7) if we have a session, cache the `Server` handle and (optionally) do a quick ping
+            if let Some(session) = have_session {
+                println!("[connect] connected to {addr}");
+
+                // cache the Server client for this peer
+                self.handles
+                    .write()
+                    .await
+                    .insert(peer_id, server_client.clone());
+
+                // optional sanity ping on the session's ping() if you like:
+                let _ = session.ping_request().send().promise.await;
+
+                // or fetch caps here if you want to warm them (not required):
+                // let _ = _session.get_capabilities_request().send().promise.await;
+
+                // done for this peer
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl topology::Server for Topology {
@@ -384,6 +525,7 @@ impl topology::Server for Topology {
         let peers = self.peers.clone();
         let local_sessions = self.local_sessions.clone();
         let local_creds = self.local_credential_store.clone();
+        let topology = self.clone();
 
         let handle = self.get_server_handle();
         if handle.is_none() {
@@ -393,6 +535,7 @@ impl topology::Server for Topology {
         let public_key = self.public_key.clone().to_bytes();
         let advertise = self.get_advertise_address();
         let signing_vk_bytes = self.signing_key.verifying_key().to_bytes();
+        let signing_key = self.signing_key.clone();
 
         Promise::from_future(async move {
             let request = params.get()?.get_link()?;
@@ -455,10 +598,18 @@ impl topology::Server for Topology {
                 resp.get()?.get_sync()?
             };
 
-            // Spawn background sync.
-            // Note: we do not await here. This returns a capability we can use
-            // inside a same-thread task (capabilities are !Send).
-            tokio::task::spawn_local(sync_peers_after_join(peers.clone(), sync_cap));
+            // Spawn background periodic sync + connect.
+            // FIXME: This is a workaround until we have gossip implemented.
+            tokio::task::spawn_local(async move {
+                periodic_sync_and_connect(
+                    peers,
+                    topology,
+                    sync_cap,
+                    Some(signing_key.clone()),
+                    std::time::Duration::from_secs(5), // tune as needed
+                )
+                .await;
+            });
 
             // Send signal to synchronize data with anchor node (fetch the Sync capability),
             // and start:
@@ -572,6 +723,46 @@ impl Clone for Topology {
             local_sessions: self.local_sessions.clone(),
             signing_key: self.signing_key.clone(),
             local_credential_store: self.local_credential_store.clone(),
+        }
+    }
+}
+
+/// Periodically:
+///   1) pull deltas from the anchor via `sync_cap`
+///   2) attempt to connect to known peers (tickets first, then cred)
+///
+/// Notes:
+/// - This runs forever. It coalesces if a cycle takes longer than `period`.
+/// - It’s fine to call `sync_peers_after_join` repeatedly; it no-ops when in sync.
+pub async fn periodic_sync_and_connect(
+    peers: PeersStore,
+    topology: Topology,
+    sync_cap: sync::Client,
+    signing_key: Option<SigningKey>,
+    period: Duration,
+) {
+    // Do an immediate pass before the first tick
+    sync_peers_after_join(peers.clone(), sync_cap.clone()).await;
+    if let Err(e) = topology.connect_known_peers(signing_key.as_ref()).await {
+        println!("[connect] initial connect failed: {e}");
+    }
+
+    // Then run on a fixed cadence
+    let mut ticker = interval(period);
+    loop {
+        ticker.tick().await;
+
+        println!("Syncing...");
+
+        // 1) delta sync
+        // FIXME: On restart of the anchor node, sync_cap becomes broken and we need
+        // to get it again if we want to continue performing the sync.
+        sync_peers_after_join(peers.clone(), sync_cap.clone()).await;
+
+        // 2) attempt connects (idempotent; skips self & already connected)
+        if let Err(e) = topology.connect_known_peers(signing_key.as_ref()).await {
+            println!("[connect] periodic connect failed: {e}");
+            continue;
         }
     }
 }

@@ -34,7 +34,7 @@ use crate::topology_capnp::topology::Client as TopologyClient;
 
 mod auth;
 mod config;
-mod credential;
+pub mod credential;
 mod session;
 
 #[derive(Clone)]
@@ -580,7 +580,12 @@ pub async fn start(addr: String) -> Result<(), Box<dyn std::error::Error>> {
     {
         let topology_resume = raw_topology.clone();
         tokio::task::spawn_local(async move {
-            topology_resume.resume_sessions_on_boot().await;
+            if let Err(e) = topology_resume
+                .connect_known_peers(Some(&signing_key))
+                .await
+            {
+                eprintln!("[connect] startup connect failed: {e}");
+            }
         });
     }
 
