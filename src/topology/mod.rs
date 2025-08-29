@@ -1,4 +1,5 @@
 use crate::client::connection;
+use crate::crypto::rand;
 use crate::gossip_capnp::gossip_message;
 use crate::health_capnp::NodeStatus;
 use crate::includes::server_capnp::cluster_session;
@@ -22,7 +23,6 @@ use async_channel::Receiver;
 use capnp::data;
 use capnp::{capability::Promise, Error};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use getrandom::getrandom;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -439,11 +439,9 @@ impl Topology {
             // 6) fallback: use cluster-signed credential if we can
             if have_session.is_none() {
                 if let Some(sk) = signing_key {
-                    let mut nonce = [0u8; 16];
-                    if let Err(e) = getrandom(&mut nonce) {
-                        eprintln!("[connect] nonce gen failed for {addr}: {e}");
-                        continue;
-                    }
+                    let nonce =
+                        rand::try_nonce16().map_err(|e| capnp::Error::failed(e.to_string()))?;
+
                     // short TTL is fine; you’ll immediately get back a ticket to persist
                     let ttl_secs = 10 * 60; // 10 minutes
                     let cred = ClusterCredential::sign(sk, self.node.id, ttl_secs, nonce);

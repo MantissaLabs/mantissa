@@ -1,3 +1,4 @@
+use crate::crypto::rand;
 use redb::{Database, TableDefinition};
 use std::{io, sync::Arc};
 use uuid::Uuid;
@@ -27,10 +28,7 @@ impl AuthStore {
 
     /// Issue a random 32-byte session ticket for `peer` and persist both maps.
     pub fn issue_ticket(&self, peer: Uuid) -> io::Result<Vec<u8>> {
-        use getrandom::getrandom;
-
-        let mut ticket = vec![0u8; 32];
-        getrandom(&mut ticket)?;
+        let ticket = rand::random_vec(32)?;
 
         let w = self.db.begin_write().map_err(ioerr)?;
         {

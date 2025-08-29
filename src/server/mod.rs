@@ -1,3 +1,4 @@
+use crate::crypto::rand;
 use crate::includes::sync_capnp;
 use crate::net::unix_socket::start_unix_socket_server_auto;
 use crate::node::id::set_node_id;
@@ -21,7 +22,6 @@ use crate::{gossip, token::TokenStore};
 use capnp::capability::Promise;
 use config::Config;
 use ed25519_dalek::SigningKey;
-use getrandom::getrandom;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -138,8 +138,8 @@ impl server::Server for ServerImpl {
 
             let noise_keys = noise_keys.clone();
 
-            let mut nonce = [0u8; 16];
-            getrandom(&mut nonce).map_err(|e| capnp::Error::failed(e.to_string()))?;
+            let nonce = rand::try_nonce16().map_err(|e| capnp::Error::failed(e.to_string()))?;
+
             const TTL_SECS: u64 = 3600; // 1 hour (tune it)
             let cred = ClusterCredential::sign(&signing_key, joiner_id, TTL_SECS, nonce);
             let cred_bytes = cred.to_bytes().map_err(capnp::Error::failed)?;
