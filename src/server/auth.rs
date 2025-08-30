@@ -11,6 +11,7 @@ fn ioerr<E: std::error::Error>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e.to_string())
 }
 
+#[derive(Clone)]
 pub struct AuthStore {
     db: Arc<Database>,
 }
