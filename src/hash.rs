@@ -11,6 +11,7 @@ impl HashBytes {
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
+
     #[inline]
     pub fn into_vec(self) -> Vec<u8> {
         self.0

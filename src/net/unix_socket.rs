@@ -1,6 +1,6 @@
 use crate::includes::server_capnp::cluster_session;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
-use futures::{AsyncReadExt, TryFutureExt};
+use futures::AsyncReadExt;
 use std::os::unix::fs::PermissionsExt;
 use std::{
     env, fs, io,
@@ -91,7 +91,8 @@ async fn handle_unix_conn(
     );
 
     let rpc_system = RpcSystem::new(Box::new(network), Some(server_handle.client));
-    rpc_system
-        .map_err(|e| eprintln!("UnixSocket RPC error: {e}"))
-        .await;
+
+    if let Err(e) = rpc_system.await {
+        eprintln!("UnixSocket RPC error: {e}");
+    }
 }

@@ -25,6 +25,7 @@ use capnp::{capability::Promise, Error};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::{fmt, io};
@@ -149,15 +150,18 @@ impl Topology {
         })
     }
 
+    /// Sets the server handle to be served to other Peers so that they could connect
+    /// and consume this Node's APIs.
     pub fn set_server_handle(&self, handle: server::Client) -> Result<(), server::Client> {
         let handles = self.handles.clone();
         let local_id = self.node.id;
         let public_key = self.public_key;
         let verifying_key = self.signing_key.verifying_key().clone();
 
-        // also ensure our own peer-entry exists in the store
+        // Also ensure our own peer-entry exists in the store
         let peers = self.peers.clone();
-        let advertise = self.get_advertise_address();
+        // TODO: Treat potential error.
+        let advertise = self.get_advertise_address().unwrap();
         let host = self
             .node
             .system_info
@@ -166,16 +170,16 @@ impl Topology {
             .clone()
             .unwrap_or_default();
 
-        // Setting it twice returns an error, we should handle
-        // this gracefully.
-        self.server_handle.set(handle.clone());
+        let first_set = self.server_handle.set(handle.clone()).is_ok();
+        if !first_set {
+            log::debug!("server_handle already set, ignoring duplicate set");
+        }
 
         tokio::task::spawn_local(async move {
             handles.write().await.insert(local_id, handle);
 
             let key = UuidKey::from(local_id);
 
-            // If peer does not exist, create our own PeerValue.
             match peers.exists(&key) {
                 Ok(false) => {
                     let v = PeerValue {
@@ -188,26 +192,29 @@ impl Topology {
                     if let Err(e) = peers.upsert(&key, v).await {
                         log::warn!("failed to upsert self peer: {e}");
                     }
-
-                    // TODO: store local node to retrieve information on restart.
-                    // Figure out the store situation and have a non generic store.
                 }
-                Ok(true) => {} // nothing to do
+                Ok(true) => {} // Nothing to do.
                 Err(e) => log::warn!("exists(self) failed: {e}"),
             }
-
-            // MST updated by store.upsert
         });
 
         Ok(())
     }
 
-    // TODO: Handle error cases
-    pub fn get_advertise_address(&self) -> String {
-        let local_listen_port: u16 = extract_port(self.addr.clone().as_str()).unwrap();
-        let advertise_ip = compute_advertise_ip(None, None).unwrap();
-        let advertise = format!("{}:{}", advertise_ip, local_listen_port);
-        advertise
+    pub fn get_advertise_address(&self) -> io::Result<String> {
+        let port = extract_port(self.addr.as_str()).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("invalid listen addr '{}': {}", self.addr, e),
+            )
+        })?;
+
+        // Best-effort IP discovery (no packets sent). If this fails, bubble up.
+        let ip = compute_advertise_ip(None, None).map_err(|e| {
+            io::Error::new(e.kind(), format!("failed to compute advertise ip: {}", e))
+        })?;
+
+        Ok(SocketAddr::new(ip, port).to_string())
     }
 
     pub fn get_server_handle(&self) -> Option<ServerClient> {
@@ -294,7 +301,9 @@ impl Topology {
     }
 
     pub async fn remove_peer(&self, id: Uuid) -> Result<(), Box<dyn std::error::Error>> {
-        self.peers.remove(&UuidKey::from(id)).await;
+        if let Err(e) = self.peers.remove(&UuidKey::from(id)).await {
+            eprintln!("Could not remove peer: {e}");
+        }
         Ok(())
     }
 
@@ -515,7 +524,7 @@ impl topology::Server for Topology {
     fn join(
         &mut self,
         params: topology::JoinParams,
-        mut results: topology::JoinResults,
+        mut _results: topology::JoinResults,
     ) -> Promise<(), Error> {
         let self_addr = self.addr.clone();
         let hostname = self.node.system_info.info.hostname.clone().unwrap();
@@ -531,7 +540,8 @@ impl topology::Server for Topology {
         }
         let server_handle = handle.unwrap();
         let public_key = self.public_key.clone().to_bytes();
-        let advertise = self.get_advertise_address();
+        // TODO: Treat potential error.
+        let advertise = self.get_advertise_address().unwrap();
         let signing_vk_bytes = self.signing_key.verifying_key().to_bytes();
         let signing_key = self.signing_key.clone();
 

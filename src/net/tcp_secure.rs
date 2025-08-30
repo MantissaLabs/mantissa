@@ -1,5 +1,5 @@
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
-use futures::{AsyncReadExt, TryFutureExt};
+use futures::AsyncReadExt;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -34,9 +34,9 @@ pub async fn start_tcp_secure_listener(
                     let rpc_system =
                         RpcSystem::new(Box::new(network), Some(server_handle_clone.client));
 
-                    rpc_system
-                        .map_err(|e| eprintln!("TCP secure RPC error: {e}"))
-                        .await;
+                    if let Err(e) = rpc_system.await {
+                        eprintln!("TCP secure RPC error: {e}");
+                    }
                 }
                 Err(e) => eprintln!("Noise handshake/token failed: {e}"),
             }

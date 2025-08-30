@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         },
 
-        Command::Submit(s) => {
+        Command::Submit(_s) => {
             // e.g., workload::task::submit(&s.input).await?;
             workload::task::submit().await?;
         }

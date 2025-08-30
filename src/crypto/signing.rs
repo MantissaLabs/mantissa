@@ -1,10 +1,11 @@
-use ed25519_dalek::{SigningKey, VerifyingKey, SECRET_KEY_LENGTH};
+use ed25519_dalek::{SigningKey, SECRET_KEY_LENGTH};
 use getrandom::getrandom;
 use std::{fs, io, path::Path};
 
 pub struct SignKeys {
+    // Our signing key for credentials, inner contains the
+    // pub verifying key to send to other peers.
     pub sk: SigningKey,
-    pub vk: VerifyingKey,
 }
 
 pub fn resolve_signing_key_path() -> io::Result<std::path::PathBuf> {
@@ -48,6 +49,5 @@ pub fn load_or_generate_sign_keys(path: impl AsRef<Path>) -> io::Result<SignKeys
         arr
     };
     let sk = SigningKey::from_bytes(&sk_bytes);
-    let vk = sk.verifying_key();
-    Ok(SignKeys { sk, vk })
+    Ok(SignKeys { sk })
 }
