@@ -172,6 +172,15 @@ impl server::Server for ServerImpl {
                 });
             }
 
+            // Ensure the periodic sync loop is running on this node as soon as we have a cluster
+            // at least two nodes.
+            {
+                let topo = topology.clone();
+                tokio::task::spawn_local(async move {
+                    topo.ensure_periodic_sync();
+                });
+            }
+
             let mut out = results.get();
             out.set_session(session_client);
             out.set_ticket(&ticket);
