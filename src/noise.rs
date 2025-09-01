@@ -3,7 +3,7 @@ use getrandom::getrandom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, io, path::Path};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct NoiseKeys {
@@ -42,14 +42,15 @@ fn prologue() -> &'static [u8] {
     b"MANTISSA|v1"
 }
 
+/// Client side handshake
+/// Handshake (Noise_XX) with length-prefixed frames; no token in Noise.
+/// Returns a duplex stream bridged through the Noise transport.
 pub async fn client_handshake(
     tcp: tokio::net::TcpStream,
-    keys: &NoiseKeys,
-) -> std::io::Result<tokio::io::DuplexStream> {
-    use std::io;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+    keys: &crate::noise::NoiseKeys,
+) -> io::Result<tokio::io::DuplexStream> {
     let pk_bytes = keys.private.to_bytes();
+
     let builder = snow::Builder::new(NOISE_PARAMS.parse().unwrap())
         .prologue(prologue())
         .local_private_key(&pk_bytes);
@@ -62,12 +63,14 @@ pub async fn client_handshake(
 
     // -> e
     let mut out = vec![0u8; 65535];
-    let n = hs.write_message(&[], &mut out).unwrap();
-    wr.write_all(&out[..n]).await?;
+    let n = hs
+        .write_message(&[], &mut out)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    write_framed(&mut wr, &out[..n]).await?;
 
     // <- e, ee, s, es
     let mut inb = vec![0u8; 65535];
-    let nread = rd.read(&mut inb).await?;
+    let nread = read_framed_len(&mut rd, &mut inb).await?;
     hs.read_message(&inb[..nread], &mut out).map_err(|e| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -75,22 +78,29 @@ pub async fn client_handshake(
         )
     })?;
 
-    // -> s, se    (no app payload here)
-    let n = hs.write_message(&[], &mut out).unwrap();
-    wr.write_all(&out[..n]).await?;
+    // -> s, se (no payload)
+    let n = hs
+        .write_message(&[], &mut out)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    write_framed(&mut wr, &out[..n]).await?;
 
-    let transport = hs.into_transport_mode().unwrap();
-    Ok(spawn_noise_io_bridge(rd, wr, transport))
+    // Done: switch to transport and spawn the IO bridge
+    let transport = hs
+        .into_transport_mode()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
 }
 
+/// Server side handshake
+/// Handshake (Noise_XX) with length-prefixed frames; no token in Noise.
+/// Returns a duplex stream bridged through the Noise transport.
 pub async fn server_handshake(
     tcp: tokio::net::TcpStream,
-    keys: &NoiseKeys,
-) -> std::io::Result<tokio::io::DuplexStream> {
-    use std::io;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+    keys: &crate::noise::NoiseKeys,
+) -> io::Result<tokio::io::DuplexStream> {
     let pk_bytes = keys.private.to_bytes();
+
     let builder = snow::Builder::new(NOISE_PARAMS.parse().unwrap())
         .prologue(prologue())
         .local_private_key(&pk_bytes);
@@ -98,12 +108,14 @@ pub async fn server_handshake(
     let mut hs = builder
         .build_responder()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
     let (mut rd, mut wr) = tcp.into_split();
 
     // <- e
     let mut inb = vec![0u8; 65535];
-    let nread = rd.read(&mut inb).await?;
     let mut out = vec![0u8; 65535];
+
+    let nread = read_framed_len(&mut rd, &mut inb).await?;
     hs.read_message(&inb[..nread], &mut out).map_err(|e| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -112,11 +124,13 @@ pub async fn server_handshake(
     })?;
 
     // -> e, ee, s, es
-    let n = hs.write_message(&[], &mut out).unwrap();
-    wr.write_all(&out[..n]).await?;
+    let n = hs
+        .write_message(&[], &mut out)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    write_framed(&mut wr, &out[..n]).await?;
 
-    // <- s, se   (no app payload expected)
-    let nread = rd.read(&mut inb).await?;
+    // <- s, se
+    let nread = read_framed_len(&mut rd, &mut inb).await?;
     hs.read_message(&inb[..nread], &mut out).map_err(|e| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -124,8 +138,12 @@ pub async fn server_handshake(
         )
     })?;
 
-    let transport = hs.into_transport_mode().unwrap();
-    Ok(spawn_noise_io_bridge(rd, wr, transport))
+    // Done
+    let transport = hs
+        .into_transport_mode()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
 }
 
 /// Spawn a Noise-protected I/O bridge between the TCP socket and an in-process
@@ -329,4 +347,42 @@ pub fn load_or_generate_noise_keys(path: impl AsRef<Path>) -> io::Result<NoiseKe
     };
 
     Ok(NoiseKeys::from_private_bytes(private_bytes))
+}
+
+pub async fn read_framed_len<R>(rd: &mut R, buf: &mut Vec<u8>) -> io::Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut len = [0u8; 2];
+    rd.read_exact(&mut len).await?;
+    let n = u16::from_be_bytes(len) as usize;
+
+    if n > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "handshake frame too large",
+        ));
+    }
+
+    if buf.len() < n {
+        buf.resize(n, 0);
+    }
+    rd.read_exact(&mut buf[..n]).await?;
+    Ok(n)
+}
+
+pub async fn write_framed<W>(wr: &mut W, data: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if data.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
+    let len = (data.len() as u16).to_be_bytes();
+    wr.write_all(&len).await?;
+    wr.write_all(data).await?;
+    wr.flush().await
 }

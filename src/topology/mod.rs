@@ -549,7 +549,7 @@ impl Topology {
     ///  2) obtain a ClusterSession (prefer ticket, else short-lived credential)
     ///  3) get Sync and do a one-shot delta
     pub async fn periodic_sync_loop(&self) {
-        const PERIOD_SECS: u64 = 10;
+        const PERIOD_SECS: u64 = 5;
         let mut tick = interval(Duration::from_secs(PERIOD_SECS));
 
         loop {
