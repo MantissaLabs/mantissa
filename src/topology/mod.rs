@@ -1,5 +1,5 @@
 use crate::client::connection;
-use crate::crypto::rand;
+use crate::crypto::rand::{self, nonce16};
 use crate::gossip_capnp::gossip_message;
 use crate::health_capnp::NodeStatus;
 use crate::includes::server_capnp::cluster_session;
@@ -72,6 +72,8 @@ pub struct Topology {
     // The peer ID derived from the public key.
     // FIXME: detangle from the u64 id defined in Capnproto Node struct.
     peer_id: PeerId,
+
+    is_cluster_member: Rc<OnceCell<()>>,
 }
 
 #[derive(Clone)]
@@ -147,6 +149,7 @@ impl Topology {
             node: node,
             local_sessions: sessions,
             local_credential_store: creds_store,
+            is_cluster_member: Rc::new(OnceCell::new()),
         })
     }
 
@@ -219,6 +222,31 @@ impl Topology {
 
     pub fn get_server_handle(&self) -> Option<ServerClient> {
         self.server_handle.get().cloned()
+    }
+
+    /// True if we already have at least one peer (not ourselves) or any stored ticket.
+    pub async fn already_joined(&self) -> std::io::Result<bool> {
+        // any stored ticket?
+        if !self.local_sessions.list_records()?.is_empty() {
+            return Ok(true);
+        }
+        // any peer != self in the MST?
+        let (actives, _) = self.peers.load_all()?;
+        let me = self.node.id;
+        Ok(actives.iter().any(|(k, _)| k.to_uuid() != me))
+    }
+
+    /// Spawns a single periodic sync loop (no-op if already started).
+    pub fn ensure_periodic_sync(&self) {
+        if self.is_cluster_member.set(()).is_err() {
+            // already started
+            return;
+        }
+
+        let this = self.clone();
+        tokio::task::spawn_local(async move {
+            this.periodic_sync_loop().await;
+        });
     }
 
     // The run loop receives incoming events from Gossip.
@@ -515,6 +543,154 @@ impl Topology {
 
         Ok(())
     }
+
+    /// Periodically:
+    ///  1) for each known peer (except self), open a Server client
+    ///  2) obtain a ClusterSession (prefer ticket, else short-lived credential)
+    ///  3) get Sync and do a one-shot delta
+    pub async fn periodic_sync_loop(&self) {
+        const PERIOD_SECS: u64 = 10;
+        let mut tick = interval(Duration::from_secs(PERIOD_SECS));
+
+        loop {
+            tick.tick().await;
+
+            // Snapshot peers (actives) from MST
+            let peers_snapshot = match self.peers.load_all() {
+                Ok((actives, _)) => actives,
+                Err(e) => {
+                    eprintln!("[sync-loop] load_all failed: {e}");
+                    continue;
+                }
+            };
+
+            for (k, snap) in peers_snapshot {
+                let peer_id: Uuid = k.to_uuid();
+                if peer_id == self.node.id {
+                    continue; // skip self
+                }
+
+                // Last value of MVReg is current PeerValue
+                let Some(val) = snap.as_slice().last().cloned() else {
+                    continue;
+                };
+                let addr = val.address;
+
+                // 1) Connect to remote Server
+                let client: server::Client = match connection::get_client_secure(&addr).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[sync-loop] connect {addr} failed: {e}");
+                        continue;
+                    }
+                };
+
+                // 2) Obtain session: prefer ticket, else short-lived credential (if we can sign)
+                let mut session_opt: Option<cluster_session::Client> =
+                    self.session_via_ticket(&client, peer_id).await;
+
+                if session_opt.is_none() {
+                    if let Some(s) = self.session_via_credential(&client, peer_id).await {
+                        session_opt = Some(s);
+                    }
+                }
+
+                let Some(session) = session_opt else { continue };
+
+                // 3) Get Sync capability
+                let sync_cap: sync::Client = match (async {
+                    let req = session.get_sync_request();
+                    let resp = req.send().promise.await?;
+                    resp.get()?.get_sync()
+                })
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[sync-loop] get_sync failed: {e}");
+                        continue;
+                    }
+                };
+
+                // 4) One-shot sync (want/delta/openDelta), using your existing helper
+                crate::sync::delta::sync_peers_after_join(self.peers.clone(), sync_cap).await;
+            }
+        }
+    }
+
+    /// Try to open a session using a stored ticket for `peer_id`.
+    async fn session_via_ticket(
+        &self,
+        client: &server::Client,
+        peer_id: Uuid,
+    ) -> Option<cluster_session::Client> {
+        let ticket = match self.local_sessions.get(peer_id) {
+            Ok(Some(t)) => t,
+            _ => return None,
+        };
+
+        let mut req = client.get_session_request();
+        req.get().set_ticket(&ticket);
+        match req.send().promise.await {
+            Ok(resp) => match resp.get() {
+                Ok(r) => r.get_session().ok(),
+                Err(e) => {
+                    eprintln!("[sync-loop] get_session response error: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("[sync-loop] get_session failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Try to open a session using a short-lived credential (if we have a SigningKey).
+    /// On success, persist the returned ticket for future ticket-based resumes.
+    async fn session_via_credential(
+        &self,
+        client: &server::Client,
+        peer_id: Uuid,
+    ) -> Option<cluster_session::Client> {
+        let cred_bytes = {
+            let sk = &self.signing_key;
+            let cred = ClusterCredential::sign(sk, self.node.id, 3600, nonce16());
+            match cred.to_bytes() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[sync-loop] credential serialize failed: {e}");
+                    return None;
+                }
+            }
+        };
+
+        let mut req = client.get_with_credential_request();
+        req.get().set_credential(&cred_bytes);
+
+        match req.send().promise.await {
+            Ok(resp) => {
+                let r = match resp.get() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[sync-loop] getWithCredential response error: {e}");
+                        return None;
+                    }
+                };
+
+                // Persist returned ticket for future fast path
+                if let Err(e) = self.local_sessions.put(peer_id, r.get_ticket().ok()?) {
+                    eprintln!("[sync-loop] ticket persist failed for {peer_id}: {e}");
+                }
+
+                r.get_session().ok()
+            }
+            Err(e) => {
+                eprintln!("[sync-loop] getWithCredential failed: {e}");
+                None
+            }
+        }
+    }
 }
 
 impl topology::Server for Topology {
@@ -607,17 +783,17 @@ impl topology::Server for Topology {
             };
 
             // Spawn background periodic sync + connect.
-            // FIXME: This is a workaround until we have gossip implemented.
-            tokio::task::spawn_local(async move {
-                periodic_sync_and_connect(
-                    peers,
-                    topology,
-                    sync_cap,
-                    Some(signing_key.clone()),
-                    std::time::Duration::from_secs(5), // tune as needed
-                )
-                .await;
+            // Spawn one-shot sync with the anchor (you already do this)
+            tokio::task::spawn_local({
+                let peers = peers.clone();
+                async move {
+                    sync_peers_after_join(peers, sync_cap).await;
+                }
             });
+
+            // Ensure the periodic loop is running (safe to call multiple times)
+            // FIXME: This is a workaround until we have gossip implemented.
+            topology.ensure_periodic_sync();
 
             // Send signal to synchronize data with anchor node (fetch the Sync capability),
             // and start:
@@ -731,46 +907,7 @@ impl Clone for Topology {
             local_sessions: self.local_sessions.clone(),
             signing_key: self.signing_key.clone(),
             local_credential_store: self.local_credential_store.clone(),
-        }
-    }
-}
-
-/// Periodically:
-///   1) pull deltas from the anchor via `sync_cap`
-///   2) attempt to connect to known peers (tickets first, then cred)
-///
-/// Notes:
-/// - This runs forever. It coalesces if a cycle takes longer than `period`.
-/// - It’s fine to call `sync_peers_after_join` repeatedly; it no-ops when in sync.
-pub async fn periodic_sync_and_connect(
-    peers: PeersStore,
-    topology: Topology,
-    sync_cap: sync::Client,
-    signing_key: Option<SigningKey>,
-    period: Duration,
-) {
-    // Do an immediate pass before the first tick
-    sync_peers_after_join(peers.clone(), sync_cap.clone()).await;
-    if let Err(e) = topology.connect_known_peers(signing_key.as_ref()).await {
-        println!("[connect] initial connect failed: {e}");
-    }
-
-    // Then run on a fixed cadence
-    let mut ticker = interval(period);
-    loop {
-        ticker.tick().await;
-
-        println!("Syncing...");
-
-        // 1) delta sync
-        // FIXME: On restart of the anchor node, sync_cap becomes broken and we need
-        // to get it again if we want to continue performing the sync.
-        sync_peers_after_join(peers.clone(), sync_cap.clone()).await;
-
-        // 2) attempt connects (idempotent; skips self & already connected)
-        if let Err(e) = topology.connect_known_peers(signing_key.as_ref()).await {
-            println!("[connect] periodic connect failed: {e}");
-            continue;
+            is_cluster_member: self.is_cluster_member.clone(),
         }
     }
 }

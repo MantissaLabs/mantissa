@@ -252,6 +252,7 @@ impl Bootstrap {
         };
 
         let mut topology_runner = comps.topology.clone();
+        let mut topology_sync = comps.topology.clone();
 
         // Spawn gossip loop
         tokio::task::spawn_local(async move {
@@ -262,6 +263,10 @@ impl Bootstrap {
         tokio::task::spawn_local(async move {
             topology_runner.run().await;
         });
+
+        if topology_sync.already_joined().await.unwrap_or(false) {
+            topology_sync.ensure_periodic_sync();
+        }
 
         // Best-effort connect at boot
         let topology_for_boot = comps.topology.clone();
