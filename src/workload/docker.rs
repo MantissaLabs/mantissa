@@ -402,6 +402,8 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore]
+    /// Ignore since it needs Docker running.
     async fn test_new_docker_manager() {
         // This test simply verifies the Docker connection can be established
         let result = DockerContainerManager::new().await;

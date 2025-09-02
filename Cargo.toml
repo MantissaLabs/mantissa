@@ -77,6 +77,11 @@ chacha20poly1305 = "0.10.1"
 hkdf = "0.12.4"
 sha2 = "0.10.9"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+tempfile = "3"
+anyhow = "1"
+
 [features]
 default = []
 
