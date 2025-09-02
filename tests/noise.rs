@@ -1,4 +1,6 @@
 use mantissa::noise::{client_handshake, server_handshake};
+use mantissa::noise::{read_framed_len, write_framed};
+use tokio::io;
 use tokio::time::{timeout, Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -52,4 +54,41 @@ async fn noise_xx_handshake_and_echo_both_directions() {
         .unwrap()
         .unwrap();
     assert_eq!(&buf2, b"pong");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_framed_rejects_too_large() {
+    // Make a payload > u16::MAX so write_framed must reject it.
+    let big = vec![0u8; (u16::MAX as usize) + 1];
+
+    // Use a sink writer, nothing will be written due to early error.
+    let mut sink = io::sink();
+
+    let err = write_framed(&mut sink, &big)
+        .await
+        .expect_err("should be too large");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn write_then_read_framed_roundtrip_small() {
+    // Duplex in-memory pipe
+    let (mut a, mut b) = tokio::io::duplex(1024);
+
+    // Writer task
+    let writer = async {
+        let payload = b"hello framed";
+        write_framed(&mut b, payload).await.unwrap();
+        b.shutdown().await.unwrap();
+    };
+
+    // Reader task
+    let reader = async {
+        let mut buf = Vec::new();
+        let n = read_framed_len(&mut a, &mut buf).await.unwrap();
+        assert_eq!(n, b"hello framed".len());
+        assert_eq!(&buf[..n], b"hello framed");
+    };
+
+    tokio::join!(writer, reader);
 }
