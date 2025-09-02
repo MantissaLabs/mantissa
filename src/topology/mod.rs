@@ -544,40 +544,37 @@ impl Topology {
         Ok(())
     }
 
-    /// Periodically:
-    ///  1) for each known peer (except self), open a Server client
-    ///  2) obtain a ClusterSession (prefer ticket, else short-lived credential)
-    ///  3) get Sync and do a one-shot delta
-    pub async fn periodic_sync_loop(&self) {
-        const PERIOD_SECS: u64 = 5;
-        let mut tick = interval(Duration::from_secs(PERIOD_SECS));
+    /// Run one sync "tick":
+    ///  - for each known peer (except self), open a Server client,
+    ///  - obtain a ClusterSession (prefer ticket, else short-lived credential),
+    ///  - get Sync and do a one-shot delta.
+    ///
+    /// This is factored out so tests can drive sync deterministically without timers.
+    pub async fn periodic_sync_tick(&self) {
+        // Snapshot peers (actives) from MST
+        let peers_snapshot = match self.peers.load_all() {
+            Ok((actives, _)) => actives,
+            Err(e) => {
+                eprintln!("[sync-loop] load_all failed: {e}");
+                return;
+            }
+        };
 
-        loop {
-            tick.tick().await;
+        for (k, snap) in peers_snapshot {
+            let peer_id: uuid::Uuid = k.to_uuid();
+            if peer_id == self.node.id {
+                continue; // skip self
+            }
 
-            // Snapshot peers (actives) from MST
-            let peers_snapshot = match self.peers.load_all() {
-                Ok((actives, _)) => actives,
-                Err(e) => {
-                    eprintln!("[sync-loop] load_all failed: {e}");
-                    continue;
-                }
+            // Last value of MVReg is current PeerValue
+            let Some(val) = snap.as_slice().last().cloned() else {
+                continue;
             };
+            let addr = val.address;
 
-            for (k, snap) in peers_snapshot {
-                let peer_id: Uuid = k.to_uuid();
-                if peer_id == self.node.id {
-                    continue; // skip self
-                }
-
-                // Last value of MVReg is current PeerValue
-                let Some(val) = snap.as_slice().last().cloned() else {
-                    continue;
-                };
-                let addr = val.address;
-
-                // 1) Connect to remote Server
-                let client: server::Client = match connection::get_client_secure(&addr).await {
+            // Connect to remote Server
+            let client: crate::server_capnp::server::Client =
+                match crate::client::connection::get_client_secure(&addr).await {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("[sync-loop] connect {addr} failed: {e}");
@@ -585,36 +582,45 @@ impl Topology {
                     }
                 };
 
-                // 2) Obtain session: prefer ticket, else short-lived credential (if we can sign)
-                let mut session_opt: Option<cluster_session::Client> =
-                    self.session_via_ticket(&client, peer_id).await;
+            // Obtain session: prefer ticket, else short-lived credential (if we can sign)
+            let mut session_opt: Option<crate::includes::server_capnp::cluster_session::Client> =
+                self.session_via_ticket(&client, peer_id).await;
 
-                if session_opt.is_none() {
-                    if let Some(s) = self.session_via_credential(&client, peer_id).await {
-                        session_opt = Some(s);
-                    }
+            if session_opt.is_none() {
+                if let Some(s) = self.session_via_credential(&client, peer_id).await {
+                    session_opt = Some(s);
                 }
-
-                let Some(session) = session_opt else { continue };
-
-                // 3) Get Sync capability
-                let sync_cap: sync::Client = match (async {
-                    let req = session.get_sync_request();
-                    let resp = req.send().promise.await?;
-                    resp.get()?.get_sync()
-                })
-                .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[sync-loop] get_sync failed: {e}");
-                        continue;
-                    }
-                };
-
-                // 4) One-shot sync (want/delta/openDelta), using your existing helper
-                crate::sync::delta::sync_peers_after_join(self.peers.clone(), sync_cap).await;
             }
+
+            let Some(session) = session_opt else { continue };
+
+            // Get Sync capability
+            let sync_cap: crate::includes::sync_capnp::sync::Client = match (async {
+                let req = session.get_sync_request();
+                let resp = req.send().promise.await?;
+                resp.get()?.get_sync()
+            })
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[sync-loop] get_sync failed: {e}");
+                    continue;
+                }
+            };
+
+            // One-shot sync (want/delta/openDelta), using your existing helper
+            crate::sync::delta::sync_peers_after_join(self.peers.clone(), sync_cap).await;
+        }
+    }
+
+    /// Periodically call [`periodic_sync_tick`] every few seconds.
+    pub async fn periodic_sync_loop(&self) {
+        const PERIOD_SECS: u64 = 5;
+        let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(PERIOD_SECS));
+        loop {
+            tick.tick().await;
+            self.periodic_sync_tick().await;
         }
     }
 
