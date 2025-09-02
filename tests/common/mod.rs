@@ -12,3 +12,5 @@ pub fn fixed_noise_keys(byte: u8) -> mantissa::noise::NoiseKeys {
     // Deterministic Noise keypair for tests
     mantissa::noise::NoiseKeys::from_private_bytes([byte; 32])
 }
+
+pub mod testkit;

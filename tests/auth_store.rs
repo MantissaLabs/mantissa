@@ -1,4 +1,4 @@
-use mantissa::auth::AuthStore;
+use mantissa::server::auth::AuthStore;
 use uuid::Uuid;
 
 mod common;

@@ -30,7 +30,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::{fmt, io};
 use tokio::sync::RwLock;
-use tokio::time::{interval, Duration};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 

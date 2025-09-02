@@ -214,15 +214,6 @@ impl NodeInfo {
     /// This only works if `libcpuid` is present on the machine, otherwise
     /// we return `None` and ignore the specs for further use of the
     /// delegate.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// match get_cpu_info() {
-    ///     Some(info) => println!("cpu brand: {}", info.brand),
-    ///     None => println!("can't collect cpu info on the machine"),
-    /// }
-    /// ```
     pub fn get_cpu_info(&mut self) {
         let mut sys = System::new_with_specifics(
             RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),

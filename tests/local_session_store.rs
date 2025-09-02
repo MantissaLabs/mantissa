@@ -1,4 +1,4 @@
-use mantissa::local_session_store::LocalSessionStore;
+use mantissa::store::local_session_store::LocalSessionStore;
 use uuid::Uuid;
 
 mod common;

@@ -23,11 +23,11 @@ use ed25519_dalek::SigningKey;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-mod auth;
-mod config;
+pub mod auth;
+pub mod config;
 pub mod credential;
-mod server;
-mod session;
+pub mod server;
+pub mod session;
 
 /// Start the server and sub-systems (topology, gossip, sync, unix/tcp listeners).
 pub async fn start(listen_addr: String) -> Result<(), Box<dyn std::error::Error>> {
@@ -52,7 +52,7 @@ pub async fn start(listen_addr: String) -> Result<(), Box<dyn std::error::Error>
     server.start_daemon(true).await
 }
 
-struct Bootstrap {
+pub(crate) struct Bootstrap {
     // immutable app config
     listen_addr: String,
 
@@ -69,7 +69,7 @@ struct Bootstrap {
     node_client: crate::node_capnp::node::Client,
 }
 
-struct Stores {
+pub(crate) struct Stores {
     peers: PeersStore,
     session_auth: AuthStore,           // server-side issued tickets
     local_sessions: LocalSessionStore, // client-side resume tickets (encrypted)
@@ -77,7 +77,7 @@ struct Stores {
     token_store: TokenStore,           // join token rotator
 }
 
-struct Components {
+pub(crate) struct Components {
     gossip_client: GossipClient,
     topology: Topology,
     topology_client: TopologyClient,
@@ -85,8 +85,29 @@ struct Components {
 }
 
 impl Bootstrap {
+    // Construct a Bootstrap context from injected parts (useful for tests).
+    pub(crate) fn from_parts(
+        listen_addr: String,
+        self_id: Uuid,
+        noise_keys: Arc<NoiseKeys>,
+        signing_key: SigningKey,
+        db: Arc<redb::Database>,
+        node: node::Node,
+        node_client: crate::node_capnp::node::Client,
+    ) -> Self {
+        Self {
+            listen_addr,
+            self_id,
+            noise_keys,
+            signing_key,
+            db,
+            node,
+            node_client,
+        }
+    }
+
     /// Init Keys, DB, local node & ID.
-    async fn init_base(listen_addr: String) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(crate) async fn init_base(listen_addr: String) -> Result<Self, Box<dyn std::error::Error>> {
         // Noise protocol keys.
         let keys_path = resolve_noise_key_path()?;
         let noise_keys = Arc::new(load_or_generate_noise_keys(keys_path)?);
@@ -121,7 +142,7 @@ impl Bootstrap {
     }
 
     /// Setup persistent stores + warm-up MST.
-    async fn open_stores(ctx: &Bootstrap) -> Result<Stores, Box<dyn std::error::Error>> {
+    pub(crate) async fn open_stores(ctx: &Bootstrap) -> Result<Stores, Box<dyn std::error::Error>> {
         // Peers store (CRDT+MST)
         let peers: PeersStore = open_peers_store(ctx.db.clone(), ctx.self_id)?;
         peers.rebuild_mst_from_disk().await?;
@@ -155,7 +176,7 @@ impl Bootstrap {
     }
 
     /// Build topology/gossip/sync and their Cap’n Proto clients.
-    fn build_components(
+    pub(crate) fn build_components(
         ctx: &Bootstrap,
         stores: &Stores,
     ) -> Result<Components, Box<dyn std::error::Error>> {
@@ -199,7 +220,7 @@ impl Bootstrap {
     }
 
     /// Build the ServerImpl with all dependencies injected.
-    fn build_server<'a>(
+    pub(crate) fn build_server<'a>(
         ctx: &'a Bootstrap,
         stores: &'a Stores,
         comps: &'a Components,
@@ -225,7 +246,7 @@ impl Bootstrap {
     }
 
     /// Finish wiring & kick off one-shot post-boot actions.
-    async fn after_boot(
+    pub(crate) async fn after_boot(
         server: &ServerImpl,
         _ctx: &Bootstrap,
         _stores: &Stores,

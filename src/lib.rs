@@ -1,19 +1,24 @@
-// Noise is self-contained.
-#[path = "noise.rs"]
-pub mod noise;
+pub mod includes;
+pub use includes::{
+    gossip_capnp, health_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
+    topology_capnp, utils_capnp,
+};
 
-// LocalSessionStore is self-contained (depends only on `noise` + external crates).
-#[path = "store/local_session_store.rs"]
-pub mod local_session_store;
-
-// Credentials live under server/, but we can export that file directly
-// as a top-level `credential` module to avoid building all of `server/`.
-#[path = "server/credential.rs"]
-pub mod credential;
-
-// New: allow AuthStore tests to compile (needs crypto::rand).
-#[path = "crypto/mod.rs"]
+pub mod cli;
+pub mod client;
+pub mod container;
 pub mod crypto;
-
-#[path = "server/auth.rs"]
-pub mod auth;
+pub mod gossip;
+pub mod hash;
+pub mod logger;
+pub mod monitor;
+pub mod net;
+pub mod node;
+pub mod noise;
+pub mod server;
+pub mod store;
+pub mod sync;
+pub mod token;
+pub mod topology;
+pub mod types;
+pub mod workload;

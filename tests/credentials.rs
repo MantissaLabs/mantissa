@@ -1,5 +1,5 @@
 use ed25519_dalek::SigningKey;
-use mantissa::credential::ClusterCredential;
+use mantissa::server::credential::ClusterCredential;
 use uuid::Uuid;
 
 #[test]
