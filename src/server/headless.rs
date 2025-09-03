@@ -39,8 +39,10 @@ pub struct HeadlessNode {
 
     // Transport housekeeping
     transport: HeadlessTransport,
-    _handles: Option<RunHandles>, // for TCP NonBlocking
-    _tmp_dir: Option<PathBuf>,    // when using convenience constructors
+
+    // Runtime handles for TCP
+    handles: Option<RunHandles>,
+    _tmp_dir: Option<PathBuf>, // when using convenience constructors
 }
 
 impl HeadlessNode {
@@ -82,19 +84,31 @@ impl HeadlessNode {
         let server_client: server_capnp::server::Client =
             capnp_rpc::new_client(server_impl.clone());
 
-        // --- Transport wiring (what you specifically asked to include) ---
-        let handles: Option<RunHandles> = match &transport {
+        // Transport wiring + readiness
+        let (handles, effective_transport) = match &transport {
             HeadlessTransport::Inproc => {
                 // register in-process so get_client_secure("inproc://<uuid>") resolves here
                 crate::net::inproc::register(ctx.self_id.to_string(), server_client.clone());
-                None
+                (None, HeadlessTransport::Inproc)
             }
             HeadlessTransport::Tcp { .. } => {
                 // start TCP listener non-blocking (Noise + Cap’n Proto)
-                server_impl
-                    .start_with_mode(RunMode::NonBlocking, /*enable_unix_socket=*/ false)
-                    .await
-                    .map_err(to_io)?
+                let mut h = server_impl
+                    .start_with_mode(RunMode::NonBlocking, false)
+                    .await?
+                    .expect("NonBlocking must return handles");
+
+                // Wait until the listener is actually bound and ready.
+                h.wait_ready().await;
+
+                // Use the actual bound socket addr in our transport (ephemeral ports)
+                let bound = h.addr();
+                (
+                    Some(h),
+                    HeadlessTransport::Tcp {
+                        addr: bound.to_string(),
+                    },
+                )
             }
         };
 
@@ -108,36 +122,10 @@ impl HeadlessNode {
             _db: db,
             _noise_keys: noise_keys,
             _signing: signing_key,
-            transport,
-            _handles: handles,
+            transport: effective_transport,
+            handles,
             _tmp_dir: None,
         })
-    }
-
-    pub async fn wait_until_listening(&self) -> std::io::Result<()> {
-        use std::io;
-        use tokio::time::{sleep, Duration};
-
-        match &self.transport {
-            HeadlessTransport::Inproc => Ok(()), // nothing to wait for
-            HeadlessTransport::Tcp { addr } => {
-                // Try to connect until it succeeds or times out
-                for _ in 0..50 {
-                    match tokio::net::TcpStream::connect(addr).await {
-                        Ok(_) => return Ok(()),
-                        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-                            sleep(Duration::from_millis(50)).await;
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "listener did not come up in time",
-                ))
-            }
-        }
     }
 
     /// Fetch this node's current join token via the real Topology API.
@@ -258,6 +246,7 @@ impl HeadlessNode {
             link.set_anchor(anchor_addr);
             link.set_join_token(join_token);
         }
+
         req.get().set_link(
             msg.get_root::<crate::topology_capnp::join_request::Builder>()?
                 .into_reader(),

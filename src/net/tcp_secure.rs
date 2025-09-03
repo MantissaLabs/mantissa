@@ -3,17 +3,24 @@ use futures::AsyncReadExt;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-pub async fn start_tcp_secure_listener(
-    listen_addr: String,
+/// Accept-loop used by both blocking and non-blocking variants.
+async fn accept_loop(
+    listener: TcpListener,
     server_handle: crate::server_capnp::server::Client,
     noise_keys: Arc<crate::noise::NoiseKeys>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(&listen_addr).await?;
-    println!("Server listening (secure) on {}", listen_addr);
-
+) {
     loop {
-        let (stream, _peer) = listener.accept().await?;
-        stream.set_nodelay(true)?;
+        let (stream, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("TCP accept error: {e}");
+                continue;
+            }
+        };
+
+        if let Err(e) = stream.set_nodelay(true) {
+            eprintln!("set_nodelay failed: {e}");
+        }
 
         let server_handle_clone = server_handle.clone();
         let keys = noise_keys.clone();
@@ -42,4 +49,50 @@ pub async fn start_tcp_secure_listener(
             }
         });
     }
+}
+
+/// **Blocking**: runs the accept loop on the current task until error/abort.
+/// (compat: unchanged signature/behavior)
+pub async fn start_tcp_secure_listener(
+    listen_addr: String,
+    server_handle: crate::server_capnp::server::Client,
+    noise_keys: Arc<crate::noise::NoiseKeys>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(&listen_addr).await?;
+    let bound = listener.local_addr()?;
+    println!("Server listening (secure) on {}", bound);
+    accept_loop(listener, server_handle, noise_keys).await;
+    Ok(())
+}
+
+/// **Non-Blocking**: spawns the accept loop and returns:
+///  - JoinHandle<()> for the loop
+///  - oneshot::Receiver<()> that fires once the socket is bound (readiness)
+///  - the actual bound SocketAddr (helpful if you passed "127.0.0.1:0")
+pub async fn start_tcp_secure_listener_nonblocking_with_ready(
+    listen_addr: String,
+    server_handle: crate::server_capnp::server::Client,
+    noise_keys: Arc<crate::noise::NoiseKeys>,
+) -> Result<
+    (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+        std::net::SocketAddr,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let listener = TcpListener::bind(&listen_addr).await?;
+    let bound = listener.local_addr()?;
+    println!("Server listening (secure) on {}", bound);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    // Move everything into the local task (Cap’n Proto requires !Send)
+    let handle = tokio::task::spawn_local(async move {
+        // Signal readiness immediately after successful bind.
+        let _ = tx.send(());
+        accept_loop(listener, server_handle, noise_keys).await;
+    });
+
+    Ok((handle, rx, bound))
 }

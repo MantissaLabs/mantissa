@@ -29,10 +29,7 @@ async fn register_node_inproc() {
 async fn register_node_tcp() {
     run_local(async {
         let anchor = TestNode::new_tcp().await;
-        anchor.node.wait_until_listening().await.unwrap();
-
         let joiner = TestNode::new_tcp().await;
-        joiner.node.wait_until_listening().await.unwrap();
 
         joiner.join(&anchor).await.expect("join ok");
 
