@@ -20,6 +20,23 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 /// At the moment, any method using `get_client` *needs* to be run in a tokio task,
 /// otherwise this will panic.
 pub async fn get_client_secure(addr: &str) -> Result<server::Client, capnp::Error> {
+    // Only useful for tests, catch the capnp capability in-process to
+    // avoid any networking call.
+    #[cfg(any(test, feature = "testkit"))]
+    {
+        if let Some(rest) = addr.strip_prefix("inproc://") {
+            use crate::net;
+
+            if let Some(c) = net::inproc::get(rest) {
+                return Ok(c);
+            }
+            return Err(capnp::Error::failed(format!(
+                "inproc target not found: {}",
+                rest
+            )));
+        }
+    }
+
     use std::net::ToSocketAddrs;
     let sock = addr
         .to_socket_addrs()

@@ -82,9 +82,10 @@ tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
 tempfile = "3"
 anyhow = "1"
 
-[features]
-default = []
-
 # eBPF / Networking
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = "0.13.1"
+
+[features]
+default = []
+testkit = []

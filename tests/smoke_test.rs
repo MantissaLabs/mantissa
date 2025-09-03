@@ -1,34 +1,35 @@
+use std::time::Duration;
 use tokio::task::LocalSet;
 
 mod common;
-use common::testkit::{JoinerKeys, TestNode};
 
 #[tokio::test(flavor = "current_thread")]
 async fn register_node_smoke() {
-    // everything runs on a LocalSet because code uses spawn_local internally
+    use common::testkit::TestNode;
+
     LocalSet::new()
         .run_until(async {
-            // Bring up one node
-            let node = TestNode::new().await;
+            // Bring up two real headless nodes
+            let anchor = TestNode::new().await;
+            let joiner = TestNode::new().await;
 
-            // Joiner keys (deterministic for test)
-            let joiner = JoinerKeys::deterministic(0x22);
+            // Joiner uses the real Topology.join path (in-process anchor)
+            let session = joiner.join_anchor(&anchor).await.expect("join ok");
 
-            // Call registerNode via helper
-            let (cred, session) = node.register_joiner(&joiner).await.expect("register ok");
-
-            // Session ping works
+            // Session is usable
             session.ping_request().send().promise.await.expect("ping");
 
-            // Credential looks right
-            assert_eq!(cred.subject, joiner.id);
-            // issuer is the server’s signing key VK; we can’t access it here,
-            // but the signature was verified already in register_joiner().
+            // Reciprocal ticket eventually shows up at the anchor (registerNode spawns retries)
+            anchor
+                .wait_for_ticket_from(joiner.id(), Duration::from_secs(3))
+                .await
+                .expect("anchor got reciprocal ticket");
 
-            // Topology knows the joiner
+            // Topology on anchor lists both nodes
+            let ids = anchor.list_peer_ids().await.expect("list");
             assert!(
-                node.topology.peer_exists(joiner.id).expect("exists"),
-                "joiner should be registered"
+                ids.contains(&joiner.id()),
+                "anchor topology must contain joiner"
             );
         })
         .await;
