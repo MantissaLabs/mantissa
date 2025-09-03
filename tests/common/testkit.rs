@@ -1,138 +1,113 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
-#![allow(unused_macros)]
+#![allow(unused_variables)]
 
-use std::{sync::Arc, time::Duration};
-
-use ed25519_dalek::SigningKey;
-use tokio::time::sleep;
+use std::future::Future;
+use std::time::Duration;
+use tokio::task::LocalSet;
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
-use capnp::message::Builder;
+use mantissa::{node, server::headless::HeadlessNode};
 
-use mantissa::noise::NoiseKeys;
-use mantissa::server::headless::HeadlessNode;
+/// Run an async block inside a LocalSet so all `spawn_local` tasks work.
+pub async fn run_local<F, T>(f: F) -> T
+where
+    F: Future<Output = T>,
+{
+    LocalSet::new().run_until(f).await
+}
 
-use mantissa::{server_capnp, topology_capnp};
-
+/// A thin, test-friendly wrapper around a real headless node.
+///
+/// By default this uses the **in-process transport** (no sockets, very fast).
+/// If you want to validate the full network + Noise path, use `TestNode::new_tcp()`.
 pub struct TestNode {
-    pub inner: HeadlessNode,
-    topo: topology_capnp::topology::Client,
+    pub node: HeadlessNode,
 }
 
 impl TestNode {
+    /// Start a node with in-process transport (fast path).
     pub async fn new() -> Self {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let db =
-            Arc::new(redb::Database::create(tmp.path().join("state.redb")).expect("redb create"));
-        let noise = Arc::new(NoiseKeys::from_private_bytes([0x11; 32]));
-        let signing = SigningKey::from_bytes(&[0xA5; 32]);
-        let id = Uuid::new_v4();
-
-        let inner = HeadlessNode::new_with("127.0.0.1:0".into(), db, noise, signing, id)
+        let node = HeadlessNode::new_inproc()
             .await
-            .expect("headless");
-
-        let topo = capnp_rpc::new_client(inner.topology.clone());
-        Self { inner, topo }
+            .expect("headless inproc node");
+        Self { node }
     }
 
+    /// Start a node that listens on a random TCP port (Noise + Cap'n Proto over TCP).
+    pub async fn new_tcp() -> Self {
+        let node = HeadlessNode::new_tcp_ephemeral()
+            .await
+            .expect("headless tcp node");
+        Self { node }
+    }
+
+    /// Ask this node to join the cluster whose **anchor** is `anchor`.
+    ///
+    /// This takes the current join token from the anchor and calls the real
+    /// `Topology.join` RPC on *this* node (the joiner).
+    pub async fn join(&self, anchor: &TestNode) -> Result<(), capnp::Error> {
+        let token = anchor.node.current_join_token().await?;
+        let anchor_addr = anchor.node.client_addr();
+        self.node.join_anchor_addr(&anchor_addr, &token).await
+    }
+
+    /// Returns this node's UUID (cluster node id).
     pub fn id(&self) -> Uuid {
-        self.inner.id
+        self.node.id
     }
 
-    pub fn client(&self) -> server_capnp::server::Client {
-        self.inner.client()
+    /// Returns the client address this node exposes:
+    /// - `inproc://<uuid>` for inproc transport
+    /// - `127.0.0.1:<port>` for TCP transport
+    pub fn addr(&self) -> String {
+        self.node.client_addr()
     }
 
-    async fn token(&self) -> String {
-        let resp = self
-            .topo
-            .show_token_request()
-            .send()
-            .promise
-            .await
-            .expect("showToken");
-        resp.get()
-            .unwrap()
-            .get_token()
-            .unwrap()
-            .to_string()
-            .unwrap()
-    }
+    /// Fetch the list of known node IDs via `Topology.list`.
+    pub async fn list_ids(&self) -> Vec<Uuid> {
+        let req = self.node.topology_client.list_request();
+        let resp = req.send().promise.await.expect("list send");
+        let get_resp = resp.get().expect("list get");
+        let nodes = get_resp.get_nodes().unwrap();
+        let list = nodes.get_nodes().unwrap();
 
-    /// Real join path: joiner → Topology.join(anchor="inproc://<anchor-id>", token)
-    pub async fn join_anchor(
-        &self,
-        anchor: &TestNode,
-    ) -> Result<server_capnp::cluster_session::Client, capnp::Error> {
-        let token = anchor.token().await;
-
-        // Local session on the joiner (what Unix socket would give)
-        let session = self.inner.local_session();
-
-        // Obtain Topology capability from the session
-        let topo = {
-            let resp = session.get_topology_request().send().promise.await?;
-            resp.get()?.get_topology()?
-        };
-
-        // Build JoinRequest
-        let mut builder = Builder::new_default();
-        {
-            use topology_capnp::join_request as JoinRequest;
-            let mut link = builder.init_root::<JoinRequest::Builder>();
-            link.set_anchor(&anchor.inner.inproc_anchor_uri());
-            link.set_join_token(&token);
-        }
-
-        // Call join
-        let mut req = topo.join_request();
-        req.get().set_link(
-            builder
-                .get_root::<topology_capnp::join_request::Builder>()?
-                .into_reader(),
-        );
-        let resp = req.send().promise.await?;
-        let jr = resp.get()?.get_resp()?;
-        let err = jr.get_error()?.to_string()?;
-        if !err.is_empty() {
-            return Err(capnp::Error::failed(err));
-        }
-
-        // The anchor returned a session inside registerNode; we can open our
-        // own session back using our stored ticket via normal reconnect logic,
-        // but for smoke tests we can just fetch capabilities from the anchor’s
-        // inline session returned by registerNode (Topology.join did it already).
-        // For a simple assert, a ping on our local session is fine:
-        Ok(session)
-    }
-
-    /// Wait until this node has a local ticket for `peer`.
-    pub async fn wait_for_ticket_from(&self, peer: Uuid, timeout: Duration) -> std::io::Result<()> {
-        let start = std::time::Instant::now();
-        loop {
-            if self.inner.local_sessions().get(peer)?.is_some() {
-                return Ok(());
-            }
-            if start.elapsed() >= timeout {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "ticket timeout",
-                ));
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    pub async fn list_peer_ids(&self) -> Result<Vec<Uuid>, capnp::Error> {
-        let resp = self.topo.list_request().send().promise.await?;
-        let lst = resp.get()?.get_nodes()?.get_nodes()?;
-        let mut out = Vec::with_capacity(lst.len() as usize);
-        for i in 0..lst.len() {
-            let id = mantissa::node::id::read_node_id(lst.get(i).get_id()?)?;
+        let mut out = Vec::with_capacity(list.len() as usize);
+        for i in 0..list.len() {
+            let ni = list.get(i);
+            let id = node::id::read_node_id(ni.get_id().unwrap()).expect("node id");
             out.push(id);
         }
-        Ok(out)
+        out.sort();
+        out
+    }
+
+    /// Wait until this node sees `expected` members in `Topology.list`.
+    /// Returns `true` if reached before timeout.
+    pub async fn wait_for_cluster_size(&self, expected: usize, timeout_ms: u64) -> bool {
+        let patience = Duration::from_millis(timeout_ms);
+        let poll_every = Duration::from_millis(50);
+
+        let fut = async {
+            loop {
+                let ids = self.list_ids().await;
+                if ids.len() == expected {
+                    break true;
+                }
+                sleep(poll_every).await;
+            }
+        };
+
+        match timeout(patience, fut).await {
+            Ok(done) => done,
+            Err(_) => false,
+        }
+    }
+
+    /// Assert that this node sees `expected` members within a short timeout.
+    pub async fn assert_cluster_size(&self, expected: usize, msg: &str) {
+        let ok = self.wait_for_cluster_size(expected, 5_000).await;
+        assert!(ok, "{msg}");
     }
 }

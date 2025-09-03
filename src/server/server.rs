@@ -1,5 +1,4 @@
 use crate::crypto::rand;
-use crate::net::unix_socket::start_unix_socket_server_auto;
 use crate::node::id;
 use crate::node::id::set_node_id;
 use crate::node::identity::pubkey_from_slice;
@@ -44,6 +43,20 @@ pub struct ServerImpl {
     config: Option<Config>,
     noise_keys: Option<Arc<NoiseKeys>>,
     signing_key: Option<SigningKey>,
+}
+
+// How to run the listeners
+#[derive(Clone, Copy, Debug)]
+pub enum RunMode {
+    Blocking,
+    NonBlocking,
+}
+
+// Join handles when running in NonBlocking mode (tests usually keep these)
+#[derive(Debug)]
+pub struct RunHandles {
+    pub tcp: tokio::task::JoinHandle<()>,
+    pub unix: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl server::Server for ServerImpl {
@@ -339,30 +352,22 @@ impl ServerImpl {
         Default::default()
     }
 
-    /// Starts the server, bootstrapping all necessary sub-components
-    pub async fn start_daemon(
-        self,
-        enable_unix_socket: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    /// Internal helper: spawn TCP secure listener (and optionally Unix socket) without blocking.
+    fn spawn_listeners_nonblocking(&self, enable_unix_socket: bool) -> RunHandles {
         let cfg = self.config.as_ref().expect("config");
         let listen_addr = cfg.listen_addr.clone();
         let noise_keys = self.noise_keys.as_ref().expect("noise keys").clone();
 
-        let topology_client = self.topology_client.as_ref().unwrap().clone();
-        let gossip_client = self.gossip_client.as_ref().unwrap().clone();
-        let sync_client = self.sync_client.as_ref().unwrap().clone();
-        let node_client = self.node_client.as_ref().unwrap().clone();
+        // Cap'n Proto server handle
+        let server_handle: crate::server_capnp::server::Client =
+            capnp_rpc::new_client(self.clone());
 
-        // Turn the server impl into a Cap'n Proto capability
-        let server_handle: crate::server_capnp::server::Client = capnp_rpc::new_client(self);
-
-        // Spawn TCP secure listener
-        let tcp_task = {
-            let server_handle = server_handle.clone();
-            let noise_keys = noise_keys.clone();
-            tokio::task::spawn_local(async move {
+        // TCP + Noise (real production listener)
+        let tcp_task = tokio::task::spawn_local({
+            let addr = listen_addr.clone();
+            async move {
                 if let Err(e) = crate::net::tcp_secure::start_tcp_secure_listener(
-                    listen_addr,
+                    addr,
                     server_handle,
                     noise_keys,
                 )
@@ -370,31 +375,65 @@ impl ServerImpl {
                 {
                     eprintln!("TCP secure listener error: {e}");
                 }
-            })
-        };
+            }
+        });
 
-        // Local session used for Unix Socket communication.
-        let local_session = capnp_rpc::new_client(ClusterSessionImpl::new(
-            topology_client,
-            sync_client,
-            gossip_client,
-            node_client,
-        ));
-
-        // Spawn UnixSocket listener (optional)
+        // Optional Unix socket
         let unix_task = if enable_unix_socket {
-            tokio::task::spawn_local(async move {
-                match start_unix_socket_server_auto(local_session).await {
+            let local_session =
+                capnp_rpc::new_client(crate::server::session::ClusterSessionImpl::new(
+                    self.topology_client.as_ref().unwrap().clone(),
+                    self.sync_client.as_ref().unwrap().clone(),
+                    self.gossip_client.as_ref().unwrap().clone(),
+                    self.node_client.as_ref().unwrap().clone(),
+                ));
+            Some(tokio::task::spawn_local(async move {
+                match crate::net::unix_socket::start_unix_socket_server_auto(local_session).await {
                     Ok(p) => eprintln!("UnixSocket ready at {}", p.display()),
                     Err(e) => eprintln!("UnixSocket listener error: {e}"),
                 }
-            })
+            }))
         } else {
-            tokio::task::spawn_local(async {})
+            None
         };
 
-        // TODO: Run forever for now, find a way to stop these gracefully.
-        let _ = tokio::join!(tcp_task, unix_task);
+        RunHandles {
+            tcp: tcp_task,
+            unix: unix_task,
+        }
+    }
+
+    /// New unified entry point: choose Blocking vs NonBlocking.
+    /// - `Blocking` = identical behavior to previous `start_daemon(true/false)`.
+    /// - `NonBlocking` = returns join handles so tests can proceed.
+    pub async fn start_with_mode(
+        self,
+        mode: RunMode,
+        enable_unix_socket: bool,
+    ) -> Result<Option<RunHandles>, Box<dyn std::error::Error>> {
+        let handles = self.spawn_listeners_nonblocking(enable_unix_socket);
+
+        match mode {
+            RunMode::Blocking => {
+                if let Some(unix) = handles.unix {
+                    let _ = tokio::join!(handles.tcp, unix);
+                } else {
+                    let _ = handles.tcp.await;
+                }
+                Ok(None)
+            }
+            RunMode::NonBlocking => Ok(Some(handles)),
+        }
+    }
+
+    /// Backward-compatible wrapper (kept for the daemon path).
+    pub async fn start_daemon(
+        self,
+        enable_unix_socket: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = self
+            .start_with_mode(RunMode::Blocking, enable_unix_socket)
+            .await?;
         Ok(())
     }
 

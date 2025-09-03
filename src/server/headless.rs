@@ -1,43 +1,58 @@
-use std::sync::Arc;
-
-use ed25519_dalek::SigningKey;
+use std::{io, net::TcpListener, path::PathBuf, sync::Arc};
 use uuid::Uuid;
 
 use crate::{
-    includes::server_capnp,
     node,
     noise::NoiseKeys,
-    server::{Bootstrap, Stores},
-    store::peer_store::PeersStore,
-    store::{local_credential_store::LocalCredentialStore, local_session_store::LocalSessionStore},
-    topology::Topology,
+    server::server::{RunHandles, RunMode, ServerImpl},
+    server::{Bootstrap, Components, Stores},
+    server_capnp,
+    topology_capnp::topology,
 };
 
-#[derive(Clone)]
+/// How this headless node exposes its Server during tests.
+#[derive(Clone, Debug)]
+pub enum HeadlessTransport {
+    /// In-process transport: `get_client_secure("inproc://<uuid>")` will resolve
+    /// to the registered server capability without opening sockets.
+    Inproc,
+    /// TCP transport (Noise + Cap’n Proto) bound at `addr`.
+    Tcp { addr: String },
+}
+
 pub struct HeadlessNode {
     pub id: Uuid,
-    pub topology: Topology,
 
-    server_client: server_capnp::server::Client,
-    local_session: server_capnp::cluster_session::Client,
+    // Handy handles for tests
+    pub topology_client: topology::Client,
+    pub server_client: server_capnp::server::Client,
 
-    // Hold refs to keep everything alive for test lifetime
+    // Stores (optional inspection in tests)
+    pub peers: crate::store::peer_store::PeersStore,
+    pub local_sessions: crate::store::local_session_store::LocalSessionStore,
+    pub local_creds: crate::store::local_credential_store::LocalCredentialStore,
+
+    // Keep resources alive
     _db: Arc<redb::Database>,
     _noise_keys: Arc<NoiseKeys>,
-    _signing: SigningKey,
+    _signing: ed25519_dalek::SigningKey,
 
-    peers: PeersStore,
-    local_sessions: LocalSessionStore,
-    local_creds: LocalCredentialStore,
+    // Transport housekeeping
+    transport: HeadlessTransport,
+    _handles: Option<RunHandles>, // for TCP NonBlocking
+    _tmp_dir: Option<PathBuf>,    // when using convenience constructors
 }
 
 impl HeadlessNode {
+    /// Core constructor used by all variants. It builds a **real** node using the same
+    /// Bootstrap flow as production, and wires transport depending on `transport`.
     pub async fn new_with(
         listen_addr: String,
         db: Arc<redb::Database>,
         noise_keys: Arc<NoiseKeys>,
-        signing_key: SigningKey,
+        signing_key: ed25519_dalek::SigningKey,
         self_id: Uuid,
+        transport: HeadlessTransport,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Local Node + client
         let mut node_obj = node::node::Node::new();
@@ -45,7 +60,7 @@ impl HeadlessNode {
         node_obj.id = self_id;
         let node_client = capnp_rpc::new_client(node_obj.clone());
 
-        // Build runtime exactly like production (no sockets)
+        // Build runtime exactly like production
         let ctx = Bootstrap::from_parts(
             listen_addr,
             self_id,
@@ -56,68 +71,245 @@ impl HeadlessNode {
             node_client,
         );
         let stores: Stores = Bootstrap::open_stores(&ctx).await?;
-        let comps = Bootstrap::build_components(&ctx, &stores)?;
-        let server_impl = Bootstrap::build_server(&ctx, &stores, &comps).build();
-        Bootstrap::after_boot(&server_impl, &ctx, &stores, &comps).await?;
+        let comps: Components = Bootstrap::build_components(&ctx, &stores)?;
+        let server_impl: ServerImpl = Bootstrap::build_server(&ctx, &stores, &comps).build();
 
-        // Server capability (same as production server)
+        // Finish wiring and spawn background tasks (gossip loop, topology loop, etc.)
+        Bootstrap::after_boot(&server_impl, &ctx, &stores, &comps).await?;
+        Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps).await;
+
+        // Cap’n Proto Server capability
         let server_client: server_capnp::server::Client =
             capnp_rpc::new_client(server_impl.clone());
 
-        // Local session (what Unix socket would give you)
-        let session_impl = crate::server::session::ClusterSessionImpl::new(
-            comps.topology_client.clone(),
-            comps.sync_client.clone(),
-            comps.gossip_client.clone(),
-            ctx.node_client.clone(),
-        );
-        let local_session: server_capnp::cluster_session::Client =
-            capnp_rpc::new_client(session_impl);
-
-        // Register this node into the in-process registry for test dials
-        #[cfg(any(test, feature = "testkit"))]
-        {
-            use crate::net::inproc;
-
-            inproc::register(self_id.to_string(), server_client.clone());
-        }
+        // --- Transport wiring (what you specifically asked to include) ---
+        let handles: Option<RunHandles> = match &transport {
+            HeadlessTransport::Inproc => {
+                // register in-process so get_client_secure("inproc://<uuid>") resolves here
+                crate::net::inproc::register(ctx.self_id.to_string(), server_client.clone());
+                None
+            }
+            HeadlessTransport::Tcp { .. } => {
+                // start TCP listener non-blocking (Noise + Cap’n Proto)
+                server_impl
+                    .start_with_mode(RunMode::NonBlocking, /*enable_unix_socket=*/ false)
+                    .await
+                    .map_err(to_io)?
+            }
+        };
 
         Ok(Self {
             id: ctx.self_id,
-            topology: comps.topology.clone(),
+            topology_client: comps.topology_client.clone(),
             server_client,
-            local_session,
-            _db: db,
-            _noise_keys: noise_keys,
-            _signing: signing_key,
             peers: stores.peers.clone(),
             local_sessions: stores.local_sessions.clone(),
             local_creds: stores.local_creds.clone(),
+            _db: db,
+            _noise_keys: noise_keys,
+            _signing: signing_key,
+            transport,
+            _handles: handles,
+            _tmp_dir: None,
         })
     }
 
-    pub fn client(&self) -> server_capnp::server::Client {
-        self.server_client.clone()
+    pub async fn wait_until_listening(&self) -> std::io::Result<()> {
+        use std::io;
+        use tokio::time::{sleep, Duration};
+
+        match &self.transport {
+            HeadlessTransport::Inproc => Ok(()), // nothing to wait for
+            HeadlessTransport::Tcp { addr } => {
+                // Try to connect until it succeeds or times out
+                for _ in 0..50 {
+                    match tokio::net::TcpStream::connect(addr).await {
+                        Ok(_) => return Ok(()),
+                        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                            sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "listener did not come up in time",
+                ))
+            }
+        }
     }
 
-    pub fn local_session(&self) -> server_capnp::cluster_session::Client {
-        self.local_session.clone()
+    /// Fetch this node's current join token via the real Topology API.
+    pub async fn current_join_token(&self) -> Result<String, capnp::Error> {
+        let req = self.topology_client.show_token_request();
+        let resp = req.send().promise.await?;
+        let token = resp.get()?.get_token()?.to_string()?;
+        Ok(token)
     }
 
-    pub fn peers_store(&self) -> PeersStore {
-        self.peers.clone()
+    /// From-parts wrapper for **in-process** transport.
+    pub async fn new_inproc_from_parts(
+        db: Arc<redb::Database>,
+        noise_keys: Arc<NoiseKeys>,
+        signing_key: ed25519_dalek::SigningKey,
+        self_id: Uuid,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with(
+            "127.0.0.1:0".to_string(),
+            db,
+            noise_keys,
+            signing_key,
+            self_id,
+            HeadlessTransport::Inproc,
+        )
+        .await
     }
 
-    pub fn local_sessions(&self) -> LocalSessionStore {
-        self.local_sessions.clone()
+    /// From-parts wrapper for **TCP** at a specific address (e.g., "127.0.0.1:6578").
+    pub async fn new_tcp_at_from_parts(
+        addr: String,
+        db: Arc<redb::Database>,
+        noise_keys: Arc<NoiseKeys>,
+        signing_key: ed25519_dalek::SigningKey,
+        self_id: Uuid,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with(
+            addr.clone(),
+            db,
+            noise_keys,
+            signing_key,
+            self_id,
+            HeadlessTransport::Tcp { addr },
+        )
+        .await
     }
 
-    pub fn local_creds(&self) -> LocalCredentialStore {
-        self.local_creds.clone()
+    /// From-parts wrapper for **TCP** on an ephemeral loopback port.
+    pub async fn new_tcp_ephemeral_from_parts(
+        db: Arc<redb::Database>,
+        noise_keys: Arc<NoiseKeys>,
+        signing_key: ed25519_dalek::SigningKey,
+        self_id: Uuid,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let addr = pick_loopback_ephemeral()?;
+        Self::new_with(
+            addr.clone(),
+            db,
+            noise_keys,
+            signing_key,
+            self_id,
+            HeadlessTransport::Tcp { addr },
+        )
+        .await
     }
 
-    /// Convenience for tests: the inproc anchor URI for this node.
-    pub fn inproc_anchor_uri(&self) -> String {
-        format!("inproc://{}", self.id)
+    /// Quick-start **in-process** node using a temp DB and deterministic test keys.
+    /// Great for simple tests. For full control, prefer the *_from_parts variants.
+    pub async fn new_inproc() -> io::Result<Self> {
+        let (db, noise_keys, signing_key, id, tmp) = self_contained_state()?;
+        let mut node = Self::new_inproc_from_parts(db, noise_keys, signing_key, id)
+            .await
+            .map_err(to_io)?;
+        node._tmp_dir = Some(tmp);
+        Ok(node)
     }
+
+    /// Quick-start **TCP** node bound at an ephemeral 127.0.0.1 port.
+    pub async fn new_tcp_ephemeral() -> io::Result<Self> {
+        let (db, noise_keys, signing_key, id, tmp) = self_contained_state()?;
+        let mut node = Self::new_tcp_ephemeral_from_parts(db, noise_keys, signing_key, id)
+            .await
+            .map_err(to_io)?;
+        node._tmp_dir = Some(tmp);
+        Ok(node)
+    }
+
+    /// Quick-start **TCP** node bound at `addr` (e.g., "127.0.0.1:6578").
+    pub async fn new_tcp_at(addr: impl Into<String>) -> io::Result<Self> {
+        let (db, noise_keys, signing_key, id, tmp) = self_contained_state()?;
+        let mut node = Self::new_tcp_at_from_parts(addr.into(), db, noise_keys, signing_key, id)
+            .await
+            .map_err(to_io)?;
+        node._tmp_dir = Some(tmp);
+        Ok(node)
+    }
+
+    /// Address string tests can hand to `Topology.join` (inproc or tcp).
+    pub fn client_addr(&self) -> String {
+        match &self.transport {
+            HeadlessTransport::Inproc => format!("inproc://{}", self.id),
+            HeadlessTransport::Tcp { addr } => addr.clone(),
+        }
+    }
+
+    /// Call real Topology.join on **this** node to join an anchor address.
+    pub async fn join_anchor_addr(
+        &self,
+        anchor_addr: &str,
+        join_token: &str,
+    ) -> Result<(), capnp::Error> {
+        let topo = self.topology_client.clone();
+        let mut req = topo.join_request();
+
+        let mut msg = capnp::message::Builder::new_default();
+        {
+            let mut link = msg.init_root::<crate::topology_capnp::join_request::Builder>();
+            link.set_anchor(anchor_addr);
+            link.set_join_token(join_token);
+        }
+        req.get().set_link(
+            msg.get_root::<crate::topology_capnp::join_request::Builder>()?
+                .into_reader(),
+        );
+
+        let resp = req.send().promise.await?;
+        let jr = resp.get()?.get_resp()?;
+        let err = jr.get_error()?.to_string()?;
+        if !err.is_empty() {
+            return Err(capnp::Error::failed(err));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HeadlessNode {
+    fn drop(&mut self) {
+        if let Some(dir) = self._tmp_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e.to_string())
+}
+
+fn pick_loopback_ephemeral() -> io::Result<String> {
+    let l = TcpListener::bind(("127.0.0.1", 0))?;
+    let addr = l.local_addr()?;
+    drop(l);
+    Ok(addr.to_string())
+}
+
+/// Create an isolated temp dir with a redb DB and deterministic test keys.
+/// (Deterministic keys are fine for tests, production still uses real keys.)
+fn self_contained_state() -> io::Result<(
+    Arc<redb::Database>,
+    Arc<NoiseKeys>,
+    ed25519_dalek::SigningKey,
+    Uuid,
+    PathBuf,
+)> {
+    let tmp = std::env::temp_dir().join(format!("mantissa-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp)?;
+
+    let db_path = tmp.join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).map_err(to_io)?);
+
+    let noise = Arc::new(NoiseKeys::from_private_bytes([0x11; 32]));
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[0xA5; 32]);
+    let id = Uuid::new_v4();
+
+    Ok((db, noise, signing, id, tmp))
 }

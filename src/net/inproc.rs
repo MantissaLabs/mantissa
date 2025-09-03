@@ -1,5 +1,3 @@
-#![cfg(any(test, feature = "testkit"))]
-
 use std::{cell::RefCell, collections::HashMap};
 
 use crate::includes::server_capnp;

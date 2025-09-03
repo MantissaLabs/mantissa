@@ -35,6 +35,7 @@ use tokio::task::LocalSet;
 use crate::{
     cli::{Command, MantissaCli, NodesCommand, TasksCommand, TokenCommand},
     client::config::ClientConfig,
+    server::server::RunMode,
 };
 
 #[tokio::main]
@@ -53,7 +54,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match args.cmd {
         Command::Init(_init) => {
-            local.run_until(server::start(listen)).await?;
+            local
+                .run_until(server::start(listen, RunMode::Blocking, true))
+                .await?;
         }
 
         Command::Info(_info) => {

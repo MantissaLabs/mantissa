@@ -30,8 +30,14 @@ pub mod headless;
 pub mod server;
 pub mod session;
 
-/// Start the server and sub-systems (topology, gossip, sync, unix/tcp listeners).
-pub async fn start(listen_addr: String) -> Result<(), Box<dyn std::error::Error>> {
+/// Starts the daemon and its subsystems, picking a run mode and whether to enable unix socket or not.
+/// - `RunMode::Blocking` will not return until listeners stop.
+/// - `RunMode::NonBlocking` returns immediately with join handles inside `Ok(Some(...))`.
+pub async fn start(
+    listen_addr: String,
+    mode: server::RunMode,
+    enable_unix_socket: bool,
+) -> Result<Option<server::RunHandles>, Box<dyn std::error::Error>> {
     // Build low-level context (keys, db, node)
     let ctx = Bootstrap::init_base(listen_addr).await?;
 
@@ -43,14 +49,13 @@ pub async fn start(listen_addr: String) -> Result<(), Box<dyn std::error::Error>
 
     // Wire up ServerImpl and spawn listeners
     let server = Bootstrap::build_server(&ctx, &stores, &comps).build();
-
     Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
 
     // Fire background tasks: gossip loop, topology loop, best-effort reconnect
     Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps).await;
 
-    // Run the daemon (tcp + optional unix)
-    server.start_daemon(true).await
+    // Run the daemon with chosen mode (tcp + optional unix)
+    server.start_with_mode(mode, enable_unix_socket).await
 }
 
 pub(crate) struct Bootstrap {
