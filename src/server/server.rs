@@ -173,52 +173,6 @@ impl server::Server for ServerImpl {
                 ClusterSessionImpl::new(topology_client, sync_client, gossip_client, node_client);
             let session_client = capnp_rpc::new_client(session);
 
-            // Get a reciprocal ticket from joining node. Happens in a retry loop because the joining
-            // node must sync before it could issue a ticket for our Node ID.
-            {
-                let handle_for_retry = handle.clone();
-                let local_sessions_for_retry = local_sessions.clone();
-                let anchor_id = self_id;
-                let joiner_id_for_store = joiner_id;
-
-                tokio::task::spawn_local(async move {
-                    use tokio::time::{sleep, Duration};
-                    let mut delay_ms = 200u64;
-                    for _ in 0..8 {
-                        let mut req = handle_for_retry.issue_ticket_request();
-                        set_node_id(req.get().reborrow().init_peer_id(), &anchor_id);
-                        match req.send().promise.await {
-                            Ok(resp) => match resp.get() {
-                                Ok(r) => match r.get_ticket() {
-                                    Ok(ticket_from_joiner) => {
-                                        if let Err(e) = local_sessions_for_retry
-                                            .put(joiner_id_for_store, ticket_from_joiner)
-                                        {
-                                            eprintln!(
-                                                "warn: storing reciprocal ticket failed: {e}"
-                                            );
-                                        }
-                                        // success; stop retrying
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        warn!(target: "server", "reciprocal ticket read failed: {e}")
-                                    }
-                                },
-                                Err(e) => {
-                                    warn!(target: "server",  "reciprocal ticket response failed: {e}")
-                                }
-                            },
-                            Err(e) => {
-                                warn!(target: "server", "reciprocal ticket request failed (likely not yet registered): {e}")
-                            }
-                        }
-                        sleep(Duration::from_millis(delay_ms)).await;
-                        delay_ms = (delay_ms * 2).min(5_000);
-                    }
-                });
-            }
-
             // Ensure the periodic sync loop is running on this node as soon as we have a cluster
             // at least two nodes.
             {
@@ -325,33 +279,6 @@ impl server::Server for ServerImpl {
             out.set_session(session_client);
             out.set_ticket(&ticket);
             crate::node::id::set_node_id(out.reborrow().init_peer_id(), &self_id);
-            Ok(())
-        })
-    }
-
-    fn issue_ticket(
-        &mut self,
-        params: server::IssueTicketParams,
-        mut results: server::IssueTicketResults,
-    ) -> Promise<(), capnp::Error> {
-        let session_store = self.session_store.as_ref().unwrap().clone();
-        let topology = self.topology.as_ref().unwrap().clone();
-
-        Promise::from_future(async move {
-            let peer_id = crate::node::id::read_node_id(params.get()?.get_peer_id()?)?;
-
-            if !topology
-                .peer_exists(peer_id)
-                .map_err(|e| capnp::Error::failed(e.to_string()))?
-            {
-                return Err(capnp::Error::failed("peer not registered".to_string()));
-            }
-
-            let ticket = session_store
-                .issue_ticket(peer_id)
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-            results.get().set_ticket(&ticket);
             Ok(())
         })
     }

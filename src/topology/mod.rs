@@ -771,7 +771,7 @@ impl topology::Server for Topology {
             let peer_id = read_node_id(register.get()?.get_peer_id()?)?;
             let cred_blob = register.get()?.get_credential()?;
 
-            // Pre-register the peer to be able to issue the ticket.
+            // Pre-register the peer to be able to issue tickets/credentials for the anchor.
             // This ensures we don't have to wait until receiving the full node information
             // to be able to issue a reciprocal ticket.
             {

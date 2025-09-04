@@ -17,10 +17,6 @@ interface Server {
   getWithCredential @2 (credential :Data) -> (session :ClusterSession, ticket :Data, peerId :Node.NodeId);
   # Bootstrap to (re)open a session on this node using a short-lived credential.
   # (Cluster-wide credentials can be enabled later; for now this node verifies.)
-
-  issueTicket @3 (peerId :Node.NodeId) -> (ticket :Data);
-  # Ask this server to issue a session ticket for `peerId`.
-  # Used by the *other* side during registerNode to complete mutual trust.
 }
 
 interface ClusterSession {
