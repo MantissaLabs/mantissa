@@ -771,6 +771,21 @@ impl topology::Server for Topology {
             let peer_id = read_node_id(register.get()?.get_peer_id()?)?;
             let cred_blob = register.get()?.get_credential()?;
 
+            // Pre-register the peer to be able to issue the ticket.
+            // This ensures we don't have to wait until receiving the full node information
+            // to be able to issue a reciprocal ticket.
+            {
+                let v = crate::topology::peers::PeerValue {
+                    address: anchor.clone(),
+                    hostname: String::new(),
+                    noise_static_pub: [0u8; 32],
+                    signing_pub: [0u8; 32],
+                };
+                if let Err(e) = peers.upsert(&UuidKey::from(peer_id), v).await {
+                    log::warn!(target: "topology", "join: pre-upsert of anchor placeholder failed: {e}");
+                }
+            }
+
             // Persist the local session for later resume if node restarts.
             local_sessions
                 .put(peer_id, ticket)
