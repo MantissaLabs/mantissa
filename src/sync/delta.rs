@@ -83,7 +83,6 @@ pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
         let local_root = peers.root_hex().await;
 
         if remote_root == local_root {
-            debug!(target: "sync", "roots equal, skipping delta");
             return Ok(());
         }
 
