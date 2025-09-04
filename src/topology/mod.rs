@@ -698,20 +698,18 @@ impl Topology {
         }
     }
 
-    /// Return the expected ed25519 verifying key (32 bytes) for a registered peer,
-    /// as learned from the CRDT/MST peers store. `Ok(None)` if not found.
-    pub fn expected_signing_key_for(&self, id: uuid::Uuid) -> std::io::Result<Option<[u8; 32]>> {
-        let (actives, _tombs) = self.peers.load_all()?;
-        for (k, snap) in actives {
-            if k.to_uuid() == id {
-                if let Some(val) = snap.as_slice().last().cloned() {
-                    return Ok(Some(val.signing_pub));
-                } else {
-                    return Ok(None);
-                }
-            }
-        }
-        Ok(None)
+    /// Return the stored ed25519 verifying key for `peer_id` if we have it locally.
+    /// This is used to verify self-signed short-lived credentials in getWithCredential.
+    pub fn signing_vk_for(&self, peer_id: Uuid) -> Option<VerifyingKey> {
+        let (actives, _tombs) = self.peers.load_all().ok()?;
+
+        // Find the MVReg snapshot for this UUID and take the latest value.
+        let snap = actives.into_iter().find(|(k, _)| k.to_uuid() == peer_id)?.1;
+        let last = snap.as_slice().last()?.clone();
+
+        // Convert the stored 32-byte pk -> ed25519_dalek::VerifyingKey
+        let arr: [u8; 32] = last.signing_pub.as_slice().try_into().ok()?;
+        VerifyingKey::from_bytes(&arr).ok()
     }
 }
 
@@ -787,6 +785,10 @@ impl topology::Server for Topology {
             let peer_id = read_node_id(register.get()?.get_peer_id()?)?;
             let cred_blob = register.get()?.get_credential()?;
 
+            let cred = crate::server::credential::ClusterCredential::from_bytes_verified(cred_blob)
+                .map_err(|e| capnp::Error::failed(format!("credential parse: {e}")))?;
+            let anchor_vk = cred.issuer;
+
             // Pre-register the peer to be able to issue tickets/credentials for the anchor.
             // This ensures we don't have to wait until receiving the full node information
             // to be able to issue a reciprocal ticket.
@@ -795,7 +797,7 @@ impl topology::Server for Topology {
                     address: anchor.clone(),
                     hostname: String::new(),
                     noise_static_pub: [0u8; 32],
-                    signing_pub: [0u8; 32],
+                    signing_pub: anchor_vk.to_bytes(),
                 };
                 if let Err(e) = peers.upsert(&UuidKey::from(peer_id), v).await {
                     log::warn!(target: "topology", "join: pre-upsert of anchor placeholder failed: {e}");

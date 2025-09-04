@@ -261,15 +261,18 @@ impl server::Server for ServerImpl {
                 ));
             }
 
-            // Issuer key must match what we know for this subject
-            let expected_vk = topology
-                .expected_signing_key_for(cred.subject)
-                .map_err(|e| capnp::Error::failed(e.to_string()))?
-                .ok_or_else(|| capnp::Error::failed("peer missing signing key".to_string()))?;
-
-            if expected_vk != cred.issuer.to_bytes() {
+            if let Some(expected_vk) = topology.signing_vk_for(cred.subject) {
+                if expected_vk != cred.issuer {
+                    debug!(target: "server", subject=%cred.subject, "issuer mismatch for");
+                    return Err(capnp::Error::failed(
+                        "issuer mismatch for subject".to_string(),
+                    ));
+                }
+            } else {
+                // Likely not yet synced, reject for now and the next sync tick will succeed.
+                debug!(target: "server", subject=%cred.subject, "issuer unknown (not yet synced)");
                 return Err(capnp::Error::failed(
-                    "issuer mismatch for subject".to_string(),
+                    "issuer unknown (not yet synced)".to_string(),
                 ));
             }
 
