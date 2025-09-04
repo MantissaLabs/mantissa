@@ -102,12 +102,12 @@ provision:
       if ! grep -q 'MANTISSA_BIN=' ~/.bashrc; then
         echo 'export MANTISSA_BIN="/mantissa/target/debug"' >> ~/.bashrc
         echo 'export PATH="$PATH:$MANTISSA_BIN"' >> ~/.bashrc
-        echo "alias mts='mantissa'" >> ~/.bashrc
+        echo "alias mts='RUST_LOG=debug mantissa'" >> ~/.bashrc
       fi
       if ! grep -q 'MANTISSA_BIN=' ~/.profile; then
         echo 'export MANTISSA_BIN="/mantissa/target/debug"' >> ~/.profile
         echo 'export PATH="$PATH:$MANTISSA_BIN"' >> ~/.profile
-        echo "alias mts='mantissa'" >> ~/.profile
+        echo "alias mts='RUST_LOG=debug mantissa'" >> ~/.profile
       fi
 PROVISION_1
     # Separate step to set hostname with ${NAME} (needs host-side expansion)

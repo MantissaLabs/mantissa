@@ -9,6 +9,7 @@ use crate::{
     sync_capnp::{sync, Domain},
 };
 use capnp::capability::Promise;
+use tracing::debug;
 
 pub mod delta;
 
@@ -56,7 +57,7 @@ impl sync::Server for SyncService {
 
             match p.get_domain()? {
                 Domain::Peers => {
-                    println!("getRanges: received");
+                    debug!("getRanges: received");
                     peers.debug_dump_root("server.before.get_ranges").await;
                     peers.debug_dump_ranges("server.before.get_ranges", 5).await;
 
@@ -81,7 +82,7 @@ impl sync::Server for SyncService {
         params: sync::OpenDeltaParams,
         _results: sync::OpenDeltaResults,
     ) -> Promise<(), capnp::Error> {
-        println!("open_delta: received");
+        debug!("open_delta: received");
 
         Promise::from_future({
             let peers = self.peers.clone();
@@ -98,17 +99,17 @@ impl sync::Server for SyncService {
                     }
                 }
 
-                println!("open_delta: received");
+                debug!(target: "delta", "open_delta: received");
                 peers.debug_dump_root("server.before.open_delta").await;
                 peers.debug_dump_ranges("server.before.open_delta", 5).await;
 
                 // Client sends the delta ranges it needs, not its full summary.
                 let want = owned_ranges_from_capnp::<UuidKey>(p.get_want()?)?;
-                println!("open_delta: want ranges = {}", want.len());
+                debug!(target: "delta", "open_delta: want ranges = {}", want.len());
 
                 // If there's no delta to send, end immediately.
                 if want.is_empty() {
-                    println!("open_delta: no ranges requested; exporting regs=0, tombs=0");
+                    debug!(target: "delta", "open_delta: no ranges requested; exporting regs=0, tombs=0");
                     p.get_sink()?.end_request().send().promise.await?;
                     return Ok(());
                 }
@@ -117,7 +118,8 @@ impl sync::Server for SyncService {
                     .export_delta_for_owned(&want)
                     .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-                println!(
+                debug!(
+                    target: "delta",
                     "open_delta: exporting regs={}, tombs={}",
                     regs.len(),
                     tombs.len()

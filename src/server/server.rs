@@ -16,6 +16,7 @@ use capnp::capability::Promise;
 use ed25519_dalek::SigningKey;
 use std::rc::Rc;
 use std::sync::Arc;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::gossip_capnp::gossip::Client as GossipClient;
@@ -190,17 +191,27 @@ impl server::Server for ServerImpl {
                             Ok(resp) => match resp.get() {
                                 Ok(r) => match r.get_ticket() {
                                     Ok(ticket_from_joiner) => {
-                                        if let Err(e) = local_sessions_for_retry.put(joiner_id_for_store, ticket_from_joiner) {
-                                            eprintln!("warn: storing reciprocal ticket failed: {e}");
+                                        if let Err(e) = local_sessions_for_retry
+                                            .put(joiner_id_for_store, ticket_from_joiner)
+                                        {
+                                            eprintln!(
+                                                "warn: storing reciprocal ticket failed: {e}"
+                                            );
                                         }
                                         // success; stop retrying
                                         break;
                                     }
-                                    Err(e) => eprintln!("warn: reciprocal ticket read failed: {e}"),
+                                    Err(e) => {
+                                        warn!(target: "server", "reciprocal ticket read failed: {e}")
+                                    }
                                 },
-                                Err(e) => eprintln!("warn: reciprocal ticket response failed: {e}"),
+                                Err(e) => {
+                                    warn!(target: "server",  "reciprocal ticket response failed: {e}")
+                                }
                             },
-                            Err(e) => eprintln!("warn: reciprocal ticket request failed (likely not yet registered): {e}"),
+                            Err(e) => {
+                                warn!(target: "server", "reciprocal ticket request failed (likely not yet registered): {e}")
+                            }
                         }
                         sleep(Duration::from_millis(delay_ms)).await;
                         delay_ms = (delay_ms * 2).min(5_000);
@@ -417,7 +428,7 @@ impl ServerImpl {
                 if let Err(e) =
                     crate::net::unix_socket::start_unix_socket_server_auto(local_session).await
                 {
-                    eprintln!("UnixSocket listener error: {e}");
+                    error!(target: "server", "UnixSocket listener error: {e}");
                 }
             }))
         } else {

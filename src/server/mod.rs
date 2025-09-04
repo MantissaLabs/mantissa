@@ -21,6 +21,7 @@ use crate::topology_capnp::topology::Client as TopologyClient;
 use async_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;
 use std::sync::{Arc, Mutex};
+use tracing::error;
 use uuid::Uuid;
 
 pub mod auth;
@@ -166,11 +167,8 @@ impl Bootstrap {
         let token_store = TokenStore::new(None);
         token_store.generate().await;
 
-        // Optional debug dump
-        peers.debug_dump_root("startup").await;
-        peers.debug_dump_ranges("startup", 5).await;
-        peers.debug_dump_leaf_bytes_from_store();
-        peers.debug_dump_mst_ranges();
+        // Debug dump mst root for peers store.
+        peers.debug_dump_root("peers").await;
 
         Ok(Stores {
             peers,
@@ -304,7 +302,7 @@ impl Bootstrap {
                 .connect_known_peers(Some(&signing_for_boot))
                 .await
             {
-                eprintln!("[connect] startup connect failed: {e}");
+                error!(target: "server", "Startup connect failed: {e}");
             }
         });
     }

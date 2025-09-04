@@ -12,6 +12,7 @@ use std::hash::Hasher;
 use std::marker::PhantomData;
 use std::{hash::Hash, io, sync::Arc};
 use tokio::sync::RwLock;
+use tracing::debug;
 
 /// Leaf value for MST.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -466,19 +467,22 @@ where
 
     pub async fn debug_dump_root(&self, label: &str) {
         let hex = self.root_hex().await;
-        println!("[MST] {label}: root={hex}");
+        debug!(target: "merkle search tree", "{label}: root={hex}");
     }
 
     pub async fn debug_dump_ranges(&self, label: &str, limit: usize) {
         let t = self.mst.write().await;
         let prs = t.serialise_page_ranges().unwrap_or_default();
-        println!("[MST] {label}: {} ranges", prs.len());
+
+        debug!(target: "merkle search tree", "{label}: {} ranges", prs.len());
+
         for (i, pr) in prs.iter().take(limit).enumerate() {
             // public accessors vary by version; adapt if needed
             let s = C::key_to_bytes(pr.start());
             let e = C::key_to_bytes(pr.end());
             let h = pr.hash().as_ref();
-            println!(
+            debug!(
+                target: "merkle search tree",
                 "  [{:03}] start={:02X?} end={:02X?} hash={:02X?}",
                 i,
                 &s[..std::cmp::min(6, s.len())],

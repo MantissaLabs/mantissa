@@ -8,6 +8,7 @@ use std::{
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::compat::TokioAsyncReadCompatExt;
+use tracing::info;
 
 pub fn candidate_unix_socket_paths() -> Vec<PathBuf> {
     let mut v = Vec::new();
@@ -51,7 +52,7 @@ pub async fn start_unix_socket_server_auto(
         match UnixListener::bind(&path) {
             Ok(listener) => {
                 let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-                eprintln!("Local UnixSocket listening at {}", path.display());
+                info!(target: "server", "Local UnixSocket listening at {}", path.display());
                 tokio::task::spawn_local(accept_loop(listener, server_handle.clone()));
                 return Ok(path);
             }

@@ -2,6 +2,7 @@ use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::AsyncReadExt;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tracing::info;
 
 /// Accept-loop used by both blocking and non-blocking variants.
 async fn accept_loop(
@@ -60,7 +61,7 @@ pub async fn start_tcp_secure_listener(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&listen_addr).await?;
     let bound = listener.local_addr()?;
-    println!("Server listening (secure) on {}", bound);
+    info!(target: "server", "Server listening (secure) on {}", bound);
     accept_loop(listener, server_handle, noise_keys).await;
     Ok(())
 }
@@ -83,7 +84,7 @@ pub async fn start_tcp_secure_listener_nonblocking_with_ready(
 > {
     let listener = TcpListener::bind(&listen_addr).await?;
     let bound = listener.local_addr()?;
-    println!("Server listening (secure) on {}", bound);
+    info!(target: "server", "Server listening (secure) on {}", bound);
 
     let (tx, rx) = tokio::sync::oneshot::channel();
 

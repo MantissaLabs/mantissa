@@ -40,9 +40,9 @@ use crate::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    log::set_logger(&logger::LOGGER)
-        .map(|()| log::set_max_level(log::LevelFilter::Info))
-        .unwrap();
+    if let Err(e) = mantissa::logger::init() {
+        eprintln!("logger init failed: {e}");
+    }
 
     let local = LocalSet::new();
     let args = MantissaCli::parse();

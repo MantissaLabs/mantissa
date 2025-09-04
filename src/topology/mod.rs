@@ -30,6 +30,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::{fmt, io};
 use tokio::sync::RwLock;
+use tracing::{error, info};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
@@ -447,7 +448,7 @@ impl Topology {
             let server_client: server::Client = match connection::get_client_secure(&addr).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("[connect] dial {addr} failed: {e}");
+                    error!(target: "connect", "dial {addr} failed: {e}");
                     continue;
                 }
             };
@@ -463,11 +464,11 @@ impl Topology {
                             have_session = Some(sess);
                         }
                         Err(e) => {
-                            eprintln!("[connect] getSession ok but no session: {e}");
+                            error!(target: "connect", "getSession ok but no session: {e}");
                         }
                     },
                     Err(e) => {
-                        eprintln!("[connect] getSession to {addr} failed: {e}");
+                        error!(target: "connect", "getSession to {addr} failed: {e}");
                     }
                 }
             }
@@ -484,7 +485,7 @@ impl Topology {
                     let cred_bytes = match cred.to_bytes() {
                         Ok(b) => b,
                         Err(e) => {
-                            eprintln!("[connect] cred serialize failed for {addr}: {e}");
+                            error!(target: "connect", "cred serialize failed for {addr}: {e}");
                             continue;
                         }
                     };
@@ -499,30 +500,30 @@ impl Topology {
                                     have_session = Some(sess);
                                 }
                                 Err(e) => {
-                                    eprintln!("[connect] getWithCredential ok but no session: {e}");
+                                    error!(target: "connect", "getWithCredential ok but no session: {e}");
                                     continue;
                                 }
                             }
                             // Persist returned ticket for future fast resume
                             let ticket = resp.get()?.get_ticket()?;
                             if let Err(e) = self.local_sessions.put(peer_id, ticket) {
-                                eprintln!("[connect] failed to persist ticket from {addr}: {e}");
+                                error!(target: "connect", "failed to persist ticket from {addr}: {e}");
                             }
                         }
                         Err(e) => {
-                            println!("[connect] getWithCredential to {addr} failed: {e}");
+                            error!(target: "connect", "getWithCredential to {addr} failed: {e}");
                             continue;
                         }
                     }
                 } else {
                     // No signing key provided; can’t cred-bootstrap. Skip.
-                    eprintln!("[connect] no ticket and no signing key; skipping {}", addr);
+                    error!(target: "connect", "no ticket and no signing key; skipping {addr}");
                 }
             }
 
             // 7) if we have a session, cache the `Server` handle and (optionally) do a quick ping
             if let Some(session) = have_session {
-                println!("[connect] connected to {addr}");
+                info!(target: "connect", "connected to {addr}");
 
                 // cache the Server client for this peer
                 self.handles
@@ -554,7 +555,7 @@ impl Topology {
         let peers_snapshot = match self.peers.load_all() {
             Ok((actives, _)) => actives,
             Err(e) => {
-                eprintln!("[sync-loop] load_all failed: {e}");
+                error!(target: "sync", "load all peers failed: {e}");
                 return;
             }
         };
@@ -576,7 +577,7 @@ impl Topology {
                 match crate::client::connection::get_client_secure(&addr).await {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("[sync-loop] connect {addr} failed: {e}");
+                        error!(target: "sync", "connect {addr} failed: {e}");
                         continue;
                     }
                 };
@@ -603,7 +604,7 @@ impl Topology {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[sync-loop] get_sync failed: {e}");
+                    error!(target: "sync", "get_sync failed: {e}");
                     continue;
                 }
             };
@@ -640,12 +641,12 @@ impl Topology {
             Ok(resp) => match resp.get() {
                 Ok(r) => r.get_session().ok(),
                 Err(e) => {
-                    eprintln!("[sync-loop] get_session response error: {e}");
+                    error!(target: "sync", "get_session response error: {e}");
                     None
                 }
             },
             Err(e) => {
-                eprintln!("[sync-loop] get_session failed: {e}");
+                error!(target: "sync", "get_session failed: {e}");
                 None
             }
         }
@@ -664,7 +665,7 @@ impl Topology {
             match cred.to_bytes() {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("[sync-loop] credential serialize failed: {e}");
+                    error!(target: "sync", "credential serialize failed: {e}");
                     return None;
                 }
             }
@@ -678,20 +679,20 @@ impl Topology {
                 let r = match resp.get() {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("[sync-loop] getWithCredential response error: {e}");
+                        error!(target: "sync", "getWithCredential response error: {e}");
                         return None;
                     }
                 };
 
                 // Persist returned ticket for future fast path
                 if let Err(e) = self.local_sessions.put(peer_id, r.get_ticket().ok()?) {
-                    eprintln!("[sync-loop] ticket persist failed for {peer_id}: {e}");
+                    error!(target: "sync", "ticket persist failed for {peer_id}: {e}");
                 }
 
                 r.get_session().ok()
             }
             Err(e) => {
-                eprintln!("[sync-loop] getWithCredential failed: {e}");
+                error!(target: "sync", "getWithCredential failed: {e}");
                 None
             }
         }
@@ -834,7 +835,7 @@ impl topology::Server for Topology {
         _params: topology::ListParams,
         mut results: topology::ListResults,
     ) -> Promise<(), Error> {
-        println!("Listing nodes...");
+        info!(target: "topology", "Listing nodes");
 
         let peers = self.peers.clone();
 
@@ -857,7 +858,7 @@ impl topology::Server for Topology {
                     node.set_public_key(&val.noise_static_pub);
                 }
 
-                // TODO real health; placeholder:
+                // TODO: real health; placeholder:
                 node.set_health(NodeStatus::Alive);
             }
 

@@ -10,6 +10,7 @@ use crate::{
     sync_capnp::delta_sink,
 };
 use capnp::capability::Promise;
+use tracing::debug;
 
 pub struct DeltaSinkImpl {
     peers: PeersStore,
@@ -50,15 +51,17 @@ impl delta_sink::Server for DeltaSinkImpl {
         _params: delta_sink::EndParams,
         _results: delta_sink::EndResults,
     ) -> Promise<(), capnp::Error> {
-        log::debug!("delta stream end: rebuilding MST");
-        println!("delta stream end: rebuilding MST");
+        debug!(target: "delta", "delta stream end: rebuilding MST");
+
         let peers = self.peers.clone();
         Promise::from_future(async move {
             peers
                 .finalize_after_stream()
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            println!("finalized after stream");
+
+            debug!(target: "delta",  "finalized after stream");
+
             Ok(())
         })
     }
@@ -80,7 +83,7 @@ pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
         let local_root = peers.root_hex().await;
 
         if remote_root == local_root {
-            println!("sync: roots equal; skipping delta");
+            debug!(target: "sync", "roots equal, skipping delta");
             return Ok(());
         }
 
@@ -96,12 +99,11 @@ pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
         // Compute want
         let want_owned = compute_want_from_owned(&remote_owned, &local_owned);
         if want_owned.is_empty() {
-            println!("sync: want empty; nothing to fetch");
+            debug!(target: "sync", "want empty ranges, nothing to fetch");
             return Ok(());
         }
 
-        // REMOVE: dump roots/ranges for debugging
-        println!("client: want ranges = {}", want_owned.len());
+        debug!(target: "sync", "want ranges = {}", want_owned.len());
         peers
             .debug_dump_root("client.local.before_open_delta")
             .await;
@@ -120,9 +122,10 @@ pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
             p.set_sink(sink_client);
         }
 
-        println!("sync: opening delta stream...");
+        debug!(target: "sync", "opening delta stream...");
         od.send().promise.await?;
-        println!("sync: delta stream finished");
+        debug!(target: "sync", "delta stream finished");
+
         Ok(())
     }
     .await;
