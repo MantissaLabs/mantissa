@@ -16,7 +16,7 @@ use capnp::capability::Promise;
 use ed25519_dalek::SigningKey;
 use std::rc::Rc;
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::gossip_capnp::gossip::Client as GossipClient;
@@ -246,12 +246,12 @@ impl server::Server for ServerImpl {
         let self_id = self.id;
 
         Promise::from_future(async move {
-            // 1) parse+verify the signed blob
+            // Parse + Verify the signed blob
             let cred_bytes = params.get()?.get_credential()?;
             let cred =
                 ClusterCredential::from_bytes_verified(cred_bytes).map_err(capnp::Error::failed)?;
 
-            // 2) must already know the subject as a registered peer
+            // We must already know the subject as a registered peer
             if !topology
                 .peer_exists(cred.subject)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?
@@ -261,12 +261,26 @@ impl server::Server for ServerImpl {
                 ));
             }
 
-            // 3) mint a fresh ticket for the subject
+            // Issuer key must match what we know for this subject
+            let expected_vk = topology
+                .expected_signing_key_for(cred.subject)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?
+                .ok_or_else(|| capnp::Error::failed("peer missing signing key".to_string()))?;
+
+            if expected_vk != cred.issuer.to_bytes() {
+                return Err(capnp::Error::failed(
+                    "issuer mismatch for subject".to_string(),
+                ));
+            }
+
+            debug!(target: "server", "Peer {} authenticated", cred.subject);
+
+            // Mint a fresh ticket for the subject
             let ticket = session_store
                 .issue_ticket(cred.subject)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-            // 4) return session + ticket + our peer id (so caller can persist)
+            // Return session + ticket + our peer id (so caller can persist)
             let session = crate::server::session::ClusterSessionImpl::new(
                 topology_client,
                 sync_client,

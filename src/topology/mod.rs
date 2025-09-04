@@ -697,6 +697,22 @@ impl Topology {
             }
         }
     }
+
+    /// Return the expected ed25519 verifying key (32 bytes) for a registered peer,
+    /// as learned from the CRDT/MST peers store. `Ok(None)` if not found.
+    pub fn expected_signing_key_for(&self, id: uuid::Uuid) -> std::io::Result<Option<[u8; 32]>> {
+        let (actives, _tombs) = self.peers.load_all()?;
+        for (k, snap) in actives {
+            if k.to_uuid() == id {
+                if let Some(val) = snap.as_slice().last().cloned() {
+                    return Ok(Some(val.signing_pub));
+                } else {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl topology::Server for Topology {
