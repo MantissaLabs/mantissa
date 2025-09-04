@@ -40,6 +40,9 @@ pub struct HeadlessNode {
     // Transport housekeeping
     transport: HeadlessTransport,
 
+    // Used to control listeners and stop/start.
+    server_impl: ServerImpl,
+
     // Runtime handles for TCP
     handles: Option<RunHandles>,
     _tmp_dir: Option<PathBuf>, // when using convenience constructors
@@ -84,6 +87,8 @@ impl HeadlessNode {
         let server_client: server_capnp::server::Client =
             capnp_rpc::new_client(server_impl.clone());
 
+        let stored_server = server_impl.clone();
+
         // Transport wiring + readiness
         let (handles, effective_transport) = match &transport {
             HeadlessTransport::Inproc => {
@@ -124,6 +129,7 @@ impl HeadlessNode {
             _signing: signing_key,
             transport: effective_transport,
             handles,
+            server_impl: stored_server,
             _tmp_dir: None,
         })
     }
@@ -259,6 +265,54 @@ impl HeadlessNode {
             return Err(capnp::Error::failed(err));
         }
         Ok(())
+    }
+
+    /// Stop accepting new connections (simulate node down).
+    /// - Inproc: unregister from registry.
+    /// - TCP: abort the listener task.
+    pub async fn stop(&mut self) -> io::Result<()> {
+        match &self.transport {
+            HeadlessTransport::Inproc => {
+                #[cfg(any(test, feature = "testkit"))]
+                {
+                    crate::net::inproc::unregister(self.id.to_string());
+                }
+                Ok(())
+            }
+            HeadlessTransport::Tcp { .. } => {
+                if let Some(h) = self.handles.take() {
+                    h.abort();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Start (or restart) the listener.
+    /// - Inproc: re-register in registry.
+    /// - TCP: start listener again; update bound addr (ephemeral port).
+    pub async fn start(&mut self) -> io::Result<()> {
+        match &mut self.transport {
+            HeadlessTransport::Inproc => {
+                #[cfg(any(test, feature = "testkit"))]
+                {
+                    crate::net::inproc::register(self.id.to_string(), self.server_client.clone());
+                }
+                Ok(())
+            }
+            HeadlessTransport::Tcp { addr } => {
+                let server = self.server_impl.clone();
+                let mut h = server
+                    .start_with_mode(RunMode::NonBlocking, false)
+                    .await
+                    .map_err(to_io)?
+                    .expect("handles");
+                h.wait_ready().await;
+                *addr = h.addr().to_string();
+                self.handles = Some(h);
+                Ok(())
+            }
+        }
     }
 }
 

@@ -15,6 +15,12 @@ pub fn register(name: impl Into<String>, client: server_capnp::server::Client) {
     });
 }
 
+pub fn unregister(id: String) {
+    REGISTRY.with(|map| {
+        map.borrow_mut().remove(&id);
+    });
+}
+
 pub fn get(name: &str) -> Option<server_capnp::server::Client> {
     REGISTRY.with(|r| r.borrow().get(name).cloned())
 }

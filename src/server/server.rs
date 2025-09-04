@@ -16,7 +16,6 @@ use capnp::capability::Promise;
 use ed25519_dalek::SigningKey;
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::gossip_capnp::gossip::Client as GossipClient;
@@ -72,6 +71,14 @@ impl RunHandles {
 
     pub fn addr(&self) -> std::net::SocketAddr {
         self.tcp_addr
+    }
+
+    /// Abort listener tasks (used in tests for fast shutdown).
+    pub fn abort(self) {
+        if let Some(u) = self.unix_task {
+            u.abort();
+        }
+        self.tcp_task.abort();
     }
 }
 
