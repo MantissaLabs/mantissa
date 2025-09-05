@@ -2,8 +2,9 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+use mantissa::topology_capnp::topology;
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::LocalSet;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
@@ -109,5 +110,41 @@ impl TestNode {
     pub async fn assert_cluster_size(&self, expected: usize, msg: &str) {
         let ok = self.wait_for_cluster_size(expected, 5_000).await;
         assert!(ok, "{msg}");
+    }
+
+    /// Convenience accessor to the node's Topology client.
+    pub fn topology(&self) -> topology::Client {
+        self.node.topology_client.clone()
+    }
+
+    /// Current node's own `peers` root (hex), via local Sync.
+    pub async fn root_hex(&self) -> String {
+        self.node.local_peers_root_hex().await
+    }
+
+    /// Wait until two nodes report the same peers root hash (or timeout).
+    pub async fn wait_roots_equal(
+        a: &TestNode,
+        b: &TestNode,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let root_a = a.root_hex().await;
+            let root_b = b.root_hex().await;
+
+            if !root_a.is_empty() && !root_b.is_empty() && root_a == root_b {
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "roots diverged or empty after {:?}: root_a={:?} root_b={:?}",
+                    timeout, root_a, root_b
+                ));
+            }
+
+            sleep(Duration::from_millis(20)).await;
+        }
     }
 }

@@ -587,6 +587,7 @@ where
     }
 
     /// Print the exact byte stream we hash per leaf Entry (canonical).
+    #[allow(dead_code)]
     pub fn debug_dump_leaf_bytes_from_store(&self) -> io::Result<()> {
         let (actives, tombs) = self.load_all()?; // (Vec<(Key, Snapshot)>, Vec<(Key, u64)>)
 
@@ -620,6 +621,7 @@ where
     }
 
     /// Print MST page ranges + hashes (what serialise_page_ranges() sees).
+    #[allow(dead_code)]
     pub async fn debug_dump_mst_ranges(&self) -> io::Result<()> {
         let t = self.mst.write().await;
         let Some(ranges) = t.serialise_page_ranges() else {

@@ -4,9 +4,12 @@ use uuid::Uuid;
 use crate::{
     node,
     noise::NoiseKeys,
-    server::server::{RunHandles, RunMode, ServerImpl},
-    server::{Bootstrap, Components, Stores},
+    server::{
+        server::{RunHandles, RunMode, ServerImpl},
+        Bootstrap, Components, Stores,
+    },
     server_capnp,
+    sync_capnp::{self, Domain},
     topology_capnp::topology,
 };
 
@@ -26,6 +29,7 @@ pub struct HeadlessNode {
     // Handy handles for tests
     pub topology_client: topology::Client,
     pub server_client: server_capnp::server::Client,
+    pub sync_client: sync_capnp::sync::Client,
 
     // Stores (optional inspection in tests)
     pub peers: crate::store::peer_store::PeersStore,
@@ -87,17 +91,24 @@ impl HeadlessNode {
         let server_client: server_capnp::server::Client =
             capnp_rpc::new_client(server_impl.clone());
 
+        // Keep a clone to use start/stop server on.
         let stored_server = server_impl.clone();
 
-        // Transport wiring + readiness
+        // Transport wiring + readiness: compute the effective transport we report back
         let (handles, effective_transport) = match &transport {
             HeadlessTransport::Inproc => {
-                // register in-process so get_client_secure("inproc://<uuid>") resolves here
+                // Register in-process so get_client_secure("inproc://<uuid>") resolves here
                 crate::net::inproc::register(ctx.self_id.to_string(), server_client.clone());
+
+                // Ensure peers advertise the inproc URI in tests
+                comps
+                    .topology
+                    .set_advertise_override(Some(format!("inproc://{}", ctx.self_id)));
+
                 (None, HeadlessTransport::Inproc)
             }
             HeadlessTransport::Tcp { .. } => {
-                // start TCP listener non-blocking (Noise + Cap’n Proto)
+                // Start TCP listener non-blocking (Noise + Cap’n Proto)
                 let mut h = server_impl
                     .start_with_mode(RunMode::NonBlocking, false)
                     .await?
@@ -106,8 +117,10 @@ impl HeadlessNode {
                 // Wait until the listener is actually bound and ready.
                 h.wait_ready().await;
 
-                // Use the actual bound socket addr in our transport (ephemeral ports)
+                // Use the actual bound socket addr in our transport (handles ephemeral ports)
                 let bound = h.addr();
+                comps.topology.set_bound_addr(bound);
+
                 (
                     Some(h),
                     HeadlessTransport::Tcp {
@@ -120,7 +133,8 @@ impl HeadlessNode {
         Ok(Self {
             id: ctx.self_id,
             topology_client: comps.topology_client.clone(),
-            server_client,
+            server_client: server_client,
+            sync_client: comps.sync_client.clone(),
             peers: stores.peers.clone(),
             local_sessions: stores.local_sessions.clone(),
             local_creds: stores.local_creds.clone(),
@@ -265,6 +279,18 @@ impl HeadlessNode {
             return Err(capnp::Error::failed(err));
         }
         Ok(())
+    }
+
+    pub async fn local_peers_root_hex(&self) -> String {
+        let mut req = self.sync_client.get_root_request();
+        req.get().set_domain(Domain::Peers);
+        match req.send().promise.await {
+            Ok(resp) => match resp.get().and_then(|r| r.get_root_hex()) {
+                Ok(text) => text.to_string().unwrap_or_default(),
+                Err(_) => String::new(),
+            },
+            Err(_) => String::new(),
+        }
     }
 
     /// Stop accepting new connections (simulate node down).

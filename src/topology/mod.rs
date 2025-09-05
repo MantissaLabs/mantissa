@@ -27,7 +27,7 @@ use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 use tokio::sync::RwLock;
 use tracing::{error, info};
@@ -74,6 +74,9 @@ pub struct Topology {
     peer_id: PeerId,
 
     is_cluster_member: Rc<OnceCell<()>>,
+
+    bound_addr: Arc<Mutex<Option<SocketAddr>>>,
+    advertise_addr: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -150,7 +153,17 @@ impl Topology {
             local_sessions: sessions,
             local_credential_store: creds_store,
             is_cluster_member: Rc::new(OnceCell::new()),
+            bound_addr: Arc::new(Mutex::new(None)),
+            advertise_addr: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub fn set_bound_addr(&self, sa: SocketAddr) {
+        *self.bound_addr.lock().unwrap() = Some(sa);
+    }
+
+    pub fn set_advertise_override<S: Into<String>>(&self, s: Option<S>) {
+        *self.advertise_addr.lock().unwrap() = s.map(Into::into);
     }
 
     /// Sets the server handle to be served to other Peers so that they could connect
@@ -163,8 +176,8 @@ impl Topology {
 
         // Also ensure our own peer-entry exists in the store
         let peers = self.peers.clone();
-        // TODO: Treat potential error.
-        let advertise = self.get_advertise_address().unwrap();
+        // TODO: Handle errors properly
+        let advertise = self.compute_advertise_addr().unwrap();
         let host = self
             .node
             .system_info
@@ -204,20 +217,49 @@ impl Topology {
         Ok(())
     }
 
-    pub fn get_advertise_address(&self) -> io::Result<String> {
-        let port = extract_port(self.addr.as_str()).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("invalid listen addr '{}': {}", self.addr, e),
-            )
-        })?;
+    /// Computes what we publish in NodeInfo.addr / PeerValue.address.
+    /// Order of precedence:
+    /// 1) explicit override (e.g., "inproc://<uuid>" for inproc tests)
+    /// 2) actual bound addr (if known) — if ip is 0.0.0.0, replace ip but keep the bound port
+    /// 3) configured addr (self.addr) — if ip is 0.0.0.0, compute a best-effort ip but keep its port
+    pub fn compute_advertise_addr(&self) -> io::Result<String> {
+        // Return the overridden address if present.
+        if let Some(s) = self.advertise_addr.lock().unwrap().clone() {
+            return Ok(s);
+        }
 
         // Best-effort IP discovery (no packets sent). If this fails, bubble up.
         let ip = compute_advertise_ip(None, None).map_err(|e| {
             io::Error::new(e.kind(), format!("failed to compute advertise ip: {}", e))
         })?;
 
-        Ok(SocketAddr::new(ip, port).to_string())
+        // bound addr if present
+        if let Some(bound) = *self.bound_addr.lock().unwrap() {
+            if bound.ip().is_unspecified() {
+                return Ok(SocketAddr::new(ip, bound.port()).to_string());
+            } else {
+                return Ok(bound.to_string());
+            }
+        }
+
+        // fallback to configured `self.addr`
+        //  - if it parses as a SocketAddr, normalize unspecified ip
+        //  - else just return as-is (last resort)
+        if let Ok(cfg_sa) = self.addr.parse::<SocketAddr>() {
+            if cfg_sa.ip().is_unspecified() || cfg_sa.port() == 0 {
+                let port = if cfg_sa.port() == 0 {
+                    // we really don't know yet, best effort: keep 0 to make the bug obvious
+                    0
+                } else {
+                    cfg_sa.port()
+                };
+                return Ok(SocketAddr::new(ip, port).to_string());
+            } else {
+                return Ok(cfg_sa.to_string());
+            }
+        }
+
+        Ok(self.addr.clone())
     }
 
     pub fn get_server_handle(&self) -> Option<ServerClient> {
@@ -614,6 +656,14 @@ impl Topology {
         }
     }
 
+    /// Kick a one-shot sync pass immediately (no waiting for the next interval).
+    pub fn sync_once_now(&self) {
+        let topo = self.clone();
+        tokio::task::spawn_local(async move {
+            topo.periodic_sync_tick().await;
+        });
+    }
+
     /// Periodically call [`periodic_sync_tick`] every few seconds.
     pub async fn periodic_sync_loop(&self) {
         const PERIOD_SECS: u64 = 5;
@@ -737,7 +787,7 @@ impl topology::Server for Topology {
         let server_handle = handle.unwrap();
         let public_key = self.public_key.clone().to_bytes();
         // TODO: Treat potential error.
-        let advertise = self.get_advertise_address().unwrap();
+        let advertise = self.compute_advertise_addr().unwrap();
         let signing_vk_bytes = self.signing_key.verifying_key().to_bytes();
         let signing_key = self.signing_key.clone();
 
@@ -833,6 +883,7 @@ impl topology::Server for Topology {
             // Ensure the periodic loop is running (safe to call multiple times)
             // FIXME: This is a workaround until we have gossip implemented.
             topology.ensure_periodic_sync();
+            topology.sync_once_now();
 
             // Send signal to synchronize data with anchor node (fetch the Sync capability),
             // and start:
@@ -947,6 +998,8 @@ impl Clone for Topology {
             signing_key: self.signing_key.clone(),
             local_credential_store: self.local_credential_store.clone(),
             is_cluster_member: self.is_cluster_member.clone(),
+            advertise_addr: self.advertise_addr.clone(),
+            bound_addr: self.bound_addr.clone(),
         }
     }
 }

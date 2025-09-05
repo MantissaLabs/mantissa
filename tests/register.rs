@@ -1,4 +1,6 @@
 mod common;
+use std::time::Duration;
+
 use common::testkit::{run_local, TestNode};
 
 #[tokio::test(flavor = "current_thread")]
@@ -21,6 +23,11 @@ async fn register_node_inproc() {
         let a = anchor.list_ids().await;
         let b = joiner.list_ids().await;
         assert_eq!(a, b, "anchor/joiner disagree on membership");
+
+        // Assert peers-state convergence by comparing the Merkle root.
+        TestNode::wait_roots_equal(&anchor, &joiner, Duration::from_secs(2))
+            .await
+            .expect("roots equal");
     })
     .await;
 }
@@ -45,6 +52,11 @@ async fn register_node_tcp() {
         let a = anchor.list_ids().await;
         let b = joiner.list_ids().await;
         assert_eq!(a, b, "anchor/joiner disagree on membership");
+
+        // Assert peers-state convergence by comparing the Merkle root.
+        TestNode::wait_roots_equal(&anchor, &joiner, Duration::from_secs(2))
+            .await
+            .expect("roots equal");
     })
     .await;
 }
