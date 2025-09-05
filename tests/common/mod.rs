@@ -17,4 +17,6 @@ pub fn fixed_noise_keys(byte: u8) -> mantissa::noise::NoiseKeys {
     mantissa::noise::NoiseKeys::from_private_bytes([byte; 32])
 }
 
+#[macro_use]
+pub mod macros;
 pub mod testkit;

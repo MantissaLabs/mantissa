@@ -10,18 +10,6 @@ use tracing_subscriber::{
     EnvFilter,
 };
 
-// Auto-initialize logging for all integration/unit tests when `--features testkit` is used.
-#[cfg(feature = "testkit")]
-mod __mantissa_test_log_autoinit {
-    // Ensure this module is kept even if not directly referenced.
-    #[allow(dead_code)]
-    #[ctor::ctor]
-    fn _init_logs_once() {
-        // Idempotent: your logger::init_for_tests() should handle “already initialized”.
-        let _ = crate::logger::init_for_tests();
-    }
-}
-
 static INIT: OnceCell<()> = OnceCell::new();
 
 fn local_timer() -> OffsetTime<&'static [FormatItem<'static>]> {

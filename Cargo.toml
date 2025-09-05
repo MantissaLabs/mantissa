@@ -79,7 +79,6 @@ tracing-subscriber = { version = "0.3.18", features = [
 ] }
 time = { version = "0.3", features = ["local-offset", "macros"] }
 log = "0.4"
-ctor = { version = "0.2", optional = true }
 
 # used for fully deterministic hashing across platforms and compiler versions (XXHash).
 twox-hash = "2.1.1"
@@ -100,4 +99,4 @@ aya = "0.13.1"
 
 [features]
 default = []
-testkit = ["ctor"]
+testkit = []
