@@ -147,4 +147,31 @@ impl TestNode {
             sleep(Duration::from_millis(20)).await;
         }
     }
+
+    /// Fetch the current join token of **this** node through the real Topology API.
+    pub async fn current_join_token(&self) -> Result<String, capnp::Error> {
+        self.node.current_join_token().await
+    }
+
+    /// Rotate the join token on **this** node and return the new token.
+    pub async fn rotate_join_token(&self) -> Result<String, capnp::Error> {
+        let req = self.topology().rotate_token_request();
+        let resp = req.send().promise.await?;
+        let token = resp.get()?.get_token()?.to_string()?;
+        Ok(token)
+    }
+
+    /// Join the cluster anchored at `anchor` using the explicit `join_token_str`.
+    ///
+    /// This is the complement to `join(&anchor)` which internally fetches the token first.
+    pub async fn join_with_token(
+        &self,
+        anchor: &TestNode,
+        join_token_str: &str,
+    ) -> Result<(), capnp::Error> {
+        let anchor_address = anchor.addr();
+        self.node
+            .join_anchor_addr(&anchor_address, join_token_str)
+            .await
+    }
 }

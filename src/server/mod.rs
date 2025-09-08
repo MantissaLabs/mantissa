@@ -163,9 +163,8 @@ impl Bootstrap {
         // Local short-lived credential store
         let local_creds = LocalCredentialStore::new(ctx.db.clone())?;
 
-        // Join token store (this node acts as anchor)
-        let token_store = TokenStore::new(None);
-        token_store.generate().await;
+        // Join token store. Generate new token if none exists.
+        let token_store = TokenStore::load(ctx.db.clone()).expect("load persistent join token");
 
         // Debug dump mst root for peers store.
         peers.debug_dump_root("peers").await;
@@ -201,13 +200,13 @@ impl Bootstrap {
         let topology = Topology::new(
             ctx.listen_addr.clone(),
             topology_rx,
-            stores.token_store.clone(),
             stores.local_creds.clone(),
             ctx.noise_keys.public,
             ctx.signing_key.clone(),
             ctx.node.clone(),
             stores.peers.clone(),
             stores.local_sessions.clone(),
+            stores.token_store.clone(),
         )?;
         let topology_client: TopologyClient = capnp_rpc::new_client(topology.clone());
 

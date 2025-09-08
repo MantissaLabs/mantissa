@@ -1,16 +1,19 @@
 use data_encoding::Specification;
 use getrandom::getrandom;
-use std::sync::Arc;
+use redb::Database;
+use std::{io, sync::Arc};
 use tokio::sync::RwLock;
+
+use crate::store::local_token_store::LocalTokenStore;
 
 const TOKEN_PREFIX: &str = "MNTISA-1-";
 
 #[derive(Clone, Default)]
-pub struct TokenStore {
+pub struct TokenStoreInMemory {
     inner: Arc<RwLock<String>>,
 }
 
-impl TokenStore {
+impl TokenStoreInMemory {
     /// Initialize with an optional existing token. `None`/empty means no valid token yet.
     pub fn new(initial: Option<String>) -> Self {
         Self {
@@ -71,4 +74,110 @@ pub fn is_valid_format(token: &str) -> bool {
         && rest
             .bytes()
             .all(|b| (b'a'..=b'z').contains(&b) || (b'2'..=b'7').contains(&b))
+}
+
+#[derive(Clone)]
+pub struct TokenStore {
+    local_store: LocalTokenStore,
+    in_memory: TokenStoreInMemory,
+}
+
+impl TokenStore {
+    /// Load from `redb`. If empty or invalid, generate a fresh token and persist it.
+    pub fn load(database: Arc<Database>) -> io::Result<Self> {
+        let local_store = LocalTokenStore::new(database)?;
+        let token = match local_store.read()? {
+            Some(saved) if is_valid_format(&saved) => saved,
+            _ => {
+                // We are inside token.rs so we can call the private generator directly.
+                let fresh = generate_token();
+                local_store.write(&fresh)?;
+                fresh
+            }
+        };
+        let in_memory = TokenStoreInMemory::new(Some(token));
+        Ok(Self {
+            local_store,
+            in_memory,
+        })
+    }
+
+    /// Give a `TokenStore` handle to components that already expect the in-memory store
+    /// (e.g., `ServerImpl::with_token_store`).
+    pub fn in_memory_handle(&self) -> TokenStoreInMemory {
+        self.in_memory.clone()
+    }
+
+    /// The current token string (always present after `load`).
+    pub async fn current_token(&self) -> String {
+        // In practice this is always Some(...) after load()
+        self.in_memory.current().await.unwrap_or_default()
+    }
+
+    /// Rotate, persist, and return the new token.
+    pub async fn rotate_and_persist(&self) -> io::Result<String> {
+        let new_token = self.in_memory.rotate().await;
+        self.local_store.write(&new_token)?;
+        Ok(new_token)
+    }
+
+    /// Convenience for server join checks.
+    pub async fn matches(&self, presented: &str) -> bool {
+        self.in_memory.matches(presented).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{store::local_token_store::LocalTokenStore, token::TokenStore};
+    use redb::Database;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn local_token_store_roundtrip() {
+        let temp_directory = tempdir().unwrap();
+        let db_path = temp_directory.path().join("state.redb");
+        let database = Arc::new(Database::create(db_path).unwrap());
+        let store = LocalTokenStore::new(database).expect("open");
+        assert!(store.read().unwrap().is_none());
+        store.write("MNTISA-1-abc234").unwrap();
+        assert_eq!(store.read().unwrap().as_deref(), Some("MNTISA-1-abc234"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_store_persistent_survives_restart_and_rotates() {
+        let temp_directory = tempdir().unwrap();
+        let db_path = temp_directory.path().join("state.redb");
+
+        let mut token_a = String::new();
+        let mut token_rotated = String::new();
+
+        // First boot.
+        {
+            let database = Arc::new(Database::create(&db_path).unwrap());
+            let persistent_a = TokenStore::load(database.clone()).unwrap();
+            token_a = persistent_a.current_token().await;
+        }
+
+        // "Restart"
+        {
+            let database_reopen = Arc::new(Database::create(&db_path).unwrap());
+
+            let persistent_b = TokenStore::load(database_reopen).unwrap();
+            let token_b = persistent_b.current_token().await;
+
+            // Assert tokens are equal.
+            assert_eq!(token_a, token_b, "token must be stable across restart");
+
+            // rotate
+            token_rotated = persistent_b.rotate_and_persist().await.unwrap();
+        }
+
+        // restart again → must see rotated value
+        let database_third = Arc::new(Database::create(&db_path).unwrap());
+        let persistent_c = TokenStore::load(database_third).unwrap();
+        let token_c = persistent_c.current_token().await;
+        assert_eq!(token_c, token_rotated);
+    }
 }

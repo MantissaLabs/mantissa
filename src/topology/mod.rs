@@ -4,7 +4,7 @@ use crate::gossip_capnp::gossip_message;
 use crate::health_capnp::NodeStatus;
 use crate::includes::server_capnp::cluster_session;
 use crate::includes::sync_capnp::sync;
-use crate::node::address::{compute_advertise_ip, extract_port};
+use crate::node::address::compute_advertise_ip;
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
 use crate::node::node::Node;
@@ -44,8 +44,6 @@ pub struct Topology {
     // FIXME: To be replaced with full NodeInfo struct.
     addr: String,
 
-    token_store: TokenStore,
-
     // NodeInfo struct for our local node.
     node: Node,
 
@@ -77,6 +75,9 @@ pub struct Topology {
 
     bound_addr: Arc<Mutex<Option<SocketAddr>>>,
     advertise_addr: Arc<Mutex<Option<String>>>,
+
+    // Persistent token store, holding the current token for joining the cluster.
+    token_store: TokenStore,
 }
 
 #[derive(Clone)]
@@ -131,13 +132,13 @@ impl Topology {
     pub fn new(
         addr: String,
         rx: Receiver<TopologyEvent>,
-        token_store: TokenStore,
         creds_store: LocalCredentialStore,
         public: PublicKey,
         signing_key: SigningKey,
         node: Node,
         peers: PeersStore,
         sessions: LocalSessionStore,
+        token_store: TokenStore,
     ) -> Result<Self, Error> {
         Ok(Self {
             addr,
@@ -145,7 +146,6 @@ impl Topology {
             peers: peers,
             server_handle: std::rc::Rc::new(OnceCell::new()),
             handles: Arc::new(RwLock::new(HashMap::new())),
-            token_store,
             public_key: public,
             signing_key: signing_key,
             peer_id: peer_id_from_public(&public),
@@ -155,6 +155,7 @@ impl Topology {
             is_cluster_member: Rc::new(OnceCell::new()),
             bound_addr: Arc::new(Mutex::new(None)),
             advertise_addr: Arc::new(Mutex::new(None)),
+            token_store,
         })
     }
 
@@ -960,7 +961,7 @@ impl topology::Server for Topology {
         let store: TokenStore = self.token_store.clone();
 
         Promise::from_future(async move {
-            let token = store.current().await.unwrap_or_default();
+            let token = store.current_token().await;
             results.get().set_token(&token);
             Ok(())
         })
@@ -975,7 +976,7 @@ impl topology::Server for Topology {
         let store: TokenStore = self.token_store.clone();
 
         Promise::from_future(async move {
-            let new_token = store.rotate().await;
+            let new_token = store.rotate_and_persist().await?;
             results.get().set_token(&new_token);
             Ok(())
         })

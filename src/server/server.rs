@@ -17,7 +17,7 @@ use capnp::capability::Promise;
 use ed25519_dalek::SigningKey;
 use std::rc::Rc;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::gossip_capnp::gossip::Client as GossipClient;
