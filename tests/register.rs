@@ -30,26 +30,21 @@ local_test!(register_node_inproc, {
 });
 
 local_test!(register_node_tcp, {
-    let anchor = TestNode::new_tcp().await;
-    let joiner = TestNode::new_tcp().await;
+    let cluster = TestNode::new_cluster_tcp(3).await.unwrap();
 
-    joiner.join(&anchor).await.expect("join ok");
+    TestNode::assert_cluster_size_all(&cluster, 3, "cluster size should converge to 3").await;
 
-    anchor
-        .assert_cluster_size(2, "anchor should see 2 nodes")
-        .await;
-    joiner
-        .assert_cluster_size(2, "joiner should see 2 nodes")
-        .await;
+    let a = cluster[0].list_ids().await;
+    let b = cluster[1].list_ids().await;
+    let c = cluster[2].list_ids().await;
 
-    let a = anchor.list_ids().await;
-    let b = joiner.list_ids().await;
     assert_eq!(a, b, "anchor/joiner disagree on membership");
+    assert_eq!(b, c, "joiner nodes disagree on membership");
 
     // Assert peers-state convergence by comparing the Merkle root.
-    TestNode::wait_roots_equal(&anchor, &joiner, Duration::from_secs(2))
+    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(5))
         .await
-        .expect("roots equal");
+        .expect("all roots equal");
 });
 
 local_test!(register_node_token_rotate, {

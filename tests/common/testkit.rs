@@ -148,6 +148,164 @@ impl TestNode {
         }
     }
 
+    /// Spin up `n` TCP nodes (first one is the anchor) and join the rest to it.
+    pub async fn new_cluster_tcp(n: usize) -> Result<Vec<TestNode>, capnp::Error> {
+        assert!(n >= 1, "cluster size must be >= 1");
+
+        // 1) Create anchor and capture the data we need BEFORE moving it.
+        let anchor = TestNode::new_tcp().await;
+        let anchor_addr = anchor.addr(); // String, cheap clone
+        let join_token = anchor.current_join_token().await?; // fetch once
+
+        // 2) Start joiners and join using the captured data (no &anchor needed).
+        let mut cluster = Vec::with_capacity(n);
+        cluster.push(anchor); // move anchor now; we won't borrow it again
+
+        for _ in 1..n {
+            let node = TestNode::new_tcp().await;
+            node.node
+                .join_anchor_addr(&anchor_addr, &join_token)
+                .await?;
+            cluster.push(node);
+        }
+
+        Ok(cluster)
+    }
+
+    /// Spin up `n` in-process nodes (first one is the anchor).
+    pub async fn new_cluster_inproc(n: usize) -> Result<Vec<TestNode>, capnp::Error> {
+        assert!(n >= 1, "cluster size must be >= 1");
+
+        let anchor = TestNode::new().await;
+        let anchor_addr = anchor.addr();
+        let join_token = anchor.current_join_token().await?;
+
+        let mut cluster = Vec::with_capacity(n);
+        cluster.push(anchor);
+
+        for _ in 1..n {
+            let node = TestNode::new().await;
+            node.node
+                .join_anchor_addr(&anchor_addr, &join_token)
+                .await?;
+            cluster.push(node);
+        }
+
+        Ok(cluster)
+    }
+
+    /// Convenience: pick whichever transport you prefer as the default.
+    pub async fn new_cluster(n: usize) -> Result<Vec<TestNode>, capnp::Error> {
+        Self::new_cluster_tcp(n).await
+    }
+
+    /// Wait until *all* nodes in `cluster` report the same non-empty peers root.
+    /// Returns Err with a snapshot of roots if the deadline expires.
+    pub async fn wait_roots_equal_all(
+        cluster: &[TestNode],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        if cluster.is_empty() {
+            return Ok(()); // vacuously equal
+        }
+
+        let poll_every = Duration::from_millis(20);
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            // snapshot roots sequentially (keeps !Send futures happy on LocalSet)
+            let mut roots: Vec<(Uuid, String)> = Vec::with_capacity(cluster.len());
+            for n in cluster {
+                roots.push((n.id(), n.root_hex().await));
+            }
+
+            // all non-empty?
+            let all_non_empty = roots.iter().all(|(_, r)| !r.is_empty());
+
+            // all equal?
+            let all_equal = if let Some((_, first)) = roots.first() {
+                roots.iter().all(|(_, r)| r == first)
+            } else {
+                true
+            };
+
+            if all_non_empty && all_equal {
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                let snapshot = roots
+                    .into_iter()
+                    .map(|(id, r)| {
+                        format!(
+                            "{}={}",
+                            &id.to_string()[..8],
+                            if r.is_empty() { "<empty>".into() } else { r }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "roots diverged or empty after {:?}: {}",
+                    timeout, snapshot
+                ));
+            }
+
+            tokio::time::sleep(poll_every).await;
+        }
+    }
+
+    /// Wait until *every* node in `cluster` sees exactly `expected` members.
+    /// Returns Err with per-node sizes if the deadline expires.
+    pub async fn wait_cluster_size_all(
+        cluster: &[TestNode],
+        expected: usize,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let poll_every = Duration::from_millis(50);
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let mut sizes: Vec<(Uuid, usize)> = Vec::with_capacity(cluster.len());
+            let mut all_ok = true;
+
+            for n in cluster {
+                let ids = n.list_ids().await;
+                let len = ids.len();
+                sizes.push((n.id(), len));
+                if len != expected {
+                    all_ok = false;
+                }
+            }
+
+            if all_ok {
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                let snapshot = sizes
+                    .into_iter()
+                    .map(|(id, sz)| format!("{}:{}", &id.to_string()[..8], sz))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "cluster size not converged to {} after {:?} → [{}]",
+                    expected, timeout, snapshot
+                ));
+            }
+
+            tokio::time::sleep(poll_every).await;
+        }
+    }
+
+    /// Assert that every node in `cluster` sees `expected` within 10s.
+    pub async fn assert_cluster_size_all(cluster: &[TestNode], expected: usize, msg: &str) {
+        let timeout = Duration::from_secs(10);
+        if let Err(e) = Self::wait_cluster_size_all(cluster, expected, timeout).await {
+            panic!("{msg}: {e}");
+        }
+    }
+
     /// Fetch the current join token of **this** node through the real Topology API.
     pub async fn current_join_token(&self) -> Result<String, capnp::Error> {
         self.node.current_join_token().await
