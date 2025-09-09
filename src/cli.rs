@@ -47,6 +47,9 @@ pub enum Command {
     /// Link a node to an existing cluster
     Link(LinkArgs),
 
+    /// Leave a node to an existing cluster
+    Leave(LeaveArgs),
+
     /// Nodes subcommands
     #[command(alias = "n", subcommand_required = true, arg_required_else_help = true)]
     Nodes {
@@ -107,6 +110,13 @@ pub struct LinkArgs {
     #[arg(long = "join-token", value_name = "TOKEN")]
     pub join_token: Option<String>,
 
+    /// Print debug information verbosely
+    #[arg(short = 'd', action = ArgAction::SetTrue)]
+    pub debug: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct LeaveArgs {
     /// Print debug information verbosely
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub debug: bool,

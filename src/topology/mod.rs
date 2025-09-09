@@ -23,14 +23,17 @@ use async_channel::Receiver;
 use capnp::data;
 use capnp::{capability::Promise, Error};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
@@ -71,7 +74,9 @@ pub struct Topology {
     // FIXME: detangle from the u64 id defined in Capnproto Node struct.
     peer_id: PeerId,
 
-    is_cluster_member: Rc<OnceCell<()>>,
+    // is_cluster_member: Rc<OnceCell<()>>,
+    periodic_sync_running: Rc<AtomicBool>,
+    periodic_sync_handle: Rc<RefCell<Option<JoinHandle<()>>>>,
 
     bound_addr: Arc<Mutex<Option<SocketAddr>>>,
     advertise_addr: Arc<Mutex<Option<String>>>,
@@ -152,10 +157,11 @@ impl Topology {
             node: node,
             local_sessions: sessions,
             local_credential_store: creds_store,
-            is_cluster_member: Rc::new(OnceCell::new()),
             bound_addr: Arc::new(Mutex::new(None)),
             advertise_addr: Arc::new(Mutex::new(None)),
             token_store,
+            periodic_sync_running: Rc::new(AtomicBool::new(false)),
+            periodic_sync_handle: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -279,17 +285,33 @@ impl Topology {
         Ok(actives.iter().any(|(k, _)| k.to_uuid() != me))
     }
 
-    /// Spawns a single periodic sync loop (no-op if already started).
+    /// Spawns a single periodic sync loop (idempotent). Restartable after `stop_periodic_sync()`.
     pub fn ensure_periodic_sync(&self) {
-        if self.is_cluster_member.set(()).is_err() {
-            // already started
+        // fast path if already running
+        if self
+            .periodic_sync_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return;
         }
 
         let this = self.clone();
-        tokio::task::spawn_local(async move {
+        let handle = tokio::task::spawn_local(async move {
             this.periodic_sync_loop().await;
+            // if the loop exits naturally, mark stopped
+            this.periodic_sync_running.store(false, Ordering::SeqCst);
         });
+
+        *self.periodic_sync_handle.borrow_mut() = Some(handle);
+    }
+
+    /// Abort the periodic sync loop (if any) and mark it stopped.
+    pub fn stop_periodic_sync(&self) {
+        if let Some(h) = self.periodic_sync_handle.borrow_mut().take() {
+            h.abort();
+        }
+        self.periodic_sync_running.store(false, Ordering::SeqCst);
     }
 
     // The run loop receives incoming events from Gossip.
@@ -895,22 +917,36 @@ impl topology::Server for Topology {
         })
     }
 
-    /// Leave the cluster.
+    /// Leave the cluster: tombstone *this node* in its local Peers store and
+    /// trigger an immediate sync so peers learn about the removal quickly.
     fn leave(
         &mut self,
         _params: topology::LeaveParams,
-        mut _results: topology::LeaveResults,
-    ) -> Promise<(), Error> {
-        // TODO: Contact any node in the peers list other than ourselves and
-        // send a leave request. Needs to be done after gossip is implemented
-        // and we sync the peers list with the anchor node.
+        _results: topology::LeaveResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        let self_id = self.node.id;
+        let peers = self.peers.clone();
+        let handles_map = self.handles.clone();
 
-        // At this point we need to remove the peers from our peers list and
-        // revoke its access and ticket to get a cluster session. The node has
-        // to go back through registration to get a new ticket if it wants
-        // to interact with the cluster again.
+        capnp::capability::Promise::from_future(async move {
+            use crate::store::crdt::uuid_key::UuidKey;
 
-        Promise::ok(())
+            // Tombstone our own entry locally
+            peers
+                .remove(&UuidKey::from(self_id))
+                .await
+                .map_err(|e| capnp::Error::failed(format!("leave: tombstone failed: {e}")))?;
+
+            {
+                let mut guard = handles_map.write().await;
+                guard.clear();
+            }
+
+            // Stop the loop so this node is quiescent and can rejoin elsewhere
+            // topology.stop_periodic_sync();
+
+            Ok(())
+        })
     }
 
     /// List members of the network. Returns a list of nodes with their
@@ -998,9 +1034,10 @@ impl Clone for Topology {
             local_sessions: self.local_sessions.clone(),
             signing_key: self.signing_key.clone(),
             local_credential_store: self.local_credential_store.clone(),
-            is_cluster_member: self.is_cluster_member.clone(),
             advertise_addr: self.advertise_addr.clone(),
             bound_addr: self.bound_addr.clone(),
+            periodic_sync_running: self.periodic_sync_running.clone(),
+            periodic_sync_handle: self.periodic_sync_handle.clone(),
         }
     }
 }

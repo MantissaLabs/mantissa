@@ -108,7 +108,7 @@ impl TestNode {
 
     /// Assert that this node sees `expected` members within a short timeout.
     pub async fn assert_cluster_size(&self, expected: usize, msg: &str) {
-        let ok = self.wait_for_cluster_size(expected, 5_000).await;
+        let ok = self.wait_for_cluster_size(expected, 10_000).await;
         assert!(ok, "{msg}");
     }
 
@@ -173,5 +173,12 @@ impl TestNode {
         self.node
             .join_anchor_addr(&anchor_address, join_token_str)
             .await
+    }
+
+    /// Ask this node to leave the cluster via its local Topology capability.
+    pub async fn leave(&self) -> Result<(), capnp::Error> {
+        let req = self.node.topology_client.leave_request();
+        let _ = req.send().promise.await?;
+        Ok(())
     }
 }

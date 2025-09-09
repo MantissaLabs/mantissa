@@ -35,7 +35,6 @@ local_test!(register_node_tcp, {
 
     joiner.join(&anchor).await.expect("join ok");
 
-    // Both should see 2 nodes (self + the other)
     anchor
         .assert_cluster_size(2, "anchor should see 2 nodes")
         .await;
@@ -43,7 +42,6 @@ local_test!(register_node_tcp, {
         .assert_cluster_size(2, "joiner should see 2 nodes")
         .await;
 
-    // Sets should match
     let a = anchor.list_ids().await;
     let b = joiner.list_ids().await;
     assert_eq!(a, b, "anchor/joiner disagree on membership");
@@ -123,4 +121,36 @@ local_test!(register_node_token_rotate, {
     TestNode::wait_roots_equal(&anchor, &third, Duration::from_secs(5))
         .await
         .expect("roots equal between anchor and third");
+});
+
+local_test!(node_leave_tcp, {
+    // 1) Bring up 3 nodes (anchor + two joiners)
+    let anchor = TestNode::new_tcp().await;
+    let joiner1 = TestNode::new_tcp().await;
+    let joiner2 = TestNode::new_tcp().await;
+
+    // 2) Join both to the anchor
+    joiner1.join(&anchor).await.expect("joiner1 join ok");
+    joiner2.join(&anchor).await.expect("joiner2 join ok");
+
+    // 3) All three should see 3 members
+    anchor.assert_cluster_size(3, "anchor sees 3").await;
+    joiner1.assert_cluster_size(3, "joiner1 sees 3").await;
+    joiner2.assert_cluster_size(3, "joiner2 sees 3").await;
+
+    // 4) Now let joiner2 leave
+    joiner2.leave().await.expect("leave ok");
+
+    // 5) Remaining cluster (anchor + joiner1) should converge down to 2
+    anchor
+        .assert_cluster_size(2, "anchor should see 2 nodes after leave")
+        .await;
+    joiner1
+        .assert_cluster_size(2, "joiner1 should see 2 nodes after leave")
+        .await;
+
+    // 6) And their peers roots should match
+    TestNode::wait_roots_equal(&anchor, &joiner1, Duration::from_secs(10))
+        .await
+        .expect("roots equal after leave");
 });

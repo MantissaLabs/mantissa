@@ -493,6 +493,19 @@ where
     }
 
     pub async fn merge_register(&self, k: &C::Key, incoming: &C::Reg) -> std::io::Result<()> {
+        // Do not resurrect a tombstoned key with a remote register.
+        // If a tombstone exists, we keep it. Reappearance must be explicit via local `upsert`.
+        {
+            let r = self.db.begin_read().map_err(into_io)?;
+            let t = r.open_table(T::tombs()).map_err(into_io)?;
+            let kb = Self::enc_key(k);
+            if t.get(kb.as_slice()).map_err(into_io)?.is_some() {
+                // MST already reflects the tombstone (either from previous apply_tombstone,
+                // or will be rebuilt on stream end). Do nothing.
+                return Ok(());
+            }
+        }
+
         // Read current
         let current: Option<C::Reg> = {
             let r = self.db.begin_read().map_err(into_io)?;
@@ -509,7 +522,7 @@ where
         let merged = C::merge_regs(current, incoming.clone());
         let snap = C::snapshot_reg(&merged);
 
-        // Write back + clear tombstone
+        // Write back + clear tombstone (safe, we've asserted above no tomb exists)
         {
             let w = self.db.begin_write().map_err(into_io)?;
             {

@@ -92,6 +92,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             local.run_until(client::node::link(&cfg)).await?;
         }
 
+        Command::Leave(_) => {
+            local.run_until(client::node::leave(&cfg)).await?;
+        }
+
         Command::Merge(m) => {
             // e.g., client::cluster::merge(&cfg, &m.origin, &m.destination).await?;
             eprintln!("merge {} -> {}", m.origin, m.destination);
