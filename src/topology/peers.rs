@@ -1,4 +1,6 @@
 use crate::topology::{peer_provider::PeerProvider, PeerHandle, Topology};
+use crate::topology_capnp::node_info as node_info_capnp;
+use capnp::Error as CapnpError;
 use async_trait::async_trait;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
@@ -50,5 +52,34 @@ impl PeerProvider for Topology {
         }
 
         out
+    }
+}
+
+impl PeerValue {
+    /// Build a `PeerValue` from a Cap'n Proto `NodeInfo` reader.
+    pub fn from_node_info(ni: node_info_capnp::Reader<'_>) -> Result<PeerValue, CapnpError> {
+        let address = ni.get_addr()?.to_string()?;
+        let hostname = ni.get_hostname()?.to_string()?;
+
+        let pk_bytes = ni.get_public_key()?;
+        if pk_bytes.len() != 32 {
+            return Err(CapnpError::failed("publicKey must be exactly 32 bytes".into()));
+        }
+        let mut noise_static_pub = [0u8; 32];
+        noise_static_pub.copy_from_slice(pk_bytes);
+
+        let sk_bytes = ni.get_signing_key()?;
+        if sk_bytes.len() != 32 {
+            return Err(CapnpError::failed("signingKey must be exactly 32 bytes".into()));
+        }
+        let mut signing_pub = [0u8; 32];
+        signing_pub.copy_from_slice(sk_bytes);
+
+        Ok(PeerValue {
+            address,
+            hostname,
+            noise_static_pub,
+            signing_pub,
+        })
     }
 }

@@ -91,7 +91,6 @@ impl server::Server for ServerImpl {
     ) -> Promise<(), capnp::Error> {
         let token_store = self.token_store.as_ref().unwrap().clone();
         let session_store = self.session_store.as_ref().unwrap().clone();
-        let local_sessions = self.local_sessions.as_ref().unwrap().clone();
 
         let topology = self.topology.as_ref().unwrap().clone();
 
@@ -99,10 +98,8 @@ impl server::Server for ServerImpl {
         let sync_client = self.sync_client.as_ref().unwrap().clone();
         let gossip_client = self.gossip_client.as_ref().unwrap().clone();
         let node_client = self.node_client.as_ref().unwrap().clone();
-
-        let self_id = self.id;
-        let noise_keys = self.noise_keys.as_ref().unwrap().clone();
         let signing_key = self.signing_key.as_ref().unwrap().clone();
+        let self_id = self.id;
 
         Promise::from_future(async move {
             let p = params.get()?;
@@ -161,8 +158,6 @@ impl server::Server for ServerImpl {
                 .issue_ticket(joiner_id)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-            let noise_keys = noise_keys.clone();
-
             let nonce = rand::try_nonce16().map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             const TTL_SECS: u64 = 3600; // 1 hour (tune it)
@@ -185,7 +180,11 @@ impl server::Server for ServerImpl {
             let mut out = results.get();
             out.set_session(session_client);
             out.set_ticket(&ticket);
-            set_node_id(out.reborrow().init_peer_id(), &self_id);
+
+            // Include our NodeInfo so the joiner can immediately insert to its store.
+            // Fast propagation of our info means we can get a session to the joiner fast.
+            let ni = out.reborrow().init_node_info();
+            topology.populate_self_node_info(ni);
             out.set_credential(&cred_bytes);
 
             Ok(())
@@ -243,8 +242,6 @@ impl server::Server for ServerImpl {
         let gossip_client = self.gossip_client.as_ref().unwrap().clone();
         let node_client = self.node_client.as_ref().unwrap().clone();
 
-        let self_id = self.id;
-
         Promise::from_future(async move {
             // Parse + Verify the signed blob
             let cred_bytes = params.get()?.get_credential()?;
@@ -295,7 +292,11 @@ impl server::Server for ServerImpl {
             let mut out = results.get();
             out.set_session(session_client);
             out.set_ticket(&ticket);
-            crate::node::id::set_node_id(out.reborrow().init_peer_id(), &self_id);
+
+            // Include our NodeInfo so the caller can upsert immediately.
+            let ni = out.reborrow().init_node_info();
+            topology.populate_self_node_info(ni);
+
             Ok(())
         })
     }
@@ -329,6 +330,8 @@ impl ServerImpl {
     pub fn new() -> Self {
         Default::default()
     }
+
+    // (moved populate_self_node_info to Topology)
 
     /// Internal helper: spawn TCP secure listener (and optionally Unix socket) without blocking.
     async fn spawn_listeners_nonblocking(

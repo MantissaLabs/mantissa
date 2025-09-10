@@ -272,6 +272,36 @@ impl Topology {
         self.server_handle.get().cloned()
     }
 
+    /// Populate a NodeInfo builder with this node's identity and addresses.
+    pub fn populate_self_node_info(&self, mut info: crate::topology_capnp::node_info::Builder) {
+        // id
+        set_node_id(info.reborrow().init_id(), &self.node.id);
+
+        // handle to this Server (stored in Topology)
+        if let Some(h) = self.get_server_handle() {
+            info.set_handle(h);
+        }
+
+        // hostname and advertise address
+        let host = self
+            .node
+            .system_info
+            .info
+            .hostname
+            .clone()
+            .unwrap_or_default();
+        info.set_hostname(&host);
+
+        let addr = self
+            .compute_advertise_addr()
+            .unwrap_or_else(|_| String::new());
+        info.set_addr(&addr);
+
+        // Keys
+        info.set_public_key(&self.public_key.to_bytes());
+        info.set_signing_key(&self.signing_key.verifying_key().to_bytes());
+    }
+
     /// True if we already have at least one peer (not ourselves) or any stored ticket.
     pub async fn already_joined(&self) -> std::io::Result<bool> {
         // any stored ticket?
@@ -492,23 +522,22 @@ impl Topology {
         for (k, snap) in actives {
             let peer_id = k.to_uuid();
 
-            // 1) skip self
             if peer_id == self.node.id {
                 continue;
             }
 
-            // 2) skip if we already have a handle cached
+            // Skip if we already have a handle cached
             if self.handles.read().await.contains_key(&peer_id) {
                 continue;
             }
 
-            // 3) latest value for address/hostname/public key
+            // Latest value for address/hostname/public key
             let Some(val) = snap.as_slice().last().cloned() else {
                 continue;
             };
             let addr = val.address.clone();
 
-            // 4) dial the peer's Server
+            // Dial the peer's Server
             let server_client: server::Client = match connection::get_client_secure(&addr).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -517,7 +546,7 @@ impl Topology {
                 }
             };
 
-            // 5) try ticket first
+            // try ticket first
             let mut have_session: Option<cluster_session::Client> = None;
             if let Ok(Some(ticket)) = self.local_sessions.get(peer_id) {
                 let mut req = server_client.get_session_request();
@@ -537,7 +566,7 @@ impl Topology {
                 }
             }
 
-            // 6) fallback: use cluster-signed credential if we can
+            // fallback: use cluster-signed credential if we can
             if have_session.is_none() {
                 if let Some(sk) = signing_key {
                     let nonce =
@@ -559,7 +588,8 @@ impl Topology {
                     match req.send().promise.await {
                         Ok(resp) => {
                             // Session
-                            match resp.get()?.get_session() {
+                            let r = resp.get()?;
+                            match r.get_session() {
                                 Ok(sess) => {
                                     have_session = Some(sess);
                                 }
@@ -568,8 +598,24 @@ impl Topology {
                                     continue;
                                 }
                             }
+
+                            // Upsert returned NodeInfo for fresh address/keys
+                            if let Ok(info) = r.get_node_info() {
+                                match PeerValue::from_node_info(info) {
+                                    Ok(v) => {
+                                        if let Err(e) =
+                                            self.peers.upsert(&UuidKey::from(peer_id), v).await
+                                        {
+                                            error!(target: "connect", "upsert nodeInfo from {addr} failed: {e}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!(target: "connect", "decode nodeInfo from {addr} failed: {e}")
+                                    }
+                                }
+                            }
                             // Persist returned ticket for future fast resume
-                            let ticket = resp.get()?.get_ticket()?;
+                            let ticket = r.get_ticket()?;
                             if let Err(e) = self.local_sessions.put(peer_id, ticket) {
                                 error!(target: "connect", "failed to persist ticket from {addr}: {e}");
                             }
@@ -585,7 +631,7 @@ impl Topology {
                 }
             }
 
-            // 7) if we have a session, cache the `Server` handle and (optionally) do a quick ping
+            // If we have a session, cache the `Server` handle and (optionally) do a quick ping
             if let Some(session) = have_session {
                 info!(target: "connect", "connected to {addr}");
 
@@ -600,8 +646,6 @@ impl Topology {
 
                 // or fetch caps here if you want to warm them (not required):
                 // let _ = _session.get_capabilities_request().send().promise.await;
-
-                // done for this peer
             }
         }
 
@@ -756,6 +800,20 @@ impl Topology {
                     }
                 };
 
+                // Upsert returned NodeInfo immediately (fresh keys/addr)
+                if let Ok(ni) = r.get_node_info() {
+                    match PeerValue::from_node_info(ni) {
+                        Ok(v) => {
+                            if let Err(e) = self.peers.upsert(&UuidKey::from(peer_id), v).await {
+                                error!(target: "sync", "upsert nodeInfo failed for {peer_id}: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            error!(target: "sync", "decode nodeInfo failed for {peer_id}: {e}")
+                        }
+                    }
+                }
+
                 // Persist returned ticket for future fast path
                 if let Err(e) = self.local_sessions.put(peer_id, r.get_ticket().ok()?) {
                     error!(target: "sync", "ticket persist failed for {peer_id}: {e}");
@@ -853,25 +911,15 @@ impl topology::Server for Topology {
 
             let session = register.get()?.get_session()?;
             let ticket = register.get()?.get_ticket()?;
-            let peer_id = read_node_id(register.get()?.get_peer_id()?)?;
+            let node_info = register.get()?.get_node_info()?;
+            let peer_id = read_node_id(node_info.get_id()?)?;
             let cred_blob = register.get()?.get_credential()?;
 
-            let cred = crate::server::credential::ClusterCredential::from_bytes_verified(cred_blob)
-                .map_err(|e| capnp::Error::failed(format!("credential parse: {e}")))?;
-            let anchor_vk = cred.issuer;
-
-            // Pre-register the peer to be able to issue tickets/credentials for the anchor.
-            // This ensures we don't have to wait until receiving the full node information
-            // to be able to issue a reciprocal ticket.
+            // Upsert full anchor NodeInfo directly so we can contact it immediately.
             {
-                let v = crate::topology::peers::PeerValue {
-                    address: anchor.clone(),
-                    hostname: String::new(),
-                    noise_static_pub: [0u8; 32],
-                    signing_pub: anchor_vk.to_bytes(),
-                };
+                let v = crate::topology::peers::PeerValue::from_node_info(node_info)?;
                 if let Err(e) = peers.upsert(&UuidKey::from(peer_id), v).await {
-                    log::warn!(target: "topology", "join: pre-upsert of anchor placeholder failed: {e}");
+                    log::warn!(target: "topology", "join: upsert of anchor NodeInfo failed: {e}");
                 }
             }
 
@@ -884,7 +932,8 @@ impl topology::Server for Topology {
                 .put(peer_id, cred_blob)
                 .map_err(|e| Error::failed(format!("credential persist failed: {e}")))?;
 
-            // TODO: Use credentials and fan out to other nodes.
+            // Persist credential for future secure reconnects.
+            let _ = crate::server::credential::ClusterCredential::from_bytes_verified(cred_blob);
 
             let sync_cap: sync::Client = {
                 let req = session.get_sync_request();

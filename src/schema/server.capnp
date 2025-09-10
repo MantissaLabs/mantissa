@@ -6,7 +6,7 @@ using Node = import "node.capnp";
 using import "sync.capnp".Sync;
 
 interface Server {
-  registerNode @0 (info :Node.NodeInfo, token :Text) -> (session :ClusterSession, ticket :Data, peerId :Node.NodeId, credential :Data);
+  registerNode @0 (info :Node.NodeInfo, token :Text) -> (session :ClusterSession, ticket :Data, nodeInfo :Node.NodeInfo, credential :Data);
   # First-time join. Adding the node to the trusted set of peers if the token
   # is valid. On failure, returns a capnp error.
 
@@ -14,7 +14,7 @@ interface Server {
   # Get a session given a ticket returned by registerNode. Returns a capnp
   # error on failure (unknown/expired/not-registered).
 
-  getWithCredential @2 (credential :Data) -> (session :ClusterSession, ticket :Data, peerId :Node.NodeId);
+  getWithCredential @2 (credential :Data) -> (session :ClusterSession, ticket :Data, nodeInfo :Node.NodeInfo);
   # Bootstrap to (re)open a session on this node using a short-lived credential.
   # (Cluster-wide credentials can be enabled later; for now this node verifies.)
 }

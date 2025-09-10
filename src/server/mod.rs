@@ -50,10 +50,11 @@ pub async fn start(
 
     // Wire up ServerImpl and spawn listeners
     let server = Bootstrap::build_server(&ctx, &stores, &comps).build();
-    Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
 
     // Fire background tasks: gossip loop, topology loop, best-effort reconnect
     Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps).await;
+
+    Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
 
     // Run the daemon with chosen mode (tcp + optional unix)
     server.start_with_mode(mode, enable_unix_socket).await
@@ -276,7 +277,7 @@ impl Bootstrap {
         };
 
         let mut topology_runner = comps.topology.clone();
-        let mut topology_sync = comps.topology.clone();
+        let topology_sync = comps.topology.clone();
 
         // Spawn gossip loop
         tokio::task::spawn_local(async move {
