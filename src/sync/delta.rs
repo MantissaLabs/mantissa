@@ -28,14 +28,14 @@ impl delta_sink::Server for DeltaSinkImpl {
         Promise::from_future(async move {
             let c = params.get()?.get_chunk()?;
 
-            // tombstones
+            // tombstones first
             for it in c.get_tombs()?.iter() {
                 let k = peers.from_wire_key(it.get_key()?)?;
                 let ts = it.get_ts();
                 peers.apply_tombstone(&k, ts).await?;
             }
 
-            // registers
+            // registers after
             for it in c.get_regs()?.iter() {
                 let k = peers.from_wire_key(it.get_key()?)?;
                 let r = peers.from_wire_reg(it.get_reg()?)?;

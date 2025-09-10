@@ -344,20 +344,9 @@ where
     }
 
     /// Merge a remote register for key `k` into durable state and MST.
-    /// If a local tombstone exists, the register is ignored (no resurrection).
+    /// Clears any local tombstone to allow explicit resurrection when a fresh
+    /// register arrives via sync.
     pub async fn merge_register(&self, k: &C::Key, incoming: &C::Reg) -> io::Result<()> {
-        // Guard: refuse resurrection if tombstone exists.
-        {
-            let r = self.db.begin_read().map_err(into_io)?;
-            let t = r.open_table(T::tombs()).map_err(into_io)?;
-            if t.get(Self::encode_key(k).as_slice())
-                .map_err(into_io)?
-                .is_some()
-            {
-                return Ok(());
-            }
-        }
-
         // Read current reg (if any)
         let current = {
             let r = self.db.begin_read().map_err(into_io)?;
@@ -810,7 +799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_register_respects_tombstone() {
+    async fn merge_register_clears_tombstone() {
         let db = temp_db();
         let store: CrdtMstStore<Adapter, Hasher, TestTables> = CrdtMstStore::open(db, 1u8).unwrap();
 
@@ -818,19 +807,22 @@ mod tests {
 
         // apply tombstone
         store.apply_tombstone(&k, 42).await.unwrap();
+        assert!(!store.exists(&k).unwrap());
 
-        // incoming register should be ignored (no resurrection)
+        // incoming register should resurrect and clear local tombstone
         let reg = {
             let current = None;
             <Adapter as RegAdapter>::upsert_reg(current, &1u8, "hello".to_string())
         };
         store.merge_register(&k, &reg).await.unwrap();
 
-        // Values table must not contain k, tombs must.
-        let (actives, tombs) = store.load_all().unwrap();
-        assert!(actives.is_empty());
-        assert_eq!(tombs.len(), 1);
-        assert_eq!(tombs[0].0, k);
+        // Value must exist and tomb be cleared
+        assert!(store.exists(&k).unwrap());
+        let (_actives, tombs) = store.load_all().unwrap();
+        assert!(tombs.is_empty());
+
+        // Subsequent tombstone would remove the value again (no guard). We only
+        // assert that resurrection cleared the tomb as expected above.
     }
 
     #[tokio::test]
