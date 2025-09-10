@@ -44,6 +44,23 @@ impl TestNode {
         Self { node }
     }
 
+    /// Start a node with in-process transport and a custom periodic sync tick.
+    pub async fn new_with_tick_ms(ms: u64) -> Self {
+        let node = HeadlessNode::new_inproc_with_tick(std::time::Duration::from_millis(ms))
+            .await
+            .expect("headless inproc node (with tick)");
+        Self { node }
+    }
+
+    /// Start a TCP node with a custom periodic sync tick.
+    pub async fn new_tcp_with_tick_ms(ms: u64) -> Self {
+        let node =
+            HeadlessNode::new_tcp_ephemeral_with_tick(std::time::Duration::from_millis(ms))
+                .await
+                .expect("headless tcp node (with tick)");
+        Self { node }
+    }
+
     /// Ask this node to join the cluster whose **anchor** is `anchor`.
     ///
     /// This takes the current join token from the anchor and calls the real
@@ -197,6 +214,31 @@ impl TestNode {
     /// Convenience: pick whichever transport you prefer as the default.
     pub async fn new_cluster(n: usize) -> Result<Vec<TestNode>, capnp::Error> {
         Self::new_cluster_tcp(n).await
+    }
+
+    /// Spin up `n` TCP nodes with a custom periodic sync tick (ms).
+    pub async fn new_cluster_tcp_with_tick(
+        n: usize,
+        tick_ms: u64,
+    ) -> Result<Vec<TestNode>, capnp::Error> {
+        assert!(n >= 1, "cluster size must be >= 1");
+
+        let anchor = TestNode::new_tcp_with_tick_ms(tick_ms).await;
+        let anchor_addr = anchor.addr();
+        let join_token = anchor.current_join_token().await?;
+
+        let mut cluster = Vec::with_capacity(n);
+        cluster.push(anchor);
+
+        for _ in 1..n {
+            let node = TestNode::new_tcp_with_tick_ms(tick_ms).await;
+            node.node
+                .join_anchor_addr(&anchor_addr, &join_token)
+                .await?;
+            cluster.push(node);
+        }
+
+        Ok(cluster)
     }
 
     /// Wait until *all* nodes in `cluster` report the same non-empty peers root.

@@ -30,6 +30,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -79,6 +80,8 @@ pub struct Topology {
 
     bound_addr: Arc<Mutex<Option<SocketAddr>>>,
     advertise_addr: Arc<Mutex<Option<String>>>,
+    // Periodic sync interval (dynamic to allow tests to speed up convergence)
+    sync_interval: Arc<Mutex<Duration>>,
 
     // Persistent token store, holding the current token for joining the cluster.
     token_store: TokenStore,
@@ -158,6 +161,7 @@ impl Topology {
             local_credential_store: creds_store,
             bound_addr: Arc::new(Mutex::new(None)),
             advertise_addr: Arc::new(Mutex::new(None)),
+            sync_interval: Arc::new(Mutex::new(Duration::from_secs(3))),
             token_store,
             periodic_sync_running: Rc::new(AtomicBool::new(false)),
             periodic_sync_handle: Rc::new(RefCell::new(None)),
@@ -270,6 +274,11 @@ impl Topology {
 
     pub fn get_server_handle(&self) -> Option<ServerClient> {
         self.server_handle.get().cloned()
+    }
+
+    /// Set the periodic sync interval (useful for tests to speed up convergence).
+    pub fn set_sync_interval(&self, d: Duration) {
+        *self.sync_interval.lock().unwrap() = d;
     }
 
     /// Populate a NodeInfo builder with this node's identity and addresses.
@@ -732,10 +741,9 @@ impl Topology {
 
     /// Periodically call [`periodic_sync_tick`] every few seconds.
     pub async fn periodic_sync_loop(&self) {
-        const PERIOD_SECS: u64 = 5;
-        let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(PERIOD_SECS));
         loop {
-            tick.tick().await;
+            let d = *self.sync_interval.lock().unwrap();
+            tokio::time::sleep(d).await;
             self.periodic_sync_tick().await;
         }
     }
@@ -1090,6 +1098,7 @@ impl Clone for Topology {
             bound_addr: self.bound_addr.clone(),
             periodic_sync_running: self.periodic_sync_running.clone(),
             periodic_sync_handle: self.periodic_sync_handle.clone(),
+            sync_interval: self.sync_interval.clone(),
         }
     }
 }

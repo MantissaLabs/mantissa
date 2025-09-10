@@ -1,4 +1,4 @@
-use std::{io, net::TcpListener, path::PathBuf, sync::Arc};
+use std::{io, net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
@@ -62,6 +62,7 @@ impl HeadlessNode {
         signing_key: ed25519_dalek::SigningKey,
         self_id: Uuid,
         transport: HeadlessTransport,
+        sync_tick: Option<Duration>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Local Node + client
         let mut node_obj = node::node::Node::new();
@@ -81,6 +82,9 @@ impl HeadlessNode {
         );
         let stores: Stores = Bootstrap::open_stores(&ctx).await?;
         let comps: Components = Bootstrap::build_components(&ctx, &stores)?;
+        if let Some(d) = sync_tick {
+            comps.topology.set_sync_interval(d);
+        }
         let server_impl: ServerImpl = Bootstrap::build_server(&ctx, &stores, &comps).build();
 
         // Finish wiring and spawn background tasks (gossip loop, topology loop, etc.)
@@ -170,6 +174,7 @@ impl HeadlessNode {
             signing_key,
             self_id,
             HeadlessTransport::Inproc,
+            None,
         )
         .await
     }
@@ -189,6 +194,7 @@ impl HeadlessNode {
             signing_key,
             self_id,
             HeadlessTransport::Tcp { addr },
+            None,
         )
         .await
     }
@@ -208,6 +214,47 @@ impl HeadlessNode {
             signing_key,
             self_id,
             HeadlessTransport::Tcp { addr },
+            None,
+        )
+        .await
+    }
+
+    /// From-parts, but with a custom periodic sync tick.
+    pub async fn new_inproc_with_tick_from_parts(
+        db: Arc<redb::Database>,
+        noise_keys: Arc<NoiseKeys>,
+        signing_key: ed25519_dalek::SigningKey,
+        self_id: Uuid,
+        tick: Duration,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with(
+            "127.0.0.1:0".to_string(),
+            db,
+            noise_keys,
+            signing_key,
+            self_id,
+            HeadlessTransport::Inproc,
+            Some(tick),
+        )
+        .await
+    }
+
+    pub async fn new_tcp_ephemeral_with_tick_from_parts(
+        db: Arc<redb::Database>,
+        noise_keys: Arc<NoiseKeys>,
+        signing_key: ed25519_dalek::SigningKey,
+        self_id: Uuid,
+        tick: Duration,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let addr = pick_loopback_ephemeral()?;
+        Self::new_with(
+            addr.clone(),
+            db,
+            noise_keys,
+            signing_key,
+            self_id,
+            HeadlessTransport::Tcp { addr },
+            Some(tick),
         )
         .await
     }
@@ -229,6 +276,28 @@ impl HeadlessNode {
         let mut node = Self::new_tcp_ephemeral_from_parts(db, noise_keys, signing_key, id)
             .await
             .map_err(to_io)?;
+        node._tmp_dir = Some(tmp);
+        Ok(node)
+    }
+
+    /// Quick-start **in-process** node with a custom sync tick.
+    pub async fn new_inproc_with_tick(tick: Duration) -> io::Result<Self> {
+        let (db, noise_keys, signing_key, id, tmp) = self_contained_state()?;
+        let mut node = Self::new_inproc_with_tick_from_parts(db, noise_keys, signing_key, id, tick)
+            .await
+            .map_err(to_io)?;
+        node._tmp_dir = Some(tmp);
+        Ok(node)
+    }
+
+    /// Quick-start **TCP** node with a custom sync tick on an ephemeral port.
+    pub async fn new_tcp_ephemeral_with_tick(tick: Duration) -> io::Result<Self> {
+        let (db, noise_keys, signing_key, id, tmp) = self_contained_state()?;
+        let mut node = Self::new_tcp_ephemeral_with_tick_from_parts(
+            db, noise_keys, signing_key, id, tick,
+        )
+        .await
+        .map_err(to_io)?;
         node._tmp_dir = Some(tmp);
         Ok(node)
     }

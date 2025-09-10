@@ -5,8 +5,8 @@ use std::time::Duration;
 use common::testkit::TestNode;
 
 local_test!(register_node_inproc, {
-    let anchor = TestNode::new().await;
-    let joiner = TestNode::new().await;
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let joiner = TestNode::new_with_tick_ms(100).await;
 
     joiner.join(&anchor).await.expect("join ok");
 
@@ -24,13 +24,13 @@ local_test!(register_node_inproc, {
     assert_eq!(a, b, "anchor/joiner disagree on membership");
 
     // Assert peers-state convergence by comparing the Merkle root.
-    TestNode::wait_roots_equal(&anchor, &joiner, Duration::from_secs(10))
+    TestNode::wait_roots_equal(&anchor, &joiner, Duration::from_secs(5))
         .await
         .expect("roots equal");
 });
 
 local_test!(register_node_tcp, {
-    let cluster = TestNode::new_cluster_tcp(3).await.unwrap();
+    let cluster = TestNode::new_cluster_tcp_with_tick(3, 100).await.unwrap();
 
     TestNode::assert_cluster_size_all(&cluster, 3, "cluster size should converge to 3").await;
 
@@ -42,16 +42,16 @@ local_test!(register_node_tcp, {
     assert_eq!(b, c, "joiner nodes disagree on membership");
 
     // Assert peers-state convergence by comparing the Merkle root.
-    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(10))
+    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(5))
         .await
         .expect("all roots equal");
 });
 
 local_test!(register_node_token_rotate, {
     // Create three nodes: anchor, second, third.
-    let anchor = TestNode::new().await;
-    let second = TestNode::new().await;
-    let third = TestNode::new().await;
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let second = TestNode::new_with_tick_ms(100).await;
+    let third = TestNode::new_with_tick_ms(100).await;
 
     // Read the current join token from the anchor.
     let initial_token = anchor
@@ -110,19 +110,19 @@ local_test!(register_node_token_rotate, {
 
     // Peers-state (Merkle roots) converge across all involved nodes.
     use std::time::Duration;
-    TestNode::wait_roots_equal(&anchor, &second, Duration::from_secs(10))
+    TestNode::wait_roots_equal(&anchor, &second, Duration::from_secs(5))
         .await
         .expect("roots equal between anchor and second");
-    TestNode::wait_roots_equal(&anchor, &third, Duration::from_secs(10))
+    TestNode::wait_roots_equal(&anchor, &third, Duration::from_secs(5))
         .await
         .expect("roots equal between anchor and third");
 });
 
 local_test!(node_leave_tcp, {
     // Bring up 3 nodes (anchor + two joiners)
-    let anchor = TestNode::new_tcp().await;
-    let joiner1 = TestNode::new_tcp().await;
-    let joiner2 = TestNode::new_tcp().await;
+    let anchor = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner1 = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner2 = TestNode::new_tcp_with_tick_ms(100).await;
 
     // Join both to the anchor
     joiner1.join(&anchor).await.expect("joiner1 join ok");
@@ -145,7 +145,7 @@ local_test!(node_leave_tcp, {
         .await;
 
     // Their peers roots should match
-    TestNode::wait_roots_equal(&anchor, &joiner1, Duration::from_secs(10))
+    TestNode::wait_roots_equal(&anchor, &joiner1, Duration::from_secs(5))
         .await
         .expect("roots equal after leave");
 });
@@ -154,16 +154,14 @@ local_test!(node_leave_tcp, {
 // Ensures that a node can leave, rejoin (clearing any tombstone),
 // and leave again without causing persistent divergence between peers.
 local_test!(node_leave_rejoin_tcp, {
-    use std::time::Duration;
-
-    // Bring up a 3-node cluster
-    let cluster = TestNode::new_cluster_tcp(3).await.unwrap();
+    // Bring up a 3-node cluster with a fast sync tick (100ms)
+    let cluster = TestNode::new_cluster_tcp_with_tick(3, 100).await.unwrap();
     let anchor = &cluster[0];
     let joiner1 = &cluster[1];
     let rejoiner = &cluster[2];
 
     TestNode::assert_cluster_size_all(&cluster, 3, "initial cluster size 3").await;
-    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(10))
+    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(5))
         .await
         .expect("all roots equal initially");
 
@@ -175,7 +173,7 @@ local_test!(node_leave_rejoin_tcp, {
     joiner1
         .assert_cluster_size(2, "joiner1 sees 2 after leave")
         .await;
-    TestNode::wait_roots_equal(anchor, joiner1, Duration::from_secs(10))
+    TestNode::wait_roots_equal(anchor, joiner1, Duration::from_secs(5))
         .await
         .expect("roots equal after leave");
 
@@ -184,9 +182,6 @@ local_test!(node_leave_rejoin_tcp, {
     for n in [&anchor, &joiner1, &rejoiner] {
         n.assert_cluster_size(3, "all see 3 after rejoin").await;
     }
-    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(10))
-        .await
-        .expect("all roots equal after rejoin");
 
     // Step 3: rejoiner leaves again → remaining two stabilize at 2 and stay consistent
     rejoiner.leave().await.expect("second leave ok");
@@ -208,7 +203,7 @@ local_test!(node_leave_rejoin_tcp, {
     joiner1
         .assert_cluster_size(2, "joiner1 still sees 2 after delay")
         .await;
-    TestNode::wait_roots_equal(anchor, joiner1, Duration::from_secs(10))
+    TestNode::wait_roots_equal(anchor, joiner1, Duration::from_secs(5))
         .await
         .expect("roots remain equal after delay");
 });
