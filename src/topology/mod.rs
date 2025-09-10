@@ -811,7 +811,6 @@ impl topology::Server for Topology {
         // TODO: Treat potential error.
         let advertise = self.compute_advertise_addr().unwrap();
         let signing_vk_bytes = self.signing_key.verifying_key().to_bytes();
-        let signing_key = self.signing_key.clone();
 
         Promise::from_future(async move {
             let request = params.get()?.get_link()?;
