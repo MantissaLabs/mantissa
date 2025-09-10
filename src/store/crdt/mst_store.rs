@@ -281,9 +281,40 @@ where
     /// - delete any register row,
     /// - persist the tombstone and reflect it in MST.
     pub async fn remove(&self, k: &C::Key) -> io::Result<u64> {
-        let w = self.db.begin_write().map_err(into_io)?;
+        // First check if tomb already exists; if so, do NOT allocate a new seq.
+        let (already_tombstoned, needs_value_drop) = {
+            let r = self.db.begin_read().map_err(into_io)?;
+            let tombstones = r.open_table(T::tombs()).map_err(into_io)?;
+            let values = r.open_table(T::values()).map_err(into_io)?;
 
-        // Allocate next tomb sequence
+            let kb = Self::encode_key(k);
+            let tomb_ts = tombstones
+                .get(kb.as_slice())
+                .map_err(into_io)?
+                .map(|g| g.value());
+            let value_exists = values.get(kb.as_slice()).map_err(into_io)?.is_some();
+
+            (tomb_ts, value_exists)
+        };
+
+        if let Some(ts) = already_tombstoned {
+            // Ensure value row is gone and MST reflects the *existing* monotonic ts.
+            let w = self.db.begin_write().map_err(into_io)?;
+            if needs_value_drop {
+                let mut values = w.open_table(T::values()).map_err(into_io)?;
+                let _ = values
+                    .remove(Self::encode_key(k).as_slice())
+                    .map_err(into_io)?;
+            }
+            w.commit().map_err(into_io)?;
+
+            let mut t = self.mst.write().await;
+            t.upsert(k.clone(), &Entry::Deleted { ts });
+            return Ok(ts);
+        }
+
+        // No tombstone yet: allocate a new sequence and persist.
+        let w = self.db.begin_write().map_err(into_io)?;
         let ts = {
             let mut meta = w.open_table(T::meta()).map_err(into_io)?;
             let next = match meta.get("tomb_seq").map_err(into_io)? {
@@ -293,16 +324,12 @@ where
             meta.insert("tomb_seq", &next).map_err(into_io)?;
             next
         };
-
-        // Drop register row
         {
             let mut values = w.open_table(T::values()).map_err(into_io)?;
             let _ = values
                 .remove(Self::encode_key(k).as_slice())
                 .map_err(into_io)?;
         }
-
-        // Write tombstone
         {
             let mut tombs = w.open_table(T::tombs()).map_err(into_io)?;
             tombs
@@ -311,10 +338,8 @@ where
         }
         w.commit().map_err(into_io)?;
 
-        // Update MST
         let mut t = self.mst.write().await;
         t.upsert(k.clone(), &Entry::Deleted { ts });
-
         Ok(ts)
     }
 
@@ -857,5 +882,47 @@ mod tests {
         // (3,4) due to hash mismatch, and (5,6) missing locally
         assert!(want.iter().any(|w| w.start == vec![3] && w.end == vec![4]));
         assert!(want.iter().any(|w| w.start == vec![5] && w.end == vec![6]));
+    }
+
+    #[tokio::test]
+    async fn apply_tombstone_uses_monotonic_ts_in_mst() {
+        let db = temp_db();
+        let store: CrdtMstStore<Adapter, Hasher, TestTables> = CrdtMstStore::open(db, 1u8).unwrap();
+        let k = key(1);
+
+        // First a higher remote ts arrives
+        store.apply_tombstone(&k, 100).await.unwrap();
+
+        // Then a stale lower ts arrives
+        store.apply_tombstone(&k, 10).await.unwrap();
+
+        // Disk must hold 100, and MST leaf must also be 100 (not 10)
+        let (_, tombs) = store.load_all().unwrap();
+        assert_eq!(tombs[0].1, 100);
+        let root_before = store.root_hex().await;
+        store.apply_tombstone(&k, 10).await.unwrap();
+        let root_after = store.root_hex().await;
+        assert_eq!(
+            root_before, root_after,
+            "stale tomb must not change MST root"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_is_idempotent() {
+        let db = temp_db();
+        let store: CrdtMstStore<Adapter, Hasher, TestTables> = CrdtMstStore::open(db, 1u8).unwrap();
+        let k = key(2);
+
+        // First call allocates a seq
+        let ts1 = store.remove(&k).await.unwrap();
+        let root1 = store.root_hex().await;
+
+        // Second call returns same ts (no meta bump), root unchanged
+        let ts2 = store.remove(&k).await.unwrap();
+        let root2 = store.root_hex().await;
+
+        assert_eq!(ts1, ts2, "idempotent remove must not allocate a new seq");
+        assert_eq!(root1, root2, "idempotent remove must not change MST root");
     }
 }

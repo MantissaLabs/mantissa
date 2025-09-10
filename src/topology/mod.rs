@@ -32,8 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
@@ -924,9 +923,14 @@ impl topology::Server for Topology {
         _params: topology::LeaveParams,
         _results: topology::LeaveResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
+        if !self.periodic_sync_running.load(Ordering::SeqCst) {
+            return Promise::err(capnp::Error::failed("node is not part of a cluster".into()));
+        }
+
         let self_id = self.node.id;
         let peers = self.peers.clone();
         let handles_map = self.handles.clone();
+        let topology = self.clone();
 
         capnp::capability::Promise::from_future(async move {
             use crate::store::crdt::uuid_key::UuidKey;
@@ -943,7 +947,7 @@ impl topology::Server for Topology {
             }
 
             // Stop the loop so this node is quiescent and can rejoin elsewhere
-            // topology.stop_periodic_sync();
+            topology.stop_periodic_sync();
 
             Ok(())
         })
