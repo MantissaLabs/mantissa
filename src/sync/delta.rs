@@ -2,7 +2,7 @@ use crate::{
     includes::sync_capnp::{sync, Domain},
     store::{
         crdt::{
-            mst_store::{capnp_fill_ranges, compute_want_from_owned, owned_ranges_from_capnp},
+            mst_store::{capnp_fill_ranges, compute_want_from_have, page_ranges_from_capnp},
             uuid_key::UuidKey,
         },
         peer_store::PeersStore,
@@ -30,15 +30,15 @@ impl delta_sink::Server for DeltaSinkImpl {
 
             // tombstones
             for it in c.get_tombs()?.iter() {
-                let k = peers.key_from_wire(it.get_key()?)?;
+                let k = peers.from_wire_key(it.get_key()?)?;
                 let ts = it.get_ts();
                 peers.apply_tombstone(&k, ts).await?;
             }
 
             // registers
             for it in c.get_regs()?.iter() {
-                let k = peers.key_from_wire(it.get_key()?)?;
-                let r = peers.reg_from_wire(it.get_reg()?)?;
+                let k = peers.from_wire_key(it.get_key()?)?;
+                let r = peers.from_wire_reg(it.get_reg()?)?;
                 peers.merge_register(&k, &r).await?;
             }
 
@@ -90,19 +90,23 @@ pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
         let mut rr = sync_cap.get_ranges_request();
         rr.get().set_domain(Domain::Peers);
         let ranges_resp = rr.send().promise.await?;
-        let remote_owned = owned_ranges_from_capnp::<UuidKey>(ranges_resp.get()?.get_summary()?)?;
+        let remote_page_ranges =
+            page_ranges_from_capnp::<UuidKey>(ranges_resp.get()?.get_summary()?)?;
 
         // Local ranges (this is io::Result, so convert)
-        let local_owned = peers.mst_ranges_owned().await.map_err(io_to_capnp)?;
+        let local_page_ranges = peers
+            .get_page_ranges_summaries()
+            .await
+            .map_err(io_to_capnp)?;
 
         // Compute want
-        let want_owned = compute_want_from_owned(&remote_owned, &local_owned);
-        if want_owned.is_empty() {
+        let want_ranges = compute_want_from_have(&remote_page_ranges, &local_page_ranges);
+        if want_ranges.is_empty() {
             debug!(target: "sync", "want empty ranges, nothing to fetch");
             return Ok(());
         }
 
-        debug!(target: "sync", "want ranges = {}", want_owned.len());
+        debug!(target: "sync", "want ranges = {}", want_ranges.len());
         peers
             .debug_dump_root("client.local.before_open_delta")
             .await;
@@ -117,7 +121,7 @@ pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
             let mut p = od.get();
             p.set_domain(Domain::Peers);
             let want_builder = p.reborrow().init_want();
-            capnp_fill_ranges::<UuidKey>(&want_owned, want_builder)?;
+            capnp_fill_ranges::<UuidKey>(&want_ranges, want_builder)?;
             p.set_sink(sink_client);
         }
 

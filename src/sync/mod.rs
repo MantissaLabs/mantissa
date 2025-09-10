@@ -1,7 +1,7 @@
 use crate::{
     store::{
         crdt::{
-            mst_store::{capnp_fill_ranges, owned_ranges_from_capnp},
+            mst_store::{capnp_fill_ranges, page_ranges_from_capnp},
             uuid_key::UuidKey,
         },
         peer_store::PeersStore,
@@ -61,13 +61,13 @@ impl sync::Server for SyncService {
                     peers.debug_dump_root("server.before.get_ranges").await;
                     peers.debug_dump_ranges("server.before.get_ranges", 5).await;
 
-                    let owned = peers
-                        .mst_ranges_owned()
+                    let ranges = peers
+                        .get_page_ranges_summaries()
                         .await
                         .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
                     let out = results.get().init_summary();
-                    capnp_fill_ranges::<UuidKey>(&owned, out)?;
+                    capnp_fill_ranges::<UuidKey>(&ranges, out)?;
                     Ok(())
                 }
                 _ => Err(capnp::Error::unimplemented(
@@ -104,7 +104,7 @@ impl sync::Server for SyncService {
                 peers.debug_dump_ranges("server.before.open_delta", 5).await;
 
                 // Client sends the delta ranges it needs, not its full summary.
-                let want = owned_ranges_from_capnp::<UuidKey>(p.get_want()?)?;
+                let want = page_ranges_from_capnp::<UuidKey>(p.get_want()?)?;
                 debug!(target: "delta", "open_delta: want ranges = {}", want.len());
 
                 // If there's no delta to send, end immediately.
@@ -115,7 +115,7 @@ impl sync::Server for SyncService {
                 }
 
                 let (regs, tombs) = peers
-                    .export_delta_for_owned(&want)
+                    .export_page_ranges_delta(&want)
                     .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
                 debug!(
