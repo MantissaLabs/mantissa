@@ -1,14 +1,10 @@
 use crate::{
     includes::sync_capnp::{sync, Domain},
-    store::{
-        crdt::{
-            mst_store::{capnp_fill_ranges, compute_want_from_have, page_ranges_from_capnp},
-            uuid_key::UuidKey,
-        },
-        peer_store::PeersStore,
-    },
+    store::peer_store::PeersStore,
     sync_capnp::delta_sink,
 };
+use crdt_store::{compute_want_from_have, uuid_key::UuidKey};
+use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp::capability::Promise;
 use tracing::debug;
 
@@ -90,8 +86,7 @@ pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
         let mut rr = sync_cap.get_ranges_request();
         rr.get().set_domain(Domain::Peers);
         let ranges_resp = rr.send().promise.await?;
-        let remote_page_ranges =
-            page_ranges_from_capnp::<UuidKey>(ranges_resp.get()?.get_summary()?)?;
+        let remote_page_ranges = page_ranges_from_capnp(ranges_resp.get()?.get_summary()?)?;
 
         // Local ranges (this is io::Result, so convert)
         let local_page_ranges = peers
@@ -121,7 +116,7 @@ pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
             let mut p = od.get();
             p.set_domain(Domain::Peers);
             let want_builder = p.reborrow().init_want();
-            capnp_fill_ranges::<UuidKey>(&want_ranges, want_builder)?;
+            capnp_fill_ranges(&want_ranges, want_builder)?;
             p.set_sink(sink_client);
         }
 

@@ -1,4 +1,4 @@
-use super::hash::XXHash128;
+use crdt_store::hash::XXHash128;
 use merkle_search_tree::MerkleSearchTree;
 use std::collections::HashMap;
 

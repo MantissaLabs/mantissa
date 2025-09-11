@@ -11,7 +11,6 @@ use crate::node::node::Node;
 use crate::server::credential::ClusterCredential;
 use crate::server_capnp::server;
 use crate::server_capnp::server::Client as ServerClient;
-use crate::store::crdt::uuid_key::UuidKey;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
@@ -22,6 +21,7 @@ use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
 use capnp::data;
 use capnp::{capability::Promise, Error};
+use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
@@ -29,8 +29,8 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::{fmt, io};
 use std::time::Duration;
+use std::{fmt, io};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -989,7 +989,7 @@ impl topology::Server for Topology {
         let topology = self.clone();
 
         capnp::capability::Promise::from_future(async move {
-            use crate::store::crdt::uuid_key::UuidKey;
+            use crdt_store::uuid_key::UuidKey;
 
             // Tombstone our own entry locally
             peers

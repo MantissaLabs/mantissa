@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::{fmt::Debug, hash::Hash};
 
-use crate::store::crdt::mvreg::MvRegSnapshot;
-use crate::store::crdt::uuid_key::{UuidKey, UuidKeyParseError};
+use crate::mvreg::MvRegSnapshot;
+use crate::uuid_key::{UuidKey, UuidKeyParseError};
 
 /// Register-centric adapter (works great for MVReg, Orswot, etc.).
 pub trait RegAdapter {
@@ -30,14 +30,14 @@ pub trait RegAdapter {
     fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg;
 }
 
-/// MVReg adapter with a canonical (sorted) snapshot (requires Value: Ord).
-pub struct MvRegAdapterSorted<K, V, A>(std::marker::PhantomData<(K, V, A)>);
-
 impl From<UuidKeyParseError> for io::Error {
     fn from(e: UuidKeyParseError) -> Self {
         io::Error::new(io::ErrorKind::InvalidData, e.to_string())
     }
 }
+
+/// MVReg adapter with a canonical (sorted) snapshot (requires Value: Ord).
+pub struct MvRegAdapterSorted<K, V, A>(pub(crate) std::marker::PhantomData<(K, V, A)>);
 
 impl<V, A> RegAdapter for MvRegAdapterSorted<UuidKey, V, A>
 where
@@ -82,3 +82,4 @@ where
         }
     }
 }
+

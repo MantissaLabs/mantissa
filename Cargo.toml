@@ -10,12 +10,19 @@ readme = "README.md"
 build = "build.rs"
 edition = "2021"
 
+[workspace]
+members = [
+    ".",
+    "crates/crdt_store",
+]
+
 [build-dependencies]
 capnpc = "0.21.0"
 aya-build = { git = "https://github.com/aya-rs/aya" }
 anyhow = "1"
 
 [dependencies]
+crdt_store = { path = "crates/crdt_store" }
 clap = { version = "4.5.45", features = ["derive", "cargo"] }
 chrono = { version = "0.4", features = ["serde"] }
 tabwriter = "1"

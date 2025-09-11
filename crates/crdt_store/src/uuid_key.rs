@@ -53,6 +53,7 @@ impl fmt::Display for UuidKeyParseError {
         f.write_str("UuidKey: expected 16 bytes")
     }
 }
+
 impl Error for UuidKeyParseError {}
 
 impl<'a> TryFrom<&'a [u8]> for UuidKey {

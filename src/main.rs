@@ -7,7 +7,6 @@ mod client;
 pub mod container;
 mod crypto;
 mod gossip;
-mod hash;
 mod includes;
 mod logger;
 pub mod monitor;

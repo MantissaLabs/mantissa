@@ -605,6 +605,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "crdt_store"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bincode",
+ "crdts 7.3.2",
+ "merkle-search-tree",
+ "redb",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "twox-hash",
+ "uuid",
+]
+
+[[package]]
 name = "crdt_tree"
 version = "0.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1495,6 +1512,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "clap",
+ "crdt_store",
  "crdt_tree",
  "crdts 7.3.2",
  "data-encoding",

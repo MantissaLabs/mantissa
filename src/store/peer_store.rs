@@ -1,14 +1,14 @@
-use crate::store::crdt::mst_store::CrdtMstStore;
-use crate::store::crdt::table_set::TableSet;
-use crate::store::crdt::uuid_key::UuidKey;
+use crdt_store::mst_store::CrdtMstStore;
+use crdt_store::table_set::TableSet;
+use crdt_store::uuid_key::UuidKey;
 use std::sync::Arc;
 use uuid::Uuid;
 
 // Hasher for MST leaves/keys (your existing implementation)
-use crate::hash::XXHash128;
+use crdt_store::hash::XXHash128;
 
 // Adapter = MVReg<V,A> with sorted snapshot
-use crate::store::crdt::adapter::MvRegAdapterSorted;
+use crdt_store::adapter::MvRegAdapterSorted;
 
 // What a peer stores
 use crate::topology::peers::PeerValue;

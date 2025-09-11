@@ -1,0 +1,17 @@
+//! Generic Redb-backed CRDT store with Merkle Search Tree ranges.
+//!
+//! - Parameterised by a `RegAdapter` that maps a CRDT register type to
+//!   a stable, hashable snapshot for MST leaves.
+//! - Stores durable registers + tombstones in Redb tables.
+//! - Maintains an in-memory Merkle Search Tree to power fast anti-entropy.
+
+pub mod adapter;
+pub mod mst_store;
+pub mod mvreg;
+pub mod table_set;
+pub mod uuid_key;
+pub mod hash;
+
+// Re-exports used by downstreams
+pub use mst_store::{compute_want_from_have, Entry, PageDigestRange};
+pub use table_set::TableSet;

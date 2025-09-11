@@ -1,4 +1,3 @@
-pub mod crdt;
 pub mod local;
 pub mod local_credential_store;
 pub mod local_session_store;

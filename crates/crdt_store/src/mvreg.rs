@@ -35,3 +35,4 @@ impl<T: Hash> Hash for MvRegSnapshot<T> {
         self.vals.hash(state);
     }
 }
+

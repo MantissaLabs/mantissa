@@ -9,7 +9,6 @@ pub mod client;
 pub mod container;
 pub mod crypto;
 pub mod gossip;
-pub mod hash;
 pub mod logger;
 pub mod monitor;
 pub mod net;
