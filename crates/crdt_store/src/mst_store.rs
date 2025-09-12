@@ -473,7 +473,11 @@ where
 
     /// Return page summaries (inclusive [start,end] + digest) for the current MST.
     pub async fn get_page_ranges_summaries(&self) -> io::Result<Vec<PageDigestRange>> {
-        let t = self.mst.write().await;
+        let mut t = self.mst.write().await;
+
+        // We re-hash the tree before serializing page ranges to ensure the hash is up-to-date.
+        let _ = t.root_hash();
+
         let prs = t.serialise_page_ranges().unwrap_or_default();
 
         let out: Vec<PageDigestRange> = prs
@@ -559,7 +563,8 @@ where
     }
 
     pub async fn debug_dump_ranges(&self, label: &str, limit: usize) {
-        let t = self.mst.write().await;
+        let mut t = self.mst.write().await;
+        let _ = t.root_hash();
         let prs = t.serialise_page_ranges().unwrap_or_default();
 
         debug!(target: "merkle search tree", "{label}: {} ranges", prs.len());
