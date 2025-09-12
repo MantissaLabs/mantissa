@@ -1,9 +1,8 @@
+use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use crate::{
     store::peer_store::PeersStore,
     sync_capnp::{sync, Domain},
 };
-use crdt_store::uuid_key::UuidKey;
-use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp::capability::Promise;
 use tracing::debug;
 
@@ -59,7 +58,7 @@ impl sync::Server for SyncService {
                     peers.debug_dump_ranges("server.before.get_ranges", 5).await;
 
                     let ranges = peers
-                        .get_page_ranges_summaries()
+                        .page_range_summary()
                         .await
                         .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
@@ -122,19 +121,18 @@ impl sync::Server for SyncService {
                     tombs.len()
                 );
 
-                // Pre-encode to wire bytes
+                // Pre-encode to wire bytes (keys are raw bytes of UuidKey, regs via bincode)
                 let mut regs_wire: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(regs.len());
                 for (k, r) in regs {
-                    regs_wire.push((
-                        peers.to_wire_key(&k),
-                        peers
-                            .to_wire_reg(&r)
-                            .map_err(|e| capnp::Error::failed(e.to_string()))?,
-                    ));
+                    let key_bytes = k.as_ref().to_vec();
+                    let reg_bytes =
+                        bincode::serialize(&r).map_err(|e| capnp::Error::failed(e.to_string()))?;
+                    regs_wire.push((key_bytes, reg_bytes));
                 }
+
                 let tombs_wire: Vec<(Vec<u8>, u64)> = tombs
                     .into_iter()
-                    .map(|(k, ts)| (peers.to_wire_key(&k), ts))
+                    .map(|(k, ts)| (k.as_ref().to_vec(), ts))
                     .collect();
 
                 // Create a simple cursor and stream to the client sink

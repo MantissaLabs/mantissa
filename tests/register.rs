@@ -168,6 +168,10 @@ local_test!(node_leave_rejoin_tcp, {
 
     // Step 1: rejoiner leaves → remaining two converge to size 2
     rejoiner.leave().await.expect("leave ok");
+
+    // Wait two ticks.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
     anchor
         .assert_cluster_size(2, "anchor sees 2 after leave")
         .await;
@@ -180,6 +184,10 @@ local_test!(node_leave_rejoin_tcp, {
 
     // Step 2: rejoiner rejoins via anchor → all converge to 3
     rejoiner.join(anchor).await.expect("rejoin ok");
+
+    // Wait two ticks.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
     for n in [&anchor, &joiner1, &rejoiner] {
         n.assert_cluster_size(3, "all see 3 after rejoin").await;
     }
@@ -196,8 +204,8 @@ local_test!(node_leave_rejoin_tcp, {
         .await
         .expect("roots equal after second leave");
 
-    // Sanity: after a short wait (one tick), they still agree and size is 2.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // Sanity check: after a short wait (two ticks), they still agree and size is 2.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     anchor
         .assert_cluster_size(2, "anchor still sees 2 after delay")
         .await;

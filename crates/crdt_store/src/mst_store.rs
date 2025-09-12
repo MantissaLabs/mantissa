@@ -104,6 +104,11 @@ where
         + 'static,
     T: TableSet,
 {
+    /// Start a delta-apply session. Apply one or more chunks, then call `commit()`.
+    pub fn begin_delta_apply(&self) -> DeltaApplySession<'_, C, H, T> {
+        DeltaApplySession { store: self }
+    }
+
     /// Open (or initialize) the underlying tables and create an empty in-memory MST.
     pub fn open(db: Arc<redb::Database>, actor: C::Actor) -> io::Result<Self> {
         // Ensure tables exist
@@ -215,6 +220,15 @@ where
     pub async fn root_hex(&self) -> String {
         let mut t = self.mst.write().await;
         t.root_hash().to_string()
+    }
+
+    /// Binary root digest of the MST (16 bytes for XXH3-128).
+    pub async fn root_digest(&self) -> [u8; 16] {
+        let mut t = self.mst.write().await;
+        let d = t.root_hash();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(d.as_ref());
+        out
     }
 
     /// Insert or update value for key `k`.
@@ -440,6 +454,68 @@ where
         Ok(())
     }
 
+    /// Apply one streamed delta chunk and update the in-memory MST incrementally.
+    /// This avoids a full rebuild at the end of the stream when chunks are small.
+    pub async fn apply_delta_chunk_update_mst(
+        &self,
+        regs: Vec<(C::Key, C::Reg)>,
+        tombs: Vec<(C::Key, u64)>,
+    ) -> io::Result<()> {
+        // Prepare merged registers by reading current values once.
+        let merged_regs: Vec<(C::Key, C::Reg)> = {
+            let r = self.db.begin_read().map_err(into_io)?;
+            let values = r.open_table(T::values()).map_err(into_io)?;
+
+            let mut out = Vec::with_capacity(regs.len());
+            for (k, incoming) in regs {
+                let kb = Self::encode_key(&k);
+                let current = match values.get(kb.as_slice()).map_err(into_io)? {
+                    Some(row) => Some(Self::decode_reg(row.value())?),
+                    None => None,
+                };
+                out.push((k, C::merge_regs(current, incoming)));
+            }
+            out
+        };
+
+        // Single write transaction for everything:
+        let w = self.db.begin_write().map_err(into_io)?;
+        {
+            let mut tv = w.open_table(T::values()).map_err(into_io)?;
+            let mut tt = w.open_table(T::tombs()).map_err(into_io)?;
+
+            for (k, reg) in &merged_regs {
+                tv.insert(
+                    Self::encode_key(k).as_slice(),
+                    Self::encode_reg(reg)?.as_slice(),
+                )
+                .map_err(into_io)?;
+                let _ = tt.remove(Self::encode_key(k).as_slice()).map_err(into_io)?;
+            }
+
+            for (k, ts) in &tombs {
+                tt.insert(Self::encode_key(k).as_slice(), ts)
+                    .map_err(into_io)?;
+                let _ = tv.remove(Self::encode_key(k).as_slice()).map_err(into_io)?;
+            }
+        }
+        w.commit().map_err(into_io)?;
+
+        // Reflect in MST in the same logical order: regs then tombs.
+        {
+            let mut t = self.mst.write().await;
+            for (k, reg) in &merged_regs {
+                let snap = C::snapshot_reg(reg);
+                t.upsert(k.clone(), &Entry::Active(snap));
+            }
+            for (k, ts) in tombs {
+                t.upsert(k.clone(), &Entry::Deleted { ts });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Rebuild MST once after a sequence of `apply_delta_chunk()` calls.
     pub async fn finalize_after_stream(&self) -> io::Result<()> {
         self.rebuild_mst_from_disk().await
@@ -471,13 +547,25 @@ where
         Ok((actives, tomb_list))
     }
 
+    /// Read and return the current snapshot for key `k`, if present.
+    pub fn get_snapshot(&self, k: &C::Key) -> io::Result<Option<C::Snapshot>> {
+        let r = self.db.begin_read().map_err(into_io)?;
+        let t = r.open_table(T::values()).map_err(into_io)?;
+        let kb = Self::encode_key(k);
+        match t.get(kb.as_slice()).map_err(into_io)? {
+            Some(v) => {
+                let reg = Self::decode_reg(v.value())?;
+                Ok(Some(C::snapshot_reg(&reg)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Return page summaries (inclusive [start,end] + digest) for the current MST.
-    pub async fn get_page_ranges_summaries(&self) -> io::Result<Vec<PageDigestRange>> {
+    pub async fn page_range_summary(&self) -> io::Result<Vec<PageDigestRange>> {
         let mut t = self.mst.write().await;
-
-        // We re-hash the tree before serializing page ranges to ensure the hash is up-to-date.
+        // Ensure root is computed
         let _ = t.root_hash();
-
         let prs = t.serialise_page_ranges().unwrap_or_default();
 
         let out: Vec<PageDigestRange> = prs
@@ -498,9 +586,6 @@ where
         &self,
         want: &[PageDigestRange],
     ) -> io::Result<(Vec<(C::Key, C::Reg)>, Vec<(C::Key, u64)>)> {
-        // Build an index over requested ranges, sorted by start.
-        let index = RangeIndex::new(want);
-
         let r = self.db.begin_read().map_err(into_io)?;
         let values = r.open_table(T::values()).map_err(into_io)?;
         let tombstones = r.open_table(T::tombs()).map_err(into_io)?;
@@ -508,52 +593,43 @@ where
         let mut registers_out: Vec<(C::Key, C::Reg)> = Vec::new();
         let mut tombstones_out: Vec<(C::Key, u64)> = Vec::new();
 
-        // To avoid double-emitting the same key if ranges overlap:
-        let mut seen_regs: HashSet<C::Key> = HashSet::new();
-        let mut seen_tombs: HashSet<C::Key> = HashSet::new();
+        // Deduplicate across overlapping ranges with raw key bytes
+        let mut seen_regs: HashSet<Vec<u8>> = HashSet::new();
+        let mut seen_tombs: HashSet<Vec<u8>> = HashSet::new();
 
-        // Scan registers once, filter by range index.
-        {
-            let mut it = values.iter().map_err(into_io)?;
-            while let Some(Ok((k_g, v_g))) = it.next() {
-                let key = Self::decode_key(k_g.value())?;
-                let raw = key_to_raw_bytes::<C>(&key);
-                if index.contains(&raw) && seen_regs.insert(key.clone()) {
+        for r in want {
+            let start = r.start.as_slice();
+            let end = r.end.as_slice();
+
+            // Registers in [start, end]
+            {
+                let mut it = values.range(start..=end).map_err(into_io)?;
+                while let Some(Ok((k_g, v_g))) = it.next() {
+                    let k_bytes = k_g.value();
+                    if !seen_regs.insert(k_bytes.to_vec()) {
+                        continue;
+                    }
+                    let key = Self::decode_key(k_bytes)?;
                     let reg = Self::decode_reg(v_g.value())?;
                     registers_out.push((key, reg));
                 }
             }
-        }
 
-        // Scan tombstones once, filter by range index.
-        {
-            let mut it = tombstones.iter().map_err(into_io)?;
-            while let Some(Ok((k_g, ts_g))) = it.next() {
-                let key = Self::decode_key(k_g.value())?;
-                let raw = key_to_raw_bytes::<C>(&key);
-                if index.contains(&raw) && seen_tombs.insert(key.clone()) {
+            // Tombstones in [start, end]
+            {
+                let mut it = tombstones.range(start..=end).map_err(into_io)?;
+                while let Some(Ok((k_g, ts_g))) = it.next() {
+                    let k_bytes = k_g.value();
+                    if !seen_tombs.insert(k_bytes.to_vec()) {
+                        continue;
+                    }
+                    let key = Self::decode_key(k_bytes)?;
                     tombstones_out.push((key, ts_g.value()));
                 }
             }
         }
 
         Ok((registers_out, tombstones_out))
-    }
-
-    // Wire helpers
-    pub fn from_wire_reg(&self, b: &[u8]) -> io::Result<C::Reg> {
-        bincode::deserialize(b).map_err(into_io)
-    }
-    pub fn from_wire_key(&self, b: &[u8]) -> io::Result<C::Key> {
-        C::key_from_bytes(b)
-    }
-    #[inline]
-    pub fn to_wire_key(&self, k: &C::Key) -> Vec<u8> {
-        k.as_ref().to_vec()
-    }
-    #[inline]
-    pub fn to_wire_reg(&self, r: &C::Reg) -> io::Result<Vec<u8>> {
-        bincode::serialize(r).map_err(into_io)
     }
 
     // Debug helpers
@@ -649,6 +725,51 @@ impl RangeIndex {
         }
         let (start, end) = &self.ranges[pos - 1];
         start.as_slice() <= key && key <= end.as_slice()
+    }
+}
+
+/// A simple guard to apply multiple delta chunks, then finalize once.
+pub struct DeltaApplySession<'a, C, H, T>
+where
+    C: RegAdapter,
+    C::Key: AsRef<[u8]> + std::fmt::Debug,
+    H: MstHasher<16, C::Key>
+        + MstHasher<16, Entry<C::Snapshot>>
+        + Default
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    T: TableSet,
+{
+    store: &'a CrdtMstStore<C, H, T>,
+}
+
+impl<'a, C, H, T> DeltaApplySession<'a, C, H, T>
+where
+    C: RegAdapter,
+    C::Key: AsRef<[u8]> + std::fmt::Debug,
+    H: MstHasher<16, C::Key>
+        + MstHasher<16, Entry<C::Snapshot>>
+        + Default
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    T: TableSet,
+{
+    /// Apply one chunk of registers and tombstones (batched write).
+    pub fn apply_chunk(
+        &self,
+        regs: Vec<(C::Key, C::Reg)>,
+        tombs: Vec<(C::Key, u64)>,
+    ) -> io::Result<()> {
+        self.store.apply_delta_chunk(regs, tombs)
+    }
+
+    /// Finalize once after all chunks (rebuild MST from disk).
+    pub async fn commit(self) -> io::Result<()> {
+        self.store.finalize_after_stream().await
     }
 }
 
@@ -748,6 +869,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_digest_matches_hex() {
+        let db = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, 1u8).unwrap();
+
+        // Mutate so we have a non-empty root
+        store.upsert(&key(1), "v1".into()).await.unwrap();
+        store.rebuild_mst_from_disk().await.unwrap();
+
+        let s = store.root_hex().await; // string representation from MST
+        let d = store.root_digest().await; // raw bytes
+                                           // The MerkleSearchTree's root to_string() is base64 over the raw digest bytes.
+        let expect = base64::engine::general_purpose::STANDARD.encode(d);
+        assert_eq!(s, expect);
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_returns_current_value() {
+        let db = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, 1u8).unwrap();
+
+        let k = key(9);
+        store.upsert(&k, "alpha".into()).await.unwrap();
+        let snap = store.get_snapshot(&k).unwrap().unwrap();
+        assert_eq!(snap.as_slice(), &[String::from("alpha")]);
+
+        // Update MVReg by same actor; snapshot should be replaced with the latest value
+        store.upsert(&k, "beta".into()).await.unwrap();
+        let snap2 = store.get_snapshot(&k).unwrap().unwrap();
+        assert_eq!(snap2.as_slice(), &[String::from("beta")]);
+    }
+
+    #[tokio::test]
     async fn merge_register_clears_tombstone() {
         let db = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
@@ -836,5 +991,93 @@ mod tests {
         store.apply_tombstone(&k, 10).await.unwrap();
         let root_after = store.root_hex().await;
         assert_eq!(root_before, root_after);
+    }
+
+    #[tokio::test]
+    async fn export_overlap_ranges_are_deduped() {
+        let db = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, 1u8).unwrap();
+
+        for n in 1..=5u8 {
+            store.upsert(&key(n), format!("v{n}")).await.unwrap();
+        }
+        store.remove(&key(3)).await.unwrap();
+        store.rebuild_mst_from_disk().await.unwrap();
+
+        // Two overlapping wants: [2,4] and [3,5]
+        let want = vec![
+            PageDigestRange {
+                start: key_to_raw_bytes::<Adapter>(&key(2)),
+                end: key_to_raw_bytes::<Adapter>(&key(4)),
+                hash: vec![],
+            },
+            PageDigestRange {
+                start: key_to_raw_bytes::<Adapter>(&key(3)),
+                end: key_to_raw_bytes::<Adapter>(&key(5)),
+                hash: vec![],
+            },
+        ];
+
+        let (regs, tombs) = store.export_page_ranges_delta(&want).unwrap();
+        let mut reg_keys: Vec<_> = regs.into_iter().map(|(k, _)| k).collect();
+        let mut tmb_keys: Vec<_> = tombs.into_iter().map(|(k, _)| k).collect();
+        reg_keys.sort();
+        tmb_keys.sort();
+
+        assert_eq!(reg_keys, vec![key(2), key(4), key(5)]);
+        assert_eq!(tmb_keys, vec![key(3)]);
+    }
+
+    #[tokio::test]
+    async fn delta_apply_session_commit_rebuilds_once() {
+        let db_src = temp_db();
+        let db_dst = temp_db();
+        let src: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db_src, 1u8).unwrap();
+        let dst: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db_dst, 2u8).unwrap();
+
+        // Populate source
+        for n in 1..=4u8 {
+            src.upsert(&key(n), format!("v{n}")).await.unwrap();
+        }
+        src.remove(&key(3)).await.unwrap();
+        src.rebuild_mst_from_disk().await.unwrap();
+
+        // Export everything from source
+        let want = src.page_range_summary().await.unwrap();
+        let (regs, tombs) = src.export_page_ranges_delta(&want).unwrap();
+
+        // Apply via session and commit
+        let sess = dst.begin_delta_apply();
+        sess.apply_chunk(regs, tombs).unwrap();
+        sess.commit().await.unwrap();
+
+        // Roots match after commit
+        assert_eq!(src.root_hex().await, dst.root_hex().await);
+    }
+
+    #[tokio::test]
+    async fn apply_delta_chunk_update_mst_keeps_tree_fresh() {
+        let db = temp_db();
+        let src: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db.clone(), 1u8).unwrap();
+        let dst: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, 2u8).unwrap();
+
+        src.upsert(&key(1), "x".into()).await.unwrap();
+        src.upsert(&key(2), "y".into()).await.unwrap();
+        src.remove(&key(1)).await.unwrap();
+        src.rebuild_mst_from_disk().await.unwrap();
+
+        let want = src.page_range_summary().await.unwrap();
+        let (regs, tombs) = src.export_page_ranges_delta(&want).unwrap();
+
+        // Apply and update MST incrementally
+        dst.apply_delta_chunk_update_mst(regs, tombs).await.unwrap();
+
+        // No finalize call; roots should already match
+        assert_eq!(src.root_hex().await, dst.root_hex().await);
     }
 }

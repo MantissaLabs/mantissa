@@ -1,11 +1,13 @@
+use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use crate::{
     includes::sync_capnp::{sync, Domain},
     store::peer_store::PeersStore,
     sync_capnp::delta_sink,
 };
-use crdt_store::{compute_want_from_have, uuid_key::UuidKey};
-use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
+use bincode;
 use capnp::capability::Promise;
+use crdt_store::{compute_want_from_have, uuid_key::UuidKey};
+use crdts::MVReg;
 use tracing::debug;
 
 pub struct DeltaSinkImpl {
@@ -24,19 +26,33 @@ impl delta_sink::Server for DeltaSinkImpl {
         Promise::from_future(async move {
             let c = params.get()?.get_chunk()?;
 
-            // tombstones first
+            // Collect tombstones and registers, then apply in one batch write.
+            let mut tombs = Vec::new();
             for it in c.get_tombs()?.iter() {
-                let k = peers.from_wire_key(it.get_key()?)?;
-                let ts = it.get_ts();
-                peers.apply_tombstone(&k, ts).await?;
+                let key = UuidKey::try_from(it.get_key()?)
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+                let tombstone = it.get_ts();
+
+                tombs.push((key, tombstone));
             }
 
-            // registers after
+            let mut regs = Vec::new();
             for it in c.get_regs()?.iter() {
-                let k = peers.from_wire_key(it.get_key()?)?;
-                let r = peers.from_wire_reg(it.get_reg()?)?;
-                peers.merge_register(&k, &r).await?;
+                let key = UuidKey::try_from(it.get_key()?)
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+                let register: MVReg<crate::topology::peers::PeerValue, uuid::Uuid> =
+                    bincode::deserialize(it.get_reg()?)
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+                regs.push((key, register));
             }
+
+            peers
+                .apply_delta_chunk_update_mst(regs, tombs)
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             Ok(())
         })
@@ -47,19 +63,10 @@ impl delta_sink::Server for DeltaSinkImpl {
         _params: delta_sink::EndParams,
         _results: delta_sink::EndResults,
     ) -> Promise<(), capnp::Error> {
-        debug!(target: "delta", "delta stream end: rebuilding MST");
+        debug!(target: "delta", "delta stream end");
 
-        let peers = self.peers.clone();
-        Promise::from_future(async move {
-            peers
-                .finalize_after_stream()
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-            debug!(target: "delta",  "finalized after stream");
-
-            Ok(())
-        })
+        // Incremental apply keeps MST up-to-date; nothing to finalize.
+        Promise::ok(())
     }
 }
 
@@ -89,10 +96,7 @@ pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
         let remote_page_ranges = page_ranges_from_capnp(ranges_resp.get()?.get_summary()?)?;
 
         // Local ranges (this is io::Result, so convert)
-        let local_page_ranges = peers
-            .get_page_ranges_summaries()
-            .await
-            .map_err(io_to_capnp)?;
+        let local_page_ranges = peers.page_range_summary().await.map_err(io_to_capnp)?;
 
         // Compute want
         let want_ranges = compute_want_from_have(&remote_page_ranges, &local_page_ranges);
