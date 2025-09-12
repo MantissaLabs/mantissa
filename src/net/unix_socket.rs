@@ -1,6 +1,6 @@
-use crate::includes::server_capnp::cluster_session;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::AsyncReadExt;
+use protocol::server::cluster_session;
 use std::os::unix::fs::PermissionsExt;
 use std::{
     env, fs, io,
@@ -78,10 +78,7 @@ async fn accept_loop(listener: UnixListener, server_handle: cluster_session::Cli
     }
 }
 
-async fn handle_unix_conn(
-    stream: UnixStream,
-    server_handle: crate::server_capnp::cluster_session::Client,
-) {
+async fn handle_unix_conn(stream: UnixStream, server_handle: cluster_session::Client) {
     let (reader, writer) = stream.compat().split();
 
     let network = twoparty::VatNetwork::new(

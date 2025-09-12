@@ -1,13 +1,12 @@
 use crate::crypto::rand;
 use crate::node::id;
-use crate::node::id::set_node_id;
 use crate::node::identity::pubkey_from_slice;
 use crate::noise::NoiseKeys;
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::credential::ClusterCredential;
 use crate::server::session::ClusterSessionImpl;
-use crate::server_capnp::server;
+use protocol::server::server;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
@@ -19,11 +18,11 @@ use std::sync::Arc;
 use tracing::{debug, error};
 use uuid::Uuid;
 
-use crate::gossip_capnp::gossip::Client as GossipClient;
-use crate::node_capnp::node::Client as NodeClient;
-use crate::server_capnp::server::Client as ServerClient;
-use crate::sync_capnp::sync::Client as SyncClient;
-use crate::topology_capnp::topology::Client as TopologyClient;
+use protocol::gossip::gossip::Client as GossipClient;
+use protocol::node::node::Client as NodeClient;
+use protocol::server::server::Client as ServerClient;
+use protocol::sync::sync::Client as SyncClient;
+use protocol::topology::topology::Client as TopologyClient;
 
 #[derive(Clone)]
 pub struct ServerImpl {
@@ -342,7 +341,7 @@ impl ServerImpl {
         let listen_addr = cfg.listen_addr.clone();
 
         // identical to start_daemon’s server handle
-        let server_handle: crate::server_capnp::server::Client =
+        let server_handle: protocol::server::server::Client =
             capnp_rpc::new_client(self.clone());
         let noise_keys = self.noise_keys.as_ref().expect("noise keys").clone();
 

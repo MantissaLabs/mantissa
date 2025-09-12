@@ -16,7 +16,7 @@ interface Server {
 
   getWithCredential @2 (credential :Data) -> (session :ClusterSession, ticket :Data, nodeInfo :Node.NodeInfo);
   # Bootstrap to (re)open a session on this node using a short-lived credential.
-  # (Cluster-wide credentials can be enabled later; for now this node verifies.)
+  # Used after join to contact other neighbors in the mesh/network.
 }
 
 interface ClusterSession {

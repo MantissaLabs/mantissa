@@ -1,28 +1,28 @@
 use crate::client::connection;
 use crate::crypto::rand::{self, nonce16};
-use crate::gossip_capnp::gossip_message;
-use crate::health_capnp::NodeStatus;
-use crate::includes::server_capnp::cluster_session;
-use crate::includes::sync_capnp::sync;
 use crate::node::address::compute_advertise_ip;
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
 use crate::node::node::Node;
 use crate::server::credential::ClusterCredential;
-use crate::server_capnp::server;
-use crate::server_capnp::server::Client as ServerClient;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::sync::delta::sync_peers_after_join;
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
-use crate::topology_capnp::{topology, topology_event};
 use async_channel::Receiver;
 use capnp::data;
 use capnp::{capability::Promise, Error};
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use protocol::gossip::gossip_message;
+use protocol::health::NodeStatus;
+use protocol::server::cluster_session;
+use protocol::server::server;
+use protocol::server::server::Client as ServerClient;
+use protocol::sync::sync;
+use protocol::topology::{topology, topology_event};
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -412,10 +412,7 @@ impl Topology {
     }
 
     pub async fn restore_peers(&self) -> std::io::Result<()> {
-        self.peers
-            .rebuild_mst_from_disk()
-            .await
-            .map_err(Into::into)
+        self.peers.rebuild_mst_from_disk().await.map_err(Into::into)
     }
 
     pub async fn register_peer(
@@ -693,7 +690,7 @@ impl Topology {
             let addr = val.address;
 
             // Connect to remote Server
-            let client: crate::server_capnp::server::Client =
+            let client: protocol::server::server::Client =
                 match crate::client::connection::get_client_secure(&addr).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -703,7 +700,7 @@ impl Topology {
                 };
 
             // Obtain session: prefer ticket, else short-lived credential (if we can sign)
-            let mut session_opt: Option<crate::includes::server_capnp::cluster_session::Client> =
+            let mut session_opt: Option<cluster_session::Client> =
                 self.session_via_ticket(&client, peer_id).await;
 
             if session_opt.is_none() {
@@ -715,7 +712,7 @@ impl Topology {
             let Some(session) = session_opt else { continue };
 
             // Get Sync capability
-            let sync_cap: crate::includes::sync_capnp::sync::Client = match (async {
+            let sync_cap: sync::Client = match (async {
                 let req = session.get_sync_request();
                 let resp = req.send().promise.await?;
                 resp.get()?.get_sync()

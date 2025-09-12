@@ -1,8 +1,6 @@
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
-use crate::{
-    store::peer_store::PeersStore,
-    sync_capnp::{sync, Domain},
-};
+use crate::store::peer_store::PeersStore;
+use protocol::sync::{sync, Domain};
 use capnp::capability::Promise;
 use tracing::debug;
 

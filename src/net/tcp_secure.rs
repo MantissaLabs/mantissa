@@ -7,7 +7,7 @@ use tracing::info;
 /// Accept-loop used by both blocking and non-blocking variants.
 async fn accept_loop(
     listener: TcpListener,
-    server_handle: crate::server_capnp::server::Client,
+    server_handle: protocol::server::server::Client,
     noise_keys: Arc<crate::noise::NoiseKeys>,
 ) {
     loop {
@@ -56,7 +56,7 @@ async fn accept_loop(
 /// (compat: unchanged signature/behavior)
 pub async fn start_tcp_secure_listener(
     listen_addr: String,
-    server_handle: crate::server_capnp::server::Client,
+    server_handle: protocol::server::server::Client,
     noise_keys: Arc<crate::noise::NoiseKeys>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&listen_addr).await?;
@@ -72,7 +72,7 @@ pub async fn start_tcp_secure_listener(
 ///  - the actual bound SocketAddr (helpful if you passed "127.0.0.1:0")
 pub async fn start_tcp_secure_listener_nonblocking_with_ready(
     listen_addr: String,
-    server_handle: crate::server_capnp::server::Client,
+    server_handle: protocol::server::server::Client,
     noise_keys: Arc<crate::noise::NoiseKeys>,
 ) -> Result<
     (

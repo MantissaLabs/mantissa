@@ -1,8 +1,5 @@
-use crate::includes::{
-    gossip_capnp::gossip, node_capnp::node, server_capnp::cluster_session, sync_capnp::sync,
-    topology_capnp::topology,
-};
 use capnp::capability::Promise;
+use protocol::{gossip::gossip, node::node, server::cluster_session, sync::sync, topology::topology};
 
 #[derive(Clone)]
 pub struct ClusterSessionImpl {

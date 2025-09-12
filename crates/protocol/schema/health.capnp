@@ -17,3 +17,4 @@ enum NodeStatus {
   # reachable but persistent digest/root mismatch beyond grace window
   # (useful to signal "needs anti-entropy" without marking it down)
 }
+

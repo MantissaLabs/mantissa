@@ -1,7 +1,7 @@
 use crate::info_capnp::info as SystemInfo;
 use crate::node::id::new_node_id_v7;
 use crate::node::info::info::NodeInfo;
-use crate::node_capnp::node;
+use protocol::node::node;
 use capnp::capability::Promise;
 use capnp::message::Builder;
 use capnp::Error;

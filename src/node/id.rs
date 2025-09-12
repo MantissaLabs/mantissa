@@ -1,4 +1,4 @@
-use crate::topology_capnp::node_info::Reader as NodeInfo;
+use protocol::topology::node_info::Reader as NodeInfo;
 use capnp::Error as CapnpError;
 use uuid::Uuid;
 
@@ -29,13 +29,13 @@ pub fn uuid_sort_key(u: &Uuid) -> u128 {
 
 /// Set NodeId bytes into a builder (validates length via UUID first if you want).
 #[inline]
-pub fn set_node_id(mut id_builder: crate::node_capnp::node_id::Builder, id: &Uuid) {
+pub fn set_node_id(mut id_builder: protocol::node::node_id::Builder, id: &Uuid) {
     id_builder.set_bytes(&uuid_to_bytes(id));
 }
 
 /// Read NodeId (bytes) from a reader and return a Uuid.
 #[inline]
-pub fn read_node_id(id_reader: crate::node_capnp::node_id::Reader) -> Result<Uuid, CapnpError> {
+pub fn read_node_id(id_reader: protocol::node::node_id::Reader) -> Result<Uuid, CapnpError> {
     let bytes = id_reader.get_bytes()?; // &[u8]
     uuid_from_bytes(bytes).map_err(|e| CapnpError::failed(e))
 }

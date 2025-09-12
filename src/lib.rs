@@ -1,5 +1,4 @@
-pub mod includes;
-pub use includes::{
+pub use protocol::{
     gossip_capnp, health_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
     topology_capnp, utils_capnp,
 };

@@ -1,7 +1,7 @@
 use crate::client::config::ClientConfig;
 use crate::client::connection;
 use crate::node::id::{id_sort_key_uuid_bytes, id_string};
-use crate::topology_capnp::node_info::Reader as NodeInfo;
+use protocol::topology::node_info::Reader as NodeInfo;
 use anyhow::Result;
 use std::io::Write;
 use tabwriter::TabWriter;

@@ -7,7 +7,6 @@ mod client;
 pub mod container;
 mod crypto;
 mod gossip;
-mod includes;
 mod logger;
 pub mod monitor;
 mod net;
@@ -22,7 +21,7 @@ mod types;
 mod workload;
 
 use clap::Parser;
-use includes::{
+use protocol::{
     gossip_capnp, health_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
     topology_capnp, utils_capnp,
 };

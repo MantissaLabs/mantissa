@@ -1,13 +1,11 @@
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
-use crate::{
-    includes::sync_capnp::{sync, Domain},
-    store::peer_store::PeersStore,
-    sync_capnp::delta_sink,
-};
+use crate::store::peer_store::PeersStore;
+use protocol::sync::delta_sink;
 use bincode;
 use capnp::capability::Promise;
 use crdt_store::{compute_want_from_have, uuid_key::UuidKey};
 use crdts::MVReg;
+use protocol::sync::{sync, Domain};
 use tracing::debug;
 
 pub struct DeltaSinkImpl {
@@ -70,7 +68,9 @@ impl delta_sink::Server for DeltaSinkImpl {
     }
 }
 
-fn to_capnp<E: std::fmt::Display>(e: E) -> capnp::Error { capnp::Error::failed(e.to_string()) }
+fn to_capnp<E: std::fmt::Display>(e: E) -> capnp::Error {
+    capnp::Error::failed(e.to_string())
+}
 
 pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
     let res: Result<(), capnp::Error> = async {

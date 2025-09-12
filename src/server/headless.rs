@@ -8,10 +8,9 @@ use crate::{
         server::{RunHandles, RunMode, ServerImpl},
         Bootstrap, Components, Stores,
     },
-    server_capnp,
-    sync_capnp::{self, Domain},
-    topology_capnp::topology,
 };
+use protocol::sync::{self, Domain};
+use protocol::topology::topology;
 
 /// How this headless node exposes its Server during tests.
 #[derive(Clone, Debug)]
@@ -28,8 +27,8 @@ pub struct HeadlessNode {
 
     // Handy handles for tests
     pub topology_client: topology::Client,
-    pub server_client: server_capnp::server::Client,
-    pub sync_client: sync_capnp::sync::Client,
+    pub server_client: protocol::server::server::Client,
+    pub sync_client: protocol::sync::sync::Client,
 
     // Stores (optional inspection in tests)
     pub peers: crate::store::peer_store::PeersStore,
@@ -92,7 +91,7 @@ impl HeadlessNode {
         Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps).await;
 
         // Cap’n Proto Server capability
-        let server_client: server_capnp::server::Client =
+        let server_client: protocol::server::server::Client =
             capnp_rpc::new_client(server_impl.clone());
 
         // Keep a clone to use start/stop server on.
@@ -293,11 +292,10 @@ impl HeadlessNode {
     /// Quick-start **TCP** node with a custom sync tick on an ephemeral port.
     pub async fn new_tcp_ephemeral_with_tick(tick: Duration) -> io::Result<Self> {
         let (db, noise_keys, signing_key, id, tmp) = self_contained_state()?;
-        let mut node = Self::new_tcp_ephemeral_with_tick_from_parts(
-            db, noise_keys, signing_key, id, tick,
-        )
-        .await
-        .map_err(to_io)?;
+        let mut node =
+            Self::new_tcp_ephemeral_with_tick_from_parts(db, noise_keys, signing_key, id, tick)
+                .await
+                .map_err(to_io)?;
         node._tmp_dir = Some(tmp);
         Ok(node)
     }

@@ -95,10 +95,10 @@ struct NodeInfo {
   # nodes.
 
   publicKey @7 :Data;
-  # Noise public key.
+  # The node's static public key used in secure communications.
 
   signingKey @8 :Data;
-  # ed25519 verifying key (32 bytes)
+  # Ed25519 public key for signed cluster credentials.
 
   health @9 :NodeStatus;
   # Health status of the node.
@@ -106,6 +106,13 @@ struct NodeInfo {
 
 struct NodeList {
   nodes @0 :List(NodeInfo);
-  # Contains a list of nodes holding a membership in the
-  # cluster.
+}
+
+struct ClusterCredential {
+  # Signed by issuer's signing key; authorizes subject to open session.
+  issuer @0 :Data;  # ed25519 public key of issuer
+  subject @1 :Node.NodeId;
+  issuedAt @2 :UInt64;
+  expiresAt @3 :UInt64;
+  sig @4 :Data;  # signature over the payload
 }

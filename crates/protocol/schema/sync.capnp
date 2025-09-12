@@ -52,3 +52,4 @@ interface Sync {
   # Server streams chunks into that sink and calls end() when done.
   openDelta @2 (domain :Domain, want :PageRangeSummary, sink :DeltaSink);
 }
+

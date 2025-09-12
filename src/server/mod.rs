@@ -1,13 +1,12 @@
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::Message;
-use crate::gossip_capnp::gossip::Client as GossipClient;
-use crate::includes::sync_capnp;
+use protocol::gossip::gossip::Client as GossipClient;
 use crate::node::node;
 use crate::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::server::ServerImpl;
-use crate::server_capnp::server::Client as ServerClient;
+use protocol::server::server::Client as ServerClient;
 use crate::store::local::load_or_create_node_id;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
@@ -16,7 +15,8 @@ use crate::store::peer_store::{open_peers_store, PeersStore};
 use crate::sync::SyncService;
 use crate::token::TokenStore;
 use crate::topology::{PeerHandle, Topology};
-use crate::topology_capnp::topology::Client as TopologyClient;
+use protocol::topology::topology::Client as TopologyClient;
+use protocol::sync as sync_capnp;
 
 use async_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;
@@ -74,7 +74,7 @@ pub(crate) struct Bootstrap {
 
     // local node object + client
     node: node::Node,
-    node_client: crate::node_capnp::node::Client,
+    node_client: protocol::node::node::Client,
 }
 
 pub(crate) struct Stores {
@@ -89,7 +89,7 @@ pub(crate) struct Components {
     gossip_client: GossipClient,
     topology: Topology,
     topology_client: TopologyClient,
-    sync_client: sync_capnp::sync::Client,
+    sync_client: protocol::sync::sync::Client,
 }
 
 impl Bootstrap {
@@ -213,7 +213,7 @@ impl Bootstrap {
 
         // sync capability
         let sync_service = SyncService::new(stores.peers.clone());
-        let sync_client: sync_capnp::sync::Client = capnp_rpc::new_client(sync_service);
+        let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
 
         Ok(Components {
             gossip_client,

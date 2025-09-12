@@ -1,5 +1,5 @@
 use crate::topology::{peer_provider::PeerProvider, PeerHandle, Topology};
-use crate::topology_capnp::node_info as node_info_capnp;
+use protocol::topology::node_info as node_info_capnp;
 use capnp::Error as CapnpError;
 use async_trait::async_trait;
 use uuid::Uuid;

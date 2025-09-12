@@ -3,7 +3,7 @@ use crdt_store::PageDigestRange;
 /// Fill a capnp builder from a slice of page digest ranges.
 pub fn capnp_fill_ranges(
     ranges: &[PageDigestRange],
-    mut out: crate::sync_capnp::page_range_summary::Builder,
+    mut out: protocol::sync::page_range_summary::Builder,
 ) -> Result<(), capnp::Error> {
     let mut lst = out.reborrow().init_ranges(ranges.len() as u32);
     for (i, r) in ranges.iter().enumerate() {
@@ -17,7 +17,7 @@ pub fn capnp_fill_ranges(
 
 /// Parse page digest ranges from a capnp reader.
 pub fn page_ranges_from_capnp(
-    reader: crate::sync_capnp::page_range_summary::Reader,
+    reader: protocol::sync::page_range_summary::Reader,
 ) -> Result<Vec<PageDigestRange>, capnp::Error> {
     let ranges = reader.get_ranges()?;
     let mut out = Vec::with_capacity(ranges.len() as usize);
@@ -31,4 +31,3 @@ pub fn page_ranges_from_capnp(
     }
     Ok(out)
 }
-

@@ -5,15 +5,15 @@
 //! other nodes in the cluster based on events and updates to be applied.
 //!
 
-use crate::gossip_capnp::gossip;
-use crate::gossip_capnp::gossip_message::Which::*;
-use crate::gossip_capnp::message_list as ActionList;
 use crate::topology;
 use crate::topology::peer_provider::PeerProvider;
 use crate::topology::TopologyEvent;
 use async_channel::{Receiver, Sender};
 use capnp::capability::Promise;
 use capnp::Error;
+use protocol::gossip::gossip;
+use protocol::gossip::gossip_message::Which::*;
+use protocol::gossip::message_list as ActionList;
 use rand::rng;
 use rand::seq::IndexedRandom;
 use std::cell::RefCell;

@@ -1,12 +1,11 @@
 use crate::{
     client::errors::ClientConnectError,
-    includes::server_capnp::cluster_session,
     net::unix_socket::candidate_unix_socket_paths,
     noise::{client_handshake, load_or_generate_noise_keys},
-    server_capnp::server,
 };
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::{AsyncReadExt, FutureExt};
+use protocol::server::{cluster_session, server};
 use std::{
     fs, io,
     os::unix::fs::FileTypeExt,

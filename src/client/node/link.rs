@@ -1,6 +1,6 @@
 use crate::client::config::ClientConfig;
 use crate::client::connection;
-use crate::topology_capnp::join_request as JoinRequest;
+use protocol::topology::join_request as JoinRequest;
 use anyhow::{anyhow, Result};
 use capnp::message::Builder;
 
