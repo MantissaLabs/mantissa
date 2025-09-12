@@ -70,21 +70,18 @@ impl delta_sink::Server for DeltaSinkImpl {
     }
 }
 
-fn io_to_capnp(e: std::io::Error) -> capnp::Error {
-    capnp::Error::failed(e.to_string())
-}
+fn to_capnp<E: std::fmt::Display>(e: E) -> capnp::Error { capnp::Error::failed(e.to_string()) }
 
 pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
     let res: Result<(), capnp::Error> = async {
-        // Fast path: compare roots.
         let mut gr = sync_cap.get_root_request();
         gr.get().set_domain(Domain::Peers);
         let root_resp = gr.send().promise.await?;
-        let remote_root: String = root_resp.get()?.get_root_hex()?.to_string()?;
 
-        // root_hex() returns String, so no map_err here
+        let remote_root = root_resp.get()?.get_root_hex()?.to_string()?;
         let local_root = peers.root_hex().await;
 
+        // Compare roots, if equal: nothing to sync.
         if remote_root == local_root {
             return Ok(());
         }
@@ -95,8 +92,8 @@ pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
         let ranges_resp = rr.send().promise.await?;
         let remote_page_ranges = page_ranges_from_capnp(ranges_resp.get()?.get_summary()?)?;
 
-        // Local ranges (this is io::Result, so convert)
-        let local_page_ranges = peers.page_range_summary().await.map_err(io_to_capnp)?;
+        // Local ranges
+        let local_page_ranges = peers.page_range_summary().await.map_err(to_capnp)?;
 
         // Compute want
         let want_ranges = compute_want_from_have(&remote_page_ranges, &local_page_ranges);

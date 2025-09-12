@@ -412,7 +412,10 @@ impl Topology {
     }
 
     pub async fn restore_peers(&self) -> std::io::Result<()> {
-        self.peers.rebuild_mst_from_disk().await
+        self.peers
+            .rebuild_mst_from_disk()
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn register_peer(
@@ -428,7 +431,7 @@ impl Topology {
 
     /// Return true if the peer `id` already exists in the peers store.
     pub fn peer_exists(&self, id: Uuid) -> io::Result<bool> {
-        self.peers.exists(&UuidKey::from(id))
+        self.peers.exists(&UuidKey::from(id)).map_err(Into::into)
     }
 
     pub async fn remove_peer(&self, id: Uuid) -> Result<(), Box<dyn std::error::Error>> {

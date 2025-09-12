@@ -7,7 +7,7 @@
 //! This module exposes fast range-based delta export/import primitives to power
 //! anti-entropy sync between peers.
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+// base64 used only in debug helpers/tests; prefer fully-qualified calls to avoid unused imports.
 use merkle_search_tree::digest::Hasher as MstHasher;
 use merkle_search_tree::{builder::Builder, MerkleSearchTree};
 use redb::ReadableTable;
@@ -19,6 +19,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::adapter::RegAdapter;
+use crate::error::Error;
 use crate::table_set::TableSet;
 
 /// Value stored in each MST leaf.
@@ -58,14 +59,8 @@ pub struct PageDigestRange {
 }
 
 #[inline]
-fn into_io<E: std::error::Error>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
-}
-
-/// Convert a logical key to the raw byte ordering used by MST/page ranges.
-#[inline]
-fn key_to_raw_bytes<C: RegAdapter>(k: &C::Key) -> Vec<u8> {
-    C::key_to_bytes(k)
+fn into_err<E: Into<Error>>(e: E) -> Error {
+    e.into()
 }
 
 /// CRDT + MST store. Parameterized by:
@@ -104,48 +99,46 @@ where
         + 'static,
     T: TableSet,
 {
+    /// Create a builder to customize MST options (e.g., hasher).
+    pub fn builder(db: Arc<redb::Database>, actor: C::Actor) -> StoreBuilder<C, H, T> {
+        StoreBuilder::<C, H, T> {
+            db,
+            actor,
+            hasher: None,
+            _tables: std::marker::PhantomData,
+        }
+    }
+
     /// Start a delta-apply session. Apply one or more chunks, then call `commit()`.
     pub fn begin_delta_apply(&self) -> DeltaApplySession<'_, C, H, T> {
-        DeltaApplySession { store: self }
+        DeltaApplySession {
+            store: self,
+            finalize: FinalizeStrategy::Rebuild,
+        }
     }
 
     /// Open (or initialize) the underlying tables and create an empty in-memory MST.
-    pub fn open(db: Arc<redb::Database>, actor: C::Actor) -> io::Result<Self> {
-        // Ensure tables exist
-        let w = db.begin_write().map_err(into_io)?;
-        let _ = w.open_table(T::values()).map_err(into_io)?;
-        let _ = w.open_table(T::tombs()).map_err(into_io)?;
-        let _ = w.open_table(T::meta()).map_err(into_io)?;
-        w.commit().map_err(into_io)?;
-
-        let mst = Arc::new(RwLock::new(
-            Builder::default().with_hasher(H::default()).build(),
-        ));
-        Ok(Self {
-            db,
-            actor,
-            mst,
-            _tables: std::marker::PhantomData,
-        })
+    pub fn open(db: Arc<redb::Database>, actor: C::Actor) -> crate::Result<Self> {
+        Self::builder(db, actor).build()
     }
 
     /// Return whether a register value exists for key `k`.
-    pub fn exists(&self, k: &C::Key) -> io::Result<bool> {
-        let r = self.db.begin_read().map_err(into_io)?;
-        let t = r.open_table(T::values()).map_err(into_io)?;
+    pub fn exists(&self, k: &C::Key) -> crate::Result<bool> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let t = r.open_table(T::values()).map_err(into_err)?;
         Ok(t.get(Self::encode_key(k).as_slice())
-            .map_err(into_io)?
+            .map_err(into_err)?
             .is_some())
     }
 
     #[inline]
-    fn encode_reg(r: &C::Reg) -> io::Result<Vec<u8>> {
-        bincode::serialize(r).map_err(into_io)
+    fn encode_reg(r: &C::Reg) -> crate::Result<Vec<u8>> {
+        bincode::serialize(r).map_err(into_err)
     }
 
     #[inline]
-    fn decode_reg(bytes: &[u8]) -> io::Result<C::Reg> {
-        bincode::deserialize(bytes).map_err(into_io)
+    fn decode_reg(bytes: &[u8]) -> crate::Result<C::Reg> {
+        bincode::deserialize(bytes).map_err(into_err)
     }
 
     #[inline]
@@ -154,20 +147,20 @@ where
     }
 
     #[inline]
-    fn decode_key(bytes: &[u8]) -> io::Result<C::Key> {
-        C::key_from_bytes(bytes)
+    fn decode_key(bytes: &[u8]) -> crate::Result<C::Key> {
+        C::key_from_bytes(bytes).map_err(into_err)
     }
 
     /// Rebuild the in-memory MST from durable registers + tombstones.
-    pub async fn rebuild_mst_from_disk(&self) -> io::Result<()> {
-        let r = self.db.begin_read().map_err(into_io)?;
-        let values = r.open_table(T::values()).map_err(into_io)?;
-        let tombs = r.open_table(T::tombs()).map_err(into_io)?;
+    pub async fn rebuild_mst_from_disk(&self) -> crate::Result<()> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let values = r.open_table(T::values()).map_err(into_err)?;
+        let tombs = r.open_table(T::tombs()).map_err(into_err)?;
 
         // Collect snapshots
         let mut actives: Vec<(C::Key, C::Snapshot)> = {
             let mut out = Vec::new();
-            let mut it = values.iter().map_err(into_io)?;
+            let mut it = values.iter().map_err(into_err)?;
             while let Some(Ok((k_guard, v_guard))) = it.next() {
                 let key = Self::decode_key(k_guard.value())?;
                 let reg = Self::decode_reg(v_guard.value())?;
@@ -179,7 +172,7 @@ where
 
         let mut tomb_list: Vec<(C::Key, u64)> = {
             let mut out = Vec::new();
-            let mut it = tombs.iter().map_err(into_io)?;
+            let mut it = tombs.iter().map_err(into_err)?;
             while let Some(Ok((k_guard, ts_guard))) = it.next() {
                 out.push((Self::decode_key(k_guard.value())?, ts_guard.value()));
             }
@@ -232,12 +225,12 @@ where
     }
 
     /// Insert or update value for key `k`.
-    pub async fn upsert(&self, k: &C::Key, v: C::Value) -> io::Result<()> {
+    pub async fn upsert(&self, k: &C::Key, v: C::Value) -> crate::Result<()> {
         // Load current register (if any)
         let current = {
-            let r = self.db.begin_read().map_err(into_io)?;
-            let t = r.open_table(T::values()).map_err(into_io)?;
-            match t.get(Self::encode_key(k).as_slice()).map_err(into_io)? {
+            let r = self.db.begin_read().map_err(into_err)?;
+            let t = r.open_table(T::values()).map_err(into_err)?;
+            match t.get(Self::encode_key(k).as_slice()).map_err(into_err)? {
                 Some(row) => Some(Self::decode_reg(row.value())?),
                 None => None,
             }
@@ -247,23 +240,23 @@ where
         let snap = C::snapshot_reg(&new_reg);
 
         // Persist: write register + clear tombstone
-        let w = self.db.begin_write().map_err(into_io)?;
+        let w = self.db.begin_write().map_err(into_err)?;
         {
-            let mut values = w.open_table(T::values()).map_err(into_io)?;
+            let mut values = w.open_table(T::values()).map_err(into_err)?;
             values
                 .insert(
                     Self::encode_key(k).as_slice(),
                     Self::encode_reg(&new_reg)?.as_slice(),
                 )
-                .map_err(into_io)?;
+                .map_err(into_err)?;
         }
         {
-            let mut tombs = w.open_table(T::tombs()).map_err(into_io)?;
+            let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
             let _ = tombs
                 .remove(Self::encode_key(k).as_slice())
-                .map_err(into_io)?;
+                .map_err(into_err)?;
         }
-        w.commit().map_err(into_io)?;
+        w.commit().map_err(into_err)?;
 
         // Reflect in MST
         let mut t = self.mst.write().await;
@@ -273,33 +266,33 @@ where
     }
 
     /// Remove key and persist a tombstone with a monotonic sequence.
-    pub async fn remove(&self, k: &C::Key) -> io::Result<u64> {
+    pub async fn remove(&self, k: &C::Key) -> crate::Result<u64> {
         // First check if tomb already exists; if so, do NOT allocate a new seq.
         let (already_tombstoned, needs_value_drop) = {
-            let r = self.db.begin_read().map_err(into_io)?;
-            let tombstones = r.open_table(T::tombs()).map_err(into_io)?;
-            let values = r.open_table(T::values()).map_err(into_io)?;
+            let r = self.db.begin_read().map_err(into_err)?;
+            let tombstones = r.open_table(T::tombs()).map_err(into_err)?;
+            let values = r.open_table(T::values()).map_err(into_err)?;
 
             let kb = Self::encode_key(k);
             let tomb_ts = tombstones
                 .get(kb.as_slice())
-                .map_err(into_io)?
+                .map_err(into_err)?
                 .map(|g| g.value());
-            let value_exists = values.get(kb.as_slice()).map_err(into_io)?.is_some();
+            let value_exists = values.get(kb.as_slice()).map_err(into_err)?.is_some();
 
             (tomb_ts, value_exists)
         };
 
         if let Some(ts) = already_tombstoned {
             // Ensure value row is gone and MST reflects the *existing* monotonic ts.
-            let w = self.db.begin_write().map_err(into_io)?;
+            let w = self.db.begin_write().map_err(into_err)?;
             if needs_value_drop {
-                let mut values = w.open_table(T::values()).map_err(into_io)?;
+                let mut values = w.open_table(T::values()).map_err(into_err)?;
                 let _ = values
                     .remove(Self::encode_key(k).as_slice())
-                    .map_err(into_io)?;
+                    .map_err(into_err)?;
             }
-            w.commit().map_err(into_io)?;
+            w.commit().map_err(into_err)?;
 
             let mut t = self.mst.write().await;
             t.upsert(k.clone(), &Entry::Deleted { ts });
@@ -307,29 +300,29 @@ where
         }
 
         // No tombstone yet: allocate a new sequence and persist.
-        let w = self.db.begin_write().map_err(into_io)?;
+        let w = self.db.begin_write().map_err(into_err)?;
         let ts = {
-            let mut meta = w.open_table(T::meta()).map_err(into_io)?;
-            let next = match meta.get("tomb_seq").map_err(into_io)? {
+            let mut meta = w.open_table(T::meta()).map_err(into_err)?;
+            let next = match meta.get("tomb_seq").map_err(into_err)? {
                 Some(g) => g.value().saturating_add(1),
                 None => 1,
             };
-            meta.insert("tomb_seq", &next).map_err(into_io)?;
+            meta.insert("tomb_seq", &next).map_err(into_err)?;
             next
         };
         {
-            let mut values = w.open_table(T::values()).map_err(into_io)?;
+            let mut values = w.open_table(T::values()).map_err(into_err)?;
             let _ = values
                 .remove(Self::encode_key(k).as_slice())
-                .map_err(into_io)?;
+                .map_err(into_err)?;
         }
         {
-            let mut tombs = w.open_table(T::tombs()).map_err(into_io)?;
+            let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
             tombs
                 .insert(Self::encode_key(k).as_slice(), &ts)
-                .map_err(into_io)?;
+                .map_err(into_err)?;
         }
-        w.commit().map_err(into_io)?;
+        w.commit().map_err(into_err)?;
 
         let mut t = self.mst.write().await;
         t.upsert(k.clone(), &Entry::Deleted { ts });
@@ -337,12 +330,12 @@ where
     }
 
     /// Merge a remote register for key `k` into durable state and MST, clearing any local tombstone.
-    pub async fn merge_register(&self, k: &C::Key, incoming: &C::Reg) -> io::Result<()> {
+    pub async fn merge_register(&self, k: &C::Key, incoming: &C::Reg) -> crate::Result<()> {
         // Read current reg (if any)
         let current = {
-            let r = self.db.begin_read().map_err(into_io)?;
-            let t = r.open_table(T::values()).map_err(into_io)?;
-            match t.get(Self::encode_key(k).as_slice()).map_err(into_io)? {
+            let r = self.db.begin_read().map_err(into_err)?;
+            let t = r.open_table(T::values()).map_err(into_err)?;
+            match t.get(Self::encode_key(k).as_slice()).map_err(into_err)? {
                 Some(row) => Some(Self::decode_reg(row.value())?),
                 None => None,
             }
@@ -352,23 +345,23 @@ where
         let merged = C::merge_regs(current, incoming.clone());
         let snap = C::snapshot_reg(&merged);
 
-        let w = self.db.begin_write().map_err(into_io)?;
+        let w = self.db.begin_write().map_err(into_err)?;
         {
-            let mut values = w.open_table(T::values()).map_err(into_io)?;
+            let mut values = w.open_table(T::values()).map_err(into_err)?;
             values
                 .insert(
                     Self::encode_key(k).as_slice(),
                     Self::encode_reg(&merged)?.as_slice(),
                 )
-                .map_err(into_io)?;
+                .map_err(into_err)?;
         }
         {
-            let mut tombs = w.open_table(T::tombs()).map_err(into_io)?;
+            let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
             let _ = tombs
                 .remove(Self::encode_key(k).as_slice())
-                .map_err(into_io)?;
+                .map_err(into_err)?;
         }
-        w.commit().map_err(into_io)?;
+        w.commit().map_err(into_err)?;
 
         // Update MST
         let mut t = self.mst.write().await;
@@ -378,23 +371,23 @@ where
 
     /// Apply an inbound tombstone (idempotent, monotonic).
     pub async fn apply_tombstone(&self, k: &C::Key, ts: u64) -> io::Result<()> {
-        let w = self.db.begin_write().map_err(into_io)?;
+        let w = self.db.begin_write().map_err(into_err)?;
         {
-            let mut values = w.open_table(T::values()).map_err(into_io)?;
+            let mut values = w.open_table(T::values()).map_err(into_err)?;
             let _ = values
                 .remove(Self::encode_key(k).as_slice())
-                .map_err(into_io)?;
+                .map_err(into_err)?;
         }
         {
-            let mut tombs = w.open_table(T::tombs()).map_err(into_io)?;
+            let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
             let kb = Self::encode_key(k);
-            let next_ts = match tombs.get(kb.as_slice()).map_err(into_io)? {
+            let next_ts = match tombs.get(kb.as_slice()).map_err(into_err)? {
                 Some(g) => g.value().max(ts),
                 None => ts,
             };
-            tombs.insert(kb.as_slice(), &next_ts).map_err(into_io)?;
+            tombs.insert(kb.as_slice(), &next_ts).map_err(into_err)?;
         }
-        w.commit().map_err(into_io)?;
+        w.commit().map_err(into_err)?;
 
         let mut t = self.mst.write().await;
         t.upsert(k.clone(), &Entry::Deleted { ts });
@@ -409,13 +402,13 @@ where
     ) -> io::Result<()> {
         // Prepare merged registers by reading current values once.
         let merged_regs: Vec<(C::Key, C::Reg)> = {
-            let r = self.db.begin_read().map_err(into_io)?;
-            let values = r.open_table(T::values()).map_err(into_io)?;
+            let r = self.db.begin_read().map_err(into_err)?;
+            let values = r.open_table(T::values()).map_err(into_err)?;
 
             let mut out = Vec::with_capacity(regs.len());
             for (k, incoming) in regs {
                 let kb = Self::encode_key(&k);
-                let current = match values.get(kb.as_slice()).map_err(into_io)? {
+                let current = match values.get(kb.as_slice()).map_err(into_err)? {
                     Some(row) => Some(Self::decode_reg(row.value())?),
                     None => None,
                 };
@@ -425,10 +418,10 @@ where
         };
 
         // Single write transaction for everything:
-        let w = self.db.begin_write().map_err(into_io)?;
+        let w = self.db.begin_write().map_err(into_err)?;
         {
-            let mut tv = w.open_table(T::values()).map_err(into_io)?;
-            let mut tt = w.open_table(T::tombs()).map_err(into_io)?;
+            let mut tv = w.open_table(T::values()).map_err(into_err)?;
+            let mut tt = w.open_table(T::tombs()).map_err(into_err)?;
 
             // Apply merged registers (and clear any tombstone)
             for (k, reg) in &merged_regs {
@@ -436,20 +429,20 @@ where
                     Self::encode_key(k).as_slice(),
                     Self::encode_reg(reg)?.as_slice(),
                 )
-                .map_err(into_io)?;
-                let _ = tt.remove(Self::encode_key(k).as_slice()).map_err(into_io)?;
+                .map_err(into_err)?;
+                let _ = tt.remove(Self::encode_key(k).as_slice()).map_err(into_err)?;
             }
 
             // Apply tombstones (and remove register rows)
             for (k, ts) in tombs {
                 tt.insert(Self::encode_key(&k).as_slice(), &ts)
-                    .map_err(into_io)?;
+                    .map_err(into_err)?;
                 let _ = tv
                     .remove(Self::encode_key(&k).as_slice())
-                    .map_err(into_io)?;
+                    .map_err(into_err)?;
             }
         }
-        w.commit().map_err(into_io)?;
+        w.commit().map_err(into_err)?;
 
         Ok(())
     }
@@ -463,13 +456,13 @@ where
     ) -> io::Result<()> {
         // Prepare merged registers by reading current values once.
         let merged_regs: Vec<(C::Key, C::Reg)> = {
-            let r = self.db.begin_read().map_err(into_io)?;
-            let values = r.open_table(T::values()).map_err(into_io)?;
+            let r = self.db.begin_read().map_err(into_err)?;
+            let values = r.open_table(T::values()).map_err(into_err)?;
 
             let mut out = Vec::with_capacity(regs.len());
             for (k, incoming) in regs {
                 let kb = Self::encode_key(&k);
-                let current = match values.get(kb.as_slice()).map_err(into_io)? {
+                let current = match values.get(kb.as_slice()).map_err(into_err)? {
                     Some(row) => Some(Self::decode_reg(row.value())?),
                     None => None,
                 };
@@ -479,27 +472,27 @@ where
         };
 
         // Single write transaction for everything:
-        let w = self.db.begin_write().map_err(into_io)?;
+        let w = self.db.begin_write().map_err(into_err)?;
         {
-            let mut tv = w.open_table(T::values()).map_err(into_io)?;
-            let mut tt = w.open_table(T::tombs()).map_err(into_io)?;
+            let mut tv = w.open_table(T::values()).map_err(into_err)?;
+            let mut tt = w.open_table(T::tombs()).map_err(into_err)?;
 
             for (k, reg) in &merged_regs {
                 tv.insert(
                     Self::encode_key(k).as_slice(),
                     Self::encode_reg(reg)?.as_slice(),
                 )
-                .map_err(into_io)?;
-                let _ = tt.remove(Self::encode_key(k).as_slice()).map_err(into_io)?;
+                .map_err(into_err)?;
+                let _ = tt.remove(Self::encode_key(k).as_slice()).map_err(into_err)?;
             }
 
             for (k, ts) in &tombs {
                 tt.insert(Self::encode_key(k).as_slice(), ts)
-                    .map_err(into_io)?;
-                let _ = tv.remove(Self::encode_key(k).as_slice()).map_err(into_io)?;
+                    .map_err(into_err)?;
+                let _ = tv.remove(Self::encode_key(k).as_slice()).map_err(into_err)?;
             }
         }
-        w.commit().map_err(into_io)?;
+        w.commit().map_err(into_err)?;
 
         // Reflect in MST in the same logical order: regs then tombs.
         {
@@ -517,19 +510,19 @@ where
     }
 
     /// Rebuild MST once after a sequence of `apply_delta_chunk()` calls.
-    pub async fn finalize_after_stream(&self) -> io::Result<()> {
+    pub async fn finalize_after_stream(&self) -> crate::Result<()> {
         self.rebuild_mst_from_disk().await
     }
 
     /// Dump durable (key, snapshot) and (key, tombstone).
-    pub fn load_all(&self) -> io::Result<(Vec<(C::Key, C::Snapshot)>, Vec<(C::Key, u64)>)> {
-        let r = self.db.begin_read().map_err(into_io)?;
-        let values = r.open_table(T::values()).map_err(into_io)?;
-        let tombs = r.open_table(T::tombs()).map_err(into_io)?;
+    pub fn load_all(&self) -> crate::Result<(Vec<(C::Key, C::Snapshot)>, Vec<(C::Key, u64)>)> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let values = r.open_table(T::values()).map_err(into_err)?;
+        let tombs = r.open_table(T::tombs()).map_err(into_err)?;
 
         let mut actives = Vec::new();
         {
-            let mut it = values.iter().map_err(into_io)?;
+            let mut it = values.iter().map_err(into_err)?;
             while let Some(Ok((k, v))) = it.next() {
                 let key = Self::decode_key(k.value())?;
                 let reg = Self::decode_reg(v.value())?;
@@ -539,7 +532,7 @@ where
 
         let mut tomb_list = Vec::new();
         {
-            let mut it = tombs.iter().map_err(into_io)?;
+            let mut it = tombs.iter().map_err(into_err)?;
             while let Some(Ok((k, ts))) = it.next() {
                 tomb_list.push((Self::decode_key(k.value())?, ts.value()));
             }
@@ -547,12 +540,42 @@ where
         Ok((actives, tomb_list))
     }
 
+    /// Visit all snapshots using a single read transaction without building a Vec.
+    pub fn for_each_snapshot<F>(&self, mut f: F) -> crate::Result<()>
+    where
+        F: FnMut(C::Key, C::Snapshot),
+    {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let values = r.open_table(T::values()).map_err(into_err)?;
+        let mut it = values.iter().map_err(into_err)?;
+        while let Some(Ok((k, v))) = it.next() {
+            let key = Self::decode_key(k.value())?;
+            let reg = Self::decode_reg(v.value())?;
+            f(key, C::snapshot_reg(&reg));
+        }
+        Ok(())
+    }
+
+    /// Visit all tombstones using a single read transaction without building a Vec.
+    pub fn for_each_tombstone<F>(&self, mut f: F) -> crate::Result<()>
+    where
+        F: FnMut(C::Key, u64),
+    {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let tombs = r.open_table(T::tombs()).map_err(into_err)?;
+        let mut it = tombs.iter().map_err(into_err)?;
+        while let Some(Ok((k, ts))) = it.next() {
+            f(Self::decode_key(k.value())?, ts.value());
+        }
+        Ok(())
+    }
+
     /// Read and return the current snapshot for key `k`, if present.
-    pub fn get_snapshot(&self, k: &C::Key) -> io::Result<Option<C::Snapshot>> {
-        let r = self.db.begin_read().map_err(into_io)?;
-        let t = r.open_table(T::values()).map_err(into_io)?;
+    pub fn get_snapshot(&self, k: &C::Key) -> crate::Result<Option<C::Snapshot>> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let t = r.open_table(T::values()).map_err(into_err)?;
         let kb = Self::encode_key(k);
-        match t.get(kb.as_slice()).map_err(into_io)? {
+        match t.get(kb.as_slice()).map_err(into_err)? {
             Some(v) => {
                 let reg = Self::decode_reg(v.value())?;
                 Ok(Some(C::snapshot_reg(&reg)))
@@ -562,7 +585,7 @@ where
     }
 
     /// Return page summaries (inclusive [start,end] + digest) for the current MST.
-    pub async fn page_range_summary(&self) -> io::Result<Vec<PageDigestRange>> {
+    pub async fn page_range_summary(&self) -> crate::Result<Vec<PageDigestRange>> {
         let mut t = self.mst.write().await;
         // Ensure root is computed
         let _ = t.root_hash();
@@ -585,10 +608,10 @@ where
     pub fn export_page_ranges_delta(
         &self,
         want: &[PageDigestRange],
-    ) -> io::Result<(Vec<(C::Key, C::Reg)>, Vec<(C::Key, u64)>)> {
-        let r = self.db.begin_read().map_err(into_io)?;
-        let values = r.open_table(T::values()).map_err(into_io)?;
-        let tombstones = r.open_table(T::tombs()).map_err(into_io)?;
+    ) -> crate::Result<(Vec<(C::Key, C::Reg)>, Vec<(C::Key, u64)>)> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let values = r.open_table(T::values()).map_err(into_err)?;
+        let tombstones = r.open_table(T::tombs()).map_err(into_err)?;
 
         let mut registers_out: Vec<(C::Key, C::Reg)> = Vec::new();
         let mut tombstones_out: Vec<(C::Key, u64)> = Vec::new();
@@ -603,7 +626,7 @@ where
 
             // Registers in [start, end]
             {
-                let mut it = values.range(start..=end).map_err(into_io)?;
+                let mut it = values.range(start..=end).map_err(into_err)?;
                 while let Some(Ok((k_g, v_g))) = it.next() {
                     let k_bytes = k_g.value();
                     if !seen_regs.insert(k_bytes.to_vec()) {
@@ -617,7 +640,7 @@ where
 
             // Tombstones in [start, end]
             {
-                let mut it = tombstones.range(start..=end).map_err(into_io)?;
+                let mut it = tombstones.range(start..=end).map_err(into_err)?;
                 while let Some(Ok((k_g, ts_g))) = it.next() {
                     let k_bytes = k_g.value();
                     if !seen_tombs.insert(k_bytes.to_vec()) {
@@ -632,101 +655,138 @@ where
         Ok((registers_out, tombstones_out))
     }
 
-    // Debug helpers
+    // Debug helpers (feature-gated). When disabled, they are cheap no-ops.
     pub async fn debug_dump_root(&self, label: &str) {
-        let hex = self.root_hex().await;
-        debug!(target: "merkle search tree", "{label}: root={hex}");
+        if std::env::var_os("CRDT_STORE_DEBUG_DUMP").is_some() {
+            let hex = self.root_hex().await;
+            debug!(target: "merkle search tree", "{label}: root={hex}");
+        } else {
+            let _ = label;
+        }
     }
 
     pub async fn debug_dump_ranges(&self, label: &str, limit: usize) {
-        let mut t = self.mst.write().await;
-        let _ = t.root_hash();
-        let prs = t.serialise_page_ranges().unwrap_or_default();
+        if std::env::var_os("CRDT_STORE_DEBUG_DUMP").is_some() {
+            let mut t = self.mst.write().await;
+            let _ = t.root_hash();
+            let prs = t.serialise_page_ranges().unwrap_or_default();
 
-        debug!(target: "merkle search tree", "{label}: {} ranges", prs.len());
-        for (i, pr) in prs.iter().take(limit).enumerate() {
-            let s = C::key_to_bytes(pr.start());
-            let e = C::key_to_bytes(pr.end());
-            let h = pr.hash().as_ref();
-            debug!(
-                target: "merkle search tree",
-                "  [{:03}] start={:02X?} end={:02X?} hash={:02X?}",
-                i,
-                &s[..std::cmp::min(6, s.len())],
-                &e[..std::cmp::min(6, e.len())],
-                &h[..std::cmp::min(6, h.len())],
-            );
+            debug!(target: "merkle search tree", "{label}: {} ranges", prs.len());
+            for (i, pr) in prs.iter().take(limit).enumerate() {
+                let s = C::key_to_bytes(pr.start());
+                let e = C::key_to_bytes(pr.end());
+                let h = pr.hash().as_ref();
+                debug!(
+                    target: "merkle search tree",
+                    "  [{:03}] start={:02X?} end={:02X?} hash={:02X?}",
+                    i,
+                    &s[..std::cmp::min(6, s.len())],
+                    &e[..std::cmp::min(6, e.len())],
+                    &h[..std::cmp::min(6, h.len())],
+                );
+            }
+        } else {
+            let _ = (label, limit);
         }
     }
 
     /// Print the exact bytes we hash per leaf Entry (canonical). Debug only.
     #[allow(dead_code)]
     pub fn debug_dump_leaf_bytes_from_store(&self) -> io::Result<()> {
-        let (actives, tombs) = self.load_all()?;
+        if std::env::var_os("CRDT_STORE_DEBUG_DUMP").is_some() {
+            let (actives, tombs) = self.load_all()?;
 
-        println!("[LEAVES] actives:");
-        for (k, snap) in actives {
-            let mut sink = HashBytes::default();
-            Entry::Active(snap).hash(&mut sink);
-            println!(
-                "  key={:?} bytes(base64)={}",
-                k.as_ref(),
-                B64.encode(&sink.as_slice())
-            );
-        }
+            println!("[LEAVES] actives:");
+            for (k, snap) in actives {
+                let mut sink = HashBytes::default();
+                Entry::Active(snap).hash(&mut sink);
+                use base64::Engine as _;
+                println!(
+                    "  key={:?} bytes(base64)={}",
+                    k.as_ref(),
+                    base64::engine::general_purpose::STANDARD.encode(&sink.as_slice()),
+                );
+            }
 
-        println!("[LEAVES] tombstones:");
-        for (k, ts) in tombs {
-            let mut sink = HashBytes::default();
-            let e: Entry<C::Snapshot> = Entry::Deleted { ts };
-            e.hash(&mut sink);
-            println!(
-                "  key={:?} bytes(base64)={}",
-                k.as_ref(),
-                B64.encode(sink.as_slice())
-            );
+            println!("[LEAVES] tombstones:");
+            for (k, ts) in tombs {
+                let mut sink = HashBytes::default();
+                let e: Entry<C::Snapshot> = Entry::Deleted { ts };
+                e.hash(&mut sink);
+                use base64::Engine as _;
+                println!(
+                    "  key={:?} bytes(base64)={}",
+                    k.as_ref(),
+                    base64::engine::general_purpose::STANDARD.encode(&sink.as_slice()),
+                );
+            }
+            Ok(())
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 }
 
-// RangeIndex: fast membership check for many inclusive [start,end] ranges.
-struct RangeIndex {
-    // Sorted by start lexicographically (MST key ordering).
-    starts: Vec<Vec<u8>>,
-    ranges: Vec<(Vec<u8>, Vec<u8>)>, // (start, end)
+/// Builder for `CrdtMstStore` to customize MST options (hasher selection, future knobs).
+pub struct StoreBuilder<C, H, T>
+where
+    C: RegAdapter,
+    C::Key: AsRef<[u8]> + std::fmt::Debug,
+    H: MstHasher<16, C::Key>
+        + MstHasher<16, Entry<C::Snapshot>>
+        + Default
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    T: TableSet,
+{
+    db: Arc<redb::Database>,
+    actor: C::Actor,
+    hasher: Option<H>,
+    _tables: std::marker::PhantomData<T>,
 }
 
-impl RangeIndex {
-    fn new(ranges: &[PageDigestRange]) -> Self {
-        let mut rs: Vec<(Vec<u8>, Vec<u8>)> = ranges
-            .iter()
-            .map(|r| (r.start.clone(), r.end.clone()))
-            .collect();
-        rs.sort_by(|a, b| a.0.cmp(&b.0));
-        let starts = rs.iter().map(|(s, _)| s.clone()).collect();
-        Self { starts, ranges: rs }
+impl<C, H, T> StoreBuilder<C, H, T>
+where
+    C: RegAdapter,
+    C::Key: AsRef<[u8]> + std::fmt::Debug,
+    H: MstHasher<16, C::Key>
+        + MstHasher<16, Entry<C::Snapshot>>
+        + Default
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    T: TableSet,
+{
+    /// Override the hasher used by the MST.
+    pub fn with_hasher(mut self, h: H) -> Self {
+        self.hasher = Some(h);
+        self
     }
 
-    /// Returns true if `key` is inside any inclusive [start, end].
-    /// Complexity: O(log r) binary search + O(1) final bound check.
-    fn contains(&self, key: &[u8]) -> bool {
-        if self.ranges.is_empty() {
-            return false;
-        }
-        // upper_bound(start <= key) → candidate is at pos-1
-        let pos = self
-            .starts
-            .binary_search_by(|probe| probe.as_slice().cmp(key))
-            .map(|i| i + 1)
-            .unwrap_or_else(|i| i);
-        if pos == 0 {
-            return false;
-        }
-        let (start, end) = &self.ranges[pos - 1];
-        start.as_slice() <= key && key <= end.as_slice()
+    /// Build and open the store.
+    pub fn build(self) -> crate::Result<CrdtMstStore<C, H, T>> {
+        // Ensure tables exist
+        let w = self.db.begin_write().map_err(into_err)?;
+        let _ = w.open_table(T::values()).map_err(into_err)?;
+        let _ = w.open_table(T::tombs()).map_err(into_err)?;
+        let _ = w.open_table(T::meta()).map_err(into_err)?;
+        w.commit().map_err(into_err)?;
+
+        let hasher = self.hasher.unwrap_or_default();
+        let mst = Arc::new(RwLock::new(Builder::default().with_hasher(hasher).build()));
+        Ok(CrdtMstStore {
+            db: self.db,
+            actor: self.actor,
+            mst,
+            _tables: std::marker::PhantomData,
+        })
     }
 }
+
+// RangeIndex removed in favor of direct Redb range-scans in export_page_ranges_delta.
 
 /// A simple guard to apply multiple delta chunks, then finalize once.
 pub struct DeltaApplySession<'a, C, H, T>
@@ -743,6 +803,7 @@ where
     T: TableSet,
 {
     store: &'a CrdtMstStore<C, H, T>,
+    finalize: FinalizeStrategy,
 }
 
 impl<'a, C, H, T> DeltaApplySession<'a, C, H, T>
@@ -763,14 +824,29 @@ where
         &self,
         regs: Vec<(C::Key, C::Reg)>,
         tombs: Vec<(C::Key, u64)>,
-    ) -> io::Result<()> {
-        self.store.apply_delta_chunk(regs, tombs)
+    ) -> crate::Result<()> {
+        Ok(self.store.apply_delta_chunk(regs, tombs)?)
     }
 
     /// Finalize once after all chunks (rebuild MST from disk).
-    pub async fn commit(self) -> io::Result<()> {
-        self.store.finalize_after_stream().await
+    pub async fn commit(self) -> crate::Result<()> {
+        match self.finalize {
+            FinalizeStrategy::Rebuild => self.store.finalize_after_stream().await,
+            FinalizeStrategy::NoOp => Ok(()),
+        }
     }
+
+    /// Choose commit() finalize behavior. Default is Rebuild.
+    pub fn with_finalize_strategy(mut self, s: FinalizeStrategy) -> Self {
+        self.finalize = s;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum FinalizeStrategy {
+    Rebuild,
+    NoOp,
 }
 
 /// Compute what we want from `remote` that is either missing locally or has a different digest.
@@ -881,6 +957,7 @@ mod tests {
         let s = store.root_hex().await; // string representation from MST
         let d = store.root_digest().await; // raw bytes
                                            // The MerkleSearchTree's root to_string() is base64 over the raw digest bytes.
+        use base64::Engine as _;
         let expect = base64::engine::general_purpose::STANDARD.encode(d);
         assert_eq!(s, expect);
     }
@@ -941,8 +1018,8 @@ mod tests {
 
         // Ask for ranges that cover keys 2..4
         let want = vec![PageDigestRange {
-            start: key_to_raw_bytes::<Adapter>(&key(2)),
-            end: key_to_raw_bytes::<Adapter>(&key(4)),
+            start: <Adapter as RegAdapter>::key_to_bytes(&key(2)),
+            end: <Adapter as RegAdapter>::key_to_bytes(&key(4)),
             hash: vec![],
         }];
 
@@ -1008,13 +1085,13 @@ mod tests {
         // Two overlapping wants: [2,4] and [3,5]
         let want = vec![
             PageDigestRange {
-                start: key_to_raw_bytes::<Adapter>(&key(2)),
-                end: key_to_raw_bytes::<Adapter>(&key(4)),
+                start: <Adapter as RegAdapter>::key_to_bytes(&key(2)),
+                end: <Adapter as RegAdapter>::key_to_bytes(&key(4)),
                 hash: vec![],
             },
             PageDigestRange {
-                start: key_to_raw_bytes::<Adapter>(&key(3)),
-                end: key_to_raw_bytes::<Adapter>(&key(5)),
+                start: <Adapter as RegAdapter>::key_to_bytes(&key(3)),
+                end: <Adapter as RegAdapter>::key_to_bytes(&key(5)),
                 hash: vec![],
             },
         ];

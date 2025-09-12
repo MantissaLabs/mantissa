@@ -9,6 +9,9 @@ use tracing::debug;
 pub mod delta;
 pub mod ranges;
 
+// Chunk size used when streaming delta from server to client. Adjust as needed.
+pub const DELTA_CHUNK_MAX: usize = 1024;
+
 impl SyncService {
     pub fn new(peers: PeersStore) -> Self {
         Self { peers }
@@ -137,7 +140,7 @@ impl sync::Server for SyncService {
 
                 // Create a simple cursor and stream to the client sink
                 let sink = p.get_sink()?; // client-implemented DeltaSink
-                const MAX: usize = 1000;
+                const MAX: usize = crate::sync::DELTA_CHUNK_MAX;
                 let mut i_reg = 0usize;
                 let mut i_tmb = 0usize;
 

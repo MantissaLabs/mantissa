@@ -11,7 +11,10 @@ pub mod mvreg;
 pub mod table_set;
 pub mod uuid_key;
 pub mod hash;
+pub mod error;
 
 // Re-exports used by downstreams
 pub use mst_store::{compute_want_from_have, Entry, PageDigestRange};
 pub use table_set::TableSet;
+
+pub type Result<T> = std::result::Result<T, error::Error>;
