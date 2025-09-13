@@ -430,7 +430,9 @@ where
                     Self::encode_reg(reg)?.as_slice(),
                 )
                 .map_err(into_err)?;
-                let _ = tt.remove(Self::encode_key(k).as_slice()).map_err(into_err)?;
+                let _ = tt
+                    .remove(Self::encode_key(k).as_slice())
+                    .map_err(into_err)?;
             }
 
             // Apply tombstones (and remove register rows)
@@ -483,13 +485,17 @@ where
                     Self::encode_reg(reg)?.as_slice(),
                 )
                 .map_err(into_err)?;
-                let _ = tt.remove(Self::encode_key(k).as_slice()).map_err(into_err)?;
+                let _ = tt
+                    .remove(Self::encode_key(k).as_slice())
+                    .map_err(into_err)?;
             }
 
             for (k, ts) in &tombs {
                 tt.insert(Self::encode_key(k).as_slice(), ts)
                     .map_err(into_err)?;
-                let _ = tv.remove(Self::encode_key(k).as_slice()).map_err(into_err)?;
+                let _ = tv
+                    .remove(Self::encode_key(k).as_slice())
+                    .map_err(into_err)?;
             }
         }
         w.commit().map_err(into_err)?;

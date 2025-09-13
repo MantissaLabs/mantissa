@@ -81,4 +81,3 @@ struct Workload {
 struct Allocation {
   slots @0 :List(Slot);
 }
-

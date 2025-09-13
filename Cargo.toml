@@ -11,9 +11,9 @@ edition = "2021"
 
 [workspace]
 members = [
-    ".",
     "crates/crdt_store",
     "crates/protocol",
+    "crates/net",
 ]
 
 [build-dependencies]
@@ -23,25 +23,26 @@ anyhow = "1"
 [dependencies]
 crdt_store = { path = "crates/crdt_store" }
 protocol = { path = "crates/protocol" }
+net = { path = "crates/net" }
 clap = { version = "4.5.45", features = ["derive", "cargo"] }
 chrono = { version = "0.4", features = ["serde"] }
 tabwriter = "1"
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["compat"] }
 async-trait = "0.1.88"
 thiserror = "2.0.12"
-futures = "0.3.31"
 async-channel = "2.5.0"
 rand = { version = "0.9.2", features = ["std"] }
 bytes = "1"
 data-encoding = "2.9.0"
-getrandom = "0.2"
+blake3 = "1"
+uuid = { version = "1", features = ["v4", "v7", "fast-rng", "serde"] }
+futures = "0.3.31"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 ed25519-dalek = { version = "2", default-features = false, features = [
     "alloc",
 ] }
-blake3 = "1"
-uuid = { version = "1", features = ["v4", "v7", "fast-rng", "serde"] }
+getrandom = "0.2"
 
 # Container / MicroVMs / Workload management
 bollard = "0.18.1"

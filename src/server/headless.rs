@@ -3,13 +3,13 @@ use uuid::Uuid;
 
 use crate::{
     node,
-    noise::NoiseKeys,
     server::{
         server::{RunHandles, RunMode, ServerImpl},
         Bootstrap, Components, Stores,
     },
 };
-use protocol::sync::{self, Domain};
+use net::noise::NoiseKeys;
+use protocol::sync::Domain;
 use protocol::topology::topology;
 
 /// How this headless node exposes its Server during tests.
@@ -101,7 +101,7 @@ impl HeadlessNode {
         let (handles, effective_transport) = match &transport {
             HeadlessTransport::Inproc => {
                 // Register in-process so get_client_secure("inproc://<uuid>") resolves here
-                crate::net::inproc::register(ctx.self_id.to_string(), server_client.clone());
+                net::inproc::register(ctx.self_id.to_string(), server_client.clone());
 
                 // Ensure peers advertise the inproc URI in tests
                 comps
@@ -368,7 +368,7 @@ impl HeadlessNode {
             HeadlessTransport::Inproc => {
                 #[cfg(any(test, feature = "testkit"))]
                 {
-                    crate::net::inproc::unregister(self.id.to_string());
+                    net::inproc::unregister(self.id.to_string());
                 }
                 Ok(())
             }
@@ -389,7 +389,7 @@ impl HeadlessNode {
             HeadlessTransport::Inproc => {
                 #[cfg(any(test, feature = "testkit"))]
                 {
-                    crate::net::inproc::register(self.id.to_string(), self.server_client.clone());
+                    net::inproc::register(self.id.to_string(), self.server_client.clone());
                 }
                 Ok(())
             }

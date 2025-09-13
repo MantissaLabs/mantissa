@@ -1,18 +1,18 @@
 use crate::crypto::rand;
 use crate::node::id;
 use crate::node::identity::pubkey_from_slice;
-use crate::noise::NoiseKeys;
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::credential::ClusterCredential;
 use crate::server::session::ClusterSessionImpl;
-use protocol::server::server;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
 use crate::topology::Topology;
 use capnp::capability::Promise;
 use ed25519_dalek::SigningKey;
+use net::noise::NoiseKeys;
+use protocol::server::server;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{debug, error};
@@ -341,13 +341,12 @@ impl ServerImpl {
         let listen_addr = cfg.listen_addr.clone();
 
         // identical to start_daemon’s server handle
-        let server_handle: protocol::server::server::Client =
-            capnp_rpc::new_client(self.clone());
+        let server_handle: protocol::server::server::Client = capnp_rpc::new_client(self.clone());
         let noise_keys = self.noise_keys.as_ref().expect("noise keys").clone();
 
         // Non-blocking TCP listener with readiness + bound addr.
         let (tcp_task, tcp_ready, bound) =
-            crate::net::tcp_secure::start_tcp_secure_listener_nonblocking_with_ready(
+            net::tcp_secure::start_tcp_secure_listener_nonblocking_with_ready(
                 listen_addr,
                 server_handle.clone(),
                 noise_keys,
@@ -371,8 +370,7 @@ impl ServerImpl {
                 ));
 
             Some(tokio::task::spawn_local(async move {
-                if let Err(e) =
-                    crate::net::unix_socket::start_unix_socket_server_auto(local_session).await
+                if let Err(e) = net::unix_socket::start_unix_socket_server_auto(local_session).await
                 {
                     error!(target: "server", "UnixSocket listener error: {e}");
                 }

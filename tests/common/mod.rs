@@ -12,9 +12,9 @@ pub fn temp_db(path: &PathBuf) -> Arc<redb::Database> {
     Arc::new(redb::Database::create(path).expect("create redb"))
 }
 
-pub fn fixed_noise_keys(byte: u8) -> mantissa::noise::NoiseKeys {
+pub fn fixed_noise_keys(byte: u8) -> net::noise::NoiseKeys {
     // Deterministic Noise keypair for tests
-    mantissa::noise::NoiseKeys::from_private_bytes([byte; 32])
+    net::noise::NoiseKeys::from_private_bytes([byte; 32])
 }
 
 #[macro_use]

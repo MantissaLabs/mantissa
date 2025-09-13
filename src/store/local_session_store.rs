@@ -3,6 +3,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
 };
 use hkdf::Hkdf;
+use net::noise::NoiseKeys;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -12,8 +13,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
-
-use crate::noise::NoiseKeys;
 
 /// KV table: key = remote peer UUID (16 bytes), value = sealed blob (nonce||ciphertext).
 const T_SESS: TableDefinition<[u8; 16], &'static [u8]> =

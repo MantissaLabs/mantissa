@@ -1,10 +1,10 @@
-use crate::{
-    client::errors::ClientConnectError,
-    net::unix_socket::candidate_unix_socket_paths,
-    noise::{client_handshake, load_or_generate_noise_keys},
-};
+use crate::client::errors::ClientConnectError;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::{AsyncReadExt, FutureExt};
+use net::{
+    noise::{client_handshake, load_or_generate_noise_keys},
+    unix_socket::candidate_unix_socket_paths,
+};
 use protocol::server::{cluster_session, server};
 use std::{
     fs, io,
@@ -24,7 +24,7 @@ pub async fn get_client_secure(addr: &str) -> Result<server::Client, capnp::Erro
     #[cfg(any(test, feature = "testkit"))]
     {
         if let Some(rest) = addr.strip_prefix("inproc://") {
-            use crate::net;
+            use net;
 
             if let Some(c) = net::inproc::get(rest) {
                 return Ok(c);
@@ -48,7 +48,7 @@ pub async fn get_client_secure(addr: &str) -> Result<server::Client, capnp::Erro
         .map_err(|e| capnp::Error::failed(format!("tcp connect: {e}")))?;
     tcp.set_nodelay(true).ok();
 
-    let keys_path = crate::noise::resolve_noise_key_path()?;
+    let keys_path = net::noise::resolve_noise_key_path()?;
     let keys = Arc::new(load_or_generate_noise_keys(keys_path)?);
     let noise_stream = client_handshake(tcp, &keys)
         .await

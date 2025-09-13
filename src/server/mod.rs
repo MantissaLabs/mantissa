@@ -1,12 +1,9 @@
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::Message;
-use protocol::gossip::gossip::Client as GossipClient;
 use crate::node::node;
-use crate::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::server::ServerImpl;
-use protocol::server::server::Client as ServerClient;
 use crate::store::local::load_or_create_node_id;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
@@ -15,8 +12,10 @@ use crate::store::peer_store::{open_peers_store, PeersStore};
 use crate::sync::SyncService;
 use crate::token::TokenStore;
 use crate::topology::{PeerHandle, Topology};
+use net::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
+use protocol::gossip::gossip::Client as GossipClient;
+use protocol::server::server::Client as ServerClient;
 use protocol::topology::topology::Client as TopologyClient;
-use protocol::sync as sync_capnp;
 
 use async_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;

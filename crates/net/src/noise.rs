@@ -3,7 +3,7 @@ use getrandom::getrandom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, io, path::Path};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct NoiseKeys {
