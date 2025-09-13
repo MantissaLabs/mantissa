@@ -18,7 +18,8 @@ use rand::rng;
 use rand::seq::IndexedRandom;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use topology::PeerHandle;
 
 /// The Gossip action list
@@ -78,7 +79,7 @@ impl gossip::Server for Gossip {
                         }
                     }
                     Topology(Err(e)) => {
-                        eprintln!("Error reading topology: {:?}", e);
+                        eprintln!("Error reading topology: {e}");
                     }
                     _ => {
                         eprintln!("Unhandled message variant");
@@ -100,7 +101,7 @@ pub async fn start(event_rx: Receiver<Message>, peers: Arc<Mutex<Vec<PeerHandle>
         tokio::select! {
             _ = ticker.tick() => {
                 if !buffer.is_empty() {
-                    let peers_guard = peers.lock().unwrap();
+                    let peers_guard = peers.lock().await;
                     for peer in peers_guard.iter() {
                         if let Err(e) = send_gossip(&buffer, peer).await {
                             eprintln!("Gossip to {} failed: {:?}", peer.address, e);

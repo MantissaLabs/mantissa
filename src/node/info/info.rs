@@ -144,11 +144,11 @@ impl NodeInfo {
     }
 
     pub fn get_cpu_frequency(&self) -> u64 {
-        for cpu in self.sys.cpus() {
+        if let Some(cpu) = self.sys.cpus().iter().next() {
             return cpu.frequency();
+        } else {
+            return 0;
         }
-
-        0
     }
 
     pub fn get_load_avg(&mut self) {

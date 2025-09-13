@@ -4,7 +4,7 @@ macro_rules! local_test {
         #[tokio::test(flavor = "current_thread")]
         async fn $name() {
             mantissa::logger::init_for_tests();
-            crate::common::testkit::run_local(async { $body }).await
+            common::testkit::run_local(async { $body }).await
         }
     };
 }

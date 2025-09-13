@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use std::{io, net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
@@ -49,6 +53,14 @@ pub struct HeadlessNode {
     // Runtime handles for TCP
     handles: Option<RunHandles>,
     _tmp_dir: Option<PathBuf>, // when using convenience constructors
+}
+
+struct State {
+    db: Arc<redb::Database>,
+    noise_keys: Arc<NoiseKeys>,
+    signing_key: ed25519_dalek::SigningKey,
+    id: Uuid,
+    tmp_dir: PathBuf,
 }
 
 impl HeadlessNode {
@@ -136,7 +148,7 @@ impl HeadlessNode {
         Ok(Self {
             id: ctx.self_id,
             topology_client: comps.topology_client.clone(),
-            server_client: server_client,
+            server_client,
             sync_client: comps.sync_client.clone(),
             peers: stores.peers.clone(),
             local_sessions: stores.local_sessions.clone(),
@@ -261,52 +273,75 @@ impl HeadlessNode {
     /// Quick-start **in-process** node using a temp DB and deterministic test keys.
     /// Great for simple tests. For full control, prefer the *_from_parts variants.
     pub async fn new_inproc() -> io::Result<Self> {
-        let (db, noise_keys, signing_key, id, tmp) = self_contained_state()?;
-        let mut node = Self::new_inproc_from_parts(db, noise_keys, signing_key, id)
-            .await
-            .map_err(to_io)?;
-        node._tmp_dir = Some(tmp);
+        let state = self_contained_state()?;
+        let mut node =
+            Self::new_inproc_from_parts(state.db, state.noise_keys, state.signing_key, state.id)
+                .await
+                .map_err(to_io)?;
+        node._tmp_dir = Some(state.tmp_dir);
         Ok(node)
     }
 
     /// Quick-start **TCP** node bound at an ephemeral 127.0.0.1 port.
     pub async fn new_tcp_ephemeral() -> io::Result<Self> {
-        let (db, noise_keys, signing_key, id, tmp) = self_contained_state()?;
-        let mut node = Self::new_tcp_ephemeral_from_parts(db, noise_keys, signing_key, id)
-            .await
-            .map_err(to_io)?;
-        node._tmp_dir = Some(tmp);
+        let state = self_contained_state()?;
+        let mut node = Self::new_tcp_ephemeral_from_parts(
+            state.db,
+            state.noise_keys,
+            state.signing_key,
+            state.id,
+        )
+        .await
+        .map_err(to_io)?;
+        node._tmp_dir = Some(state.tmp_dir);
         Ok(node)
     }
 
     /// Quick-start **in-process** node with a custom sync tick.
     pub async fn new_inproc_with_tick(tick: Duration) -> io::Result<Self> {
-        let (db, noise_keys, signing_key, id, tmp) = self_contained_state()?;
-        let mut node = Self::new_inproc_with_tick_from_parts(db, noise_keys, signing_key, id, tick)
-            .await
-            .map_err(to_io)?;
-        node._tmp_dir = Some(tmp);
+        let state = self_contained_state()?;
+        let mut node = Self::new_inproc_with_tick_from_parts(
+            state.db,
+            state.noise_keys,
+            state.signing_key,
+            state.id,
+            tick,
+        )
+        .await
+        .map_err(to_io)?;
+        node._tmp_dir = Some(state.tmp_dir);
         Ok(node)
     }
 
     /// Quick-start **TCP** node with a custom sync tick on an ephemeral port.
     pub async fn new_tcp_ephemeral_with_tick(tick: Duration) -> io::Result<Self> {
-        let (db, noise_keys, signing_key, id, tmp) = self_contained_state()?;
-        let mut node =
-            Self::new_tcp_ephemeral_with_tick_from_parts(db, noise_keys, signing_key, id, tick)
-                .await
-                .map_err(to_io)?;
-        node._tmp_dir = Some(tmp);
+        let state = self_contained_state()?;
+        let mut node = Self::new_tcp_ephemeral_with_tick_from_parts(
+            state.db,
+            state.noise_keys,
+            state.signing_key,
+            state.id,
+            tick,
+        )
+        .await
+        .map_err(to_io)?;
+        node._tmp_dir = Some(state.tmp_dir);
         Ok(node)
     }
 
     /// Quick-start **TCP** node bound at `addr` (e.g., "127.0.0.1:6578").
     pub async fn new_tcp_at(addr: impl Into<String>) -> io::Result<Self> {
-        let (db, noise_keys, signing_key, id, tmp) = self_contained_state()?;
-        let mut node = Self::new_tcp_at_from_parts(addr.into(), db, noise_keys, signing_key, id)
-            .await
-            .map_err(to_io)?;
-        node._tmp_dir = Some(tmp);
+        let state = self_contained_state()?;
+        let mut node = Self::new_tcp_at_from_parts(
+            addr.into(),
+            state.db,
+            state.noise_keys,
+            state.signing_key,
+            state.id,
+        )
+        .await
+        .map_err(to_io)?;
+        node._tmp_dir = Some(state.tmp_dir);
         Ok(node)
     }
 
@@ -418,7 +453,7 @@ impl Drop for HeadlessNode {
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 fn pick_loopback_ephemeral() -> io::Result<String> {
@@ -430,22 +465,22 @@ fn pick_loopback_ephemeral() -> io::Result<String> {
 
 /// Create an isolated temp dir with a redb DB and deterministic test keys.
 /// (Deterministic keys are fine for tests, production still uses real keys.)
-fn self_contained_state() -> io::Result<(
-    Arc<redb::Database>,
-    Arc<NoiseKeys>,
-    ed25519_dalek::SigningKey,
-    Uuid,
-    PathBuf,
-)> {
-    let tmp = std::env::temp_dir().join(format!("mantissa-test-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&tmp)?;
+fn self_contained_state() -> io::Result<State> {
+    let tmp_dir = std::env::temp_dir().join(format!("mantissa-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir)?;
 
-    let db_path = tmp.join("state.redb");
+    let db_path = tmp_dir.join("state.redb");
     let db = Arc::new(redb::Database::create(db_path).map_err(to_io)?);
 
-    let noise = Arc::new(NoiseKeys::from_private_bytes([0x11; 32]));
-    let signing = ed25519_dalek::SigningKey::from_bytes(&[0xA5; 32]);
+    let noise_keys = Arc::new(NoiseKeys::from_private_bytes([0x11; 32]));
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xA5; 32]);
     let id = Uuid::new_v4();
 
-    Ok((db, noise, signing, id, tmp))
+    Ok(State {
+        db,
+        noise_keys,
+        signing_key,
+        id,
+        tmp_dir,
+    })
 }

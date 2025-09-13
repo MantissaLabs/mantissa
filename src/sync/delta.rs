@@ -1,10 +1,10 @@
-use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use crate::store::peer_store::PeersStore;
-use protocol::sync::delta_sink;
+use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use bincode;
 use capnp::capability::Promise;
 use crdt_store::{compute_want_from_have, uuid_key::UuidKey};
 use crdts::MVReg;
+use protocol::sync::delta_sink;
 use protocol::sync::{sync, Domain};
 use tracing::debug;
 
@@ -130,6 +130,6 @@ pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
     .await;
 
     if let Err(e) = res {
-        println!("sync_after_join error: {}", e);
+        println!("sync_after_join error: {e}");
     }
 }

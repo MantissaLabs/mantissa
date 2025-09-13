@@ -51,7 +51,7 @@ where
     type Snapshot = MvRegSnapshot<V>;
 
     fn upsert_reg(current: Option<Self::Reg>, actor: &Self::Actor, v: Self::Value) -> Self::Reg {
-        let mut reg = current.unwrap_or_else(MVReg::new);
+        let mut reg = current.unwrap_or_default();
         let rc: ReadCtx<Vec<V>, A> = reg.read();
         let add = rc.derive_add_ctx(actor.clone());
         let op = reg.write(v, add);
@@ -82,4 +82,3 @@ where
         }
     }
 }
-

@@ -54,10 +54,9 @@ impl TestNode {
 
     /// Start a TCP node with a custom periodic sync tick.
     pub async fn new_tcp_with_tick_ms(ms: u64) -> Self {
-        let node =
-            HeadlessNode::new_tcp_ephemeral_with_tick(std::time::Duration::from_millis(ms))
-                .await
-                .expect("headless tcp node (with tick)");
+        let node = HeadlessNode::new_tcp_ephemeral_with_tick(std::time::Duration::from_millis(ms))
+            .await
+            .expect("headless tcp node (with tick)");
         Self { node }
     }
 
@@ -117,10 +116,7 @@ impl TestNode {
             }
         };
 
-        match timeout(patience, fut).await {
-            Ok(done) => done,
-            Err(_) => false,
-        }
+        timeout(patience, fut).await.unwrap_or_default()
     }
 
     /// Assert that this node sees `expected` members within a short timeout.

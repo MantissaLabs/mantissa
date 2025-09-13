@@ -73,7 +73,7 @@ pub fn is_valid_format(token: &str) -> bool {
     !rest.is_empty()
         && rest
             .bytes()
-            .all(|b| (b'a'..=b'z').contains(&b) || (b'2'..=b'7').contains(&b))
+            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
 }
 
 #[derive(Clone)]
@@ -150,8 +150,8 @@ mod tests {
         let temp_directory = tempdir().unwrap();
         let db_path = temp_directory.path().join("state.redb");
 
-        let mut token_a = String::new();
-        let mut token_rotated = String::new();
+        let token_a;
+        let token_rotated;
 
         // First boot.
         {

@@ -7,7 +7,7 @@ const T_CRED: TableDefinition<[u8; 16], &'static [u8]> =
 
 #[inline]
 fn ioerr<E: std::error::Error>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 /// Client-side store of short-lived cluster credentials, keyed by remote peer id.

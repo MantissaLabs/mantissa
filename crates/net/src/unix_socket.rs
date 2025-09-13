@@ -63,8 +63,7 @@ pub async fn start_unix_socket_server_auto(
         }
     }
 
-    Err(last_err
-        .unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "no usable UnixSocket path")))
+    Err(last_err.unwrap_or_else(|| io::Error::other("no usable UnixSocket path")))
 }
 
 async fn accept_loop(listener: UnixListener, server_handle: cluster_session::Client) {

@@ -57,7 +57,7 @@ pub async fn client_handshake(
 
     let mut hs = builder
         .build_initiator()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     let (mut rd, mut wr) = tcp.into_split();
 
@@ -65,7 +65,7 @@ pub async fn client_handshake(
     let mut out = vec![0u8; 65535];
     let n = hs
         .write_message(&[], &mut out)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     write_framed(&mut wr, &out[..n]).await?;
 
     // <- e, ee, s, es
@@ -81,13 +81,13 @@ pub async fn client_handshake(
     // -> s, se (no payload)
     let n = hs
         .write_message(&[], &mut out)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     write_framed(&mut wr, &out[..n]).await?;
 
     // Done: switch to transport and spawn the IO bridge
     let transport = hs
         .into_transport_mode()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
 }
@@ -107,7 +107,7 @@ pub async fn server_handshake(
 
     let mut hs = builder
         .build_responder()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     let (mut rd, mut wr) = tcp.into_split();
 
@@ -126,7 +126,7 @@ pub async fn server_handshake(
     // -> e, ee, s, es
     let n = hs
         .write_message(&[], &mut out)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     write_framed(&mut wr, &out[..n]).await?;
 
     // <- s, se
@@ -141,7 +141,7 @@ pub async fn server_handshake(
     // Done
     let transport = hs
         .into_transport_mode()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
 }

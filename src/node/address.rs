@@ -14,7 +14,7 @@ pub fn outbound_ip_for<A: ToSocketAddrs>(dest: A) -> io::Result<IpAddr> {
     let dest_sa = addrs
         .find(|sa| sa.is_ipv4())
         .or_else(|| addrs.next())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no destination addrs"))?;
+        .ok_or_else(|| io::Error::other("no destination addrs"))?;
 
     // Bind wildcard on the same family as dest
     let bind_sa: SocketAddr = match dest_sa {

@@ -1,8 +1,8 @@
 use crate::client::config::ClientConfig;
 use crate::client::connection;
 use crate::node::id::{id_sort_key_uuid_bytes, id_string};
-use protocol::topology::node_info::Reader as NodeInfo;
 use anyhow::Result;
+use protocol::topology::node_info::Reader as NodeInfo;
 use std::io::Write;
 use tabwriter::TabWriter;
 
@@ -36,7 +36,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     tw.flush().unwrap();
     let output = String::from_utf8(tw.into_inner().unwrap()).unwrap();
 
-    println!("{}", output);
+    println!("{output}");
 
     Ok(())
 }

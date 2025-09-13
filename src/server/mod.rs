@@ -19,7 +19,8 @@ use protocol::topology::topology::Client as TopologyClient;
 
 use async_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::error;
 use uuid::Uuid;
 

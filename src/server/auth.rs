@@ -8,7 +8,7 @@ const T_REVERSE: TableDefinition<[u8; 16], &'static [u8]> = TableDefinition::new
 
 #[inline]
 fn ioerr<E: std::error::Error>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 #[derive(Clone)]

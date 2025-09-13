@@ -150,13 +150,13 @@ impl Topology {
         Ok(Self {
             addr,
             rx,
-            peers: peers,
+            peers,
             server_handle: std::rc::Rc::new(OnceCell::new()),
             handles: Arc::new(RwLock::new(HashMap::new())),
             public_key: public,
-            signing_key: signing_key,
+            signing_key,
             peer_id: peer_id_from_public(&public),
-            node: node,
+            node,
             local_sessions: sessions,
             local_credential_store: creds_store,
             bound_addr: Arc::new(Mutex::new(None)),
@@ -182,7 +182,7 @@ impl Topology {
         let handles = self.handles.clone();
         let local_id = self.node.id;
         let public_key = self.public_key;
-        let verifying_key = self.signing_key.verifying_key().clone();
+        let verifying_key = self.signing_key.verifying_key();
 
         // Also ensure our own peer-entry exists in the store
         let peers = self.peers.clone();
@@ -240,7 +240,7 @@ impl Topology {
 
         // Best-effort IP discovery (no packets sent). If this fails, bubble up.
         let ip = compute_advertise_ip(None, None).map_err(|e| {
-            io::Error::new(e.kind(), format!("failed to compute advertise ip: {}", e))
+            io::Error::new(e.kind(), format!("failed to compute advertise ip: {e}"))
         })?;
 
         // bound addr if present
@@ -370,14 +370,14 @@ impl Topology {
                             println!("[Topology] Node joined: {id} at {address}");
 
                             let v = PeerValue {
-                                address: address,
+                                address,
                                 hostname,
                                 noise_static_pub: noise_static_pub.to_bytes(),
                                 signing_pub: signing_pub.to_bytes(),
                             };
 
                             if let Err(e) = self.register_peer(id, &v, client).await {
-                                println!("Failed to register peer: {}", e);
+                                println!("Failed to register peer: {e}");
                             }
 
                             // TODO: broadcast event to other components that may be
@@ -862,7 +862,7 @@ impl topology::Server for Topology {
     ) -> Promise<(), Error> {
         let self_addr = self.addr.clone();
         let hostname = self.node.system_info.info.hostname.clone().unwrap();
-        let id = self.node.id.clone();
+        let id = self.node.id;
         let peers = self.peers.clone();
         let local_sessions = self.local_sessions.clone();
         let local_creds = self.local_credential_store.clone();
@@ -898,7 +898,7 @@ impl topology::Server for Topology {
             let client = connection::get_client_secure(anchor.as_str())
                 .await
                 .map_err(|e| {
-                    capnp::Error::failed(format!("could not connect to anchor {}: {}", anchor, e))
+                    capnp::Error::failed(format!("could not connect to anchor {anchor}: {e}"))
                 })?;
 
             let mut request = client.register_node_request();
@@ -1083,7 +1083,7 @@ impl Clone for Topology {
     fn clone(&self) -> Self {
         Self {
             addr: self.addr.clone(),
-            peer_id: self.peer_id.clone(),
+            peer_id: self.peer_id,
             rx: self.rx.clone(),
             peers: self.peers.clone(),
             handles: self.handles.clone(),
@@ -1121,13 +1121,13 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
 
     let event = match reader.get_event()? {
         EventType::Add => TopologyEvent::NodeJoined {
-            id: id,
+            id,
             hostname: node.get_hostname()?.to_str()?.to_string(),
             address: node.get_addr()?.to_str()?.to_string(),
             root_hash: node.get_root_hash()?.to_str()?.to_string(),
             client: node.get_handle()?,
             noise_static_pub: pubkey,
-            signing_pub: signing_pub,
+            signing_pub,
         },
         EventType::Remove => TopologyEvent::NodeLeft { id },
         EventType::Suspect => TopologyEvent::NodeSuspect { id },
@@ -1158,7 +1158,7 @@ pub fn add_event(
             topo.set_event(topology_event::EventType::Add);
             let mut node = topo.init_node();
 
-            set_node_id(node.reborrow().init_id(), &id);
+            set_node_id(node.reborrow().init_id(), id);
             node.set_hostname(hostname);
             node.set_addr(address);
             node.set_root_hash(root_hash);
@@ -1173,14 +1173,14 @@ pub fn add_event(
             let mut topo = msg.init_topology();
             topo.set_event(topology_event::EventType::Remove);
             let mut node = topo.init_node();
-            set_node_id(node.reborrow().init_id(), &id);
+            set_node_id(node.reborrow().init_id(), id);
         }
 
         TopologyEvent::NodeSuspect { id } => {
             let mut topo = msg.init_topology();
             topo.set_event(topology_event::EventType::Suspect);
             let mut node = topo.init_node();
-            set_node_id(node.reborrow().init_id(), &id);
+            set_node_id(node.reborrow().init_id(), id);
         }
     }
 }

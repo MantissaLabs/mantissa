@@ -20,7 +20,7 @@ const T_SESS: TableDefinition<[u8; 16], &'static [u8]> =
 
 #[inline]
 fn ioerr<E: std::error::Error>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 fn now_secs() -> u64 {
@@ -61,7 +61,7 @@ fn seal(kek: &[u8; 32], plaintext: &[u8]) -> io::Result<Vec<u8>> {
 
     let ct = aead
         .encrypt(Nonce::from_slice(&nonce), plaintext)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&nonce);

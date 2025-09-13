@@ -7,7 +7,7 @@ const T_TOKEN: TableDefinition<&'static str, &'static str> =
 
 #[inline]
 fn ioerr<E: std::error::Error>(err: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, err.to_string())
+    io::Error::other(err.to_string())
 }
 
 /// Durable store for the cluster join token. Very small, single-row.

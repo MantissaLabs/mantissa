@@ -5,7 +5,7 @@ use uuid::Uuid;
 const T_LOCAL: TableDefinition<&'static str, &'static str> = TableDefinition::new("local");
 
 fn into_io<E: std::error::Error>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 // create tables if missing

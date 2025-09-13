@@ -40,7 +40,7 @@ pub fn load_or_generate_sign_keys(path: impl AsRef<Path>) -> io::Result<SignKeys
     } else {
         let mut arr = [0u8; SECRET_KEY_LENGTH];
         getrandom(&mut arr)?;
-        fs::write(path, &arr)?;
+        fs::write(path, arr)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -19,11 +19,7 @@ mod types;
 mod workload;
 
 use clap::Parser;
-use net;
-use protocol::{
-    gossip_capnp, health_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
-    topology_capnp, utils_capnp,
-};
+use protocol::{info_capnp, node_capnp, topology_capnp};
 
 use anyhow::Result;
 use std::error::Error;

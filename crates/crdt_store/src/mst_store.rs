@@ -710,7 +710,7 @@ where
                 println!(
                     "  key={:?} bytes(base64)={}",
                     k.as_ref(),
-                    base64::engine::general_purpose::STANDARD.encode(&sink.as_slice()),
+                    base64::engine::general_purpose::STANDARD.encode(sink.as_slice()),
                 );
             }
 
@@ -723,7 +723,7 @@ where
                 println!(
                     "  key={:?} bytes(base64)={}",
                     k.as_ref(),
-                    base64::engine::general_purpose::STANDARD.encode(&sink.as_slice()),
+                    base64::engine::general_purpose::STANDARD.encode(sink.as_slice()),
                 );
             }
             Ok(())
@@ -943,7 +943,7 @@ mod tests {
         let k = key(2);
         let ts = store.remove(&k).await.unwrap();
         assert!(ts > 0);
-        assert!(store.exists(&k).unwrap() == false);
+        assert!(!store.exists(&k).unwrap());
 
         // Tombstone reflected in MST root
         let root = store.root_hex().await;
