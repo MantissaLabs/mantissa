@@ -17,4 +17,4 @@ pub mod error;
 pub use mst_store::{compute_want_from_have, Entry, PageDigestRange};
 pub use table_set::TableSet;
 
-pub type Result<T> = std::result::Result<T, error::Error>;
+pub type Result<T> = std::result::Result<T, Box<error::Error>>;

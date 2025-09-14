@@ -59,8 +59,8 @@ pub struct PageDigestRange {
 }
 
 #[inline]
-fn into_err<E: Into<Error>>(e: E) -> Error {
-    e.into()
+fn into_err<E: Into<Error>>(e: E) -> Box<Error> {
+    Box::new(e.into())
 }
 
 /// CRDT + MST store. Parameterized by:
@@ -831,7 +831,7 @@ where
         regs: Vec<(C::Key, C::Reg)>,
         tombs: Vec<(C::Key, u64)>,
     ) -> crate::Result<()> {
-        Ok(self.store.apply_delta_chunk(regs, tombs)?)
+        self.store.apply_delta_chunk(regs, tombs).map_err(into_err)
     }
 
     /// Finalize once after all chunks (rebuild MST from disk).
