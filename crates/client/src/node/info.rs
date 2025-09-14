@@ -1,4 +1,4 @@
-use crate::client::{config::ClientConfig, connection};
+use crate::{config::ClientConfig, connection};
 use anyhow::Result;
 
 pub async fn info(cfg: &ClientConfig) -> Result<()> {
@@ -60,3 +60,4 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
 
     Ok(())
 }
+

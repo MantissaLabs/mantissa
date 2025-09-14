@@ -1,4 +1,3 @@
-use crate::client::connection;
 use crate::crypto::rand::{self, nonce16};
 use crate::node::address::compute_advertise_ip;
 use crate::node::id::{read_node_id, set_node_id};
@@ -486,7 +485,7 @@ impl Topology {
                 continue;
             };
 
-            match crate::client::connection::get_client_secure(addr).await {
+            match client::connection::get_client_secure(addr).await {
                 Ok(client) => {
                     let mut req = client.get_session_request();
                     req.get().set_ticket(&ticket);
@@ -545,13 +544,14 @@ impl Topology {
             let addr = val.address.clone();
 
             // Dial the peer's Server
-            let server_client: server::Client = match connection::get_client_secure(&addr).await {
-                Ok(c) => c,
-                Err(e) => {
-                    error!(target: "connect", "dial {addr} failed: {e}");
-                    continue;
-                }
-            };
+            let server_client: server::Client =
+                match client::connection::get_client_secure(&addr).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(target: "connect", "dial {addr} failed: {e}");
+                        continue;
+                    }
+                };
 
             // try ticket first
             let mut have_session: Option<cluster_session::Client> = None;
@@ -689,7 +689,7 @@ impl Topology {
 
             // Connect to remote Server
             let client: protocol::server::server::Client =
-                match crate::client::connection::get_client_secure(&addr).await {
+                match client::connection::get_client_secure(&addr).await {
                     Ok(c) => c,
                     Err(e) => {
                         error!(target: "sync", "connect {addr} failed: {e}");
@@ -893,7 +893,7 @@ impl topology::Server for Topology {
                 return Err(capnp::Error::failed("cannot join own address".to_string()));
             }
 
-            let client = connection::get_client_secure(anchor.as_str())
+            let client = client::connection::get_client_secure(anchor.as_str())
                 .await
                 .map_err(|e| {
                     capnp::Error::failed(format!("could not connect to anchor {anchor}: {e}"))

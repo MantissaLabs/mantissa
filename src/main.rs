@@ -3,7 +3,6 @@ extern crate log;
 extern crate sysinfo;
 
 mod cli;
-mod client;
 pub mod container;
 mod crypto;
 mod gossip;
@@ -24,11 +23,9 @@ use anyhow::Result;
 use std::error::Error;
 use tokio::task::LocalSet;
 
-use crate::{
-    cli::{Command, MantissaCli, NodesCommand, TasksCommand, TokenCommand},
-    client::config::ClientConfig,
-    server::RunMode,
-};
+use crate::cli::*;
+use crate::server::RunMode;
+use client::config::ClientConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

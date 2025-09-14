@@ -1,5 +1,5 @@
-use crate::client::config::ClientConfig;
-use crate::client::connection;
+use crate::config::ClientConfig;
+use crate::connection;
 use anyhow::Result;
 
 pub async fn leave(cfg: &ClientConfig) -> Result<()> {
@@ -13,3 +13,4 @@ pub async fn leave(cfg: &ClientConfig) -> Result<()> {
 
     Ok(())
 }
+

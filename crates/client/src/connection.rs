@@ -1,4 +1,4 @@
-use crate::client::errors::ClientSocketError;
+use crate::errors::ClientSocketError;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::{AsyncReadExt, FutureExt};
 use net::{
@@ -16,7 +16,7 @@ use tokio::net::UnixStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 /// Used to get a client connection with Capn'proto.
-/// At the moment, any method using `get_client` *needs* to be run in a tokio task,
+/// At the moment, any method using `get_client` needs to be run in a tokio task,
 /// otherwise this will panic.
 pub async fn get_client_secure(addr: &str) -> Result<server::Client, capnp::Error> {
     // Only useful for tests, catch the capnp capability in-process to
@@ -24,8 +24,6 @@ pub async fn get_client_secure(addr: &str) -> Result<server::Client, capnp::Erro
     #[cfg(any(test, feature = "testkit"))]
     {
         if let Some(rest) = addr.strip_prefix("inproc://") {
-            use net;
-
             if let Some(c) = net::inproc::get(rest) {
                 return Ok(c);
             }
@@ -121,7 +119,7 @@ pub async fn get_client_unix_path(
 /// Get local socket client, either use explicitly provided socket path
 /// or auto-discover.
 pub async fn get_local_session(
-    cfg: &crate::client::config::ClientConfig,
+    cfg: &crate::config::ClientConfig,
 ) -> Result<cluster_session::Client, ClientSocketError> {
     if let Some(ref p) = cfg.socket {
         return get_client_unix_path(p.clone()).await;
@@ -148,3 +146,4 @@ pub async fn get_local_session(
     }
     Err(ClientSocketError::NotFound { tried })
 }
+

@@ -1,8 +1,8 @@
-use crate::client::config::ClientConfig;
-use crate::client::connection;
-use protocol::topology::join_request as JoinRequest;
+use crate::config::ClientConfig;
+use crate::connection;
 use anyhow::{anyhow, Result};
 use capnp::message::Builder;
+use protocol::topology::join_request as JoinRequest;
 
 pub async fn link(cfg: &ClientConfig) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
@@ -37,3 +37,4 @@ pub async fn link(cfg: &ClientConfig) -> Result<()> {
 
     Ok(())
 }
+

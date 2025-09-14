@@ -1,10 +1,10 @@
-use crate::client::config::ClientConfig;
-use crate::client::connection;
-use crate::node::id::{id_sort_key_uuid_bytes, id_string};
+use crate::config::ClientConfig;
+use crate::connection;
 use anyhow::Result;
 use protocol::topology::node_info::Reader as NodeInfo;
 use std::io::Write;
 use tabwriter::TabWriter;
+use uuid::Uuid;
 
 pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
@@ -39,4 +39,24 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     println!("{output}");
 
     Ok(())
+}
+
+#[inline]
+fn id_sort_key_uuid_bytes(n: &NodeInfo) -> u128 {
+    match n
+        .get_id()
+        .and_then(|id| id.get_bytes())
+        .ok()
+        .and_then(|b| Uuid::from_slice(b).ok())
+    {
+        Some(u) => u128::from_be_bytes(*u.as_bytes()),
+        None => u128::MAX,
+    }
+}
+
+#[inline]
+fn id_string(n: &NodeInfo) -> anyhow::Result<String> {
+    let bytes = n.get_id()?.get_bytes()?;
+    let u = Uuid::from_slice(bytes).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(u.to_string())
 }
