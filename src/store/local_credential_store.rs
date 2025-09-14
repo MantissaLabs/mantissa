@@ -41,10 +41,10 @@ impl LocalCredentialStore {
     pub fn get(&self, peer: Uuid) -> io::Result<Option<Vec<u8>>> {
         let r = self.db.begin_read().map_err(ioerr)?;
         let t = r.open_table(T_CRED).map_err(ioerr)?;
-        let out = match t.get(*peer.as_bytes()).map_err(ioerr)? {
-            Some(g) => Some(g.value().to_vec()),
-            None => None,
-        };
+        let out = t
+            .get(*peer.as_bytes())
+            .map_err(ioerr)?
+            .map(|g| g.value().to_vec());
         Ok(out)
     }
 

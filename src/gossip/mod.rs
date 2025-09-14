@@ -81,9 +81,6 @@ impl gossip::Server for Gossip {
                     Topology(Err(e)) => {
                         eprintln!("Error reading topology: {e}");
                     }
-                    _ => {
-                        eprintln!("Unhandled message variant");
-                    }
                 }
             }
             Ok(())
@@ -121,7 +118,7 @@ pub async fn start(event_rx: Receiver<Message>, peers: Arc<Mutex<Vec<PeerHandle>
     }
 }
 
-async fn send_gossip(messages: &[Message], peer: &PeerHandle) -> Result<(), capnp::Error> {
+async fn send_gossip(_messages: &[Message], _peer: &PeerHandle) -> Result<(), capnp::Error> {
     // Build gossip client using peer information or use readily available client
     // and build message to send (list of messages) via Builder.
     Ok(())

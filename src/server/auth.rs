@@ -53,11 +53,13 @@ impl AuthStore {
     pub fn lookup(&self, ticket: &[u8]) -> io::Result<Option<Uuid>> {
         let r = self.db.begin_read().map_err(ioerr)?;
         let t = r.open_table(T_TICKETS).map_err(ioerr)?;
-        let out = match t.get(ticket).map_err(ioerr)? {
-            // g.value() returns [u8;16] by value for fixed-size types.
-            Some(g) => Some(Uuid::from_bytes(g.value())),
-            None => None,
-        };
+
+        // g.value() returns [u8;16] by value for fixed-size types.
+        let out = t
+            .get(ticket)
+            .map_err(ioerr)?
+            .map(|g| Uuid::from_bytes(g.value()));
+
         Ok(out)
     }
 

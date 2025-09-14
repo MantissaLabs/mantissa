@@ -83,8 +83,7 @@ impl TwoWFD {
         let freshness_point = Self::calculate_freshness_point(&self.qos);
 
         println!(
-            "Adding process {} with timeout {:?}, freshness point {:?}",
-            process_id, timeout, freshness_point
+            "Adding process {process_id} with timeout {timeout:?}, freshness point {freshness_point:?}"
         );
 
         let process = MonitoredProcess {
@@ -159,7 +158,7 @@ impl TwoWFD {
                     let mut suspected = self.suspected.lock().unwrap();
                     suspected.remove(&from);
 
-                    println!("Process {} is now considered ALIVE", from);
+                    println!("Process {from} is now considered ALIVE");
                 }
             }
         }
@@ -210,10 +209,7 @@ impl TwoWFD {
                     if elapsed > process.timeout && process.status == ProcessStatus::Alive {
                         process.status = ProcessStatus::Suspected;
                         to_suspect.push(id.clone());
-                        println!(
-                            "Process {} is now SUSPECTED (no heartbeat for {:?})",
-                            id, elapsed
-                        );
+                        println!("Process {id} is now SUSPECTED (no heartbeat for {elapsed:?})",);
                     }
                 }
 
@@ -296,8 +292,8 @@ pub struct MockTransport {
     broadcast_sender: broadcast::Sender<(String, Message)>,
 }
 
-impl MockTransport {
-    pub fn new() -> Self {
+impl Default for MockTransport {
+    fn default() -> Self {
         let (sender, mut receiver) = mpsc::channel(100);
         let (broadcast_sender, _) = broadcast::channel(100);
 
@@ -318,6 +314,12 @@ impl MockTransport {
     }
 }
 
+impl MockTransport {
+    pub fn new() -> Self {
+        MockTransport::default()
+    }
+}
+
 impl TransportAdapter for MockTransport {
     fn send_message(
         &self,
@@ -327,7 +329,7 @@ impl TransportAdapter for MockTransport {
         let sender = self.sender.clone();
         tokio::spawn(async move {
             if let Err(e) = sender.send((target, message)).await {
-                eprintln!("Failed to send message: {}", e);
+                eprintln!("Failed to send message: {e}");
             }
         });
         Ok(())
@@ -367,7 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             time::sleep(Duration::from_secs(1)).await;
             if let Err(e) = fd_clone.send_heartbeat("node1".to_string()).await {
-                eprintln!("Failed to send heartbeat: {}", e);
+                eprintln!("Failed to send heartbeat: {e}");
             }
         }
     });

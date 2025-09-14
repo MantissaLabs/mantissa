@@ -337,7 +337,7 @@ pub fn load_or_generate_noise_keys(path: impl AsRef<Path>) -> io::Result<NoiseKe
     } else {
         let mut sk = [0u8; 32];
         getrandom(&mut sk)?;
-        fs::write(path, &sk)?;
+        fs::write(path, sk)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

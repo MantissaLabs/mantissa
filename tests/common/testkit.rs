@@ -152,8 +152,7 @@ impl TestNode {
 
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "roots diverged or empty after {:?}: root_a={:?} root_b={:?}",
-                    timeout, root_a, root_b
+                    "roots diverged or empty after {timeout:?}: root_a={root_a:?} root_b={root_b:?}"
                 ));
             }
 
@@ -284,8 +283,7 @@ impl TestNode {
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(format!(
-                    "roots diverged or empty after {:?}: {}",
-                    timeout, snapshot
+                    "roots diverged or empty after {timeout:?}: {snapshot}"
                 ));
             }
 
@@ -327,8 +325,7 @@ impl TestNode {
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(format!(
-                    "cluster size not converged to {} after {:?} → [{}]",
-                    expected, timeout, snapshot
+                    "cluster size not converged to {expected} after {timeout:?} → [{snapshot}]"
                 ));
             }
 
