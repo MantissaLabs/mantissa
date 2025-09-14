@@ -11,7 +11,7 @@ use crate::topology::TopologyEvent;
 use async_channel::{Receiver, Sender};
 use capnp::capability::Promise;
 use capnp::Error;
-use protocol::gossip::gossip;
+use protocol::gossip;
 use protocol::gossip::gossip_message::Which::*;
 use protocol::gossip::message_list as ActionList;
 use rand::rng;

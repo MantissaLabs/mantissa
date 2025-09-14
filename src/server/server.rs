@@ -18,11 +18,11 @@ use std::sync::Arc;
 use tracing::{debug, error};
 use uuid::Uuid;
 
-use protocol::gossip::gossip::Client as GossipClient;
-use protocol::node::node::Client as NodeClient;
-use protocol::server::server::Client as ServerClient;
-use protocol::sync::sync::Client as SyncClient;
-use protocol::topology::topology::Client as TopologyClient;
+use protocol::gossip::GossipClient;
+use protocol::node::NodeClient;
+use protocol::server::ServerClient;
+use protocol::sync::SyncClient;
+use protocol::topology::TopologyClient;
 
 #[derive(Clone)]
 pub struct ServerImpl {
@@ -352,7 +352,7 @@ impl ServerImpl {
                 noise_keys,
             )
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Optional Unix socket (same behavior as start_daemon)
         let unix_task = if enable_unix_socket {
