@@ -15,7 +15,6 @@ mod store;
 mod sync;
 mod token;
 mod topology;
-mod types;
 mod workload;
 
 use clap::Parser;
@@ -28,7 +27,7 @@ use tokio::task::LocalSet;
 use crate::{
     cli::{Command, MantissaCli, NodesCommand, TasksCommand, TokenCommand},
     client::config::ClientConfig,
-    server::server::RunMode,
+    server::RunMode,
 };
 
 #[tokio::main]
@@ -48,7 +47,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match args.cmd {
         Command::Init(_init) => {
             local
-                .run_until(server::start(listen, RunMode::Blocking, true))
+                .run_until(server::bootstrap::start(listen, RunMode::Blocking, true))
                 .await?;
         }
 

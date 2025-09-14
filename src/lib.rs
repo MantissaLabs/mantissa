@@ -16,5 +16,4 @@ pub mod store;
 pub mod sync;
 pub mod token;
 pub mod topology;
-pub mod types;
 pub mod workload;

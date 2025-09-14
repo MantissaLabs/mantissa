@@ -1,20 +1,19 @@
 use std::{fmt, io, path::PathBuf};
 
 #[derive(Debug)]
-pub enum ClientConnectError {
-    LocalSocketNotFound { tried: Vec<PathBuf> },
-    LocalSocketPermissionDenied { path: PathBuf },
-    LocalSocketRefused { path: PathBuf }, // daemon not accepting yet / stale socket
-    LocalSocketNotASocket { path: PathBuf }, // file exists but is not a socket
-    LocalSocketOther { path: PathBuf, source: io::Error },
-    // TODO: Add other variants here.
+pub enum ClientSocketError {
+    NotFound { tried: Vec<PathBuf> },
+    PermissionDenied { path: PathBuf },
+    Refused { path: PathBuf },    // daemon not accepting yet / stale socket
+    NotASocket { path: PathBuf }, // file exists but is not a socket
+    Other { path: PathBuf, source: io::Error },
 }
 
-impl fmt::Display for ClientConnectError {
+impl fmt::Display for ClientSocketError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use ClientConnectError::*;
+        use ClientSocketError::*;
         match self {
-            LocalSocketNotFound { tried } => {
+            NotFound { tried } => {
                 writeln!(f, "Mantissa daemon is not reachable locally.")?;
                 writeln!(f, "I looked for a Unix socket at:")?;
                 for p in tried {
@@ -26,24 +25,24 @@ impl fmt::Display for ClientConnectError {
                 )?;
                 Ok(())
             }
-            LocalSocketPermissionDenied { path } => {
+            PermissionDenied { path } => {
                 write!(f, "Permission denied opening {}. Try running the daemon as the same user, or check file permissions (expected 0600).", path.display())
             }
-            LocalSocketRefused { path } => {
+            Refused { path } => {
                 write!(f, "The local socket exists at {} but the daemon refused the connection (is it starting up or stale?). Try restarting the daemon.", path.display())
             }
-            LocalSocketNotASocket { path } => {
+            NotASocket { path } => {
                 write!(
                     f,
                     "Found {} but it isn’t a Unix socket. Remove it and restart the daemon.",
                     path.display()
                 )
             }
-            LocalSocketOther { path, source } => {
+            Other { path, source } => {
                 write!(f, "Failed to connect to {}: {}", path.display(), source)
             }
         }
     }
 }
 
-impl std::error::Error for ClientConnectError {}
+impl std::error::Error for ClientSocketError {}

@@ -1,4 +1,4 @@
-use crate::client::errors::ClientConnectError;
+use crate::client::errors::ClientSocketError;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use futures::{AsyncReadExt, FutureExt};
 use net::{
@@ -30,8 +30,7 @@ pub async fn get_client_secure(addr: &str) -> Result<server::Client, capnp::Erro
                 return Ok(c);
             }
             return Err(capnp::Error::failed(format!(
-                "inproc target not found: {}",
-                rest
+                "inproc target not found: {rest}"
             )));
         }
     }
@@ -72,7 +71,7 @@ pub async fn get_client_secure(addr: &str) -> Result<server::Client, capnp::Erro
 /// Shared helper to build a client from a connected UnixStream
 async fn client_from_unix_stream(
     stream: UnixStream,
-) -> Result<cluster_session::Client, ClientConnectError> {
+) -> Result<cluster_session::Client, ClientSocketError> {
     let (reader, writer) = stream.compat().split();
     let network = twoparty::VatNetwork::new(
         reader,
@@ -86,10 +85,10 @@ async fn client_from_unix_stream(
     Ok(client)
 }
 
-fn classify_path_not_socket(path: &Path) -> Option<ClientConnectError> {
+fn classify_path_not_socket(path: &Path) -> Option<ClientSocketError> {
     if let Ok(meta) = fs::symlink_metadata(path) {
         if !meta.file_type().is_socket() {
-            return Some(ClientConnectError::LocalSocketNotASocket {
+            return Some(ClientSocketError::NotASocket {
                 path: path.to_path_buf(),
             });
         }
@@ -100,7 +99,7 @@ fn classify_path_not_socket(path: &Path) -> Option<ClientConnectError> {
 /// Explicit socket for local communication.
 pub async fn get_client_unix_path(
     path: PathBuf,
-) -> Result<cluster_session::Client, ClientConnectError> {
+) -> Result<cluster_session::Client, ClientSocketError> {
     if let Some(e) = classify_path_not_socket(&path) {
         return Err(e);
     }
@@ -110,10 +109,10 @@ pub async fn get_client_unix_path(
         Err(e) => {
             use io::ErrorKind::*;
             Err(match e.kind() {
-                NotFound => ClientConnectError::LocalSocketNotFound { tried: vec![path] },
-                PermissionDenied => ClientConnectError::LocalSocketPermissionDenied { path },
-                ConnectionRefused => ClientConnectError::LocalSocketRefused { path },
-                _ => ClientConnectError::LocalSocketOther { path, source: e },
+                NotFound => ClientSocketError::NotFound { tried: vec![path] },
+                PermissionDenied => ClientSocketError::PermissionDenied { path },
+                ConnectionRefused => ClientSocketError::Refused { path },
+                _ => ClientSocketError::Other { path, source: e },
             })
         }
     }
@@ -123,7 +122,7 @@ pub async fn get_client_unix_path(
 /// or auto-discover.
 pub async fn get_local_session(
     cfg: &crate::client::config::ClientConfig,
-) -> Result<cluster_session::Client, ClientConnectError> {
+) -> Result<cluster_session::Client, ClientSocketError> {
     if let Some(ref p) = cfg.socket {
         return get_client_unix_path(p.clone()).await;
     }
@@ -139,13 +138,13 @@ pub async fn get_local_session(
             Ok(stream) => return client_from_unix_stream(stream).await,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                return Err(ClientConnectError::LocalSocketPermissionDenied { path: p })
+                return Err(ClientSocketError::PermissionDenied { path: p })
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-                return Err(ClientConnectError::LocalSocketRefused { path: p })
+                return Err(ClientSocketError::Refused { path: p })
             }
-            Err(e) => return Err(ClientConnectError::LocalSocketOther { path: p, source: e }),
+            Err(e) => return Err(ClientSocketError::Other { path: p, source: e }),
         }
     }
-    Err(ClientConnectError::LocalSocketNotFound { tried })
+    Err(ClientSocketError::NotFound { tried })
 }

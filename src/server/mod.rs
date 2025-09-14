@@ -1,309 +1,502 @@
-use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
-use crate::gossip::Message;
-use crate::node::node;
+use crate::crypto::rand;
+use crate::node::id;
+use crate::node::identity::pubkey_from_slice;
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
-use crate::server::server::ServerImpl;
-use crate::store::local::load_or_create_node_id;
-use crate::store::local_credential_store::LocalCredentialStore;
+use crate::server::credential::ClusterCredential;
+use crate::server::session::ClusterSessionImpl;
 use crate::store::local_session_store::LocalSessionStore;
-use crate::store::path::default_db_path;
-use crate::store::peer_store::{open_peers_store, PeersStore};
-use crate::sync::SyncService;
 use crate::token::TokenStore;
-use crate::topology::{PeerHandle, Topology};
-use net::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
-use protocol::gossip::gossip::Client as GossipClient;
-use protocol::server::server::Client as ServerClient;
-use protocol::topology::topology::Client as TopologyClient;
-
-use async_channel::{Receiver, Sender};
+use crate::topology::peers::PeerValue;
+use crate::topology::Topology;
+use capnp::capability::Promise;
 use ed25519_dalek::SigningKey;
+use net::noise::NoiseKeys;
+use protocol::server::server;
+use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{debug, error};
 use uuid::Uuid;
 
+use protocol::gossip::GossipClient;
+use protocol::node::NodeClient;
+use protocol::server::ServerClient;
+use protocol::sync::SyncClient;
+use protocol::topology::TopologyClient;
+
 pub mod auth;
+pub mod bootstrap;
 pub mod config;
 pub mod credential;
 pub mod headless;
-pub mod server;
 pub mod session;
 
-/// Starts the daemon and its subsystems, picking a run mode and whether to enable unix socket or not.
-/// - `RunMode::Blocking` will not return until listeners stop.
-/// - `RunMode::NonBlocking` returns immediately with join handles inside `Ok(Some(...))`.
-pub async fn start(
-    listen_addr: String,
-    mode: server::RunMode,
-    enable_unix_socket: bool,
-) -> Result<Option<server::RunHandles>, Box<dyn std::error::Error>> {
-    // Build low-level context (keys, db, node)
-    let ctx = Bootstrap::init_base(listen_addr).await?;
+#[derive(Clone)]
+pub struct ServerImpl {
+    // UUID of the node.
+    pub id: Uuid,
 
-    // Open persistent stores (peers + sessions + creds), load peers into MST
-    let stores = Bootstrap::open_stores(&ctx).await?;
+    pub server_client: Option<ServerClient>,
+    pub gossip_client: Option<GossipClient>,
+    pub topology_client: Option<TopologyClient>,
+    pub node_client: Option<NodeClient>,
+    pub sync_client: Option<SyncClient>,
 
-    // Build runtime components (gossip, topology, sync) and their clients
-    let comps = Bootstrap::build_components(&ctx, &stores)?;
+    topology: Option<Topology>,
+    token_store: Option<TokenStore>,
+    session_store: Option<Rc<AuthStore>>,
+    local_sessions: Option<LocalSessionStore>,
 
-    // Wire up ServerImpl and spawn listeners
-    let server = Bootstrap::build_server(&ctx, &stores, &comps).build();
-
-    // Fire background tasks: gossip loop, topology loop, best-effort reconnect
-    Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps).await;
-
-    Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
-
-    // Run the daemon with chosen mode (tcp + optional unix)
-    server.start_with_mode(mode, enable_unix_socket).await
+    config: Option<Config>,
+    noise_keys: Option<Arc<NoiseKeys>>,
+    signing_key: Option<SigningKey>,
 }
 
-pub(crate) struct Bootstrap {
-    // immutable app config
-    listen_addr: String,
-
-    // durable identity & keys
-    self_id: Uuid,
-    noise_keys: Arc<NoiseKeys>,
-    signing_key: SigningKey,
-
-    // storage
-    db: Arc<redb::Database>,
-
-    // local node object + client
-    node: node::Node,
-    node_client: protocol::node::node::Client,
+// How to run the listeners
+#[derive(Clone, Copy, Debug)]
+pub enum RunMode {
+    Blocking,
+    NonBlocking,
 }
 
-pub(crate) struct Stores {
-    peers: PeersStore,
-    session_auth: AuthStore,           // server-side issued tickets
-    local_sessions: LocalSessionStore, // client-side resume tickets (encrypted)
-    local_creds: LocalCredentialStore, // short-lived cluster creds
-    token_store: TokenStore,           // join token rotator
+// Join handles when running in NonBlocking mode (tests usually keep these)
+#[derive(Debug)]
+pub struct RunHandles {
+    pub tcp_task: tokio::task::JoinHandle<()>,
+    pub tcp_ready: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub tcp_addr: std::net::SocketAddr,
+    pub unix_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-pub(crate) struct Components {
-    gossip_client: GossipClient,
-    topology: Topology,
-    topology_client: TopologyClient,
-    sync_client: protocol::sync::sync::Client,
-}
-
-impl Bootstrap {
-    // Construct a Bootstrap context from injected parts (useful for tests).
-    pub(crate) fn from_parts(
-        listen_addr: String,
-        self_id: Uuid,
-        noise_keys: Arc<NoiseKeys>,
-        signing_key: SigningKey,
-        db: Arc<redb::Database>,
-        node: node::Node,
-        node_client: crate::node_capnp::node::Client,
-    ) -> Self {
-        Self {
-            listen_addr,
-            self_id,
-            noise_keys,
-            signing_key,
-            db,
-            node,
-            node_client,
+impl RunHandles {
+    /// Await the readiness signal once (no-op if already awaited).
+    pub async fn wait_ready(&mut self) {
+        if let Some(rx) = self.tcp_ready.take() {
+            let _ = rx.await;
         }
     }
 
-    /// Init Keys, DB, local node & ID.
-    pub(crate) async fn init_base(listen_addr: String) -> Result<Self, Box<dyn std::error::Error>> {
-        // Noise protocol keys.
-        let keys_path = resolve_noise_key_path()?;
-        let noise_keys = Arc::new(load_or_generate_noise_keys(keys_path)?);
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.tcp_addr
+    }
 
-        // Ed25519 signing keys (for cluster credentials).
-        let sign_path = resolve_signing_key_path()?;
-        let sign_keys = load_or_generate_sign_keys(sign_path)?;
-        let signing_key = sign_keys.sk;
+    /// Abort listener tasks (used in tests for fast shutdown).
+    pub fn abort(self) {
+        if let Some(u) = self.unix_task {
+            u.abort();
+        }
+        self.tcp_task.abort();
+    }
+}
 
-        // redb database (creates if missing)
-        let db_path = default_db_path()?;
-        let db = Arc::new(redb::Database::create(db_path)?);
+impl server::Server for ServerImpl {
+    fn register_node(
+        &mut self,
+        params: server::RegisterNodeParams,
+        mut results: server::RegisterNodeResults,
+    ) -> Promise<(), capnp::Error> {
+        let token_store = self.token_store.as_ref().unwrap().clone();
+        let session_store = self.session_store.as_ref().unwrap().clone();
 
-        // Durable node-id
-        let self_id: Uuid = load_or_create_node_id(&db)?;
+        let topology = self.topology.as_ref().unwrap().clone();
 
-        // Local Node (capability) with collected system info
-        let mut node = node::Node::new();
-        node.collect_system_info();
-        node.id = self_id;
-        let node_client = capnp_rpc::new_client(node.clone());
+        let topology_client = self.topology_client.as_ref().unwrap().clone();
+        let sync_client = self.sync_client.as_ref().unwrap().clone();
+        let gossip_client = self.gossip_client.as_ref().unwrap().clone();
+        let node_client = self.node_client.as_ref().unwrap().clone();
+        let signing_key = self.signing_key.as_ref().unwrap().clone();
+        let self_id = self.id;
 
-        Ok(Self {
-            listen_addr,
-            self_id,
-            noise_keys,
-            signing_key,
-            db,
-            node,
-            node_client,
+        Promise::from_future(async move {
+            let p = params.get()?;
+            let info = p.get_info()?;
+            let token = p.get_token()?.to_string()?;
+            let handle = info.get_handle()?;
+
+            // Join token check.
+            if !token_store.matches(&token).await {
+                return Err(capnp::Error::failed("invalid join token".to_string()));
+            }
+
+            let joiner_id = id::read_node_id(info.get_id()?)?;
+            if joiner_id == self_id {
+                return Err(capnp::Error::failed("cannot join self".to_string()));
+            }
+
+            // Already registered?
+            let exists = topology
+                .peer_exists(joiner_id)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            if exists {
+                return Err(capnp::Error::failed("node already registered".to_string()));
+            }
+
+            // Upsert peer into store (MST will update)
+            let hostname = info.get_hostname()?.to_string()?;
+            let address = info.get_addr()?.to_string()?;
+
+            let public_key = info.get_public_key()?;
+            let pubkey = pubkey_from_slice(public_key).expect("expect valid public key");
+
+            let sk_vec = info.get_signing_key()?.to_vec();
+            let sk_arr: [u8; 32] = sk_vec.as_slice().try_into().map_err(|_| {
+                capnp::Error::failed("signing key must be exactly 32 bytes".to_string())
+            })?;
+
+            let signing_vk = ed25519_dalek::VerifyingKey::from_bytes(&sk_arr)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            let peer = PeerValue {
+                address,
+                hostname,
+                noise_static_pub: pubkey.to_bytes(),
+                signing_pub: signing_vk.to_bytes(),
+            };
+
+            topology
+                .register_peer(joiner_id, &peer, handle.clone())
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            // Issue session ticket.
+            let ticket = session_store
+                .issue_ticket(joiner_id)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            let nonce = rand::try_nonce16().map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            const TTL_SECS: u64 = 3600; // 1 hour (tune it)
+            let cred = ClusterCredential::sign(&signing_key, joiner_id, TTL_SECS, nonce);
+            let cred_bytes = cred.to_bytes().map_err(capnp::Error::failed)?;
+
+            let session =
+                ClusterSessionImpl::new(topology_client, sync_client, gossip_client, node_client);
+            let session_client = capnp_rpc::new_client(session);
+
+            // Ensure the periodic sync loop is running on this node as soon as we have a cluster
+            // at least two nodes.
+            {
+                let topo = topology.clone();
+                tokio::task::spawn_local(async move {
+                    topo.ensure_periodic_sync();
+                });
+            }
+
+            let mut out = results.get();
+            out.set_session(session_client);
+            out.set_ticket(&ticket);
+
+            // Include our NodeInfo so the joiner can immediately insert to its store.
+            // Fast propagation of our info means we can get a session to the joiner fast.
+            let ni = out.reborrow().init_node_info();
+            topology.populate_self_node_info(ni);
+            out.set_credential(&cred_bytes);
+
+            Ok(())
         })
     }
 
-    /// Setup persistent stores + warm-up MST.
-    pub(crate) async fn open_stores(ctx: &Bootstrap) -> Result<Stores, Box<dyn std::error::Error>> {
-        // Peers store (CRDT+MST)
-        let peers: PeersStore = open_peers_store(ctx.db.clone(), ctx.self_id)?;
-        peers.rebuild_mst_from_disk().await?;
+    fn get_session(
+        &mut self,
+        params: server::GetSessionParams,
+        mut results: server::GetSessionResults,
+    ) -> Promise<(), capnp::Error> {
+        let session_store = self.session_store.as_ref().unwrap().clone();
 
-        // Server-side session ticket store (anchor issues)
-        let session_auth = crate::server::auth::AuthStore::new(ctx.db.clone())?;
+        let topology = self.topology.as_ref().unwrap().clone();
 
-        // Client-side encrypted resume tickets (for reconnect)
-        let local_sessions = LocalSessionStore::open(ctx.db.clone(), &ctx.noise_keys)?;
+        let topology_client = self.topology_client.as_ref().unwrap().clone();
+        let sync_client = self.sync_client.as_ref().unwrap().clone();
+        let gossip_client = self.gossip_client.as_ref().unwrap().clone();
+        let node_client = self.node_client.as_ref().unwrap().clone();
 
-        // Local short-lived credential store
-        let local_creds = LocalCredentialStore::new(ctx.db.clone())?;
+        Promise::from_future(async move {
+            let ticket = params.get()?.get_ticket()?;
+            let Some(peer_id) = session_store
+                .lookup(ticket)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?
+            else {
+                return Err(capnp::Error::failed("unknown session ticket".to_string()));
+            };
 
-        // Join token store. Generate new token if none exists.
-        let token_store = TokenStore::load(ctx.db.clone()).expect("load persistent join token");
+            if !topology
+                .peer_exists(peer_id)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?
+            {
+                return Err(capnp::Error::failed("peer not registered".to_string()));
+            }
 
-        // Debug dump mst root for peers store.
-        peers.debug_dump_root("peers").await;
-
-        Ok(Stores {
-            peers,
-            session_auth,
-            local_sessions,
-            local_creds,
-            token_store,
+            let session =
+                ClusterSessionImpl::new(topology_client, sync_client, gossip_client, node_client);
+            let session_client = capnp_rpc::new_client(session);
+            results.get().set_session(session_client);
+            Ok(())
         })
     }
 
-    /// Build topology/gossip/sync and their Cap’n Proto clients.
-    pub(crate) fn build_components(
-        ctx: &Bootstrap,
-        stores: &Stores,
-    ) -> Result<Components, Box<dyn std::error::Error>> {
-        // gossip channels
-        let (_gossip_tx, _gossip_rx): (Sender<Message>, Receiver<Message>) =
-            async_channel::bounded(128);
-        let (topology_tx, topology_rx) = async_channel::bounded(128);
+    fn get_with_credential(
+        &mut self,
+        params: server::GetWithCredentialParams,
+        mut results: server::GetWithCredentialResults,
+    ) -> Promise<(), capnp::Error> {
+        let session_store = self.session_store.as_ref().unwrap().clone();
+        let topology = self.topology.as_ref().unwrap().clone();
 
-        // gossip capability
-        let gossip = crate::gossip::Gossip {
-            chans: crate::gossip::Channels {
-                topology_events: topology_tx.clone(),
-            },
-        };
-        let gossip_client = capnp_rpc::new_client(gossip);
+        let topology_client = self.topology_client.as_ref().unwrap().clone();
+        let sync_client = self.sync_client.as_ref().unwrap().clone();
+        let gossip_client = self.gossip_client.as_ref().unwrap().clone();
+        let node_client = self.node_client.as_ref().unwrap().clone();
 
-        // topology object + client
-        let topology = Topology::new(
-            ctx.listen_addr.clone(),
-            topology_rx,
-            stores.local_creds.clone(),
-            ctx.noise_keys.public,
-            ctx.signing_key.clone(),
-            ctx.node.clone(),
-            stores.peers.clone(),
-            stores.local_sessions.clone(),
-            stores.token_store.clone(),
-        )?;
-        let topology_client: TopologyClient = capnp_rpc::new_client(topology.clone());
+        Promise::from_future(async move {
+            // Parse + Verify the signed blob
+            let cred_bytes = params.get()?.get_credential()?;
+            let cred =
+                ClusterCredential::from_bytes_verified(cred_bytes).map_err(capnp::Error::failed)?;
 
-        // sync capability
-        let sync_service = SyncService::new(stores.peers.clone());
-        let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
+            // We must already know the subject as a registered peer
+            if !topology
+                .peer_exists(cred.subject)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?
+            {
+                return Err(capnp::Error::failed(
+                    "peer not registered on this node".to_string(),
+                ));
+            }
 
-        Ok(Components {
-            gossip_client,
-            topology,
-            topology_client,
-            sync_client,
+            if let Some(expected_vk) = topology.signing_vk_for(cred.subject) {
+                if expected_vk != cred.issuer {
+                    debug!(target: "server", subject=%cred.subject, "issuer mismatch for");
+                    return Err(capnp::Error::failed(
+                        "issuer mismatch for subject".to_string(),
+                    ));
+                }
+            } else {
+                // Likely not yet synced, reject for now and the next sync tick will succeed.
+                debug!(target: "server", subject=%cred.subject, "issuer unknown (not yet synced)");
+                return Err(capnp::Error::failed(
+                    "issuer unknown (not yet synced)".to_string(),
+                ));
+            }
+
+            debug!(target: "server", "Peer {} authenticated", cred.subject);
+
+            // Mint a fresh ticket for the subject
+            let ticket = session_store
+                .issue_ticket(cred.subject)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            // Return session + ticket + our peer id (so caller can persist)
+            let session = crate::server::session::ClusterSessionImpl::new(
+                topology_client,
+                sync_client,
+                gossip_client,
+                node_client,
+            );
+            let session_client = capnp_rpc::new_client(session);
+
+            let mut out = results.get();
+            out.set_session(session_client);
+            out.set_ticket(&ticket);
+
+            // Include our NodeInfo so the caller can upsert immediately.
+            let ni = out.reborrow().init_node_info();
+            topology.populate_self_node_info(ni);
+
+            Ok(())
         })
     }
+}
 
-    /// Build the ServerImpl with all dependencies injected.
-    pub(crate) fn build_server<'a>(
-        ctx: &'a Bootstrap,
-        stores: &'a Stores,
-        comps: &'a Components,
-    ) -> ServerImpl {
-        ServerImpl::new()
-            .with_id(ctx.self_id)
-            .with_gossip_client(comps.gossip_client.clone())
-            .with_topology_client(comps.topology_client.clone())
-            .with_sync_client(comps.sync_client.clone())
-            .with_node_client(ctx.node_client.clone())
-            .with_topology(comps.topology.clone())
-            .with_noise_keys(ctx.noise_keys.clone())
-            .with_signing_key(ctx.signing_key.clone())
-            .with_token_store(stores.token_store.clone())
-            .with_session_store(stores.session_auth.clone())
-            .with_local_sessions(stores.local_sessions.clone())
-            .with_config(
-                Config::new()
-                    .with_listen_addr(ctx.listen_addr.clone())
-                    .build(),
+impl Default for ServerImpl {
+    fn default() -> Self {
+        ServerImpl {
+            id: id::new_node_id_v7(),
+            server_client: None,
+            gossip_client: None,
+            topology_client: None,
+            sync_client: None,
+            node_client: None,
+            config: None,
+            noise_keys: None,
+            token_store: None,
+            session_store: None,
+            topology: None,
+            local_sessions: None,
+            signing_key: None,
+        }
+    }
+}
+
+impl ServerImpl {
+    /// Creates a new server.
+    ///
+    /// Returns the server and the memberlist actions to execute
+    /// in a gossip loop.
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    // (moved populate_self_node_info to Topology)
+
+    /// Internal helper: spawn TCP secure listener (and optionally Unix socket) without blocking.
+    async fn spawn_listeners_nonblocking(
+        &self,
+        enable_unix_socket: bool,
+    ) -> std::io::Result<RunHandles> {
+        let cfg = self.config.as_ref().expect("config");
+        let listen_addr = cfg.listen_addr.clone();
+
+        // identical to start_daemon’s server handle
+        let server_handle: protocol::server::server::Client = capnp_rpc::new_client(self.clone());
+        let noise_keys = self.noise_keys.as_ref().expect("noise keys").clone();
+
+        // Non-blocking TCP listener with readiness + bound addr.
+        let (tcp_task, tcp_ready, bound) =
+            net::tcp_secure::start_tcp_secure_listener_nonblocking_with_ready(
+                listen_addr,
+                server_handle.clone(),
+                noise_keys,
             )
-            .build()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        // Optional Unix socket (same behavior as start_daemon)
+        let unix_task = if enable_unix_socket {
+            let topology_client = self.topology_client.as_ref().unwrap().clone();
+            let sync_client = self.sync_client.as_ref().unwrap().clone();
+            let gossip_client = self.gossip_client.as_ref().unwrap().clone();
+            let node_client = self.node_client.as_ref().unwrap().clone();
+
+            let local_session =
+                capnp_rpc::new_client(crate::server::session::ClusterSessionImpl::new(
+                    topology_client,
+                    sync_client,
+                    gossip_client,
+                    node_client,
+                ));
+
+            Some(tokio::task::spawn_local(async move {
+                if let Err(e) = net::unix_socket::start_unix_socket_server_auto(local_session).await
+                {
+                    error!(target: "server", "UnixSocket listener error: {e}");
+                }
+            }))
+        } else {
+            None
+        };
+
+        Ok(RunHandles {
+            tcp_task,
+            tcp_ready: Some(tcp_ready),
+            tcp_addr: bound,
+            unix_task,
+        })
     }
 
-    /// Finish wiring & kick off one-shot post-boot actions.
-    pub(crate) async fn after_boot(
-        server: &ServerImpl,
-        _ctx: &Bootstrap,
-        _stores: &Stores,
-        comps: &Components,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // Give Topology a Server handle (capability)
-        let server_client: ServerClient = capnp_rpc::new_client(server.clone());
-        comps.topology.set_server_handle(server_client.clone());
+    /// New unified entry point: choose Blocking vs NonBlocking.
+    /// - `Blocking` = identical behavior to previous `start_daemon(true/false)`.
+    /// - `NonBlocking` = returns join handles so tests can proceed.
+    pub async fn start_with_mode(
+        self,
+        mode: RunMode,
+        enable_unix_socket: bool,
+    ) -> Result<Option<RunHandles>, Box<dyn std::error::Error>> {
+        let mut handles = self.spawn_listeners_nonblocking(enable_unix_socket).await?;
 
+        match mode {
+            RunMode::Blocking => {
+                // be “up” before awaiting tasks
+                handles.wait_ready().await;
+
+                if let Some(unix) = handles.unix_task {
+                    let _ = tokio::join!(handles.tcp_task, unix);
+                } else {
+                    let _ = handles.tcp_task.await;
+                }
+                Ok(None)
+            }
+            RunMode::NonBlocking => {
+                // caller (Headless/Test) can await readiness or not
+                Ok(Some(handles))
+            }
+        }
+    }
+
+    /// Backward-compatible wrapper (kept for the daemon path).
+    pub async fn start_daemon(
+        self,
+        enable_unix_socket: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _ = self
+            .start_with_mode(RunMode::Blocking, enable_unix_socket)
+            .await?;
         Ok(())
     }
 
-    /// Background loops: gossip, topology run, best-effort connect at boot.
-    async fn spawn_runtime_tasks(ctx: &Bootstrap, _stores: &Stores, comps: &Components) {
-        // gossip loop (placeholder peer list; kept for future use)
-        let peers_vec: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
-        let gossip_rx = {
-            // rebuild the rx the same way build_components did
-            // (or pass it through Components if you prefer)
-            // We’ll re-create it here to keep this snippet self-contained.
-            // In your codebase, prefer exposing `gossip_rx` from build_components.
-            let (_tx, rx) = async_channel::bounded(128);
-            rx
-        };
+    pub fn with_id(&mut self, id: Uuid) -> &mut ServerImpl {
+        self.id = id;
+        self
+    }
 
-        let mut topology_runner = comps.topology.clone();
-        let topology_sync = comps.topology.clone();
+    pub fn with_topology_client(&mut self, topology_client: TopologyClient) -> &mut ServerImpl {
+        self.topology_client = Some(topology_client);
+        self
+    }
 
-        // Spawn gossip loop
-        tokio::task::spawn_local(async move {
-            crate::gossip::start(gossip_rx, peers_vec).await;
-        });
+    pub fn with_gossip_client(&mut self, gossip_client: GossipClient) -> &mut ServerImpl {
+        self.gossip_client = Some(gossip_client);
+        self
+    }
 
-        // Spawn topology loop
-        tokio::task::spawn_local(async move {
-            topology_runner.run().await;
-        });
+    pub fn with_sync_client(&mut self, sync_client: SyncClient) -> &mut ServerImpl {
+        self.sync_client = Some(sync_client);
+        self
+    }
 
-        if topology_sync.already_joined().await.unwrap_or(false) {
-            topology_sync.ensure_periodic_sync();
-        }
+    pub fn with_node_client(&mut self, node_client: NodeClient) -> &mut ServerImpl {
+        self.node_client = Some(node_client);
+        self
+    }
 
-        // Best-effort connect at boot
-        let topology_for_boot = comps.topology.clone();
-        let signing_for_boot = ctx.signing_key.clone();
+    pub fn with_config(&mut self, config: Config) -> &mut ServerImpl {
+        self.config = Some(config);
+        self
+    }
 
-        tokio::task::spawn_local(async move {
-            if let Err(e) = topology_for_boot
-                .connect_known_peers(Some(&signing_for_boot))
-                .await
-            {
-                error!(target: "server", "Startup connect failed: {e}");
-            }
-        });
+    pub fn with_topology(&mut self, topology: Topology) -> &mut ServerImpl {
+        self.topology = Some(topology);
+        self
+    }
+
+    pub fn with_token_store(&mut self, token_store: TokenStore) -> &mut ServerImpl {
+        self.token_store = Some(token_store);
+        self
+    }
+
+    pub fn with_session_store(&mut self, session_store: AuthStore) -> &mut ServerImpl {
+        self.session_store = Some(Rc::new(session_store));
+        self
+    }
+
+    pub fn with_noise_keys(&mut self, keys: Arc<NoiseKeys>) -> &mut ServerImpl {
+        self.noise_keys = Some(keys);
+        self
+    }
+
+    pub fn with_local_sessions(&mut self, local: LocalSessionStore) -> &mut ServerImpl {
+        self.local_sessions = Some(local);
+        self
+    }
+
+    pub fn with_signing_key(&mut self, sk: SigningKey) -> &mut ServerImpl {
+        self.signing_key = Some(sk);
+        self
+    }
+
+    pub fn build(&mut self) -> ServerImpl {
+        let server_client = capnp_rpc::new_client(self.clone());
+        self.server_client = Some(server_client);
+        self.clone()
     }
 }

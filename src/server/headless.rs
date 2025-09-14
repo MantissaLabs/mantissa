@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::{
     node,
     server::{
-        server::{RunHandles, RunMode, ServerImpl},
-        Bootstrap, Components, Stores,
+        bootstrap::{Bootstrap, Components, Stores},
+        RunHandles, RunMode, ServerImpl,
     },
 };
 use net::noise::NoiseKeys;
@@ -76,7 +76,7 @@ impl HeadlessNode {
         sync_tick: Option<Duration>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Local Node + client
-        let mut node_obj = node::node::Node::new();
+        let mut node_obj = node::Node::new();
         node_obj.collect_system_info();
         node_obj.id = self_id;
         let node_client = capnp_rpc::new_client(node_obj.clone());
