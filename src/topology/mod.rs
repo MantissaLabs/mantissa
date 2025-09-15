@@ -1,8 +1,8 @@
 use crate::crypto::rand::{self, nonce16};
+use crate::node::Node;
 use crate::node::address::compute_advertise_ip;
 use crate::node::id::{read_node_id, set_node_id};
-use crate::node::identity::{peer_id_from_public, pubkey_from_slice, PeerId};
-use crate::node::Node;
+use crate::node::identity::{PeerId, peer_id_from_public, pubkey_from_slice};
 use crate::server::credential::ClusterCredential;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
@@ -12,18 +12,19 @@ use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
 use async_channel::Receiver;
 use capnp::data;
-use capnp::{capability::Promise, Error};
+use capnp::{Error, capability::Promise};
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use protocol::gossip::gossip_message;
 use protocol::health::NodeStatus;
-use protocol::server::{self, cluster_session, ServerClient};
+use protocol::server::{self, ServerClient, cluster_session};
 use protocol::sync;
 use protocol::topology::{topology, topology_event};
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -82,6 +83,9 @@ pub struct Topology {
 
     // Persistent token store, holding the current token for joining the cluster.
     token_store: TokenStore,
+
+    // Health monitor (phase 1: passive observation only).
+    health_monitor: StdArc<health::HealthMonitor>,
 }
 
 #[derive(Clone)]
@@ -143,6 +147,7 @@ impl Topology {
         peers: PeersStore,
         sessions: LocalSessionStore,
         token_store: TokenStore,
+        health_monitor: StdArc<health::HealthMonitor>,
     ) -> Result<Self, Error> {
         Ok(Self {
             addr,
@@ -162,6 +167,7 @@ impl Topology {
             token_store,
             periodic_sync_running: Rc::new(AtomicBool::new(false)),
             periodic_sync_handle: Rc::new(RefCell::new(None)),
+            health_monitor,
         })
     }
 
@@ -180,6 +186,7 @@ impl Topology {
         let local_id = self.node.id;
         let public_key = self.public_key;
         let verifying_key = self.signing_key.verifying_key();
+        let health = self.health_monitor.clone();
 
         // Also ensure our own peer-entry exists in the store
         let peers = self.peers.clone();
@@ -219,6 +226,9 @@ impl Topology {
                 Ok(true) => {} // Nothing to do.
                 Err(e) => log::warn!("exists(self) failed: {e}"),
             }
+
+            // mark self as alive in health (passive observation)
+            health.observe_seen(local_id);
         });
 
         Ok(())
@@ -271,6 +281,11 @@ impl Topology {
 
     pub fn get_server_handle(&self) -> Option<ServerClient> {
         self.server_handle.get().cloned()
+    }
+
+    /// Current Peers MST root digest (16 bytes) as seen locally.
+    pub async fn peers_root_digest(&self) -> std::io::Result<[u8; 16]> {
+        Ok(self.peers.root_digest().await)
     }
 
     /// Set the periodic sync interval (useful for tests to speed up convergence).
@@ -493,7 +508,12 @@ impl Topology {
                         Ok(resp) => match resp.get().and_then(|r| r.get_session()) {
                             Ok(session) => {
                                 self.attach_handle_only(peer_id, client.clone()).await;
-                                let _ = session.ping_request().send().promise.await;
+                                let _ = session.ping_request().send().promise.await.map(|_| {
+                                    self.health_monitor.observe_seen(peer_id);
+                                });
+
+                                // Also mark as seen upon successful session restoration
+                                self.health_monitor.observe_seen(peer_id);
 
                                 println!("Session established with peer {peer_id} @ {addr}");
                             }
@@ -649,7 +669,13 @@ impl Topology {
                     .insert(peer_id, server_client.clone());
 
                 // optional sanity ping on the session's ping() if you like:
-                let _ = session.ping_request().send().promise.await;
+                let _ = session.ping_request().send().promise.await.map(|_| {
+                    // passive observation: mark as seen
+                    self.health_monitor.observe_seen(peer_id);
+                });
+
+                // If ping failed, we still consider the session establishment as seen
+                self.health_monitor.observe_seen(peer_id);
 
                 // or fetch caps here if you want to warm them (not required):
                 // let _ = _session.get_capabilities_request().send().promise.await;
@@ -743,6 +769,95 @@ impl Topology {
             let d = *self.sync_interval.lock().unwrap();
             tokio::time::sleep(d).await;
             self.periodic_sync_tick().await;
+        }
+    }
+
+    /// Probe a small random sample of peers via Health RPC and update the monitor on success.
+    pub async fn health_probe_tick(&self, fanout: usize) {
+        // Snapshot peers (actives) from MST
+        let peers_snapshot = match self.peers.load_all() {
+            Ok((actives, _)) => actives,
+            Err(e) => {
+                error!(target: "health", "load all peers failed: {e}");
+                return;
+            }
+        };
+
+        // Build list of peers excluding self
+        let mut candidates: Vec<(uuid::Uuid, String)> = Vec::new();
+        for (k, snap) in peers_snapshot {
+            let peer_id: uuid::Uuid = k.to_uuid();
+            if peer_id == self.node.id {
+                continue;
+            }
+            if let Some(v) = snap.as_slice().last().cloned() {
+                candidates.push((peer_id, v.address));
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+
+        // Randomly pick up to `fanout`
+        use ::rand::prelude::SliceRandom;
+        let mut rng = ::rand::rng();
+        candidates.shuffle(&mut rng);
+        let sample = candidates.into_iter().take(fanout);
+
+        for (peer_id, addr) in sample {
+            // Connect to remote Server
+            let client: protocol::server::server::Client =
+                match client::connection::get_client_secure(&addr).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(target: "health", "connect {addr} failed: {e}");
+                        continue;
+                    }
+                };
+
+            // Obtain session: prefer ticket, else credential (if we can sign)
+            let mut session_opt: Option<cluster_session::Client> =
+                self.session_via_ticket(&client, peer_id).await;
+            if session_opt.is_none() {
+                if let Some(s) = self.session_via_credential(&client, peer_id).await {
+                    session_opt = Some(s);
+                }
+            }
+            let Some(session) = session_opt else { continue };
+
+            // Get Health capability
+            let health_cap = match (async {
+                let req = session.get_capabilities_request();
+                let resp = req.send().promise.await?;
+                let caps = resp.get()?.get_caps()?;
+                caps.get_health()
+            })
+            .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    error!(target: "health", "get health cap failed: {e}");
+                    continue;
+                }
+            };
+
+            // Ping with timeout
+            let ping = async {
+                let req = health_cap.ping_request();
+                req.send().promise.await
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(1), ping).await {
+                Ok(Ok(_)) => {
+                    // success: mark peer as seen
+                    self.health_monitor.observe_seen(peer_id);
+                }
+                Ok(Err(e)) => {
+                    error!(target: "health", "ping failed for {addr}: {e}");
+                }
+                Err(_) => {
+                    error!(target: "health", "ping timed out for {addr}");
+                }
+            }
         }
     }
 
@@ -941,6 +1056,9 @@ impl topology::Server for Topology {
             // Persist credential for future secure reconnects.
             let _ = crate::server::credential::ClusterCredential::from_bytes_verified(cred_blob);
 
+            // Passive observation: we just successfully registered and obtained a session.
+            topology.health_monitor.observe_seen(peer_id);
+
             let sync_cap: sync::Client = {
                 let req = session.get_sync_request();
                 let resp = req.send().promise.await?;
@@ -1017,6 +1135,7 @@ impl topology::Server for Topology {
         info!(target: "topology", "Listing nodes");
 
         let peers = self.peers.clone();
+        let health_snapshot = self.health_monitor.snapshot();
 
         Promise::from_future(async move {
             let (actives, _) = peers
@@ -1037,8 +1156,19 @@ impl topology::Server for Topology {
                     node.set_public_key(&val.noise_static_pub);
                 }
 
-                // TODO: real health; placeholder:
-                node.set_health(NodeStatus::Alive);
+                // Map health snapshot to NodeStatus.
+                let s = match health_snapshot
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or(health::Status::Unknown)
+                {
+                    health::Status::Unknown => NodeStatus::Unknown,
+                    health::Status::Alive => NodeStatus::Alive,
+                    health::Status::Suspect => NodeStatus::Suspect,
+                    health::Status::Down => NodeStatus::Down,
+                    health::Status::Degraded => NodeStatus::Degraded,
+                };
+                node.set_health(s);
             }
 
             Ok(())
@@ -1097,6 +1227,7 @@ impl Clone for Topology {
             periodic_sync_running: self.periodic_sync_running.clone(),
             periodic_sync_handle: self.periodic_sync_handle.clone(),
             sync_interval: self.sync_interval.clone(),
+            health_monitor: self.health_monitor.clone(),
         }
     }
 }

@@ -83,6 +83,7 @@ pub(crate) struct Components {
     pub topology: Topology,
     pub topology_client: TopologyClient,
     pub sync_client: protocol::sync::sync::Client,
+    pub health_monitor: std::sync::Arc<health::HealthMonitor>,
 }
 
 impl Bootstrap {
@@ -191,6 +192,10 @@ impl Bootstrap {
         let gossip_client = capnp_rpc::new_client(gossip);
 
         // topology object + client
+        // Health monitor (phase 1: passive observation only)
+        let health_cfg = health::Config::default();
+        let health_monitor = health::HealthMonitor::new(health_cfg);
+
         let topology = Topology::new(
             ctx.listen_addr.clone(),
             topology_rx,
@@ -201,6 +206,7 @@ impl Bootstrap {
             stores.peers.clone(),
             stores.local_sessions.clone(),
             stores.token_store.clone(),
+            health_monitor.clone(),
         )?;
         let topology_client: TopologyClient = capnp_rpc::new_client(topology.clone());
 
@@ -213,6 +219,7 @@ impl Bootstrap {
             topology,
             topology_client,
             sync_client,
+            health_monitor,
         })
     }
 
@@ -258,6 +265,8 @@ impl Bootstrap {
 
     /// Background loops: gossip, topology run, best-effort connect at boot.
     pub(crate) async fn spawn_runtime_tasks(ctx: &Bootstrap, _stores: &Stores, comps: &Components) {
+        // Start health monitor loop inside the local task set.
+        let _hm = comps.health_monitor.start();
         // gossip loop (placeholder peer list; kept for future use)
         let peers_vec: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let gossip_rx = {
@@ -296,6 +305,27 @@ impl Bootstrap {
                 .await
             {
                 error!(target: "server", "Startup connect failed: {e}");
+            }
+        });
+
+        // Health active pinger loop (low fanout).
+        let topo_for_health = comps.topology.clone();
+        tokio::task::spawn_local(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                topo_for_health.health_probe_tick(2).await;
+            }
+        });
+
+        // Keep self marked as Alive by recording a periodic self observation.
+        let hm_self = comps.health_monitor.clone();
+        let self_id = ctx.self_id;
+        tokio::task::spawn_local(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                hm_self.observe_seen(self_id);
             }
         });
     }

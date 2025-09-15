@@ -7,7 +7,6 @@ pub mod cli;
 pub mod crypto;
 pub mod gossip;
 pub mod logger;
-pub mod monitor;
 pub mod node;
 pub mod server;
 pub mod store;

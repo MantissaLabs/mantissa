@@ -6,7 +6,6 @@ mod cli;
 mod crypto;
 mod gossip;
 mod logger;
-pub mod monitor;
 mod node;
 mod server;
 mod store;

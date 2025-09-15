@@ -10,6 +10,7 @@ use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 use mantissa::{node, server::headless::HeadlessNode};
+use protocol::health::NodeStatus;
 
 /// Run an async block inside a LocalSet so all `spawn_local` tasks work.
 pub async fn run_local<F, T>(f: F) -> T
@@ -373,5 +374,59 @@ impl TestNode {
         let req = self.node.topology_client.leave_request();
         let _ = req.send().promise.await?;
         Ok(())
+    }
+
+    /// Stop accepting new connections (simulate node down).
+    /// - Inproc: unregister from registry.
+    /// - TCP: abort the listener task.
+    pub async fn stop(&mut self) -> std::io::Result<()> {
+        self.node.stop().await
+    }
+
+    /// Start (or restart) the listener.
+    /// - Inproc: re-register in registry.
+    /// - TCP: start listener again; update bound addr (ephemeral port).
+    pub async fn start(&mut self) -> std::io::Result<()> {
+        self.node.start().await
+    }
+
+    /// Return the NodeStatus of `target` as seen by this node via Topology.list.
+    pub async fn list_status_of(&self, target: Uuid) -> Result<Option<NodeStatus>, capnp::Error> {
+        let topo = self.topology();
+        let req = topo.list_request();
+        let resp = req.send().promise.await?;
+        let list = resp.get()?.get_nodes()?;
+        for n in list.get_nodes()?.iter() {
+            let id_bytes = n.get_id()?.get_bytes()?;
+            let id = uuid::Uuid::from_slice(id_bytes).unwrap();
+            if id == target {
+                return Ok(Some(n.get_health()?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Wait until this node reports `expect` for `target` via Topology.list or timeouts.
+    pub async fn wait_status_of(
+        &self,
+        target: Uuid,
+        expect: NodeStatus,
+        timeout: Duration,
+    ) -> Result<(), capnp::Error> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(s) = self.list_status_of(target).await? {
+                if s == expect {
+                    return Ok(());
+                }
+            }
+            if Instant::now() > deadline {
+                return Err(capnp::Error::failed(format!(
+                    "timeout waiting for {:?} on {}",
+                    expect, target
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 }

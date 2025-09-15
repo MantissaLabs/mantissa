@@ -4,6 +4,7 @@ using import "gossip.capnp".Gossip;
 using import "topology.capnp".Topology;
 using Node = import "node.capnp";
 using import "sync.capnp".Sync;
+using import "health.capnp".Health;
 
 interface Server {
   registerNode @0 (info :Node.NodeInfo, token :Text) -> (session :ClusterSession, ticket :Data, nodeInfo :Node.NodeInfo, credential :Data);
@@ -39,4 +40,5 @@ struct Capabilities {
   topology @1 :Topology;
   node @2 :Node.Node;
   sync @3 :Sync;
+  health @4 :Health;
 }

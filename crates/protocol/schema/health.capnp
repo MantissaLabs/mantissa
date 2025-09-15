@@ -1,5 +1,11 @@
 @0x8ddfac9670d583d3;
 
+# Lightweight health RPC for liveness/diagnostics.
+interface Health {
+  ping @0 () -> (ok :Bool, now :UInt64, rootDigest :Data);
+  # Returns a quick heartbeat with current time and the 16-byte MST root digest (Peers domain).
+}
+
 enum NodeStatus {
   unknown @0;
   # default before any heartbeat observed
@@ -17,4 +23,3 @@ enum NodeStatus {
   # reachable but persistent digest/root mismatch beyond grace window
   # (useful to signal "needs anti-entropy" without marking it down)
 }
-

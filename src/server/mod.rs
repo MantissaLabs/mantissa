@@ -7,8 +7,8 @@ use crate::server::credential::ClusterCredential;
 use crate::server::session::ClusterSessionImpl;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::token::TokenStore;
-use crate::topology::peers::PeerValue;
 use crate::topology::Topology;
+use crate::topology::peers::PeerValue;
 use capnp::capability::Promise;
 use ed25519_dalek::SigningKey;
 use net::noise::NoiseKeys;
@@ -19,6 +19,7 @@ use tracing::{debug, error};
 use uuid::Uuid;
 
 use protocol::gossip::GossipClient;
+use protocol::health::health as health_iface;
 use protocol::node::NodeClient;
 use protocol::server::ServerClient;
 use protocol::sync::SyncClient;
@@ -29,6 +30,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod credential;
 pub mod headless;
+pub mod health;
 pub mod session;
 
 #[derive(Clone)]
@@ -170,8 +172,15 @@ impl server::Server for ServerImpl {
             let cred = ClusterCredential::sign(&signing_key, joiner_id, TTL_SECS, nonce);
             let cred_bytes = cred.to_bytes().map_err(capnp::Error::failed)?;
 
-            let session =
-                ClusterSessionImpl::new(topology_client, sync_client, gossip_client, node_client);
+            let health_srv = crate::server::health::HealthImpl::new(topology.clone());
+            let health_client: health_iface::Client = capnp_rpc::new_client(health_srv);
+            let session = ClusterSessionImpl::new(
+                topology_client,
+                sync_client,
+                gossip_client,
+                node_client,
+                health_client,
+            );
             let session_client = capnp_rpc::new_client(session);
 
             // Ensure the periodic sync loop is running on this node as soon as we have a cluster
@@ -227,8 +236,15 @@ impl server::Server for ServerImpl {
                 return Err(capnp::Error::failed("peer not registered".to_string()));
             }
 
-            let session =
-                ClusterSessionImpl::new(topology_client, sync_client, gossip_client, node_client);
+            let health_srv = crate::server::health::HealthImpl::new(topology.clone());
+            let health_client: health_iface::Client = capnp_rpc::new_client(health_srv);
+            let session = ClusterSessionImpl::new(
+                topology_client,
+                sync_client,
+                gossip_client,
+                node_client,
+                health_client,
+            );
             let session_client = capnp_rpc::new_client(session);
             results.get().set_session(session_client);
             Ok(())
@@ -287,11 +303,14 @@ impl server::Server for ServerImpl {
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             // Return session + ticket + our peer id (so caller can persist)
+            let health_srv = crate::server::health::HealthImpl::new(topology.clone());
+            let health_client: health_iface::Client = capnp_rpc::new_client(health_srv);
             let session = crate::server::session::ClusterSessionImpl::new(
                 topology_client,
                 sync_client,
                 gossip_client,
                 node_client,
+                health_client,
             );
             let session_client = capnp_rpc::new_client(session);
 
@@ -367,6 +386,9 @@ impl ServerImpl {
             let sync_client = self.sync_client.as_ref().unwrap().clone();
             let gossip_client = self.gossip_client.as_ref().unwrap().clone();
             let node_client = self.node_client.as_ref().unwrap().clone();
+            let topology_obj = self.topology.as_ref().unwrap().clone();
+            let health_srv = crate::server::health::HealthImpl::new(topology_obj);
+            let health_client: health_iface::Client = capnp_rpc::new_client(health_srv);
 
             let local_session =
                 capnp_rpc::new_client(crate::server::session::ClusterSessionImpl::new(
@@ -374,6 +396,7 @@ impl ServerImpl {
                     sync_client,
                     gossip_client,
                     node_client,
+                    health_client,
                 ));
 
             Some(tokio::task::spawn_local(async move {

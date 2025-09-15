@@ -1098,6 +1098,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "health"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1538,6 +1547,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "getrandom 0.2.15",
+ "health",
  "hkdf",
  "log",
  "merkle-search-tree",

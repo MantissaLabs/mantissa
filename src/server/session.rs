@@ -1,5 +1,8 @@
 use capnp::capability::Promise;
-use protocol::{gossip::gossip, node::node, server::cluster_session, sync::sync, topology::topology};
+use protocol::{
+    gossip::gossip, health::health, node::node, server::cluster_session, sync::sync,
+    topology::topology,
+};
 
 #[derive(Clone)]
 pub struct ClusterSessionImpl {
@@ -7,6 +10,7 @@ pub struct ClusterSessionImpl {
     sync: sync::Client,
     gossip: gossip::Client,
     node: node::Client,
+    health: health::Client,
 }
 
 impl ClusterSessionImpl {
@@ -15,12 +19,14 @@ impl ClusterSessionImpl {
         sync: sync::Client,
         gossip: gossip::Client,
         node: node::Client,
+        health: health::Client,
     ) -> Self {
         Self {
             topology,
             sync,
             gossip,
             node,
+            health,
         }
     }
 }
@@ -37,6 +43,7 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_gossip(self.gossip.clone());
         caps.set_topology(self.topology.clone());
         caps.set_sync(self.sync.clone());
+        caps.set_health(self.health.clone());
 
         Promise::ok(())
     }
@@ -74,14 +81,6 @@ impl cluster_session::Server for ClusterSessionImpl {
         mut results: cluster_session::GetNodeResults,
     ) -> Promise<(), capnp::Error> {
         results.get().set_node(self.node.clone());
-        Promise::ok(())
-    }
-
-    fn ping(
-        &mut self,
-        _params: cluster_session::PingParams,
-        _results: cluster_session::PingResults,
-    ) -> Promise<(), capnp::Error> {
         Promise::ok(())
     }
 }

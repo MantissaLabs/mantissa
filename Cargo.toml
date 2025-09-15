@@ -15,6 +15,7 @@ members = [
     "crates/protocol",
     "crates/net",
     "crates/client",
+    "crates/health",
 ]
 
 [build-dependencies]
@@ -26,6 +27,7 @@ crdt_store = { path = "crates/crdt_store" }
 protocol = { path = "crates/protocol" }
 net = { path = "crates/net" }
 client = { path = "crates/client" }
+health = { path = "crates/health" }
 clap = { version = "4.5.45", features = ["derive", "cargo"] }
 chrono = { version = "0.4", features = ["serde"] }
 tabwriter = "1"
