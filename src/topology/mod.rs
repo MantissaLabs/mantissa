@@ -283,6 +283,16 @@ impl Topology {
         self.server_handle.get().cloned()
     }
 
+    /// Mark `id` as recently seen (Alive) in the health monitor.
+    pub fn mark_seen(&self, id: Uuid) {
+        self.health_monitor.observe_seen(id);
+    }
+
+    /// Return true if we have a stored ticket for `peer_id` in local sessions.
+    pub fn has_ticket(&self, peer_id: Uuid) -> bool {
+        matches!(self.local_sessions.get(peer_id), Ok(Some(_)))
+    }
+
     /// Current Peers MST root digest (16 bytes) as seen locally.
     pub async fn peers_root_digest(&self) -> std::io::Result<[u8; 16]> {
         Ok(self.peers.root_digest().await)
@@ -509,11 +519,11 @@ impl Topology {
                             Ok(session) => {
                                 self.attach_handle_only(peer_id, client.clone()).await;
                                 let _ = session.ping_request().send().promise.await.map(|_| {
-                                    self.health_monitor.observe_seen(peer_id);
+                                    self.mark_seen(peer_id);
                                 });
 
                                 // Also mark as seen upon successful session restoration
-                                self.health_monitor.observe_seen(peer_id);
+                                self.mark_seen(peer_id);
 
                                 println!("Session established with peer {peer_id} @ {addr}");
                             }
@@ -671,11 +681,11 @@ impl Topology {
                 // optional sanity ping on the session's ping() if you like:
                 let _ = session.ping_request().send().promise.await.map(|_| {
                     // passive observation: mark as seen
-                    self.health_monitor.observe_seen(peer_id);
+                    self.mark_seen(peer_id);
                 });
 
                 // If ping failed, we still consider the session establishment as seen
-                self.health_monitor.observe_seen(peer_id);
+                self.mark_seen(peer_id);
 
                 // or fetch caps here if you want to warm them (not required):
                 // let _ = _session.get_capabilities_request().send().promise.await;
@@ -848,8 +858,7 @@ impl Topology {
             };
             match tokio::time::timeout(std::time::Duration::from_secs(1), ping).await {
                 Ok(Ok(_)) => {
-                    // success: mark peer as seen
-                    self.health_monitor.observe_seen(peer_id);
+                    self.mark_seen(peer_id);
                 }
                 Ok(Err(e)) => {
                     error!(target: "health", "ping failed for {addr}: {e}");
@@ -1057,7 +1066,7 @@ impl topology::Server for Topology {
             let _ = crate::server::credential::ClusterCredential::from_bytes_verified(cred_blob);
 
             // Passive observation: we just successfully registered and obtained a session.
-            topology.health_monitor.observe_seen(peer_id);
+            topology.mark_seen(peer_id);
 
             let sync_cap: sync::Client = {
                 let req = session.get_sync_request();
