@@ -6,13 +6,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use bollard::Docker;
 use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
     RemoveContainerOptions, RestartContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::models::{HostConfig, RestartPolicy, RestartPolicyNameEnum};
 use bollard::service::ContainerInspectResponse;
-use bollard::Docker;
 
 use async_trait::async_trait;
 use log::{debug, error, info};
@@ -200,7 +200,7 @@ impl ContainerManager for DockerContainerManager {
 
         if !response.warnings.is_empty() {
             for warning in response.warnings {
-                debug!("Container creation warning: {}", warning);
+                debug!("Container creation warning: {warning}");
             }
         }
 
@@ -307,7 +307,7 @@ impl ContainerManager for DockerContainerManager {
 
         let options = ListContainersOptions {
             all: true,
-            filters: filters.unwrap_or_else(HashMap::new),
+            filters: filters.unwrap_or_default(),
             ..Default::default()
         };
 
@@ -382,7 +382,7 @@ impl ContainerManager for DockerContainerManager {
             match result {
                 Ok(update) => {
                     if let Some(status) = update.status {
-                        debug!("Pull status: {}", status);
+                        debug!("Pull status: {status}");
                     }
                     if let Some(error) = update.error {
                         return Err(ContainerError::OperationFailed(error));

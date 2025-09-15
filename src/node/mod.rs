@@ -1,9 +1,9 @@
 use crate::info_capnp::info as SystemInfo;
 use crate::node::id::new_node_id_v7;
 use crate::node::info::NodeInfo;
+use capnp::Error;
 use capnp::capability::Promise;
 use capnp::message::Builder;
-use capnp::Error;
 use protocol::node;
 
 pub mod address;
@@ -109,7 +109,7 @@ impl node::Server for Node {
             let mut system = builder.init_root::<SystemInfo::Builder>();
 
             if info.hostname.is_some() {
-                system.set_hostname(&info.hostname.unwrap());
+                system.set_hostname(info.hostname.unwrap());
             }
 
             // Operating system
@@ -143,8 +143,8 @@ impl node::Server for Node {
                 if info.cpu_info.is_some() {
                     let cpu_info = info.cpu_info.unwrap();
                     cpu.set_vendor(cpu_info.vendor.unwrap_or(String::from("Unknown")));
-                    cpu.set_brand(&cpu_info.brand.unwrap_or(String::from("Unknown")));
-                    cpu.set_codename(&cpu_info.codename.unwrap_or(String::from("Unknown")));
+                    cpu.set_brand(cpu_info.brand.unwrap_or(String::from("Unknown")));
+                    cpu.set_codename(cpu_info.codename.unwrap_or(String::from("Unknown")));
                     cpu.set_frequency(cpu_info.frequency.unwrap_or(0));
                     cpu.set_num_cores(cpu_info.num_cores);
                     cpu.set_logical_cpus(cpu_info.num_logical_cpus);
@@ -183,12 +183,11 @@ impl node::Server for Node {
         }
 
         match builder.get_root::<SystemInfo::Builder>() {
-            Ok(system_reader) => {
-                results.get().set_info(system_reader.into_reader());
-            }
-            Err(e) => return Promise::err(e),
+            Ok(system_reader) => match results.get().set_info(system_reader.into_reader()) {
+                Ok(_) => Promise::ok(()),
+                Err(e) => Promise::err(e),
+            },
+            Err(e) => Promise::err(e),
         }
-
-        Promise::ok(())
     }
 }

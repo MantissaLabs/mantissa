@@ -29,7 +29,7 @@ pub async fn submit() -> Result<()> {
 
     // Start the container
     container_manager.start_container(&container_id).await?;
-    println!("Container started: {}", container_id);
+    println!("Container started: {container_id}");
 
     // List all running containers
     let mut filters = HashMap::new();

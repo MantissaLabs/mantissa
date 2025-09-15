@@ -1,18 +1,18 @@
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::Message;
+use crate::server::ServerImpl;
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
-use crate::server::ServerImpl;
 use crate::store::local::load_or_create_node_id;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::path::default_db_path;
-use crate::store::peer_store::{open_peers_store, PeersStore};
+use crate::store::peer_store::{PeersStore, open_peers_store};
 use crate::sync::SyncService;
 use crate::token::TokenStore;
 use crate::topology::{PeerHandle, Topology};
 use crate::{node, server};
-use net::noise::{load_or_generate_noise_keys, resolve_noise_key_path, NoiseKeys};
+use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::server::server::Client as ServerClient;
 use protocol::topology::topology::Client as TopologyClient;
@@ -266,7 +266,8 @@ impl Bootstrap {
     /// Background loops: gossip, topology run, best-effort connect at boot.
     pub(crate) async fn spawn_runtime_tasks(ctx: &Bootstrap, _stores: &Stores, comps: &Components) {
         // Start health monitor loop inside the local task set.
-        let _hm = comps.health_monitor.start();
+        comps.health_monitor.start();
+
         // gossip loop (placeholder peer list; kept for future use)
         let peers_vec: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let gossip_rx = {
