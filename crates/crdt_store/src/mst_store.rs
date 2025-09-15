@@ -30,6 +30,21 @@ pub enum Entry<S> {
     Deleted { ts: u64 },
 }
 
+/// List of `(Key, Snapshot)` pairs.
+pub type Snapshots<K, S> = Vec<(K, S)>;
+
+/// List of `(Key, Reg)` pairs.
+pub type Registers<K, R> = Vec<(K, R)>;
+
+/// List of `(Key, tombstone_ts)` pairs.
+pub type Tombstones<K> = Vec<(K, u64)>;
+
+/// Tuple of `(Snapshots, Tombstones)` returned by bulk loaders.
+pub type SnapshotsAndTombs<K, S> = (Snapshots<K, S>, Tombstones<K>);
+
+/// Tuple of `(Registers, Tombstones)` returned by delta exporters.
+pub type RegistersAndTombs<K, R> = (Registers<K, R>, Tombstones<K>);
+
 // Canonical hashing: tag byte + payload in a fixed-endian encoding.
 // IMPORTANT: The hashing of snapshots must be stable/canonical.
 impl<S> Hash for Entry<S>
@@ -397,8 +412,8 @@ where
     /// Apply one streamed delta chunk (register merges + tombstones). Batches in a single write.
     pub fn apply_delta_chunk(
         &self,
-        regs: Vec<(C::Key, C::Reg)>,
-        tombs: Vec<(C::Key, u64)>,
+        regs: Registers<C::Key, C::Reg>,
+        tombs: Tombstones<C::Key>,
     ) -> io::Result<()> {
         // Prepare merged registers by reading current values once.
         let merged_regs: Vec<(C::Key, C::Reg)> = {
@@ -453,8 +468,8 @@ where
     /// This avoids a full rebuild at the end of the stream when chunks are small.
     pub async fn apply_delta_chunk_update_mst(
         &self,
-        regs: Vec<(C::Key, C::Reg)>,
-        tombs: Vec<(C::Key, u64)>,
+        regs: Registers<C::Key, C::Reg>,
+        tombs: Tombstones<C::Key>,
     ) -> io::Result<()> {
         // Prepare merged registers by reading current values once.
         let merged_regs: Vec<(C::Key, C::Reg)> = {
@@ -521,7 +536,7 @@ where
     }
 
     /// Dump durable (key, snapshot) and (key, tombstone).
-    pub fn load_all(&self) -> crate::Result<(Vec<(C::Key, C::Snapshot)>, Vec<(C::Key, u64)>)> {
+    pub fn load_all(&self) -> crate::Result<SnapshotsAndTombs<C::Key, C::Snapshot>> {
         let r = self.db.begin_read().map_err(into_err)?;
         let values = r.open_table(T::values()).map_err(into_err)?;
         let tombs = r.open_table(T::tombs()).map_err(into_err)?;
@@ -614,7 +629,7 @@ where
     pub fn export_page_ranges_delta(
         &self,
         want: &[PageDigestRange],
-    ) -> crate::Result<(Vec<(C::Key, C::Reg)>, Vec<(C::Key, u64)>)> {
+    ) -> crate::Result<RegistersAndTombs<C::Key, C::Reg>> {
         let r = self.db.begin_read().map_err(into_err)?;
         let values = r.open_table(T::values()).map_err(into_err)?;
         let tombstones = r.open_table(T::tombs()).map_err(into_err)?;
@@ -828,8 +843,8 @@ where
     /// Apply one chunk of registers and tombstones (batched write).
     pub fn apply_chunk(
         &self,
-        regs: Vec<(C::Key, C::Reg)>,
-        tombs: Vec<(C::Key, u64)>,
+        regs: Registers<C::Key, C::Reg>,
+        tombs: Tombstones<C::Key>,
     ) -> crate::Result<()> {
         self.store.apply_delta_chunk(regs, tombs).map_err(into_err)
     }

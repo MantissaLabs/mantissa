@@ -36,11 +36,7 @@ impl TokenStoreInMemory {
     /// Current token if set.
     pub async fn current(&self) -> Option<String> {
         let s = self.inner.read().await.clone();
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
+        if s.is_empty() { None } else { Some(s) }
     }
 
     /// Validate a candidate token against the current one.

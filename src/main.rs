@@ -3,7 +3,6 @@ extern crate log;
 extern crate sysinfo;
 
 mod cli;
-pub mod container;
 mod crypto;
 mod gossip;
 mod logger;

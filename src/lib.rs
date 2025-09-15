@@ -4,7 +4,6 @@ pub use protocol::{
 };
 
 pub mod cli;
-pub mod container;
 pub mod crypto;
 pub mod gossip;
 pub mod logger;

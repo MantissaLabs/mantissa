@@ -7,7 +7,7 @@ description = "Decentralized cluster management"
 homepage = "https://mantissa.io"
 repository = "https://github.com/abronan/mantissa"
 readme = "README.md"
-edition = "2021"
+edition = "2024"
 
 [workspace]
 members = [

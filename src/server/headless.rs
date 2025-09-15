@@ -1,6 +1,4 @@
 #![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
 
 use std::{io, net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
@@ -8,8 +6,8 @@ use uuid::Uuid;
 use crate::{
     node,
     server::{
-        bootstrap::{Bootstrap, Components, Stores},
         RunHandles, RunMode, ServerImpl,
+        bootstrap::{Bootstrap, Components, Stores},
     },
 };
 use net::noise::NoiseKeys;
@@ -372,7 +370,7 @@ impl HeadlessNode {
         req.get().set_link(
             msg.get_root::<crate::topology_capnp::join_request::Builder>()?
                 .into_reader(),
-        );
+        )?;
 
         let resp = req.send().promise.await?;
         let jr = resp.get()?.get_resp()?;
