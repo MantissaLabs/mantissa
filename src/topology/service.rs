@@ -7,6 +7,7 @@ use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::sync::delta::sync_peers_after_join;
 use crate::token::TokenStore;
+use crate::topology::health::status_to_node_status;
 use crate::topology::peers::PeerValue;
 use capnp::data;
 use capnp::{Error, capability::Promise};
@@ -296,18 +297,12 @@ impl topology::Server for Topology {
                 }
 
                 // Map health snapshot to NodeStatus.
-                let s = match health_snapshot
+                let health_status = health_snapshot
                     .get(&id)
                     .cloned()
-                    .unwrap_or(::health::Status::Unknown)
-                {
-                    ::health::Status::Unknown => NodeStatus::Unknown,
-                    ::health::Status::Alive => NodeStatus::Alive,
-                    ::health::Status::Suspect => NodeStatus::Suspect,
-                    ::health::Status::Down => NodeStatus::Down,
-                    ::health::Status::Degraded => NodeStatus::Degraded,
-                };
-                node.set_health(s);
+                    .unwrap_or(::health::Status::Unknown);
+                let node_status = status_to_node_status(health_status);
+                node.set_health(node_status);
             }
 
             Ok(())
