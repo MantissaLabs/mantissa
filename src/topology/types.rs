@@ -42,7 +42,7 @@ pub enum TopologyEvent {
         root_hash: String,
         client: server::Client,
         noise_static_pub: PublicKey,
-        signing_pub: VerifyingKey,
+        signing_pub: Box<VerifyingKey>,
     },
     Leave {
         id: Uuid,

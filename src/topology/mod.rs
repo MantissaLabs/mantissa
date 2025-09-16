@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,7 +40,7 @@ mod types;
 pub use self::types::{PeerHandle, TopologyEvent};
 pub use service::{add_event, read_topology_event};
 
-pub type HandleMap = Arc<RwLock<HashMap<Uuid, server::Client>>>;
+pub type HandleMap = Rc<RwLock<HashMap<Uuid, server::Client>>>;
 
 pub struct Topology {
     // Address of the node.
@@ -88,7 +87,7 @@ pub struct Topology {
     token_store: TokenStore,
 
     // Health monitor (phase 1: passive observation only).
-    health_monitor: StdArc<HealthMonitor>,
+    health_monitor: Arc<HealthMonitor>,
 }
 
 #[derive(Clone, Copy)]
@@ -108,14 +107,14 @@ impl Topology {
         peers: PeersStore,
         sessions: LocalSessionStore,
         token_store: TokenStore,
-        health_monitor: StdArc<HealthMonitor>,
+        health_monitor: Arc<HealthMonitor>,
     ) -> Result<Self, Error> {
         Ok(Self {
             addr,
             rx,
             peers,
             server_handle: std::rc::Rc::new(OnceCell::new()),
-            handles: Arc::new(RwLock::new(HashMap::new())),
+            handles: Rc::new(RwLock::new(HashMap::new())),
             public_key: public,
             signing_key,
             peer_id: peer_id_from_public(&public),

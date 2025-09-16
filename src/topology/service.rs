@@ -14,7 +14,6 @@ use capnp::{Error, capability::Promise};
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::VerifyingKey;
 use protocol::gossip::gossip_message;
-use protocol::health::NodeStatus;
 use protocol::server::{self, cluster_session};
 use protocol::topology::{topology, topology_event};
 use std::sync::atomic::Ordering;
@@ -210,7 +209,7 @@ impl topology::Server for Topology {
             )
             .await?;
 
-            ClusterCredential::from_bytes_verified(&credential).map_err(|e| Error::failed(e))?;
+            ClusterCredential::from_bytes_verified(&credential).map_err(Error::failed)?;
 
             topology.mark_seen(peer_id);
 
@@ -365,7 +364,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             root_hash: node.get_root_hash()?.to_str()?.to_string(),
             client: node.get_handle()?,
             noise_static_pub: pubkey,
-            signing_pub,
+            signing_pub: Box::new(signing_pub),
         },
         EventType::Remove => TopologyEvent::Leave { id },
         EventType::Suspect => TopologyEvent::Suspect { id },

@@ -13,7 +13,6 @@ use capnp::Error;
 use capnp::capability::Promise;
 use protocol::gossip;
 use protocol::gossip::gossip_message::Which::*;
-use protocol::gossip::message_list as ActionList;
 use rand::rng;
 use rand::seq::IndexedRandom;
 use std::cell::RefCell;

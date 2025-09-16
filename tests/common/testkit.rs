@@ -422,8 +422,7 @@ impl TestNode {
             }
             if Instant::now() > deadline {
                 return Err(capnp::Error::failed(format!(
-                    "timeout waiting for {:?} on {}",
-                    expect, target
+                    "timeout waiting for {expect:?} on {target}"
                 )));
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
