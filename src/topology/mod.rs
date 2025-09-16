@@ -42,6 +42,22 @@ pub use service::{add_event, read_topology_event};
 
 pub type HandleMap = Rc<RwLock<HashMap<Uuid, server::Client>>>;
 
+/// Bundles the store handles required to construct a `Topology`.
+#[derive(Clone)]
+pub struct TopologyStores {
+    pub credentials: LocalCredentialStore,
+    pub sessions: LocalSessionStore,
+    pub peers: PeersStore,
+    pub token_store: TokenStore,
+}
+
+/// Keys and signing material used by the topology service.
+#[derive(Clone)]
+pub struct Keys {
+    pub noise_public_key: PublicKey,
+    pub signing_key: SigningKey,
+}
+
 pub struct Topology {
     // Address of the node.
     // FIXME: To be replaced with full NodeInfo struct.
@@ -100,27 +116,35 @@ impl Topology {
     pub fn new(
         addr: String,
         rx: Receiver<TopologyEvent>,
-        creds_store: LocalCredentialStore,
-        public: PublicKey,
-        signing_key: SigningKey,
         node: Node,
-        peers: PeersStore,
-        sessions: LocalSessionStore,
-        token_store: TokenStore,
+        stores: TopologyStores,
+        crypto: Keys,
         health_monitor: Arc<HealthMonitor>,
     ) -> Result<Self, Error> {
+        let TopologyStores {
+            credentials,
+            sessions,
+            peers,
+            token_store,
+        } = stores;
+
+        let Keys {
+            noise_public_key,
+            signing_key,
+        } = crypto;
+
         Ok(Self {
             addr,
             rx,
             peers,
             server_handle: std::rc::Rc::new(OnceCell::new()),
             handles: Rc::new(RwLock::new(HashMap::new())),
-            public_key: public,
+            public_key: noise_public_key,
             signing_key,
-            peer_id: peer_id_from_public(&public),
+            peer_id: peer_id_from_public(&noise_public_key),
             node,
             local_sessions: sessions,
-            local_credential_store: creds_store,
+            local_credential_store: credentials,
             bound_addr: Arc::new(Mutex::new(None)),
             advertise_addr: Arc::new(Mutex::new(None)),
             sync_interval: Arc::new(Mutex::new(Duration::from_secs(3))),

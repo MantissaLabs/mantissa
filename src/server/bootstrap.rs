@@ -10,7 +10,7 @@ use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
 use crate::sync::SyncService;
 use crate::token::TokenStore;
-use crate::topology::{PeerHandle, Topology};
+use crate::topology::{Keys, PeerHandle, Topology, TopologyStores};
 use crate::{node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
@@ -196,18 +196,27 @@ impl Bootstrap {
         let health_cfg = health::Config::default();
         let health_monitor = health::HealthMonitor::new(health_cfg);
 
+        let stores = TopologyStores {
+            credentials: stores.local_creds.clone(),
+            sessions: stores.local_sessions.clone(),
+            peers: stores.peers.clone(),
+            token_store: stores.token_store.clone(),
+        };
+
+        let keys = Keys {
+            noise_public_key: ctx.noise_keys.public,
+            signing_key: ctx.signing_key.clone(),
+        };
+
         let topology = Topology::new(
             ctx.listen_addr.clone(),
             topology_rx,
-            stores.local_creds.clone(),
-            ctx.noise_keys.public,
-            ctx.signing_key.clone(),
             ctx.node.clone(),
-            stores.peers.clone(),
-            stores.local_sessions.clone(),
-            stores.token_store.clone(),
+            stores.clone(),
+            keys,
             health_monitor.clone(),
         )?;
+
         let topology_client: TopologyClient = capnp_rpc::new_client(topology.clone());
 
         // sync capability
