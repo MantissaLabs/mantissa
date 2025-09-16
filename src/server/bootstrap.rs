@@ -41,7 +41,7 @@ pub async fn start(
     // Build runtime components (gossip, topology, sync) and their clients
     let comps = Bootstrap::build_components(&ctx, &stores)?;
 
-    // Wire up Server and spawn listeners
+    // Wire up ServerImpl and spawn listeners
     let server = Bootstrap::build_server(&ctx, &stores, &comps);
 
     // Fire background tasks: gossip loop, topology loop, best-effort reconnect
@@ -223,12 +223,10 @@ impl Bootstrap {
         })
     }
 
-    /// Build the Server with all dependencies injected.
+    /// Build the ServerImpl with all dependencies injected.
     pub(crate) fn build_server(ctx: &Bootstrap, stores: &Stores, comps: &Components) -> Server {
         let mut config = Config::new();
         let config = config.with_listen_addr(ctx.listen_addr.clone()).build();
-        let topology = comps.topology.clone();
-
         let clients = ServerClients {
             topology_client: comps.topology_client.clone(),
             gossip_client: comps.gossip_client.clone(),
@@ -236,17 +234,19 @@ impl Bootstrap {
             node_client: ctx.node_client.clone(),
         };
 
-        let stores = ServerStores {
+        let stores_bundle = ServerStores {
             token_store: stores.token_store.clone(),
             session_store: stores.session_auth.clone(),
         };
+
+        let topology = comps.topology.clone();
 
         Server::new(
             ctx.self_id,
             config,
             topology,
             clients,
-            stores,
+            stores_bundle,
             ctx.noise_keys.clone(),
             ctx.signing_key.clone(),
         )

@@ -120,12 +120,51 @@ enum SessionStrategy {
     TicketThenCredential,
 }
 
+#[derive(Clone)]
+struct JoinPayload {
+    id: Uuid,
+    hostname: String,
+    advertise_addr: String,
+    server_handle: server::Client,
+    public_key: [u8; 32],
+    signing_key: [u8; 32],
+}
+
+struct JoinInputs {
+    anchor: String,
+    join_token: String,
+}
+
+impl JoinInputs {
+    fn from_params(params: topology::JoinParams) -> Result<Self, Error> {
+        let request = params.get()?.get_link()?;
+        let anchor = request
+            .get_anchor()?
+            .to_string()
+            .expect("expected anchor address");
+        let join_token = request
+            .get_join_token()?
+            .to_string()
+            .expect("expected join token");
+
+        Ok(Self { anchor, join_token })
+    }
+}
+
+struct JoinResponse {
+    peer_id: Uuid,
+    peer_value: PeerValue,
+    ticket: Vec<u8>,
+    credential: Vec<u8>,
+    session: cluster_session::Client,
+}
+
 /// Actions to apply to the memberlist.
 ///
 /// These actions could apply to one or many nodes.
 #[derive(Clone)]
 pub enum TopologyEvent {
-    NodeJoined {
+    Join {
         id: Uuid,
         hostname: String,
         address: String,
@@ -134,10 +173,10 @@ pub enum TopologyEvent {
         noise_static_pub: PublicKey,
         signing_pub: VerifyingKey,
     },
-    NodeLeft {
+    Leave {
         id: Uuid,
     },
-    NodeSuspect {
+    Suspect {
         id: Uuid,
     },
 }
@@ -386,7 +425,7 @@ impl Topology {
             match self.rx.recv().await {
                 Ok(event) => {
                     match event {
-                        TopologyEvent::NodeJoined {
+                        TopologyEvent::Join {
                             id,
                             address,
                             hostname,
@@ -412,7 +451,7 @@ impl Topology {
                             // interested in the event.
                         }
 
-                        TopologyEvent::NodeLeft { id } => {
+                        TopologyEvent::Leave { id } => {
                             println!("[Topology] Node left: {id}");
 
                             let result = self
@@ -425,7 +464,7 @@ impl Topology {
                             }
                         }
 
-                        TopologyEvent::NodeSuspect { id } => {
+                        TopologyEvent::Suspect { id } => {
                             println!("[Topology] Heartbeat from: {id}");
                             // update heartbeat timestamp if tracking
                         }
@@ -581,6 +620,96 @@ impl Topology {
         let resp = req.send().promise.await?;
         let caps = resp.get()?.get_caps()?;
         caps.get_health()
+    }
+
+    fn build_join_payload(&self) -> Result<JoinPayload, Error> {
+        let server_handle = self
+            .get_server_handle()
+            .ok_or_else(|| Error::failed("server handle not set".into()))?;
+
+        let advertise_addr = self
+            .compute_advertise_addr()
+            .map_err(|e| Error::failed(format!("failed to compute advertise addr: {e}")))?;
+
+        let hostname = self
+            .node
+            .system_info
+            .info
+            .hostname
+            .clone()
+            .ok_or_else(|| Error::failed("hostname not set".into()))?;
+
+        Ok(JoinPayload {
+            id: self.node.id,
+            hostname,
+            advertise_addr,
+            server_handle,
+            public_key: self.public_key.to_bytes(),
+            signing_key: self.signing_key.verifying_key().to_bytes(),
+        })
+    }
+
+    async fn register_with_anchor(
+        client: server::Client,
+        payload: &JoinPayload,
+        join_token: &str,
+    ) -> Result<JoinResponse, Error> {
+        let mut request = client.register_node_request();
+
+        let mut info = request.get().init_info();
+        set_node_id(info.reborrow().init_id(), &payload.id);
+        info.set_hostname(&payload.hostname);
+        info.set_addr(&payload.advertise_addr);
+        info.set_handle(payload.server_handle.clone());
+        info.set_public_key(&payload.public_key);
+        info.set_signing_key(&payload.signing_key);
+
+        request.get().set_token(join_token);
+
+        let response = request.send().promise.await?;
+        let resp = response.get()?;
+
+        let session = resp.get_session()?;
+        let ticket = resp.get_ticket()?.to_vec();
+        let credential = resp.get_credential()?.to_vec();
+        let node_info = resp.get_node_info()?;
+        let peer_id = read_node_id(node_info.get_id()?)?;
+        let peer_value = PeerValue::from_node_info(node_info)?;
+
+        Ok(JoinResponse {
+            peer_id,
+            peer_value,
+            ticket,
+            credential,
+            session,
+        })
+    }
+
+    async fn persist_join_state(
+        peers: PeersStore,
+        local_sessions: LocalSessionStore,
+        local_creds: LocalCredentialStore,
+        peer_id: Uuid,
+        peer_value: &PeerValue,
+        ticket: &[u8],
+        credential: &[u8],
+    ) -> Result<(), Error> {
+        if let Err(e) = peers
+            .upsert(&UuidKey::from(peer_id), peer_value.clone())
+            .await
+        {
+            log::warn!(target: "topology", "join: upsert of anchor NodeInfo failed: {e}");
+        }
+
+        local_sessions
+            .put(peer_id, ticket)
+            .map_err(|e| Error::failed(format!("ticket persist failed: {e}")))?;
+
+        local_creds
+            .put(peer_id, credential)
+            .map_err(|e| Error::failed(format!("credential persist failed: {e}")))?;
+
+        Ok(())
     }
 
     /// Connect to known peers and open a ClusterSession with each.
@@ -906,100 +1035,61 @@ impl topology::Server for Topology {
         params: topology::JoinParams,
         mut _results: topology::JoinResults,
     ) -> Promise<(), Error> {
+        let payload = match self.build_join_payload() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(e),
+        };
+
         let self_addr = self.addr.clone();
-        let hostname = self.node.system_info.info.hostname.clone().unwrap();
-        let id = self.node.id;
         let peers = self.peers.clone();
         let local_sessions = self.local_sessions.clone();
         let local_creds = self.local_credential_store.clone();
         let topology = self.clone();
 
-        let handle = self.get_server_handle();
-        if handle.is_none() {
-            return Promise::err(capnp::Error::failed("server handle not set".into()));
-        }
-        let server_handle = handle.unwrap();
-        let public_key = self.public_key.clone().to_bytes();
-        // TODO: Treat potential error.
-        let advertise = self.compute_advertise_addr().unwrap();
-        let signing_vk_bytes = self.signing_key.verifying_key().to_bytes();
-
         Promise::from_future(async move {
-            let request = params.get()?.get_link()?;
+            let inputs = JoinInputs::from_params(params)?;
 
-            let anchor = request
-                .get_anchor()?
-                .to_string()
-                .expect("expected anchor address");
-
-            let join_token = request
-                .get_join_token()?
-                .to_string()
-                .expect("expected join token");
-
-            if anchor == self_addr {
+            if inputs.anchor == self_addr {
                 return Err(capnp::Error::failed("cannot join own address".to_string()));
             }
 
-            let client = client::connection::get_client_secure(anchor.as_str())
+            let client = Topology::connect_to_peer(&inputs.anchor)
                 .await
                 .map_err(|e| {
-                    capnp::Error::failed(format!("could not connect to anchor {anchor}: {e}"))
+                    Error::failed(format!(
+                        "could not connect to anchor {}: {e}",
+                        inputs.anchor
+                    ))
                 })?;
 
-            let mut request = client.register_node_request();
+            let response =
+                Topology::register_with_anchor(client, &payload, &inputs.join_token).await?;
 
-            // Build info message.
-            let mut info = request.get().init_info();
-            set_node_id(info.reborrow().init_id(), &id);
-            info.set_hostname(hostname);
-            info.set_addr(advertise);
-            info.set_handle(server_handle);
-            info.set_public_key(&public_key);
-            info.set_signing_key(&signing_vk_bytes);
+            let JoinResponse {
+                peer_id,
+                peer_value,
+                ticket,
+                credential,
+                session,
+            } = response;
 
-            // Set the join token.
-            request.get().set_token(join_token.as_str());
+            Topology::persist_join_state(
+                peers.clone(),
+                local_sessions.clone(),
+                local_creds.clone(),
+                peer_id,
+                &peer_value,
+                &ticket,
+                &credential,
+            )
+            .await?;
 
-            let register = request.send().promise.await?;
+            ClusterCredential::from_bytes_verified(&credential).map_err(|e| Error::failed(e))?;
 
-            let session = register.get()?.get_session()?;
-            let ticket = register.get()?.get_ticket()?;
-            let node_info = register.get()?.get_node_info()?;
-            let peer_id = read_node_id(node_info.get_id()?)?;
-            let cred_blob = register.get()?.get_credential()?;
-
-            // Upsert full anchor NodeInfo directly so we can contact it immediately.
-            {
-                let v = crate::topology::peers::PeerValue::from_node_info(node_info)?;
-                if let Err(e) = peers.upsert(&UuidKey::from(peer_id), v).await {
-                    log::warn!(target: "topology", "join: upsert of anchor NodeInfo failed: {e}");
-                }
-            }
-
-            // Persist the local session for later resume if node restarts.
-            local_sessions
-                .put(peer_id, ticket)
-                .map_err(|e| Error::failed(format!("ticket persist failed: {e}")))?;
-
-            local_creds
-                .put(peer_id, cred_blob)
-                .map_err(|e| Error::failed(format!("credential persist failed: {e}")))?;
-
-            // Persist credential for future secure reconnects.
-            let _ = crate::server::credential::ClusterCredential::from_bytes_verified(cred_blob);
-
-            // Passive observation: we just successfully registered and obtained a session.
             topology.mark_seen(peer_id);
 
-            let sync_cap: sync::Client = {
-                let req = session.get_sync_request();
-                let resp = req.send().promise.await?;
-                resp.get()?.get_sync()?
-            };
+            let sync_cap = Topology::fetch_sync_capability(&session).await?;
 
-            // Spawn background periodic sync + connect.
-            // Spawn one-shot sync with the anchor (you already do this)
             tokio::task::spawn_local({
                 let peers = peers.clone();
                 async move {
@@ -1007,15 +1097,8 @@ impl topology::Server for Topology {
                 }
             });
 
-            // Ensure the periodic loop is running (safe to call multiple times)
-            // FIXME: This is a workaround until we have gossip implemented.
             topology.ensure_periodic_sync();
             topology.sync_once_now();
-
-            // Send signal to synchronize data with anchor node (fetch the Sync capability),
-            // and start:
-            // - heartbeat background task
-            // - gossip loop
 
             Ok(())
         })
@@ -1182,7 +1265,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
     let signing_pub = verifying_key_from_data(node.get_signing_key()?)?;
 
     let event = match reader.get_event()? {
-        EventType::Add => TopologyEvent::NodeJoined {
+        EventType::Add => TopologyEvent::Join {
             id,
             hostname: node.get_hostname()?.to_str()?.to_string(),
             address: node.get_addr()?.to_str()?.to_string(),
@@ -1191,8 +1274,8 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             noise_static_pub: pubkey,
             signing_pub,
         },
-        EventType::Remove => TopologyEvent::NodeLeft { id },
-        EventType::Suspect => TopologyEvent::NodeSuspect { id },
+        EventType::Remove => TopologyEvent::Leave { id },
+        EventType::Suspect => TopologyEvent::Suspect { id },
     };
 
     Ok(event)
@@ -1206,7 +1289,7 @@ pub fn add_event(
     let msg = list.reborrow().get(index);
 
     match event {
-        TopologyEvent::NodeJoined {
+        TopologyEvent::Join {
             id,
             hostname,
             address,
@@ -1231,14 +1314,14 @@ pub fn add_event(
             node.set_handle(client.clone());
         }
 
-        TopologyEvent::NodeLeft { id } => {
+        TopologyEvent::Leave { id } => {
             let mut topo = msg.init_topology();
             topo.set_event(topology_event::EventType::Remove);
             let mut node = topo.init_node();
             set_node_id(node.reborrow().init_id(), id);
         }
 
-        TopologyEvent::NodeSuspect { id } => {
+        TopologyEvent::Suspect { id } => {
             let mut topo = msg.init_topology();
             topo.set_event(topology_event::EventType::Suspect);
             let mut node = topo.init_node();

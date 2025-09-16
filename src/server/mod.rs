@@ -35,10 +35,9 @@ pub struct Server {
     // UUID of the node.
     pub id: Uuid,
 
+    topology: Topology,
     clients: ServerClients,
     stores: ServerStores,
-
-    topology: Topology,
     config: Config,
     noise_keys: Arc<NoiseKeys>,
     signing_key: SigningKey,
