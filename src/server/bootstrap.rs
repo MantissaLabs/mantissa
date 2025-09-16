@@ -42,7 +42,7 @@ pub async fn start(
     let comps = Bootstrap::build_components(&ctx, &stores)?;
 
     // Wire up ServerImpl and spawn listeners
-    let server = Bootstrap::build_server(&ctx, &stores, &comps).build();
+    let server = Bootstrap::build_server(&ctx, &stores, &comps);
 
     // Fire background tasks: gossip loop, topology loop, best-effort reconnect
     Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps).await;
@@ -224,29 +224,23 @@ impl Bootstrap {
     }
 
     /// Build the ServerImpl with all dependencies injected.
-    pub(crate) fn build_server<'a>(
-        ctx: &'a Bootstrap,
-        stores: &'a Stores,
-        comps: &'a Components,
-    ) -> ServerImpl {
-        ServerImpl::new()
-            .with_id(ctx.self_id)
-            .with_gossip_client(comps.gossip_client.clone())
-            .with_topology_client(comps.topology_client.clone())
-            .with_sync_client(comps.sync_client.clone())
-            .with_node_client(ctx.node_client.clone())
-            .with_topology(comps.topology.clone())
-            .with_noise_keys(ctx.noise_keys.clone())
-            .with_signing_key(ctx.signing_key.clone())
-            .with_token_store(stores.token_store.clone())
-            .with_session_store(stores.session_auth.clone())
-            .with_local_sessions(stores.local_sessions.clone())
-            .with_config(
-                Config::new()
-                    .with_listen_addr(ctx.listen_addr.clone())
-                    .build(),
-            )
-            .build()
+    pub(crate) fn build_server(ctx: &Bootstrap, stores: &Stores, comps: &Components) -> ServerImpl {
+        let mut config = Config::new();
+        let config = config.with_listen_addr(ctx.listen_addr.clone()).build();
+
+        ServerImpl::new(
+            ctx.self_id,
+            config,
+            comps.topology.clone(),
+            comps.topology_client.clone(),
+            comps.gossip_client.clone(),
+            comps.sync_client.clone(),
+            ctx.node_client.clone(),
+            stores.token_store.clone(),
+            stores.session_auth.clone(),
+            ctx.noise_keys.clone(),
+            ctx.signing_key.clone(),
+        )
     }
 
     /// Finish wiring & kick off one-shot post-boot actions.
@@ -258,7 +252,10 @@ impl Bootstrap {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Give Topology a Server handle (capability)
         let server_client: ServerClient = capnp_rpc::new_client(server.clone());
-        comps.topology.set_server_handle(server_client.clone());
+        if let Err(handle) = comps.topology.set_server_handle(server_client.clone()) {
+            error!(target: "server", "failed to set server handle");
+            drop(handle);
+        }
 
         Ok(())
     }

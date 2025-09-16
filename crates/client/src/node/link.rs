@@ -1,6 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use capnp::message::Builder;
 use protocol::topology::join_request as JoinRequest;
 
@@ -37,4 +37,3 @@ pub async fn link(cfg: &ClientConfig) -> Result<()> {
 
     Ok(())
 }
-

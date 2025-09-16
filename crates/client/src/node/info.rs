@@ -60,4 +60,3 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
 
     Ok(())
 }
-

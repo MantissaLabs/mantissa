@@ -15,4 +15,3 @@ pub async fn show(cfg: &ClientConfig) -> Result<()> {
 
     Ok(())
 }
-

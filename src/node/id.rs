@@ -1,5 +1,5 @@
-use protocol::topology::node_info::Reader as NodeInfo;
 use capnp::Error as CapnpError;
+use protocol::topology::node_info::Reader as NodeInfo;
 use uuid::Uuid;
 
 /// Generate a **time-ordered** UUID (v7).

@@ -1,7 +1,7 @@
 use net::noise::{client_handshake, server_handshake};
 use net::noise::{read_framed_len, write_framed};
 use tokio::io;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},

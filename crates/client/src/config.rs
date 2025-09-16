@@ -12,4 +12,3 @@ pub struct ClientConfig {
     /// If set, defines the cluster to filter results for.
     pub cluster: Option<String>,
 }
-

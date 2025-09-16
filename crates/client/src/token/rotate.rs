@@ -15,4 +15,3 @@ pub async fn rotate(cfg: &ClientConfig) -> Result<()> {
 
     Ok(())
 }
-

@@ -94,7 +94,7 @@ impl HeadlessNode {
         if let Some(d) = sync_tick {
             comps.topology.set_sync_interval(d);
         }
-        let server_impl: ServerImpl = Bootstrap::build_server(&ctx, &stores, &comps).build();
+        let server_impl: ServerImpl = Bootstrap::build_server(&ctx, &stores, &comps);
 
         // Finish wiring and spawn background tasks (gossip loop, topology loop, etc.)
         Bootstrap::after_boot(&server_impl, &ctx, &stores, &comps).await?;

@@ -5,7 +5,7 @@ use capnp::capability::Promise;
 use crdt_store::{compute_want_from_have, uuid_key::UuidKey};
 use crdts::MVReg;
 use protocol::sync::delta_sink;
-use protocol::sync::{sync, Domain};
+use protocol::sync::{Domain, sync};
 use tracing::debug;
 
 pub struct DeltaSinkImpl {

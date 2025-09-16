@@ -26,10 +26,18 @@ impl fmt::Display for ClientSocketError {
                 Ok(())
             }
             PermissionDenied { path } => {
-                write!(f, "Permission denied opening {}. Try running the daemon as the same user, or check file permissions (expected 0600).", path.display())
+                write!(
+                    f,
+                    "Permission denied opening {}. Try running the daemon as the same user, or check file permissions (expected 0600).",
+                    path.display()
+                )
             }
             Refused { path } => {
-                write!(f, "The local socket exists at {} but the daemon refused the connection (is it starting up or stale?). Try restarting the daemon.", path.display())
+                write!(
+                    f,
+                    "The local socket exists at {} but the daemon refused the connection (is it starting up or stale?). Try restarting the daemon.",
+                    path.display()
+                )
             }
             NotASocket { path } => {
                 write!(
@@ -46,4 +54,3 @@ impl fmt::Display for ClientSocketError {
 }
 
 impl std::error::Error for ClientSocketError {}
-

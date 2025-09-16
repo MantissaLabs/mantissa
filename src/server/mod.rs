@@ -5,23 +5,20 @@ use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::credential::ClusterCredential;
 use crate::server::session::ClusterSessionImpl;
-use crate::store::local_session_store::LocalSessionStore;
 use crate::token::TokenStore;
 use crate::topology::Topology;
 use crate::topology::peers::PeerValue;
 use capnp::capability::Promise;
 use ed25519_dalek::SigningKey;
 use net::noise::NoiseKeys;
-use protocol::server::server;
-use std::rc::Rc;
+use protocol::server::{self, cluster_session};
 use std::sync::Arc;
 use tracing::{debug, error};
 use uuid::Uuid;
 
 use protocol::gossip::GossipClient;
-use protocol::health::health as health_iface;
+use protocol::health::HealthClient;
 use protocol::node::NodeClient;
-use protocol::server::ServerClient;
 use protocol::sync::SyncClient;
 use protocol::topology::TopologyClient;
 
@@ -38,20 +35,18 @@ pub struct ServerImpl {
     // UUID of the node.
     pub id: Uuid,
 
-    pub server_client: Option<ServerClient>,
-    pub gossip_client: Option<GossipClient>,
-    pub topology_client: Option<TopologyClient>,
-    pub node_client: Option<NodeClient>,
-    pub sync_client: Option<SyncClient>,
+    gossip_client: GossipClient,
+    topology_client: TopologyClient,
+    node_client: NodeClient,
+    sync_client: SyncClient,
 
-    topology: Option<Topology>,
-    token_store: Option<TokenStore>,
-    session_store: Option<Rc<AuthStore>>,
-    local_sessions: Option<LocalSessionStore>,
+    topology: Topology,
+    token_store: TokenStore,
+    session_store: AuthStore,
 
-    config: Option<Config>,
-    noise_keys: Option<Arc<NoiseKeys>>,
-    signing_key: Option<SigningKey>,
+    config: Config,
+    noise_keys: Arc<NoiseKeys>,
+    signing_key: SigningKey,
 }
 
 // How to run the listeners
@@ -97,17 +92,7 @@ impl server::Server for ServerImpl {
         params: server::RegisterNodeParams,
         mut results: server::RegisterNodeResults,
     ) -> Promise<(), capnp::Error> {
-        let token_store = self.token_store.as_ref().unwrap().clone();
-        let session_store = self.session_store.as_ref().unwrap().clone();
-
-        let topology = self.topology.as_ref().unwrap().clone();
-
-        let topology_client = self.topology_client.as_ref().unwrap().clone();
-        let sync_client = self.sync_client.as_ref().unwrap().clone();
-        let gossip_client = self.gossip_client.as_ref().unwrap().clone();
-        let node_client = self.node_client.as_ref().unwrap().clone();
-        let signing_key = self.signing_key.as_ref().unwrap().clone();
-        let self_id = self.id;
+        let server = self.clone();
 
         Promise::from_future(async move {
             let p = params.get()?;
@@ -116,17 +101,18 @@ impl server::Server for ServerImpl {
             let handle = info.get_handle()?;
 
             // Join token check.
-            if !token_store.matches(&token).await {
+            if !server.token_store.matches(&token).await {
                 return Err(capnp::Error::failed("invalid join token".to_string()));
             }
 
             let joiner_id = id::read_node_id(info.get_id()?)?;
-            if joiner_id == self_id {
+            if joiner_id == server.id {
                 return Err(capnp::Error::failed("cannot join self".to_string()));
             }
 
             // Already registered?
-            let exists = topology
+            let exists = server
+                .topology
                 .peer_exists(joiner_id)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
@@ -156,37 +142,29 @@ impl server::Server for ServerImpl {
                 signing_pub: signing_vk.to_bytes(),
             };
 
-            topology
+            server
+                .topology
                 .register_peer(joiner_id, &peer, handle.clone())
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             // Issue session ticket.
-            let ticket = session_store
+            let ticket = server
+                .session_store
                 .issue_ticket(joiner_id)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             let nonce = rand::try_nonce16().map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             const TTL_SECS: u64 = 3600; // 1 hour (tune it)
-            let cred = ClusterCredential::sign(&signing_key, joiner_id, TTL_SECS, nonce);
+            let cred = ClusterCredential::sign(&server.signing_key, joiner_id, TTL_SECS, nonce);
             let cred_bytes = cred.to_bytes().map_err(capnp::Error::failed)?;
-
-            let health_srv = crate::server::health::HealthImpl::new(topology.clone());
-            let health_client: health_iface::Client = capnp_rpc::new_client(health_srv);
-            let session = ClusterSessionImpl::new(
-                topology_client,
-                sync_client,
-                gossip_client,
-                node_client,
-                health_client,
-            );
-            let session_client = capnp_rpc::new_client(session);
+            let session_client = server.new_session_client();
 
             // Ensure the periodic sync loop is running on this node as soon as we have a cluster
             // at least two nodes.
             {
-                let topo = topology.clone();
+                let topo = server.topology.clone();
                 tokio::task::spawn_local(async move {
                     topo.ensure_periodic_sync();
                 });
@@ -199,7 +177,7 @@ impl server::Server for ServerImpl {
             // Include our NodeInfo so the joiner can immediately insert to its store.
             // Fast propagation of our info means we can get a session to the joiner fast.
             let ni = out.reborrow().init_node_info();
-            topology.populate_self_node_info(ni);
+            server.topology.populate_self_node_info(ni);
             out.set_credential(&cred_bytes);
 
             Ok(())
@@ -211,41 +189,27 @@ impl server::Server for ServerImpl {
         params: server::GetSessionParams,
         mut results: server::GetSessionResults,
     ) -> Promise<(), capnp::Error> {
-        let session_store = self.session_store.as_ref().unwrap().clone();
-
-        let topology = self.topology.as_ref().unwrap().clone();
-
-        let topology_client = self.topology_client.as_ref().unwrap().clone();
-        let sync_client = self.sync_client.as_ref().unwrap().clone();
-        let gossip_client = self.gossip_client.as_ref().unwrap().clone();
-        let node_client = self.node_client.as_ref().unwrap().clone();
+        let server = self.clone();
 
         Promise::from_future(async move {
             let ticket = params.get()?.get_ticket()?;
-            let Some(peer_id) = session_store
+            let Some(peer_id) = server
+                .session_store
                 .lookup(ticket)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?
             else {
                 return Err(capnp::Error::failed("unknown session ticket".to_string()));
             };
 
-            if !topology
+            if !server
+                .topology
                 .peer_exists(peer_id)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?
             {
                 return Err(capnp::Error::failed("peer not registered".to_string()));
             }
 
-            let health_srv = crate::server::health::HealthImpl::new(topology.clone());
-            let health_client: health_iface::Client = capnp_rpc::new_client(health_srv);
-            let session = ClusterSessionImpl::new(
-                topology_client,
-                sync_client,
-                gossip_client,
-                node_client,
-                health_client,
-            );
-            let session_client = capnp_rpc::new_client(session);
+            let session_client = server.new_session_client();
             results.get().set_session(session_client);
             Ok(())
         })
@@ -256,13 +220,7 @@ impl server::Server for ServerImpl {
         params: server::GetWithCredentialParams,
         mut results: server::GetWithCredentialResults,
     ) -> Promise<(), capnp::Error> {
-        let session_store = self.session_store.as_ref().unwrap().clone();
-        let topology = self.topology.as_ref().unwrap().clone();
-
-        let topology_client = self.topology_client.as_ref().unwrap().clone();
-        let sync_client = self.sync_client.as_ref().unwrap().clone();
-        let gossip_client = self.gossip_client.as_ref().unwrap().clone();
-        let node_client = self.node_client.as_ref().unwrap().clone();
+        let server = self.clone();
 
         Promise::from_future(async move {
             // Parse + Verify the signed blob
@@ -271,7 +229,8 @@ impl server::Server for ServerImpl {
                 ClusterCredential::from_bytes_verified(cred_bytes).map_err(capnp::Error::failed)?;
 
             // We must already know the subject as a registered peer
-            if !topology
+            if !server
+                .topology
                 .peer_exists(cred.subject)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?
             {
@@ -280,7 +239,7 @@ impl server::Server for ServerImpl {
                 ));
             }
 
-            if let Some(expected_vk) = topology.signing_vk_for(cred.subject) {
+            if let Some(expected_vk) = server.topology.signing_vk_for(cred.subject) {
                 if expected_vk != cred.issuer {
                     debug!(target: "server", subject=%cred.subject, "issuer mismatch for");
                     return Err(capnp::Error::failed(
@@ -298,21 +257,13 @@ impl server::Server for ServerImpl {
             debug!(target: "server", "Peer {} authenticated", cred.subject);
 
             // Mint a fresh ticket for the subject
-            let ticket = session_store
+            let ticket = server
+                .session_store
                 .issue_ticket(cred.subject)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             // Return session + ticket + our peer id (so caller can persist)
-            let health_srv = crate::server::health::HealthImpl::new(topology.clone());
-            let health_client: health_iface::Client = capnp_rpc::new_client(health_srv);
-            let session = crate::server::session::ClusterSessionImpl::new(
-                topology_client,
-                sync_client,
-                gossip_client,
-                node_client,
-                health_client,
-            );
-            let session_client = capnp_rpc::new_client(session);
+            let session_client = server.new_session_client();
 
             let mut out = results.get();
             out.set_session(session_client);
@@ -320,55 +271,67 @@ impl server::Server for ServerImpl {
 
             // Include our NodeInfo so the caller can upsert immediately.
             let ni = out.reborrow().init_node_info();
-            topology.populate_self_node_info(ni);
+            server.topology.populate_self_node_info(ni);
 
             Ok(())
         })
     }
 }
 
-impl Default for ServerImpl {
-    fn default() -> Self {
-        ServerImpl {
-            id: id::new_node_id_v7(),
-            server_client: None,
-            gossip_client: None,
-            topology_client: None,
-            sync_client: None,
-            node_client: None,
-            config: None,
-            noise_keys: None,
-            token_store: None,
-            session_store: None,
-            topology: None,
-            local_sessions: None,
-            signing_key: None,
+impl ServerImpl {
+    /// Construct a fully wired server implementation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: Uuid,
+        config: Config,
+        topology: Topology,
+        topology_client: TopologyClient,
+        gossip_client: GossipClient,
+        sync_client: SyncClient,
+        node_client: NodeClient,
+        token_store: TokenStore,
+        session_store: AuthStore,
+        noise_keys: Arc<NoiseKeys>,
+        signing_key: SigningKey,
+    ) -> Self {
+        Self {
+            id,
+            gossip_client,
+            topology_client,
+            node_client,
+            sync_client,
+            topology,
+            token_store,
+            session_store,
+            config,
+            noise_keys,
+            signing_key,
         }
     }
-}
 
-impl ServerImpl {
-    /// Creates a new server.
-    ///
-    /// Returns the server and the memberlist actions to execute
-    /// in a gossip loop.
-    pub fn new() -> Self {
-        Default::default()
+    fn new_session_client(&self) -> cluster_session::Client {
+        let health_srv = crate::server::health::HealthImpl::new(self.topology.clone());
+        let health_client: HealthClient = capnp_rpc::new_client(health_srv);
+        let session = ClusterSessionImpl::new(
+            self.topology_client.clone(),
+            self.sync_client.clone(),
+            self.gossip_client.clone(),
+            self.node_client.clone(),
+            health_client,
+        );
+        capnp_rpc::new_client(session)
     }
-
-    // (moved populate_self_node_info to Topology)
 
     /// Internal helper: spawn TCP secure listener (and optionally Unix socket) without blocking.
     async fn spawn_listeners_nonblocking(
         &self,
         enable_unix_socket: bool,
     ) -> std::io::Result<RunHandles> {
-        let cfg = self.config.as_ref().expect("config");
-        let listen_addr = cfg.listen_addr.clone();
+        let listen_addr = self.config.listen_addr.clone();
 
         // identical to start_daemon’s server handle
         let server_handle: protocol::server::server::Client = capnp_rpc::new_client(self.clone());
-        let noise_keys = self.noise_keys.as_ref().expect("noise keys").clone();
+        let noise_keys = self.noise_keys.clone();
 
         // Non-blocking TCP listener with readiness + bound addr.
         let (tcp_task, tcp_ready, bound) =
@@ -382,22 +345,7 @@ impl ServerImpl {
 
         // Optional Unix socket (same behavior as start_daemon)
         let unix_task = if enable_unix_socket {
-            let topology_client = self.topology_client.as_ref().unwrap().clone();
-            let sync_client = self.sync_client.as_ref().unwrap().clone();
-            let gossip_client = self.gossip_client.as_ref().unwrap().clone();
-            let node_client = self.node_client.as_ref().unwrap().clone();
-            let topology_obj = self.topology.as_ref().unwrap().clone();
-            let health_srv = crate::server::health::HealthImpl::new(topology_obj);
-            let health_client: health_iface::Client = capnp_rpc::new_client(health_srv);
-
-            let local_session =
-                capnp_rpc::new_client(crate::server::session::ClusterSessionImpl::new(
-                    topology_client,
-                    sync_client,
-                    gossip_client,
-                    node_client,
-                    health_client,
-                ));
+            let local_session = self.new_session_client();
 
             Some(tokio::task::spawn_local(async move {
                 if let Err(e) = net::unix_socket::start_unix_socket_server_auto(local_session).await
@@ -455,71 +403,5 @@ impl ServerImpl {
             .start_with_mode(RunMode::Blocking, enable_unix_socket)
             .await?;
         Ok(())
-    }
-
-    pub fn with_id(&mut self, id: Uuid) -> &mut ServerImpl {
-        self.id = id;
-        self
-    }
-
-    pub fn with_topology_client(&mut self, topology_client: TopologyClient) -> &mut ServerImpl {
-        self.topology_client = Some(topology_client);
-        self
-    }
-
-    pub fn with_gossip_client(&mut self, gossip_client: GossipClient) -> &mut ServerImpl {
-        self.gossip_client = Some(gossip_client);
-        self
-    }
-
-    pub fn with_sync_client(&mut self, sync_client: SyncClient) -> &mut ServerImpl {
-        self.sync_client = Some(sync_client);
-        self
-    }
-
-    pub fn with_node_client(&mut self, node_client: NodeClient) -> &mut ServerImpl {
-        self.node_client = Some(node_client);
-        self
-    }
-
-    pub fn with_config(&mut self, config: Config) -> &mut ServerImpl {
-        self.config = Some(config);
-        self
-    }
-
-    pub fn with_topology(&mut self, topology: Topology) -> &mut ServerImpl {
-        self.topology = Some(topology);
-        self
-    }
-
-    pub fn with_token_store(&mut self, token_store: TokenStore) -> &mut ServerImpl {
-        self.token_store = Some(token_store);
-        self
-    }
-
-    pub fn with_session_store(&mut self, session_store: AuthStore) -> &mut ServerImpl {
-        self.session_store = Some(Rc::new(session_store));
-        self
-    }
-
-    pub fn with_noise_keys(&mut self, keys: Arc<NoiseKeys>) -> &mut ServerImpl {
-        self.noise_keys = Some(keys);
-        self
-    }
-
-    pub fn with_local_sessions(&mut self, local: LocalSessionStore) -> &mut ServerImpl {
-        self.local_sessions = Some(local);
-        self
-    }
-
-    pub fn with_signing_key(&mut self, sk: SigningKey) -> &mut ServerImpl {
-        self.signing_key = Some(sk);
-        self
-    }
-
-    pub fn build(&mut self) -> ServerImpl {
-        let server_client = capnp_rpc::new_client(self.clone());
-        self.server_client = Some(server_client);
-        self.clone()
     }
 }

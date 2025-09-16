@@ -1,7 +1,7 @@
-use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use crate::store::peer_store::PeersStore;
-use protocol::sync::{sync, Domain};
+use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp::capability::Promise;
+use protocol::sync::{Domain, sync};
 use tracing::debug;
 
 pub mod delta;
@@ -92,7 +92,7 @@ impl sync::Server for SyncService {
                     _ => {
                         return Err(capnp::Error::unimplemented(
                             "domain not implemented".to_string(),
-                        ))
+                        ));
                     }
                 }
 

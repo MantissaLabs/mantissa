@@ -6,11 +6,11 @@
 //!
 
 use crate::topology;
-use crate::topology::peer_provider::PeerProvider;
 use crate::topology::TopologyEvent;
+use crate::topology::peer_provider::PeerProvider;
 use async_channel::{Receiver, Sender};
-use capnp::capability::Promise;
 use capnp::Error;
+use capnp::capability::Promise;
 use protocol::gossip;
 use protocol::gossip::gossip_message::Which::*;
 use protocol::gossip::message_list as ActionList;
@@ -90,7 +90,7 @@ impl gossip::Server for Gossip {
 
 // This method receives messages to gossip to neighbors in the network.
 pub async fn start(event_rx: Receiver<Message>, peers: Arc<Mutex<Vec<PeerHandle>>>) {
-    use tokio::time::{interval, Duration};
+    use tokio::time::{Duration, interval};
     let mut ticker = interval(Duration::from_secs(1));
     let mut buffer = Vec::new();
 

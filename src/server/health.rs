@@ -34,4 +34,3 @@ impl health::Server for HealthImpl {
         })
     }
 }
-

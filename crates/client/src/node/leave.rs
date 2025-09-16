@@ -13,4 +13,3 @@ pub async fn leave(cfg: &ClientConfig) -> Result<()> {
 
     Ok(())
 }
-

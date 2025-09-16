@@ -1,4 +1,4 @@
-use crate::crypto::rand::{self, nonce16};
+use crate::crypto::rand::nonce16;
 use crate::node::Node;
 use crate::node::address::compute_advertise_ip;
 use crate::node::id::{read_node_id, set_node_id};
@@ -112,6 +112,12 @@ impl fmt::Debug for PeerHandle {
             )
             .finish()
     }
+}
+
+#[derive(Clone, Copy)]
+enum SessionStrategy {
+    TicketOnly,
+    TicketThenCredential,
 }
 
 /// Actions to apply to the memberlist.
@@ -384,7 +390,7 @@ impl Topology {
                             id,
                             address,
                             hostname,
-                            root_hash,
+                            root_hash: _root_hash,
                             client,
                             noise_static_pub,
                             signing_pub,
@@ -510,7 +516,7 @@ impl Topology {
                 continue;
             };
 
-            match client::connection::get_client_secure(addr).await {
+            match Topology::connect_to_peer(addr).await {
                 Ok(client) => {
                     let mut req = client.get_session_request();
                     req.get().set_ticket(&ticket);
@@ -539,6 +545,44 @@ impl Topology {
         }
     }
 
+    async fn session_for_strategy(
+        &self,
+        client: &server::Client,
+        peer_id: Uuid,
+        strategy: SessionStrategy,
+    ) -> Option<cluster_session::Client> {
+        let mut session = self.session_via_ticket(client, peer_id).await;
+
+        if session.is_none() && matches!(strategy, SessionStrategy::TicketThenCredential) {
+            session = self.session_via_credential(client, peer_id).await;
+        }
+
+        session
+    }
+
+    async fn connect_to_peer(addr: &str) -> Result<server::Client, String> {
+        client::connection::get_client_secure(addr)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn fetch_sync_capability(
+        session: &cluster_session::Client,
+    ) -> Result<sync::Client, capnp::Error> {
+        let req = session.get_sync_request();
+        let resp = req.send().promise.await?;
+        resp.get()?.get_sync()
+    }
+
+    async fn fetch_health_capability(
+        session: &cluster_session::Client,
+    ) -> Result<protocol::health::health::Client, capnp::Error> {
+        let req = session.get_capabilities_request();
+        let resp = req.send().promise.await?;
+        let caps = resp.get()?.get_caps()?;
+        caps.get_health()
+    }
+
     /// Connect to known peers and open a ClusterSession with each.
     /// - Try local ticket via `getSession`.
     /// - If no ticket (or it fails) and `signing_key` is provided,
@@ -549,11 +593,16 @@ impl Topology {
         &self,
         signing_key: Option<&SigningKey>, // pass Some(sk) if you’ve enabled cluster-signed creds
     ) -> Result<(), capnp::Error> {
-        // Snapshot peers from the store.
         let (actives, _tombs) = self
             .peers
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        let strategy = if signing_key.is_some() {
+            SessionStrategy::TicketThenCredential
+        } else {
+            SessionStrategy::TicketOnly
+        };
 
         for (k, snap) in actives {
             let peer_id = k.to_uuid();
@@ -562,134 +611,36 @@ impl Topology {
                 continue;
             }
 
-            // Skip if we already have a handle cached
             if self.handles.read().await.contains_key(&peer_id) {
                 continue;
             }
 
-            // Latest value for address/hostname/public key
             let Some(val) = snap.as_slice().last().cloned() else {
                 continue;
             };
             let addr = val.address.clone();
 
-            // Dial the peer's Server
-            let server_client: server::Client =
-                match client::connection::get_client_secure(&addr).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!(target: "connect", "dial {addr} failed: {e}");
-                        continue;
-                    }
-                };
-
-            // try ticket first
-            let mut have_session: Option<cluster_session::Client> = None;
-            if let Ok(Some(ticket)) = self.local_sessions.get(peer_id) {
-                let mut req = server_client.get_session_request();
-                req.get().set_ticket(&ticket);
-                match req.send().promise.await {
-                    Ok(resp) => match resp.get()?.get_session() {
-                        Ok(sess) => {
-                            have_session = Some(sess);
-                        }
-                        Err(e) => {
-                            error!(target: "connect", "getSession ok but no session: {e}");
-                        }
-                    },
-                    Err(e) => {
-                        error!(target: "connect", "getSession to {addr} failed: {e}");
-                    }
+            let client = match Topology::connect_to_peer(&addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(target: "connect", "dial {addr} failed: {e}");
+                    continue;
                 }
-            }
+            };
 
-            // fallback: use cluster-signed credential if we can
-            if have_session.is_none() {
-                if let Some(sk) = signing_key {
-                    let nonce =
-                        rand::try_nonce16().map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-                    // short TTL is fine; you’ll immediately get back a ticket to persist
-                    let ttl_secs = 10 * 60; // 10 minutes
-                    let cred = ClusterCredential::sign(sk, self.node.id, ttl_secs, nonce);
-                    let cred_bytes = match cred.to_bytes() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            error!(target: "connect", "cred serialize failed for {addr}: {e}");
-                            continue;
-                        }
-                    };
-
-                    let mut req = server_client.get_with_credential_request();
-                    req.get().set_credential(&cred_bytes);
-                    match req.send().promise.await {
-                        Ok(resp) => {
-                            // Session
-                            let r = resp.get()?;
-                            match r.get_session() {
-                                Ok(sess) => {
-                                    have_session = Some(sess);
-                                }
-                                Err(e) => {
-                                    error!(target: "connect", "getWithCredential ok but no session: {e}");
-                                    continue;
-                                }
-                            }
-
-                            // Upsert returned NodeInfo for fresh address/keys
-                            if let Ok(info) = r.get_node_info() {
-                                match PeerValue::from_node_info(info) {
-                                    Ok(v) => {
-                                        if let Err(e) =
-                                            self.peers.upsert(&UuidKey::from(peer_id), v).await
-                                        {
-                                            error!(target: "connect", "upsert nodeInfo from {addr} failed: {e}");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!(target: "connect", "decode nodeInfo from {addr} failed: {e}")
-                                    }
-                                }
-                            }
-                            // Persist returned ticket for future fast resume
-                            let ticket = r.get_ticket()?;
-                            if let Err(e) = self.local_sessions.put(peer_id, ticket) {
-                                error!(target: "connect", "failed to persist ticket from {addr}: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            error!(target: "connect", "getWithCredential to {addr} failed: {e}");
-                            continue;
-                        }
-                    }
-                } else {
-                    // No signing key provided; can’t cred-bootstrap. Skip.
+            let Some(session) = self.session_for_strategy(&client, peer_id, strategy).await else {
+                if signing_key.is_none() {
                     error!(target: "connect", "no ticket and no signing key; skipping {addr}");
                 }
-            }
+                continue;
+            };
 
-            // If we have a session, cache the `Server` handle and (optionally) do a quick ping
-            if let Some(session) = have_session {
-                info!(target: "connect", "connected to {addr}");
+            info!(target: "connect", "connected to {addr}");
+            self.handles.write().await.insert(peer_id, client.clone());
 
-                // cache the Server client for this peer
-                self.handles
-                    .write()
-                    .await
-                    .insert(peer_id, server_client.clone());
-
-                // optional sanity ping on the session's ping() if you like:
-                let _ = session.ping_request().send().promise.await.map(|_| {
-                    // passive observation: mark as seen
-                    self.mark_seen(peer_id);
-                });
-
-                // If ping failed, we still consider the session establishment as seen
+            let _ = session.ping_request().send().promise.await.map(|_| {
                 self.mark_seen(peer_id);
-
-                // or fetch caps here if you want to warm them (not required):
-                // let _ = _session.get_capabilities_request().send().promise.await;
-            }
+            });
         }
 
         Ok(())
@@ -723,36 +674,22 @@ impl Topology {
             };
             let addr = val.address;
 
-            // Connect to remote Server
-            let client: protocol::server::server::Client =
-                match client::connection::get_client_secure(&addr).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!(target: "sync", "connect {addr} failed: {e}");
-                        continue;
-                    }
-                };
-
-            // Obtain session: prefer ticket, else short-lived credential (if we can sign)
-            let mut session_opt: Option<cluster_session::Client> =
-                self.session_via_ticket(&client, peer_id).await;
-
-            if session_opt.is_none() {
-                if let Some(s) = self.session_via_credential(&client, peer_id).await {
-                    session_opt = Some(s);
+            let client = match Topology::connect_to_peer(&addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(target: "sync", "connect {addr} failed: {e}");
+                    continue;
                 }
-            }
+            };
 
-            let Some(session) = session_opt else { continue };
+            let Some(session) = self
+                .session_for_strategy(&client, peer_id, SessionStrategy::TicketThenCredential)
+                .await
+            else {
+                continue;
+            };
 
-            // Get Sync capability
-            let sync_cap: sync::Client = match (async {
-                let req = session.get_sync_request();
-                let resp = req.send().promise.await?;
-                resp.get()?.get_sync()
-            })
-            .await
-            {
+            let sync_cap = match Topology::fetch_sync_capability(&session).await {
                 Ok(s) => s,
                 Err(e) => {
                     error!(target: "sync", "get_sync failed: {e}");
@@ -815,35 +752,22 @@ impl Topology {
         let sample = candidates.into_iter().take(fanout);
 
         for (peer_id, addr) in sample {
-            // Connect to remote Server
-            let client: protocol::server::server::Client =
-                match client::connection::get_client_secure(&addr).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!(target: "health", "connect {addr} failed: {e}");
-                        continue;
-                    }
-                };
-
-            // Obtain session: prefer ticket, else credential (if we can sign)
-            let mut session_opt: Option<cluster_session::Client> =
-                self.session_via_ticket(&client, peer_id).await;
-            if session_opt.is_none() {
-                if let Some(s) = self.session_via_credential(&client, peer_id).await {
-                    session_opt = Some(s);
+            let client = match Topology::connect_to_peer(&addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(target: "health", "connect {addr} failed: {e}");
+                    continue;
                 }
-            }
-            let Some(session) = session_opt else { continue };
+            };
 
-            // Get Health capability
-            let health_cap = match (async {
-                let req = session.get_capabilities_request();
-                let resp = req.send().promise.await?;
-                let caps = resp.get()?.get_caps()?;
-                caps.get_health()
-            })
-            .await
-            {
+            let Some(session) = self
+                .session_for_strategy(&client, peer_id, SessionStrategy::TicketThenCredential)
+                .await
+            else {
+                continue;
+            };
+
+            let health_cap = match Topology::fetch_health_capability(&session).await {
                 Ok(h) => h,
                 Err(e) => {
                     error!(target: "health", "get health cap failed: {e}");

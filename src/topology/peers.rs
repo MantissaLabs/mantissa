@@ -1,7 +1,7 @@
-use crate::topology::{peer_provider::PeerProvider, PeerHandle, Topology};
-use protocol::topology::node_info as node_info_capnp;
-use capnp::Error as CapnpError;
+use crate::topology::{PeerHandle, Topology, peer_provider::PeerProvider};
 use async_trait::async_trait;
+use capnp::Error as CapnpError;
+use protocol::topology::node_info as node_info_capnp;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
@@ -63,14 +63,18 @@ impl PeerValue {
 
         let pk_bytes = ni.get_public_key()?;
         if pk_bytes.len() != 32 {
-            return Err(CapnpError::failed("publicKey must be exactly 32 bytes".into()));
+            return Err(CapnpError::failed(
+                "publicKey must be exactly 32 bytes".into(),
+            ));
         }
         let mut noise_static_pub = [0u8; 32];
         noise_static_pub.copy_from_slice(pk_bytes);
 
         let sk_bytes = ni.get_signing_key()?;
         if sk_bytes.len() != 32 {
-            return Err(CapnpError::failed("signingKey must be exactly 32 bytes".into()));
+            return Err(CapnpError::failed(
+                "signingKey must be exactly 32 bytes".into(),
+            ));
         }
         let mut signing_pub = [0u8; 32];
         signing_pub.copy_from_slice(sk_bytes);

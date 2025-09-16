@@ -1,5 +1,5 @@
 use crate::errors::ClientSocketError;
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
+use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::{AsyncReadExt, FutureExt};
 use net::{
     noise::{client_handshake, load_or_generate_noise_keys},
@@ -136,14 +136,13 @@ pub async fn get_local_session(
             Ok(stream) => return client_from_unix_stream(stream).await,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                return Err(ClientSocketError::PermissionDenied { path: p })
+                return Err(ClientSocketError::PermissionDenied { path: p });
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-                return Err(ClientSocketError::Refused { path: p })
+                return Err(ClientSocketError::Refused { path: p });
             }
             Err(e) => return Err(ClientSocketError::Other { path: p, source: e }),
         }
     }
     Err(ClientSocketError::NotFound { tried })
 }
-

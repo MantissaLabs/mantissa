@@ -1,6 +1,6 @@
 use merkle_search_tree::digest::{Digest, Hasher};
 use std::hash::Hash;
-use twox_hash::{xxhash3_128, XxHash64};
+use twox_hash::{XxHash64, xxhash3_128};
 
 /// Collects the byte stream produced by `T: Hash`.
 #[derive(Default, Clone)]
@@ -43,4 +43,3 @@ where
         Digest::new(h128.to_be_bytes())
     }
 }
-

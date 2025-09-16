@@ -1,4 +1,4 @@
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
+use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use std::sync::Arc;
 use tokio::net::TcpListener;

@@ -9,7 +9,7 @@
 
 // base64 used only in debug helpers/tests; prefer fully-qualified calls to avoid unused imports.
 use merkle_search_tree::digest::Hasher as MstHasher;
-use merkle_search_tree::{builder::Builder, MerkleSearchTree};
+use merkle_search_tree::{MerkleSearchTree, builder::Builder};
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -977,7 +977,7 @@ mod tests {
 
         let s = store.root_hex().await; // string representation from MST
         let d = store.root_digest().await; // raw bytes
-                                           // The MerkleSearchTree's root to_string() is base64 over the raw digest bytes.
+        // The MerkleSearchTree's root to_string() is base64 over the raw digest bytes.
         use base64::Engine as _;
         let expect = base64::engine::general_purpose::STANDARD.encode(d);
         assert_eq!(s, expect);

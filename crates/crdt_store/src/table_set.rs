@@ -20,4 +20,3 @@ pub trait TableSet {
         TableDefinition::new(Self::META)
     }
 }
-

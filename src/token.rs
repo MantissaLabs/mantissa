@@ -99,7 +99,7 @@ impl TokenStore {
     }
 
     /// Give a `TokenStore` handle to components that already expect the in-memory store
-    /// (e.g., `ServerImpl::with_token_store`).
+    /// (e.g., when wiring `ServerImpl::new`).
     pub fn in_memory_handle(&self) -> TokenStoreInMemory {
         self.in_memory.clone()
     }

@@ -89,7 +89,7 @@ fn now_secs() -> u64 {
 /// Keeps the struct strongly typed while on-the-wire remains compact.
 mod serde_ed25519 {
     use super::*;
-    use serde::{de, Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer, de};
 
     pub mod verifying_key {
         use super::*;

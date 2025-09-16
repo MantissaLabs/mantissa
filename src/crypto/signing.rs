@@ -1,4 +1,4 @@
-use ed25519_dalek::{SigningKey, SECRET_KEY_LENGTH};
+use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey};
 use getrandom::getrandom;
 use std::{fs, io, path::Path};
 

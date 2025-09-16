@@ -14,7 +14,7 @@ pub mod gossip {
     pub use super::gossip_capnp::gossip;
     pub use super::gossip_capnp::gossip::*; // flatten Client, Server, etc.
     pub use super::gossip_capnp::*; // keep existing sibling modules like gossip_message, topology_event, etc.
-                                    // preserve protocol::gossip::gossip::* path
+    // preserve protocol::gossip::gossip::* path
     pub type GossipClient = super::gossip_capnp::gossip::Client;
 }
 
@@ -67,4 +67,5 @@ pub mod sync {
 
 pub mod health {
     pub use super::health_capnp::*;
+    pub type HealthClient = super::health::health::Client;
 }
