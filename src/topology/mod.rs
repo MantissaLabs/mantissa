@@ -10,6 +10,7 @@ use crate::store::peer_store::PeersStore;
 use crate::sync::delta::sync_peers_after_join;
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
+use ::health::HealthMonitor;
 use async_channel::Receiver;
 use capnp::Error;
 use crdt_store::uuid_key::UuidKey;
@@ -31,6 +32,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
+pub mod health;
 pub mod peer_provider;
 pub mod peers;
 mod service;
@@ -86,7 +88,7 @@ pub struct Topology {
     token_store: TokenStore,
 
     // Health monitor (phase 1: passive observation only).
-    health_monitor: StdArc<health::HealthMonitor>,
+    health_monitor: StdArc<HealthMonitor>,
 }
 
 #[derive(Clone, Copy)]
@@ -106,7 +108,7 @@ impl Topology {
         peers: PeersStore,
         sessions: LocalSessionStore,
         token_store: TokenStore,
-        health_monitor: StdArc<health::HealthMonitor>,
+        health_monitor: StdArc<HealthMonitor>,
     ) -> Result<Self, Error> {
         Ok(Self {
             addr,

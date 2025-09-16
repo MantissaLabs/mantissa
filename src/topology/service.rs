@@ -299,13 +299,13 @@ impl topology::Server for Topology {
                 let s = match health_snapshot
                     .get(&id)
                     .cloned()
-                    .unwrap_or(health::Status::Unknown)
+                    .unwrap_or(::health::Status::Unknown)
                 {
-                    health::Status::Unknown => NodeStatus::Unknown,
-                    health::Status::Alive => NodeStatus::Alive,
-                    health::Status::Suspect => NodeStatus::Suspect,
-                    health::Status::Down => NodeStatus::Down,
-                    health::Status::Degraded => NodeStatus::Degraded,
+                    ::health::Status::Unknown => NodeStatus::Unknown,
+                    ::health::Status::Alive => NodeStatus::Alive,
+                    ::health::Status::Suspect => NodeStatus::Suspect,
+                    ::health::Status::Down => NodeStatus::Down,
+                    ::health::Status::Degraded => NodeStatus::Degraded,
                 };
                 node.set_health(s);
             }

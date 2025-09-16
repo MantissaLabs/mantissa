@@ -20,7 +20,6 @@ pub mod bootstrap;
 pub mod config;
 pub mod credential;
 pub mod headless;
-pub mod health;
 mod service;
 pub mod session;
 
@@ -111,7 +110,7 @@ impl Server {
     }
 
     fn new_session_client(&self) -> cluster_session::Client {
-        let health_srv = crate::server::health::HealthImpl::new(self.topology.clone());
+        let health_srv = crate::topology::health::Health::new(self.topology.clone());
         let health_client: HealthClient = capnp_rpc::new_client(health_srv);
 
         let session = ClusterSessionImpl::new(
