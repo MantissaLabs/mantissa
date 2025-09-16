@@ -45,6 +45,13 @@ pub type SnapshotsAndTombs<K, S> = (Snapshots<K, S>, Tombstones<K>);
 /// Tuple of `(Registers, Tombstones)` returned by delta exporters.
 pub type RegistersAndTombs<K, R> = (Registers<K, R>, Tombstones<K>);
 
+/// In-memory Merkle Search Tree keyed by CRDT register keys for a given adapter.
+type InMemoryMerkleSearchTree<C, H> =
+    MerkleSearchTree<<C as RegAdapter>::Key, Entry<<C as RegAdapter>::Snapshot>, H>;
+
+/// Shared handle to the in-memory MST guarded by a Tokio `RwLock`.
+type SharedInMemoryMerkleSearchTree<C, H> = Arc<RwLock<InMemoryMerkleSearchTree<C, H>>>;
+
 // Canonical hashing: tag byte + payload in a fixed-endian encoding.
 // IMPORTANT: The hashing of snapshots must be stable/canonical.
 impl<S> Hash for Entry<S>
@@ -97,7 +104,7 @@ where
 {
     db: Arc<redb::Database>,
     actor: C::Actor,
-    mst: Arc<RwLock<MerkleSearchTree<C::Key, Entry<C::Snapshot>, H>>>,
+    mst: SharedInMemoryMerkleSearchTree<C, H>,
     _tables: std::marker::PhantomData<T>,
 }
 
