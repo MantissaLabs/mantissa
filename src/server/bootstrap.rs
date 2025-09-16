@@ -1,8 +1,8 @@
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::Message;
-use crate::server::ServerImpl;
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
+use crate::server::{Server, ServerClients, ServerStores};
 use crate::store::local::load_or_create_node_id;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
@@ -41,7 +41,7 @@ pub async fn start(
     // Build runtime components (gossip, topology, sync) and their clients
     let comps = Bootstrap::build_components(&ctx, &stores)?;
 
-    // Wire up ServerImpl and spawn listeners
+    // Wire up Server and spawn listeners
     let server = Bootstrap::build_server(&ctx, &stores, &comps);
 
     // Fire background tasks: gossip loop, topology loop, best-effort reconnect
@@ -223,21 +223,30 @@ impl Bootstrap {
         })
     }
 
-    /// Build the ServerImpl with all dependencies injected.
-    pub(crate) fn build_server(ctx: &Bootstrap, stores: &Stores, comps: &Components) -> ServerImpl {
+    /// Build the Server with all dependencies injected.
+    pub(crate) fn build_server(ctx: &Bootstrap, stores: &Stores, comps: &Components) -> Server {
         let mut config = Config::new();
         let config = config.with_listen_addr(ctx.listen_addr.clone()).build();
+        let topology = comps.topology.clone();
 
-        ServerImpl::new(
+        let clients = ServerClients {
+            topology_client: comps.topology_client.clone(),
+            gossip_client: comps.gossip_client.clone(),
+            sync_client: comps.sync_client.clone(),
+            node_client: ctx.node_client.clone(),
+        };
+
+        let stores = ServerStores {
+            token_store: stores.token_store.clone(),
+            session_store: stores.session_auth.clone(),
+        };
+
+        Server::new(
             ctx.self_id,
             config,
-            comps.topology.clone(),
-            comps.topology_client.clone(),
-            comps.gossip_client.clone(),
-            comps.sync_client.clone(),
-            ctx.node_client.clone(),
-            stores.token_store.clone(),
-            stores.session_auth.clone(),
+            topology,
+            clients,
+            stores,
             ctx.noise_keys.clone(),
             ctx.signing_key.clone(),
         )
@@ -245,7 +254,7 @@ impl Bootstrap {
 
     /// Finish wiring & kick off one-shot post-boot actions.
     pub(crate) async fn after_boot(
-        server: &ServerImpl,
+        server: &Server,
         _ctx: &Bootstrap,
         _stores: &Stores,
         comps: &Components,

@@ -31,19 +31,14 @@ pub mod health;
 pub mod session;
 
 #[derive(Clone)]
-pub struct ServerImpl {
+pub struct Server {
     // UUID of the node.
     pub id: Uuid,
 
-    gossip_client: GossipClient,
-    topology_client: TopologyClient,
-    node_client: NodeClient,
-    sync_client: SyncClient,
+    clients: ServerClients,
+    stores: ServerStores,
 
     topology: Topology,
-    token_store: TokenStore,
-    session_store: AuthStore,
-
     config: Config,
     noise_keys: Arc<NoiseKeys>,
     signing_key: SigningKey,
@@ -86,7 +81,21 @@ impl RunHandles {
     }
 }
 
-impl server::Server for ServerImpl {
+#[derive(Clone)]
+pub struct ServerClients {
+    pub topology_client: TopologyClient,
+    pub gossip_client: GossipClient,
+    pub sync_client: SyncClient,
+    pub node_client: NodeClient,
+}
+
+#[derive(Clone)]
+pub struct ServerStores {
+    pub token_store: TokenStore,
+    pub session_store: AuthStore,
+}
+
+impl server::Server for Server {
     fn register_node(
         &mut self,
         params: server::RegisterNodeParams,
@@ -101,7 +110,7 @@ impl server::Server for ServerImpl {
             let handle = info.get_handle()?;
 
             // Join token check.
-            if !server.token_store.matches(&token).await {
+            if !server.stores.token_store.matches(&token).await {
                 return Err(capnp::Error::failed("invalid join token".to_string()));
             }
 
@@ -150,6 +159,7 @@ impl server::Server for ServerImpl {
 
             // Issue session ticket.
             let ticket = server
+                .stores
                 .session_store
                 .issue_ticket(joiner_id)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -194,6 +204,7 @@ impl server::Server for ServerImpl {
         Promise::from_future(async move {
             let ticket = params.get()?.get_ticket()?;
             let Some(peer_id) = server
+                .stores
                 .session_store
                 .lookup(ticket)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?
@@ -258,6 +269,7 @@ impl server::Server for ServerImpl {
 
             // Mint a fresh ticket for the subject
             let ticket = server
+                .stores
                 .session_store
                 .issue_ticket(cred.subject)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -278,31 +290,22 @@ impl server::Server for ServerImpl {
     }
 }
 
-impl ServerImpl {
+impl Server {
     /// Construct a fully wired server implementation.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: Uuid,
         config: Config,
         topology: Topology,
-        topology_client: TopologyClient,
-        gossip_client: GossipClient,
-        sync_client: SyncClient,
-        node_client: NodeClient,
-        token_store: TokenStore,
-        session_store: AuthStore,
+        clients: ServerClients,
+        stores: ServerStores,
         noise_keys: Arc<NoiseKeys>,
         signing_key: SigningKey,
     ) -> Self {
         Self {
             id,
-            gossip_client,
-            topology_client,
-            node_client,
-            sync_client,
             topology,
-            token_store,
-            session_store,
+            clients,
+            stores,
             config,
             noise_keys,
             signing_key,
@@ -313,10 +316,10 @@ impl ServerImpl {
         let health_srv = crate::server::health::HealthImpl::new(self.topology.clone());
         let health_client: HealthClient = capnp_rpc::new_client(health_srv);
         let session = ClusterSessionImpl::new(
-            self.topology_client.clone(),
-            self.sync_client.clone(),
-            self.gossip_client.clone(),
-            self.node_client.clone(),
+            self.clients.topology_client.clone(),
+            self.clients.sync_client.clone(),
+            self.clients.gossip_client.clone(),
+            self.clients.node_client.clone(),
             health_client,
         );
         capnp_rpc::new_client(session)

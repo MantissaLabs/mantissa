@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::{
     node,
     server::{
-        RunHandles, RunMode, ServerImpl,
+        RunHandles, RunMode, Server,
         bootstrap::{Bootstrap, Components, Stores},
     },
 };
@@ -46,7 +46,7 @@ pub struct HeadlessNode {
     transport: HeadlessTransport,
 
     // Used to control listeners and stop/start.
-    server_impl: ServerImpl,
+    server: Server,
 
     // Runtime handles for TCP
     handles: Option<RunHandles>,
@@ -94,18 +94,17 @@ impl HeadlessNode {
         if let Some(d) = sync_tick {
             comps.topology.set_sync_interval(d);
         }
-        let server_impl: ServerImpl = Bootstrap::build_server(&ctx, &stores, &comps);
+        let server: Server = Bootstrap::build_server(&ctx, &stores, &comps);
 
         // Finish wiring and spawn background tasks (gossip loop, topology loop, etc.)
-        Bootstrap::after_boot(&server_impl, &ctx, &stores, &comps).await?;
+        Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
         Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps).await;
 
         // Cap’n Proto Server capability
-        let server_client: protocol::server::server::Client =
-            capnp_rpc::new_client(server_impl.clone());
+        let server_client: protocol::server::server::Client = capnp_rpc::new_client(server.clone());
 
         // Keep a clone to use start/stop server on.
-        let stored_server = server_impl.clone();
+        let stored_server = server.clone();
 
         // Transport wiring + readiness: compute the effective transport we report back
         let (handles, effective_transport) = match &transport {
@@ -122,7 +121,7 @@ impl HeadlessNode {
             }
             HeadlessTransport::Tcp { .. } => {
                 // Start TCP listener non-blocking (Noise + Cap’n Proto)
-                let mut h = server_impl
+                let mut h = server
                     .start_with_mode(RunMode::NonBlocking, false)
                     .await?
                     .expect("NonBlocking must return handles");
@@ -156,7 +155,7 @@ impl HeadlessNode {
             _signing: signing_key,
             transport: effective_transport,
             handles,
-            server_impl: stored_server,
+            server: stored_server,
             _tmp_dir: None,
         })
     }
@@ -427,7 +426,7 @@ impl HeadlessNode {
                 Ok(())
             }
             HeadlessTransport::Tcp { addr } => {
-                let server = self.server_impl.clone();
+                let server = self.server.clone();
                 let mut h = server
                     .start_with_mode(RunMode::NonBlocking, false)
                     .await
