@@ -58,6 +58,7 @@ pub struct Keys {
     pub signing_key: SigningKey,
 }
 
+#[derive(Clone)]
 pub struct Topology {
     // Address of the node.
     // FIXME: To be replaced with full NodeInfo struct.
@@ -872,30 +873,5 @@ impl Topology {
         // Convert the stored 32-byte pk -> ed25519_dalek::VerifyingKey
         let arr: [u8; 32] = last.signing_pub.as_slice().try_into().ok()?;
         VerifyingKey::from_bytes(&arr).ok()
-    }
-}
-
-impl Clone for Topology {
-    fn clone(&self) -> Self {
-        Self {
-            addr: self.addr.clone(),
-            peer_id: self.peer_id,
-            rx: self.rx.clone(),
-            peers: self.peers.clone(),
-            handles: self.handles.clone(),
-            token_store: self.token_store.clone(),
-            node: self.node.clone(),
-            public_key: self.public_key,
-            server_handle: self.server_handle.clone(),
-            local_sessions: self.local_sessions.clone(),
-            signing_key: self.signing_key.clone(),
-            local_credential_store: self.local_credential_store.clone(),
-            advertise_addr: self.advertise_addr.clone(),
-            bound_addr: self.bound_addr.clone(),
-            periodic_sync_running: self.periodic_sync_running.clone(),
-            periodic_sync_handle: self.periodic_sync_handle.clone(),
-            sync_interval: self.sync_interval.clone(),
-            health_monitor: self.health_monitor.clone(),
-        }
     }
 }
