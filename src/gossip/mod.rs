@@ -91,24 +91,32 @@ impl gossip::Server for Gossip {
 pub async fn start(event_rx: Receiver<Message>, topology: Topology) {
     use tokio::time::{Duration, interval};
     let mut ticker = interval(Duration::from_secs(1));
-    let mut buffer = Vec::new();
+    let mut buffer: Vec<Message> = Vec::new();
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if !buffer.is_empty() {
-                    let peers = topology.get_peers().await;
-                    let self_id = topology.self_id();
-                    for peer in peers.iter() {
-                        if peer.id == self_id {
-                            continue;
-                        }
-                        if let Err(e) = send_gossip(&buffer, peer, &topology).await {
-                            eprintln!("Gossip to {} failed: {:?}", peer.address, e);
-                        }
-                    }
-                    buffer.clear();
+                let mut pending = std::mem::take(&mut buffer);
+
+                if pending.is_empty() {
+                    pending.push(Message::Void);
                 }
+
+                let peers = topology.get_peers().await;
+                let self_id = topology.self_id();
+
+                for peer in peers.iter() {
+                    if peer.id == self_id {
+                        continue;
+                    }
+
+                    if let Err(e) = send_gossip(&pending, peer, &topology).await {
+                        eprintln!("Gossip to {} failed: {:?}", peer.address, e);
+                    }
+                }
+
+                pending.clear();
+                buffer = pending;
             }
 
             Ok(msg) = event_rx.recv() => {
@@ -134,10 +142,6 @@ async fn send_gossip(
         })
         .collect();
 
-    if filtered.is_empty() {
-        return Ok(());
-    }
-
     let Some(session) = topology.session_for_peer(peer).await else {
         return Ok(());
     };
@@ -149,16 +153,25 @@ async fn send_gossip(
     };
 
     let mut req = gossip_cap.gossip_request();
+    let message_count = if filtered.is_empty() {
+        1
+    } else {
+        filtered.len()
+    } as u32;
     let list = req.get().init_messages();
-    let mut msgs = list.init_messages(filtered.len() as u32);
+    let mut msgs = list.init_messages(message_count);
 
-    for (idx, msg) in filtered.iter().enumerate() {
-        match msg {
-            Message::Void => {
-                msgs.reborrow().get(idx as u32).init_void();
-            }
-            Message::Topology(event) => {
-                topology::add_event(&mut msgs, idx as u32, event);
+    if filtered.is_empty() {
+        msgs.reborrow().get(0).init_void();
+    } else {
+        for (idx, msg) in filtered.iter().enumerate() {
+            match msg {
+                Message::Void => {
+                    msgs.reborrow().get(idx as u32).init_void();
+                }
+                Message::Topology(event) => {
+                    topology::add_event(&mut msgs, idx as u32, event);
+                }
             }
         }
     }
