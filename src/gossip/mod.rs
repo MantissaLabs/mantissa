@@ -6,6 +6,7 @@
 //!
 
 use crate::topology;
+use crate::topology::Topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
 use async_channel::{Receiver, Sender};
@@ -18,7 +19,6 @@ use rand::seq::IndexedRandom;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use topology::PeerHandle;
 
 /// The Gossip action list
@@ -88,7 +88,7 @@ impl gossip::Server for Gossip {
 }
 
 // This method receives messages to gossip to neighbors in the network.
-pub async fn start(event_rx: Receiver<Message>, peers: Arc<Mutex<Vec<PeerHandle>>>) {
+pub async fn start(event_rx: Receiver<Message>, topology: Topology) {
     use tokio::time::{Duration, interval};
     let mut ticker = interval(Duration::from_secs(1));
     let mut buffer = Vec::new();
@@ -97,9 +97,13 @@ pub async fn start(event_rx: Receiver<Message>, peers: Arc<Mutex<Vec<PeerHandle>
         tokio::select! {
             _ = ticker.tick() => {
                 if !buffer.is_empty() {
-                    let peers_guard = peers.lock().await;
-                    for peer in peers_guard.iter() {
-                        if let Err(e) = send_gossip(&buffer, peer).await {
+                    let peers = topology.get_peers().await;
+                    let self_id = topology.self_id();
+                    for peer in peers.iter() {
+                        if peer.id == self_id {
+                            continue;
+                        }
+                        if let Err(e) = send_gossip(&buffer, peer, &topology).await {
                             eprintln!("Gossip to {} failed: {:?}", peer.address, e);
                         }
                     }
@@ -117,10 +121,49 @@ pub async fn start(event_rx: Receiver<Message>, peers: Arc<Mutex<Vec<PeerHandle>
     }
 }
 
-async fn send_gossip(_messages: &[Message], _peer: &PeerHandle) -> Result<(), capnp::Error> {
-    // Build gossip client using peer information or use readily available client
-    // and build message to send (list of messages) via Builder.
-    Ok(())
+async fn send_gossip(
+    messages: &[Message],
+    peer: &PeerHandle,
+    topology: &Topology,
+) -> Result<(), capnp::Error> {
+    let filtered: Vec<&Message> = messages
+        .iter()
+        .filter(|msg| match msg {
+            Message::Topology(TopologyEvent::Join { id, .. }) if *id == peer.id => false,
+            _ => true,
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        return Ok(());
+    }
+
+    let Some(session) = topology.session_for_peer(peer).await else {
+        return Ok(());
+    };
+
+    let gossip_cap = {
+        let req = session.get_gossip_request();
+        let resp = req.send().promise.await?;
+        resp.get()?.get_gossip()?
+    };
+
+    let mut req = gossip_cap.gossip_request();
+    let list = req.get().init_messages();
+    let mut msgs = list.init_messages(filtered.len() as u32);
+
+    for (idx, msg) in filtered.iter().enumerate() {
+        match msg {
+            Message::Void => {
+                msgs.reborrow().get(idx as u32).init_void();
+            }
+            Message::Topology(event) => {
+                topology::add_event(&mut msgs, idx as u32, event);
+            }
+        }
+    }
+
+    req.send().promise.await.map(|_| ())
 }
 
 pub async fn fanout_sample<P>(provider: &P, fanout: usize) -> Vec<PeerHandle>

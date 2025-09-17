@@ -3,6 +3,7 @@ use crate::crypto::rand;
 use crate::node::id;
 use crate::node::identity::pubkey_from_slice;
 use crate::server::credential::ClusterCredential;
+use crate::topology::TopologyEvent;
 use crate::topology::peers::PeerValue;
 use capnp::capability::Promise;
 use tracing::debug;
@@ -45,6 +46,13 @@ impl protocol::server::Server for Server {
             let hostname = info.get_hostname()?.to_string()?;
             let address = info.get_addr()?.to_string()?;
 
+            let root_hash = info
+                .get_root_hash()
+                .ok()
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+
             let public_key = info.get_public_key()?;
             let pubkey = pubkey_from_slice(public_key).expect("expect valid public key");
 
@@ -56,11 +64,13 @@ impl protocol::server::Server for Server {
             let signing_vk = ed25519_dalek::VerifyingKey::from_bytes(&sk_arr)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
+            let signing_pub = signing_vk.to_bytes();
+
             let peer = PeerValue {
                 address,
                 hostname,
                 noise_static_pub: pubkey.to_bytes(),
-                signing_pub: signing_vk.to_bytes(),
+                signing_pub,
             };
 
             server
@@ -101,6 +111,19 @@ impl protocol::server::Server for Server {
             let ni = out.reborrow().init_node_info();
             server.topology.populate_self_node_info(ni);
             out.set_credential(&cred_bytes);
+
+            // Gossip event to other peers.
+            let join_event = TopologyEvent::Join {
+                id: joiner_id,
+                hostname: peer.hostname.clone(),
+                address: peer.address.clone(),
+                root_hash,
+                client: handle.clone(),
+                noise_static_pub: pubkey,
+                signing_pub: Box::new(signing_vk),
+            };
+
+            server.topology.gossip_topology_event(join_event).await?;
 
             Ok(())
         })

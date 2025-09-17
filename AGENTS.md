@@ -1,5 +1,16 @@
 # Repository Guidelines
 
+## Purpose of the project
+
+We are developing a distributed container orchestration system that is highly scalable and fault-tolerant using Rust, Capn'proto, CRDTs, Merkle Search Trees (MSTs) and Redb for durable storage. There is no central authority (or commonly called: Primary/Master nodes), all nodes are treated equally. Scheduling is distributed, and nodes reserve resource slots onto other nodes (or itself) before proceeding and deploying tasks. Networking will use eBPF for efficient packet processing.
+
+The system needs to be:
+
+- _Performant_ (low latency, high throughput)
+- _Scalable_ (could scale to tens of thousands of nodes)
+- _Fault-tolerant_ (any node could fail without impacting the rest of the system)
+- _Storage efficient_ (distributed garbage collection of stale values)
+
 ## Project Structure & Module Organization
 
 - `src/`: Rust sources. Entrypoint in `src/main.rs`; public modules in `src/lib.rs` (client, server, node, topology, store, crypto, gossip, workload, etc.).

@@ -10,7 +10,7 @@ use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
 use crate::sync::SyncService;
 use crate::token::TokenStore;
-use crate::topology::{Keys, PeerHandle, Topology, TopologyStores};
+use crate::topology::{Keys, Topology, TopologyStores};
 use crate::{node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
@@ -20,7 +20,6 @@ use protocol::topology::topology::Client as TopologyClient;
 use async_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::error;
 use uuid::Uuid;
 
@@ -39,13 +38,13 @@ pub async fn start(
     let stores = Bootstrap::open_stores(&ctx).await?;
 
     // Build runtime components (gossip, topology, sync) and their clients
-    let comps = Bootstrap::build_components(&ctx, &stores)?;
+    let (comps, gossip_rx) = Bootstrap::build_components(&ctx, &stores)?;
 
     // Wire up ServerImpl and spawn listeners
     let server = Bootstrap::build_server(&ctx, &stores, &comps);
 
     // Fire background tasks: gossip loop, topology loop, best-effort reconnect
-    Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps).await;
+    Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps, gossip_rx).await;
 
     Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
 
@@ -177,9 +176,9 @@ impl Bootstrap {
     pub(crate) fn build_components(
         ctx: &Bootstrap,
         stores: &Stores,
-    ) -> Result<Components, Box<dyn std::error::Error>> {
-        // gossip channels
-        let (_gossip_tx, _gossip_rx): (Sender<Message>, Receiver<Message>) =
+    ) -> Result<(Components, Receiver<Message>), Box<dyn std::error::Error>> {
+        // gossip channels: topology -> gossip sender, gossip -> topology sender
+        let (gossip_tx, gossip_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(128);
         let (topology_tx, topology_rx) = async_channel::bounded(128);
 
@@ -211,6 +210,7 @@ impl Bootstrap {
         let topology = Topology::new(
             ctx.listen_addr.clone(),
             topology_rx,
+            gossip_tx,
             ctx.node.clone(),
             stores.clone(),
             keys,
@@ -223,13 +223,16 @@ impl Bootstrap {
         let sync_service = SyncService::new(stores.peers.clone());
         let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
 
-        Ok(Components {
-            gossip_client,
-            topology,
-            topology_client,
-            sync_client,
-            health_monitor,
-        })
+        Ok((
+            Components {
+                gossip_client,
+                topology,
+                topology_client,
+                sync_client,
+                health_monitor,
+            },
+            gossip_rx,
+        ))
     }
 
     /// Build the ServerImpl with all dependencies injected.
@@ -279,27 +282,22 @@ impl Bootstrap {
     }
 
     /// Background loops: gossip, topology run, best-effort connect at boot.
-    pub(crate) async fn spawn_runtime_tasks(ctx: &Bootstrap, _stores: &Stores, comps: &Components) {
+    pub(crate) async fn spawn_runtime_tasks(
+        ctx: &Bootstrap,
+        _stores: &Stores,
+        comps: &Components,
+        gossip_rx: Receiver<Message>,
+    ) {
         // Start health monitor loop inside the local task set.
         comps.health_monitor.start();
 
-        // gossip loop (placeholder peer list; kept for future use)
-        let peers_vec: Arc<Mutex<Vec<PeerHandle>>> = Arc::new(Mutex::new(Vec::new()));
-        let gossip_rx = {
-            // rebuild the rx the same way build_components did
-            // (or pass it through Components if you prefer)
-            // We’ll re-create it here to keep this snippet self-contained.
-            // In your codebase, prefer exposing `gossip_rx` from build_components.
-            let (_tx, rx) = async_channel::bounded(128);
-            rx
-        };
-
         let mut topology_runner = comps.topology.clone();
         let topology_sync = comps.topology.clone();
+        let topology_for_gossip = comps.topology.clone();
 
         // Spawn gossip loop
         tokio::task::spawn_local(async move {
-            crate::gossip::start(gossip_rx, peers_vec).await;
+            crate::gossip::start(gossip_rx, topology_for_gossip).await;
         });
 
         // Spawn topology loop

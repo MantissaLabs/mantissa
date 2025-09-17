@@ -1,4 +1,5 @@
 use crate::crypto::rand::nonce16;
+use crate::gossip::Message;
 use crate::node::Node;
 use crate::node::address::compute_advertise_ip;
 use crate::node::id::set_node_id;
@@ -11,7 +12,7 @@ use crate::sync::delta::sync_peers_after_join;
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
 use ::health::HealthMonitor;
-use async_channel::Receiver;
+use async_channel::{Receiver, Sender};
 use capnp::Error;
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -27,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
@@ -69,6 +70,9 @@ pub struct Topology {
 
     // Node event receiver, from gossiping or other components.
     rx: Receiver<TopologyEvent>,
+
+    // Channel to push topology events to gossip for propagation.
+    tx: Sender<Message>,
 
     peers: PeersStore,
 
@@ -117,6 +121,7 @@ impl Topology {
     pub fn new(
         addr: String,
         rx: Receiver<TopologyEvent>,
+        tx: Sender<Message>,
         node: Node,
         stores: TopologyStores,
         crypto: Keys,
@@ -137,6 +142,7 @@ impl Topology {
         Ok(Self {
             addr,
             rx,
+            tx,
             peers,
             server_handle: std::rc::Rc::new(OnceCell::new()),
             handles: Rc::new(RwLock::new(HashMap::new())),
@@ -148,7 +154,7 @@ impl Topology {
             local_credential_store: credentials,
             bound_addr: Arc::new(Mutex::new(None)),
             advertise_addr: Arc::new(Mutex::new(None)),
-            sync_interval: Arc::new(Mutex::new(Duration::from_secs(3))),
+            sync_interval: Arc::new(Mutex::new(Duration::from_secs(5))),
             token_store,
             periodic_sync_running: Rc::new(AtomicBool::new(false)),
             periodic_sync_handle: Rc::new(RefCell::new(None)),
@@ -156,8 +162,19 @@ impl Topology {
         })
     }
 
+    pub async fn gossip_topology_event(&self, event: TopologyEvent) -> Result<(), capnp::Error> {
+        self.tx
+            .send(Message::Topology(event))
+            .await
+            .map_err(|e| capnp::Error::failed(format!("failed to queue gossip event: {e}")))
+    }
+
     pub fn set_bound_addr(&self, sa: SocketAddr) {
         *self.bound_addr.lock().unwrap() = Some(sa);
+    }
+
+    pub fn self_id(&self) -> Uuid {
+        self.node.id
     }
 
     pub fn set_advertise_override<S: Into<String>>(&self, s: Option<S>) {
@@ -374,7 +391,7 @@ impl Topology {
                             noise_static_pub,
                             signing_pub,
                         } => {
-                            println!("[Topology] Node joined: {id} at {address}");
+                            info!(target: "topology", "Node joined: {id} at {address}");
 
                             let v = PeerValue {
                                 address,
@@ -392,7 +409,7 @@ impl Topology {
                         }
 
                         TopologyEvent::Leave { id } => {
-                            println!("[Topology] Node left: {id}");
+                            info!(target: "topology", "Node left: {id}");
 
                             let result = self
                                 .remove_peer(id)
@@ -400,18 +417,18 @@ impl Topology {
                                 .map_err(|e| capnp::Error::failed(e.to_string()));
 
                             if result.is_err() {
-                                println!("Failed to remove peer: {}", result.err().unwrap());
+                                error!("Failed to remove peer: {}", result.err().unwrap());
                             }
                         }
 
                         TopologyEvent::Suspect { id } => {
-                            println!("[Topology] Heartbeat from: {id}");
+                            info!(target: "topology", "Heartbeat from: {id}");
                             // update heartbeat timestamp if tracking
                         }
                     }
                 }
                 Err(async_channel::RecvError) => {
-                    eprintln!("topology channel closed!");
+                    debug!("topology channel closed!");
                     break;
                 }
             }
@@ -537,6 +554,11 @@ impl Topology {
         }
 
         session
+    }
+
+    pub async fn session_for_peer(&self, peer: &PeerHandle) -> Option<cluster_session::Client> {
+        self.session_for_strategy(&peer.client, peer.id, SessionStrategy::TicketThenCredential)
+            .await
     }
 
     async fn connect_to_peer(addr: &str) -> Result<server::Client, String> {

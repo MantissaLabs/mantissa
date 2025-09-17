@@ -7,7 +7,7 @@ use crate::{
     node,
     server::{
         RunHandles, RunMode, Server,
-        bootstrap::{Bootstrap, Components, Stores},
+        bootstrap::{Bootstrap, Stores},
     },
 };
 use net::noise::NoiseKeys;
@@ -90,7 +90,7 @@ impl HeadlessNode {
             node_client,
         );
         let stores: Stores = Bootstrap::open_stores(&ctx).await?;
-        let comps: Components = Bootstrap::build_components(&ctx, &stores)?;
+        let (comps, gossip_rx) = Bootstrap::build_components(&ctx, &stores)?;
         if let Some(d) = sync_tick {
             comps.topology.set_sync_interval(d);
         }
@@ -98,7 +98,7 @@ impl HeadlessNode {
 
         // Finish wiring and spawn background tasks (gossip loop, topology loop, etc.)
         Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
-        Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps).await;
+        Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps, gossip_rx).await;
 
         // Cap’n Proto Server capability
         let server_client: protocol::server::server::Client = capnp_rpc::new_client(server.clone());
