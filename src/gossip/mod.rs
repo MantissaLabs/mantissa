@@ -134,13 +134,9 @@ async fn send_gossip(
     peer: &PeerHandle,
     topology: &Topology,
 ) -> Result<(), capnp::Error> {
-    let filtered: Vec<&Message> = messages
-        .iter()
-        .filter(|msg| match msg {
-            Message::Topology(TopologyEvent::Join { id, .. }) if *id == peer.id => false,
-            _ => true,
-        })
-        .collect();
+    if messages.is_empty() {
+        return Ok(());
+    }
 
     let Some(session) = topology.session_for_peer(peer).await else {
         return Ok(());
@@ -153,25 +149,17 @@ async fn send_gossip(
     };
 
     let mut req = gossip_cap.gossip_request();
-    let message_count = if filtered.is_empty() {
-        1
-    } else {
-        filtered.len()
-    } as u32;
+    let message_count = messages.len() as u32;
     let list = req.get().init_messages();
     let mut msgs = list.init_messages(message_count);
 
-    if filtered.is_empty() {
-        msgs.reborrow().get(0).init_void();
-    } else {
-        for (idx, msg) in filtered.iter().enumerate() {
-            match msg {
-                Message::Void => {
-                    msgs.reborrow().get(idx as u32).init_void();
-                }
-                Message::Topology(event) => {
-                    topology::add_event(&mut msgs, idx as u32, event);
-                }
+    for (idx, msg) in messages.iter().enumerate() {
+        match msg {
+            Message::Void => {
+                msgs.reborrow().get(idx as u32).init_void();
+            }
+            Message::Topology(event) => {
+                topology::add_event(&mut msgs, idx as u32, event);
             }
         }
     }
