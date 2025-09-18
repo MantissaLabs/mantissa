@@ -15,6 +15,39 @@ use net::noise::NoiseKeys;
 use protocol::sync::Domain;
 use protocol::topology::topology;
 
+#[derive(Clone)]
+pub struct HeadlessKeys {
+    pub noise: Arc<NoiseKeys>,
+    pub signing: ed25519_dalek::SigningKey,
+}
+
+impl HeadlessKeys {
+    pub fn new(noise: Arc<NoiseKeys>, signing: ed25519_dalek::SigningKey) -> Self {
+        Self { noise, signing }
+    }
+}
+
+#[derive(Clone)]
+pub struct HeadlessConfig {
+    pub listen_addr: String,
+    pub transport: HeadlessTransport,
+    pub sync_tick: Option<Duration>,
+    pub gossip_tick: Option<Duration>,
+    pub gossip_fanout: Option<usize>,
+}
+
+impl Default for HeadlessConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: "127.0.0.1:0".to_string(),
+            transport: HeadlessTransport::Inproc,
+            sync_tick: None,
+            gossip_tick: None,
+            gossip_fanout: None,
+        }
+    }
+}
+
 /// How this headless node exposes its Server during tests.
 #[derive(Clone, Debug)]
 pub enum HeadlessTransport {
@@ -66,16 +99,19 @@ impl HeadlessNode {
     /// Core constructor used by all variants. It builds a **real** node using the same
     /// Bootstrap flow as production, and wires transport depending on `transport`.
     pub async fn new_with(
-        listen_addr: String,
         db: Arc<redb::Database>,
-        noise_keys: Arc<NoiseKeys>,
-        signing_key: ed25519_dalek::SigningKey,
         self_id: Uuid,
-        transport: HeadlessTransport,
-        sync_tick: Option<Duration>,
-        gossip_tick: Option<Duration>,
-        gossip_fanout: Option<usize>,
+        keys: HeadlessKeys,
+        cfg: HeadlessConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let HeadlessKeys { noise, signing } = keys;
+        let HeadlessConfig {
+            listen_addr,
+            transport,
+            sync_tick,
+            gossip_tick,
+            gossip_fanout,
+        } = cfg;
         // Local Node + client
         let mut node_obj = node::Node::new();
         node_obj.collect_system_info();
@@ -86,8 +122,8 @@ impl HeadlessNode {
         let ctx = Bootstrap::from_parts(
             listen_addr,
             self_id,
-            noise_keys.clone(),
-            signing_key.clone(),
+            noise.clone(),
+            signing.clone(),
             db.clone(),
             node_obj,
             node_client,
@@ -119,7 +155,7 @@ impl HeadlessNode {
         let stored_server = server.clone();
 
         // Transport wiring + readiness: compute the effective transport we report back
-        let (handles, effective_transport) = match &transport {
+        let (handles, effective_transport) = match transport {
             HeadlessTransport::Inproc => {
                 // Register in-process so get_client_secure("inproc://<uuid>") resolves here
                 net::inproc::register(ctx.self_id.to_string(), server_client.clone());
@@ -163,8 +199,8 @@ impl HeadlessNode {
             local_sessions: stores.local_sessions.clone(),
             local_creds: stores.local_creds.clone(),
             _db: db,
-            _noise_keys: noise_keys,
-            _signing: signing_key,
+            _noise_keys: noise,
+            _signing: signing,
             transport: effective_transport,
             handles,
             server: stored_server,
@@ -188,15 +224,10 @@ impl HeadlessNode {
         self_id: Uuid,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Self::new_with(
-            "127.0.0.1:0".to_string(),
             db,
-            noise_keys,
-            signing_key,
             self_id,
-            HeadlessTransport::Inproc,
-            None,
-            None,
-            None,
+            HeadlessKeys::new(noise_keys, signing_key),
+            HeadlessConfig::default(),
         )
         .await
     }
@@ -210,15 +241,14 @@ impl HeadlessNode {
         self_id: Uuid,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Self::new_with(
-            addr.clone(),
             db,
-            noise_keys,
-            signing_key,
             self_id,
-            HeadlessTransport::Tcp { addr },
-            None,
-            None,
-            None,
+            HeadlessKeys::new(noise_keys, signing_key),
+            HeadlessConfig {
+                listen_addr: addr.clone(),
+                transport: HeadlessTransport::Tcp { addr },
+                ..HeadlessConfig::default()
+            },
         )
         .await
     }
@@ -232,15 +262,14 @@ impl HeadlessNode {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let addr = pick_loopback_ephemeral()?;
         Self::new_with(
-            addr.clone(),
             db,
-            noise_keys,
-            signing_key,
             self_id,
-            HeadlessTransport::Tcp { addr },
-            None,
-            None,
-            None,
+            HeadlessKeys::new(noise_keys, signing_key),
+            HeadlessConfig {
+                listen_addr: addr.clone(),
+                transport: HeadlessTransport::Tcp { addr },
+                ..HeadlessConfig::default()
+            },
         )
         .await
     }
@@ -254,15 +283,13 @@ impl HeadlessNode {
         tick: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Self::new_with(
-            "127.0.0.1:0".to_string(),
             db,
-            noise_keys,
-            signing_key,
             self_id,
-            HeadlessTransport::Inproc,
-            Some(tick),
-            None,
-            None,
+            HeadlessKeys::new(noise_keys, signing_key),
+            HeadlessConfig {
+                sync_tick: Some(tick),
+                ..HeadlessConfig::default()
+            },
         )
         .await
     }
@@ -276,15 +303,15 @@ impl HeadlessNode {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let addr = pick_loopback_ephemeral()?;
         Self::new_with(
-            addr.clone(),
             db,
-            noise_keys,
-            signing_key,
             self_id,
-            HeadlessTransport::Tcp { addr },
-            Some(tick),
-            None,
-            None,
+            HeadlessKeys::new(noise_keys, signing_key),
+            HeadlessConfig {
+                listen_addr: addr.clone(),
+                transport: HeadlessTransport::Tcp { addr },
+                sync_tick: Some(tick),
+                ..HeadlessConfig::default()
+            },
         )
         .await
     }
@@ -358,15 +385,16 @@ impl HeadlessNode {
     ) -> io::Result<Self> {
         let state = self_contained_state()?;
         let mut node = Self::new_with(
-            "127.0.0.1:0".to_string(),
             state.db,
-            state.noise_keys,
-            state.signing_key,
             state.id,
-            HeadlessTransport::Inproc,
-            sync_tick,
-            gossip_tick,
-            fanout,
+            HeadlessKeys::new(state.noise_keys, state.signing_key),
+            HeadlessConfig {
+                listen_addr: "127.0.0.1:0".to_string(),
+                transport: HeadlessTransport::Inproc,
+                sync_tick,
+                gossip_tick,
+                gossip_fanout: fanout,
+            },
         )
         .await
         .map_err(to_io)?;
