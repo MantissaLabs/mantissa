@@ -1,5 +1,5 @@
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
-use crate::gossip::Message;
+use crate::gossip::{DEFAULT_FANOUT, Message};
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerStores};
@@ -44,7 +44,7 @@ pub async fn start(
     let server = Bootstrap::build_server(&ctx, &stores, &comps);
 
     // Fire background tasks: gossip loop, topology loop, best-effort reconnect
-    Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps, gossip_rx).await;
+    Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps, gossip_rx, DEFAULT_FANOUT).await;
 
     Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
 
@@ -287,6 +287,7 @@ impl Bootstrap {
         _stores: &Stores,
         comps: &Components,
         gossip_rx: Receiver<Message>,
+        gossip_fanout: usize,
     ) {
         // Start health monitor loop inside the local task set.
         comps.health_monitor.start();
@@ -294,10 +295,17 @@ impl Bootstrap {
         let mut topology_runner = comps.topology.clone();
         let topology_sync = comps.topology.clone();
         let topology_for_gossip = comps.topology.clone();
+        let gossip_tick = topology_for_gossip.gossip_interval();
 
         // Spawn gossip loop
         tokio::task::spawn_local(async move {
-            crate::gossip::start(gossip_rx, topology_for_gossip).await;
+            crate::gossip::start(
+                gossip_rx,
+                topology_for_gossip,
+                Some(gossip_fanout),
+                gossip_tick,
+            )
+            .await;
         });
 
         // Spawn topology loop

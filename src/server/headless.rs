@@ -4,6 +4,7 @@ use std::{io, net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
+    gossip::DEFAULT_FANOUT,
     node,
     server::{
         RunHandles, RunMode, Server,
@@ -72,6 +73,8 @@ impl HeadlessNode {
         self_id: Uuid,
         transport: HeadlessTransport,
         sync_tick: Option<Duration>,
+        gossip_tick: Option<Duration>,
+        gossip_fanout: Option<usize>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Local Node + client
         let mut node_obj = node::Node::new();
@@ -94,11 +97,20 @@ impl HeadlessNode {
         if let Some(d) = sync_tick {
             comps.topology.set_sync_interval(d);
         }
+        if let Some(d) = gossip_tick {
+            comps.topology.set_gossip_interval(d);
+        }
+        if matches!(transport, HeadlessTransport::Inproc) {
+            comps
+                .topology
+                .set_advertise_override(Some(format!("inproc://{}", ctx.self_id)));
+        }
         let server: Server = Bootstrap::build_server(&ctx, &stores, &comps);
 
         // Finish wiring and spawn background tasks (gossip loop, topology loop, etc.)
         Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
-        Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps, gossip_rx).await;
+        let fanout = gossip_fanout.unwrap_or(DEFAULT_FANOUT);
+        Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps, gossip_rx, fanout).await;
 
         // Cap’n Proto Server capability
         let server_client: protocol::server::server::Client = capnp_rpc::new_client(server.clone());
@@ -183,6 +195,8 @@ impl HeadlessNode {
             self_id,
             HeadlessTransport::Inproc,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -202,6 +216,8 @@ impl HeadlessNode {
             signing_key,
             self_id,
             HeadlessTransport::Tcp { addr },
+            None,
+            None,
             None,
         )
         .await
@@ -223,6 +239,8 @@ impl HeadlessNode {
             self_id,
             HeadlessTransport::Tcp { addr },
             None,
+            None,
+            None,
         )
         .await
     }
@@ -243,6 +261,8 @@ impl HeadlessNode {
             self_id,
             HeadlessTransport::Inproc,
             Some(tick),
+            None,
+            None,
         )
         .await
     }
@@ -263,6 +283,8 @@ impl HeadlessNode {
             self_id,
             HeadlessTransport::Tcp { addr },
             Some(tick),
+            None,
+            None,
         )
         .await
     }
@@ -270,13 +292,11 @@ impl HeadlessNode {
     /// Quick-start **in-process** node using a temp DB and deterministic test keys.
     /// Great for simple tests. For full control, prefer the *_from_parts variants.
     pub async fn new_inproc() -> io::Result<Self> {
-        let state = self_contained_state()?;
-        let mut node =
-            Self::new_inproc_from_parts(state.db, state.noise_keys, state.signing_key, state.id)
-                .await
-                .map_err(to_io)?;
-        node._tmp_dir = Some(state.tmp_dir);
-        Ok(node)
+        Self::new_inproc_custom(None, None, None).await
+    }
+
+    pub async fn new_inproc_with_gossip_fanout(fanout: usize) -> io::Result<Self> {
+        Self::new_inproc_custom(None, None, Some(fanout)).await
     }
 
     /// Quick-start **TCP** node bound at an ephemeral 127.0.0.1 port.
@@ -296,18 +316,7 @@ impl HeadlessNode {
 
     /// Quick-start **in-process** node with a custom sync tick.
     pub async fn new_inproc_with_tick(tick: Duration) -> io::Result<Self> {
-        let state = self_contained_state()?;
-        let mut node = Self::new_inproc_with_tick_from_parts(
-            state.db,
-            state.noise_keys,
-            state.signing_key,
-            state.id,
-            tick,
-        )
-        .await
-        .map_err(to_io)?;
-        node._tmp_dir = Some(state.tmp_dir);
-        Ok(node)
+        Self::new_inproc_custom(Some(tick), None, None).await
     }
 
     /// Quick-start **TCP** node with a custom sync tick on an ephemeral port.
@@ -335,6 +344,29 @@ impl HeadlessNode {
             state.noise_keys,
             state.signing_key,
             state.id,
+        )
+        .await
+        .map_err(to_io)?;
+        node._tmp_dir = Some(state.tmp_dir);
+        Ok(node)
+    }
+
+    pub async fn new_inproc_custom(
+        sync_tick: Option<Duration>,
+        gossip_tick: Option<Duration>,
+        fanout: Option<usize>,
+    ) -> io::Result<Self> {
+        let state = self_contained_state()?;
+        let mut node = Self::new_with(
+            "127.0.0.1:0".to_string(),
+            state.db,
+            state.noise_keys,
+            state.signing_key,
+            state.id,
+            HeadlessTransport::Inproc,
+            sync_tick,
+            gossip_tick,
+            fanout,
         )
         .await
         .map_err(to_io)?;

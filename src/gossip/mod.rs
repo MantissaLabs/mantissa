@@ -6,20 +6,34 @@
 //!
 
 use crate::topology;
-use crate::topology::Topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
 use async_channel::{Receiver, Sender};
+use async_trait::async_trait;
 use capnp::Error;
 use capnp::capability::Promise;
 use protocol::gossip;
+use protocol::gossip::gossip::Client as GossipClient;
 use protocol::gossip::gossip_message::Which::*;
 use rand::rng;
 use rand::seq::IndexedRandom;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::sync::Arc;
+use std::time::Duration;
 use topology::PeerHandle;
+use uuid::Uuid;
+
+#[async_trait(?Send)]
+pub trait GossipContext: PeerProvider {
+    fn local_peer_id(&self) -> Uuid;
+
+    async fn gossip_client_for(
+        &self,
+        peer: &PeerHandle,
+    ) -> Result<Option<GossipClient>, capnp::Error>;
+}
 
 /// The Gossip action list
 ///
@@ -29,11 +43,22 @@ pub struct GossipEvents {
     pub events: Arc<RefCell<VecDeque<Message>>>,
 }
 
+#[derive(Clone)]
 pub enum Message {
-    Void,
-    Topology(TopologyEvent),
+    Void { id: Uuid },
+    Topology { id: Uuid, event: TopologyEvent },
     // Scheduling(SchedulingEvent),
 }
+
+impl Message {
+    pub fn id(&self) -> Uuid {
+        match self {
+            Message::Void { id } | Message::Topology { id, .. } => *id,
+        }
+    }
+}
+
+pub const DEFAULT_FANOUT: usize = 5;
 
 /// Represents the gossip server.
 pub struct Gossip {
@@ -41,7 +66,7 @@ pub struct Gossip {
 }
 
 pub struct Channels {
-    pub topology_events: Sender<TopologyEvent>,
+    pub topology_events: Sender<Message>,
     // scheduling_events: Sender<SchedulingEvent>,
 }
 
@@ -63,20 +88,38 @@ impl gossip::Server for Gossip {
             let msgs = params.get().unwrap().get_messages();
 
             for msg in msgs.unwrap().get_messages().unwrap().iter() {
+                let id = match msg.get_id() {
+                    Ok(data) => {
+                        let bytes = data.to_owned();
+                        match <[u8; 16]>::try_from(bytes.as_slice()) {
+                            Ok(arr) => Uuid::from_bytes(arr),
+                            Err(_) => {
+                                eprintln!("Invalid gossip id length");
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Missing gossip id: {e}");
+                        continue;
+                    }
+                };
+
                 match msg.reborrow().which().expect("failed to read variant") {
-                    Void(_) => {}
-                    Topology(Ok(reader)) => {
-                        if let Ok(event) = topology::read_topology_event(reader) {
-                            // Send event to topology events channel.
-                            tx.send(event).await.map_err(|e| {
+                    Void(_) => {
+                        let _ = tx.send(Message::Void { id }).await;
+                    }
+                    Topology(Ok(reader)) => match topology::read_topology_event(reader) {
+                        Ok(event) => {
+                            let message = Message::Topology { id, event };
+                            tx.send(message).await.map_err(|e| {
                                 capnp::Error::failed(format!(
                                     "Couldn't sent event to topology: {e}"
                                 ))
                             })?;
-                        } else {
-                            eprintln!("Failed to convert topology event");
                         }
-                    }
+                        Err(e) => eprintln!("Failed to convert topology event: {e}"),
+                    },
                     Topology(Err(e)) => {
                         eprintln!("Error reading topology: {e}");
                     }
@@ -88,9 +131,16 @@ impl gossip::Server for Gossip {
 }
 
 // This method receives messages to gossip to neighbors in the network.
-pub async fn start(event_rx: Receiver<Message>, topology: Topology) {
-    use tokio::time::{Duration, interval};
-    let mut ticker = interval(Duration::from_secs(1));
+pub async fn start<C>(
+    event_rx: Receiver<Message>,
+    context: C,
+    fanout: Option<usize>,
+    tick: Duration,
+) where
+    C: GossipContext,
+{
+    use tokio::time::interval;
+    let mut ticker = interval(tick);
     let mut buffer: Vec<Message> = Vec::new();
 
     loop {
@@ -99,18 +149,22 @@ pub async fn start(event_rx: Receiver<Message>, topology: Topology) {
                 let mut pending = std::mem::take(&mut buffer);
 
                 if pending.is_empty() {
-                    pending.push(Message::Void);
+                    pending.push(Message::Void { id: Uuid::new_v4() });
                 }
 
-                let peers = topology.get_peers().await;
-                let self_id = topology.self_id();
+                let peers = match fanout {
+                    Some(0) => context.get_peers().await,
+                    Some(n) => fanout_sample(&context, n).await,
+                    None => fanout_sample(&context, DEFAULT_FANOUT).await,
+                };
+                let self_id = context.local_peer_id();
 
                 for peer in peers.iter() {
                     if peer.id == self_id {
                         continue;
                     }
 
-                    if let Err(e) = send_gossip(&pending, peer, &topology).await {
+                    if let Err(e) = send_gossip(&pending, peer, &context).await {
                         eprintln!("Gossip to {} failed: {:?}", peer.address, e);
                     }
                 }
@@ -129,23 +183,20 @@ pub async fn start(event_rx: Receiver<Message>, topology: Topology) {
     }
 }
 
-async fn send_gossip(
+async fn send_gossip<C>(
     messages: &[Message],
     peer: &PeerHandle,
-    topology: &Topology,
-) -> Result<(), capnp::Error> {
+    ctx: &C,
+) -> Result<(), capnp::Error>
+where
+    C: GossipContext + ?Sized,
+{
     if messages.is_empty() {
         return Ok(());
     }
 
-    let Some(session) = topology.session_for_peer(peer).await else {
+    let Some(gossip_cap) = ctx.gossip_client_for(peer).await? else {
         return Ok(());
-    };
-
-    let gossip_cap = {
-        let req = session.get_gossip_request();
-        let resp = req.send().promise.await?;
-        resp.get()?.get_gossip()?
     };
 
     let mut req = gossip_cap.gossip_request();
@@ -154,11 +205,14 @@ async fn send_gossip(
     let mut msgs = list.init_messages(message_count);
 
     for (idx, msg) in messages.iter().enumerate() {
+        let mut builder = msgs.reborrow().get(idx as u32);
+        builder.set_id(msg.id().as_bytes());
+
         match msg {
-            Message::Void => {
-                msgs.reborrow().get(idx as u32).init_void();
+            Message::Void { .. } => {
+                builder.init_void();
             }
-            Message::Topology(event) => {
+            Message::Topology { event, .. } => {
                 topology::add_event(&mut msgs, idx as u32, event);
             }
         }
@@ -169,9 +223,14 @@ async fn send_gossip(
 
 pub async fn fanout_sample<P>(provider: &P, fanout: usize) -> Vec<PeerHandle>
 where
-    P: PeerProvider + Send + Sync,
+    P: PeerProvider + ?Sized,
 {
     let peers = provider.get_peers().await;
+
+    if fanout == 0 || fanout >= peers.len() {
+        return peers;
+    }
+
     let mut rng = rng();
     peers.choose_multiple(&mut rng, fanout).cloned().collect()
 }

@@ -1,5 +1,5 @@
 use crate::crypto::rand::nonce16;
-use crate::gossip::Message;
+use crate::gossip::{GossipContext, Message};
 use crate::node::Node;
 use crate::node::address::compute_advertise_ip;
 use crate::node::id::set_node_id;
@@ -13,20 +13,22 @@ use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
 use ::health::HealthMonitor;
 use async_channel::{Receiver, Sender};
+use async_trait::async_trait;
 use capnp::Error;
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use protocol::gossip::gossip::Client as GossipClient;
 use protocol::server::{self, ServerClient, cluster_session};
 use protocol::sync;
 use std::cell::{OnceCell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -69,10 +71,13 @@ pub struct Topology {
     node: Node,
 
     // Node event receiver, from gossiping or other components.
-    rx: Receiver<TopologyEvent>,
+    rx: Receiver<Message>,
 
     // Channel to push topology events to gossip for propagation.
     tx: Sender<Message>,
+
+    // Gossip events we've already processed (dedupe by id).
+    seen_gossip_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
 
     peers: PeersStore,
 
@@ -103,6 +108,8 @@ pub struct Topology {
     advertise_addr: Arc<Mutex<Option<String>>>,
     // Periodic sync interval (dynamic to allow tests to speed up convergence)
     sync_interval: Arc<Mutex<Duration>>,
+    // Gossip tick interval for outbound gossip loop
+    gossip_interval: Arc<Mutex<Duration>>,
 
     // Persistent token store, holding the current token for joining the cluster.
     token_store: TokenStore,
@@ -120,7 +127,7 @@ enum SessionStrategy {
 impl Topology {
     pub fn new(
         addr: String,
-        rx: Receiver<TopologyEvent>,
+        rx: Receiver<Message>,
         tx: Sender<Message>,
         node: Node,
         stores: TopologyStores,
@@ -155,18 +162,32 @@ impl Topology {
             bound_addr: Arc::new(Mutex::new(None)),
             advertise_addr: Arc::new(Mutex::new(None)),
             sync_interval: Arc::new(Mutex::new(Duration::from_secs(5))),
+            gossip_interval: Arc::new(Mutex::new(Duration::from_secs(1))),
             token_store,
             periodic_sync_running: Rc::new(AtomicBool::new(false)),
             periodic_sync_handle: Rc::new(RefCell::new(None)),
             health_monitor,
+            seen_gossip_ids: Arc::new(AsyncMutex::new(HashSet::new())),
         })
     }
 
     pub async fn gossip_topology_event(&self, event: TopologyEvent) -> Result<(), capnp::Error> {
+        let id = Uuid::new_v4();
+        let _ = self.record_gossip_id(id).await;
+        self.send_gossip_message(Message::Topology { id, event })
+            .await
+    }
+
+    async fn send_gossip_message(&self, message: Message) -> Result<(), capnp::Error> {
         self.tx
-            .send(Message::Topology(event))
+            .send(message)
             .await
             .map_err(|e| capnp::Error::failed(format!("failed to queue gossip event: {e}")))
+    }
+
+    async fn record_gossip_id(&self, id: Uuid) -> bool {
+        let mut guard = self.seen_gossip_ids.lock().await;
+        guard.insert(id)
     }
 
     pub fn set_bound_addr(&self, sa: SocketAddr) {
@@ -305,6 +326,14 @@ impl Topology {
         *self.sync_interval.lock().unwrap() = d;
     }
 
+    pub fn set_gossip_interval(&self, d: Duration) {
+        *self.gossip_interval.lock().unwrap() = d;
+    }
+
+    pub fn gossip_interval(&self) -> Duration {
+        *self.gossip_interval.lock().unwrap()
+    }
+
     /// Populate a NodeInfo builder with this node's identity and addresses.
     pub fn populate_self_node_info(&self, mut info: crate::topology_capnp::node_info::Builder) {
         // id
@@ -380,7 +409,16 @@ impl Topology {
     pub async fn run(&mut self) {
         loop {
             match self.rx.recv().await {
-                Ok(event) => {
+                Ok(Message::Void { .. }) => {
+                    // Keepalive message; nothing to process for topology state.
+                }
+                Ok(Message::Topology { id, event }) => {
+                    if !self.record_gossip_id(id).await {
+                        continue;
+                    }
+
+                    let event_clone = event.clone();
+
                     match event {
                         TopologyEvent::Join {
                             id,
@@ -401,23 +439,17 @@ impl Topology {
                             };
 
                             if let Err(e) = self.register_peer(id, &v, client).await {
-                                println!("Failed to register peer: {e}");
+                                error!("Failed to register peer: {e}");
+                                continue;
                             }
-
-                            // TODO: broadcast event to other components that may be
-                            // interested in the event.
                         }
 
                         TopologyEvent::Leave { id } => {
                             info!(target: "topology", "Node left: {id}");
 
-                            let result = self
-                                .remove_peer(id)
-                                .await
-                                .map_err(|e| capnp::Error::failed(e.to_string()));
-
-                            if result.is_err() {
-                                error!("Failed to remove peer: {}", result.err().unwrap());
+                            if let Err(e) = self.remove_peer(id).await {
+                                error!("Failed to remove peer: {e}");
+                                continue;
                             }
                         }
 
@@ -425,6 +457,16 @@ impl Topology {
                             info!(target: "topology", "Heartbeat from: {id}");
                             // update heartbeat timestamp if tracking
                         }
+                    }
+
+                    if let Err(e) = self
+                        .send_gossip_message(Message::Topology {
+                            id,
+                            event: event_clone,
+                        })
+                        .await
+                    {
+                        error!("Failed to forward gossip event: {e}");
                     }
                 }
                 Err(async_channel::RecvError) => {
@@ -895,5 +937,27 @@ impl Topology {
         // Convert the stored 32-byte pk -> ed25519_dalek::VerifyingKey
         let arr: [u8; 32] = last.signing_pub.as_slice().try_into().ok()?;
         VerifyingKey::from_bytes(&arr).ok()
+    }
+}
+
+#[async_trait(?Send)]
+impl GossipContext for Topology {
+    fn local_peer_id(&self) -> Uuid {
+        self.self_id()
+    }
+
+    async fn gossip_client_for(
+        &self,
+        peer: &PeerHandle,
+    ) -> Result<Option<GossipClient>, capnp::Error> {
+        let Some(session) = self.session_for_peer(peer).await else {
+            return Ok(None);
+        };
+
+        let req = session.get_gossip_request();
+        let resp = req.send().promise.await?;
+        let gossip = resp.get()?.get_gossip()?;
+
+        Ok(Some(gossip))
     }
 }

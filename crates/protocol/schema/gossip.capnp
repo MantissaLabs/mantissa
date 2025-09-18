@@ -20,9 +20,11 @@ struct GossipMessage {
   # This can impact topology management, scheduling
   # updates, etc.
 
+  id @0 :Data;
+
   union {
-    void @0: Void;
-    topology @1 :TopologyEvent;
+    void @1: Void;
+    topology @2 :TopologyEvent;
   }
 }
 

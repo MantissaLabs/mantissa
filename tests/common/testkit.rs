@@ -37,6 +37,13 @@ impl TestNode {
         Self { node }
     }
 
+    pub async fn new_with_fanout(fanout: usize) -> Self {
+        let node = HeadlessNode::new_inproc_custom(None, None, Some(fanout))
+            .await
+            .expect("headless inproc node (custom fanout)");
+        Self { node }
+    }
+
     /// Start a node that listens on a random TCP port (Noise + Cap'n Proto over TCP).
     pub async fn new_tcp() -> Self {
         let node = HeadlessNode::new_tcp_ephemeral()
@@ -47,9 +54,10 @@ impl TestNode {
 
     /// Start a node with in-process transport and a custom periodic sync tick.
     pub async fn new_with_tick_ms(ms: u64) -> Self {
-        let node = HeadlessNode::new_inproc_with_tick(std::time::Duration::from_millis(ms))
-            .await
-            .expect("headless inproc node (with tick)");
+        let node =
+            HeadlessNode::new_inproc_custom(Some(std::time::Duration::from_millis(ms)), None, None)
+                .await
+                .expect("headless inproc node (with tick)");
         Self { node }
     }
 
@@ -187,24 +195,7 @@ impl TestNode {
 
     /// Spin up `n` in-process nodes (first one is the anchor).
     pub async fn new_cluster_inproc(n: usize) -> Result<Vec<TestNode>, capnp::Error> {
-        assert!(n >= 1, "cluster size must be >= 1");
-
-        let anchor = TestNode::new().await;
-        let anchor_addr = anchor.addr();
-        let join_token = anchor.current_join_token().await?;
-
-        let mut cluster = Vec::with_capacity(n);
-        cluster.push(anchor);
-
-        for _ in 1..n {
-            let node = TestNode::new().await;
-            node.node
-                .join_anchor_addr(&anchor_addr, &join_token)
-                .await?;
-            cluster.push(node);
-        }
-
-        Ok(cluster)
+        Self::new_cluster_inproc_with_config(n, ClusterConfig::default()).await
     }
 
     /// Convenience: pick whichever transport you prefer as the default.
@@ -427,5 +418,55 @@ impl TestNode {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClusterConfig {
+    pub sync_tick_ms: Option<u64>,
+    pub gossip_tick_ms: Option<u64>,
+    pub gossip_fanout: Option<usize>,
+}
+
+impl ClusterConfig {
+    fn as_options(&self) -> (Option<std::time::Duration>, Option<usize>) {
+        let sync_tick = self.sync_tick_ms.map(std::time::Duration::from_millis);
+        (sync_tick, self.gossip_fanout)
+    }
+}
+
+async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
+    let (sync_tick, fanout) = cfg.as_options();
+    let gossip_tick = cfg.gossip_tick_ms.map(std::time::Duration::from_millis);
+    HeadlessNode::new_inproc_custom(sync_tick, gossip_tick, fanout)
+        .await
+        .expect("headless inproc node (custom)")
+}
+
+impl TestNode {
+    pub async fn new_cluster_inproc_with_config(
+        n: usize,
+        cfg: ClusterConfig,
+    ) -> Result<Vec<TestNode>, capnp::Error> {
+        assert!(n >= 1, "cluster size must be >= 1");
+
+        let anchor_node = build_inproc_node_with_config(cfg).await;
+        let anchor = TestNode { node: anchor_node };
+        let anchor_addr = anchor.addr();
+        let join_token = anchor.current_join_token().await?;
+
+        let mut cluster = Vec::with_capacity(n);
+        cluster.push(anchor);
+
+        for _ in 1..n {
+            let node = build_inproc_node_with_config(cfg).await;
+            let test_node = TestNode { node };
+            test_node
+                .node
+                .join_anchor_addr(&anchor_addr, &join_token)
+                .await?;
+            cluster.push(test_node);
+        }
+
+        Ok(cluster)
     }
 }
