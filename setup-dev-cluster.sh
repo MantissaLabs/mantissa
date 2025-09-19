@@ -86,7 +86,22 @@ provision:
     script: |
       set -euxo pipefail
       sudo apt-get update && sudo apt-get upgrade -y
-      sudo apt-get install -y build-essential curl git capnproto libcapnp-dev libssl-dev pkg-config iputils-ping
+
+      # Install docker
+      sudo apt-get install -y ca-certificates curl build-essential git capnproto libcapnp-dev libssl-dev pkg-config iputils-ping
+      sudo install -m 0755 -d /etc/apt/keyrings
+      if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
+        curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      fi
+      sudo chmod a+r /etc/apt/keyrings/docker.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo \$VERSION_CODENAME) stable" | \
+        sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+      sudo apt-get update
+      sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      sudo systemctl enable docker
+      sudo systemctl start docker
+      sudo usermod -aG docker "$USER"
+
       # Rust toolchain
       if ! command -v rustup >/dev/null 2>&1; then
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -98,6 +113,7 @@ provision:
       if ! grep -q 'cargo/bin' ~/.profile; then
         echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.profile
       fi
+
       # Mantissa dev bin and alias
       if ! grep -q 'MANTISSA_BIN=' ~/.bashrc; then
         echo 'export MANTISSA_BIN="/mantissa/target/debug"' >> ~/.bashrc
