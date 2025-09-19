@@ -164,7 +164,19 @@ pub async fn start<C>(
                         continue;
                     }
 
-                    if let Err(e) = send_gossip(&pending, peer, &context).await {
+                    // Filter out messages that describe the peer itself so we never
+                    // hand its exported capability back to the same connection.
+                    let outbound: Vec<Message> = pending
+                        .iter()
+                        .cloned()
+                        .filter(|msg| !message_targets_peer(msg, peer.id))
+                        .collect();
+
+                    if outbound.is_empty() {
+                        continue;
+                    }
+
+                    if let Err(e) = send_gossip(&outbound, peer, &context).await {
                         eprintln!("Gossip to {} failed: {:?}", peer.address, e);
                     }
                 }
@@ -219,6 +231,18 @@ where
     }
 
     req.send().promise.await.map(|_| ())
+}
+
+// Return true when the gossip message is about the provided peer identifier.
+fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
+    match message {
+        Message::Void { .. } => false,
+        Message::Topology { event, .. } => match event {
+            TopologyEvent::Join { id, .. }
+            | TopologyEvent::Leave { id }
+            | TopologyEvent::Suspect { id } => *id == peer_id,
+        },
+    }
 }
 
 pub async fn fanout_sample<P>(provider: &P, fanout: usize) -> Vec<PeerHandle>
