@@ -8,9 +8,12 @@ use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
+use crate::store::workload_store::{WorkloadStore, open_workload_store};
 use crate::sync::SyncService;
 use crate::token::TokenStore;
 use crate::topology::{Keys, Topology, TopologyStores};
+use crate::workload::manager::WorkloadManager;
+use crate::workload::service::WorkloadService;
 use crate::{node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
@@ -38,7 +41,7 @@ pub async fn start(
     let stores = Bootstrap::open_stores(&ctx).await?;
 
     // Build runtime components (gossip, topology, sync) and their clients
-    let (comps, gossip_rx) = Bootstrap::build_components(&ctx, &stores)?;
+    let (comps, gossip_rx) = Bootstrap::build_components(&ctx, &stores).await?;
 
     // Wire up ServerImpl and spawn listeners
     let server = Bootstrap::build_server(&ctx, &stores, &comps);
@@ -75,6 +78,7 @@ pub(crate) struct Stores {
     pub local_sessions: LocalSessionStore, // client-side resume tickets (encrypted)
     pub local_creds: LocalCredentialStore, // short-lived cluster creds
     pub token_store: TokenStore,           // join token rotator
+    pub workloads: WorkloadStore,
 }
 
 pub(crate) struct Components {
@@ -83,6 +87,7 @@ pub(crate) struct Components {
     pub topology_client: TopologyClient,
     pub sync_client: protocol::sync::sync::Client,
     pub health_monitor: std::sync::Arc<health::HealthMonitor>,
+    pub workload_manager: WorkloadManager,
 }
 
 impl Bootstrap {
@@ -163,17 +168,21 @@ impl Bootstrap {
         // Debug dump mst root for peers store.
         peers.debug_dump_root("peers").await;
 
+        let workloads = open_workload_store(ctx.db.clone(), ctx.self_id)?;
+        workloads.rebuild_mst_from_disk().await?;
+
         Ok(Stores {
             peers,
             session_auth,
             local_sessions,
             local_creds,
             token_store,
+            workloads,
         })
     }
 
     /// Build topology/gossip/sync and their Cap’n Proto clients.
-    pub(crate) fn build_components(
+    pub(crate) async fn build_components(
         ctx: &Bootstrap,
         stores: &Stores,
     ) -> Result<(Components, Receiver<Message>), Box<dyn std::error::Error>> {
@@ -181,11 +190,14 @@ impl Bootstrap {
         let (gossip_tx, gossip_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(128);
         let (topology_tx, topology_rx) = async_channel::bounded(128);
+        let (workload_tx, workload_rx): (Sender<Message>, Receiver<Message>) =
+            async_channel::bounded(128);
 
         // gossip capability
         let gossip = crate::gossip::Gossip {
             chans: crate::gossip::Channels {
                 topology_events: topology_tx.clone(),
+                workload_events: workload_tx.clone(),
             },
         };
         let gossip_client = capnp_rpc::new_client(gossip);
@@ -195,7 +207,7 @@ impl Bootstrap {
         let health_cfg = health::Config::default();
         let health_monitor = health::HealthMonitor::new(health_cfg);
 
-        let stores = TopologyStores {
+        let topology_stores = TopologyStores {
             credentials: stores.local_creds.clone(),
             sessions: stores.local_sessions.clone(),
             peers: stores.peers.clone(),
@@ -210,9 +222,9 @@ impl Bootstrap {
         let topology = Topology::new(
             ctx.listen_addr.clone(),
             topology_rx,
-            gossip_tx,
+            gossip_tx.clone(),
             ctx.node.clone(),
-            stores.clone(),
+            topology_stores.clone(),
             keys,
             health_monitor.clone(),
         )?;
@@ -220,8 +232,28 @@ impl Bootstrap {
         let topology_client: TopologyClient = capnp_rpc::new_client(topology.clone());
 
         // sync capability
-        let sync_service = SyncService::new(stores.peers.clone());
+        let sync_service = SyncService::new(topology_stores.peers.clone());
         let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
+
+        let local_node_name = ctx
+            .node
+            .system_info
+            .info
+            .hostname
+            .clone()
+            .unwrap_or_else(|| ctx.listen_addr.clone());
+
+        let docker_manager = crate::workload::docker::DockerContainerManager::new()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        let workload_manager = WorkloadManager::new(
+            stores.workloads.clone(),
+            gossip_tx.clone(),
+            workload_rx,
+            ctx.self_id,
+            local_node_name,
+            Arc::new(docker_manager),
+        );
 
         Ok((
             Components {
@@ -230,6 +262,7 @@ impl Bootstrap {
                 topology_client,
                 sync_client,
                 health_monitor,
+                workload_manager,
             },
             gossip_rx,
         ))
@@ -239,11 +272,17 @@ impl Bootstrap {
     pub(crate) fn build_server(ctx: &Bootstrap, stores: &Stores, comps: &Components) -> Server {
         let mut config = Config::new();
         let config = config.with_listen_addr(ctx.listen_addr.clone()).build();
+
+        let workload_manager = comps.workload_manager.clone();
+        let workload_service = WorkloadService::new(workload_manager.clone());
+        let workload_client = capnp_rpc::new_client(workload_service);
+
         let clients = ServerClients {
             topology_client: comps.topology_client.clone(),
             gossip_client: comps.gossip_client.clone(),
             sync_client: comps.sync_client.clone(),
             node_client: ctx.node_client.clone(),
+            workload_client,
         };
 
         let stores_bundle = ServerStores {
@@ -296,6 +335,11 @@ impl Bootstrap {
         let topology_sync = comps.topology.clone();
         let topology_for_gossip = comps.topology.clone();
         let gossip_tick = topology_for_gossip.gossip_interval();
+
+        let mut workload_runner = comps.workload_manager.clone();
+        tokio::task::spawn_local(async move {
+            workload_runner.run().await;
+        });
 
         // Spawn gossip loop
         tokio::task::spawn_local(async move {

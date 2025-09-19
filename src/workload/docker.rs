@@ -4,6 +4,7 @@
 //! using the Bollard Docker API.
 
 use std::collections::HashMap;
+use std::env;
 use std::time::Duration;
 
 use bollard::Docker;
@@ -45,6 +46,7 @@ pub trait ContainerManager {
         &self,
         name: &str,
         image: &str,
+        command: Option<Vec<String>>,
         env_vars: Option<Vec<String>>,
         ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
         volumes: Option<Vec<String>>,
@@ -118,6 +120,7 @@ pub struct ContainerInfo {
 }
 
 /// Docker container manager implementation
+#[derive(Clone)]
 pub struct DockerContainerManager {
     docker: Docker,
 }
@@ -125,9 +128,45 @@ pub struct DockerContainerManager {
 impl DockerContainerManager {
     /// Create a new Docker container manager
     pub async fn new() -> ContainerResult<Self> {
-        let docker = Docker::connect_with_local_defaults().map_err(ContainerError::DockerAPI)?;
+        let (docker, endpoint) = Self::connect().map_err(ContainerError::DockerAPI)?;
+
+        docker
+            .ping()
+            .await
+            .map_err(|e| ContainerError::OperationFailed(format!("docker ping failed: {e}")))?;
+
+        info!(
+            target: "workload",
+            "Connected to Docker endpoint {}",
+            endpoint
+        );
 
         Ok(Self { docker })
+    }
+
+    fn connect() -> Result<(Docker, String), bollard::errors::Error> {
+        if let Ok(host) = env::var("MANTISSA_DOCKER_HOST") {
+            return Self::connect_with_host(&host).map(|docker| (docker, host));
+        }
+
+        if let Ok(host) = env::var("DOCKER_HOST") {
+            return Self::connect_with_host(&host).map(|docker| (docker, host));
+        }
+
+        let docker = Docker::connect_with_defaults()?;
+        Ok((docker, "(defaults)".to_string()))
+    }
+
+    fn connect_with_host(host: &str) -> Result<Docker, bollard::errors::Error> {
+        if host.starts_with("tcp://") || host.starts_with("http://") {
+            Docker::connect_with_http(host, 120, bollard::API_DEFAULT_VERSION)
+        } else if host.starts_with("unix://") {
+            Docker::connect_with_unix(host, 120, bollard::API_DEFAULT_VERSION)
+        } else if host.starts_with('/') {
+            Docker::connect_with_unix(host, 120, bollard::API_DEFAULT_VERSION)
+        } else {
+            Docker::connect_with_defaults()
+        }
     }
 }
 
@@ -137,6 +176,7 @@ impl ContainerManager for DockerContainerManager {
         &self,
         name: &str,
         image: &str,
+        command: Option<Vec<String>>,
         env_vars: Option<Vec<String>>,
         ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
         volumes: Option<Vec<String>>,
@@ -169,6 +209,7 @@ impl ContainerManager for DockerContainerManager {
         let config = Config {
             image: Some(image.to_string()),
             env: env_vars,
+            cmd: command,
             exposed_ports: if let Some(ports_map) = ports {
                 // Convert from HashMap<String, Vec<HashMap<String, String>>> to HashMap<String, HashMap<(), ()>>
                 let mut exposed = HashMap::new();

@@ -1,6 +1,7 @@
 @0xbfbfd4615e1d9b8a;
 
 using import "topology.capnp".TopologyEvent;
+using import "workload.capnp".WorkloadEvent;
 
 interface Gossip {
   # Gossip defines operations or event notifications to
@@ -25,6 +26,7 @@ struct GossipMessage {
   union {
     void @1: Void;
     topology @2 :TopologyEvent;
+    workload @3 :WorkloadEvent;
   }
 }
 

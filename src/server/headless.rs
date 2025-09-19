@@ -129,7 +129,7 @@ impl HeadlessNode {
             node_client,
         );
         let stores: Stores = Bootstrap::open_stores(&ctx).await?;
-        let (comps, gossip_rx) = Bootstrap::build_components(&ctx, &stores)?;
+        let (comps, gossip_rx) = Bootstrap::build_components(&ctx, &stores).await?;
         if let Some(d) = sync_tick {
             comps.topology.set_sync_interval(d);
         }

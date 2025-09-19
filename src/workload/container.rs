@@ -15,7 +15,7 @@ pub enum RuntimeType {
 }
 
 /// Represents the current state of a container or MicroVM
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ContainerState {
     Pending,
     Creating,

@@ -8,6 +8,8 @@
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
+use crate::workload::service as workload_service;
+use crate::workload::types::WorkloadEvent;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 use capnp::Error;
@@ -47,13 +49,16 @@ pub struct GossipEvents {
 pub enum Message {
     Void { id: Uuid },
     Topology { id: Uuid, event: TopologyEvent },
+    Workload { id: Uuid, event: WorkloadEvent },
     // Scheduling(SchedulingEvent),
 }
 
 impl Message {
     pub fn id(&self) -> Uuid {
         match self {
-            Message::Void { id } | Message::Topology { id, .. } => *id,
+            Message::Void { id } | Message::Topology { id, .. } | Message::Workload { id, .. } => {
+                *id
+            }
         }
     }
 }
@@ -67,6 +72,7 @@ pub struct Gossip {
 
 pub struct Channels {
     pub topology_events: Sender<Message>,
+    pub workload_events: Sender<Message>,
     // scheduling_events: Sender<SchedulingEvent>,
 }
 
@@ -82,7 +88,8 @@ impl gossip::Server for Gossip {
         params: gossip::GossipParams,
         _results: gossip::GossipResults,
     ) -> Promise<(), Error> {
-        let tx = self.chans.topology_events.clone();
+        let topo_tx = self.chans.topology_events.clone();
+        let workload_tx = self.chans.workload_events.clone();
 
         Promise::from_future(async move {
             let msgs = params.get().unwrap().get_messages();
@@ -107,12 +114,12 @@ impl gossip::Server for Gossip {
 
                 match msg.reborrow().which().expect("failed to read variant") {
                     Void(_) => {
-                        let _ = tx.send(Message::Void { id }).await;
+                        let _ = topo_tx.send(Message::Void { id }).await;
                     }
                     Topology(Ok(reader)) => match topology::read_topology_event(reader) {
                         Ok(event) => {
                             let message = Message::Topology { id, event };
-                            tx.send(message).await.map_err(|e| {
+                            topo_tx.send(message).await.map_err(|e| {
                                 capnp::Error::failed(format!(
                                     "Couldn't sent event to topology: {e}"
                                 ))
@@ -122,6 +129,20 @@ impl gossip::Server for Gossip {
                     },
                     Topology(Err(e)) => {
                         eprintln!("Error reading topology: {e}");
+                    }
+                    Workload(Ok(reader)) => match workload_service::read_event(reader) {
+                        Ok(event) => {
+                            let message = Message::Workload { id, event };
+                            workload_tx.send(message).await.map_err(|e| {
+                                capnp::Error::failed(format!(
+                                    "Couldn't send event to workload: {e}"
+                                ))
+                            })?;
+                        }
+                        Err(e) => eprintln!("Failed to convert workload event: {e}"),
+                    },
+                    Workload(Err(e)) => {
+                        eprintln!("Error reading workload: {e}");
                     }
                 }
             }
@@ -227,6 +248,9 @@ where
             Message::Topology { event, .. } => {
                 topology::add_event(&mut msgs, idx as u32, event);
             }
+            Message::Workload { event, .. } => {
+                workload_service::add_event(&mut msgs, idx as u32, event);
+            }
         }
     }
 
@@ -242,6 +266,8 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
             | TopologyEvent::Leave { id }
             | TopologyEvent::Suspect { id } => *id == peer_id,
         },
+        // Workload updates replicate to every peer regardless of assignment so keep them.
+        Message::Workload { .. } => false,
     }
 }
 

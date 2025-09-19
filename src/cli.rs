@@ -149,6 +149,13 @@ pub enum TasksCommand {
     /// List tasks in a cluster
     #[command(alias = "ls")]
     List(TasksListArgs),
+
+    /// Start a container workload
+    #[command(alias = "run")]
+    Start(TasksStartArgs),
+
+    /// Stop a container workload
+    Stop(TasksStopArgs),
 }
 
 #[derive(Args, Debug)]
@@ -156,6 +163,28 @@ pub struct TasksListArgs {
     /// The cluster to list tasks for
     #[arg(index = 1)]
     pub cluster: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct TasksStartArgs {
+    /// Friendly name for the workload
+    #[arg(index = 1, value_name = "NAME")]
+    pub name: String,
+
+    /// Container image to run
+    #[arg(short = 'i', long = "image", value_name = "IMAGE")]
+    pub image: String,
+
+    /// Command arguments for the container (repeat flag to add arguments)
+    #[arg(short = 'c', long = "command", value_name = "ARG", action = ArgAction::Append)]
+    pub command: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct TasksStopArgs {
+    /// Workload ID to stop (UUID)
+    #[arg(index = 1, value_name = "ID")]
+    pub id: String,
 }
 
 #[derive(Args, Debug)]

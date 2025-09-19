@@ -186,6 +186,7 @@ impl topology::Server for Topology {
                         inputs.anchor
                     ))
                 })?;
+            let anchor_handle = client.clone();
 
             let response =
                 Topology::register_with_anchor(client, &payload, &inputs.join_token).await?;
@@ -212,6 +213,8 @@ impl topology::Server for Topology {
             ClusterCredential::from_bytes_verified(&credential).map_err(Error::failed)?;
 
             topology.mark_seen(peer_id);
+
+            topology.attach_handle_only(peer_id, anchor_handle).await;
 
             let sync_cap = Topology::fetch_sync_capability(&session).await?;
 

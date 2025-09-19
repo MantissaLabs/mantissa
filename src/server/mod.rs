@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use protocol::{
     gossip::GossipClient, health::HealthClient, node::NodeClient, sync::SyncClient,
-    topology::TopologyClient,
+    topology::TopologyClient, workload::WorkloadClient,
 };
 
 pub mod auth;
@@ -79,6 +79,7 @@ pub struct ServerClients {
     pub gossip_client: GossipClient,
     pub sync_client: SyncClient,
     pub node_client: NodeClient,
+    pub workload_client: WorkloadClient,
 }
 
 #[derive(Clone)]
@@ -119,6 +120,7 @@ impl Server {
             self.clients.gossip_client.clone(),
             self.clients.node_client.clone(),
             health_client,
+            self.clients.workload_client.clone(),
         );
 
         capnp_rpc::new_client(session)

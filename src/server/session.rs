@@ -1,7 +1,7 @@
 use capnp::capability::Promise;
 use protocol::{
     gossip::gossip, health::health, node::node, server::cluster_session, sync::sync,
-    topology::topology,
+    topology::topology, workload::workload,
 };
 
 #[derive(Clone)]
@@ -11,6 +11,7 @@ pub struct ClusterSessionImpl {
     gossip: gossip::Client,
     node: node::Client,
     health: health::Client,
+    workload: workload::Client,
 }
 
 impl ClusterSessionImpl {
@@ -20,6 +21,7 @@ impl ClusterSessionImpl {
         gossip: gossip::Client,
         node: node::Client,
         health: health::Client,
+        workload: workload::Client,
     ) -> Self {
         Self {
             topology,
@@ -27,6 +29,7 @@ impl ClusterSessionImpl {
             gossip,
             node,
             health,
+            workload,
         }
     }
 }
@@ -44,6 +47,7 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_topology(self.topology.clone());
         caps.set_sync(self.sync.clone());
         caps.set_health(self.health.clone());
+        caps.set_workload(self.workload.clone());
 
         Promise::ok(())
     }
@@ -81,6 +85,15 @@ impl cluster_session::Server for ClusterSessionImpl {
         mut results: cluster_session::GetNodeResults,
     ) -> Promise<(), capnp::Error> {
         results.get().set_node(self.node.clone());
+        Promise::ok(())
+    }
+
+    fn get_workload(
+        &mut self,
+        _params: cluster_session::GetWorkloadParams,
+        mut results: cluster_session::GetWorkloadResults,
+    ) -> Promise<(), capnp::Error> {
+        results.get().set_workload(self.workload.clone());
         Promise::ok(())
     }
 }
