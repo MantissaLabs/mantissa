@@ -599,8 +599,47 @@ impl Topology {
     }
 
     pub async fn session_for_peer(&self, peer: &PeerHandle) -> Option<cluster_session::Client> {
-        self.session_for_strategy(&peer.client, peer.id, SessionStrategy::TicketThenCredential)
+        if let Some(session) = self
+            .session_for_strategy(&peer.client, peer.id, SessionStrategy::TicketThenCredential)
             .await
+        {
+            return Some(session);
+        }
+
+        // Try to rebuild the handle via a fresh TCP connection when the capability is stale.
+        let Some(refreshed) = self.refresh_peer_handle(peer.id).await else {
+            return None;
+        };
+
+        self.session_for_strategy(&refreshed, peer.id, SessionStrategy::TicketThenCredential)
+            .await
+    }
+
+    // Replace a stale Server capability by dialing the peer's advertised address again.
+    async fn refresh_peer_handle(&self, peer_id: Uuid) -> Option<server::Client> {
+        let peer = self.peer_latest_value(peer_id)?;
+        let addr = peer.address.clone();
+
+        self.handles.write().await.remove(&peer_id);
+
+        match Topology::connect_to_peer(&addr).await {
+            Ok(client) => {
+                self.handles.write().await.insert(peer_id, client.clone());
+                Some(client)
+            }
+            Err(e) => {
+                error!(target: "connect", "reconnect {addr} failed: {e}");
+                None
+            }
+        }
+    }
+
+    fn peer_latest_value(&self, peer_id: Uuid) -> Option<PeerValue> {
+        let (actives, _) = self.peers.load_all().ok()?;
+        actives
+            .into_iter()
+            .find(|(k, _)| k.to_uuid() == peer_id)
+            .and_then(|(_, snap)| snap.as_slice().last().cloned())
     }
 
     async fn connect_to_peer(addr: &str) -> Result<server::Client, String> {
