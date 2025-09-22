@@ -24,7 +24,7 @@ use tokio::task::LocalSet;
 use crate::cli::*;
 use crate::server::RunMode;
 use client::config::ClientConfig;
-use client::workload::{
+use client::tasks::{
     list as client_workload_list, start as client_workload_start, stop as client_workload_stop,
 };
 
@@ -67,11 +67,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         Command::Tasks { cmd } => match cmd {
             TasksCommand::List(_) => {
-                local.run_until(client_workload_list(&cfg)).await?;
+                local.run_until(client::tasks::list(&cfg)).await?;
             }
             TasksCommand::Start(args) => {
                 local
-                    .run_until(client_workload_start(
+                    .run_until(client::tasks::start(
                         &cfg,
                         &args.name,
                         &args.image,
@@ -80,15 +80,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .await?;
             }
             TasksCommand::Stop(args) => {
-                local
-                    .run_until(client_workload_stop(&cfg, &args.id))
-                    .await?;
+                local.run_until(client::tasks::stop(&cfg, &args.id)).await?;
             }
         },
 
         Command::Submit(_s) => {
             // e.g., workload::task::submit(&s.input).await?;
-            workload::task::submit().await?;
         }
 
         Command::Link(l) => {

@@ -137,8 +137,7 @@ impl DockerContainerManager {
 
         info!(
             target: "workload",
-            "Connected to Docker endpoint {}",
-            endpoint
+            "Connected to Docker endpoint {endpoint}",
         );
 
         Ok(Self { docker })
@@ -160,9 +159,7 @@ impl DockerContainerManager {
     fn connect_with_host(host: &str) -> Result<Docker, bollard::errors::Error> {
         if host.starts_with("tcp://") || host.starts_with("http://") {
             Docker::connect_with_http(host, 120, bollard::API_DEFAULT_VERSION)
-        } else if host.starts_with("unix://") {
-            Docker::connect_with_unix(host, 120, bollard::API_DEFAULT_VERSION)
-        } else if host.starts_with('/') {
+        } else if host.starts_with("unix://") || host.starts_with('/') {
             Docker::connect_with_unix(host, 120, bollard::API_DEFAULT_VERSION)
         } else {
             Docker::connect_with_defaults()

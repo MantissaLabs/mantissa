@@ -20,27 +20,3 @@ pub enum WorkloadEvent {
     Upsert(WorkloadSpec),
     Remove { id: Uuid },
 }
-
-impl WorkloadSpec {
-    pub fn new(
-        id: Uuid,
-        name: impl Into<String>,
-        image: impl Into<String>,
-        state: ContainerState,
-        created_at: impl Into<String>,
-        command: Vec<String>,
-        node_id: Uuid,
-        node_name: impl Into<String>,
-    ) -> Self {
-        Self {
-            id,
-            name: name.into(),
-            image: image.into(),
-            state,
-            created_at: created_at.into(),
-            command,
-            node_id,
-            node_name: node_name.into(),
-        }
-    }
-}

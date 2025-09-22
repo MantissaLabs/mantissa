@@ -1,6 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::workload::uuid_to_string;
+use crate::tasks::uuid_to_string;
 use anyhow::Result;
 use std::io::Write;
 

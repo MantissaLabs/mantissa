@@ -88,7 +88,7 @@ pub fn write_spec(mut builder: workload_spec::Builder, spec: &WorkloadSpec) {
     builder.set_id(spec.id.as_bytes());
     builder.set_name(&spec.name);
     builder.set_image(&spec.image);
-    builder.set_state(&state_to_str(&spec.state));
+    builder.set_state(state_to_str(&spec.state));
     builder.set_created_at(&spec.created_at);
     builder.set_node_id(spec.node_id.as_bytes());
     builder.set_node_name(&spec.node_name);

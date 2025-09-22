@@ -62,7 +62,8 @@ impl WorkloadManager {
             .await
             .map_err(|e| anyhow::anyhow!("docker pull failed: {e}"))?;
 
-        let container_name = format!("mantissa-{}", id);
+        let container_name = format!("mantissa-{id}");
+
         // Create and start the container before advertising the workload to the cluster.
         let container_id = self
             .container_manager
@@ -89,16 +90,16 @@ impl WorkloadManager {
 
         let _ = self.local_containers.lock().await.insert(id, container_id);
 
-        let spec = WorkloadSpec::new(
+        let spec = WorkloadSpec {
             id,
-            name.clone(),
-            image.clone(),
-            ContainerState::Running,
-            created_at.to_rfc3339(),
-            command.clone(),
-            self.local_node_id,
-            self.local_node_name.clone(),
-        );
+            name: name.clone(),
+            image: image.clone(),
+            state: ContainerState::Running,
+            created_at: created_at.to_rfc3339(),
+            command: command.clone(),
+            node_id: self.local_node_id,
+            node_name: self.local_node_name.clone(),
+        };
 
         self.persist_spec(&spec).await?;
         let event = WorkloadEvent::Upsert(spec.clone());
@@ -180,11 +181,11 @@ impl WorkloadManager {
 
     pub async fn stop_workload(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
         let spec = self.load_spec(id).await?;
+        let node_name = spec.node_name.clone();
 
         if spec.node_id != self.local_node_id {
             return Err(anyhow::anyhow!(
-                "workload {} is assigned to node {}",
-                id, spec.node_name
+                "workload {id} is assigned to node {node_name}",
             ));
         }
 
@@ -210,7 +211,8 @@ impl WorkloadManager {
         updated.state = ContainerState::Stopped;
 
         self.persist_spec(&updated).await?;
-        self.enqueue_gossip(WorkloadEvent::Upsert(updated.clone())).await?;
+        self.enqueue_gossip(WorkloadEvent::Upsert(updated.clone()))
+            .await?;
         Ok(updated)
     }
 

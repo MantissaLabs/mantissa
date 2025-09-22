@@ -1,7 +1,7 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::workload::uuid_from_data;
-use anyhow::{anyhow, Result};
+use crate::tasks::uuid_from_data;
+use anyhow::{Result, anyhow};
 use std::io::Write;
 use uuid::Uuid;
 
