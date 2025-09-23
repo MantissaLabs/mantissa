@@ -8,6 +8,8 @@ mod gossip;
 mod logger;
 mod node;
 mod server;
+mod service_manifest;
+mod services;
 mod store;
 mod sync;
 mod token;
@@ -23,10 +25,9 @@ use tokio::task::LocalSet;
 
 use crate::cli::*;
 use crate::server::RunMode;
+use crate::service_manifest::load_manifest_from_path;
+use crate::services::{deploy_manifest, render_summary};
 use client::config::ClientConfig;
-use client::tasks::{
-    list as client_workload_list, start as client_workload_start, stop as client_workload_stop,
-};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -81,6 +82,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             TasksCommand::Stop(args) => {
                 local.run_until(client::tasks::stop(&cfg, &args.id)).await?;
+            }
+        },
+
+        Command::Services { cmd } => match cmd {
+            ServicesCommand::Run(args) => {
+                let manifest = load_manifest_from_path(&args.manifest)?;
+                let deployments = local.run_until(deploy_manifest(&cfg, &manifest)).await?;
+                let summary = render_summary(&manifest, &deployments)?;
+                println!("{summary}");
             }
         },
 

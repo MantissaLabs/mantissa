@@ -1,5 +1,6 @@
 // src/cli.rs
 use clap::{ArgAction, Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,6 +70,17 @@ pub enum Command {
     Tasks {
         #[command(subcommand)]
         cmd: TasksCommand,
+    },
+
+    /// Service deployment subcommands
+    #[command(
+        alias = "svc",
+        subcommand_required = true,
+        arg_required_else_help = true
+    )]
+    Services {
+        #[command(subcommand)]
+        cmd: ServicesCommand,
     },
 
     /// Submit a job to the cluster
@@ -185,6 +197,20 @@ pub struct TasksStopArgs {
     /// Workload ID to stop (UUID)
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServicesCommand {
+    /// Deploy a service manifest from a RON description
+    #[command(alias = "apply")]
+    Run(ServicesRunArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ServicesRunArgs {
+    /// Path to the RON manifest describing the services to deploy
+    #[arg(index = 1, value_name = "MANIFEST")]
+    pub manifest: PathBuf,
 }
 
 #[derive(Args, Debug)]
