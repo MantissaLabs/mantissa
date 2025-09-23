@@ -1,0 +1,20 @@
+(
+    name: Some("demo-service"),
+    services: [
+        (
+            name: "echo",
+            image: "alpine:3.20",
+            command: [
+                "sh",
+                "-c",
+                "while true; do echo 'demo-service echo replica'; sleep 5; done",
+            ],
+            replicas: 2,
+        ),
+        (
+            name: "api",
+            image: "nginx:1.27-alpine",
+            replicas: 1,
+        ),
+    ],
+)
