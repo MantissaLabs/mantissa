@@ -1,7 +1,7 @@
 use crate::service_manifest::{ServiceManifest, ServiceSpec};
 use anyhow::{Context, Result};
 use client::config::ClientConfig;
-use client::tasks::{StartedWorkload, start_with_details};
+use client::services::{StartedWorkload, run};
 use std::io::Write;
 use tabwriter::TabWriter;
 
@@ -45,7 +45,7 @@ async fn start_service(
             base_name.clone()
         };
 
-        let workload = start_with_details(cfg, &workload_name, &service.image, &service.command)
+        let workload = run(cfg, &workload_name, &service.image, &service.command)
             .await
             .with_context(|| {
                 format!(
