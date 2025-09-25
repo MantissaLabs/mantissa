@@ -561,6 +561,8 @@ dependencies = [
  "futures",
  "net",
  "protocol",
+ "ron",
+ "serde",
  "tabwriter",
  "tokio",
  "tokio-util",

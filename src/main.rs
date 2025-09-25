@@ -9,8 +9,6 @@ mod logger;
 mod node;
 mod scheduler;
 mod server;
-mod service_manifest;
-mod services;
 mod store;
 mod sync;
 mod token;
@@ -26,8 +24,6 @@ use tokio::task::LocalSet;
 
 use crate::cli::*;
 use crate::server::RunMode;
-use crate::service_manifest::load_manifest_from_path;
-use crate::services::{deploy_manifest, render_summary};
 use client::config::ClientConfig;
 
 #[tokio::main]
@@ -102,9 +98,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         Command::Services { cmd } => match cmd {
             ServicesCommand::Run(args) => {
-                let manifest = load_manifest_from_path(&args.manifest)?;
-                let deployments = local.run_until(deploy_manifest(&cfg, &manifest)).await?;
-                let summary = render_summary(&manifest, &deployments)?;
+                let manifest = client::services::load_manifest_from_path(&args.manifest)?;
+                let deployments = local
+                    .run_until(client::services::deploy_manifest(&cfg, &manifest))
+                    .await?;
+                let summary = client::services::render_summary(&manifest, &deployments)?;
                 println!("{summary}");
             }
         },

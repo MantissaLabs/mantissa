@@ -1,7 +1,7 @@
-use crate::service_manifest::ServiceManifest;
+use super::manifest::ServiceManifest;
+use super::run::{StartedWorkload, WorkloadStartParams, run_many};
+use crate::config::ClientConfig;
 use anyhow::{Context, Result, anyhow};
-use client::config::ClientConfig;
-use client::services::{StartedWorkload, WorkloadStartParams, run_many};
 use std::io::Write;
 use tabwriter::TabWriter;
 
