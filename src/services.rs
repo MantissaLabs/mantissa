@@ -1,7 +1,7 @@
-use crate::service_manifest::{ServiceManifest, ServiceSpec};
-use anyhow::{Context, Result};
+use crate::service_manifest::ServiceManifest;
+use anyhow::{Context, Result, anyhow};
 use client::config::ClientConfig;
-use client::services::{StartedWorkload, run};
+use client::services::{StartedWorkload, WorkloadStartParams, run_many};
 use std::io::Write;
 use tabwriter::TabWriter;
 
@@ -16,50 +16,60 @@ pub async fn deploy_manifest(
     cfg: &ClientConfig,
     manifest: &ServiceManifest,
 ) -> Result<Vec<ReplicaStart>> {
-    let mut replicas = Vec::new();
+    let mut requests = Vec::new();
+    let mut layout = Vec::new();
 
     for service in &manifest.services {
-        replicas.extend(start_service(cfg, manifest, service).await?);
-    }
-
-    Ok(replicas)
-}
-
-async fn start_service(
-    cfg: &ClientConfig,
-    manifest: &ServiceManifest,
-    service: &ServiceSpec,
-) -> Result<Vec<ReplicaStart>> {
-    let mut replicas = Vec::with_capacity(service.replicas as usize);
-    let base_name = if let Some(prefix) = manifest.name.as_ref() {
-        format!("{prefix}-{}", service.name)
-    } else {
-        service.name.clone()
-    };
-
-    for replica_idx in 0..service.replicas {
-        let replica_number = replica_idx + 1;
-        let workload_name = if service.replicas > 1 {
-            format!("{base_name}-{replica_number}")
+        let base_name = if let Some(prefix) = manifest.name.as_ref() {
+            format!("{prefix}-{}", service.name)
         } else {
-            base_name.clone()
+            service.name.clone()
         };
 
-        let workload = run(cfg, &workload_name, &service.image, &service.command)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to start replica {replica_number} of service '{}'",
-                    service.name
-                )
-            })?;
+        for replica_idx in 0..service.replicas {
+            let replica_number = replica_idx + 1;
+            let workload_name = if service.replicas > 1 {
+                format!("{base_name}-{replica_number}")
+            } else {
+                base_name.clone()
+            };
 
-        replicas.push(ReplicaStart {
-            service_name: service.name.clone(),
+            requests.push(WorkloadStartParams {
+                name: workload_name,
+                image: service.image.clone(),
+                command: service.command.clone(),
+                cpu_millis: 0,
+                memory_bytes: 0,
+            });
+            layout.push((service.name.clone(), replica_number));
+        }
+    }
+
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let workloads = run_many(cfg, requests)
+        .await
+        .context("failed to start service replicas")?;
+
+    if workloads.len() != layout.len() {
+        return Err(anyhow!(
+            "workload batch returned {} replicas but {} were requested",
+            workloads.len(),
+            layout.len()
+        ));
+    }
+
+    let replicas = workloads
+        .into_iter()
+        .zip(layout.into_iter())
+        .map(|(workload, (service_name, replica_number))| ReplicaStart {
+            service_name,
             replica_number,
             workload,
-        });
-    }
+        })
+        .collect();
 
     Ok(replicas)
 }

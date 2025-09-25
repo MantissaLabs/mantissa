@@ -1,5 +1,7 @@
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::{DEFAULT_FANOUT, Message};
+use crate::scheduler::service::SchedulerService;
+use crate::scheduler::{Scheduler, SlotCapacity, SlotSpec};
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerStores};
@@ -8,22 +10,25 @@ use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
+use crate::store::scheduler_store::open_scheduler_store;
 use crate::store::workload_store::{WorkloadStore, open_workload_store};
 use crate::sync::SyncService;
 use crate::token::TokenStore;
 use crate::topology::{Keys, Topology, TopologyStores};
+use crate::workload::docker::ContainerManager;
 use crate::workload::manager::WorkloadManager;
 use crate::workload::service::WorkloadService;
 use crate::{node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
+use protocol::scheduling::scheduler::Client as SchedulerClient;
 use protocol::server::server::Client as ServerClient;
 use protocol::topology::topology::Client as TopologyClient;
 
 use async_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info};
 use uuid::Uuid;
 
 /// Starts the daemon and its subsystems, picking a run mode and whether to enable unix socket or not.
@@ -79,6 +84,7 @@ pub(crate) struct Stores {
     pub local_creds: LocalCredentialStore, // short-lived cluster creds
     pub token_store: TokenStore,           // join token rotator
     pub workloads: WorkloadStore,
+    pub scheduler: Arc<Scheduler>,
 }
 
 pub(crate) struct Components {
@@ -88,9 +94,59 @@ pub(crate) struct Components {
     pub sync_client: protocol::sync::sync::Client,
     pub health_monitor: std::sync::Arc<health::HealthMonitor>,
     pub workload_manager: WorkloadManager,
+    pub scheduler: Arc<Scheduler>,
+    pub scheduler_client: SchedulerClient,
 }
 
 impl Bootstrap {
+    fn derive_slot_specs(node: &node::Node) -> Vec<SlotSpec> {
+        let info = &node.system_info.info;
+
+        let mut slot_count = info
+            .cpu_info
+            .as_ref()
+            .map(|cpu| cpu.num_logical_cpus.max(1) as u64)
+            .unwrap_or(1);
+
+        if slot_count == 0 {
+            slot_count = 1;
+        }
+
+        let total_memory = info.mem_info.as_ref().map(|mem| mem.total).unwrap_or(0);
+
+        let base_memory = if slot_count > 0 {
+            total_memory / slot_count
+        } else {
+            total_memory
+        };
+        let mut remainder = if slot_count > 0 {
+            total_memory % slot_count
+        } else {
+            0
+        };
+
+        let mut specs = Vec::with_capacity(slot_count as usize);
+        for slot_idx in 0..slot_count {
+            let extra = if remainder > 0 {
+                remainder -= 1;
+                1
+            } else {
+                0
+            };
+            let memory_bytes = base_memory + extra;
+            specs.push(SlotSpec::new(
+                slot_idx,
+                SlotCapacity::new(1_000, memory_bytes),
+            ));
+        }
+
+        if specs.is_empty() {
+            specs.push(SlotSpec::new(0, SlotCapacity::new(1_000, total_memory)));
+        }
+
+        specs
+    }
+
     // Construct a Bootstrap context from injected parts (useful for tests).
     pub(crate) fn from_parts(
         listen_addr: String,
@@ -171,6 +227,21 @@ impl Bootstrap {
         let workloads = open_workload_store(ctx.db.clone(), ctx.self_id)?;
         workloads.rebuild_mst_from_disk().await?;
 
+        let scheduler_store = open_scheduler_store(ctx.db.clone(), ctx.self_id)?;
+        scheduler_store.rebuild_mst_from_disk().await?;
+        let scheduler = Arc::new(
+            Scheduler::new(scheduler_store.clone(), ctx.self_id)
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?,
+        );
+
+        if scheduler.snapshot().await.is_none() {
+            let specs = Self::derive_slot_specs(&ctx.node);
+            scheduler
+                .init_slots(specs)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        }
+
         Ok(Stores {
             peers,
             session_auth,
@@ -178,6 +249,7 @@ impl Bootstrap {
             local_creds,
             token_store,
             workloads,
+            scheduler,
         })
     }
 
@@ -246,14 +318,27 @@ impl Bootstrap {
         let docker_manager = crate::workload::docker::DockerContainerManager::new()
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        let docker_manager = Arc::new(docker_manager);
+        let container_manager: Arc<dyn ContainerManager + Send + Sync> = docker_manager.clone();
         let workload_manager = WorkloadManager::new(
             stores.workloads.clone(),
             gossip_tx.clone(),
             workload_rx,
             ctx.self_id,
-            local_node_name,
-            Arc::new(docker_manager),
+            local_node_name.clone(),
+            stores.scheduler.clone(),
+            container_manager,
         );
+
+        let topology_arc = Arc::new(topology.clone());
+
+        let scheduler_service = SchedulerService::new(
+            stores.scheduler.clone(),
+            topology_arc.clone(),
+            ctx.self_id,
+            local_node_name.clone(),
+        );
+        let scheduler_client_cap = capnp_rpc::new_client(scheduler_service);
 
         Ok((
             Components {
@@ -263,6 +348,8 @@ impl Bootstrap {
                 sync_client,
                 health_monitor,
                 workload_manager,
+                scheduler: stores.scheduler.clone(),
+                scheduler_client: scheduler_client_cap,
             },
             gossip_rx,
         ))
@@ -283,6 +370,7 @@ impl Bootstrap {
             sync_client: comps.sync_client.clone(),
             node_client: ctx.node_client.clone(),
             workload_client,
+            scheduler_client: comps.scheduler_client.clone(),
         };
 
         let stores_bundle = ServerStores {
@@ -315,6 +403,20 @@ impl Bootstrap {
         if let Err(handle) = comps.topology.set_server_handle(server_client.clone()) {
             error!(target: "server", "failed to set server handle");
             drop(handle);
+        }
+
+        match comps.scheduler.snapshot().await {
+            Some(snapshot) => {
+                info!(
+                    target: "scheduler",
+                    slots = snapshot.slots.len(),
+                    version = snapshot.version,
+                    "scheduler initialised"
+                );
+            }
+            None => {
+                info!(target: "scheduler", "scheduler has no slots configured");
+            }
         }
 
         Ok(())

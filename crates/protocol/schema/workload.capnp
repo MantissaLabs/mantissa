@@ -9,12 +9,17 @@ struct WorkloadSpec {
   command @5 :List(Text);
   nodeId @6 :Data;
   nodeName @7 :Text;
+  slotId @8 :UInt64;
+  cpuMillis @9 :UInt64;
+  memoryBytes @10 :UInt64;
 }
 
 struct StartRequest {
   name @0 :Text;
   image @1 :Text;
   command @2 :List(Text);
+  cpuMillis @3 :UInt64;
+  memoryBytes @4 :UInt64;
 }
 
 struct StopRequest {
@@ -35,4 +40,5 @@ interface Workload {
   start @0 (request :StartRequest) -> (spec :WorkloadSpec);
   list @1 () -> (workloads :List(WorkloadSpec));
   stop @2 (request :StopRequest) -> (spec :WorkloadSpec);
+  startMany @3 (requests :List(StartRequest)) -> (specs :List(WorkloadSpec));
 }

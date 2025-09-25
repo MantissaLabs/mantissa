@@ -1,0 +1,101 @@
+use crate::config::ClientConfig;
+use crate::connection;
+use anyhow::{Result, anyhow};
+use protocol::scheduling;
+use std::io::Write;
+use tabwriter::TabWriter;
+use uuid::Uuid;
+
+pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> Result<()> {
+    let client = connection::get_local_session(cfg).await?;
+
+    let scheduler_cap = client
+        .get_scheduler_request()
+        .send()
+        .promise
+        .await?
+        .get()?
+        .get_scheduler()?;
+
+    let mut summary_req = scheduler_cap.summary_request();
+    {
+        let mut inner = summary_req.get().init_request();
+        if let Some(peer) = peer_id {
+            let uuid =
+                Uuid::parse_str(peer).map_err(|e| anyhow!("invalid peer id '{peer}': {e}"))?;
+            inner.set_peer_id(uuid.as_bytes());
+        } else {
+            inner.set_peer_id(&[]);
+        }
+        inner.set_include_details(details);
+    }
+
+    let response = summary_req.send().promise.await?;
+    let summary = response.get()?.get_summary()?;
+
+    let node_id = bytes_to_uuid(summary.get_node_id()?).unwrap_or_else(Uuid::nil);
+    let node_name = summary.get_node_name()?.to_str()?.to_string();
+    let total = summary.get_total_slots();
+    let free = summary.get_free_slots();
+    let reserved = summary.get_reserved_slots();
+
+    println!(
+        "Scheduler Summary:\n  Node: {} ({})\n  Total slots: {}\n  Free slots: {}\n  Reserved slots: {}",
+        if node_name.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            node_name.clone()
+        },
+        node_id,
+        total,
+        free,
+        reserved,
+    );
+
+    if details {
+        let details_reader = summary.get_details()?;
+        if !details_reader.is_empty() {
+            let mut tw = TabWriter::new(Vec::new());
+            writeln!(&mut tw, "SLOT\tCPU(m)\tMEM(MiB)\tSTATE\tOWNER\tWORKLOAD")?;
+
+            for detail in details_reader.iter() {
+                let slot_id = detail.get_slot_id();
+                let cpu = detail.get_cpu_millis();
+                let mem_mib = detail.get_memory_bytes() / (1024 * 1024);
+                let state = match detail.get_state()? {
+                    scheduling::SlotState::Free => "free",
+                    scheduling::SlotState::Reserved => "reserved",
+                };
+
+                let owner = bytes_to_uuid(detail.get_owner()?)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let workload = bytes_to_uuid(detail.get_workload_id()?)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+
+                writeln!(
+                    &mut tw,
+                    "{slot_id}\t{cpu}\t{mem_mib}\t{state}\t{owner}\t{workload}",
+                )?;
+            }
+
+            tw.flush()?;
+            let output = String::from_utf8(tw.into_inner()?)?;
+            println!("\nSlot Details:\n{output}");
+        } else {
+            println!("\nNo slot details available.");
+        }
+    }
+
+    Ok(())
+}
+
+fn bytes_to_uuid(bytes: &[u8]) -> Option<Uuid> {
+    if bytes.len() != 16 {
+        return None;
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(bytes);
+    Some(Uuid::from_bytes(arr))
+}

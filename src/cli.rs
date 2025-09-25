@@ -72,6 +72,13 @@ pub enum Command {
         cmd: TasksCommand,
     },
 
+    /// Scheduler inspection subcommands
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Scheduler {
+        #[command(subcommand)]
+        cmd: SchedulerCommand,
+    },
+
     /// Service deployment subcommands
     #[command(
         alias = "svc",
@@ -190,6 +197,18 @@ pub struct TasksStartArgs {
     /// Command arguments for the container (repeat flag to add arguments)
     #[arg(short = 'c', long = "command", value_name = "ARG", action = ArgAction::Append)]
     pub command: Vec<String>,
+
+    /// CPU requested in milli-CPUs (e.g. 500 = 0.5 vCPU)
+    #[arg(long = "cpu-millis", value_name = "MCPU", default_value = "1000")]
+    pub cpu_millis: u64,
+
+    /// Memory requested in bytes
+    #[arg(
+        long = "memory-bytes",
+        value_name = "BYTES",
+        default_value = "536870912"
+    )]
+    pub memory_bytes: u64,
 }
 
 #[derive(Args, Debug)]
@@ -197,6 +216,24 @@ pub struct TasksStopArgs {
     /// Workload ID to stop (UUID)
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SchedulerCommand {
+    /// Show slot usage for a node
+    #[command(alias = "ls")]
+    Slots(SchedulerSlotsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SchedulerSlotsArgs {
+    /// Optional peer ID (UUID). Defaults to the local node when omitted.
+    #[arg(index = 1, value_name = "PEER-ID")]
+    pub peer_id: Option<String>,
+
+    /// Include per-slot details
+    #[arg(long = "details", action = ArgAction::SetTrue)]
+    pub details: bool,
 }
 
 #[derive(Subcommand, Debug)]

@@ -79,6 +79,7 @@ capnp-futures = "0.21"
 sysinfo = "0.36.1"
 dirs = "5.0.1"
 anyhow = "1"
+arc-swap = "1.6"
 
 # Logging
 tracing = "0.1"

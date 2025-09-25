@@ -59,6 +59,38 @@ struct Slot {
   workload @5 :Workload;
 }
 
+enum SlotState {
+  free @0;
+  reserved @1;
+}
+
+struct SlotDetail {
+  slotId @0 :UInt64;
+  cpuMillis @1 :UInt64;
+  memoryBytes @2 :UInt64;
+  state @3 :SlotState;
+  owner @4 :Data;
+  workloadId @5 :Data;
+}
+
+struct Summary {
+  nodeId @0 :Data;
+  nodeName @1 :Text;
+  totalSlots @2 :UInt32;
+  freeSlots @3 :UInt32;
+  reservedSlots @4 :UInt32;
+  details @5 :List(SlotDetail);
+}
+
+struct SummaryRequest {
+  peerId @0 :Data;
+  includeDetails @1 :Bool;
+}
+
+interface Scheduler {
+  summary @0 (request :SummaryRequest) -> (summary :Summary);
+}
+
 struct Workload {
   # A Workload. It defines a programs to run on the
   # pool of machines.

@@ -7,6 +7,7 @@ mod crypto;
 mod gossip;
 mod logger;
 mod node;
+mod scheduler;
 mod server;
 mod service_manifest;
 mod services;
@@ -77,11 +78,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         &args.name,
                         &args.image,
                         &args.command,
+                        args.cpu_millis,
+                        args.memory_bytes,
                     ))
                     .await?;
             }
             TasksCommand::Stop(args) => {
                 local.run_until(client::tasks::stop(&cfg, &args.id)).await?;
+            }
+        },
+
+        Command::Scheduler { cmd } => match cmd {
+            SchedulerCommand::Slots(args) => {
+                local
+                    .run_until(client::scheduler::slots(
+                        &cfg,
+                        args.peer_id.as_deref(),
+                        args.details,
+                    ))
+                    .await?;
             }
         },
 

@@ -6,6 +6,7 @@ using Node = import "node.capnp";
 using import "sync.capnp".Sync;
 using import "health.capnp".Health;
 using import "workload.capnp".Workload;
+using import "scheduling.capnp".Scheduler;
 
 interface Server {
   registerNode @0 (info :Node.NodeInfo, token :Text) -> (session :ClusterSession, ticket :Data, nodeInfo :Node.NodeInfo, credential :Data);
@@ -35,6 +36,7 @@ interface ClusterSession {
 
   ping @5 ();
   getWorkload @6 () -> (workload :Workload);
+  getScheduler @7 () -> (scheduler :Scheduler);
 }
 
 struct Capabilities {
@@ -44,4 +46,5 @@ struct Capabilities {
   sync @3 :Sync;
   health @4 :Health;
   workload @5 :Workload;
+  scheduler @6 :Scheduler;
 }

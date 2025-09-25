@@ -11,8 +11,9 @@ use tracing::error;
 use uuid::Uuid;
 
 use protocol::{
-    gossip::GossipClient, health::HealthClient, node::NodeClient, sync::SyncClient,
-    topology::TopologyClient, workload::WorkloadClient,
+    gossip::GossipClient, health::HealthClient, node::NodeClient,
+    scheduling::scheduler::Client as SchedulerClient, sync::SyncClient, topology::TopologyClient,
+    workload::WorkloadClient,
 };
 
 pub mod auth;
@@ -80,6 +81,7 @@ pub struct ServerClients {
     pub sync_client: SyncClient,
     pub node_client: NodeClient,
     pub workload_client: WorkloadClient,
+    pub scheduler_client: SchedulerClient,
 }
 
 #[derive(Clone)]
@@ -121,6 +123,7 @@ impl Server {
             self.clients.node_client.clone(),
             health_client,
             self.clients.workload_client.clone(),
+            self.clients.scheduler_client.clone(),
         );
 
         capnp_rpc::new_client(session)

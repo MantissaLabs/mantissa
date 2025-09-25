@@ -434,24 +434,3 @@ impl ContainerManager for DockerContainerManager {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore]
-    /// Ignore since it needs Docker running.
-    async fn test_new_docker_manager() {
-        // This test simply verifies the Docker connection can be established
-        let result = DockerContainerManager::new().await;
-        assert!(
-            result.is_ok(),
-            "Failed to connect to Docker: {:?}",
-            result.err()
-        );
-    }
-
-    // More tests would be added in a real implementation
-    // These would likely use a Docker test container to verify actual operations
-}

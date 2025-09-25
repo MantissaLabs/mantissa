@@ -610,16 +610,28 @@ impl Topology {
         }
 
         // Try to rebuild the handle via a fresh TCP connection when the capability is stale.
-        let Some(refreshed) = self.refresh_peer_handle(peer.id).await else {
-            return None;
-        };
+        let refreshed = self.refresh_peer_handle(peer.id).await?;
 
         self.session_for_strategy(&refreshed, peer.id, SessionStrategy::TicketThenCredential)
             .await
     }
 
+    pub async fn server_handle_for(&self, peer_id: Uuid) -> Option<server::Client> {
+        let guard = self.handles.read().await;
+        guard.get(&peer_id).cloned()
+    }
+
+    pub async fn scheduler_session_via_handle(
+        &self,
+        client: &server::Client,
+        peer_id: Uuid,
+    ) -> Option<cluster_session::Client> {
+        self.session_for_strategy(client, peer_id, SessionStrategy::TicketThenCredential)
+            .await
+    }
+
     // Replace a stale Server capability by dialing the peer's advertised address again.
-    async fn refresh_peer_handle(&self, peer_id: Uuid) -> Option<server::Client> {
+    pub async fn refresh_peer_handle(&self, peer_id: Uuid) -> Option<server::Client> {
         let peer = self.peer_latest_value(peer_id)?;
         let addr = peer.address.clone();
 

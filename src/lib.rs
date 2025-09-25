@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod gossip;
 pub mod logger;
 pub mod node;
+pub mod scheduler;
 pub mod server;
 pub mod service_manifest;
 pub mod services;

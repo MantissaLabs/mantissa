@@ -30,13 +30,25 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     }
 
     let mut tw = TabWriter::new(Vec::new());
-    writeln!(&mut tw, "ID\tNAME\tIMAGE\tCOMMAND\tNODE\tSTATUS\tCREATED")?;
+    writeln!(
+        &mut tw,
+        "ID\tNAME\tIMAGE\tSLOT\tCPU(m)\tMEM(MiB)\tCOMMAND\tNODE\tSTATUS\tCREATED"
+    )?;
 
     for spec in specs {
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            spec.id, spec.name, spec.image, spec.command, spec.node, spec.state, spec.created_at,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            spec.id,
+            spec.name,
+            spec.image,
+            spec.slot,
+            spec.cpu_millis,
+            spec.memory_mib,
+            spec.command,
+            spec.node,
+            spec.state,
+            spec.created_at,
         )?;
     }
 
@@ -51,6 +63,9 @@ struct WorkloadRow {
     id: String,
     name: String,
     image: String,
+    slot: String,
+    cpu_millis: u64,
+    memory_mib: u64,
     command: String,
     node: String,
     state: String,
@@ -66,6 +81,14 @@ impl WorkloadRow {
         let created_at = spec.get_created_at()?.to_str()?.to_string();
         let node_name = spec.get_node_name()?.to_str()?.to_string();
         let node_id = uuid_short(spec.get_node_id()?)?;
+        let slot_raw = spec.get_slot_id();
+        let slot = if slot_raw == 0 {
+            "-".to_string()
+        } else {
+            slot_raw.to_string()
+        };
+        let cpu_millis = spec.get_cpu_millis();
+        let memory_mib = spec.get_memory_bytes() / (1024 * 1024);
 
         let mut command = Vec::new();
         for arg in spec.get_command()?.iter() {
@@ -82,6 +105,9 @@ impl WorkloadRow {
             id,
             name,
             image,
+            slot,
+            cpu_millis,
+            memory_mib,
             command: if command.is_empty() {
                 "-".to_string()
             } else {

@@ -1,5 +1,5 @@
 use crate::workload::container::ContainerState;
-use crate::workload::manager::WorkloadManager;
+use crate::workload::manager::{ContainerStartRequest, WorkloadManager};
 use crate::workload::types::{WorkloadEvent, WorkloadSpec};
 use capnp::Error;
 use capnp::capability::Promise;
@@ -63,6 +63,9 @@ pub fn add_event(
             spec_builder.set_created_at("");
             spec_builder.set_node_id(&[0u8; 16]);
             spec_builder.set_node_name("");
+            spec_builder.set_slot_id(0);
+            spec_builder.set_cpu_millis(0);
+            spec_builder.set_memory_bytes(0);
             spec_builder.init_command(0);
         }
     }
@@ -97,6 +100,10 @@ pub fn write_spec(mut builder: workload_spec::Builder, spec: &WorkloadSpec) {
     for (idx, arg) in spec.command.iter().enumerate() {
         cmd_builder.set(idx as u32, arg);
     }
+
+    builder.set_slot_id(spec.slot_id.unwrap_or_default());
+    builder.set_cpu_millis(spec.cpu_millis);
+    builder.set_memory_bytes(spec.memory_bytes);
 }
 
 pub fn read_spec(reader: workload_spec::Reader) -> Result<WorkloadSpec, Error> {
@@ -118,6 +125,11 @@ pub fn read_spec(reader: workload_spec::Reader) -> Result<WorkloadSpec, Error> {
         command.push(arg?.to_str()?.to_string());
     }
 
+    let slot_id = reader.get_slot_id();
+    let slot_id = if slot_id == 0 { None } else { Some(slot_id) };
+    let cpu_millis = reader.get_cpu_millis();
+    let memory_bytes = reader.get_memory_bytes();
+
     Ok(WorkloadSpec {
         id,
         name,
@@ -127,6 +139,9 @@ pub fn read_spec(reader: workload_spec::Reader) -> Result<WorkloadSpec, Error> {
         command,
         node_id,
         node_name,
+        slot_id,
+        cpu_millis,
+        memory_bytes,
     })
 }
 
@@ -175,15 +190,63 @@ impl workload::Server for WorkloadService {
             for arg in req.get_command()?.iter() {
                 command.push(arg?.to_str()?.to_string());
             }
+            let cpu_millis = req.get_cpu_millis();
+            let memory_bytes = req.get_memory_bytes();
 
             let spec = manager
-                .start_container(name, image, command)
+                .start_container(name, image, command, cpu_millis, memory_bytes)
                 .await
                 .map_err(|e| Error::failed(e.to_string()))?;
 
             let mut out = results.get();
             let spec_builder = out.reborrow().init_spec();
             write_spec(spec_builder, &spec);
+            Ok(())
+        })
+    }
+
+    fn start_many(
+        &mut self,
+        params: workload::StartManyParams,
+        mut results: workload::StartManyResults,
+    ) -> Promise<(), Error> {
+        let manager = self.manager.clone();
+
+        Promise::from_future(async move {
+            let list = params.get()?.get_requests()?;
+            let mut requests = Vec::with_capacity(list.len() as usize);
+
+            for entry in list.iter() {
+                let name = entry.get_name()?.to_str()?.to_string();
+                let image = entry.get_image()?.to_str()?.to_string();
+                let cpu_millis = entry.get_cpu_millis();
+                let memory_bytes = entry.get_memory_bytes();
+
+                let mut command = Vec::new();
+                for arg in entry.get_command()?.iter() {
+                    command.push(arg?.to_str()?.to_string());
+                }
+
+                requests.push(ContainerStartRequest {
+                    name,
+                    image,
+                    command,
+                    cpu_millis,
+                    memory_bytes,
+                });
+            }
+
+            let specs = manager
+                .start_containers_batch(requests)
+                .await
+                .map_err(|e| Error::failed(e.to_string()))?;
+
+            let mut list_builder = results.get().init_specs(specs.len() as u32);
+            for (idx, spec) in specs.iter().enumerate() {
+                let builder = list_builder.reborrow().get(idx as u32);
+                write_spec(builder, spec);
+            }
+
             Ok(())
         })
     }
