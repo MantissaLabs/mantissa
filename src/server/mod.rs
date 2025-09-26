@@ -7,6 +7,7 @@ use ed25519_dalek::SigningKey;
 use net::noise::NoiseKeys;
 use protocol::server::cluster_session;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::error;
 use uuid::Uuid;
 
@@ -35,6 +36,7 @@ pub struct Server {
     config: Config,
     noise_keys: Arc<NoiseKeys>,
     signing_key: SigningKey,
+    online: Arc<AtomicBool>,
 }
 
 // How to run the listeners
@@ -109,6 +111,7 @@ impl Server {
             config,
             noise_keys,
             signing_key,
+            online: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -124,9 +127,26 @@ impl Server {
             health_client,
             self.clients.workload_client.clone(),
             self.clients.scheduler_client.clone(),
+            self.online.clone(),
         );
 
         capnp_rpc::new_client(session)
+    }
+
+    pub fn set_online(&self, online: bool) {
+        self.online.store(online, Ordering::SeqCst);
+    }
+
+    pub fn is_online(&self) -> bool {
+        self.online.load(Ordering::SeqCst)
+    }
+
+    fn ensure_online(&self) -> Result<(), capnp::Error> {
+        if self.is_online() {
+            Ok(())
+        } else {
+            Err(capnp::Error::failed("server offline".into()))
+        }
     }
 
     /// Internal helper: spawn TCP secure listener (and optionally Unix socket) without blocking.

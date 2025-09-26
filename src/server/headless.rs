@@ -456,6 +456,8 @@ impl HeadlessNode {
     /// - Inproc: unregister from registry.
     /// - TCP: abort the listener task.
     pub async fn stop(&mut self) -> io::Result<()> {
+        self.server.set_online(false);
+
         match &self.transport {
             HeadlessTransport::Inproc => {
                 #[cfg(any(test, feature = "testkit"))]
@@ -483,6 +485,7 @@ impl HeadlessNode {
                 {
                     net::inproc::register(self.id.to_string(), self.server_client.clone());
                 }
+                self.server.set_online(true);
                 Ok(())
             }
             HeadlessTransport::Tcp { addr } => {
@@ -495,6 +498,7 @@ impl HeadlessNode {
                 h.wait_ready().await;
                 *addr = h.addr().to_string();
                 self.handles = Some(h);
+                self.server.set_online(true);
                 Ok(())
             }
         }

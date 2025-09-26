@@ -17,6 +17,8 @@ impl protocol::server::Server for Server {
         let server = self.clone();
 
         Promise::from_future(async move {
+            server.ensure_online()?;
+
             let p = params.get()?;
             let info = p.get_info()?;
             let token = p.get_token()?.to_string()?;
@@ -137,6 +139,8 @@ impl protocol::server::Server for Server {
         let server = self.clone();
 
         Promise::from_future(async move {
+            server.ensure_online()?;
+
             let ticket = params.get()?.get_ticket()?;
             let Some(peer_id) = server
                 .stores
@@ -169,6 +173,8 @@ impl protocol::server::Server for Server {
         let server = self.clone();
 
         Promise::from_future(async move {
+            server.ensure_online()?;
+
             // Parse + Verify the signed blob
             let cred_bytes = params.get()?.get_credential()?;
             let cred =

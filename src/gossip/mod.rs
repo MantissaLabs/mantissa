@@ -35,6 +35,10 @@ pub trait GossipContext: PeerProvider {
         &self,
         peer: &PeerHandle,
     ) -> Result<Option<GossipClient>, capnp::Error>;
+
+    async fn invalidate_peer_capabilities(&self, peer: &PeerHandle) {
+        let _ = peer;
+    }
 }
 
 /// The Gossip action list
@@ -254,7 +258,13 @@ where
         }
     }
 
-    req.send().promise.await.map(|_| ())
+    match req.send().promise.await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            ctx.invalidate_peer_capabilities(peer).await;
+            Err(err)
+        }
+    }
 }
 
 // Return true when the gossip message is about the provided peer identifier.

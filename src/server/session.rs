@@ -3,6 +3,8 @@ use protocol::{
     gossip::gossip, health::health, node::node, scheduling::scheduler, server::cluster_session,
     sync::sync, topology::topology, workload::workload,
 };
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone)]
 pub struct ClusterSessionImpl {
@@ -13,6 +15,7 @@ pub struct ClusterSessionImpl {
     health: health::Client,
     workload: workload::Client,
     scheduler: scheduler::Client,
+    online: Arc<AtomicBool>,
 }
 
 impl ClusterSessionImpl {
@@ -24,6 +27,7 @@ impl ClusterSessionImpl {
         health: health::Client,
         workload: workload::Client,
         scheduler: scheduler::Client,
+        online: Arc<AtomicBool>,
     ) -> Self {
         Self {
             topology,
@@ -33,6 +37,15 @@ impl ClusterSessionImpl {
             health,
             workload,
             scheduler,
+            online,
+        }
+    }
+
+    fn ensure_online(&self) -> Result<(), capnp::Error> {
+        if self.online.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(capnp::Error::failed("server offline".into()))
         }
     }
 }
@@ -44,6 +57,10 @@ impl cluster_session::Server for ClusterSessionImpl {
         _params: cluster_session::GetCapabilitiesParams,
         mut results: cluster_session::GetCapabilitiesResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(e) = self.ensure_online() {
+            return Promise::err(e);
+        }
+
         let mut caps = results.get().init_caps();
 
         caps.set_gossip(self.gossip.clone());
@@ -61,6 +78,10 @@ impl cluster_session::Server for ClusterSessionImpl {
         _params: cluster_session::GetTopologyParams,
         mut results: cluster_session::GetTopologyResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(e) = self.ensure_online() {
+            return Promise::err(e);
+        }
+
         results.get().set_topology(self.topology.clone());
         Promise::ok(())
     }
@@ -70,6 +91,10 @@ impl cluster_session::Server for ClusterSessionImpl {
         _params: cluster_session::GetSyncParams,
         mut results: cluster_session::GetSyncResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(e) = self.ensure_online() {
+            return Promise::err(e);
+        }
+
         results.get().set_sync(self.sync.clone());
         Promise::ok(())
     }
@@ -79,6 +104,10 @@ impl cluster_session::Server for ClusterSessionImpl {
         _params: cluster_session::GetGossipParams,
         mut results: cluster_session::GetGossipResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(e) = self.ensure_online() {
+            return Promise::err(e);
+        }
+
         results.get().set_gossip(self.gossip.clone());
         Promise::ok(())
     }
@@ -88,6 +117,10 @@ impl cluster_session::Server for ClusterSessionImpl {
         _params: cluster_session::GetNodeParams,
         mut results: cluster_session::GetNodeResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(e) = self.ensure_online() {
+            return Promise::err(e);
+        }
+
         results.get().set_node(self.node.clone());
         Promise::ok(())
     }
@@ -97,6 +130,10 @@ impl cluster_session::Server for ClusterSessionImpl {
         _params: cluster_session::GetWorkloadParams,
         mut results: cluster_session::GetWorkloadResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(e) = self.ensure_online() {
+            return Promise::err(e);
+        }
+
         results.get().set_workload(self.workload.clone());
         Promise::ok(())
     }
@@ -106,6 +143,10 @@ impl cluster_session::Server for ClusterSessionImpl {
         _params: cluster_session::GetSchedulerParams,
         mut results: cluster_session::GetSchedulerResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(e) = self.ensure_online() {
+            return Promise::err(e);
+        }
+
         results.get().set_scheduler(self.scheduler.clone());
         Promise::ok(())
     }

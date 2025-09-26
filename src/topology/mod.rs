@@ -640,9 +640,11 @@ impl Topology {
                 }
                 Ok(Err(e)) => {
                     error!(target: "health", "ping failed for {addr}: {e}");
+                    self.registry.invalidate_peer_capabilities(peer_id).await;
                 }
                 Err(_) => {
                     error!(target: "health", "ping timed out for {addr}");
+                    self.registry.invalidate_peer_capabilities(peer_id).await;
                 }
             }
         }
@@ -674,5 +676,9 @@ impl GossipContext for Topology {
         peer: &PeerHandle,
     ) -> Result<Option<GossipClient>, capnp::Error> {
         self.registry.gossip_client_for(peer.id).await
+    }
+
+    async fn invalidate_peer_capabilities(&self, peer: &PeerHandle) {
+        self.registry.invalidate_peer_capabilities(peer.id).await;
     }
 }

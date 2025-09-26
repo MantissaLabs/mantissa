@@ -13,12 +13,49 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::error;
 use uuid::Uuid;
 
-/// Internal map storing server handles per peer.
-type HandleMap = Arc<RwLock<HashMap<Uuid, server::Client>>>;
+type PeerEntry = Arc<AsyncMutex<PeerState>>;
+type CapabilityMap = Arc<RwLock<HashMap<Uuid, PeerEntry>>>;
+
+#[derive(Default)]
+struct PeerState {
+    server: Option<server::Client>,
+    session: Option<cluster_session::Client>,
+    sync: Option<sync::Client>,
+    health: Option<health::health::Client>,
+    gossip: Option<GossipClient>,
+}
+
+impl PeerState {
+    fn clear_capabilities(&mut self) {
+        self.sync = None;
+        self.health = None;
+        self.gossip = None;
+    }
+
+    fn clear_session(&mut self) {
+        self.session = None;
+        self.clear_capabilities();
+    }
+
+    fn replace_server(&mut self, server: server::Client) {
+        self.server = Some(server);
+        self.clear_session();
+    }
+
+    fn replace_session(&mut self, session: cluster_session::Client) {
+        self.session = Some(session);
+        self.clear_capabilities();
+    }
+
+    fn clear_all(&mut self) {
+        self.server = None;
+        self.clear_session();
+    }
+}
 
 #[derive(Clone)]
 pub struct Registry {
-    handles: HandleMap,
+    cache: CapabilityMap,
     sessions: LocalSessionStore,
     peers: PeersStore,
     signing_key: Arc<AsyncMutex<SigningKey>>,
@@ -41,7 +78,7 @@ impl Registry {
         health_monitor: Arc<HealthMonitor>,
     ) -> Self {
         Self {
-            handles: Arc::new(RwLock::new(HashMap::new())),
+            cache: Arc::new(RwLock::new(HashMap::new())),
             sessions,
             peers,
             signing_key: Arc::new(AsyncMutex::new(signing_key)),
@@ -51,24 +88,40 @@ impl Registry {
     }
 
     pub async fn register_peer_handle(&self, id: Uuid, handle: server::Client) {
-        self.handles.write().await.insert(id, handle);
+        let entry = self.ensure_entry(id).await;
+        let mut state = entry.lock().await;
+        state.replace_server(handle);
     }
 
     pub async fn attach_handle_only(&self, id: Uuid, handle: server::Client) {
-        self.handles.write().await.insert(id, handle);
+        let entry = self.ensure_entry(id).await;
+        let mut state = entry.lock().await;
+        state.replace_server(handle);
     }
 
     pub async fn remove_peer(&self, id: Uuid) {
-        self.handles.write().await.remove(&id);
+        self.cache.write().await.remove(&id);
     }
 
     pub async fn clear(&self) {
-        self.handles.write().await.clear();
+        self.cache.write().await.clear();
+    }
+
+    /// Clears any cached capabilities for `peer_id`, forcing a full refresh on next access.
+    pub async fn invalidate_peer_capabilities(&self, peer_id: Uuid) {
+        if let Some(entry) = self.entry_if_present(peer_id).await {
+            self.invalidate_peer(peer_id, &entry).await;
+        }
     }
 
     pub async fn server_handle_for(&self, peer_id: Uuid) -> Option<server::Client> {
-        let guard = self.handles.read().await;
-        guard.get(&peer_id).cloned()
+        let entry = {
+            let guard = self.cache.read().await;
+            guard.get(&peer_id).cloned()
+        }?;
+
+        let state = entry.lock().await;
+        state.server.clone()
     }
 
     pub async fn refresh_peer_handle(&self, peer_id: Uuid) -> Option<server::Client> {
@@ -76,15 +129,11 @@ impl Registry {
 
         let addr = peer.address.clone();
 
-        {
-            let mut guard = self.handles.write().await;
-            guard.remove(&peer_id);
-        }
-
         match Self::connect_to_peer(&addr).await {
             Ok(client) => {
-                let mut guard = self.handles.write().await;
-                guard.insert(peer_id, client.clone());
+                let entry = self.ensure_entry(peer_id).await;
+                let mut state = entry.lock().await;
+                state.replace_server(client.clone());
                 Some(client)
             }
             Err(e) => {
@@ -95,18 +144,8 @@ impl Registry {
     }
 
     pub async fn session_for_peer(&self, peer_id: Uuid) -> Option<cluster_session::Client> {
-        if let Some(client) = self.server_handle_for(peer_id).await {
-            if let Some(session) = self
-                .session_for_strategy(&client, peer_id, SessionStrategy::TicketThenCredential)
-                .await
-            {
-                return Some(session);
-            }
-        }
-
-        let refreshed = self.refresh_peer_handle(peer_id).await?;
-
-        self.session_for_strategy(&refreshed, peer_id, SessionStrategy::TicketThenCredential)
+        let entry = self.ensure_entry(peer_id).await;
+        self.ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
             .await
     }
 
@@ -115,8 +154,18 @@ impl Registry {
         client: &server::Client,
         peer_id: Uuid,
     ) -> Option<cluster_session::Client> {
-        self.session_for_strategy(client, peer_id, SessionStrategy::TicketThenCredential)
-            .await
+        if let Some(entry) = self.entry_if_present(peer_id).await {
+            if let Some(session) = self.cached_session(&entry).await {
+                return Some(session);
+            }
+        }
+
+        let session = self
+            .session_for_strategy(client, peer_id, SessionStrategy::TicketThenCredential)
+            .await?;
+
+        self.store_session(peer_id, session.clone()).await;
+        Some(session)
     }
 
     pub async fn connect_known_peers(&self, allow_credentials: bool) -> Result<(), capnp::Error> {
@@ -138,7 +187,7 @@ impl Registry {
                 continue;
             }
 
-            if self.handles.read().await.contains_key(&peer_id) {
+            if self.server_handle_for(peer_id).await.is_some() {
                 continue;
             }
 
@@ -162,7 +211,8 @@ impl Registry {
                 continue;
             };
 
-            self.handles.write().await.insert(peer_id, client.clone());
+            self.register_peer_handle(peer_id, client.clone()).await;
+            self.store_session(peer_id, session.clone()).await;
 
             let _ = session.ping_request().send().promise.await.map(|_| {
                 self.health_monitor.observe_seen(peer_id);
@@ -215,6 +265,7 @@ impl Registry {
                         Ok(resp) => match resp.get().and_then(|r| r.get_session()) {
                             Ok(session) => {
                                 self.attach_handle_only(peer_id, client.clone()).await;
+                                self.store_session(peer_id, session.clone()).await;
                                 let _ = session.ping_request().send().promise.await.map(|_| {
                                     self.health_monitor.observe_seen(peer_id);
                                 });
@@ -237,49 +288,226 @@ impl Registry {
         &self,
         peer_id: Uuid,
     ) -> Result<Option<sync::Client>, capnp::Error> {
-        let Some(session) = self.session_for_peer(peer_id).await else {
+        let entry = self.ensure_entry(peer_id).await;
+
+        if let Some(sync_cap) = {
+            let state = entry.lock().await;
+            state.sync.clone()
+        } {
+            return Ok(Some(sync_cap));
+        }
+
+        let Some(session) = self
+            .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
+            .await
+        else {
             return Ok(None);
         };
 
-        let req = session.get_sync_request();
-        let resp = req.send().promise.await?;
-        let sync_cap = resp.get()?.get_sync()?;
-        Ok(Some(sync_cap))
+        match Self::fetch_sync_from_session(&session).await {
+            Ok(sync_cap) => {
+                let mut state = entry.lock().await;
+                state.sync = Some(sync_cap.clone());
+                Ok(Some(sync_cap))
+            }
+            Err(err) => {
+                self.invalidate_peer(peer_id, &entry).await;
+
+                let Some(session) = self
+                    .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
+                    .await
+                else {
+                    return Err(err);
+                };
+
+                let sync_cap = Self::fetch_sync_from_session(&session).await?;
+                let mut state = entry.lock().await;
+                state.sync = Some(sync_cap.clone());
+                Ok(Some(sync_cap))
+            }
+        }
     }
 
     pub async fn fetch_health_capability(
         &self,
         peer_id: Uuid,
     ) -> Result<Option<health::health::Client>, capnp::Error> {
-        let client = match self.refresh_peer_handle(peer_id).await {
-            Some(handle) => handle,
-            None => return Ok(None),
-        };
+        let entry = self.ensure_entry(peer_id).await;
+
+        if let Some(health_cap) = {
+            let state = entry.lock().await;
+            state.health.clone()
+        } {
+            return Ok(Some(health_cap));
+        }
 
         let Some(session) = self
-            .session_for_strategy(&client, peer_id, SessionStrategy::TicketThenCredential)
+            .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
             .await
         else {
             return Ok(None);
         };
 
-        let req = session.get_capabilities_request();
-        let resp = req.send().promise.await?;
-        let caps = resp.get()?.get_caps()?;
-        caps.get_health().map(Some)
+        match Self::fetch_health_from_session(&session).await {
+            Ok(health_cap) => {
+                let mut state = entry.lock().await;
+                state.health = Some(health_cap.clone());
+                Ok(Some(health_cap))
+            }
+            Err(err) => {
+                self.invalidate_peer(peer_id, &entry).await;
+
+                let Some(session) = self
+                    .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
+                    .await
+                else {
+                    return Err(err);
+                };
+
+                let health_cap = Self::fetch_health_from_session(&session).await?;
+                let mut state = entry.lock().await;
+                state.health = Some(health_cap.clone());
+                Ok(Some(health_cap))
+            }
+        }
     }
 
     pub async fn gossip_client_for(
         &self,
         peer_id: Uuid,
     ) -> Result<Option<GossipClient>, capnp::Error> {
-        let Some(session) = self.session_for_peer(peer_id).await else {
+        let entry = self.ensure_entry(peer_id).await;
+
+        if let Some(gossip_cap) = {
+            let state = entry.lock().await;
+            state.gossip.clone()
+        } {
+            return Ok(Some(gossip_cap));
+        }
+
+        let Some(session) = self
+            .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
+            .await
+        else {
             return Ok(None);
         };
 
+        match Self::fetch_gossip_from_session(&session).await {
+            Ok(gossip_cap) => {
+                let mut state = entry.lock().await;
+                state.gossip = Some(gossip_cap.clone());
+                Ok(Some(gossip_cap))
+            }
+            Err(err) => {
+                self.invalidate_peer(peer_id, &entry).await;
+
+                let Some(session) = self
+                    .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
+                    .await
+                else {
+                    return Err(err);
+                };
+
+                let gossip_cap = Self::fetch_gossip_from_session(&session).await?;
+                let mut state = entry.lock().await;
+                state.gossip = Some(gossip_cap.clone());
+                Ok(Some(gossip_cap))
+            }
+        }
+    }
+
+    /// Returns the cached capability entry for `peer_id` if one already exists.
+    async fn entry_if_present(&self, peer_id: Uuid) -> Option<PeerEntry> {
+        let guard = self.cache.read().await;
+        guard.get(&peer_id).cloned()
+    }
+
+    /// Ensures a capability entry exists for `peer_id`, creating one if necessary.
+    async fn ensure_entry(&self, peer_id: Uuid) -> PeerEntry {
+        let mut guard = self.cache.write().await;
+        guard
+            .entry(peer_id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(PeerState::default())))
+            .clone()
+    }
+
+    /// Returns the cached ClusterSession for the given peer entry, if present.
+    async fn cached_session(&self, entry: &PeerEntry) -> Option<cluster_session::Client> {
+        let state = entry.lock().await;
+        state.session.clone()
+    }
+
+    /// Stores a freshly obtained ClusterSession for `peer_id` and clears derived capability caches.
+    async fn store_session(&self, peer_id: Uuid, session: cluster_session::Client) {
+        let entry = self.ensure_entry(peer_id).await;
+        let mut state = entry.lock().await;
+        state.replace_session(session);
+    }
+
+    /// Guarantees a ClusterSession for `peer_id`, reconnecting as needed with the supplied strategy.
+    async fn ensure_session(
+        &self,
+        peer_id: Uuid,
+        entry: &PeerEntry,
+        strategy: SessionStrategy,
+    ) -> Option<cluster_session::Client> {
+        if let Some(session) = self.cached_session(entry).await {
+            return Some(session);
+        }
+
+        if let Some(server) = {
+            let state = entry.lock().await;
+            state.server.clone()
+        } {
+            if let Some(session) = self.session_for_strategy(&server, peer_id, strategy).await {
+                let mut state = entry.lock().await;
+                state.replace_session(session.clone());
+                return Some(session);
+            }
+        }
+
+        let refreshed = self.refresh_peer_handle(peer_id).await?;
+        let session = self
+            .session_for_strategy(&refreshed, peer_id, strategy)
+            .await?;
+
+        let mut state = entry.lock().await;
+        state.replace_session(session.clone());
+        Some(session)
+    }
+
+    /// Clears the cached capability tree for the peer so the next call rebuilds it from scratch.
+    async fn invalidate_peer(&self, _peer_id: Uuid, entry: &PeerEntry) {
+        let mut state = entry.lock().await;
+        state.clear_all();
+    }
+
+    /// Fetches the Sync capability from an existing session.
+    async fn fetch_sync_from_session(
+        session: &cluster_session::Client,
+    ) -> Result<sync::Client, capnp::Error> {
+        let req = session.get_sync_request();
+        let resp = req.send().promise.await?;
+        resp.get()?.get_sync()
+    }
+
+    /// Fetches the Health capability by expanding the session capabilities set.
+    async fn fetch_health_from_session(
+        session: &cluster_session::Client,
+    ) -> Result<health::health::Client, capnp::Error> {
+        let req = session.get_capabilities_request();
+        let resp = req.send().promise.await?;
+        let caps = resp.get()?.get_caps()?;
+        caps.get_health()
+    }
+
+    /// Fetches the Gossip capability from the cached session.
+    async fn fetch_gossip_from_session(
+        session: &cluster_session::Client,
+    ) -> Result<GossipClient, capnp::Error> {
         let req = session.get_gossip_request();
         let resp = req.send().promise.await?;
-        resp.get()?.get_gossip().map(Some)
+        resp.get()?.get_gossip()
     }
 
     async fn session_for_strategy(
