@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use capnp::capability::Promise;
 use protocol::scheduling::scheduler;
@@ -6,25 +6,17 @@ use uuid::Uuid;
 
 use super::Scheduler;
 use super::summary::SchedulerSummary;
-use crate::topology::Topology;
 
 pub struct SchedulerService {
-    scheduler: Arc<Scheduler>,
-    topology: Arc<Topology>,
+    scheduler: Rc<Scheduler>,
     node_id: Uuid,
     node_name: String,
 }
 
 impl SchedulerService {
-    pub fn new(
-        scheduler: Arc<Scheduler>,
-        topology: Arc<Topology>,
-        node_id: Uuid,
-        node_name: String,
-    ) -> Self {
+    pub fn new(scheduler: Rc<Scheduler>, node_id: Uuid, node_name: String) -> Self {
         Self {
             scheduler,
-            topology,
             node_id,
             node_name,
         }
@@ -38,7 +30,6 @@ impl scheduler::Server for SchedulerService {
         mut results: scheduler::SummaryResults,
     ) -> Promise<(), capnp::Error> {
         let scheduler = self.scheduler.clone();
-        let topology = self.topology.clone();
         let node_id = self.node_id;
         let node_name = self.node_name.clone();
 
@@ -59,7 +50,7 @@ impl scheduler::Server for SchedulerService {
 
             let summary = if let Some(peer_id) = target_peer {
                 scheduler
-                    .fetch_remote_summary(topology.as_ref(), peer_id, include_details)
+                    .fetch_remote_summary(peer_id, include_details)
                     .await?
             } else {
                 let snapshot = scheduler.snapshot().await;

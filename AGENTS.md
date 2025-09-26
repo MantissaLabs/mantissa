@@ -34,6 +34,9 @@ The system needs to be:
 - Naming: modules/files `snake_case`; types/traits `CamelCase`; functions `snake_case`; constants `SCREAMING_SNAKE_CASE`.
 - Errors: prefer `thiserror` for library errors and `anyhow::Result` at the application edges.
 - Logging: use `tracing` (`info!`, `warn!`, `debug!`); enable via `RUST_LOG=mantissa=debug`.
+- All methods need to have a header comment describing what it does and its role in a larger context.
+- Code needs to be well-structured and maintainable, following best practices for Rust programming.
+- Lines that are ambiguous need to be commented profusely to avoid later confusion.
 
 ## Testing Guidelines
 

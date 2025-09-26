@@ -11,6 +11,7 @@ use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
 use crdt_store::uuid_key::UuidKey;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -25,7 +26,7 @@ pub struct WorkloadManager {
     seen_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
     local_node_id: Uuid,
     local_node_name: String,
-    scheduler: Arc<Scheduler>,
+    scheduler: Rc<Scheduler>,
     container_manager: Arc<dyn ContainerManager + Send + Sync>,
     local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
 }
@@ -60,7 +61,7 @@ impl WorkloadManager {
         rx: Receiver<Message>,
         local_node_id: Uuid,
         local_node_name: impl Into<String>,
-        scheduler: Arc<Scheduler>,
+        scheduler: Rc<Scheduler>,
         container_manager: Arc<dyn ContainerManager + Send + Sync>,
     ) -> Self {
         Self {
@@ -626,12 +627,19 @@ fn value_to_spec(id: Uuid, value: WorkloadValue) -> WorkloadSpec {
 mod tests {
     use super::*;
 
+    use crate::registry::Registry;
     use crate::scheduler::SlotSpec;
+    use crate::store::local_session_store::LocalSessionStore;
+    use crate::store::peer_store::open_peers_store;
     use crate::store::scheduler_store::open_scheduler_store;
     use crate::store::workload_store::open_workload_store;
+    use ::health::{Config as HealthConfig, HealthMonitor};
     use async_channel::bounded;
     use async_trait::async_trait;
+    use ed25519_dalek::SigningKey;
+    use net::noise::NoiseKeys;
     use std::collections::HashMap;
+    use std::rc::Rc;
     use tempfile::tempdir;
 
     #[derive(Clone, Default)]
@@ -721,12 +729,39 @@ mod tests {
         (db, dir)
     }
 
-    async fn setup_manager() -> (WorkloadManager, Arc<Scheduler>, Arc<MockContainerManager>) {
+    async fn setup_manager() -> (WorkloadManager, Rc<Scheduler>, Arc<MockContainerManager>) {
         let actor = Uuid::new_v4();
         let (scheduler_db, _dir) = temp_db("scheduler");
         let scheduler_store =
             open_scheduler_store(scheduler_db.clone(), actor).expect("open scheduler store");
-        let scheduler = Arc::new(Scheduler::new(scheduler_store, actor).expect("scheduler init"));
+        scheduler_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild scheduler store");
+
+        let (registry_db, _reg_dir) = temp_db("registry");
+        let peers_store = open_peers_store(registry_db.clone(), actor).expect("open peers store");
+        peers_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild peers store");
+
+        let noise_keys = NoiseKeys::from_private_bytes([0x11; 32]);
+        let session_store =
+            LocalSessionStore::open(registry_db.clone(), &noise_keys).expect("open sessions");
+
+        let health_monitor = HealthMonitor::new(HealthConfig::default());
+
+        let registry = Registry::new(
+            peers_store,
+            session_store,
+            SigningKey::from_bytes(&[0xA5; 32]),
+            actor,
+            health_monitor,
+        );
+
+        let scheduler =
+            Rc::new(Scheduler::new(scheduler_store, registry, actor).expect("scheduler init"));
         scheduler
             .init_slots([
                 SlotSpec::new(0, SlotCapacity::new(1_000, 1_024 * 1_024 * 1_024)),

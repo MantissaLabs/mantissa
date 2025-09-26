@@ -1,5 +1,6 @@
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::{DEFAULT_FANOUT, Message};
+use crate::registry::Registry;
 use crate::scheduler::service::SchedulerService;
 use crate::scheduler::{Scheduler, SlotCapacity, SlotSpec};
 use crate::server::auth::AuthStore;
@@ -10,7 +11,7 @@ use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
-use crate::store::scheduler_store::open_scheduler_store;
+use crate::store::scheduler_store::{SchedulerStore, open_scheduler_store};
 use crate::store::workload_store::{WorkloadStore, open_workload_store};
 use crate::sync::SyncService;
 use crate::token::TokenStore;
@@ -27,6 +28,7 @@ use protocol::topology::topology::Client as TopologyClient;
 
 use async_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;
+use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -84,7 +86,7 @@ pub(crate) struct Stores {
     pub local_creds: LocalCredentialStore, // short-lived cluster creds
     pub token_store: TokenStore,           // join token rotator
     pub workloads: WorkloadStore,
-    pub scheduler: Arc<Scheduler>,
+    pub scheduler_store: SchedulerStore,
 }
 
 pub(crate) struct Components {
@@ -94,8 +96,10 @@ pub(crate) struct Components {
     pub sync_client: protocol::sync::sync::Client,
     pub health_monitor: std::sync::Arc<health::HealthMonitor>,
     pub workload_manager: WorkloadManager,
-    pub scheduler: Arc<Scheduler>,
+    pub scheduler: Rc<Scheduler>,
     pub scheduler_client: SchedulerClient,
+    #[allow(dead_code)]
+    pub registry: Registry,
 }
 
 impl Bootstrap {
@@ -229,18 +233,6 @@ impl Bootstrap {
 
         let scheduler_store = open_scheduler_store(ctx.db.clone(), ctx.self_id)?;
         scheduler_store.rebuild_mst_from_disk().await?;
-        let scheduler = Arc::new(
-            Scheduler::new(scheduler_store.clone(), ctx.self_id)
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?,
-        );
-
-        if scheduler.snapshot().await.is_none() {
-            let specs = Self::derive_slot_specs(&ctx.node);
-            scheduler
-                .init_slots(specs)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-        }
 
         Ok(Stores {
             peers,
@@ -249,7 +241,7 @@ impl Bootstrap {
             local_creds,
             token_store,
             workloads,
-            scheduler,
+            scheduler_store,
         })
     }
 
@@ -291,6 +283,31 @@ impl Bootstrap {
             signing_key: ctx.signing_key.clone(),
         };
 
+        let registry = Registry::new(
+            stores.peers.clone(),
+            stores.local_sessions.clone(),
+            ctx.signing_key.clone(),
+            ctx.self_id,
+            health_monitor.clone(),
+        );
+
+        let scheduler = Rc::new(
+            Scheduler::new(
+                stores.scheduler_store.clone(),
+                registry.clone(),
+                ctx.self_id,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?,
+        );
+
+        if scheduler.snapshot().await.is_none() {
+            let specs = Self::derive_slot_specs(&ctx.node);
+            scheduler
+                .init_slots(specs)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        }
+
         let topology = Topology::new(
             ctx.listen_addr.clone(),
             topology_rx,
@@ -298,6 +315,7 @@ impl Bootstrap {
             ctx.node.clone(),
             topology_stores.clone(),
             keys,
+            registry.clone(),
             health_monitor.clone(),
         )?;
 
@@ -326,18 +344,12 @@ impl Bootstrap {
             workload_rx,
             ctx.self_id,
             local_node_name.clone(),
-            stores.scheduler.clone(),
+            scheduler.clone(),
             container_manager,
         );
 
-        let topology_arc = Arc::new(topology.clone());
-
-        let scheduler_service = SchedulerService::new(
-            stores.scheduler.clone(),
-            topology_arc.clone(),
-            ctx.self_id,
-            local_node_name.clone(),
-        );
+        let scheduler_service =
+            SchedulerService::new(scheduler.clone(), ctx.self_id, local_node_name.clone());
         let scheduler_client_cap = capnp_rpc::new_client(scheduler_service);
 
         Ok((
@@ -348,8 +360,9 @@ impl Bootstrap {
                 sync_client,
                 health_monitor,
                 workload_manager,
-                scheduler: stores.scheduler.clone(),
+                scheduler,
                 scheduler_client: scheduler_client_cap,
+                registry,
             },
             gossip_rx,
         ))

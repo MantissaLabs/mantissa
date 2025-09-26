@@ -29,7 +29,6 @@ impl PeerProvider for Topology {
             }
         };
 
-        let handles_guard = self.handles.read().await;
         let mut out = Vec::with_capacity(actives.len());
 
         for (k, snap) in actives {
@@ -37,17 +36,14 @@ impl PeerProvider for Topology {
 
             // pick a deterministic representative from the MVReg snapshot
             if let Some(v) = snap.as_slice().last().cloned() {
-                if let Some(h) = handles_guard.get(&id) {
-                    out.push(PeerHandle {
-                        id,
-                        address: v.address,
-                        hostname: v.hostname,
-                        client: h.clone(),
-                        noise_static_pub: PublicKey::from(v.noise_static_pub),
-                        // TODO: wire real root hash when tracked
-                        root_hash: Default::default(),
-                    });
-                }
+                out.push(PeerHandle {
+                    id,
+                    address: v.address,
+                    hostname: v.hostname,
+                    noise_static_pub: PublicKey::from(v.noise_static_pub),
+                    // TODO: wire real root hash when tracked
+                    root_hash: Default::default(),
+                });
             }
         }
 

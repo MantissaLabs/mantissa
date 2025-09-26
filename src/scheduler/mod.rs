@@ -7,8 +7,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::registry::Registry;
 use crate::store::scheduler_store::SchedulerStore;
-use crate::topology::Topology;
 
 use self::summary::SchedulerSummary;
 
@@ -154,6 +154,7 @@ pub struct Scheduler {
     store: SchedulerStore,
     store_key: UuidKey,
     state: Arc<ArcSwapOption<SchedulerState>>, // stores Option<Arc<SchedulerState>>
+    registry: Registry,
 }
 
 fn ptr_eq_option(a: &Option<Arc<SchedulerState>>, b: &Option<Arc<SchedulerState>>) -> bool {
@@ -165,7 +166,11 @@ fn ptr_eq_option(a: &Option<Arc<SchedulerState>>, b: &Option<Arc<SchedulerState>
 }
 
 impl Scheduler {
-    pub fn new(store: SchedulerStore, resource_id: Uuid) -> Result<Self, SchedulerError> {
+    pub fn new(
+        store: SchedulerStore,
+        registry: Registry,
+        resource_id: Uuid,
+    ) -> Result<Self, SchedulerError> {
         let store_key = UuidKey::from(resource_id);
         let existing_snapshot = store
             .get_snapshot(&store_key)?
@@ -179,6 +184,7 @@ impl Scheduler {
             store,
             store_key,
             state,
+            registry,
         })
     }
 
@@ -367,12 +373,12 @@ impl Scheduler {
     }
 
     async fn fetch_remote_summary_via_handle(
-        topology: &Topology,
+        registry: &Registry,
         client: &protocol::server::Client,
         peer_id: Uuid,
         include_details: bool,
     ) -> Result<SchedulerSummary, capnp::Error> {
-        let session = topology
+        let session = registry
             .scheduler_session_via_handle(client, peer_id)
             .await
             .ok_or_else(|| {
@@ -404,26 +410,36 @@ impl Scheduler {
 
     pub async fn fetch_remote_summary(
         &self,
-        topology: &Topology,
         peer_id: Uuid,
         include_details: bool,
     ) -> Result<SchedulerSummary, capnp::Error> {
-        if peer_id == topology.self_id() {
+        let self_id = self.store_key.to_uuid();
+
+        if peer_id == self_id {
             return Err(capnp::Error::failed(
                 "peer id references local node for scheduler summary".into(),
             ));
         }
 
-        let mut client = match topology.server_handle_for(peer_id).await {
+        let mut client = match self.registry.server_handle_for(peer_id).await {
             Some(handle) => handle,
-            None => topology.refresh_peer_handle(peer_id).await.ok_or_else(|| {
-                capnp::Error::failed(format!("no handle available for peer {peer_id}"))
-            })?,
+            None => self
+                .registry
+                .refresh_peer_handle(peer_id)
+                .await
+                .ok_or_else(|| {
+                    capnp::Error::failed(format!("no handle available for peer {peer_id}"))
+                })?,
         };
 
         for attempt in 0..=1 {
-            match Self::fetch_remote_summary_via_handle(topology, &client, peer_id, include_details)
-                .await
+            match Self::fetch_remote_summary_via_handle(
+                &self.registry,
+                &client,
+                peer_id,
+                include_details,
+            )
+            .await
             {
                 Ok(summary) => return Ok(summary),
                 Err(err) => {
@@ -431,7 +447,7 @@ impl Scheduler {
                         return Err(err);
                     }
 
-                    client = match topology.refresh_peer_handle(peer_id).await {
+                    client = match self.registry.refresh_peer_handle(peer_id).await {
                         Some(new_client) => new_client,
                         None => return Err(err),
                     };
@@ -547,23 +563,56 @@ mod tests {
 
     use std::sync::Arc;
 
+    use crate::store::local_session_store::LocalSessionStore;
+    use crate::store::peer_store::open_peers_store;
     use crate::store::scheduler_store::open_scheduler_store;
+    use ::health::{Config as HealthConfig, HealthMonitor};
+    use ed25519_dalek::SigningKey;
+    use net::noise::NoiseKeys;
     use tempfile::tempdir;
 
-    fn make_scheduler() -> (Scheduler, tempfile::TempDir) {
+    async fn make_scheduler() -> (Scheduler, tempfile::TempDir) {
         let dir = tempdir().expect("tempdir");
         let db_path = dir
             .path()
             .join(format!("scheduler-test-{}.redb", Uuid::new_v4()));
         let db = Arc::new(redb::Database::create(db_path).expect("create db"));
-        let store = open_scheduler_store(db, Uuid::new_v4()).expect("open store");
-        let scheduler = Scheduler::new(store, Uuid::new_v4()).expect("scheduler init");
+        let actor = Uuid::new_v4();
+
+        let scheduler_store = open_scheduler_store(db.clone(), actor).expect("open store");
+        scheduler_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild scheduler store");
+
+        let peers_store = open_peers_store(db.clone(), actor).expect("open peers store");
+        peers_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild peers store");
+
+        let noise_keys = NoiseKeys::from_private_bytes([0x11; 32]);
+        let session_store =
+            LocalSessionStore::open(db.clone(), &noise_keys).expect("open local session store");
+
+        let health_monitor = HealthMonitor::new(HealthConfig::default());
+
+        let registry = Registry::new(
+            peers_store,
+            session_store,
+            SigningKey::from_bytes(&[0xA5; 32]),
+            actor,
+            health_monitor,
+        );
+
+        let scheduler = Scheduler::new(scheduler_store, registry, actor).expect("scheduler init");
+
         (scheduler, dir)
     }
 
     #[tokio::test]
     async fn init_slots_sets_free_state() {
-        let (scheduler, _dir) = make_scheduler();
+        let (scheduler, _dir) = make_scheduler().await;
         let snapshot = scheduler
             .init_slots([
                 SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024)),
@@ -591,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_slots_marks_slots() {
-        let (scheduler, _dir) = make_scheduler();
+        let (scheduler, _dir) = make_scheduler().await;
         scheduler
             .init_slots([
                 SlotSpec::new(10, SlotCapacity::new(1000, 1024 * 1024 * 1024)),
@@ -631,7 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_slots_conflict_returns_error() {
-        let (scheduler, _dir) = make_scheduler();
+        let (scheduler, _dir) = make_scheduler().await;
         scheduler
             .init_slots([SlotSpec::new(
                 1,
@@ -683,7 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn free_slots_releases_reservations() {
-        let (scheduler, _dir) = make_scheduler();
+        let (scheduler, _dir) = make_scheduler().await;
         scheduler
             .init_slots([SlotSpec::new(
                 5,
@@ -712,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn free_slots_unknown_slot_errors() {
-        let (scheduler, _dir) = make_scheduler();
+        let (scheduler, _dir) = make_scheduler().await;
         scheduler
             .init_slots([SlotSpec::new(
                 5,
@@ -732,7 +781,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_slots_version_mismatch() {
-        let (scheduler, _dir) = make_scheduler();
+        let (scheduler, _dir) = make_scheduler().await;
         scheduler
             .init_slots([
                 SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024)),

@@ -10,7 +10,6 @@ pub struct PeerHandle {
     pub hostname: String,
     pub address: String,
     pub root_hash: String,
-    pub client: server::Client,
     pub noise_static_pub: PublicKey,
 }
 

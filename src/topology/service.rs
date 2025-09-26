@@ -178,7 +178,7 @@ impl topology::Server for Topology {
                 return Err(capnp::Error::failed("cannot join own address".to_string()));
             }
 
-            let client = Topology::connect_to_peer(&inputs.anchor)
+            let client = client::connection::get_client_secure(&inputs.anchor)
                 .await
                 .map_err(|e| {
                     Error::failed(format!(
@@ -216,7 +216,11 @@ impl topology::Server for Topology {
 
             topology.attach_handle_only(peer_id, anchor_handle).await;
 
-            let sync_cap = Topology::fetch_sync_capability(&session).await?;
+            let sync_cap = {
+                let req = session.get_sync_request();
+                let resp = req.send().promise.await?;
+                resp.get()?.get_sync()?
+            };
 
             tokio::task::spawn_local({
                 let peers = peers.clone();
@@ -245,7 +249,7 @@ impl topology::Server for Topology {
 
         let self_id = self.node.id;
         let peers = self.peers.clone();
-        let handles_map = self.handles.clone();
+        let registry = self.registry.clone();
         let topology = self.clone();
 
         Promise::from_future(async move {
@@ -255,10 +259,7 @@ impl topology::Server for Topology {
                 .await
                 .map_err(|e| capnp::Error::failed(format!("leave: tombstone failed: {e}")))?;
 
-            {
-                let mut guard = handles_map.write().await;
-                guard.clear();
-            }
+            registry.clear().await;
 
             // Stop the loop so this node is quiescent and can rejoin elsewhere
             topology.stop_periodic_sync();

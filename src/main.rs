@@ -7,6 +7,7 @@ mod crypto;
 mod gossip;
 mod logger;
 mod node;
+mod registry;
 mod scheduler;
 mod server;
 mod store;
