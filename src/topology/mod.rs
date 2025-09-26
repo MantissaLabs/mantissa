@@ -67,10 +67,10 @@ pub struct Topology {
     node: Node,
 
     // Node event receiver, from gossiping or other components.
-    rx: Receiver<Message>,
+    gossip_receiver: Receiver<Message>,
 
     // Channel to push topology events to gossip for propagation.
-    tx: Sender<Message>,
+    gossip_sender: Sender<Message>,
 
     // Gossip events we've already processed (dedupe by id).
     seen_gossip_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
@@ -117,8 +117,8 @@ pub struct Topology {
 impl Topology {
     pub fn new(
         addr: String,
-        rx: Receiver<Message>,
-        tx: Sender<Message>,
+        gossip_receiver: Receiver<Message>,
+        gossip_sender: Sender<Message>,
         node: Node,
         stores: TopologyStores,
         crypto: Keys,
@@ -139,8 +139,8 @@ impl Topology {
 
         Ok(Self {
             addr,
-            rx,
-            tx,
+            gossip_receiver,
+            gossip_sender,
             peers,
             server_handle: std::rc::Rc::new(OnceCell::new()),
             registry,
@@ -170,7 +170,7 @@ impl Topology {
     }
 
     async fn send_gossip_message(&self, message: Message) -> Result<(), capnp::Error> {
-        self.tx
+        self.gossip_sender
             .send(message)
             .await
             .map_err(|e| capnp::Error::failed(format!("failed to queue gossip event: {e}")))
@@ -399,7 +399,7 @@ impl Topology {
     // The run loop receives incoming events from Gossip.
     pub async fn run(&mut self) {
         loop {
-            match self.rx.recv().await {
+            match self.gossip_receiver.recv().await {
                 Ok(Message::Void { .. }) => {
                     // Keepalive message; nothing to process for topology state.
                 }
