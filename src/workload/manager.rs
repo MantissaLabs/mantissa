@@ -546,6 +546,10 @@ impl WorkloadManager {
             ));
         }
 
+        if matches!(spec.state, ContainerState::Stopped) {
+            return Ok(spec);
+        }
+
         let identifier_entry = {
             let mut guard = self.local_containers.lock().await;
             guard.remove(&id)
@@ -555,6 +559,14 @@ impl WorkloadManager {
             Some(value) => (value, true),
             None => (format!("mantissa-{id}"), false),
         };
+
+        let mut updated = spec.clone();
+        if !matches!(spec.state, ContainerState::Stopping) {
+            updated.state = ContainerState::Stopping;
+            self.persist_spec(&updated).await?;
+            self.enqueue_gossip(WorkloadEvent::Upsert(updated.clone()))
+                .await?;
+        }
 
         match self
             .container_manager
@@ -568,7 +580,15 @@ impl WorkloadManager {
                     "container {container_identifier} not found while stopping workload {id}; cache_hit={from_cache}"
                 );
             }
-            Err(e) => return Err(anyhow::anyhow!("docker stop failed: {e}")),
+            Err(e) => {
+                updated.state = spec.state;
+                if updated.state != ContainerState::Stopping {
+                    self.persist_spec(&updated).await?;
+                    self.enqueue_gossip(WorkloadEvent::Upsert(updated.clone()))
+                        .await?;
+                }
+                return Err(anyhow::anyhow!("docker stop failed: {e}"));
+            }
         }
 
         if let Err(e) = self
@@ -588,7 +608,6 @@ impl WorkloadManager {
             }
         }
 
-        let mut updated = spec.clone();
         updated.state = ContainerState::Stopped;
         if let Some(slot_id) = spec.slot_id {
             self.release_slot(slot_id)
@@ -862,6 +881,7 @@ mod tests {
         let slot_id = spec.slot_id.expect("slot assigned");
         let stopped = manager.stop_workload(spec.id).await.expect("stop workload");
 
+        assert!(matches!(stopped.state, ContainerState::Stopped));
         let stopped_containers = mock_cm.stopped.lock().await.clone();
         assert_eq!(stopped_containers, vec!["container-0".to_string()]);
 
