@@ -460,8 +460,8 @@ impl Topology {
                         error!("Failed to forward gossip event: {e}");
                     }
                 }
-                Ok(Message::Workload { .. }) => {
-                    // Intentionally ignored: handled by the workload manager.
+                Ok(Message::Workload { .. }) | Ok(Message::Service { .. }) => {
+                    // Intentionally ignored: handled by dedicated managers.
                 }
                 Err(async_channel::RecvError) => {
                     debug!("topology channel closed!");

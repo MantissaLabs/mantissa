@@ -11,6 +11,7 @@ pub mod node;
 pub mod registry;
 pub mod scheduler;
 pub mod server;
+pub mod services;
 pub mod store;
 pub mod sync;
 pub mod token;

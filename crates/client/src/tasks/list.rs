@@ -7,36 +7,6 @@ use protocol::workload::{ContainerStateFilter, workload_spec};
 use std::io::Write;
 use tabwriter::TabWriter;
 
-/// Client-side representation of the selectable workload lifecycle states.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum TasksListState {
-    Pending,
-    Creating,
-    Running,
-    Paused,
-    Stopping,
-    Stopped,
-    Failed,
-    Exited,
-    Unknown,
-}
-
-impl From<TasksListState> for ContainerStateFilter {
-    fn from(value: TasksListState) -> Self {
-        match value {
-            TasksListState::Pending => ContainerStateFilter::Pending,
-            TasksListState::Creating => ContainerStateFilter::Creating,
-            TasksListState::Running => ContainerStateFilter::Running,
-            TasksListState::Paused => ContainerStateFilter::Paused,
-            TasksListState::Stopping => ContainerStateFilter::Stopping,
-            TasksListState::Stopped => ContainerStateFilter::Stopped,
-            TasksListState::Failed => ContainerStateFilter::Failed,
-            TasksListState::Exited => ContainerStateFilter::Exited,
-            TasksListState::Unknown => ContainerStateFilter::Unknown,
-        }
-    }
-}
-
 pub async fn list(cfg: &ClientConfig, states: &[TasksListState]) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
 
@@ -156,5 +126,35 @@ impl WorkloadRow {
             state,
             created_at,
         })
+    }
+}
+
+/// Client-side representation of the selectable workload lifecycle states.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TasksListState {
+    Pending,
+    Creating,
+    Running,
+    Paused,
+    Stopping,
+    Stopped,
+    Failed,
+    Exited,
+    Unknown,
+}
+
+impl From<TasksListState> for ContainerStateFilter {
+    fn from(value: TasksListState) -> Self {
+        match value {
+            TasksListState::Pending => ContainerStateFilter::Pending,
+            TasksListState::Creating => ContainerStateFilter::Creating,
+            TasksListState::Running => ContainerStateFilter::Running,
+            TasksListState::Paused => ContainerStateFilter::Paused,
+            TasksListState::Stopping => ContainerStateFilter::Stopping,
+            TasksListState::Stopped => ContainerStateFilter::Stopped,
+            TasksListState::Failed => ContainerStateFilter::Failed,
+            TasksListState::Exited => ContainerStateFilter::Exited,
+            TasksListState::Unknown => ContainerStateFilter::Unknown,
+        }
     }
 }

@@ -1,13 +1,15 @@
 use super::manifest::ServiceManifest;
 use super::run::{StartedWorkload, WorkloadStartParams, run_many};
+use super::state::register_manifest;
 use crate::config::ClientConfig;
 use anyhow::{Context, Result, anyhow};
 use std::io::Write;
 use tabwriter::TabWriter;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct ReplicaStart {
-    pub service_name: String,
+    pub task_name: String,
     pub replica_number: u16,
     pub workload: StartedWorkload,
 }
@@ -19,16 +21,12 @@ pub async fn deploy_manifest(
     let mut requests = Vec::new();
     let mut layout = Vec::new();
 
-    for service in &manifest.services {
-        let base_name = if let Some(prefix) = manifest.name.as_ref() {
-            format!("{prefix}-{}", service.name)
-        } else {
-            service.name.clone()
-        };
+    for task in &manifest.tasks {
+        let base_name = format!("{}-{}", manifest.name, task.name);
 
-        for replica_idx in 0..service.replicas {
+        for replica_idx in 0..task.replicas {
             let replica_number = replica_idx + 1;
-            let workload_name = if service.replicas > 1 {
+            let workload_name = if task.replicas > 1 {
                 format!("{base_name}-{replica_number}")
             } else {
                 base_name.clone()
@@ -36,12 +34,12 @@ pub async fn deploy_manifest(
 
             requests.push(WorkloadStartParams {
                 name: workload_name,
-                image: service.image.clone(),
-                command: service.command.clone(),
+                image: task.image.clone(),
+                command: task.command.clone(),
                 cpu_millis: 0,
                 memory_bytes: 0,
             });
-            layout.push((service.name.clone(), replica_number));
+            layout.push((task.name.clone(), replica_number));
         }
     }
 
@@ -61,15 +59,20 @@ pub async fn deploy_manifest(
         ));
     }
 
-    let replicas = workloads
+    let replicas: Vec<ReplicaStart> = workloads
         .into_iter()
         .zip(layout.into_iter())
-        .map(|(workload, (service_name, replica_number))| ReplicaStart {
-            service_name,
+        .map(|(workload, (task_name, replica_number))| ReplicaStart {
+            task_name,
             replica_number,
             workload,
         })
         .collect();
+
+    let manifest_id = Uuid::new_v4();
+    register_manifest(cfg, manifest, manifest_id, &replicas)
+        .await
+        .context("failed to register service manifest")?;
 
     Ok(replicas)
 }
@@ -81,8 +84,8 @@ pub fn render_summary(manifest: &ServiceManifest, replicas: &[ReplicaStart]) -> 
 
     let mut rows: Vec<&ReplicaStart> = replicas.iter().collect();
     rows.sort_by(|a, b| {
-        a.service_name
-            .cmp(&b.service_name)
+        a.task_name
+            .cmp(&b.task_name)
             .then_with(|| a.replica_number.cmp(&b.replica_number))
             .then_with(|| a.workload.name.cmp(&b.workload.name))
     });
@@ -90,7 +93,7 @@ pub fn render_summary(manifest: &ServiceManifest, replicas: &[ReplicaStart]) -> 
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "SERVICE\tREPLICA\tWORKLOAD\tID\tIMAGE\tCOMMAND\tNODE\tSTATUS"
+        "SERVICE\tTASK\tREPLICA\tWORKLOAD\tID\tIMAGE\tCOMMAND\tNODE\tSTATUS"
     )?;
 
     for row in rows {
@@ -102,8 +105,9 @@ pub fn render_summary(manifest: &ServiceManifest, replicas: &[ReplicaStart]) -> 
 
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            row.service_name,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            manifest.name,
+            row.task_name,
             row.replica_number,
             row.workload.name,
             row.workload.id,
@@ -118,11 +122,7 @@ pub fn render_summary(manifest: &ServiceManifest, replicas: &[ReplicaStart]) -> 
     let output = String::from_utf8(tw.into_inner()?)?;
 
     let mut summary = String::new();
-    if let Some(name) = manifest.name.as_ref() {
-        summary.push_str(&format!("manifest '{name}' deployed\n"));
-    } else {
-        summary.push_str("service manifest deployed\n");
-    }
+    summary.push_str(&format!("service '{}' deployed\n", manifest.name));
     summary.push_str(&output);
 
     Ok(summary)

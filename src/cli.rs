@@ -281,6 +281,13 @@ pub enum ServicesCommand {
     /// Deploy a service manifest from a RON description
     #[command(alias = "apply")]
     Run(ServicesRunArgs),
+
+    /// List desired services and their configuration
+    #[command(alias = "ls")]
+    List(ServicesListArgs),
+
+    /// Stop a service and all associated workloads
+    Stop(ServicesStopArgs),
 }
 
 #[derive(Args, Debug)]
@@ -288,6 +295,16 @@ pub struct ServicesRunArgs {
     /// Path to the RON manifest describing the services to deploy
     #[arg(index = 1, value_name = "MANIFEST")]
     pub manifest: PathBuf,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct ServicesListArgs {}
+
+#[derive(Args, Debug)]
+pub struct ServicesStopArgs {
+    /// Service ID (UUID)
+    #[arg(index = 1, value_name = "ID")]
+    pub id: String,
 }
 
 #[derive(Args, Debug)]

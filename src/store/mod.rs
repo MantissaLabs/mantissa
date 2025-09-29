@@ -5,4 +5,5 @@ pub mod local_token_store;
 pub mod path;
 pub mod peer_store;
 pub mod scheduler_store;
+pub mod service_store;
 pub mod workload_store;

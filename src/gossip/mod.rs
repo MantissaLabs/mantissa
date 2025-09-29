@@ -5,6 +5,8 @@
 //! other nodes in the cluster based on events and updates to be applied.
 //!
 
+use crate::services::service::{read_service_event, write_service_event};
+use crate::services::types::ServiceEvent;
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
@@ -54,15 +56,17 @@ pub enum Message {
     Void { id: Uuid },
     Topology { id: Uuid, event: TopologyEvent },
     Workload { id: Uuid, event: WorkloadEvent },
+    Service { id: Uuid, event: ServiceEvent },
     // Scheduling(SchedulingEvent),
 }
 
 impl Message {
     pub fn id(&self) -> Uuid {
         match self {
-            Message::Void { id } | Message::Topology { id, .. } | Message::Workload { id, .. } => {
-                *id
-            }
+            Message::Void { id }
+            | Message::Topology { id, .. }
+            | Message::Workload { id, .. }
+            | Message::Service { id, .. } => *id,
         }
     }
 }
@@ -77,6 +81,7 @@ pub struct Gossip {
 pub struct Channels {
     pub topology_events: Sender<Message>,
     pub workload_events: Sender<Message>,
+    pub service_events: Sender<Message>,
     // scheduling_events: Sender<SchedulingEvent>,
 }
 
@@ -94,6 +99,7 @@ impl gossip::Server for Gossip {
     ) -> Promise<(), Error> {
         let topo_tx = self.chans.topology_events.clone();
         let workload_tx = self.chans.workload_events.clone();
+        let service_tx = self.chans.service_events.clone();
 
         Promise::from_future(async move {
             let msgs = params.get().unwrap().get_messages();
@@ -147,6 +153,20 @@ impl gossip::Server for Gossip {
                     },
                     Workload(Err(e)) => {
                         eprintln!("Error reading workload: {e}");
+                    }
+                    Service(Ok(reader)) => match read_service_event(reader) {
+                        Ok(event) => {
+                            let message = Message::Service { id, event };
+                            service_tx.send(message).await.map_err(|e| {
+                                capnp::Error::failed(format!(
+                                    "Couldn't send event to services: {e}"
+                                ))
+                            })?;
+                        }
+                        Err(e) => eprintln!("Failed to convert service event: {e}"),
+                    },
+                    Service(Err(e)) => {
+                        eprintln!("Error reading service: {e}");
                     }
                 }
             }
@@ -255,6 +275,10 @@ where
             Message::Workload { event, .. } => {
                 workload_service::add_event(&mut msgs, idx as u32, event);
             }
+            Message::Service { event, .. } => {
+                let service_builder = builder.init_service();
+                write_service_event(service_builder, event)?;
+            }
         }
     }
 
@@ -278,6 +302,7 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
         },
         // Workload updates replicate to every peer regardless of assignment so keep them.
         Message::Workload { .. } => false,
+        Message::Service { .. } => false,
     }
 }
 

@@ -10,6 +10,7 @@ mod node;
 mod registry;
 mod scheduler;
 mod server;
+mod services;
 mod store;
 mod sync;
 mod token;
@@ -108,6 +109,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .await?;
                 let summary = client::services::render_summary(&manifest, &deployments)?;
                 println!("{summary}");
+            }
+            ServicesCommand::List(_) => {
+                local.run_until(client::services::list(&cfg)).await?;
+            }
+            ServicesCommand::Stop(args) => {
+                local
+                    .run_until(client::services::stop(&cfg, &args.id))
+                    .await?;
             }
         },
 

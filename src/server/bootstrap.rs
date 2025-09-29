@@ -6,12 +6,14 @@ use crate::scheduler::{Scheduler, SlotCapacity, SlotSpec};
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerStores};
+use crate::services::{ServiceManager, ServiceRegistry, ServicesService};
 use crate::store::local::load_or_create_node_id;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
 use crate::store::scheduler_store::{SchedulerStore, open_scheduler_store};
+use crate::store::service_store::{ServiceStore, open_service_store};
 use crate::store::workload_store::{WorkloadStore, open_workload_store};
 use crate::sync::SyncService;
 use crate::token::TokenStore;
@@ -24,6 +26,7 @@ use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path}
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::scheduling::scheduler::Client as SchedulerClient;
 use protocol::server::server::Client as ServerClient;
+use protocol::services::services::Client as ServicesClient;
 use protocol::topology::topology::Client as TopologyClient;
 
 use async_channel::{Receiver, Sender};
@@ -87,6 +90,7 @@ pub(crate) struct Stores {
     pub token_store: TokenStore,           // join token rotator
     pub workloads: WorkloadStore,
     pub scheduler_store: SchedulerStore,
+    pub services: ServiceStore,
 }
 
 pub(crate) struct Components {
@@ -96,10 +100,12 @@ pub(crate) struct Components {
     pub sync_client: protocol::sync::sync::Client,
     pub health_monitor: std::sync::Arc<health::HealthMonitor>,
     pub workload_manager: WorkloadManager,
+    pub service_manager: ServiceManager,
     pub scheduler: Rc<Scheduler>,
     pub scheduler_client: SchedulerClient,
     #[allow(dead_code)]
     pub registry: Registry,
+    pub services_client: ServicesClient,
 }
 
 impl Bootstrap {
@@ -234,6 +240,9 @@ impl Bootstrap {
         let scheduler_store = open_scheduler_store(ctx.db.clone(), ctx.self_id)?;
         scheduler_store.rebuild_mst_from_disk().await?;
 
+        let services = open_service_store(ctx.db.clone(), ctx.self_id)?;
+        services.rebuild_mst_from_disk().await?;
+
         Ok(Stores {
             peers,
             session_auth,
@@ -242,6 +251,7 @@ impl Bootstrap {
             token_store,
             workloads,
             scheduler_store,
+            services,
         })
     }
 
@@ -256,12 +266,15 @@ impl Bootstrap {
         let (topology_tx, topology_rx) = async_channel::bounded(128);
         let (workload_tx, workload_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(128);
+        let (service_tx, service_rx): (Sender<Message>, Receiver<Message>) =
+            async_channel::bounded(128);
 
         // gossip capability
         let gossip = crate::gossip::Gossip {
             chans: crate::gossip::Channels {
                 topology_events: topology_tx.clone(),
                 workload_events: workload_tx.clone(),
+                service_events: service_tx.clone(),
             },
         };
         let gossip_client = capnp_rpc::new_client(gossip);
@@ -348,6 +361,16 @@ impl Bootstrap {
             container_manager,
         );
 
+        let service_registry = ServiceRegistry::new(stores.services.clone());
+        let service_manager = ServiceManager::new(
+            service_registry.clone(),
+            workload_manager.clone(),
+            gossip_tx.clone(),
+            service_rx,
+        );
+        let services_service = ServicesService::new(service_manager.clone());
+        let services_client_cap = capnp_rpc::new_client(services_service);
+
         let scheduler_service =
             SchedulerService::new(scheduler.clone(), ctx.self_id, local_node_name.clone());
         let scheduler_client_cap = capnp_rpc::new_client(scheduler_service);
@@ -360,9 +383,11 @@ impl Bootstrap {
                 sync_client,
                 health_monitor,
                 workload_manager,
+                service_manager,
                 scheduler,
                 scheduler_client: scheduler_client_cap,
                 registry,
+                services_client: services_client_cap,
             },
             gossip_rx,
         ))
@@ -384,6 +409,7 @@ impl Bootstrap {
             node_client: ctx.node_client.clone(),
             workload_client,
             scheduler_client: comps.scheduler_client.clone(),
+            services_client: comps.services_client.clone(),
         };
 
         let stores_bundle = ServerStores {
@@ -454,6 +480,11 @@ impl Bootstrap {
         let mut workload_runner = comps.workload_manager.clone();
         tokio::task::spawn_local(async move {
             workload_runner.run().await;
+        });
+
+        let mut service_runner = comps.service_manager.clone();
+        tokio::task::spawn_local(async move {
+            service_runner.run().await;
         });
 
         // Spawn gossip loop

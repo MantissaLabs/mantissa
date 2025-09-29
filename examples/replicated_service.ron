@@ -1,6 +1,6 @@
 (
-    name: Some("demo-service"),
-    services: [
+    name: "demo-service",
+    tasks: [
         (
             name: "echo",
             image: "alpine:3.20",

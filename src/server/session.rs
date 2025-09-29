@@ -1,7 +1,7 @@
 use capnp::capability::Promise;
 use protocol::{
     gossip::gossip, health::health, node::node, scheduling::scheduler, server::cluster_session,
-    sync::sync, topology::topology, workload::workload,
+    services::services, sync::sync, topology::topology, workload::workload,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +15,7 @@ pub struct ClusterSessionImpl {
     health: health::Client,
     workload: workload::Client,
     scheduler: scheduler::Client,
+    services: services::Client,
     online: Arc<AtomicBool>,
 }
 
@@ -27,6 +28,7 @@ impl ClusterSessionImpl {
         health: health::Client,
         workload: workload::Client,
         scheduler: scheduler::Client,
+        services: services::Client,
         online: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -37,6 +39,7 @@ impl ClusterSessionImpl {
             health,
             workload,
             scheduler,
+            services,
             online,
         }
     }
@@ -69,6 +72,7 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_health(self.health.clone());
         caps.set_workload(self.workload.clone());
         caps.set_scheduler(self.scheduler.clone());
+        caps.set_services(self.services.clone());
 
         Promise::ok(())
     }
@@ -148,6 +152,19 @@ impl cluster_session::Server for ClusterSessionImpl {
         }
 
         results.get().set_scheduler(self.scheduler.clone());
+        Promise::ok(())
+    }
+
+    fn get_services(
+        &mut self,
+        _params: cluster_session::GetServicesParams,
+        mut results: cluster_session::GetServicesResults,
+    ) -> Promise<(), capnp::Error> {
+        if let Err(e) = self.ensure_online() {
+            return Promise::err(e);
+        }
+
+        results.get().set_services(self.services.clone());
         Promise::ok(())
     }
 }

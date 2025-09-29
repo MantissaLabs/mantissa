@@ -5,9 +5,7 @@ use crate::scheduler::{
 use crate::store::workload_store::WorkloadStore;
 use crate::workload::container::ContainerState;
 use crate::workload::docker::{ContainerError, ContainerManager};
-use crate::workload::types::{
-    WorkloadEvent, WorkloadSpec, WorkloadStateFilter, WorkloadStateKind, WorkloadValue,
-};
+use crate::workload::types::{WorkloadEvent, WorkloadSpec, WorkloadStateFilter, WorkloadValue};
 use anyhow::Context;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
@@ -685,6 +683,7 @@ mod tests {
     use crate::store::peer_store::open_peers_store;
     use crate::store::scheduler_store::open_scheduler_store;
     use crate::store::workload_store::open_workload_store;
+    use crate::workload::types::WorkloadStateKind;
     use ::health::{Config as HealthConfig, HealthMonitor};
     use async_channel::bounded;
     use async_trait::async_trait;

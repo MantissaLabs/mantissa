@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use protocol::{
     gossip::GossipClient, health::HealthClient, node::NodeClient,
-    scheduling::scheduler::Client as SchedulerClient, sync::SyncClient, topology::TopologyClient,
-    workload::WorkloadClient,
+    scheduling::scheduler::Client as SchedulerClient, services::ServicesClient, sync::SyncClient,
+    topology::TopologyClient, workload::WorkloadClient,
 };
 
 pub mod auth;
@@ -84,6 +84,7 @@ pub struct ServerClients {
     pub node_client: NodeClient,
     pub workload_client: WorkloadClient,
     pub scheduler_client: SchedulerClient,
+    pub services_client: ServicesClient,
 }
 
 #[derive(Clone)]
@@ -127,6 +128,7 @@ impl Server {
             health_client,
             self.clients.workload_client.clone(),
             self.clients.scheduler_client.clone(),
+            self.clients.services_client.clone(),
             self.online.clone(),
         );
 

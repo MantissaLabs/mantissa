@@ -5,14 +5,13 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct ServiceManifest {
+    pub name: String,
     #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub services: Vec<ServiceSpec>,
+    pub tasks: Vec<TaskSpec>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct ServiceSpec {
+pub struct TaskSpec {
     pub name: String,
     pub image: String,
     #[serde(default)]
@@ -23,26 +22,30 @@ pub struct ServiceSpec {
 
 impl ServiceManifest {
     pub fn validate(&self) -> Result<()> {
-        if self.services.is_empty() {
-            return Err(anyhow!("service manifest must define at least one service"));
+        if self.name.trim().is_empty() {
+            return Err(anyhow!("service manifest must set a non-empty name"));
         }
 
-        for service in &self.services {
-            if service.name.trim().is_empty() {
-                return Err(anyhow!("service name cannot be empty"));
+        if self.tasks.is_empty() {
+            return Err(anyhow!("service manifest must define at least one task"));
+        }
+
+        for task in &self.tasks {
+            if task.name.trim().is_empty() {
+                return Err(anyhow!("task name cannot be empty"));
             }
 
-            if service.image.trim().is_empty() {
+            if task.image.trim().is_empty() {
                 return Err(anyhow!(
-                    "service '{}' must specify a container image",
-                    service.name
+                    "task '{}' must specify a container image",
+                    task.name
                 ));
             }
 
-            if service.replicas == 0 {
+            if task.replicas == 0 {
                 return Err(anyhow!(
-                    "service '{}' must request at least one replica",
-                    service.name
+                    "task '{}' must request at least one replica",
+                    task.name
                 ));
             }
         }
