@@ -5,7 +5,9 @@ use crate::scheduler::{
 use crate::store::workload_store::WorkloadStore;
 use crate::workload::container::ContainerState;
 use crate::workload::docker::{ContainerError, ContainerManager};
-use crate::workload::types::{WorkloadEvent, WorkloadSpec, WorkloadValue};
+use crate::workload::types::{
+    WorkloadEvent, WorkloadSpec, WorkloadStateFilter, WorkloadStateKind, WorkloadValue,
+};
 use anyhow::Context;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
@@ -452,7 +454,11 @@ impl WorkloadManager {
         }
     }
 
-    pub async fn list_containers(&self) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
+    /// Returns workload specifications filtered according to the provided list policy.
+    pub async fn list_containers(
+        &self,
+        filter: &WorkloadStateFilter,
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         let (actives, _) = self
             .store
             .load_all()
@@ -462,7 +468,10 @@ impl WorkloadManager {
         for (k, snap) in actives {
             let id = k.to_uuid();
             if let Some(value) = snap.as_slice().last() {
-                specs.push(value_to_spec(id, value.clone()));
+                let spec = value_to_spec(id, value.clone());
+                if filter.accepts(&spec.state) {
+                    specs.push(spec);
+                }
             }
         }
         Ok(specs)
@@ -894,6 +903,57 @@ mod tests {
         let expected = format!("mantissa-{}", spec.id);
         let stopped_containers = mock_cm.stopped.lock().await.clone();
         assert_eq!(stopped_containers, vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn list_containers_respects_filters() {
+        let (manager, _scheduler, _mock_cm) = setup_manager().await;
+
+        let spec = manager
+            .start_container("svc", "image", vec![], 500, 256 * 1_024 * 1_024)
+            .await
+            .expect("start container");
+
+        let active = manager
+            .list_containers(&WorkloadStateFilter::active_only())
+            .await
+            .expect("list active");
+        assert_eq!(active.len(), 1);
+        assert!(matches!(active[0].state, ContainerState::Running));
+
+        manager.stop_workload(spec.id).await.expect("stop workload");
+
+        let active_only = manager
+            .list_containers(&WorkloadStateFilter::active_only())
+            .await
+            .expect("list active after stop");
+        assert!(active_only.is_empty());
+
+        let with_stopped = manager
+            .list_containers(&WorkloadStateFilter::new([
+                WorkloadStateKind::Pending,
+                WorkloadStateKind::Creating,
+                WorkloadStateKind::Running,
+                WorkloadStateKind::Stopping,
+                WorkloadStateKind::Stopped,
+            ]))
+            .await
+            .expect("list active with stopped");
+        assert_eq!(with_stopped.len(), 1);
+        assert!(matches!(with_stopped[0].state, ContainerState::Stopped));
+
+        let all = manager
+            .list_containers(&WorkloadStateFilter::all())
+            .await
+            .expect("list all");
+
+        let only_stopped = manager
+            .list_containers(&WorkloadStateFilter::new([WorkloadStateKind::Stopped]))
+            .await
+            .expect("list stopped only");
+        assert_eq!(only_stopped.len(), 1);
+        assert!(matches!(only_stopped[0].state, ContainerState::Stopped));
+        assert_eq!(all.len(), 1);
     }
 
     #[tokio::test]

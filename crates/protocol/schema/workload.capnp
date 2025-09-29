@@ -26,6 +26,22 @@ struct StopRequest {
   id @0 :Data;
 }
 
+struct ListRequest {
+  states @0 :List(ContainerStateFilter);
+}
+
+enum ContainerStateFilter {
+  pending @0;
+  creating @1;
+  running @2;
+  stopping @3;
+  paused @4;
+  stopped @5;
+  failed @6;
+  exited @7;
+  unknown @8;
+}
+
 struct WorkloadEvent {
   event @0 :EventType;
   spec @1 :WorkloadSpec;
@@ -38,7 +54,7 @@ struct WorkloadEvent {
 
 interface Workload {
   start @0 (request :StartRequest) -> (spec :WorkloadSpec);
-  list @1 () -> (workloads :List(WorkloadSpec));
+  list @1 (request :ListRequest) -> (workloads :List(WorkloadSpec));
   stop @2 (request :StopRequest) -> (spec :WorkloadSpec);
   startMany @3 (requests :List(StartRequest)) -> (specs :List(WorkloadSpec));
 }

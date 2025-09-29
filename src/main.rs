@@ -65,8 +65,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
 
         Command::Tasks { cmd } => match cmd {
-            TasksCommand::List(_) => {
-                local.run_until(client::tasks::list(&cfg)).await?;
+            TasksCommand::List(args) => {
+                cfg.cluster = args.cluster.clone();
+                let states: Vec<client::tasks::TasksListState> =
+                    args.states.iter().copied().map(Into::into).collect();
+                local.run_until(client::tasks::list(&cfg, &states)).await?;
             }
             TasksCommand::Start(args) => {
                 local

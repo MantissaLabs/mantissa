@@ -3,16 +3,55 @@ use crate::connection;
 use crate::tasks::{uuid_short, uuid_to_string};
 use anyhow::Result;
 use capnp::Error as CapnpError;
-use protocol::workload::workload_spec;
+use protocol::workload::{ContainerStateFilter, workload_spec};
 use std::io::Write;
 use tabwriter::TabWriter;
 
-pub async fn list(cfg: &ClientConfig) -> Result<()> {
+/// Client-side representation of the selectable workload lifecycle states.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TasksListState {
+    Pending,
+    Creating,
+    Running,
+    Paused,
+    Stopping,
+    Stopped,
+    Failed,
+    Exited,
+    Unknown,
+}
+
+impl From<TasksListState> for ContainerStateFilter {
+    fn from(value: TasksListState) -> Self {
+        match value {
+            TasksListState::Pending => ContainerStateFilter::Pending,
+            TasksListState::Creating => ContainerStateFilter::Creating,
+            TasksListState::Running => ContainerStateFilter::Running,
+            TasksListState::Paused => ContainerStateFilter::Paused,
+            TasksListState::Stopping => ContainerStateFilter::Stopping,
+            TasksListState::Stopped => ContainerStateFilter::Stopped,
+            TasksListState::Failed => ContainerStateFilter::Failed,
+            TasksListState::Exited => ContainerStateFilter::Exited,
+            TasksListState::Unknown => ContainerStateFilter::Unknown,
+        }
+    }
+}
+
+pub async fn list(cfg: &ClientConfig, states: &[TasksListState]) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_workload_request();
     let workload = request.send().pipeline.get_workload();
-    let request = workload.list_request();
+    let mut request = workload.list_request();
+    {
+        let mut builder = request.get().init_request();
+        if !states.is_empty() {
+            let mut state_builder = builder.reborrow().init_states(states.len() as u32);
+            for (idx, state) in states.iter().enumerate() {
+                state_builder.set(idx as u32, (*state).into());
+            }
+        }
+    }
 
     let response = request.send().promise.await?;
     let workloads = response.get()?.get_workloads()?;

@@ -1,5 +1,6 @@
 // src/cli.rs
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use client::tasks::TasksListState;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -182,6 +183,15 @@ pub struct TasksListArgs {
     /// The cluster to list tasks for
     #[arg(index = 1)]
     pub cluster: Option<String>,
+
+    /// Filter workloads by lifecycle state (repeat flag to combine)
+    #[arg(
+        long = "state",
+        value_enum,
+        action = ArgAction::Append,
+        value_name = "STATE"
+    )]
+    pub states: Vec<TasksListStateOpt>,
 }
 
 #[derive(Args, Debug)]
@@ -216,6 +226,36 @@ pub struct TasksStopArgs {
     /// Workload ID to stop (UUID)
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
+}
+
+/// CLI representation of workload lifecycle states.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum TasksListStateOpt {
+    Pending,
+    Creating,
+    Running,
+    Paused,
+    Stopping,
+    Stopped,
+    Failed,
+    Exited,
+    Unknown,
+}
+
+impl From<TasksListStateOpt> for TasksListState {
+    fn from(value: TasksListStateOpt) -> Self {
+        match value {
+            TasksListStateOpt::Pending => TasksListState::Pending,
+            TasksListStateOpt::Creating => TasksListState::Creating,
+            TasksListStateOpt::Running => TasksListState::Running,
+            TasksListStateOpt::Paused => TasksListState::Paused,
+            TasksListStateOpt::Stopping => TasksListState::Stopping,
+            TasksListStateOpt::Stopped => TasksListState::Stopped,
+            TasksListStateOpt::Failed => TasksListState::Failed,
+            TasksListStateOpt::Exited => TasksListState::Exited,
+            TasksListStateOpt::Unknown => TasksListState::Unknown,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]

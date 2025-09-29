@@ -1,10 +1,12 @@
 use crate::workload::container::ContainerState;
 use crate::workload::manager::{ContainerStartRequest, WorkloadManager};
-use crate::workload::types::{WorkloadEvent, WorkloadSpec};
+use crate::workload::types::{WorkloadEvent, WorkloadSpec, WorkloadStateFilter, WorkloadStateKind};
 use capnp::Error;
 use capnp::capability::Promise;
 use protocol::gossip::gossip_message;
-use protocol::workload::{workload, workload_event, workload_spec};
+use protocol::workload::{
+    ContainerStateFilter, list_request, workload, workload_event, workload_spec,
+};
 use uuid::Uuid;
 
 fn state_to_str(state: &ContainerState) -> String {
@@ -12,6 +14,7 @@ fn state_to_str(state: &ContainerState) -> String {
         ContainerState::Pending => "pending".to_string(),
         ContainerState::Creating => "creating".to_string(),
         ContainerState::Running => "running".to_string(),
+        ContainerState::Paused => "paused".to_string(),
         ContainerState::Stopping => "stopping".to_string(),
         ContainerState::Stopped => "stopped".to_string(),
         ContainerState::Failed => "failed".to_string(),
@@ -25,6 +28,7 @@ fn state_from_str(input: &str) -> ContainerState {
         "pending" => ContainerState::Pending,
         "creating" => ContainerState::Creating,
         "running" => ContainerState::Running,
+        "paused" => ContainerState::Paused,
         "stopping" => ContainerState::Stopping,
         "stopped" => ContainerState::Stopped,
         "failed" => ContainerState::Failed,
@@ -276,14 +280,17 @@ impl workload::Server for WorkloadService {
 
     fn list(
         &mut self,
-        _params: workload::ListParams,
+        params: workload::ListParams,
         mut results: workload::ListResults,
     ) -> Promise<(), Error> {
         let manager = self.manager.clone();
 
         Promise::from_future(async move {
+            let request = params.get()?.get_request()?;
+            let filter = list_filter_from_request(&request)?;
+
             let specs = manager
-                .list_containers()
+                .list_containers(&filter)
                 .await
                 .map_err(|e| Error::failed(e.to_string()))?;
 
@@ -296,4 +303,35 @@ impl workload::Server for WorkloadService {
             Ok(())
         })
     }
+}
+
+fn list_filter_from_request(request: &list_request::Reader) -> Result<WorkloadStateFilter, Error> {
+    if !request.has_states() {
+        return Ok(WorkloadStateFilter::active_only());
+    }
+
+    let states = request.get_states()?;
+    if states.len() == 0 {
+        return Ok(WorkloadStateFilter::active_only());
+    }
+
+    let mut kinds = Vec::with_capacity(states.len() as usize);
+    for state in states.iter() {
+        let state =
+            state.map_err(|e| Error::failed(format!("unknown workload state filter: {e}")))?;
+        let kind = match state {
+            ContainerStateFilter::Pending => WorkloadStateKind::Pending,
+            ContainerStateFilter::Creating => WorkloadStateKind::Creating,
+            ContainerStateFilter::Running => WorkloadStateKind::Running,
+            ContainerStateFilter::Paused => WorkloadStateKind::Paused,
+            ContainerStateFilter::Stopping => WorkloadStateKind::Stopping,
+            ContainerStateFilter::Stopped => WorkloadStateKind::Stopped,
+            ContainerStateFilter::Failed => WorkloadStateKind::Failed,
+            ContainerStateFilter::Exited => WorkloadStateKind::Exited,
+            ContainerStateFilter::Unknown => WorkloadStateKind::Unknown,
+        };
+        kinds.push(kind);
+    }
+
+    Ok(WorkloadStateFilter::new(kinds))
 }

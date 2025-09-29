@@ -20,6 +20,7 @@ pub enum ContainerState {
     Pending,
     Creating,
     Running,
+    Paused,
     Stopping,
     Stopped,
     Failed,
