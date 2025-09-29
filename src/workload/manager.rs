@@ -4,7 +4,7 @@ use crate::scheduler::{
 };
 use crate::store::workload_store::WorkloadStore;
 use crate::workload::container::ContainerState;
-use crate::workload::docker::ContainerManager;
+use crate::workload::docker::{ContainerError, ContainerManager};
 use crate::workload::types::{WorkloadEvent, WorkloadSpec, WorkloadValue};
 use anyhow::Context;
 use async_channel::{Receiver, Sender};
@@ -15,7 +15,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -537,21 +537,45 @@ impl WorkloadManager {
             ));
         }
 
-        if let Some(container_id) = self.local_containers.lock().await.remove(&id) {
-            self.container_manager
-                .stop_container(&container_id, Some(Duration::from_secs(10)))
-                .await
-                .map_err(|e| anyhow::anyhow!("docker stop failed: {e}"))?;
+        let identifier_entry = {
+            let mut guard = self.local_containers.lock().await;
+            guard.remove(&id)
+        };
 
-            if let Err(e) = self
-                .container_manager
-                .remove_container(&container_id, false, true)
-                .await
-            {
-                tracing::warn!(
+        let (container_identifier, from_cache) = match identifier_entry {
+            Some(value) => (value, true),
+            None => (format!("mantissa-{id}"), false),
+        };
+
+        match self
+            .container_manager
+            .stop_container(&container_identifier, Some(Duration::from_secs(10)))
+            .await
+        {
+            Ok(_) => {}
+            Err(ContainerError::NotFound(_)) => {
+                debug!(
                     target: "workload",
-                    "failed to remove container {container_id}: {e}"
+                    "container {container_identifier} not found while stopping workload {id}; cache_hit={from_cache}"
                 );
+            }
+            Err(e) => return Err(anyhow::anyhow!("docker stop failed: {e}")),
+        }
+
+        if let Err(e) = self
+            .container_manager
+            .remove_container(&container_identifier, false, true)
+            .await
+        {
+            match e {
+                ContainerError::NotFound(_) => debug!(
+                    target: "workload",
+                    "container {container_identifier} already absent while removing workload {id}"
+                ),
+                other => warn!(
+                    target: "workload",
+                    "failed to remove container {container_identifier}: {other}"
+                ),
             }
         }
 
@@ -819,7 +843,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_workload_releases_slot_and_clears_resources() {
-        let (manager, scheduler, _cm) = setup_manager().await;
+        let (manager, scheduler, mock_cm) = setup_manager().await;
 
         let spec = manager
             .start_container("svc", "image", vec![], 500, 256 * 1_024 * 1_024)
@@ -828,6 +852,9 @@ mod tests {
 
         let slot_id = spec.slot_id.expect("slot assigned");
         let stopped = manager.stop_workload(spec.id).await.expect("stop workload");
+
+        let stopped_containers = mock_cm.stopped.lock().await.clone();
+        assert_eq!(stopped_containers, vec!["container-0".to_string()]);
 
         assert!(stopped.slot_id.is_none());
         assert_eq!(stopped.cpu_millis, 0);
@@ -840,6 +867,33 @@ mod tests {
             .find(|s| s.slot_id == slot_id)
             .expect("slot exists");
         assert!(matches!(slot.state, SlotState::Free));
+    }
+
+    #[tokio::test]
+    async fn stop_workload_uses_container_name_when_cache_missing() {
+        let (manager, _scheduler, mock_cm) = setup_manager().await;
+
+        let spec = manager
+            .start_container("svc", "image", vec![], 500, 256 * 1_024 * 1_024)
+            .await
+            .expect("start container");
+
+        {
+            manager.local_containers.lock().await.clear();
+        }
+
+        {
+            mock_cm.stopped.lock().await.clear();
+        }
+
+        manager
+            .stop_workload(spec.id)
+            .await
+            .expect("stop workload with fallback");
+
+        let expected = format!("mantissa-{}", spec.id);
+        let stopped_containers = mock_cm.stopped.lock().await.clone();
+        assert_eq!(stopped_containers, vec![expected]);
     }
 
     #[tokio::test]

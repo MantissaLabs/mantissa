@@ -193,8 +193,8 @@ pub async fn start<C>(
                     // hand its exported capability back to the same connection.
                     let outbound: Vec<Message> = pending
                         .iter()
-                        .cloned()
                         .filter(|msg| !message_targets_peer(msg, peer.id))
+                        .cloned()
                         .collect();
 
                     if outbound.is_empty() {
