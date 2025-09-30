@@ -5,6 +5,7 @@ use capnp::Error;
 use capnp::capability::Promise;
 use capnp::message::Builder;
 use protocol::node;
+use tracing::info;
 
 pub mod address;
 pub mod id;
@@ -98,7 +99,7 @@ impl node::Server for Node {
         _params: node::InfoParams,
         mut results: node::InfoResults,
     ) -> Promise<(), Error> {
-        println!("Collecting system information...");
+        info!(target: "node", "Collecting system information...");
 
         let mut builder = Builder::new_default();
 
