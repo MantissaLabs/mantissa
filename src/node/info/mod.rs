@@ -1,5 +1,6 @@
+use std::cell::RefCell;
 use std::rc::Rc;
-use sysinfo::{CpuRefreshKind, Disks, RefreshKind, System};
+use sysinfo::{CpuRefreshKind, Disks, System};
 
 /// # Description:
 ///
@@ -7,14 +8,14 @@ use sysinfo::{CpuRefreshKind, Disks, RefreshKind, System};
 /// such as the operating systems details, hardware components, load, etc.
 #[derive(Clone, Debug)]
 pub struct NodeInfo {
-    sys: Rc<System>,
+    sys: Rc<RefCell<System>>,
     pub info: Info,
 }
 
 impl Default for NodeInfo {
     fn default() -> Self {
         Self {
-            sys: Rc::new(System::new_all()),
+            sys: Rc::new(RefCell::new(System::new_all())),
             info: Info::default(),
         }
     }
@@ -132,7 +133,16 @@ pub struct Disk {
 }
 
 impl NodeInfo {
+    /// Refresh the cached `sysinfo::System` instance so subsequent reads use
+    /// up-to-date views without rebuilding the underlying snapshot.
+    fn refresh_system_state(&self) {
+        let mut sys = self.sys.borrow_mut();
+        sys.refresh_cpu_specifics(CpuRefreshKind::everything());
+        sys.refresh_memory();
+    }
+
     pub fn collect(&mut self) {
+        self.refresh_system_state();
         self.get_cpu_frequency();
         self.get_cpu_info();
         self.get_disk_info();
@@ -154,7 +164,8 @@ impl NodeInfo {
     }
 
     pub fn get_cpu_frequency(&self) -> u64 {
-        if let Some(cpu) = self.sys.cpus().iter().next() {
+        let sys = self.sys.borrow();
+        if let Some(cpu) = sys.cpus().iter().next() {
             cpu.frequency()
         } else {
             0
@@ -172,13 +183,14 @@ impl NodeInfo {
     }
 
     pub fn get_memory_info(&mut self) {
-        let total = self.sys.total_memory();
-        let free = self.sys.free_memory();
-        let available = self.sys.available_memory();
-        let used = self.sys.used_memory();
-        let swap_total = self.sys.total_swap();
-        let swap_used = self.sys.used_swap();
-        let swap_free = self.sys.free_swap();
+        let sys = self.sys.borrow();
+        let total = sys.total_memory();
+        let free = sys.free_memory();
+        let available = sys.available_memory();
+        let used = sys.used_memory();
+        let swap_total = sys.total_swap();
+        let swap_used = sys.used_swap();
+        let swap_free = sys.free_swap();
 
         self.info.mem_info = Some(Memory {
             total,
@@ -225,20 +237,23 @@ impl NodeInfo {
     /// we return `None` and ignore the specs for further use of the
     /// delegate.
     pub fn get_cpu_info(&mut self) {
-        let mut sys = System::new_with_specifics(
-            RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
-        );
+        let (brand, logical, physical) = {
+            let mut sys = self.sys.borrow_mut();
+            sys.refresh_cpu_specifics(CpuRefreshKind::everything());
+            let cpus = sys.cpus();
 
-        sys.refresh_cpu_all();
-
-        let cpus = sys.cpus();
-        let model = cpus.first().map(|cpu| cpu.brand().to_string()).unwrap();
-        let logical: i32 = cpus.len() as i32;
-        let physical: i32 = System::physical_core_count().unwrap_or(cpus.len()) as i32;
+            if cpus.is_empty() {
+                (None, 0, 0)
+            } else {
+                let logical = cpus.len() as i32;
+                let physical = System::physical_core_count().unwrap_or(cpus.len()) as i32;
+                (Some(cpus.first().unwrap().brand().to_string()), logical, physical)
+            }
+        };
 
         self.info.cpu_info = Some(Cpu {
             vendor: None,
-            brand: Some(model),
+            brand,
             codename: None,
             frequency: None,
             num_cores: physical,
