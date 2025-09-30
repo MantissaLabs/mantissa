@@ -22,16 +22,16 @@ impl ServiceRegistry {
         self.store
             .upsert(&UuidKey::from(value.id), value)
             .await
-            .map(|_| ())
-            .map_err(|e| anyhow!("service upsert failed: {e}"))
+            .map_err(|e| anyhow!("service upsert failed: {e}"))?;
+        Ok(())
     }
 
     pub async fn remove_by_id(&self, id: Uuid) -> Result<()> {
         self.store
             .remove(&UuidKey::from(id))
             .await
-            .map(|_| ())
-            .map_err(|e| anyhow!("service remove failed: {e}"))
+            .map_err(|e| anyhow!("service remove failed: {e}"))?;
+        Ok(())
     }
 
     pub fn get(&self, id: Uuid) -> Result<Option<ServiceSpecValue>> {

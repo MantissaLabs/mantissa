@@ -500,8 +500,8 @@ impl WorkloadManager {
         self.store
             .remove(&UuidKey::from(id))
             .await
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("workload remove failed: {e}"))
+            .map_err(|e| anyhow::anyhow!("workload remove failed: {e}"))?;
+        Ok(())
     }
 
     fn tx(&self) -> Sender<Message> {

@@ -1,6 +1,6 @@
 use crate::errors::ClientSocketError;
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
-use futures::{AsyncReadExt, FutureExt};
+use futures::AsyncReadExt;
 use net::{
     noise::{client_handshake, load_or_generate_noise_keys},
     unix_socket::candidate_unix_socket_paths,
@@ -59,7 +59,11 @@ pub async fn get_client_secure(addr: &str) -> Result<server::Client, capnp::Erro
 
     let mut rpc = RpcSystem::new(network, None);
     let client: server::Client = rpc.bootstrap(rpc_twoparty_capnp::Side::Server);
-    tokio::task::spawn_local(rpc.map(|_| ()));
+    tokio::task::spawn_local(async move {
+        if let Err(e) = rpc.await {
+            eprintln!("capnp rpc system shutdown: {e}");
+        }
+    });
     Ok(client)
 }
 
@@ -76,7 +80,11 @@ async fn client_from_unix_stream(
     );
     let mut rpc = RpcSystem::new(Box::new(network), None);
     let client: cluster_session::Client = rpc.bootstrap(rpc_twoparty_capnp::Side::Server);
-    tokio::task::spawn_local(rpc.map(|_| ()));
+    tokio::task::spawn_local(async move {
+        if let Err(e) = rpc.await {
+            eprintln!("capnp rpc system shutdown: {e}");
+        }
+    });
     Ok(client)
 }
 
