@@ -2,7 +2,6 @@ use crate::topology::{PeerHandle, Topology, peer_provider::PeerProvider};
 use async_trait::async_trait;
 use capnp::Error as CapnpError;
 use protocol::topology::node_info as node_info_capnp;
-use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
 use serde::{Deserialize, Serialize};
@@ -20,31 +19,24 @@ pub struct PeerValue {
 #[async_trait(?Send)]
 impl PeerProvider for Topology {
     async fn get_peers(&self) -> Vec<PeerHandle> {
-        // Load durable actives (snapshots) + tombstones; we only need actives here.
-        let (actives, _tombs) = match self.peers.load_all() {
-            Ok(x) => x,
-            Err(e) => {
-                log::warn!("get_peers: load_all failed: {e}");
-                return Vec::new();
-            }
+        let snapshot = match self.peer_snapshot().await {
+            Some(s) => s,
+            None => return Vec::new(),
         };
 
-        let mut out = Vec::with_capacity(actives.len());
+        let peers = snapshot.entries.clone();
+        let mut out = Vec::with_capacity(peers.len());
 
-        for (k, snap) in actives {
-            let id: Uuid = k.to_uuid(); // from UuidKey
-
-            // pick a deterministic representative from the MVReg snapshot
-            if let Some(v) = snap.as_slice().last().cloned() {
-                out.push(PeerHandle {
-                    id,
-                    address: v.address,
-                    hostname: v.hostname,
-                    noise_static_pub: PublicKey::from(v.noise_static_pub),
-                    // TODO: wire real root hash when tracked
-                    root_hash: Default::default(),
-                });
-            }
+        for entry in peers.iter() {
+            let value = entry.value.as_ref();
+            out.push(PeerHandle {
+                id: entry.peer_id,
+                address: value.address.clone(),
+                hostname: value.hostname.clone(),
+                noise_static_pub: PublicKey::from(value.noise_static_pub),
+                // TODO: wire real root hash when tracked
+                root_hash: Default::default(),
+            });
         }
 
         out

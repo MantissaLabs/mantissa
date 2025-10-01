@@ -32,8 +32,11 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
+use self::peer_snapshot::{PeerSnapshot, PeerSnapshotCache};
+
 pub mod health;
 pub mod peer_provider;
+mod peer_snapshot;
 pub mod peers;
 mod service;
 mod types;
@@ -76,6 +79,7 @@ pub struct Topology {
     seen_gossip_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
 
     peers: PeersStore,
+    peer_snapshot_cache: Arc<AsyncMutex<PeerSnapshotCache>>,
 
     local_sessions: LocalSessionStore,
 
@@ -142,6 +146,7 @@ impl Topology {
             gossip_receiver,
             gossip_sender,
             peers,
+            peer_snapshot_cache: Arc::new(AsyncMutex::new(PeerSnapshotCache::new())),
             server_handle: std::rc::Rc::new(OnceCell::new()),
             registry,
             public_key: noise_public_key,
@@ -528,6 +533,18 @@ impl Topology {
         self.registry.connect_known_peers(allow_credentials).await
     }
 
+    /// Obtain a cached snapshot of peers without hitting storage on every tick.
+    async fn peer_snapshot(&self) -> Option<PeerSnapshot> {
+        let mut cache = self.peer_snapshot_cache.lock().await;
+        match cache.snapshot(&self.peers) {
+            Ok(snapshot) => Some(snapshot),
+            Err(e) => {
+                error!(target: "sync", "load peer snapshot failed: {e}");
+                None
+            }
+        }
+    }
+
     /// Run one sync "tick":
     ///  - for each known peer (except self), open a Server client,
     ///  - obtain a ClusterSession (prefer ticket, else short-lived credential),
@@ -535,31 +552,25 @@ impl Topology {
     ///
     /// This is factored out so tests can drive sync deterministically without timers.
     pub async fn periodic_sync_tick(&self) {
-        // Snapshot peers (actives) from MST
-        let peers_snapshot = match self.peers.load_all() {
-            Ok((actives, _)) => actives,
-            Err(e) => {
-                error!(target: "sync", "load all peers failed: {e}");
-                return;
-            }
+        let snapshot = match self.peer_snapshot().await {
+            Some(s) => s,
+            None => return,
         };
 
-        for (k, snap) in peers_snapshot {
-            let peer_id: uuid::Uuid = k.to_uuid();
+        let peers = snapshot.entries.clone();
+        for entry in peers.iter() {
+            let peer_id = entry.peer_id;
             if peer_id == self.node.id {
                 continue; // skip self
             }
 
-            // Ensure we have the latest value to drive sync requests.
-            let Some(val) = snap.as_slice().last() else {
-                continue;
-            };
+            let value = entry.value.as_ref();
 
             let sync_cap = match self.registry.fetch_sync_capability(peer_id).await {
                 Ok(Some(cap)) => cap,
                 Ok(None) => continue,
                 Err(e) => {
-                    error!(target: "sync", "get_sync failed for {}: {e}", val.address);
+                    error!(target: "sync", "get_sync failed for {}: {e}", value.address);
                     continue;
                 }
             };
@@ -588,25 +599,20 @@ impl Topology {
 
     /// Probe a small random sample of peers via Health RPC and update the monitor on success.
     pub async fn health_probe_tick(&self, fanout: usize) {
-        // Snapshot peers (actives) from MST
-        let peers_snapshot = match self.peers.load_all() {
-            Ok((actives, _)) => actives,
-            Err(e) => {
-                error!(target: "health", "load all peers failed: {e}");
-                return;
-            }
+        let snapshot = match self.peer_snapshot().await {
+            Some(s) => s,
+            None => return,
         };
 
         // Build list of peers excluding self
         let mut candidates: Vec<(uuid::Uuid, String)> = Vec::new();
-        for (k, snap) in peers_snapshot {
-            let peer_id: uuid::Uuid = k.to_uuid();
-            if peer_id == self.node.id {
+        let peers = snapshot.entries.clone();
+        for entry in peers.iter() {
+            if entry.peer_id == self.node.id {
                 continue;
             }
-            if let Some(v) = snap.as_slice().last().cloned() {
-                candidates.push((peer_id, v.address));
-            }
+            let value = entry.value.as_ref();
+            candidates.push((entry.peer_id, value.address.clone()));
         }
         if candidates.is_empty() {
             return;

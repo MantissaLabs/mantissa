@@ -14,6 +14,7 @@ use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{hash::Hash, io, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -105,6 +106,7 @@ where
     db: Arc<redb::Database>,
     actor: C::Actor,
     mst: SharedInMemoryMerkleSearchTree<C, H>,
+    change_clock: AtomicU64,
     _tables: std::marker::PhantomData<T>,
 }
 
@@ -246,6 +248,17 @@ where
         out
     }
 
+    /// Advance the internal monotonic change counter after a successful write.
+    #[inline]
+    fn bump_change_clock(&self) {
+        self.change_clock.fetch_add(1, Ordering::Release);
+    }
+
+    /// Expose the current change counter so callers can detect when cached views are stale.
+    pub fn change_clock(&self) -> u64 {
+        self.change_clock.load(Ordering::Acquire)
+    }
+
     /// Insert or update value for key `k`.
     pub async fn upsert(&self, k: &C::Key, v: C::Value) -> crate::Result<()> {
         // Load current register (if any)
@@ -284,6 +297,8 @@ where
         let mut t = self.mst.write().await;
         t.upsert(k.clone(), &Entry::Active(snap));
 
+        self.bump_change_clock();
+
         Ok(())
     }
 
@@ -318,6 +333,7 @@ where
 
             let mut t = self.mst.write().await;
             t.upsert(k.clone(), &Entry::Deleted { ts });
+            self.bump_change_clock();
             return Ok(ts);
         }
 
@@ -348,6 +364,7 @@ where
 
         let mut t = self.mst.write().await;
         t.upsert(k.clone(), &Entry::Deleted { ts });
+        self.bump_change_clock();
         Ok(ts)
     }
 
@@ -388,6 +405,7 @@ where
         // Update MST
         let mut t = self.mst.write().await;
         t.upsert(k.clone(), &Entry::Active(snap));
+        self.bump_change_clock();
         Ok(())
     }
 
@@ -413,6 +431,7 @@ where
 
         let mut t = self.mst.write().await;
         t.upsert(k.clone(), &Entry::Deleted { ts });
+        self.bump_change_clock();
         Ok(())
     }
 
@@ -439,6 +458,9 @@ where
             out
         };
 
+        // Track whether anything was written so we only advance the change clock when needed.
+        let had_changes = !merged_regs.is_empty() || !tombs.is_empty();
+
         // Single write transaction for everything:
         let w = self.db.begin_write().map_err(into_err)?;
         {
@@ -458,15 +480,19 @@ where
             }
 
             // Apply tombstones (and remove register rows)
-            for (k, ts) in tombs {
-                tt.insert(Self::encode_key(&k).as_slice(), &ts)
+            for (k, ts) in &tombs {
+                tt.insert(Self::encode_key(k).as_slice(), ts)
                     .map_err(into_err)?;
                 let _ = tv
-                    .remove(Self::encode_key(&k).as_slice())
+                    .remove(Self::encode_key(k).as_slice())
                     .map_err(into_err)?;
             }
         }
         w.commit().map_err(into_err)?;
+
+        if had_changes {
+            self.bump_change_clock();
+        }
 
         Ok(())
     }
@@ -494,6 +520,8 @@ where
             }
             out
         };
+
+        let had_changes = !merged_regs.is_empty() || !tombs.is_empty();
 
         // Single write transaction for everything:
         let w = self.db.begin_write().map_err(into_err)?;
@@ -534,6 +562,10 @@ where
             }
         }
 
+        if had_changes {
+            self.bump_change_clock();
+        }
+
         Ok(())
     }
 
@@ -544,11 +576,25 @@ where
 
     /// Dump durable (key, snapshot) and (key, tombstone).
     pub fn load_all(&self) -> crate::Result<SnapshotsAndTombs<C::Key, C::Snapshot>> {
+        let mut actives = Vec::new();
+        let mut tombs = Vec::new();
+        self.load_all_into(&mut actives, &mut tombs)?;
+        Ok((actives, tombs))
+    }
+
+    /// Populate caller-provided buffers with all durable snapshots and tombstones so hot loops can reuse allocations.
+    pub fn load_all_into(
+        &self,
+        actives: &mut Vec<(C::Key, C::Snapshot)>,
+        tombs: &mut Vec<(C::Key, u64)>,
+    ) -> crate::Result<()> {
+        actives.clear();
+        tombs.clear();
+
         let r = self.db.begin_read().map_err(into_err)?;
         let values = r.open_table(T::values()).map_err(into_err)?;
-        let tombs = r.open_table(T::tombs()).map_err(into_err)?;
+        let tomb_table = r.open_table(T::tombs()).map_err(into_err)?;
 
-        let mut actives = Vec::new();
         {
             let mut it = values.iter().map_err(into_err)?;
             while let Some(Ok((k, v))) = it.next() {
@@ -558,14 +604,14 @@ where
             }
         }
 
-        let mut tomb_list = Vec::new();
         {
-            let mut it = tombs.iter().map_err(into_err)?;
+            let mut it = tomb_table.iter().map_err(into_err)?;
             while let Some(Ok((k, ts))) = it.next() {
-                tomb_list.push((Self::decode_key(k.value())?, ts.value()));
+                tombs.push((Self::decode_key(k.value())?, ts.value()));
             }
         }
-        Ok((actives, tomb_list))
+
+        Ok(())
     }
 
     /// Visit all snapshots using a single read transaction without building a Vec.
@@ -809,6 +855,7 @@ where
             db: self.db,
             actor: self.actor,
             mst,
+            change_clock: AtomicU64::new(1),
             _tables: std::marker::PhantomData,
         })
     }

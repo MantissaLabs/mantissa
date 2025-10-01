@@ -247,7 +247,11 @@ impl NodeInfo {
             } else {
                 let logical = cpus.len() as i32;
                 let physical = System::physical_core_count().unwrap_or(cpus.len()) as i32;
-                (Some(cpus.first().unwrap().brand().to_string()), logical, physical)
+                (
+                    Some(cpus.first().unwrap().brand().to_string()),
+                    logical,
+                    physical,
+                )
             }
         };
 
