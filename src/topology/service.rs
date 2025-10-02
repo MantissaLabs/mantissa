@@ -16,7 +16,6 @@ use ed25519_dalek::VerifyingKey;
 use protocol::gossip::gossip_message;
 use protocol::server::{self, cluster_session};
 use protocol::topology::{topology, topology_event};
-use std::sync::atomic::Ordering;
 use tracing::info;
 use uuid::Uuid;
 
@@ -165,7 +164,7 @@ impl topology::Server for Topology {
             Err(e) => return Promise::err(e),
         };
 
-        let self_addr = self.addr.clone();
+        let self_addr = self.networking.configured().to_string();
         let peers = self.peers.clone();
         let local_sessions = self.local_sessions.clone();
         let local_creds = self.local_credential_store.clone();
@@ -243,7 +242,7 @@ impl topology::Server for Topology {
         _params: topology::LeaveParams,
         _results: topology::LeaveResults,
     ) -> Promise<(), capnp::Error> {
-        if !self.periodic_sync_running.load(Ordering::SeqCst) {
+        if !self.sync.is_running() {
             return Promise::err(capnp::Error::failed("node is not part of a cluster".into()));
         }
 

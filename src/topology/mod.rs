@@ -2,7 +2,6 @@ use crate::gossip::{GossipContext, Message};
 use crate::node::Node;
 use crate::node::address::compute_advertise_ip;
 use crate::node::id::set_node_id;
-use crate::node::identity::{PeerId, peer_id_from_public};
 use crate::registry::Registry;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
@@ -61,60 +60,191 @@ pub struct Keys {
 }
 
 #[derive(Clone)]
-pub struct Topology {
-    // Address of the node.
-    // FIXME: To be replaced with full NodeInfo struct.
-    addr: String,
+struct Networking {
+    /// Address string as configured on startup. Used as last-resort advertise addr.
+    configured_addr: String,
 
-    // NodeInfo struct for our local node.
+    /// Socket address we actually bound to. Filled once networking stack listens.
+    bound_addr: Arc<Mutex<Option<SocketAddr>>>,
+
+    /// Optional manual override (tests, inproc transports) for advertise address.
+    advertise_override: Arc<Mutex<Option<String>>>,
+}
+
+impl Networking {
+    fn new(configured_addr: String) -> Self {
+        Self {
+            configured_addr,
+            bound_addr: Arc::new(Mutex::new(None)),
+            advertise_override: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn configured(&self) -> &str {
+        &self.configured_addr
+    }
+
+    fn set_bound(&self, addr: SocketAddr) {
+        *self.bound_addr.lock().unwrap() = Some(addr);
+    }
+
+    fn set_override<S: Into<String>>(&self, addr: Option<S>) {
+        *self.advertise_override.lock().unwrap() = addr.map(Into::into);
+    }
+
+    fn override_addr(&self) -> Option<String> {
+        self.advertise_override.lock().unwrap().clone()
+    }
+
+    fn bound(&self) -> Option<SocketAddr> {
+        *self.bound_addr.lock().unwrap()
+    }
+}
+
+#[derive(Clone)]
+struct GossipState {
+    /// Incoming topology gossip stream fed by the gossip subsystem.
+    receiver: Receiver<Message>,
+    /// Outbound channel used to fan out topology events.
+    sender: Sender<Message>,
+    /// Deduplication set so we do not re-handle identical gossip messages.
+    seen_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
+    /// Configurable interval used by the outer gossip loop for scheduling.
+    interval: Arc<Mutex<Duration>>,
+}
+
+impl GossipState {
+    fn new(receiver: Receiver<Message>, sender: Sender<Message>) -> Self {
+        Self {
+            receiver,
+            sender,
+            seen_ids: Arc::new(AsyncMutex::new(HashSet::new())),
+            interval: Arc::new(Mutex::new(Duration::from_secs(1))),
+        }
+    }
+
+    async fn recv(&self) -> Result<Message, async_channel::RecvError> {
+        self.receiver.recv().await
+    }
+
+    async fn send(&self, message: Message) -> Result<(), capnp::Error> {
+        self.sender
+            .send(message)
+            .await
+            .map_err(|e| capnp::Error::failed(format!("failed to queue gossip event: {e}")))
+    }
+
+    async fn record(&self, id: Uuid) -> bool {
+        let mut guard = self.seen_ids.lock().await;
+        guard.insert(id)
+    }
+
+    fn set_interval(&self, d: Duration) {
+        *self.interval.lock().unwrap() = d;
+    }
+
+    fn interval(&self) -> Duration {
+        *self.interval.lock().unwrap()
+    }
+}
+
+#[derive(Clone)]
+struct SyncState {
+    /// Interval between periodic peer synchronization ticks.
+    interval: Arc<Mutex<Duration>>,
+
+    /// Flag telling whether the periodic sync task is currently running.
+    running: Rc<AtomicBool>,
+
+    /// JoinHandle of the periodic sync task so we can abort it.
+    handle: Rc<RefCell<Option<JoinHandle<()>>>>,
+}
+
+impl SyncState {
+    fn new(default_interval: Duration) -> Self {
+        Self {
+            interval: Arc::new(Mutex::new(default_interval)),
+            running: Rc::new(AtomicBool::new(false)),
+            handle: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    fn set_interval(&self, d: Duration) {
+        *self.interval.lock().unwrap() = d;
+    }
+
+    fn interval(&self) -> Duration {
+        *self.interval.lock().unwrap()
+    }
+
+    fn start_if_idle(&self) -> bool {
+        self.running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn stop(&self) {
+        if let Some(handle) = self.handle.borrow_mut().take() {
+            handle.abort();
+        }
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    fn store_handle(&self, handle: JoinHandle<()>) {
+        *self.handle.borrow_mut() = Some(handle);
+    }
+
+    fn mark_stopped(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+pub struct Topology {
+    /// Snapshot of the local node (id, host info, capabilities).
     node: Node,
 
-    // Node event receiver, from gossiping or other components.
-    gossip_receiver: Receiver<Message>,
+    /// Addresses and advertise decision logic for the local node.
+    networking: Networking,
 
-    // Channel to push topology events to gossip for propagation.
-    gossip_sender: Sender<Message>,
+    /// Gossip channels and dedupe bookkeeping for topology messages.
+    gossip: GossipState,
 
-    // Gossip events we've already processed (dedupe by id).
-    seen_gossip_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
-
+    /// Persistent peer store backing the CRDT state published cluster-wide.
     peers: PeersStore,
+
+    /// Cached Peers snapshot to avoid hitting storage on every tick.
     peer_snapshot_cache: Arc<AsyncMutex<PeerSnapshotCache>>,
 
+    /// Store holding locally issued session tickets keyed by peer id.
     local_sessions: LocalSessionStore,
 
+    /// Storage for credentials minted by remote peers (used during reconnects).
     local_credential_store: LocalCredentialStore,
 
+    /// Capability registry used to keep RPC client handles for peers.
     registry: Registry,
 
-    // The capability handle for the server. To be sent to peers.
+    /// OnceCell holding the Cap'n Proto server capability exported to peers.
     server_handle: Rc<OnceCell<ServerClient>>,
 
-    // The public key of the node.
+    /// Local node Noise static public key used during handshakes.
     public_key: PublicKey,
 
-    // Credentials signing key.
+    /// Ed25519 signing key used to mint cluster credentials.
     signing_key: SigningKey,
 
-    // The peer ID derived from the public key.
-    // FIXME: detangle from the u64 id defined in Capnproto Node struct.
-    peer_id: PeerId,
+    /// Runtime state for background sync loop management.
+    sync: SyncState,
 
-    // is_cluster_member: Rc<OnceCell<()>>,
-    periodic_sync_running: Rc<AtomicBool>,
-    periodic_sync_handle: Rc<RefCell<Option<JoinHandle<()>>>>,
-
-    bound_addr: Arc<Mutex<Option<SocketAddr>>>,
-    advertise_addr: Arc<Mutex<Option<String>>>,
-    // Periodic sync interval (dynamic to allow tests to speed up convergence)
-    sync_interval: Arc<Mutex<Duration>>,
-    // Gossip tick interval for outbound gossip loop
-    gossip_interval: Arc<Mutex<Duration>>,
-
-    // Persistent token store, holding the current token for joining the cluster.
+    /// Persistent token store, holding the current token for joining the cluster.
     token_store: TokenStore,
 
-    // Health monitor (phase 1: passive observation only).
+    /// Shared health monitor tracking peer liveness observations.
     health_monitor: Arc<HealthMonitor>,
 }
 
@@ -142,52 +272,31 @@ impl Topology {
         } = crypto;
 
         Ok(Self {
-            addr,
-            gossip_receiver,
-            gossip_sender,
+            node,
+            networking: Networking::new(addr),
+            gossip: GossipState::new(gossip_receiver, gossip_sender),
             peers,
             peer_snapshot_cache: Arc::new(AsyncMutex::new(PeerSnapshotCache::new())),
-            server_handle: std::rc::Rc::new(OnceCell::new()),
-            registry,
-            public_key: noise_public_key,
-            signing_key,
-            peer_id: peer_id_from_public(&noise_public_key),
-            node,
             local_sessions: sessions,
             local_credential_store: credentials,
-            bound_addr: Arc::new(Mutex::new(None)),
-            advertise_addr: Arc::new(Mutex::new(None)),
-            sync_interval: Arc::new(Mutex::new(Duration::from_secs(5))),
-            gossip_interval: Arc::new(Mutex::new(Duration::from_secs(1))),
+            registry,
+            server_handle: Rc::new(OnceCell::new()),
+            public_key: noise_public_key,
+            signing_key,
+            sync: SyncState::new(Duration::from_secs(5)),
             token_store,
-            periodic_sync_running: Rc::new(AtomicBool::new(false)),
-            periodic_sync_handle: Rc::new(RefCell::new(None)),
             health_monitor,
-            seen_gossip_ids: Arc::new(AsyncMutex::new(HashSet::new())),
         })
     }
 
     pub async fn gossip_topology_event(&self, event: TopologyEvent) -> Result<(), capnp::Error> {
         let id = Uuid::new_v4();
-        let _ = self.record_gossip_id(id).await;
-        self.send_gossip_message(Message::Topology { id, event })
-            .await
-    }
-
-    async fn send_gossip_message(&self, message: Message) -> Result<(), capnp::Error> {
-        self.gossip_sender
-            .send(message)
-            .await
-            .map_err(|e| capnp::Error::failed(format!("failed to queue gossip event: {e}")))
-    }
-
-    async fn record_gossip_id(&self, id: Uuid) -> bool {
-        let mut guard = self.seen_gossip_ids.lock().await;
-        guard.insert(id)
+        let _ = self.gossip.record(id).await;
+        self.gossip.send(Message::Topology { id, event }).await
     }
 
     pub fn set_bound_addr(&self, sa: SocketAddr) {
-        *self.bound_addr.lock().unwrap() = Some(sa);
+        self.networking.set_bound(sa);
     }
 
     pub fn self_id(&self) -> Uuid {
@@ -195,7 +304,7 @@ impl Topology {
     }
 
     pub fn set_advertise_override<S: Into<String>>(&self, s: Option<S>) {
-        *self.advertise_addr.lock().unwrap() = s.map(Into::into);
+        self.networking.set_override(s);
     }
 
     /// Sets the server handle to be served to other Peers so that they could connect
@@ -257,10 +366,10 @@ impl Topology {
     /// Order of precedence:
     /// 1) explicit override (e.g., "inproc://<uuid>" for inproc tests)
     /// 2) actual bound addr (if known) — if ip is 0.0.0.0, replace ip but keep the bound port
-    /// 3) configured addr (self.addr) — if ip is 0.0.0.0, compute a best-effort ip but keep its port
+    /// 3) configured addr (initial value) — if ip is 0.0.0.0, compute a best-effort ip but keep its port
     pub fn compute_advertise_addr(&self) -> io::Result<String> {
         // Return the overridden address if present.
-        if let Some(s) = self.advertise_addr.lock().unwrap().clone() {
+        if let Some(s) = self.networking.override_addr() {
             return Ok(s);
         }
 
@@ -270,7 +379,7 @@ impl Topology {
         })?;
 
         // bound addr if present
-        if let Some(bound) = *self.bound_addr.lock().unwrap() {
+        if let Some(bound) = self.networking.bound() {
             if bound.ip().is_unspecified() {
                 return Ok(SocketAddr::new(ip, bound.port()).to_string());
             } else {
@@ -278,10 +387,10 @@ impl Topology {
             }
         }
 
-        // fallback to configured `self.addr`
+        // fallback to configured address
         //  - if it parses as a SocketAddr, normalize unspecified ip
         //  - else just return as-is (last resort)
-        if let Ok(cfg_sa) = self.addr.parse::<SocketAddr>() {
+        if let Ok(cfg_sa) = self.networking.configured().parse::<SocketAddr>() {
             if cfg_sa.ip().is_unspecified() || cfg_sa.port() == 0 {
                 let port = if cfg_sa.port() == 0 {
                     // we really don't know yet, best effort: keep 0 to make the bug obvious
@@ -295,7 +404,7 @@ impl Topology {
             }
         }
 
-        Ok(self.addr.clone())
+        Ok(self.networking.configured().to_string())
     }
 
     pub fn get_server_handle(&self) -> Option<ServerClient> {
@@ -319,15 +428,15 @@ impl Topology {
 
     /// Set the periodic sync interval (useful for tests to speed up convergence).
     pub fn set_sync_interval(&self, d: Duration) {
-        *self.sync_interval.lock().unwrap() = d;
+        self.sync.set_interval(d);
     }
 
     pub fn set_gossip_interval(&self, d: Duration) {
-        *self.gossip_interval.lock().unwrap() = d;
+        self.gossip.set_interval(d);
     }
 
     pub fn gossip_interval(&self) -> Duration {
-        *self.gossip_interval.lock().unwrap()
+        self.gossip.interval()
     }
 
     /// Populate a NodeInfo builder with this node's identity and addresses.
@@ -375,11 +484,7 @@ impl Topology {
     /// Spawns a single periodic sync loop (idempotent). Restartable after `stop_periodic_sync()`.
     pub fn ensure_periodic_sync(&self) {
         // fast path if already running
-        if self
-            .periodic_sync_running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+        if !self.sync.start_if_idle() {
             return;
         }
 
@@ -387,29 +492,26 @@ impl Topology {
         let handle = tokio::task::spawn_local(async move {
             this.periodic_sync_loop().await;
             // if the loop exits naturally, mark stopped
-            this.periodic_sync_running.store(false, Ordering::SeqCst);
+            this.sync.mark_stopped();
         });
 
-        *self.periodic_sync_handle.borrow_mut() = Some(handle);
+        self.sync.store_handle(handle);
     }
 
     /// Abort the periodic sync loop (if any) and mark it stopped.
     pub fn stop_periodic_sync(&self) {
-        if let Some(h) = self.periodic_sync_handle.borrow_mut().take() {
-            h.abort();
-        }
-        self.periodic_sync_running.store(false, Ordering::SeqCst);
+        self.sync.stop();
     }
 
     // The run loop receives incoming events from Gossip.
     pub async fn run(&mut self) {
         loop {
-            match self.gossip_receiver.recv().await {
+            match self.gossip.recv().await {
                 Ok(Message::Void { .. }) => {
                     // Keepalive message; nothing to process for topology state.
                 }
                 Ok(Message::Topology { id, event }) => {
-                    if !self.record_gossip_id(id).await {
+                    if !self.gossip.record(id).await {
                         continue;
                     }
 
@@ -456,7 +558,8 @@ impl Topology {
                     }
 
                     if let Err(e) = self
-                        .send_gossip_message(Message::Topology {
+                        .gossip
+                        .send(Message::Topology {
                             id,
                             event: event_clone,
                         })
@@ -516,7 +619,9 @@ impl Topology {
     ///  - call getSession(ticket) to obtain a ClusterSession,
     ///  - attach the server handle so higher-level code can use it.
     pub async fn resume_sessions_on_boot(&self) {
-        self.registry.resume_sessions_on_boot(&self.addr).await;
+        self.registry
+            .resume_sessions_on_boot(self.networking.configured())
+            .await;
     }
 
     /// Connect to known peers and open a ClusterSession with each.
@@ -591,7 +696,7 @@ impl Topology {
     /// Periodically call [`periodic_sync_tick`] every few seconds.
     pub async fn periodic_sync_loop(&self) {
         loop {
-            let d = *self.sync_interval.lock().unwrap();
+            let d = self.sync.interval();
             tokio::time::sleep(d).await;
             self.periodic_sync_tick().await;
         }
