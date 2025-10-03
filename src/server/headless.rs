@@ -10,7 +10,7 @@ use crate::{
         RunHandles, RunMode, Server,
         bootstrap::{Bootstrap, Stores},
     },
-    services::ServiceManager,
+    services::ServiceController,
 };
 use net::noise::NoiseKeys;
 use protocol::sync::Domain;
@@ -67,7 +67,7 @@ pub struct HeadlessNode {
     pub server_client: protocol::server::server::Client,
     pub sync_client: protocol::sync::sync::Client,
     pub services_client: protocol::services::services::Client,
-    pub service_manager: ServiceManager,
+    pub service_controller: ServiceController,
 
     // Stores (optional inspection in tests)
     pub peers: crate::store::peer_store::PeersStore,
@@ -199,7 +199,7 @@ impl HeadlessNode {
             server_client,
             sync_client: comps.sync_client.clone(),
             services_client: comps.services_client.clone(),
-            service_manager: comps.service_manager.clone(),
+            service_controller: comps.service_controller.clone(),
             peers: stores.peers.clone(),
             local_sessions: stores.local_sessions.clone(),
             local_creds: stores.local_creds.clone(),

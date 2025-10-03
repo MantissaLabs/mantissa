@@ -3,6 +3,6 @@ pub mod registry;
 pub mod service;
 pub mod types;
 
-pub use manager::ServiceManager;
+pub use manager::ServiceController;
 pub use registry::ServiceRegistry;
-pub use service::ServicesService;
+pub use service::ServicesRPC;

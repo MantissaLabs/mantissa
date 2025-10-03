@@ -9,7 +9,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 #[derive(Clone)]
-pub struct ServiceManager {
+pub struct ServiceController {
     registry: ServiceRegistry,
     workload_manager: WorkloadManager,
     gossip_tx: Sender<Message>,
@@ -17,7 +17,7 @@ pub struct ServiceManager {
     seen_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
 }
 
-impl ServiceManager {
+impl ServiceController {
     pub fn new(
         registry: ServiceRegistry,
         workload_manager: WorkloadManager,

@@ -1,4 +1,4 @@
-use crate::services::manager::ServiceManager;
+use crate::services::manager::ServiceController;
 use crate::services::types::{ServiceEvent, ServiceSpecValue, ServiceTaskSpecValue};
 use capnp::Error;
 use capnp::capability::Promise;
@@ -6,18 +6,18 @@ use protocol::services::{service_event, service_spec, services, task_template};
 use tracing::warn;
 use uuid::Uuid;
 
-pub struct ServicesService {
-    manager: ServiceManager,
+pub struct ServicesRPC {
+    manager: ServiceController,
 }
 
-impl ServicesService {
-    pub fn new(manager: ServiceManager) -> Self {
+impl ServicesRPC {
+    pub fn new(manager: ServiceController) -> Self {
         Self { manager }
     }
 }
 
 #[async_trait::async_trait(?Send)]
-impl services::Server for ServicesService {
+impl services::Server for ServicesRPC {
     fn upsert(
         &mut self,
         params: services::UpsertParams,

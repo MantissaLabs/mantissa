@@ -6,7 +6,7 @@ use crate::scheduler::{Scheduler, SlotCapacity, SlotSpec};
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerStores};
-use crate::services::{ServiceManager, ServiceRegistry, ServicesService};
+use crate::services::{ServiceController, ServiceRegistry, ServicesRPC};
 use crate::store::local::load_or_create_node_id;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
@@ -100,7 +100,7 @@ pub(crate) struct Components {
     pub sync_client: protocol::sync::sync::Client,
     pub health_monitor: std::sync::Arc<health::HealthMonitor>,
     pub workload_manager: WorkloadManager,
-    pub service_manager: ServiceManager,
+    pub service_controller: ServiceController,
     pub scheduler: Rc<Scheduler>,
     pub scheduler_client: SchedulerClient,
     #[allow(dead_code)]
@@ -362,13 +362,13 @@ impl Bootstrap {
         );
 
         let service_registry = ServiceRegistry::new(stores.services.clone());
-        let service_manager = ServiceManager::new(
+        let service_controller = ServiceController::new(
             service_registry.clone(),
             workload_manager.clone(),
             gossip_tx.clone(),
             service_rx,
         );
-        let services_service = ServicesService::new(service_manager.clone());
+        let services_service = ServicesRPC::new(service_controller.clone());
         let services_client_cap = capnp_rpc::new_client(services_service);
 
         let scheduler_service =
@@ -383,7 +383,7 @@ impl Bootstrap {
                 sync_client,
                 health_monitor,
                 workload_manager,
-                service_manager,
+                service_controller,
                 scheduler,
                 scheduler_client: scheduler_client_cap,
                 registry,
@@ -482,7 +482,7 @@ impl Bootstrap {
             workload_runner.run().await;
         });
 
-        let mut service_runner = comps.service_manager.clone();
+        let mut service_runner = comps.service_controller.clone();
         tokio::task::spawn_local(async move {
             service_runner.run().await;
         });

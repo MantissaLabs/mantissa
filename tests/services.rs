@@ -4,7 +4,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::testkit::{ClusterConfig, TestNode};
-use mantissa::services::ServiceManager;
+use mantissa::services::ServiceController;
 use mantissa::services::types::compute_service_id;
 use protocol::services::services;
 use tokio::time::sleep;
@@ -34,11 +34,11 @@ local_test!(services_gossip_propagates_across_peers, {
     .await;
 
     assert!(
-        wait_for_service_state(&anchor.node.service_manager, service_id, true).await,
+        wait_for_service_state(&anchor.node.service_controller, service_id, true).await,
         "anchor should observe newly registered service"
     );
     assert!(
-        wait_for_service_state(&peer.node.service_manager, service_id, true).await,
+        wait_for_service_state(&peer.node.service_controller, service_id, true).await,
         "peer should receive service via gossip"
     );
 
@@ -51,11 +51,11 @@ local_test!(services_gossip_propagates_across_peers, {
     remove_service_via_rpc(&anchor.node.services_client, service_id).await;
 
     assert!(
-        wait_for_service_state(&anchor.node.service_manager, service_id, false).await,
+        wait_for_service_state(&anchor.node.service_controller, service_id, false).await,
         "anchor should remove service after delete"
     );
     assert!(
-        wait_for_service_state(&peer.node.service_manager, service_id, false).await,
+        wait_for_service_state(&peer.node.service_controller, service_id, false).await,
         "peer should drop service after gossip remove"
     );
 
@@ -112,7 +112,7 @@ async fn remove_service_via_rpc(client: &services::Client, service_id: Uuid) {
 }
 
 async fn wait_for_service_state(
-    manager: &ServiceManager,
+    manager: &ServiceController,
     service_id: Uuid,
     expect_present: bool,
 ) -> bool {
