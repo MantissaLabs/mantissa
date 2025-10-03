@@ -72,6 +72,9 @@ impl ServiceController {
                 self.registry.upsert(spec).await?;
             }
             ServiceEvent::Remove { id } => {
+                if let Some(spec) = self.registry.get(id)? {
+                    self.stop_workloads(&spec).await;
+                }
                 self.registry.remove_by_id(id).await?;
             }
         }

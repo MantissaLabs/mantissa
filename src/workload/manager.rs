@@ -1,10 +1,13 @@
 use crate::gossip::Message;
+use crate::registry::Registry;
+use crate::scheduler::summary::SchedulerSlotState;
 use crate::scheduler::{
     Scheduler, SchedulerError, SlotCapacity, SlotId, SlotReservationRequest, SlotState,
 };
 use crate::store::workload_store::WorkloadStore;
 use crate::workload::container::ContainerState;
 use crate::workload::docker::{ContainerError, ContainerManager};
+use crate::workload::service::read_spec;
 use crate::workload::types::{WorkloadEvent, WorkloadSpec, WorkloadStateFilter, WorkloadValue};
 use anyhow::Context;
 use async_channel::{Receiver, Sender};
@@ -18,6 +21,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use protocol::server::cluster_session;
+use rand::rng;
+use rand::seq::SliceRandom;
+
 #[derive(Clone)]
 pub struct WorkloadManager {
     store: WorkloadStore,
@@ -29,6 +36,7 @@ pub struct WorkloadManager {
     scheduler: Rc<Scheduler>,
     container_manager: Arc<dyn ContainerManager + Send + Sync>,
     local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
+    registry: Registry,
 }
 
 #[derive(Clone)]
@@ -38,6 +46,8 @@ pub struct ContainerStartRequest {
     pub command: Vec<String>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    pub id: Option<Uuid>,
+    pub slot_id: Option<SlotId>,
 }
 
 struct BatchStartPlan {
@@ -52,9 +62,89 @@ struct BatchStartPlan {
     container_name: String,
     container_id: Option<String>,
     created_at: DateTime<Utc>,
+    index: usize,
+}
+
+#[derive(Clone)]
+struct StartIntent {
+    index: usize,
+    id: Uuid,
+    name: String,
+    image: String,
+    command: Vec<String>,
+    cpu_millis: u64,
+    memory_bytes: u64,
+    preassigned_slot: Option<SlotId>,
+}
+
+#[derive(Clone)]
+struct SlotChoice {
+    slot_id: SlotId,
+    capacity: SlotCapacity,
+}
+
+enum CandidateKind {
+    Local,
+    Remote { peer_id: Uuid },
+}
+
+struct NodeCandidate {
+    kind: CandidateKind,
+    slots: Vec<SlotChoice>,
+}
+
+struct RemoteStartPlan {
+    index: usize,
+    id: Uuid,
+    name: String,
+    image: String,
+    command: Vec<String>,
+    cpu_millis: u64,
+    memory_bytes: u64,
+    slot_id: SlotId,
+    peer_id: Uuid,
+}
+
+struct Assignment {
+    local: Vec<BatchStartPlan>,
+    remote: Vec<RemoteStartPlan>,
+}
+
+enum ExecutionError {
+    Retry(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl NodeCandidate {
+    fn take_slot(&mut self, cpu_millis: u64, memory_bytes: u64) -> Option<SlotChoice> {
+        if let Some(pos) = self.slots.iter().position(|slot| {
+            slot.capacity.cpu_millis >= cpu_millis && slot.capacity.memory_bytes >= memory_bytes
+        }) {
+            Some(self.slots.remove(pos))
+        } else {
+            None
+        }
+    }
 }
 
 impl WorkloadManager {
+    fn build_start_intents(requests: Vec<ContainerStartRequest>) -> Vec<StartIntent> {
+        requests
+            .into_iter()
+            .enumerate()
+            .map(|(index, request)| StartIntent {
+                index,
+                id: request.id.unwrap_or_else(Uuid::new_v4),
+                name: request.name,
+                image: request.image,
+                command: request.command,
+                cpu_millis: request.cpu_millis,
+                memory_bytes: request.memory_bytes,
+                preassigned_slot: request.slot_id,
+            })
+            .collect()
+    }
+
     pub fn new(
         store: WorkloadStore,
         tx: Sender<Message>,
@@ -63,6 +153,7 @@ impl WorkloadManager {
         local_node_name: impl Into<String>,
         scheduler: Rc<Scheduler>,
         container_manager: Arc<dyn ContainerManager + Send + Sync>,
+        registry: Registry,
     ) -> Self {
         Self {
             store,
@@ -74,55 +165,8 @@ impl WorkloadManager {
             scheduler,
             container_manager,
             local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
+            registry,
         }
-    }
-
-    async fn reserve_slot(
-        &self,
-        workload_id: Uuid,
-        cpu_millis: u64,
-        memory_bytes: u64,
-    ) -> Result<(SlotId, SlotCapacity), anyhow::Error> {
-        const MAX_ATTEMPTS: usize = 10;
-
-        for _ in 0..MAX_ATTEMPTS {
-            let snapshot = self
-                .scheduler
-                .snapshot()
-                .await
-                .ok_or_else(|| anyhow::anyhow!("scheduler snapshot unavailable"))?;
-
-            let Some(slot) = snapshot.slots.iter().find(|slot| {
-                matches!(slot.state, SlotState::Free)
-                    && slot.capacity.cpu_millis >= cpu_millis
-                    && slot.capacity.memory_bytes >= memory_bytes
-            }) else {
-                return Err(anyhow::anyhow!(
-                    "no scheduler slot satisfies cpu={cpu_millis} memory={memory_bytes}"
-                ));
-            };
-
-            let request = SlotReservationRequest {
-                slot_id: slot.slot_id,
-                owner: self.local_node_id,
-                workload_id: Some(workload_id),
-            };
-
-            match self
-                .scheduler
-                .reserve_slots(snapshot.version, vec![request])
-                .await
-            {
-                Ok(_) => return Ok((slot.slot_id, slot.capacity)),
-                Err(SchedulerError::SnapshotMismatch { .. })
-                | Err(SchedulerError::SlotsUnavailable { .. }) => continue,
-                Err(err) => return Err(anyhow::anyhow!(err)),
-            }
-        }
-
-        Err(anyhow::anyhow!(
-            "failed to reserve scheduler slot after retries"
-        ))
     }
 
     async fn release_slot(&self, slot_id: SlotId) -> Result<(), anyhow::Error> {
@@ -162,6 +206,8 @@ impl WorkloadManager {
             command,
             cpu_millis,
             memory_bytes,
+            id: None,
+            slot_id: None,
         };
 
         let mut specs = self.start_containers_batch(vec![request]).await?;
@@ -178,26 +224,305 @@ impl WorkloadManager {
             return Ok(Vec::new());
         }
 
-        let mut plans: Vec<BatchStartPlan> = requests
-            .into_iter()
-            .map(|request| BatchStartPlan {
-                id: Uuid::new_v4(),
-                name: request.name,
-                image: request.image,
-                command: request.command,
-                cpu_millis: request.cpu_millis,
-                memory_bytes: request.memory_bytes,
-                slot_id: 0,
-                slot_capacity: SlotCapacity::new(0, 0),
-                container_name: String::new(),
-                container_id: None,
-                created_at: Utc::now(),
-            })
-            .collect();
+        let intents = Self::build_start_intents(requests);
 
-        let intents: Vec<(Uuid, u64, u64)> = plans
+        const MAX_ATTEMPTS: usize = 5;
+        let mut attempt = 0usize;
+
+        while attempt < MAX_ATTEMPTS {
+            attempt += 1;
+
+            let assignment = match self.compute_assignment(&intents).await {
+                Ok(plan) => plan,
+                Err(err) => return Err(err.context("failed to compute scheduling plan")),
+            };
+
+            let remote_specs = match self.execute_remote_plans(&assignment.remote).await {
+                Ok(specs) => specs,
+                Err(ExecutionError::Retry(err)) => {
+                    debug!(
+                        target: "workload",
+                        "remote scheduling conflicted on attempt {attempt}: {err}"
+                    );
+                    continue;
+                }
+                Err(ExecutionError::Fatal(err)) => return Err(err),
+            };
+
+            match self.execute_local_plans(assignment.local).await {
+                Ok(local_specs) => {
+                    let mut ordered: Vec<Option<WorkloadSpec>> = vec![None; intents.len()];
+
+                    for (idx, spec) in remote_specs.into_iter().chain(local_specs.into_iter()) {
+                        ordered[idx] = Some(spec);
+                    }
+
+                    let specs: Vec<WorkloadSpec> = ordered
+                        .into_iter()
+                        .map(|spec| spec.expect("missing workload spec after execution"))
+                        .collect();
+
+                    self.broadcast_remote_specs(&specs).await;
+
+                    return Ok(specs);
+                }
+                Err(err) => {
+                    debug!(
+                        target: "workload",
+                        "local execution failed; attempting remote cleanup: {err}"
+                    );
+                    self.cleanup_remote_specs_from_specs(&remote_specs).await;
+                    return Err(err);
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "failed to schedule workloads after {MAX_ATTEMPTS} attempts"
+        ))
+    }
+
+    async fn compute_assignment(
+        &self,
+        intents: &[StartIntent],
+    ) -> Result<Assignment, anyhow::Error> {
+        if intents.is_empty() {
+            return Ok(Assignment {
+                local: Vec::new(),
+                remote: Vec::new(),
+            });
+        }
+
+        let snapshot = self
+            .scheduler
+            .snapshot()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("scheduler snapshot unavailable"))?;
+
+        let mut slot_lookup = HashMap::new();
+        let mut available_local_slots = Vec::new();
+        for slot in snapshot.slots.iter() {
+            slot_lookup.insert(slot.slot_id, slot.clone());
+            if matches!(slot.state, SlotState::Free) {
+                available_local_slots.push(SlotChoice {
+                    slot_id: slot.slot_id,
+                    capacity: slot.capacity,
+                });
+            }
+        }
+
+        let mut local_plans = Vec::new();
+        let mut remote_plans = Vec::new();
+        let mut assigned = vec![false; intents.len()];
+        let mut reserved_local_slots = HashSet::new();
+
+        for intent in intents.iter() {
+            if let Some(slot_id) = intent.preassigned_slot {
+                let slot = slot_lookup
+                    .get(&slot_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown preassigned slot {slot_id}"))?;
+
+                if slot.capacity.cpu_millis < intent.cpu_millis
+                    || slot.capacity.memory_bytes < intent.memory_bytes
+                {
+                    return Err(anyhow::anyhow!(
+                        "preassigned slot {slot_id} cannot satisfy requested capacity"
+                    ));
+                }
+
+                if let SlotState::Reserved(reservation) = &slot.state {
+                    if reservation.owner != self.local_node_id {
+                        return Err(anyhow::anyhow!(
+                            "preassigned slot {slot_id} owned by different node"
+                        ));
+                    }
+
+                    if let Some(workload_id) = reservation.workload_id {
+                        if workload_id != intent.id {
+                            return Err(anyhow::anyhow!(
+                                "preassigned slot {slot_id} reserved for workload {workload_id}"
+                            ));
+                        }
+                    }
+                }
+
+                reserved_local_slots.insert(slot_id);
+                assigned[intent.index] = true;
+
+                local_plans.push(BatchStartPlan {
+                    id: intent.id,
+                    name: intent.name.clone(),
+                    image: intent.image.clone(),
+                    command: intent.command.clone(),
+                    cpu_millis: intent.cpu_millis,
+                    memory_bytes: intent.memory_bytes,
+                    slot_id,
+                    slot_capacity: slot.capacity,
+                    container_name: String::new(),
+                    container_id: None,
+                    created_at: Utc::now(),
+                    index: intent.index,
+                });
+            }
+        }
+
+        if !reserved_local_slots.is_empty() {
+            available_local_slots.retain(|slot| !reserved_local_slots.contains(&slot.slot_id));
+        }
+
+        let mut nodes = Vec::new();
+        nodes.push(NodeCandidate {
+            kind: CandidateKind::Local,
+            slots: available_local_slots,
+        });
+
+        let mut remote_candidates = Vec::new();
+        let peers = self.registry.known_peers()?;
+        for peer_id in peers {
+            if peer_id == self.local_node_id {
+                continue;
+            }
+
+            let summary = match self.scheduler.fetch_remote_summary(peer_id, true).await {
+                Ok(summary) => summary,
+                Err(err) => {
+                    debug!(
+                        target: "workload",
+                        "scheduler summary fetch failed for peer {peer_id}: {err}"
+                    );
+                    continue;
+                }
+            };
+
+            let mut slots = Vec::new();
+            for detail in summary.details.iter() {
+                if !matches!(detail.state, SchedulerSlotState::Free) {
+                    continue;
+                }
+
+                slots.push(SlotChoice {
+                    slot_id: detail.slot_id,
+                    capacity: SlotCapacity::new(detail.cpu_millis, detail.memory_bytes),
+                });
+            }
+
+            if slots.is_empty() {
+                continue;
+            }
+
+            remote_candidates.push(NodeCandidate {
+                kind: CandidateKind::Remote { peer_id },
+                slots,
+            });
+        }
+
+        let mut rng = rng();
+        remote_candidates.shuffle(&mut rng);
+        nodes.extend(remote_candidates);
+
+        if nodes.is_empty() {
+            if local_plans.len() == intents.len() {
+                local_plans.sort_by_key(|plan| plan.index);
+                return Ok(Assignment {
+                    local: local_plans,
+                    remote: remote_plans,
+                });
+            }
+
+            return Err(anyhow::anyhow!(
+                "scheduler reservation failed: no available capacity across cluster"
+            ));
+        }
+
+        let node_count = nodes.len();
+        let mut cursor = 0usize;
+
+        for intent in intents.iter() {
+            if assigned[intent.index] {
+                continue;
+            }
+
+            // Walk the candidate ring in round-robin order so replicas alternate across nodes.
+            let mut allocated = None;
+            let mut checked = 0usize;
+            while checked < node_count {
+                let idx = (cursor + checked) % node_count;
+                if let Some(slot) = nodes[idx].take_slot(intent.cpu_millis, intent.memory_bytes) {
+                    allocated = Some((idx, slot));
+                    cursor = (idx + 1) % node_count;
+                    break;
+                }
+                checked += 1;
+            }
+
+            let Some((node_idx, slot)) = allocated else {
+                return Err(anyhow::anyhow!(
+                    "scheduler reservation failed: insufficient capacity for batch"
+                ));
+            };
+
+            match &nodes[node_idx].kind {
+                CandidateKind::Local => {
+                    local_plans.push(BatchStartPlan {
+                        id: intent.id,
+                        name: intent.name.clone(),
+                        image: intent.image.clone(),
+                        command: intent.command.clone(),
+                        cpu_millis: intent.cpu_millis,
+                        memory_bytes: intent.memory_bytes,
+                        slot_id: slot.slot_id,
+                        slot_capacity: slot.capacity,
+                        container_name: String::new(),
+                        container_id: None,
+                        created_at: Utc::now(),
+                        index: intent.index,
+                    });
+                }
+                CandidateKind::Remote { peer_id } => {
+                    remote_plans.push(RemoteStartPlan {
+                        index: intent.index,
+                        id: intent.id,
+                        name: intent.name.clone(),
+                        image: intent.image.clone(),
+                        command: intent.command.clone(),
+                        cpu_millis: intent.cpu_millis,
+                        memory_bytes: intent.memory_bytes,
+                        slot_id: slot.slot_id,
+                        peer_id: *peer_id,
+                    });
+                }
+            }
+
+            assigned[intent.index] = true;
+        }
+
+        local_plans.sort_by_key(|plan| plan.index);
+        remote_plans.sort_by_key(|plan| plan.index);
+
+        Ok(Assignment {
+            local: local_plans,
+            remote: remote_plans,
+        })
+    }
+
+    async fn execute_local_plans(
+        &self,
+        mut plans: Vec<BatchStartPlan>,
+    ) -> Result<Vec<(usize, WorkloadSpec)>, anyhow::Error> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let intents: Vec<(Uuid, Option<SlotId>, u64, u64)> = plans
             .iter()
-            .map(|plan| (plan.id, plan.cpu_millis, plan.memory_bytes))
+            .map(|plan| {
+                (
+                    plan.id,
+                    Some(plan.slot_id),
+                    plan.cpu_millis,
+                    plan.memory_bytes,
+                )
+            })
             .collect();
 
         let allocations = match self.reserve_slots_for_workloads(&intents).await {
@@ -217,7 +542,14 @@ impl WorkloadManager {
         }
 
         match self.commit_batch(&plans).await {
-            Ok(specs) => Ok(specs),
+            Ok(specs) => {
+                let ordered = plans
+                    .into_iter()
+                    .zip(specs.into_iter())
+                    .map(|(plan, spec)| (plan.index, spec))
+                    .collect();
+                Ok(ordered)
+            }
             Err(err) => {
                 self.cleanup_batch(&plans).await;
                 Err(err)
@@ -225,9 +557,193 @@ impl WorkloadManager {
         }
     }
 
+    async fn remote_session(
+        &self,
+        peer_id: Uuid,
+    ) -> Result<cluster_session::Client, anyhow::Error> {
+        self.registry
+            .session_for_peer(peer_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no active session for peer {peer_id}"))
+    }
+
+    async fn cleanup_remote_specs_from_specs(&self, specs: &[(usize, WorkloadSpec)]) {
+        if specs.is_empty() {
+            return;
+        }
+
+        let mut by_peer: HashMap<Uuid, Vec<&WorkloadSpec>> = HashMap::new();
+        for (_, spec) in specs.iter() {
+            if spec.node_id == self.local_node_id {
+                continue;
+            }
+            by_peer.entry(spec.node_id).or_default().push(spec);
+        }
+
+        for (peer_id, workloads) in by_peer.into_iter() {
+            let session = match self.remote_session(peer_id).await {
+                Ok(session) => session,
+                Err(err) => {
+                    warn!(
+                        target: "workload",
+                        "failed to reopen session with peer {peer_id} during cleanup: {err}"
+                    );
+                    continue;
+                }
+            };
+
+            let workload_client = match session.get_workload_request().send().promise.await {
+                Ok(resp) => match resp.get() {
+                    Ok(result) => match result.get_workload() {
+                        Ok(client) => client,
+                        Err(err) => {
+                            warn!(
+                                target: "workload",
+                                "failed to access workload capability for peer {peer_id}: {err}"
+                            );
+                            continue;
+                        }
+                    },
+                    Err(err) => {
+                        warn!(
+                            target: "workload",
+                            "failed to complete workload capability request for peer {peer_id}: {err}"
+                        );
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        target: "workload",
+                        "failed to send workload capability request to peer {peer_id}: {err}"
+                    );
+                    continue;
+                }
+            };
+
+            for spec in workloads {
+                // Remote stop is best-effort; failures are logged but do not abort cleanup.
+                let mut stop_req = workload_client.stop_request();
+                {
+                    let mut inner = stop_req.get().init_request();
+                    inner.set_id(spec.id.as_bytes());
+                }
+
+                match stop_req.send().promise.await {
+                    Ok(response) => {
+                        if let Err(err) = response.get() {
+                            warn!(
+                                target: "workload",
+                                "failed to stop remote workload {} on peer {peer_id}: {err}",
+                                spec.id
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            target: "workload",
+                            "failed to stop remote workload {} on peer {peer_id}: {err}",
+                            spec.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    async fn execute_remote_plans(
+        &self,
+        plans: &[RemoteStartPlan],
+    ) -> Result<Vec<(usize, WorkloadSpec)>, ExecutionError> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut by_peer: HashMap<Uuid, Vec<&RemoteStartPlan>> = HashMap::new();
+        for plan in plans {
+            by_peer.entry(plan.peer_id).or_default().push(plan);
+        }
+
+        let mut results = Vec::new();
+
+        for (peer_id, peer_plans) in by_peer.into_iter() {
+            let session = self
+                .remote_session(peer_id)
+                .await
+                .map_err(|err| ExecutionError::Retry(err))?;
+
+            let workload_client = session
+                .get_workload_request()
+                .send()
+                .promise
+                .await
+                .map_err(|err| ExecutionError::Retry(anyhow::anyhow!(err.to_string())))?
+                .get()
+                .map_err(|err| ExecutionError::Retry(anyhow::anyhow!(err.to_string())))?
+                .get_workload()
+                .map_err(|err| ExecutionError::Retry(anyhow::anyhow!(err.to_string())))?;
+
+            let mut start_req = workload_client.start_many_request();
+            {
+                let mut requests_builder = start_req.get().init_requests(peer_plans.len() as u32);
+                for (idx, plan) in peer_plans.iter().enumerate() {
+                    let mut entry = requests_builder.reborrow().get(idx as u32);
+                    entry.set_name(&plan.name);
+                    entry.set_image(&plan.image);
+                    entry.set_cpu_millis(plan.cpu_millis);
+                    entry.set_memory_bytes(plan.memory_bytes);
+                    entry.set_slot_id(plan.slot_id);
+                    entry.set_workload_id(plan.id.as_bytes());
+
+                    let mut cmd_builder = entry.reborrow().init_command(plan.command.len() as u32);
+                    for (arg_idx, arg) in plan.command.iter().enumerate() {
+                        cmd_builder.set(arg_idx as u32, arg);
+                    }
+                }
+            }
+
+            let response = match start_req.send().promise.await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let message = err.to_string();
+                    if message.contains("scheduler reservation failed")
+                        || message.contains("slots unavailable")
+                    {
+                        return Err(ExecutionError::Retry(anyhow::anyhow!(message)));
+                    }
+
+                    return Err(ExecutionError::Fatal(anyhow::anyhow!(message)));
+                }
+            };
+
+            let reader = response
+                .get()
+                .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
+            let specs_reader = reader
+                .get_specs()
+                .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
+
+            if specs_reader.len() as usize != peer_plans.len() {
+                return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                    "remote peer {peer_id} returned {} specs but {} plans were sent",
+                    specs_reader.len(),
+                    peer_plans.len()
+                )));
+            }
+
+            for (plan, spec_reader) in peer_plans.iter().zip(specs_reader.iter()) {
+                let spec = read_spec(spec_reader)
+                    .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
+                results.push((plan.index, spec));
+            }
+        }
+
+        Ok(results)
+    }
+
     async fn reserve_slots_for_workloads(
         &self,
-        intents: &[(Uuid, u64, u64)],
+        intents: &[(Uuid, Option<SlotId>, u64, u64)],
     ) -> Result<Vec<(SlotId, SlotCapacity)>, anyhow::Error> {
         if intents.is_empty() {
             return Ok(Vec::new());
@@ -243,24 +759,87 @@ impl WorkloadManager {
 
             let mut chosen = Vec::with_capacity(intents.len());
             let mut used = HashSet::with_capacity(intents.len());
+            let mut reserve = Vec::new();
 
             let mut insufficient = false;
-            for (_, cpu_millis, memory_bytes) in intents.iter() {
+            let mut slot_index = HashMap::new();
+            for slot in snapshot.slots.iter() {
+                slot_index.insert(slot.slot_id, slot);
+            }
+
+            for (workload_id, maybe_slot_id, cpu_millis, memory_bytes) in intents.iter() {
                 let mut candidate = None;
-                for slot in snapshot.slots.iter() {
-                    if matches!(slot.state, SlotState::Free)
-                        && slot.capacity.cpu_millis >= *cpu_millis
-                        && slot.capacity.memory_bytes >= *memory_bytes
-                        && !used.contains(&slot.slot_id)
-                    {
-                        candidate = Some((slot.slot_id, slot.capacity));
+
+                if let Some(slot_id) = maybe_slot_id {
+                    // Honor a caller-specified slot by verifying ownership and reusing the reservation when possible.
+                    let Some(slot) = slot_index.get(slot_id) else {
+                        insufficient = true;
                         break;
+                    };
+
+                    if slot.capacity.cpu_millis < *cpu_millis
+                        || slot.capacity.memory_bytes < *memory_bytes
+                    {
+                        insufficient = true;
+                        break;
+                    }
+
+                    match &slot.state {
+                        SlotState::Free => {
+                            if used.contains(slot_id) {
+                                insufficient = true;
+                                break;
+                            }
+                            candidate = Some((*slot_id, slot.capacity));
+                            used.insert(*slot_id);
+                            reserve.push(SlotReservationRequest {
+                                slot_id: *slot_id,
+                                owner: self.local_node_id,
+                                workload_id: Some(*workload_id),
+                            });
+                        }
+                        SlotState::Reserved(reservation) => {
+                            if reservation.owner != self.local_node_id {
+                                insufficient = true;
+                                break;
+                            }
+                            if let Some(existing) = reservation.workload_id {
+                                if existing != *workload_id {
+                                    insufficient = true;
+                                    break;
+                                }
+                            }
+
+                            if used.contains(slot_id) {
+                                insufficient = true;
+                                break;
+                            }
+
+                            used.insert(*slot_id);
+                            candidate = Some((*slot_id, slot.capacity));
+                        }
+                    }
+                } else {
+                    for slot in snapshot.slots.iter() {
+                        if matches!(slot.state, SlotState::Free)
+                            && slot.capacity.cpu_millis >= *cpu_millis
+                            && slot.capacity.memory_bytes >= *memory_bytes
+                            && !used.contains(&slot.slot_id)
+                        {
+                            used.insert(slot.slot_id);
+                            reserve.push(SlotReservationRequest {
+                                slot_id: slot.slot_id,
+                                owner: self.local_node_id,
+                                workload_id: Some(*workload_id),
+                            });
+                            candidate = Some((slot.slot_id, slot.capacity));
+                            break;
+                        }
                     }
                 }
 
-                if let Some((slot_id, capacity)) = candidate {
-                    used.insert(slot_id);
-                    chosen.push((slot_id, capacity));
+                if let Some(chosen_slot) = candidate {
+                    chosen.push(chosen_slot);
                 } else {
                     insufficient = true;
                     break;
@@ -273,21 +852,13 @@ impl WorkloadManager {
                 ));
             }
 
-            let requests: Vec<_> = intents
-                .iter()
-                .zip(chosen.iter())
-                .map(
-                    |((workload_id, _, _), (slot_id, _))| SlotReservationRequest {
-                        slot_id: *slot_id,
-                        owner: self.local_node_id,
-                        workload_id: Some(*workload_id),
-                    },
-                )
-                .collect();
+            if reserve.is_empty() {
+                return Ok(chosen);
+            }
 
             match self
                 .scheduler
-                .reserve_slots(snapshot.version, requests)
+                .reserve_slots(snapshot.version, reserve)
                 .await
             {
                 Ok(_) => return Ok(chosen),
@@ -377,24 +948,17 @@ impl WorkloadManager {
             specs.push(spec);
         }
 
-        let mut gossiped: Vec<WorkloadSpec> = Vec::new();
         for spec in &specs {
             if let Err(err) = self
                 .enqueue_gossip(WorkloadEvent::Upsert(spec.clone()))
                 .await
             {
-                for rollback in &gossiped {
-                    let _ = self
-                        .enqueue_gossip(WorkloadEvent::Remove { id: rollback.id })
-                        .await;
-                }
-                for rollback in &persisted {
-                    let _ = self.remove_spec(rollback.id).await;
-                }
-                return Err(err.context(format!("failed to broadcast workload spec {}", spec.name)));
+                warn!(
+                    target: "workload",
+                    "failed to enqueue workload gossip for {}: {err}",
+                    spec.name
+                );
             }
-
-            gossiped.push(spec.clone());
         }
 
         {
@@ -450,6 +1014,8 @@ impl WorkloadManager {
                 }
             }
         }
+
+        self.cleanup_orphaned_slots().await;
     }
 
     /// Returns workload specifications filtered according to the provided list policy.
@@ -506,6 +1072,113 @@ impl WorkloadManager {
 
     fn tx(&self) -> Sender<Message> {
         self.tx.clone()
+    }
+
+    async fn broadcast_remote_specs(&self, specs: &[WorkloadSpec]) {
+        for spec in specs {
+            if spec.node_id == self.local_node_id {
+                continue;
+            }
+
+            if let Err(err) = self
+                .enqueue_gossip(WorkloadEvent::Upsert(spec.clone()))
+                .await
+            {
+                warn!(
+                    target: "workload",
+                    "failed to relay workload {} from node {}: {err}",
+                    spec.name,
+                    spec.node_id
+                );
+            }
+        }
+    }
+
+    async fn cleanup_orphaned_slots(&self) {
+        const MAX_ATTEMPTS: usize = 5;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let snapshot = match self.scheduler.snapshot().await {
+                Some(snapshot) => snapshot,
+                None => return,
+            };
+
+            let reserved: Vec<SlotId> = snapshot
+                .slots
+                .iter()
+                .filter_map(|slot| match &slot.state {
+                    SlotState::Reserved(reservation) if reservation.owner == self.local_node_id => {
+                        Some(slot.slot_id)
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            if reserved.is_empty() {
+                return;
+            }
+
+            let active = match self.collect_local_slot_ids().await {
+                Ok(ids) => ids,
+                Err(err) => {
+                    warn!(
+                        target: "workload",
+                        "failed to collect active slots while cleaning orphans: {err}"
+                    );
+                    return;
+                }
+            };
+
+            let to_free: Vec<SlotId> = reserved
+                .into_iter()
+                .filter(|slot_id| !active.contains(slot_id))
+                .collect();
+
+            if to_free.is_empty() {
+                return;
+            }
+
+            match self
+                .scheduler
+                .free_slots(snapshot.version, to_free.clone())
+                .await
+            {
+                Ok(_) => return,
+                Err(SchedulerError::SnapshotMismatch { .. })
+                | Err(SchedulerError::SlotsNotReserved { .. }) => continue,
+                Err(err) => {
+                    warn!(
+                        target: "workload",
+                        "failed to free orphaned slots {:?}: {err}",
+                        to_free
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn collect_local_slot_ids(&self) -> Result<HashSet<SlotId>, anyhow::Error> {
+        let (actives, _) = self
+            .store
+            .load_all()
+            .map_err(|e| anyhow::anyhow!("workload store load_all failed: {e}"))?;
+
+        let mut slots = HashSet::new();
+        for (key, snapshot) in actives {
+            let id = key.to_uuid();
+            if let Some(value) = snapshot.as_slice().last() {
+                if value.node_id == self.local_node_id {
+                    if let Some(slot_id) = value.slot_id {
+                        slots.insert(slot_id);
+                    }
+                }
+            } else {
+                let _ = self.remove_spec(id).await;
+            }
+        }
+
+        Ok(slots)
     }
 
     async fn enqueue_gossip(&self, event: WorkloadEvent) -> Result<(), anyhow::Error> {
@@ -619,6 +1292,7 @@ impl WorkloadManager {
         self.persist_spec(&updated).await?;
         self.enqueue_gossip(WorkloadEvent::Upsert(updated.clone()))
             .await?;
+        self.cleanup_orphaned_slots().await;
         Ok(updated)
     }
 
@@ -811,8 +1485,9 @@ mod tests {
             health_monitor,
         );
 
-        let scheduler =
-            Rc::new(Scheduler::new(scheduler_store, registry, actor).expect("scheduler init"));
+        let scheduler = Rc::new(
+            Scheduler::new(scheduler_store, registry.clone(), actor).expect("scheduler init"),
+        );
         scheduler
             .init_slots([
                 SlotSpec::new(0, SlotCapacity::new(1_000, 1_024 * 1_024 * 1_024)),
@@ -835,6 +1510,7 @@ mod tests {
             "local-node",
             scheduler.clone(),
             container_manager,
+            registry,
         );
 
         (manager, scheduler, mock_manager)
@@ -998,6 +1674,8 @@ mod tests {
                     command: vec![],
                     cpu_millis: 400,
                     memory_bytes: 128 * 1_024 * 1_024,
+                    id: None,
+                    slot_id: None,
                 },
                 ContainerStartRequest {
                     name: "svc-b".into(),
@@ -1005,6 +1683,8 @@ mod tests {
                     command: vec![],
                     cpu_millis: 200,
                     memory_bytes: 64 * 1_024 * 1_024,
+                    id: None,
+                    slot_id: None,
                 },
             ])
             .await
@@ -1043,6 +1723,8 @@ mod tests {
                     command: vec![],
                     cpu_millis: 200,
                     memory_bytes: 64 * 1_024 * 1_024,
+                    id: None,
+                    slot_id: None,
                 },
                 ContainerStartRequest {
                     name: "svc-d".into(),
@@ -1050,6 +1732,8 @@ mod tests {
                     command: vec![],
                     cpu_millis: 200,
                     memory_bytes: 64 * 1_024 * 1_024,
+                    id: None,
+                    slot_id: None,
                 },
             ])
             .await

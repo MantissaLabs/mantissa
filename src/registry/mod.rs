@@ -2,6 +2,7 @@ use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::topology::peers::PeerValue;
 use ::health::HealthMonitor;
+use anyhow::{Result as AnyResult, anyhow};
 use ed25519_dalek::SigningKey;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::health;
@@ -141,6 +142,27 @@ impl Registry {
                 None
             }
         }
+    }
+
+    pub fn known_peers(&self) -> AnyResult<Vec<Uuid>> {
+        let (actives, _) = self
+            .peers
+            .load_all()
+            .map_err(|e| anyhow!("failed to load peer store: {e}"))?;
+
+        let mut ids = Vec::new();
+        for (key, snapshot) in actives {
+            let peer_id = key.to_uuid();
+            if peer_id == self.node_id {
+                continue;
+            }
+
+            if snapshot.as_slice().last().is_some() {
+                ids.push(peer_id);
+            }
+        }
+
+        Ok(ids)
     }
 
     pub async fn session_for_peer(&self, peer_id: Uuid) -> Option<cluster_session::Client> {

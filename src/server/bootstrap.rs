@@ -359,6 +359,7 @@ impl Bootstrap {
             local_node_name.clone(),
             scheduler.clone(),
             container_manager,
+            registry.clone(),
         );
 
         let service_registry = ServiceRegistry::new(stores.services.clone());
