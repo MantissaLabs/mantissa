@@ -96,12 +96,34 @@ impl ServiceController {
 
     async fn stop_workloads(&self, spec: &ServiceSpecValue) {
         for workload_id in &spec.workload_ids {
-            if let Err(err) = self.workload_manager.stop_workload(*workload_id).await {
-                tracing::warn!(
-                    target: "services",
-                    "failed to stop workload {workload_id} for service {}: {err}",
-                    spec.service_name
-                );
+            match self
+                .workload_manager
+                .workload_owned_locally(*workload_id)
+                .await
+            {
+                Ok(true) => {
+                    if let Err(err) = self.workload_manager.stop_workload(*workload_id).await {
+                        tracing::warn!(
+                            target: "services",
+                            "failed to stop workload {workload_id} for service {}: {err}",
+                            spec.service_name
+                        );
+                    }
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        target: "services",
+                        "skipping remote workload {workload_id} while stopping service {}",
+                        spec.service_name
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to inspect workload {workload_id} for service {}: {err}",
+                        spec.service_name
+                    );
+                }
             }
         }
     }

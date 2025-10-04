@@ -1371,6 +1371,11 @@ impl WorkloadManager {
         Ok(value_to_spec(id, value))
     }
 
+    pub async fn workload_owned_locally(&self, id: Uuid) -> Result<bool, anyhow::Error> {
+        let spec = self.load_spec(id).await?;
+        Ok(spec.node_id == self.local_node_id)
+    }
+
     pub async fn stop_workload(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
         let spec = self.load_spec(id).await?;
         let node_name = spec.node_name.clone();
@@ -1922,6 +1927,51 @@ mod tests {
 
         let created = mock_cm.created.lock().await.clone();
         assert_eq!(created.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn workload_owned_locally_detects_remote_entries() {
+        let (manager, _scheduler, _mock_cm) = setup_manager().await;
+
+        let local_spec = manager
+            .start_container("local", "img", vec![], 200, 64 * 1_024 * 1_024)
+            .await
+            .expect("start local workload");
+
+        assert!(
+            manager
+                .workload_owned_locally(local_spec.id)
+                .await
+                .expect("local ownership check")
+        );
+
+        let remote_id = Uuid::new_v4();
+        let remote_value = WorkloadValue::new(
+            remote_id,
+            "remote",
+            "img",
+            ContainerState::Running,
+            Utc::now().to_rfc3339(),
+            vec![],
+            Uuid::new_v4(),
+            "remote-node",
+            Some(1),
+            100,
+            64 * 1_024 * 1_024,
+        );
+
+        let store = manager.store.clone();
+        store
+            .upsert(&UuidKey::from(remote_id), remote_value)
+            .await
+            .expect("insert remote workload value");
+
+        assert!(
+            !manager
+                .workload_owned_locally(remote_id)
+                .await
+                .expect("remote ownership check")
+        );
     }
 
     #[tokio::test]
