@@ -2,7 +2,8 @@ use crate::gossip::Message;
 use crate::registry::Registry;
 use crate::scheduler::summary::SchedulerSlotState;
 use crate::scheduler::{
-    Scheduler, SchedulerError, SlotCapacity, SlotId, SlotReservationRequest, SlotState,
+    Scheduler, SchedulerError, SchedulerSnapshot, SlotCapacity, SlotId, SlotReservationRequest,
+    SlotState,
 };
 use crate::store::workload_store::WorkloadStore;
 use crate::workload::container::ContainerState;
@@ -13,7 +14,7 @@ use anyhow::Context;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
 use crdt_store::uuid_key::UuidKey;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,15 +83,46 @@ struct SlotChoice {
     capacity: SlotCapacity,
 }
 
-enum CandidateKind {
+/// Identifies whether a scheduling candidate refers to this node or a remote peer.
+#[derive(Clone)]
+enum CandidateLocation {
     Local,
-    Remote { peer_id: Uuid },
+    Remote { peer_id: Uuid, version: u64 },
 }
 
-struct NodeCandidate {
-    kind: CandidateKind,
-    version: u64,
+/// Wrapper for a node's free slots together with the metadata needed to build
+/// either a local or remote plan once a slot is assigned.
+struct Candidate {
+    location: CandidateLocation,
     slots: Vec<SlotChoice>,
+}
+
+impl Candidate {
+    /// Returns `Some` when the node has at least one usable slot; otherwise we
+    /// drop the candidate early so later stages don't need to handle empties.
+    fn new(location: CandidateLocation, slots: Vec<SlotChoice>) -> Option<Self> {
+        if slots.is_empty() {
+            None
+        } else {
+            Some(Self { location, slots })
+        }
+    }
+
+    /// Removes and returns the first slot that can satisfy the requested resources.
+    /// Keeping the allocation logic here avoids duplicating the capacity checks.
+    fn allocate(&mut self, cpu_millis: u64, memory_bytes: u64) -> Option<SlotChoice> {
+        if let Some(pos) = self.slots.iter().position(|slot| {
+            slot.capacity.cpu_millis >= cpu_millis && slot.capacity.memory_bytes >= memory_bytes
+        }) {
+            Some(self.slots.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
 }
 
 struct RemoteStartPlan {
@@ -126,18 +158,6 @@ fn is_scheduler_retryable_message(message: &str) -> bool {
     message.contains("snapshot mismatch")
         || message.contains("slots unavailable")
         || message.contains("unknown slots")
-}
-
-impl NodeCandidate {
-    fn take_slot(&mut self, cpu_millis: u64, memory_bytes: u64) -> Option<SlotChoice> {
-        if let Some(pos) = self.slots.iter().position(|slot| {
-            slot.capacity.cpu_millis >= cpu_millis && slot.capacity.memory_bytes >= memory_bytes
-        }) {
-            Some(self.slots.remove(pos))
-        } else {
-            None
-        }
-    }
 }
 
 impl WorkloadManager {
@@ -360,6 +380,12 @@ impl WorkloadManager {
         ))
     }
 
+    /// Compute a placement plan for a batch of start intents.
+    ///
+    /// The pipeline is intentionally broken down into three steps for clarity:
+    /// 1. Attach any pre-assigned local slots that came from the request (seed_local_plans).
+    /// 2. Discover the candidates (local node + remote peers) that can satisfy the rest.
+    /// 3. Walk the remaining intents in order and pick a slot from the candidate queue.
     async fn compute_assignment(
         &self,
         intents: &[StartIntent],
@@ -379,7 +405,36 @@ impl WorkloadManager {
             .ok_or_else(|| anyhow::anyhow!("scheduler snapshot unavailable"))?;
 
         let local_version = snapshot.version;
+        let (mut assignment, remaining_intents, available_slots) =
+            self.seed_local_plans(intents, &snapshot, local_version)?;
 
+        if remaining_intents.is_empty() {
+            assignment.local.sort_by_key(|plan| plan.index);
+            return Ok(assignment);
+        }
+
+        let mut candidates = self.build_candidate_queue(available_slots).await?;
+        if candidates.is_empty() {
+            return Err(anyhow::anyhow!(
+                "scheduler reservation failed: no available capacity across cluster"
+            ));
+        }
+
+        self.allocate_remaining(&mut assignment, &mut candidates, remaining_intents)?;
+        assignment.local.sort_by_key(|plan| plan.index);
+        assignment.remote.sort_by_key(|plan| plan.index);
+        Ok(assignment)
+    }
+
+    /// Prepare an initial `Assignment` containing all workloads that specified
+    /// a concrete local slot. The remaining intents plus the list of free local
+    /// slots are returned for the distributed placement step.
+    fn seed_local_plans<'a>(
+        &'a self,
+        intents: &'a [StartIntent],
+        snapshot: &SchedulerSnapshot,
+        local_version: u64,
+    ) -> Result<(Assignment, Vec<&'a StartIntent>, Vec<SlotChoice>), anyhow::Error> {
         let mut slot_lookup = HashMap::new();
         let mut available_local_slots = Vec::new();
         for slot in snapshot.slots.iter() {
@@ -393,72 +448,85 @@ impl WorkloadManager {
         }
 
         let mut local_plans = Vec::new();
-        let mut remote_plans = Vec::new();
-        let mut assigned = vec![false; intents.len()];
-        let mut reserved_local_slots = HashSet::new();
-
         for intent in intents.iter() {
-            if let Some(slot_id) = intent.preassigned_slot {
-                let slot = slot_lookup
-                    .get(&slot_id)
-                    .ok_or_else(|| anyhow::anyhow!("unknown preassigned slot {slot_id}"))?;
+            let Some(slot_id) = intent.preassigned_slot else {
+                continue;
+            };
+            let slot = slot_lookup
+                .get(&slot_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown preassigned slot {slot_id}"))?;
 
-                if slot.capacity.cpu_millis < intent.cpu_millis
-                    || slot.capacity.memory_bytes < intent.memory_bytes
-                {
+            // Caller provided a slot ID that does not satisfy the capacity expectations.
+            if slot.capacity.cpu_millis < intent.cpu_millis
+                || slot.capacity.memory_bytes < intent.memory_bytes
+            {
+                return Err(anyhow::anyhow!(
+                    "preassigned slot {slot_id} cannot satisfy requested capacity"
+                ));
+            }
+
+            // Ensure we own the reservation and (if present) that it references the same workload.
+            if let SlotState::Reserved(reservation) = &slot.state {
+                if reservation.owner != self.local_node_id {
                     return Err(anyhow::anyhow!(
-                        "preassigned slot {slot_id} cannot satisfy requested capacity"
+                        "preassigned slot {slot_id} owned by different node"
                     ));
                 }
 
-                if let SlotState::Reserved(reservation) = &slot.state {
-                    if reservation.owner != self.local_node_id {
+                if let Some(workload_id) = reservation.workload_id {
+                    if workload_id != intent.id {
                         return Err(anyhow::anyhow!(
-                            "preassigned slot {slot_id} owned by different node"
+                            "preassigned slot {slot_id} reserved for workload {workload_id}"
                         ));
                     }
-
-                    if let Some(workload_id) = reservation.workload_id {
-                        if workload_id != intent.id {
-                            return Err(anyhow::anyhow!(
-                                "preassigned slot {slot_id} reserved for workload {workload_id}"
-                            ));
-                        }
-                    }
                 }
-
-                reserved_local_slots.insert(slot_id);
-                assigned[intent.index] = true;
-
-                local_plans.push(BatchStartPlan {
-                    id: intent.id,
-                    name: intent.name.clone(),
-                    image: intent.image.clone(),
-                    command: intent.command.clone(),
-                    slot_id,
-                    slot_capacity: slot.capacity,
-                    container_name: String::new(),
-                    container_id: None,
-                    created_at: Utc::now(),
-                    index: intent.index,
-                    preassigned: true,
-                });
             }
+
+            // Remove the slot from the free pool so we do not offer it again later on.
+            available_local_slots.retain(|slot| slot.slot_id != slot_id);
+
+            local_plans.push(BatchStartPlan {
+                id: intent.id,
+                name: intent.name.clone(),
+                image: intent.image.clone(),
+                command: intent.command.clone(),
+                slot_id,
+                slot_capacity: slot.capacity,
+                container_name: String::new(),
+                container_id: None,
+                created_at: Utc::now(),
+                index: intent.index,
+                preassigned: true,
+            });
         }
 
-        if !reserved_local_slots.is_empty() {
-            available_local_slots.retain(|slot| !reserved_local_slots.contains(&slot.slot_id));
+        let assignment = Assignment {
+            local_version,
+            local: local_plans,
+            remote: Vec::new(),
+        };
+        let remaining_intents: Vec<&StartIntent> = intents
+            .iter()
+            .filter(|intent| intent.preassigned_slot.is_none())
+            .collect();
+
+        Ok((assignment, remaining_intents, available_local_slots))
+    }
+
+    /// Build the round-robin candidate queue starting with the local node followed
+    /// by a shuffled list of peers. Each candidate wraps the slots currently
+    /// reported as free by the relevant scheduler snapshot.
+    async fn build_candidate_queue(
+        &self,
+        local_slots: Vec<SlotChoice>,
+    ) -> Result<VecDeque<Candidate>, anyhow::Error> {
+        let mut queue = VecDeque::new();
+        if let Some(local_candidate) = Candidate::new(CandidateLocation::Local, local_slots) {
+            queue.push_back(local_candidate);
         }
 
-        let mut nodes = Vec::new();
-        nodes.push(NodeCandidate {
-            kind: CandidateKind::Local,
-            version: local_version,
-            slots: available_local_slots,
-        });
-
-        let mut remote_candidates = Vec::new();
         let peers = self.registry.known_peers()?;
+        let mut remote_candidates = Vec::new();
         for peer_id in peers {
             if peer_id == self.local_node_id {
                 continue;
@@ -475,78 +543,80 @@ impl WorkloadManager {
                 }
             };
 
-            let mut slots = Vec::new();
-            for detail in summary.details.iter() {
-                if !matches!(detail.state, SchedulerSlotState::Free) {
-                    continue;
-                }
-
-                slots.push(SlotChoice {
+            let slots: Vec<SlotChoice> = summary
+                .details
+                .iter()
+                .filter(|detail| matches!(detail.state, SchedulerSlotState::Free))
+                .map(|detail| SlotChoice {
                     slot_id: detail.slot_id,
                     capacity: SlotCapacity::new(detail.cpu_millis, detail.memory_bytes),
-                });
-            }
+                })
+                .collect();
 
-            if slots.is_empty() {
-                continue;
-            }
-
-            remote_candidates.push(NodeCandidate {
-                kind: CandidateKind::Remote { peer_id },
-                version: summary.version,
+            if let Some(candidate) = Candidate::new(
+                CandidateLocation::Remote {
+                    peer_id,
+                    version: summary.version,
+                },
                 slots,
-            });
+            ) {
+                remote_candidates.push(candidate);
+            }
         }
 
         let mut rng = rng();
         remote_candidates.shuffle(&mut rng);
-        nodes.extend(remote_candidates);
-
-        if nodes.is_empty() {
-            if local_plans.len() == intents.len() {
-                local_plans.sort_by_key(|plan| plan.index);
-                return Ok(Assignment {
-                    local_version,
-                    local: local_plans,
-                    remote: remote_plans,
-                });
-            }
-
-            return Err(anyhow::anyhow!(
-                "scheduler reservation failed: no available capacity across cluster"
-            ));
+        for candidate in remote_candidates {
+            queue.push_back(candidate);
         }
 
-        let node_count = nodes.len();
-        let mut cursor = 0usize;
+        Ok(queue)
+    }
 
-        for intent in intents.iter() {
-            if assigned[intent.index] {
-                continue;
+    /// Allocate the remaining intents across the candidate queue. The queue is
+    /// treated as a ring: after examining a candidate we move it to the back so
+    /// subsequent intents see a rotated view, which naturally spreads replicas.
+    fn allocate_remaining(
+        &self,
+        assignment: &mut Assignment,
+        candidates: &mut VecDeque<Candidate>,
+        intents: Vec<&StartIntent>,
+    ) -> Result<(), anyhow::Error> {
+        for intent in intents {
+            let candidate_count = candidates.len();
+            if candidate_count == 0 {
+                return Err(anyhow::anyhow!(
+                    "scheduler reservation failed: insufficient capacity for batch"
+                ));
             }
 
-            // Walk the candidate ring in round-robin order so replicas alternate across nodes.
-            let mut allocated = None;
-            let mut checked = 0usize;
-            while checked < node_count {
-                let idx = (cursor + checked) % node_count;
-                if let Some(slot) = nodes[idx].take_slot(intent.cpu_millis, intent.memory_bytes) {
-                    allocated = Some((idx, slot));
-                    cursor = (idx + 1) % node_count;
+            let mut allocated: Option<(CandidateLocation, SlotChoice)> = None;
+            for _ in 0..candidate_count {
+                let mut candidate = candidates
+                    .pop_front()
+                    .expect("candidate deque should not be empty");
+
+                if let Some(slot) = candidate.allocate(intent.cpu_millis, intent.memory_bytes) {
+                    let location = candidate.location.clone();
+                    if !candidate.is_empty() {
+                        candidates.push_back(candidate);
+                    }
+                    allocated = Some((location, slot));
                     break;
+                } else {
+                    candidates.push_back(candidate);
                 }
-                checked += 1;
             }
 
-            let Some((node_idx, slot)) = allocated else {
+            let Some((location, slot)) = allocated else {
                 return Err(anyhow::anyhow!(
                     "scheduler reservation failed: insufficient capacity for batch"
                 ));
             };
 
-            match &nodes[node_idx].kind {
-                CandidateKind::Local => {
-                    local_plans.push(BatchStartPlan {
+            match location {
+                CandidateLocation::Local => {
+                    assignment.local.push(BatchStartPlan {
                         id: intent.id,
                         name: intent.name.clone(),
                         image: intent.image.clone(),
@@ -560,8 +630,8 @@ impl WorkloadManager {
                         preassigned: false,
                     });
                 }
-                CandidateKind::Remote { peer_id } => {
-                    remote_plans.push(RemoteStartPlan {
+                CandidateLocation::Remote { peer_id, version } => {
+                    assignment.remote.push(RemoteStartPlan {
                         index: intent.index,
                         id: intent.id,
                         name: intent.name.clone(),
@@ -570,23 +640,14 @@ impl WorkloadManager {
                         cpu_millis: intent.cpu_millis,
                         memory_bytes: intent.memory_bytes,
                         slot_id: slot.slot_id,
-                        peer_id: *peer_id,
-                        scheduler_version: nodes[node_idx].version,
+                        peer_id,
+                        scheduler_version: version,
                     });
                 }
             }
-
-            assigned[intent.index] = true;
         }
 
-        local_plans.sort_by_key(|plan| plan.index);
-        remote_plans.sort_by_key(|plan| plan.index);
-
-        Ok(Assignment {
-            local_version,
-            local: local_plans,
-            remote: remote_plans,
-        })
+        Ok(())
     }
 
     async fn start_local_containers(
@@ -1526,7 +1587,7 @@ mod tests {
     use crate::store::peer_store::open_peers_store;
     use crate::store::scheduler_store::open_scheduler_store;
     use crate::store::workload_store::open_workload_store;
-    use crate::workload::types::WorkloadStateKind;
+    use crate::workload::types::{WorkloadStateKind, WorkloadValue};
     use ::health::{Config as HealthConfig, HealthMonitor};
     use async_channel::bounded;
     use async_trait::async_trait;
