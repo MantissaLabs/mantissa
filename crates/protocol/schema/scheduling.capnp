@@ -103,9 +103,19 @@ struct ReserveSlotsResponse {
   newVersion @0 :UInt64;
 }
 
+struct ReleaseSlotsRequest {
+  expectedVersion @0 :UInt64;
+  slotIds @1 :List(UInt64);
+}
+
+struct ReleaseSlotsResponse {
+  newVersion @0 :UInt64;
+}
+
 interface Scheduler {
   summary @0 (request :SummaryRequest) -> (summary :Summary);
   reserveSlots @1 (request :ReserveSlotsRequest) -> (response :ReserveSlotsResponse);
+  releaseSlots @2 (request :ReleaseSlotsRequest) -> (response :ReleaseSlotsResponse);
 }
 
 struct Workload {

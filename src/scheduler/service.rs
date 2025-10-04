@@ -126,4 +126,35 @@ impl scheduler::Server for SchedulerService {
             Ok(())
         })
     }
+
+    fn release_slots(
+        &mut self,
+        params: scheduler::ReleaseSlotsParams,
+        mut results: scheduler::ReleaseSlotsResults,
+    ) -> Promise<(), capnp::Error> {
+        let scheduler = self.scheduler.clone();
+
+        Promise::from_future(async move {
+            let request = params.get()?.get_request()?;
+            let expected_version = request.get_expected_version();
+
+            let ids_reader = request.get_slot_ids()?;
+            let mut slot_ids = Vec::with_capacity(ids_reader.len() as usize);
+            for slot_id in ids_reader.iter() {
+                slot_ids.push(slot_id);
+            }
+
+            let snapshot = scheduler
+                .free_slots(expected_version, slot_ids)
+                .await
+                .map_err(|err| capnp::Error::failed(err.to_string()))?;
+
+            results
+                .get()
+                .init_response()
+                .set_new_version(snapshot.version);
+
+            Ok(())
+        })
+    }
 }
