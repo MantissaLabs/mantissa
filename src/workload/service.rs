@@ -225,9 +225,14 @@ impl workload::Server for WorkloadService {
                 let image = entry.get_image()?.to_str()?.to_string();
                 let cpu_millis = entry.get_cpu_millis();
                 let memory_bytes = entry.get_memory_bytes();
-                let slot_id = match entry.get_slot_id() {
+                let raw_slot_id = entry.get_slot_id();
+                let slot_id = match raw_slot_id {
                     0 => None,
-                    value => Some(value),
+                    value => Some(
+                        value
+                            .checked_sub(1)
+                            .expect("slot id decoding underflow in workload request"),
+                    ),
                 };
 
                 let workload_id = {

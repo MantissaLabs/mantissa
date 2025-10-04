@@ -61,6 +61,7 @@ struct BatchStartPlan {
     container_id: Option<String>,
     created_at: DateTime<Utc>,
     index: usize,
+    preassigned: bool,
 }
 
 #[derive(Clone)]
@@ -440,6 +441,7 @@ impl WorkloadManager {
                     container_id: None,
                     created_at: Utc::now(),
                     index: intent.index,
+                    preassigned: true,
                 });
             }
         }
@@ -555,6 +557,7 @@ impl WorkloadManager {
                         container_id: None,
                         created_at: Utc::now(),
                         index: intent.index,
+                        preassigned: false,
                     });
                 }
                 CandidateKind::Remote { peer_id } => {
@@ -629,12 +632,19 @@ impl WorkloadManager {
         }
 
         let mut requests = Vec::with_capacity(plans.len());
+        let mut newly_reserved = Vec::with_capacity(plans.len());
+
         for plan in plans {
+            if plan.preassigned {
+                continue;
+            }
+
             requests.push(SlotReservationRequest {
                 slot_id: plan.slot_id,
                 owner: self.local_node_id,
                 workload_id: Some(plan.id),
             });
+            newly_reserved.push(plan.slot_id);
         }
 
         if requests.is_empty() {
@@ -646,7 +656,7 @@ impl WorkloadManager {
             .reserve_slots(expected_version, requests)
             .await
         {
-            Ok(_) => Ok(plans.iter().map(|plan| plan.slot_id).collect()),
+            Ok(_) => Ok(newly_reserved),
             Err(err @ SchedulerError::SnapshotMismatch { .. })
             | Err(err @ SchedulerError::SlotsUnavailable { .. })
             | Err(err @ SchedulerError::UnknownSlots { .. }) => {
@@ -975,7 +985,11 @@ impl WorkloadManager {
                     entry.set_image(&plan.image);
                     entry.set_cpu_millis(plan.cpu_millis);
                     entry.set_memory_bytes(plan.memory_bytes);
-                    entry.set_slot_id(plan.slot_id);
+                    let encoded_slot_id = plan
+                        .slot_id
+                        .checked_add(1)
+                        .expect("slot id overflow while encoding reservation");
+                    entry.set_slot_id(encoded_slot_id);
                     entry.set_workload_id(plan.id.as_bytes());
 
                     let mut cmd_builder = entry.reborrow().init_command(plan.command.len() as u32);
@@ -1852,6 +1866,62 @@ mod tests {
 
         let created = mock_cm.created.lock().await.clone();
         assert_eq!(created.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn start_containers_batch_respects_existing_reservations() {
+        let (manager, scheduler, mock_cm) = setup_manager().await;
+
+        let workload_id = Uuid::new_v4();
+        let slot_id = 0;
+
+        scheduler
+            .reserve_slots(
+                0,
+                vec![SlotReservationRequest {
+                    slot_id,
+                    owner: manager.local_node_id,
+                    workload_id: Some(workload_id),
+                }],
+            )
+            .await
+            .expect("pre-reserve slot");
+
+        let specs = manager
+            .start_containers_batch(vec![ContainerStartRequest {
+                name: "svc-pre".into(),
+                image: "img".into(),
+                command: vec![],
+                cpu_millis: 200,
+                memory_bytes: 64 * 1_024 * 1_024,
+                id: Some(workload_id),
+                slot_id: Some(slot_id),
+            }])
+            .await
+            .expect("start with pre-reserved slot");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].slot_id, Some(slot_id));
+
+        let snapshot = scheduler.snapshot().await.expect("snapshot");
+        assert_eq!(snapshot.version, 1);
+        let reserved: Vec<_> = snapshot
+            .slots
+            .iter()
+            .filter(|slot| matches!(slot.state, SlotState::Reserved(_)))
+            .collect();
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(reserved[0].slot_id, slot_id);
+        match &reserved[0].state {
+            SlotState::Reserved(reservation) => {
+                assert_eq!(reservation.owner, manager.local_node_id);
+                assert_eq!(reservation.workload_id, Some(workload_id));
+            }
+            _ => unreachable!("slot should be reserved"),
+        }
+
+        let created = mock_cm.created.lock().await.clone();
+        assert_eq!(created.len(), 1);
     }
 
     #[tokio::test]
