@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bollard::Docker;
@@ -17,6 +18,7 @@ use bollard::service::ContainerInspectResponse;
 
 use async_trait::async_trait;
 use log::{debug, error, info};
+use once_cell::sync::Lazy;
 use thiserror::Error;
 
 /// Errors that can occur during container operations
@@ -165,6 +167,32 @@ impl DockerContainerManager {
             Docker::connect_with_defaults()
         }
     }
+}
+
+static CONTAINER_MANAGER_OVERRIDE: Lazy<Mutex<Option<Arc<dyn ContainerManager + Send + Sync>>>> =
+    Lazy::new(|| Mutex::new(None));
+
+pub fn container_manager_override() -> Option<Arc<dyn ContainerManager + Send + Sync>> {
+    CONTAINER_MANAGER_OVERRIDE
+        .lock()
+        .expect("container manager override mutex poisoned")
+        .as_ref()
+        .cloned()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_container_manager_override(manager: Arc<dyn ContainerManager + Send + Sync>) {
+    *CONTAINER_MANAGER_OVERRIDE
+        .lock()
+        .expect("container manager override mutex poisoned") = Some(manager);
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn clear_container_manager_override() {
+    CONTAINER_MANAGER_OVERRIDE
+        .lock()
+        .expect("container manager override mutex poisoned")
+        .take();
 }
 
 #[async_trait]

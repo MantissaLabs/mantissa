@@ -1889,7 +1889,10 @@ mod tests {
             .start_container("svc", "image", vec![], 2_000, 512 * 1_024 * 1_024)
             .await
             .expect_err("reservation should fail");
-        assert!(err.to_string().contains("scheduler reservation failed"));
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string().contains("scheduler reservation failed"))
+        );
     }
 
     #[tokio::test]
@@ -2070,7 +2073,10 @@ mod tests {
             .await
             .expect_err("batch should fail when capacity is insufficient");
 
-        assert!(err.to_string().contains("scheduler reservation failed"));
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string().contains("scheduler reservation failed"))
+        );
 
         let created_after = mock_cm.created.lock().await.len();
         assert_eq!(created_before, created_after);
