@@ -68,6 +68,30 @@ pub async fn register_manifest(
     Ok(())
 }
 
+/// Return true when the local service registry already has `service_name`.
+pub async fn service_exists(cfg: &ClientConfig, service_name: &str) -> Result<bool> {
+    let client = connection::get_local_session(cfg).await?;
+    let request = client.get_services_request();
+    let services_client: services::Client = request.send().pipeline.get_services();
+
+    let response = services_client
+        .list_request()
+        .send()
+        .promise
+        .await
+        .context("failed to query registered services")?;
+    let reader = response.get()?;
+    let specs = reader.get_services()?;
+
+    for spec in specs.iter() {
+        if spec.get_service_name()?.to_str()? == service_name {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) {
     builder.set_name(&task.name);
     builder.set_image(&task.image);
