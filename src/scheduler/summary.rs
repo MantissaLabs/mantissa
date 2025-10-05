@@ -27,6 +27,7 @@ pub struct SchedulerSummary {
     pub free_slots: u32,
     pub reserved_slots: u32,
     pub details: Vec<SchedulerSlotDetail>,
+    pub version: u64,
 }
 
 impl SchedulerSummary {
@@ -43,6 +44,7 @@ impl SchedulerSummary {
             free_slots: 0,
             reserved_slots: 0,
             details: Vec::new(),
+            version: 0,
         };
 
         let Some(snapshot) = snapshot else {
@@ -50,6 +52,7 @@ impl SchedulerSummary {
         };
 
         summary.total_slots = snapshot.slots.len() as u32;
+        summary.version = snapshot.version;
 
         for slot in &snapshot.slots {
             match &slot.state {
@@ -96,6 +99,7 @@ impl SchedulerSummary {
         let total_slots = reader.get_total_slots();
         let free_slots = reader.get_free_slots();
         let reserved_slots = reader.get_reserved_slots();
+        let version = reader.get_version();
 
         let mut details = Vec::new();
         for detail in reader.get_details()?.iter() {
@@ -140,6 +144,7 @@ impl SchedulerSummary {
             free_slots,
             reserved_slots,
             details,
+            version,
         })
     }
 
@@ -152,6 +157,7 @@ impl SchedulerSummary {
         builder.set_total_slots(self.total_slots);
         builder.set_free_slots(self.free_slots);
         builder.set_reserved_slots(self.reserved_slots);
+        builder.set_version(self.version);
 
         let mut details_builder = builder.reborrow().init_details(self.details.len() as u32);
         for (idx, detail) in self.details.iter().enumerate() {

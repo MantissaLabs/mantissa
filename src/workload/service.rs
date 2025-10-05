@@ -225,6 +225,26 @@ impl workload::Server for WorkloadService {
                 let image = entry.get_image()?.to_str()?.to_string();
                 let cpu_millis = entry.get_cpu_millis();
                 let memory_bytes = entry.get_memory_bytes();
+                let raw_slot_id = entry.get_slot_id();
+                let slot_id = match raw_slot_id {
+                    0 => None,
+                    value => Some(
+                        value
+                            .checked_sub(1)
+                            .expect("slot id decoding underflow in workload request"),
+                    ),
+                };
+
+                let workload_id = {
+                    let bytes = entry.get_workload_id()?;
+                    if bytes.len() == 16 {
+                        let mut arr = [0u8; 16];
+                        arr.copy_from_slice(bytes);
+                        Some(Uuid::from_bytes(arr))
+                    } else {
+                        None
+                    }
+                };
 
                 let mut command = Vec::new();
                 for arg in entry.get_command()?.iter() {
@@ -237,6 +257,8 @@ impl workload::Server for WorkloadService {
                     command,
                     cpu_millis,
                     memory_bytes,
+                    id: workload_id,
+                    slot_id,
                 });
             }
 

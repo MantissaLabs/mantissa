@@ -1,7 +1,8 @@
 use super::manifest::ServiceManifest;
 use super::run::{StartedWorkload, WorkloadStartParams, run_many};
-use super::state::register_manifest;
+use super::state::{register_manifest, service_exists};
 use crate::config::ClientConfig;
+use crate::tasks;
 use anyhow::{Context, Result, anyhow};
 use std::io::Write;
 use tabwriter::TabWriter;
@@ -18,6 +19,16 @@ pub async fn deploy_manifest(
     cfg: &ClientConfig,
     manifest: &ServiceManifest,
 ) -> Result<Vec<ReplicaStart>> {
+    if service_exists(cfg, &manifest.name)
+        .await
+        .context("failed to check existing services")?
+    {
+        return Err(anyhow!(
+            "service '{}' already exists; stop it before deploying again",
+            manifest.name
+        ));
+    }
+
     let mut requests = Vec::new();
     let mut layout = Vec::new();
 
@@ -70,9 +81,17 @@ pub async fn deploy_manifest(
         .collect();
 
     let manifest_id = Uuid::new_v4();
-    register_manifest(cfg, manifest, manifest_id, &replicas)
-        .await
-        .context("failed to register service manifest")?;
+    if let Err(err) = register_manifest(cfg, manifest, manifest_id, &replicas).await {
+        for replica in &replicas {
+            if let Err(stop_err) = tasks::stop(cfg, &replica.workload.id).await {
+                eprintln!(
+                    "failed to stop workload {} after service deployment error: {stop_err}",
+                    replica.workload.id
+                );
+            }
+        }
+        return Err(err.context("failed to register service manifest"));
+    }
 
     Ok(replicas)
 }

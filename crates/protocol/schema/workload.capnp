@@ -20,6 +20,8 @@ struct StartRequest {
   command @2 :List(Text);
   cpuMillis @3 :UInt64;
   memoryBytes @4 :UInt64;
+  slotId @5 :UInt64;
+  workloadId @6 :Data;
 }
 
 struct StopRequest {

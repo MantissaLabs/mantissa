@@ -2,6 +2,7 @@ use crate::gossip::Message;
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{ServiceEvent, ServiceSpecValue};
 use crate::workload::manager::WorkloadManager;
+use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -49,6 +50,13 @@ impl ServiceController {
     }
 
     pub async fn upsert_service(&self, value: ServiceSpecValue) -> anyhow::Result<()> {
+        if self.registry.get(value.id)?.is_some() {
+            return Err(anyhow!(
+                "service '{}' already exists; stop it before deploying again",
+                value.service_name
+            ));
+        }
+
         self.registry.upsert(value.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(value)).await
     }
@@ -72,6 +80,9 @@ impl ServiceController {
                 self.registry.upsert(spec).await?;
             }
             ServiceEvent::Remove { id } => {
+                if let Some(spec) = self.registry.get(id)? {
+                    self.stop_workloads(&spec).await;
+                }
                 self.registry.remove_by_id(id).await?;
             }
         }
@@ -93,12 +104,34 @@ impl ServiceController {
 
     async fn stop_workloads(&self, spec: &ServiceSpecValue) {
         for workload_id in &spec.workload_ids {
-            if let Err(err) = self.workload_manager.stop_workload(*workload_id).await {
-                tracing::warn!(
-                    target: "services",
-                    "failed to stop workload {workload_id} for service {}: {err}",
-                    spec.service_name
-                );
+            match self
+                .workload_manager
+                .workload_owned_locally(*workload_id)
+                .await
+            {
+                Ok(true) => {
+                    if let Err(err) = self.workload_manager.stop_workload(*workload_id).await {
+                        tracing::warn!(
+                            target: "services",
+                            "failed to stop workload {workload_id} for service {}: {err}",
+                            spec.service_name
+                        );
+                    }
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        target: "services",
+                        "skipping remote workload {workload_id} while stopping service {}",
+                        spec.service_name
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to inspect workload {workload_id} for service {}: {err}",
+                        spec.service_name
+                    );
+                }
             }
         }
     }

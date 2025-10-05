@@ -38,9 +38,10 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
     let total = summary.get_total_slots();
     let free = summary.get_free_slots();
     let reserved = summary.get_reserved_slots();
+    let version = summary.get_version();
 
     println!(
-        "Scheduler Summary:\n  Node: {} ({})\n  Total slots: {}\n  Free slots: {}\n  Reserved slots: {}",
+        "Scheduler Summary:\n  Node: {} ({})\n  Total slots: {}\n  Free slots: {}\n  Reserved slots: {}\n  Snapshot version: {}",
         if node_name.is_empty() {
             "<unknown>".to_string()
         } else {
@@ -50,6 +51,7 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
         total,
         free,
         reserved,
+        version,
     );
 
     if details {

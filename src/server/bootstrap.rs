@@ -18,7 +18,7 @@ use crate::store::workload_store::{WorkloadStore, open_workload_store};
 use crate::sync::SyncService;
 use crate::token::TokenStore;
 use crate::topology::{Keys, Topology, TopologyStores};
-use crate::workload::docker::ContainerManager;
+use crate::workload::docker::{self, ContainerManager, DockerContainerManager};
 use crate::workload::manager::WorkloadManager;
 use crate::workload::service::WorkloadService;
 use crate::{node, server};
@@ -346,11 +346,16 @@ impl Bootstrap {
             .clone()
             .unwrap_or_else(|| ctx.listen_addr.clone());
 
-        let docker_manager = crate::workload::docker::DockerContainerManager::new()
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-        let docker_manager = Arc::new(docker_manager);
-        let container_manager: Arc<dyn ContainerManager + Send + Sync> = docker_manager.clone();
+        let container_manager: Arc<dyn ContainerManager + Send + Sync> =
+            if let Some(manager) = docker::container_manager_override() {
+                manager
+            } else {
+                Arc::new(
+                    DockerContainerManager::new()
+                        .await
+                        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?,
+                )
+            };
         let workload_manager = WorkloadManager::new(
             stores.workloads.clone(),
             gossip_tx.clone(),
@@ -359,6 +364,7 @@ impl Bootstrap {
             local_node_name.clone(),
             scheduler.clone(),
             container_manager,
+            registry.clone(),
         );
 
         let service_registry = ServiceRegistry::new(stores.services.clone());

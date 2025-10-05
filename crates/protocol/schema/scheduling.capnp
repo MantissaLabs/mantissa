@@ -80,6 +80,7 @@ struct Summary {
   freeSlots @3 :UInt32;
   reservedSlots @4 :UInt32;
   details @5 :List(SlotDetail);
+  version @6 :UInt64;
 }
 
 struct SummaryRequest {
@@ -87,8 +88,34 @@ struct SummaryRequest {
   includeDetails @1 :Bool;
 }
 
+struct SlotReservationIntent {
+  slotId @0 :UInt64;
+  owner @1 :Data;
+  workloadId @2 :Data;
+}
+
+struct ReserveSlotsRequest {
+  expectedVersion @0 :UInt64;
+  intents @1 :List(SlotReservationIntent);
+}
+
+struct ReserveSlotsResponse {
+  newVersion @0 :UInt64;
+}
+
+struct ReleaseSlotsRequest {
+  expectedVersion @0 :UInt64;
+  slotIds @1 :List(UInt64);
+}
+
+struct ReleaseSlotsResponse {
+  newVersion @0 :UInt64;
+}
+
 interface Scheduler {
   summary @0 (request :SummaryRequest) -> (summary :Summary);
+  reserveSlots @1 (request :ReserveSlotsRequest) -> (response :ReserveSlotsResponse);
+  releaseSlots @2 (request :ReleaseSlotsRequest) -> (response :ReleaseSlotsResponse);
 }
 
 struct Workload {
