@@ -289,6 +289,8 @@ impl Bootstrap {
             sessions: stores.local_sessions.clone(),
             peers: stores.peers.clone(),
             token_store: stores.token_store.clone(),
+            workloads: stores.workloads.clone(),
+            services: stores.services.clone(),
         };
 
         let keys = Keys {
@@ -335,7 +337,11 @@ impl Bootstrap {
         let topology_client: TopologyClient = capnp_rpc::new_client(topology.clone());
 
         // sync capability
-        let sync_service = SyncService::new(topology_stores.peers.clone());
+        let sync_service = SyncService::new(
+            topology_stores.peers.clone(),
+            stores.workloads.clone(),
+            stores.services.clone(),
+        );
         let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
 
         let local_node_name = ctx

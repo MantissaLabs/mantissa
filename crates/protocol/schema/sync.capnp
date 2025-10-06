@@ -2,9 +2,8 @@
 
 enum Domain {
   peers @0;
-  containers @1;
-  networks @2;
-  storage @3;
+  workloads @1;
+  services @2;
 }
 
 struct PageRange {
@@ -18,8 +17,24 @@ struct PageRangeSummary {
 }
 
 struct DeltaChunk {
-  regs  @0 :List(RegItem);
-  tombs @1 :List(TombItem);
+  domain @0 :Domain;
+  regs   @1 :List(RegItem);
+  tombs  @2 :List(TombItem);
+}
+
+struct DomainRoot {
+  domain  @0 :Domain;
+  rootHex @1 :Text;
+}
+
+struct DomainRangeSummary {
+  domain  @0 :Domain;
+  summary @1 :PageRangeSummary;
+}
+
+struct DomainWant {
+  domain @0 :Domain;
+  want   @1 :PageRangeSummary;
 }
 
 struct RegItem {
@@ -44,12 +59,11 @@ interface DeltaSink {
 }
 
 interface Sync {
-  getRoot @0 (domain :Domain) -> (rootHex :Text);
+  getRoots @0 () -> (roots :List(DomainRoot));
 
-  getRanges @1 (domain :Domain) -> (summary :PageRangeSummary);
+  getRanges @1 (domains :List(Domain)) -> (ranges :List(DomainRangeSummary));
 
-  # Client passes ranges it wants, and a DeltaSink it implements locally.
-  # Server streams chunks into that sink and calls end() when done.
-  openDelta @2 (domain :Domain, want :PageRangeSummary, sink :DeltaSink);
+  # Client passes per-domain ranges it wants, and a DeltaSink it implements locally.
+  # Server streams domain-tagged chunks into that sink and calls end() when done.
+  openDelta @2 (wants :List(DomainWant), sink :DeltaSink);
 }
-

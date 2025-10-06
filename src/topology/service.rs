@@ -5,7 +5,7 @@ use crate::server::credential::ClusterCredential;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
-use crate::sync::delta::sync_peers_after_join;
+use crate::sync::delta::{SyncStores, sync_all_domains};
 use crate::token::TokenStore;
 use crate::topology::health::status_to_node_status;
 use crate::topology::peers::PeerValue;
@@ -221,10 +221,16 @@ impl topology::Server for Topology {
                 resp.get()?.get_sync()?
             };
 
+            let sync_stores = SyncStores {
+                peers: peers.clone(),
+                workloads: topology.workloads.clone(),
+                services: topology.services.clone(),
+            };
+
             tokio::task::spawn_local({
-                let peers = peers.clone();
+                let stores = sync_stores;
                 async move {
-                    sync_peers_after_join(peers, sync_cap).await;
+                    sync_all_domains(stores, sync_cap).await;
                 }
             });
 

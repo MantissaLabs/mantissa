@@ -6,7 +6,9 @@ use crate::registry::Registry;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
-use crate::sync::delta::sync_peers_after_join;
+use crate::store::service_store::ServiceStore;
+use crate::store::workload_store::WorkloadStore;
+use crate::sync::delta::{SyncStores, sync_all_domains};
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
 use ::health::HealthMonitor;
@@ -50,6 +52,8 @@ pub struct TopologyStores {
     pub sessions: LocalSessionStore,
     pub peers: PeersStore,
     pub token_store: TokenStore,
+    pub workloads: WorkloadStore,
+    pub services: ServiceStore,
 }
 
 /// Keys and signing material used by the topology service.
@@ -216,6 +220,8 @@ pub struct Topology {
 
     /// Persistent peer store backing the CRDT state published cluster-wide.
     peers: PeersStore,
+    workloads: WorkloadStore,
+    services: ServiceStore,
 
     /// Cached Peers snapshot to avoid hitting storage on every tick.
     peer_snapshot_cache: Arc<AsyncMutex<PeerSnapshotCache>>,
@@ -264,6 +270,8 @@ impl Topology {
             sessions,
             peers,
             token_store,
+            workloads,
+            services,
         } = stores;
 
         let Keys {
@@ -276,6 +284,8 @@ impl Topology {
             networking: Networking::new(addr),
             gossip: GossipState::new(gossip_receiver, gossip_sender),
             peers,
+            workloads,
+            services,
             peer_snapshot_cache: Arc::new(AsyncMutex::new(PeerSnapshotCache::new())),
             local_sessions: sessions,
             local_credential_store: credentials,
@@ -680,8 +690,13 @@ impl Topology {
                 }
             };
 
-            // One-shot sync (want/delta/openDelta), using your existing helper
-            sync_peers_after_join(self.peers.clone(), sync_cap).await;
+            let stores = SyncStores {
+                peers: self.peers.clone(),
+                workloads: self.workloads.clone(),
+                services: self.services.clone(),
+            };
+
+            sync_all_domains(stores, sync_cap).await;
         }
     }
 

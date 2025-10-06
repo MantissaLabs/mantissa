@@ -73,6 +73,8 @@ pub struct HeadlessNode {
 
     // Stores (optional inspection in tests)
     pub peers: crate::store::peer_store::PeersStore,
+    pub workloads: crate::store::workload_store::WorkloadStore,
+    pub services: crate::store::service_store::ServiceStore,
     pub local_sessions: crate::store::local_session_store::LocalSessionStore,
     pub local_creds: crate::store::local_credential_store::LocalCredentialStore,
 
@@ -204,6 +206,8 @@ impl HeadlessNode {
             service_controller: comps.service_controller.clone(),
             workload_manager: comps.workload_manager.clone(),
             peers: stores.peers.clone(),
+            workloads: stores.workloads.clone(),
+            services: stores.services.clone(),
             local_sessions: stores.local_sessions.clone(),
             local_creds: stores.local_creds.clone(),
             _db: db,
@@ -449,11 +453,22 @@ impl HeadlessNode {
     }
 
     pub async fn local_peers_root_hex(&self) -> String {
-        let mut req = self.sync_client.get_root_request();
-        req.get().set_domain(Domain::Peers);
-        match req.send().promise.await {
-            Ok(resp) => match resp.get().and_then(|r| r.get_root_hex()) {
-                Ok(text) => text.to_string().unwrap_or_default(),
+        match self.sync_client.get_roots_request().send().promise.await {
+            Ok(resp) => match resp.get() {
+                Ok(reader) => match reader.get_roots() {
+                    Ok(list) => {
+                        for idx in 0..list.len() {
+                            let entry = list.get(idx);
+                            if matches!(entry.get_domain(), Ok(Domain::Peers)) {
+                                if let Ok(text) = entry.get_root_hex() {
+                                    return text.to_string().unwrap_or_default();
+                                }
+                            }
+                        }
+                        String::new()
+                    }
+                    Err(_) => String::new(),
+                },
                 Err(_) => String::new(),
             },
             Err(_) => String::new(),

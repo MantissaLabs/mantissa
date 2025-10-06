@@ -1,56 +1,85 @@
+use crate::services::types::ServiceSpecValue;
 use crate::store::peer_store::PeersStore;
+use crate::store::service_store::ServiceStore;
+use crate::store::workload_store::WorkloadStore;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
+use crate::topology::peers::PeerValue;
+use crate::workload::types::WorkloadValue;
+use async_trait::async_trait;
 use bincode;
 use capnp::capability::Promise;
-use crdt_store::{compute_want_from_have, uuid_key::UuidKey};
+use capnp_rpc::new_client;
+use crdt_store::{PageDigestRange, compute_want_from_have, uuid_key::UuidKey};
 use crdts::MVReg;
-use protocol::sync::delta_sink;
-use protocol::sync::{Domain, sync};
-use tracing::debug;
+use protocol::sync::{self, Domain, delta_chunk, delta_sink};
+use std::io;
+use tracing::{debug, warn};
+
+#[derive(Clone)]
+pub struct SyncStores {
+    pub peers: PeersStore,
+    pub workloads: WorkloadStore,
+    pub services: ServiceStore,
+}
+
+impl SyncStores {
+    async fn root_hex(&self, domain: Domain) -> String {
+        match domain {
+            Domain::Peers => self.peers.root_hex().await,
+            Domain::Workloads => self.workloads.root_hex().await,
+            Domain::Services => self.services.root_hex().await,
+        }
+    }
+
+    async fn page_range_summary(&self, domain: Domain) -> crdt_store::Result<Vec<PageDigestRange>> {
+        match domain {
+            Domain::Peers => self.peers.page_range_summary().await,
+            Domain::Workloads => self.workloads.page_range_summary().await,
+            Domain::Services => self.services.page_range_summary().await,
+        }
+    }
+}
 
 pub struct DeltaSinkImpl {
-    peers: PeersStore,
+    stores: SyncStores,
 }
 
 impl DeltaSinkImpl {
-    pub fn new(peers: PeersStore) -> Self {
-        Self { peers }
+    pub fn new(stores: SyncStores) -> Self {
+        Self { stores }
     }
 }
 
 impl delta_sink::Server for DeltaSinkImpl {
     fn push_chunk(&mut self, params: delta_sink::PushChunkParams) -> Promise<(), capnp::Error> {
-        let peers = self.peers.clone();
+        let stores = self.stores.clone();
         Promise::from_future(async move {
-            let c = params.get()?.get_chunk()?;
+            let chunk = params.get()?.get_chunk()?;
+            let domain = chunk
+                .get_domain()
+                .map_err(|_| capnp::Error::failed("unknown sync domain".into()))?;
 
-            // Collect tombstones and registers, then apply in one batch write.
-            let mut tombs = Vec::new();
-            for it in c.get_tombs()?.iter() {
-                let key = UuidKey::try_from(it.get_key()?)
-                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-                let tombstone = it.get_ts();
-
-                tombs.push((key, tombstone));
+            match domain {
+                Domain::Peers => {
+                    apply_chunk(stores.peers.clone(), &chunk, decode_register::<PeerValue>).await?
+                }
+                Domain::Workloads => {
+                    apply_chunk(
+                        stores.workloads.clone(),
+                        &chunk,
+                        decode_register::<WorkloadValue>,
+                    )
+                    .await?
+                }
+                Domain::Services => {
+                    apply_chunk(
+                        stores.services.clone(),
+                        &chunk,
+                        decode_register::<ServiceSpecValue>,
+                    )
+                    .await?
+                }
             }
-
-            let mut regs = Vec::new();
-            for it in c.get_regs()?.iter() {
-                let key = UuidKey::try_from(it.get_key()?)
-                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-                let register: MVReg<crate::topology::peers::PeerValue, uuid::Uuid> =
-                    bincode::deserialize(it.get_reg()?)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-                regs.push((key, register));
-            }
-
-            peers
-                .apply_delta_chunk_update_mst(regs, tombs)
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             Ok(())
         })
@@ -62,74 +91,185 @@ impl delta_sink::Server for DeltaSinkImpl {
         _results: delta_sink::EndResults,
     ) -> Promise<(), capnp::Error> {
         debug!(target: "delta", "delta stream end");
-
-        // Incremental apply keeps MST up-to-date; nothing to finalize.
         Promise::ok(())
     }
+}
+
+async fn apply_chunk<V, F>(
+    store: impl DeltaStore<V>,
+    chunk: &delta_chunk::Reader<'_>,
+    decode: F,
+) -> Result<(), capnp::Error>
+where
+    V: Clone + Send + Sync + 'static,
+    F: Fn(&delta_chunk::Reader<'_>) -> Result<Vec<(UuidKey, MVReg<V, uuid::Uuid>)>, capnp::Error>,
+{
+    let regs = decode(chunk)?;
+    let tombs = collect_tombstones(chunk)?;
+
+    store.apply_delta(regs, tombs).await.map_err(to_capnp)
+}
+
+fn collect_tombstones(
+    chunk: &delta_chunk::Reader<'_>,
+) -> Result<Vec<(UuidKey, u64)>, capnp::Error> {
+    let mut tombs = Vec::new();
+    for entry in chunk.get_tombs()?.iter() {
+        let key =
+            UuidKey::try_from(entry.get_key()?).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        tombs.push((key, entry.get_ts()));
+    }
+    Ok(tombs)
+}
+
+fn decode_register<V>(
+    chunk: &delta_chunk::Reader<'_>,
+) -> Result<Vec<(UuidKey, MVReg<V, uuid::Uuid>)>, capnp::Error>
+where
+    V: for<'de> serde::Deserialize<'de>,
+{
+    let mut regs = Vec::new();
+    for entry in chunk.get_regs()?.iter() {
+        let key =
+            UuidKey::try_from(entry.get_key()?).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let register: MVReg<V, uuid::Uuid> = bincode::deserialize(entry.get_reg()?)
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        regs.push((key, register));
+    }
+    Ok(regs)
 }
 
 fn to_capnp<E: std::fmt::Display>(e: E) -> capnp::Error {
     capnp::Error::failed(e.to_string())
 }
 
-pub async fn sync_peers_after_join(peers: PeersStore, sync_cap: sync::Client) {
+#[async_trait]
+trait DeltaStore<V>: Clone + Send + Sync + 'static {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<V, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()>;
+}
+
+#[async_trait]
+impl DeltaStore<PeerValue> for PeersStore {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<PeerValue, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()> {
+        self.apply_delta_chunk_update_mst(regs, tombs).await
+    }
+}
+
+#[async_trait]
+impl DeltaStore<WorkloadValue> for WorkloadStore {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<WorkloadValue, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()> {
+        self.apply_delta_chunk_update_mst(regs, tombs).await
+    }
+}
+
+#[async_trait]
+impl DeltaStore<ServiceSpecValue> for ServiceStore {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<ServiceSpecValue, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()> {
+        self.apply_delta_chunk_update_mst(regs, tombs).await
+    }
+}
+
+pub async fn sync_all_domains(stores: SyncStores, sync_cap: sync::Client) {
     let res: Result<(), capnp::Error> = async {
-        let mut gr = sync_cap.get_root_request();
-        gr.get().set_domain(Domain::Peers);
-        let root_resp = gr.send().promise.await?;
+        let domains = [Domain::Peers, Domain::Workloads, Domain::Services];
 
-        let remote_root = root_resp.get()?.get_root_hex()?.to_string()?;
-        let local_root = peers.root_hex().await;
+        let roots_req = sync_cap.get_roots_request();
+        let roots_resp = roots_req.send().promise.await?;
+        let roots_reader = roots_resp.get()?.get_roots()?;
 
-        // Compare roots, if equal: nothing to sync.
-        if remote_root == local_root {
+        let mut remote_roots = Vec::with_capacity(roots_reader.len() as usize);
+        for idx in 0..roots_reader.len() {
+            let entry = roots_reader.get(idx);
+            let domain = entry
+                .get_domain()
+                .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
+            let hex = entry.get_root_hex()?.to_string()?;
+            remote_roots.push((domain, hex));
+        }
+
+        let mut domains_to_sync = Vec::new();
+        for domain in domains.iter() {
+            let local_root = stores.root_hex(*domain).await;
+            let remote_root = remote_roots
+                .iter()
+                .find(|(d, _)| *d == *domain)
+                .map(|(_, hex)| hex.clone())
+                .unwrap_or_default();
+            if remote_root != local_root {
+                domains_to_sync.push(*domain);
+            }
+        }
+
+        if domains_to_sync.is_empty() {
             return Ok(());
         }
 
-        // Fetch remote ranges
-        let mut rr = sync_cap.get_ranges_request();
-        rr.get().set_domain(Domain::Peers);
-        let ranges_resp = rr.send().promise.await?;
-        let remote_page_ranges = page_ranges_from_capnp(ranges_resp.get()?.get_summary()?)?;
+        let mut ranges_req = sync_cap.get_ranges_request();
+        {
+            let mut list = ranges_req.get().init_domains(domains_to_sync.len() as u32);
+            for (idx, domain) in domains_to_sync.iter().enumerate() {
+                list.set(idx as u32, *domain);
+            }
+        }
+        let ranges_resp = ranges_req.send().promise.await?;
+        let ranges_reader = ranges_resp.get()?.get_ranges()?;
 
-        // Local ranges
-        let local_page_ranges = peers.page_range_summary().await.map_err(to_capnp)?;
+        let mut domains_wants = Vec::new();
+        for idx in 0..ranges_reader.len() {
+            let summary = ranges_reader.get(idx);
+            let domain = summary
+                .get_domain()
+                .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
+            let remote_summary = summary.get_summary()?;
+            let remote_ranges = page_ranges_from_capnp(remote_summary)?;
+            let local_ranges = stores.page_range_summary(domain).await.map_err(to_capnp)?;
+            let want = compute_want_from_have(&remote_ranges, &local_ranges);
+            if !want.is_empty() {
+                domains_wants.push((domain, want));
+            }
+        }
 
-        // Compute want
-        let want_ranges = compute_want_from_have(&remote_page_ranges, &local_page_ranges);
-        if want_ranges.is_empty() {
-            debug!(target: "sync", "want empty ranges, nothing to fetch");
+        if domains_wants.is_empty() {
             return Ok(());
         }
 
-        debug!(target: "sync", "want ranges = {}", want_ranges.len());
-        peers
-            .debug_dump_root("client.local.before_open_delta")
-            .await;
-        peers
-            .debug_dump_ranges("client.local.before_open_delta", 5)
-            .await;
+        let sink_client = new_client(DeltaSinkImpl::new(stores.clone()));
 
-        // Stream delta into local sink
-        let sink_client = capnp_rpc::new_client(DeltaSinkImpl::new(peers.clone()));
         let mut od = sync_cap.open_delta_request();
         {
-            let mut p = od.get();
-            p.set_domain(Domain::Peers);
-            let want_builder = p.reborrow().init_want();
-            capnp_fill_ranges(&want_ranges, want_builder)?;
-            p.set_sink(sink_client);
+            let mut wants_builder = od.get().init_wants(domains_wants.len() as u32);
+            for (idx, (domain, want_ranges)) in domains_wants.iter().enumerate() {
+                let mut entry = wants_builder.reborrow().get(idx as u32);
+                entry.set_domain(*domain);
+                let summary_builder = entry.reborrow().init_want();
+                capnp_fill_ranges(want_ranges, summary_builder)?;
+            }
+            od.get().set_sink(sink_client);
         }
 
-        debug!(target: "sync", "opening delta stream...");
+        debug!(target: "sync", domains = ?domains_wants.len(), "opening multi-domain delta stream");
         od.send().promise.await?;
-        debug!(target: "sync", "delta stream finished");
-
         Ok(())
     }
     .await;
 
     if let Err(e) = res {
-        println!("sync_after_join error: {e}");
+        warn!(target: "sync", "sync_all_domains error: {e}");
     }
 }

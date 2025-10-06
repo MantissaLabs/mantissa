@@ -11,6 +11,7 @@ use std::{
 use async_trait::async_trait;
 use client::services::manifest::{ServiceManifest, load_manifest_from_path};
 use common::testkit::{ClusterConfig, TestNode};
+use crdt_store::uuid_key::UuidKey;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{ServiceSpecValue, ServiceTaskSpecValue, compute_service_id};
 use mantissa::workload::docker::{
@@ -153,6 +154,82 @@ local_test!(services_deployment_replicates_across_cluster, {
             node.id()
         );
     }
+});
+
+local_test!(services_sync_recovers_missing_entries, {
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+    };
+
+    let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+        .await
+        .expect("cluster should boot");
+    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise").await;
+
+    let anchor = &cluster[0];
+    let peer = &cluster[1];
+
+    let manifest = load_manifest_from_path(Path::new("examples/replicated_service.ron"))
+        .expect("load service manifest");
+
+    let (service_id, workloads) = deploy_manifest_via_anchor(anchor, &manifest).await;
+
+    assert!(
+        wait_for_service_state(&peer.node.service_controller, service_id, true).await,
+        "peer should observe service after initial gossip"
+    );
+
+    let expected_workload_ids: Vec<Uuid> = workloads.iter().map(|spec| spec.id).collect();
+
+    peer.node
+        .services
+        .remove(&UuidKey::from(service_id))
+        .await
+        .expect("remove service from peer store");
+    for workload_id in &expected_workload_ids {
+        peer.node
+            .workloads
+            .remove(&UuidKey::from(*workload_id))
+            .await
+            .expect("remove workload from peer store");
+    }
+
+    let services_after_remove = peer
+        .node
+        .service_controller
+        .list_services()
+        .expect("list services after manual removal");
+    assert!(services_after_remove.is_empty(), "peer registry emptied");
+
+    let specs_after_remove = peer
+        .node
+        .workload_manager
+        .list_containers(&WorkloadStateFilter::all())
+        .await
+        .expect("list workloads after removal");
+    assert!(specs_after_remove.is_empty(), "peer workloads cleared");
+
+    sleep(Duration::from_secs(1)).await;
+
+    assert!(
+        wait_for_service_state(&peer.node.service_controller, service_id, true).await,
+        "periodic sync should restore service spec"
+    );
+
+    let restored_specs = peer
+        .node
+        .workload_manager
+        .list_containers(&WorkloadStateFilter::all())
+        .await
+        .expect("list workloads after sync");
+    let restored_ids: BTreeSet<Uuid> = restored_specs.iter().map(|spec| spec.id).collect();
+    let expected_ids: BTreeSet<Uuid> = expected_workload_ids.iter().cloned().collect();
+    assert_eq!(restored_ids, expected_ids, "sync restored workloads");
 });
 
 async fn register_service_via_rpc(
