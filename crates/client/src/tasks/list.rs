@@ -3,16 +3,16 @@ use crate::connection;
 use crate::tasks::{uuid_short, uuid_to_string};
 use anyhow::Result;
 use capnp::Error as CapnpError;
-use protocol::workload::{ContainerStateFilter, workload_spec};
+use protocol::task::{TaskStateFilter, task_spec};
 use std::io::Write;
 use tabwriter::TabWriter;
 
 pub async fn list(cfg: &ClientConfig, states: &[TasksListState]) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
 
-    let request = client.get_workload_request();
-    let workload = request.send().pipeline.get_workload();
-    let mut request = workload.list_request();
+    let request = client.get_task_request();
+    let task = request.send().pipeline.get_task();
+    let mut request = task.list_request();
     {
         let mut builder = request.get().init_request();
         if !states.is_empty() {
@@ -24,17 +24,17 @@ pub async fn list(cfg: &ClientConfig, states: &[TasksListState]) -> Result<()> {
     }
 
     let response = request.send().promise.await?;
-    let workloads = response.get()?.get_workloads()?;
+    let tasks = response.get()?.get_tasks()?;
 
-    let mut specs: Vec<WorkloadRow> = Vec::new();
-    for spec in workloads.iter() {
-        specs.push(WorkloadRow::from_reader(spec)?);
+    let mut specs: Vec<TaskRow> = Vec::new();
+    for spec in tasks.iter() {
+        specs.push(TaskRow::from_reader(spec)?);
     }
 
     specs.sort_by(|a, b| a.name.cmp(&b.name));
 
     if specs.is_empty() {
-        println!("no workloads found");
+        println!("no tasks found");
         return Ok(());
     }
 
@@ -68,7 +68,7 @@ pub async fn list(cfg: &ClientConfig, states: &[TasksListState]) -> Result<()> {
     Ok(())
 }
 
-struct WorkloadRow {
+struct TaskRow {
     id: String,
     name: String,
     image: String,
@@ -81,8 +81,8 @@ struct WorkloadRow {
     created_at: String,
 }
 
-impl WorkloadRow {
-    fn from_reader(spec: workload_spec::Reader) -> Result<Self, CapnpError> {
+impl TaskRow {
+    fn from_reader(spec: task_spec::Reader) -> Result<Self, CapnpError> {
         let id = uuid_to_string(spec.get_id()?)?;
         let name = spec.get_name()?.to_str()?.to_string();
         let image = spec.get_image()?.to_str()?.to_string();
@@ -129,7 +129,7 @@ impl WorkloadRow {
     }
 }
 
-/// Client-side representation of the selectable workload lifecycle states.
+/// Client-side representation of the selectable task lifecycle states.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TasksListState {
     Pending,
@@ -143,18 +143,18 @@ pub enum TasksListState {
     Unknown,
 }
 
-impl From<TasksListState> for ContainerStateFilter {
+impl From<TasksListState> for TaskStateFilter {
     fn from(value: TasksListState) -> Self {
         match value {
-            TasksListState::Pending => ContainerStateFilter::Pending,
-            TasksListState::Creating => ContainerStateFilter::Creating,
-            TasksListState::Running => ContainerStateFilter::Running,
-            TasksListState::Paused => ContainerStateFilter::Paused,
-            TasksListState::Stopping => ContainerStateFilter::Stopping,
-            TasksListState::Stopped => ContainerStateFilter::Stopped,
-            TasksListState::Failed => ContainerStateFilter::Failed,
-            TasksListState::Exited => ContainerStateFilter::Exited,
-            TasksListState::Unknown => ContainerStateFilter::Unknown,
+            TasksListState::Pending => TaskStateFilter::Pending,
+            TasksListState::Creating => TaskStateFilter::Creating,
+            TasksListState::Running => TaskStateFilter::Running,
+            TasksListState::Paused => TaskStateFilter::Paused,
+            TasksListState::Stopping => TaskStateFilter::Stopping,
+            TasksListState::Stopped => TaskStateFilter::Stopped,
+            TasksListState::Failed => TaskStateFilter::Failed,
+            TasksListState::Exited => TaskStateFilter::Exited,
+            TasksListState::Unknown => TaskStateFilter::Unknown,
         }
     }
 }

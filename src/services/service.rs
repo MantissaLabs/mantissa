@@ -40,9 +40,9 @@ impl services::Server for ServicesRPC {
                     tasks.push(read_task_template(tmpl)?);
                 }
 
-                let mut workload_ids = Vec::new();
-                for wid in spec.get_workload_ids()?.iter() {
-                    workload_ids.push(read_uuid(wid?)?);
+                let mut task_ids = Vec::new();
+                for wid in spec.get_task_ids()?.iter() {
+                    task_ids.push(read_uuid(wid?)?);
                 }
 
                 let value = ServiceSpecValue::new(
@@ -50,7 +50,7 @@ impl services::Server for ServicesRPC {
                     manifest_name.clone(),
                     service_name.clone(),
                     tasks,
-                    workload_ids,
+                    task_ids,
                 );
 
                 manager
@@ -123,11 +123,11 @@ pub(crate) fn write_service_spec(
         write_task_template(tasks_builder.reborrow().get(idx as u32), task)?;
     }
 
-    let mut workloads_builder = builder
+    let mut tasks_builder = builder
         .reborrow()
-        .init_workload_ids(value.workload_ids.len() as u32);
-    for (idx, wid) in value.workload_ids.iter().enumerate() {
-        workloads_builder.set(idx as u32, wid.as_bytes());
+        .init_task_ids(value.task_ids.len() as u32);
+    for (idx, wid) in value.task_ids.iter().enumerate() {
+        tasks_builder.set(idx as u32, wid.as_bytes());
     }
 
     Ok(())
@@ -151,7 +151,7 @@ pub(crate) fn write_service_event(
             spec_builder.set_manifest_name("");
             spec_builder.set_service_name("");
             spec_builder.reborrow().init_tasks(0);
-            spec_builder.reborrow().init_workload_ids(0);
+            spec_builder.reborrow().init_task_ids(0);
             spec_builder.set_updated_at("");
         }
     }
@@ -185,18 +185,13 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
         tasks.push(read_task_template(tmpl)?);
     }
 
-    let mut workload_ids = Vec::new();
-    for wid in reader.get_workload_ids()?.iter() {
-        workload_ids.push(read_uuid(wid?)?);
+    let mut task_ids = Vec::new();
+    for wid in reader.get_task_ids()?.iter() {
+        task_ids.push(read_uuid(wid?)?);
     }
 
-    let mut value = ServiceSpecValue::new(
-        manifest_id,
-        manifest_name,
-        service_name,
-        tasks,
-        workload_ids,
-    );
+    let mut value =
+        ServiceSpecValue::new(manifest_id, manifest_name, service_name, tasks, task_ids);
     value.id = id;
     value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
     Ok(value)

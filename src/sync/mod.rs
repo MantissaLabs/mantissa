@@ -1,6 +1,6 @@
 use crate::store::peer_store::PeersStore;
 use crate::store::service_store::ServiceStore;
-use crate::store::workload_store::WorkloadStore;
+use crate::store::task_store::TaskStore;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp::capability::Promise;
 use crdt_store::mst_store::{Registers, Tombstones};
@@ -16,15 +16,15 @@ pub const DELTA_CHUNK_MAX: usize = 1024;
 
 pub struct SyncService {
     peers: PeersStore,
-    workloads: WorkloadStore,
+    tasks: TaskStore,
     services: ServiceStore,
 }
 
 impl SyncService {
-    pub fn new(peers: PeersStore, workloads: WorkloadStore, services: ServiceStore) -> Self {
+    pub fn new(peers: PeersStore, tasks: TaskStore, services: ServiceStore) -> Self {
         Self {
             peers,
-            workloads,
+            tasks,
             services,
         }
     }
@@ -37,11 +37,11 @@ impl sync::Server for SyncService {
         mut results: sync::GetRootsResults,
     ) -> Promise<(), capnp::Error> {
         let peers = self.peers.clone();
-        let workloads = self.workloads.clone();
+        let tasks = self.tasks.clone();
         let services = self.services.clone();
         Promise::from_future(async move {
             let peers_root = peers.root_hex().await;
-            let workloads_root = workloads.root_hex().await;
+            let tasks_root = tasks.root_hex().await;
             let services_root = services.root_hex().await;
 
             let mut list = results.get().init_roots(3);
@@ -52,8 +52,8 @@ impl sync::Server for SyncService {
             }
             {
                 let mut entry = list.reborrow().get(1);
-                entry.set_domain(Domain::Workloads);
-                entry.set_root_hex(&workloads_root);
+                entry.set_domain(Domain::Tasks);
+                entry.set_root_hex(&tasks_root);
             }
             {
                 let mut entry = list.reborrow().get(2);
@@ -71,14 +71,14 @@ impl sync::Server for SyncService {
         mut results: sync::GetRangesResults,
     ) -> Promise<(), capnp::Error> {
         let peers = self.peers.clone();
-        let workloads = self.workloads.clone();
+        let tasks = self.tasks.clone();
         let services = self.services.clone();
 
         Promise::from_future(async move {
             let requested_domains: Vec<Domain> = {
                 let domains_reader = params.get()?.get_domains()?;
                 if domains_reader.is_empty() {
-                    vec![Domain::Peers, Domain::Workloads, Domain::Services]
+                    vec![Domain::Peers, Domain::Tasks, Domain::Services]
                 } else {
                     let mut out = Vec::with_capacity(domains_reader.len() as usize);
                     for domain in domains_reader.iter() {
@@ -104,20 +104,20 @@ impl sync::Server for SyncService {
                         let summary = entry.reborrow().init_summary();
                         capnp_fill_ranges(&ranges, summary)?;
                     }
-                    Domain::Workloads => {
-                        debug!("getRanges: received (workloads)");
-                        workloads
-                            .debug_dump_root("server.before.get_ranges.workloads")
+                    Domain::Tasks => {
+                        debug!("getRanges: received (tasks)");
+                        tasks
+                            .debug_dump_root("server.before.get_ranges.tasks")
                             .await;
-                        workloads
-                            .debug_dump_ranges("server.before.get_ranges.workloads", 5)
+                        tasks
+                            .debug_dump_ranges("server.before.get_ranges.tasks", 5)
                             .await;
-                        let ranges = workloads
+                        let ranges = tasks
                             .page_range_summary()
                             .await
                             .map_err(|e| capnp::Error::failed(e.to_string()))?;
                         let mut entry = list.reborrow().get(idx as u32);
-                        entry.set_domain(Domain::Workloads);
+                        entry.set_domain(Domain::Tasks);
                         let summary = entry.reborrow().init_summary();
                         capnp_fill_ranges(&ranges, summary)?;
                     }
@@ -151,7 +151,7 @@ impl sync::Server for SyncService {
         _results: sync::OpenDeltaResults,
     ) -> Promise<(), capnp::Error> {
         let peers = self.peers.clone();
-        let workloads = self.workloads.clone();
+        let tasks = self.tasks.clone();
         let services = self.services.clone();
 
         Promise::from_future(async move {
@@ -188,15 +188,15 @@ impl sync::Server for SyncService {
                             sent_chunks = true;
                         }
                     }
-                    Domain::Workloads => {
-                        debug!(target: "delta", "open_delta: received (workloads)");
-                        workloads
-                            .debug_dump_root("server.before.open_delta.workloads")
+                    Domain::Tasks => {
+                        debug!(target: "delta", "open_delta: received (tasks)");
+                        tasks
+                            .debug_dump_root("server.before.open_delta.tasks")
                             .await;
-                        workloads
-                            .debug_dump_ranges("server.before.open_delta.workloads", 5)
+                        tasks
+                            .debug_dump_ranges("server.before.open_delta.tasks", 5)
                             .await;
-                        let (regs, tombs) = workloads
+                        let (regs, tombs) = tasks
                             .export_page_ranges_delta(&want_ranges)
                             .map_err(|e| capnp::Error::failed(e.to_string()))?;
                         if send_chunks(domain, regs, tombs, &sink).await? {

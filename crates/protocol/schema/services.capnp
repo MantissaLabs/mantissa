@@ -12,7 +12,7 @@ struct ServiceUpsertSpec {
   manifestName @1 :Text;      # Human readable manifest/service name
   serviceName @2 :Text;       # Service identifier
   tasks @3 :List(TaskTemplate); # Desired task templates composing the service
-  workloadIds @4 :List(Data); # Existing workload UUIDs (each 16 bytes) tracked for this service
+  taskIds @4 :List(Data); # Existing task UUIDs (each 16 bytes) tracked for this service
 }
 
 struct ServiceSpec {
@@ -21,7 +21,7 @@ struct ServiceSpec {
   manifestName @2 :Text;      # Current manifest/service name
   serviceName @3 :Text;       # Service identifier
   tasks @4 :List(TaskTemplate); # Desired task templates
-  workloadIds @5 :List(Data); # Current workload UUIDs (16 bytes each)
+  taskIds @5 :List(Data); # Current task UUIDs (16 bytes each)
   updatedAt @6 :Text;         # RFC3339 timestamp when this spec was last updated
 }
 

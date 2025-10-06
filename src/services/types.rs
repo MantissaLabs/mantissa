@@ -10,7 +10,7 @@ pub struct ServiceSpecValue {
     pub manifest_name: String,
     pub service_name: String,
     pub tasks: Vec<ServiceTaskSpecValue>,
-    pub workload_ids: Vec<Uuid>,
+    pub task_ids: Vec<Uuid>,
     pub updated_at: String,
 }
 
@@ -20,7 +20,7 @@ impl ServiceSpecValue {
         manifest_name: impl Into<String>,
         service_name: impl Into<String>,
         tasks: Vec<ServiceTaskSpecValue>,
-        workload_ids: Vec<Uuid>,
+        task_ids: Vec<Uuid>,
     ) -> Self {
         let manifest_name = manifest_name.into();
         let service_name = service_name.into();
@@ -32,7 +32,7 @@ impl ServiceSpecValue {
             manifest_name,
             service_name,
             tasks,
-            workload_ids,
+            task_ids,
             updated_at: current_timestamp(),
         }
     }

@@ -2,7 +2,7 @@
 
 enum Domain {
   peers @0;
-  workloads @1;
+  tasks @1;
   services @2;
 }
 

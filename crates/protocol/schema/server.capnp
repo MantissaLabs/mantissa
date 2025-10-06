@@ -5,7 +5,7 @@ using import "topology.capnp".Topology;
 using Node = import "node.capnp";
 using import "sync.capnp".Sync;
 using import "health.capnp".Health;
-using import "workload.capnp".Workload;
+using import "task.capnp".Task;
 using import "services.capnp".Services;
 using import "scheduling.capnp".Scheduler;
 
@@ -36,7 +36,7 @@ interface ClusterSession {
   getGossip @4 () -> (gossip :Gossip);
 
   ping @5 ();
-  getWorkload @6 () -> (workload :Workload);
+  getTask @6 () -> (task :Task);
   getScheduler @7 () -> (scheduler :Scheduler);
   getServices @8 () -> (services :Services);
 }
@@ -47,7 +47,7 @@ struct Capabilities {
   node @2 :Node.Node;
   sync @3 :Sync;
   health @4 :Health;
-  workload @5 :Workload;
+  task @5 :Task;
   scheduler @6 :Scheduler;
   services @7 :Services;
 }

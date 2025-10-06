@@ -14,13 +14,13 @@ use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
 use crate::store::scheduler_store::{SchedulerStore, open_scheduler_store};
 use crate::store::service_store::{ServiceStore, open_service_store};
-use crate::store::workload_store::{WorkloadStore, open_workload_store};
+use crate::store::task_store::{TaskStore, open_task_store};
 use crate::sync::SyncService;
+use crate::task::docker::{self, ContainerManager, DockerContainerManager};
+use crate::task::manager::TaskManager;
+use crate::task::service::TaskService;
 use crate::token::TokenStore;
 use crate::topology::{Keys, Topology, TopologyStores};
-use crate::workload::docker::{self, ContainerManager, DockerContainerManager};
-use crate::workload::manager::WorkloadManager;
-use crate::workload::service::WorkloadService;
 use crate::{node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
@@ -88,7 +88,7 @@ pub(crate) struct Stores {
     pub local_sessions: LocalSessionStore, // client-side resume tickets (encrypted)
     pub local_creds: LocalCredentialStore, // short-lived cluster creds
     pub token_store: TokenStore,           // join token rotator
-    pub workloads: WorkloadStore,
+    pub tasks: TaskStore,
     pub scheduler_store: SchedulerStore,
     pub services: ServiceStore,
 }
@@ -99,7 +99,7 @@ pub(crate) struct Components {
     pub topology_client: TopologyClient,
     pub sync_client: protocol::sync::sync::Client,
     pub health_monitor: std::sync::Arc<health::HealthMonitor>,
-    pub workload_manager: WorkloadManager,
+    pub task_manager: TaskManager,
     pub service_controller: ServiceController,
     pub scheduler: Rc<Scheduler>,
     pub scheduler_client: SchedulerClient,
@@ -234,8 +234,8 @@ impl Bootstrap {
         // Debug dump mst root for peers store.
         peers.debug_dump_root("peers").await;
 
-        let workloads = open_workload_store(ctx.db.clone(), ctx.self_id)?;
-        workloads.rebuild_mst_from_disk().await?;
+        let tasks = open_task_store(ctx.db.clone(), ctx.self_id)?;
+        tasks.rebuild_mst_from_disk().await?;
 
         let scheduler_store = open_scheduler_store(ctx.db.clone(), ctx.self_id)?;
         scheduler_store.rebuild_mst_from_disk().await?;
@@ -249,7 +249,7 @@ impl Bootstrap {
             local_sessions,
             local_creds,
             token_store,
-            workloads,
+            tasks,
             scheduler_store,
             services,
         })
@@ -264,8 +264,7 @@ impl Bootstrap {
         let (gossip_tx, gossip_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(128);
         let (topology_tx, topology_rx) = async_channel::bounded(128);
-        let (workload_tx, workload_rx): (Sender<Message>, Receiver<Message>) =
-            async_channel::bounded(128);
+        let (task_tx, task_rx): (Sender<Message>, Receiver<Message>) = async_channel::bounded(128);
         let (service_tx, service_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(128);
 
@@ -273,7 +272,7 @@ impl Bootstrap {
         let gossip = crate::gossip::Gossip {
             chans: crate::gossip::Channels {
                 topology_events: topology_tx.clone(),
-                workload_events: workload_tx.clone(),
+                task_events: task_tx.clone(),
                 service_events: service_tx.clone(),
             },
         };
@@ -289,7 +288,7 @@ impl Bootstrap {
             sessions: stores.local_sessions.clone(),
             peers: stores.peers.clone(),
             token_store: stores.token_store.clone(),
-            workloads: stores.workloads.clone(),
+            tasks: stores.tasks.clone(),
             services: stores.services.clone(),
         };
 
@@ -339,7 +338,7 @@ impl Bootstrap {
         // sync capability
         let sync_service = SyncService::new(
             topology_stores.peers.clone(),
-            stores.workloads.clone(),
+            stores.tasks.clone(),
             stores.services.clone(),
         );
         let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
@@ -362,10 +361,10 @@ impl Bootstrap {
                         .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?,
                 )
             };
-        let workload_manager = WorkloadManager::new(
-            stores.workloads.clone(),
+        let task_manager = TaskManager::new(
+            stores.tasks.clone(),
             gossip_tx.clone(),
-            workload_rx,
+            task_rx,
             ctx.self_id,
             local_node_name.clone(),
             scheduler.clone(),
@@ -376,7 +375,7 @@ impl Bootstrap {
         let service_registry = ServiceRegistry::new(stores.services.clone());
         let service_controller = ServiceController::new(
             service_registry.clone(),
-            workload_manager.clone(),
+            task_manager.clone(),
             gossip_tx.clone(),
             service_rx,
         );
@@ -394,7 +393,7 @@ impl Bootstrap {
                 topology_client,
                 sync_client,
                 health_monitor,
-                workload_manager,
+                task_manager,
                 service_controller,
                 scheduler,
                 scheduler_client: scheduler_client_cap,
@@ -410,16 +409,16 @@ impl Bootstrap {
         let mut config = Config::new();
         let config = config.with_listen_addr(ctx.listen_addr.clone()).build();
 
-        let workload_manager = comps.workload_manager.clone();
-        let workload_service = WorkloadService::new(workload_manager.clone());
-        let workload_client = capnp_rpc::new_client(workload_service);
+        let task_manager = comps.task_manager.clone();
+        let task_service = TaskService::new(task_manager.clone());
+        let task_client = capnp_rpc::new_client(task_service);
 
         let clients = ServerClients {
             topology_client: comps.topology_client.clone(),
             gossip_client: comps.gossip_client.clone(),
             sync_client: comps.sync_client.clone(),
             node_client: ctx.node_client.clone(),
-            workload_client,
+            task_client,
             scheduler_client: comps.scheduler_client.clone(),
             services_client: comps.services_client.clone(),
         };
@@ -489,9 +488,9 @@ impl Bootstrap {
         let topology_for_gossip = comps.topology.clone();
         let gossip_tick = topology_for_gossip.gossip_interval();
 
-        let mut workload_runner = comps.workload_manager.clone();
+        let mut task_runner = comps.task_manager.clone();
         tokio::task::spawn_local(async move {
-            workload_runner.run().await;
+            task_runner.run().await;
         });
 
         let mut service_runner = comps.service_controller.clone();

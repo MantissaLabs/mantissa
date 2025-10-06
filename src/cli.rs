@@ -170,11 +170,11 @@ pub enum TasksCommand {
     #[command(alias = "ls")]
     List(TasksListArgs),
 
-    /// Start a container workload
+    /// Start a container task
     #[command(alias = "run")]
     Start(TasksStartArgs),
 
-    /// Stop a container workload
+    /// Stop a container task
     Stop(TasksStopArgs),
 }
 
@@ -184,7 +184,7 @@ pub struct TasksListArgs {
     #[arg(index = 1)]
     pub cluster: Option<String>,
 
-    /// Filter workloads by lifecycle state (repeat flag to combine)
+    /// Filter tasks by lifecycle state (repeat flag to combine)
     #[arg(
         long = "state",
         value_enum,
@@ -196,7 +196,7 @@ pub struct TasksListArgs {
 
 #[derive(Args, Debug)]
 pub struct TasksStartArgs {
-    /// Friendly name for the workload
+    /// Friendly name for the task
     #[arg(index = 1, value_name = "NAME")]
     pub name: String,
 
@@ -223,12 +223,12 @@ pub struct TasksStartArgs {
 
 #[derive(Args, Debug)]
 pub struct TasksStopArgs {
-    /// Workload ID to stop (UUID)
+    /// Task ID to stop (UUID)
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
 }
 
-/// CLI representation of workload lifecycle states.
+/// CLI representation of task lifecycle states.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum TasksListStateOpt {
     Pending,
@@ -286,7 +286,7 @@ pub enum ServicesCommand {
     #[command(alias = "ls")]
     List(ServicesListArgs),
 
-    /// Stop a service and all associated workloads
+    /// Stop a service and all associated tasks
     Stop(ServicesStopArgs),
 }
 

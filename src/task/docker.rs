@@ -138,7 +138,7 @@ impl DockerContainerManager {
             .map_err(|e| ContainerError::OperationFailed(format!("docker ping failed: {e}")))?;
 
         info!(
-            target: "workload",
+            target: "task",
             "Connected to Docker endpoint {endpoint}",
         );
 

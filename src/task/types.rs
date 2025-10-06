@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use crate::workload::container::ContainerState;
+use crate::task::container::ContainerState;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WorkloadSpec {
+pub struct TaskSpec {
     pub id: Uuid,
     pub name: String,
     pub image: String,
@@ -20,14 +20,14 @@ pub struct WorkloadSpec {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum WorkloadEvent {
-    Upsert(WorkloadSpec),
+pub enum TaskEvent {
+    Upsert(TaskSpec),
     Remove { id: Uuid },
 }
 
-/// Canonical, filterable workload lifecycle identifiers.
+/// Canonical, filterable task lifecycle identifiers.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum WorkloadStateKind {
+pub enum TaskStateKind {
     Pending,
     Creating,
     Running,
@@ -39,35 +39,35 @@ pub enum WorkloadStateKind {
     Unknown,
 }
 
-impl WorkloadStateKind {
+impl TaskStateKind {
     /// Collapses a concrete container state into its filterable counterpart.
     pub fn from_container(state: &ContainerState) -> Self {
         match state {
-            ContainerState::Pending => WorkloadStateKind::Pending,
-            ContainerState::Creating => WorkloadStateKind::Creating,
-            ContainerState::Running => WorkloadStateKind::Running,
-            ContainerState::Paused => WorkloadStateKind::Paused,
-            ContainerState::Stopping => WorkloadStateKind::Stopping,
-            ContainerState::Stopped => WorkloadStateKind::Stopped,
-            ContainerState::Failed => WorkloadStateKind::Failed,
-            ContainerState::Exited(_) => WorkloadStateKind::Exited,
-            ContainerState::Unknown => WorkloadStateKind::Unknown,
+            ContainerState::Pending => TaskStateKind::Pending,
+            ContainerState::Creating => TaskStateKind::Creating,
+            ContainerState::Running => TaskStateKind::Running,
+            ContainerState::Paused => TaskStateKind::Paused,
+            ContainerState::Stopping => TaskStateKind::Stopping,
+            ContainerState::Stopped => TaskStateKind::Stopped,
+            ContainerState::Failed => TaskStateKind::Failed,
+            ContainerState::Exited(_) => TaskStateKind::Exited,
+            ContainerState::Unknown => TaskStateKind::Unknown,
         }
     }
 }
 
-/// Arbitrary workload state filter composed of
+/// Arbitrary task state filter composed of
 /// zero or more lifecycle identifiers.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkloadStateFilter {
-    allowed: HashSet<WorkloadStateKind>,
+pub struct TaskStateFilter {
+    allowed: HashSet<TaskStateKind>,
 }
 
-impl WorkloadStateFilter {
+impl TaskStateFilter {
     /// Constructs a filter from the provided state identifiers.
     pub fn new<I>(states: I) -> Self
     where
-        I: IntoIterator<Item = WorkloadStateKind>,
+        I: IntoIterator<Item = TaskStateKind>,
     {
         Self {
             allowed: states.into_iter().collect(),
@@ -77,37 +77,37 @@ impl WorkloadStateFilter {
     /// Default "active only" view (pending/creating/running/stopping).
     pub fn active_only() -> Self {
         Self::new([
-            WorkloadStateKind::Pending,
-            WorkloadStateKind::Creating,
-            WorkloadStateKind::Running,
-            WorkloadStateKind::Stopping,
+            TaskStateKind::Pending,
+            TaskStateKind::Creating,
+            TaskStateKind::Running,
+            TaskStateKind::Stopping,
         ])
     }
 
     /// Fully permissive filter that matches all lifecycle states.
     pub fn all() -> Self {
         Self::new([
-            WorkloadStateKind::Pending,
-            WorkloadStateKind::Creating,
-            WorkloadStateKind::Running,
-            WorkloadStateKind::Paused,
-            WorkloadStateKind::Stopping,
-            WorkloadStateKind::Stopped,
-            WorkloadStateKind::Failed,
-            WorkloadStateKind::Exited,
-            WorkloadStateKind::Unknown,
+            TaskStateKind::Pending,
+            TaskStateKind::Creating,
+            TaskStateKind::Running,
+            TaskStateKind::Paused,
+            TaskStateKind::Stopping,
+            TaskStateKind::Stopped,
+            TaskStateKind::Failed,
+            TaskStateKind::Exited,
+            TaskStateKind::Unknown,
         ])
     }
 
     /// Returns true when the provided container state satisfies the filter.
     pub fn accepts(&self, state: &ContainerState) -> bool {
-        let kind = WorkloadStateKind::from_container(state);
+        let kind = TaskStateKind::from_container(state);
         self.allowed.contains(&kind)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
-pub struct WorkloadValue {
+pub struct TaskValue {
     pub id: Uuid,
     pub name: String,
     pub image: String,
@@ -121,7 +121,7 @@ pub struct WorkloadValue {
     pub memory_bytes: u64,
 }
 
-impl WorkloadValue {
+impl TaskValue {
     pub fn new(
         id: Uuid,
         name: impl Into<String>,

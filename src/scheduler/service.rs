@@ -95,8 +95,8 @@ impl scheduler::Server for SchedulerService {
                 let slot_id = intent.get_slot_id();
                 let owner = Self::parse_uuid(intent.get_owner()?)?;
 
-                let workload_id = {
-                    let bytes = intent.get_workload_id()?;
+                let task_id = {
+                    let bytes = intent.get_task_id()?;
                     if bytes.len() == 16 {
                         let mut arr = [0u8; 16];
                         arr.copy_from_slice(bytes);
@@ -109,7 +109,7 @@ impl scheduler::Server for SchedulerService {
                 reservations.push(SlotReservationRequest {
                     slot_id,
                     owner,
-                    workload_id,
+                    task_id,
                 });
             }
 

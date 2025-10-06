@@ -1,7 +1,7 @@
 @0xbfbfd4615e1d9b8a;
 
 using import "topology.capnp".TopologyEvent;
-using import "workload.capnp".WorkloadEvent;
+using import "task.capnp".TaskEvent;
 using import "services.capnp".ServiceEvent;
 
 interface Gossip {
@@ -27,7 +27,7 @@ struct GossipMessage {
   union {
     void @1: Void;
     topology @2 :TopologyEvent;
-    workload @3 :WorkloadEvent;
+    task @3 :TaskEvent;
     service @4 :ServiceEvent;
   }
 }

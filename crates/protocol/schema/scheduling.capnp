@@ -56,7 +56,7 @@ struct Slot {
 
   owner @3 :Text;
   schedulee @4 :Text;
-  workload @5 :Workload;
+  task @5 :Task;
 }
 
 enum SlotState {
@@ -70,7 +70,7 @@ struct SlotDetail {
   memoryBytes @2 :UInt64;
   state @3 :SlotState;
   owner @4 :Data;
-  workloadId @5 :Data;
+  taskId @5 :Data;
 }
 
 struct Summary {
@@ -91,7 +91,7 @@ struct SummaryRequest {
 struct SlotReservationIntent {
   slotId @0 :UInt64;
   owner @1 :Data;
-  workloadId @2 :Data;
+  taskId @2 :Data;
 }
 
 struct ReserveSlotsRequest {
@@ -118,8 +118,8 @@ interface Scheduler {
   releaseSlots @2 (request :ReleaseSlotsRequest) -> (response :ReleaseSlotsResponse);
 }
 
-struct Workload {
-  # A Workload. It defines a programs to run on the
+struct Task {
+  # A Task defines a program to run on the
   # pool of machines.
 
   id @0 :UInt64;
@@ -128,7 +128,7 @@ struct Workload {
   image @3 :Text;
   kind @4 :Kind;
 
-  # The type of the workload.
+  # The type of the task.
   enum Kind {
     job @0;
     permanent @1;

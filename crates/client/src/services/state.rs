@@ -24,11 +24,11 @@ pub async fn register_manifest(
 
     {
         let mut specs_builder = upsert.get().init_specs(1);
-        let mut workloads_by_task: HashMap<&str, Vec<Uuid>> = HashMap::new();
+        let mut tasks_by_task: HashMap<&str, Vec<Uuid>> = HashMap::new();
         for replica in replicas {
-            let id = Uuid::parse_str(&replica.workload.id)
-                .with_context(|| format!("invalid workload id {}", replica.workload.id))?;
-            workloads_by_task
+            let id = Uuid::parse_str(&replica.task.id)
+                .with_context(|| format!("invalid task id {}", replica.task.id))?;
+            tasks_by_task
                 .entry(replica.task_name.as_str())
                 .or_default()
                 .push(id);
@@ -44,23 +44,17 @@ pub async fn register_manifest(
             write_task(tasks_builder.reborrow().get(idx as u32), task);
         }
 
-        let mut workload_ids: Vec<Uuid> = manifest
+        let mut task_ids: Vec<Uuid> = manifest
             .tasks
             .iter()
-            .flat_map(|task| {
-                workloads_by_task
-                    .remove(task.name.as_str())
-                    .unwrap_or_default()
-            })
+            .flat_map(|task| tasks_by_task.remove(task.name.as_str()).unwrap_or_default())
             .collect();
-        for (_, ids) in workloads_by_task.into_iter() {
-            workload_ids.extend(ids);
+        for (_, ids) in tasks_by_task.into_iter() {
+            task_ids.extend(ids);
         }
-        let mut workload_builder = entry
-            .reborrow()
-            .init_workload_ids(workload_ids.len() as u32);
-        for (idx, wid) in workload_ids.iter().enumerate() {
-            workload_builder.set(idx as u32, wid.as_bytes());
+        let mut task_builder = entry.reborrow().init_task_ids(task_ids.len() as u32);
+        for (idx, wid) in task_ids.iter().enumerate() {
+            task_builder.set(idx as u32, wid.as_bytes());
         }
     }
 

@@ -16,7 +16,7 @@ pub struct SchedulerSlotDetail {
     pub memory_bytes: u64,
     pub state: SchedulerSlotState,
     pub owner: Option<Uuid>,
-    pub workload_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,8 +73,8 @@ impl SchedulerSummary {
                         SlotState::Reserved(SlotReservation { owner, .. }) => Some(*owner),
                         _ => None,
                     },
-                    workload_id: match &slot.state {
-                        SlotState::Reserved(SlotReservation { workload_id, .. }) => *workload_id,
+                    task_id: match &slot.state {
+                        SlotState::Reserved(SlotReservation { task_id, .. }) => *task_id,
                         _ => None,
                     },
                 });
@@ -118,7 +118,7 @@ impl SchedulerSummary {
                 _ => None,
             };
 
-            let workload_id = match detail.get_workload_id() {
+            let task_id = match detail.get_task_id() {
                 Ok(bytes) if bytes.len() == 16 => {
                     let mut arr = [0u8; 16];
                     arr.copy_from_slice(bytes);
@@ -133,7 +133,7 @@ impl SchedulerSummary {
                 memory_bytes: detail.get_memory_bytes(),
                 state,
                 owner,
-                workload_id,
+                task_id,
             });
         }
 
@@ -176,10 +176,10 @@ impl SchedulerSummary {
                 slot_builder.set_owner(&[]);
             }
 
-            if let Some(workload) = detail.workload_id {
-                slot_builder.set_workload_id(workload.as_bytes());
+            if let Some(task) = detail.task_id {
+                slot_builder.set_task_id(task.as_bytes());
             } else {
-                slot_builder.set_workload_id(&[]);
+                slot_builder.set_task_id(&[]);
             }
         }
 

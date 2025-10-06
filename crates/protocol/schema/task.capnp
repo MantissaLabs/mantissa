@@ -1,6 +1,6 @@
 @0xc040d5aebc3fbc7e;
 
-struct WorkloadSpec {
+struct TaskSpec {
   id @0 :Data;        # UUID v4 as 16 bytes
   name @1 :Text;
   image @2 :Text;
@@ -14,25 +14,25 @@ struct WorkloadSpec {
   memoryBytes @10 :UInt64;
 }
 
-struct StartRequest {
+struct TaskStartRequest {
   name @0 :Text;
   image @1 :Text;
   command @2 :List(Text);
   cpuMillis @3 :UInt64;
   memoryBytes @4 :UInt64;
   slotId @5 :UInt64;
-  workloadId @6 :Data;
+  taskId @6 :Data;
 }
 
-struct StopRequest {
+struct TaskStopRequest {
   id @0 :Data;
 }
 
-struct ListRequest {
-  states @0 :List(ContainerStateFilter);
+struct TaskListRequest {
+  states @0 :List(TaskStateFilter);
 }
 
-enum ContainerStateFilter {
+enum TaskStateFilter {
   pending @0;
   creating @1;
   running @2;
@@ -44,9 +44,9 @@ enum ContainerStateFilter {
   unknown @8;
 }
 
-struct WorkloadEvent {
+struct TaskEvent {
   event @0 :EventType;
-  spec @1 :WorkloadSpec;
+  spec @1 :TaskSpec;
 
   enum EventType {
     upsert @0;
@@ -54,9 +54,9 @@ struct WorkloadEvent {
   }
 }
 
-interface Workload {
-  start @0 (request :StartRequest) -> (spec :WorkloadSpec);
-  list @1 (request :ListRequest) -> (workloads :List(WorkloadSpec));
-  stop @2 (request :StopRequest) -> (spec :WorkloadSpec);
-  startMany @3 (requests :List(StartRequest)) -> (specs :List(WorkloadSpec));
+interface Task {
+  start @0 (request :TaskStartRequest) -> (spec :TaskSpec);
+  list @1 (request :TaskListRequest) -> (tasks :List(TaskSpec));
+  stop @2 (request :TaskStopRequest) -> (spec :TaskSpec);
+  startMany @3 (requests :List(TaskStartRequest)) -> (specs :List(TaskSpec));
 }

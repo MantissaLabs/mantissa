@@ -21,7 +21,7 @@ Mantissa gathers all of the following into a single comprehensive binary:
 - Secret Management
 - Service discovery
 - Load balancing
-- Cluster / workload autoscaler
+- Cluster / task autoscaler
 - External API
 
 Mantissa is easy to use and maintain.
@@ -29,7 +29,7 @@ Mantissa is easy to use and maintain.
 
 ## Setup a cluster
 
-Bootstraping a new cluster with mantissa is rather easy. Nodes taking part in a mantissa cluster are all equal, ie. there are no leader or followers. Each node is responsible for a part of the cluster state and can be used to schedule workloads.
+Bootstraping a new cluster with mantissa is rather easy. Nodes taking part in a mantissa cluster are all equal, ie. there are no leader or followers. Each node is responsible for a part of the cluster state and can be used to schedule tasks.
 
 ### Initialize a new cluster
 

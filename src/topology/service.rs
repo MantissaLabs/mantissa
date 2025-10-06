@@ -223,7 +223,7 @@ impl topology::Server for Topology {
 
             let sync_stores = SyncStores {
                 peers: peers.clone(),
-                workloads: topology.workloads.clone(),
+                tasks: topology.tasks.clone(),
                 services: topology.services.clone(),
             };
 

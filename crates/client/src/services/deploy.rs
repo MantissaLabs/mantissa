@@ -1,5 +1,5 @@
 use super::manifest::ServiceManifest;
-use super::run::{StartedWorkload, WorkloadStartParams, run_many};
+use super::run::{StartedTask, TaskStartParams, run_many};
 use super::state::{register_manifest, service_exists};
 use crate::config::ClientConfig;
 use crate::tasks;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 pub struct ReplicaStart {
     pub task_name: String,
     pub replica_number: u16,
-    pub workload: StartedWorkload,
+    pub task: StartedTask,
 }
 
 pub async fn deploy_manifest(
@@ -37,14 +37,14 @@ pub async fn deploy_manifest(
 
         for replica_idx in 0..task.replicas {
             let replica_number = replica_idx + 1;
-            let workload_name = if task.replicas > 1 {
+            let task_name = if task.replicas > 1 {
                 format!("{base_name}-{replica_number}")
             } else {
                 base_name.clone()
             };
 
-            requests.push(WorkloadStartParams {
-                name: workload_name,
+            requests.push(TaskStartParams {
+                name: task_name,
                 image: task.image.clone(),
                 command: task.command.clone(),
                 cpu_millis: 0,
@@ -58,35 +58,35 @@ pub async fn deploy_manifest(
         return Ok(Vec::new());
     }
 
-    let workloads = run_many(cfg, requests)
+    let tasks = run_many(cfg, requests)
         .await
         .context("failed to start service replicas")?;
 
-    if workloads.len() != layout.len() {
+    if tasks.len() != layout.len() {
         return Err(anyhow!(
-            "workload batch returned {} replicas but {} were requested",
-            workloads.len(),
+            "task batch returned {} replicas but {} were requested",
+            tasks.len(),
             layout.len()
         ));
     }
 
-    let replicas: Vec<ReplicaStart> = workloads
+    let replicas: Vec<ReplicaStart> = tasks
         .into_iter()
         .zip(layout.into_iter())
-        .map(|(workload, (task_name, replica_number))| ReplicaStart {
+        .map(|(task, (task_name, replica_number))| ReplicaStart {
             task_name,
             replica_number,
-            workload,
+            task,
         })
         .collect();
 
     let manifest_id = Uuid::new_v4();
     if let Err(err) = register_manifest(cfg, manifest, manifest_id, &replicas).await {
         for replica in &replicas {
-            if let Err(stop_err) = tasks::stop(cfg, &replica.workload.id).await {
+            if let Err(stop_err) = tasks::stop(cfg, &replica.task.id).await {
                 eprintln!(
-                    "failed to stop workload {} after service deployment error: {stop_err}",
-                    replica.workload.id
+                    "failed to stop task {} after service deployment error: {stop_err}",
+                    replica.task.id
                 );
             }
         }
@@ -98,7 +98,7 @@ pub async fn deploy_manifest(
 
 pub fn render_summary(manifest: &ServiceManifest, replicas: &[ReplicaStart]) -> Result<String> {
     if replicas.is_empty() {
-        return Ok("no workloads started".to_string());
+        return Ok("no tasks started".to_string());
     }
 
     let mut rows: Vec<&ReplicaStart> = replicas.iter().collect();
@@ -106,20 +106,20 @@ pub fn render_summary(manifest: &ServiceManifest, replicas: &[ReplicaStart]) -> 
         a.task_name
             .cmp(&b.task_name)
             .then_with(|| a.replica_number.cmp(&b.replica_number))
-            .then_with(|| a.workload.name.cmp(&b.workload.name))
+            .then_with(|| a.task.name.cmp(&b.task.name))
     });
 
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "SERVICE\tTASK\tREPLICA\tWORKLOAD\tID\tIMAGE\tCOMMAND\tNODE\tSTATUS"
+        "SERVICE\tTASK\tREPLICA\tNAME\tID\tIMAGE\tCOMMAND\tNODE\tSTATUS"
     )?;
 
     for row in rows {
-        let command = if row.workload.command.is_empty() {
+        let command = if row.task.command.is_empty() {
             "-".to_string()
         } else {
-            row.workload.command.join(" ")
+            row.task.command.join(" ")
         };
 
         writeln!(
@@ -128,12 +128,12 @@ pub fn render_summary(manifest: &ServiceManifest, replicas: &[ReplicaStart]) -> 
             manifest.name,
             row.task_name,
             row.replica_number,
-            row.workload.name,
-            row.workload.id,
-            row.workload.image,
+            row.task.name,
+            row.task.id,
+            row.task.image,
             command,
-            row.workload.node,
-            row.workload.state,
+            row.task.node,
+            row.task.state,
         )?;
     }
 

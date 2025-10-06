@@ -7,7 +7,7 @@ use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::store::service_store::ServiceStore;
-use crate::store::workload_store::WorkloadStore;
+use crate::store::task_store::TaskStore;
 use crate::sync::delta::{SyncStores, sync_all_domains};
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
@@ -52,7 +52,7 @@ pub struct TopologyStores {
     pub sessions: LocalSessionStore,
     pub peers: PeersStore,
     pub token_store: TokenStore,
-    pub workloads: WorkloadStore,
+    pub tasks: TaskStore,
     pub services: ServiceStore,
 }
 
@@ -220,7 +220,7 @@ pub struct Topology {
 
     /// Persistent peer store backing the CRDT state published cluster-wide.
     peers: PeersStore,
-    workloads: WorkloadStore,
+    tasks: TaskStore,
     services: ServiceStore,
 
     /// Cached Peers snapshot to avoid hitting storage on every tick.
@@ -270,7 +270,7 @@ impl Topology {
             sessions,
             peers,
             token_store,
-            workloads,
+            tasks,
             services,
         } = stores;
 
@@ -284,7 +284,7 @@ impl Topology {
             networking: Networking::new(addr),
             gossip: GossipState::new(gossip_receiver, gossip_sender),
             peers,
-            workloads,
+            tasks,
             services,
             peer_snapshot_cache: Arc::new(AsyncMutex::new(PeerSnapshotCache::new())),
             local_sessions: sessions,
@@ -578,7 +578,7 @@ impl Topology {
                         error!("Failed to forward gossip event: {e}");
                     }
                 }
-                Ok(Message::Workload { .. }) | Ok(Message::Service { .. }) => {
+                Ok(Message::Task { .. }) | Ok(Message::Service { .. }) => {
                     // Intentionally ignored: handled by dedicated managers.
                 }
                 Err(async_channel::RecvError) => {
@@ -692,7 +692,7 @@ impl Topology {
 
             let stores = SyncStores {
                 peers: self.peers.clone(),
-                workloads: self.workloads.clone(),
+                tasks: self.tasks.clone(),
                 services: self.services.clone(),
             };
 

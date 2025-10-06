@@ -6,13 +6,13 @@ use std::io::Write;
 use uuid::Uuid;
 
 pub async fn stop(cfg: &ClientConfig, id: &str) -> Result<()> {
-    let id = Uuid::parse_str(id).map_err(|e| anyhow!("invalid workload id: {e}"))?;
+    let id = Uuid::parse_str(id).map_err(|e| anyhow!("invalid task id: {e}"))?;
 
     let client = connection::get_local_session(cfg).await?;
 
-    let request = client.get_workload_request();
-    let workload = request.send().pipeline.get_workload();
-    let mut request = workload.stop_request();
+    let request = client.get_task_request();
+    let task = request.send().pipeline.get_task();
+    let mut request = task.stop_request();
     let mut builder = request.get().init_request();
     builder.set_id(id.as_bytes());
 
@@ -44,7 +44,7 @@ pub async fn stop(cfg: &ClientConfig, id: &str) -> Result<()> {
 
     tw.flush()?;
     let output = String::from_utf8(tw.into_inner()?)?;
-    println!("stopped workload:\n{output}");
+    println!("stopped task:\n{output}");
 
     Ok(())
 }

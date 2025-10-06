@@ -58,7 +58,7 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
         let details_reader = summary.get_details()?;
         if !details_reader.is_empty() {
             let mut tw = TabWriter::new(Vec::new());
-            writeln!(&mut tw, "SLOT\tCPU(m)\tMEM(MiB)\tSTATE\tOWNER\tWORKLOAD")?;
+            writeln!(&mut tw, "SLOT\tCPU(m)\tMEM(MiB)\tSTATE\tOWNER\tTASK")?;
 
             for detail in details_reader.iter() {
                 let slot_id = detail.get_slot_id();
@@ -72,13 +72,13 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
                 let owner = bytes_to_uuid(detail.get_owner()?)
                     .map(|u| u.to_string())
                     .unwrap_or_else(|| "-".to_string());
-                let workload = bytes_to_uuid(detail.get_workload_id()?)
+                let task = bytes_to_uuid(detail.get_task_id()?)
                     .map(|u| u.to_string())
                     .unwrap_or_else(|| "-".to_string());
 
                 writeln!(
                     &mut tw,
-                    "{slot_id}\t{cpu}\t{mem_mib}\t{state}\t{owner}\t{workload}",
+                    "{slot_id}\t{cpu}\t{mem_mib}\t{state}\t{owner}\t{task}",
                 )?;
             }
 

@@ -13,9 +13,9 @@ mod server;
 mod services;
 mod store;
 mod sync;
+mod task;
 mod token;
 mod topology;
-mod workload;
 
 use clap::Parser;
 use protocol::{info_capnp, node_capnp, topology_capnp};
@@ -121,7 +121,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
 
         Command::Submit(_s) => {
-            // e.g., workload::task::submit(&s.input).await?;
+            // e.g., task::task::submit(&s.input).await?;
         }
 
         Command::Link(l) => {

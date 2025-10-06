@@ -21,7 +21,7 @@ pub type SlotId = u64;
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct SlotReservation {
     pub owner: Uuid,
-    pub workload_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
 }
 
 /// Current state of a slot inside the scheduler snapshot.
@@ -81,7 +81,7 @@ impl SlotSpec {
 pub struct SlotReservationRequest {
     pub slot_id: SlotId,
     pub owner: Uuid,
-    pub workload_id: Option<Uuid>,
+    pub task_id: Option<Uuid>,
 }
 
 #[derive(Debug, Error)]
@@ -332,7 +332,7 @@ impl Scheduler {
                 let idx = current.index[&req.slot_id];
                 new_snapshot.slots[idx].state = SlotState::Reserved(SlotReservation {
                     owner: req.owner,
-                    workload_id: req.workload_id,
+                    task_id: req.task_id,
                 });
             }
 
@@ -650,14 +650,14 @@ mod tests {
             .unwrap();
 
         let owner = Uuid::new_v4();
-        let workload = Uuid::new_v4();
+        let task = Uuid::new_v4();
         let snapshot = scheduler
             .reserve_slots(
                 0,
                 vec![SlotReservationRequest {
                     slot_id: 10,
                     owner,
-                    workload_id: Some(workload),
+                    task_id: Some(task),
                 }],
             )
             .await
@@ -672,7 +672,7 @@ mod tests {
         match &slot10.state {
             SlotState::Reserved(res) => {
                 assert_eq!(res.owner, owner);
-                assert_eq!(res.workload_id, Some(workload));
+                assert_eq!(res.task_id, Some(task));
             }
             _ => panic!("slot 10 not reserved"),
         }
@@ -696,7 +696,7 @@ mod tests {
                 vec![SlotReservationRequest {
                     slot_id: 1,
                     owner,
-                    workload_id: None,
+                    task_id: None,
                 }],
             )
             .await
@@ -708,7 +708,7 @@ mod tests {
                 vec![SlotReservationRequest {
                     slot_id: 1,
                     owner: Uuid::new_v4(),
-                    workload_id: None,
+                    task_id: None,
                 }],
             )
             .await
@@ -748,7 +748,7 @@ mod tests {
                 vec![SlotReservationRequest {
                     slot_id: 5,
                     owner,
-                    workload_id: None,
+                    task_id: None,
                 }],
             )
             .await
@@ -796,7 +796,7 @@ mod tests {
                 vec![SlotReservationRequest {
                     slot_id: 1,
                     owner: Uuid::new_v4(),
-                    workload_id: None,
+                    task_id: None,
                 }],
             )
             .await

@@ -30,7 +30,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     rows.sort_by(|a, b| a.service_name.cmp(&b.service_name));
 
     let mut tw = TabWriter::new(Vec::new());
-    writeln!(&mut tw, "SERVICE\tTASKS\tWORKLOADS\tUPDATED\tID")?;
+    writeln!(&mut tw, "SERVICE\tTASKS\tTASK IDS\tUPDATED\tID")?;
 
     for row in rows {
         let tasks_summary = if row.tasks.is_empty() {
@@ -48,7 +48,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             "{}\t{}\t{}\t{}\t{}",
             row.service_name,
             tasks_summary,
-            row.workload_ids.len(),
+            row.task_ids.len(),
             row.updated_at,
             row.id,
         )?;
@@ -67,7 +67,7 @@ pub struct ServiceRow {
     pub service_name: String,
     pub tasks: Vec<ServiceTaskRow>,
     pub updated_at: String,
-    pub workload_ids: Vec<Uuid>,
+    pub task_ids: Vec<Uuid>,
 }
 
 impl ServiceRow {
@@ -80,17 +80,15 @@ impl ServiceRow {
             tasks.push(ServiceTaskRow::from_reader(tmpl)?);
         }
 
-        let mut workload_ids = Vec::new();
-        for wid in spec.get_workload_ids()?.iter() {
+        let mut task_ids = Vec::new();
+        for wid in spec.get_task_ids()?.iter() {
             let data = wid?.to_owned();
             if data.len() != 16 {
-                return Err(CapnpError::failed(
-                    "invalid workload uuid length".to_string(),
-                ));
+                return Err(CapnpError::failed("invalid task uuid length".to_string()));
             }
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(&data);
-            workload_ids.push(Uuid::from_bytes(bytes));
+            task_ids.push(Uuid::from_bytes(bytes));
         }
 
         Ok(Self {
@@ -98,7 +96,7 @@ impl ServiceRow {
             service_name,
             tasks,
             updated_at: spec.get_updated_at()?.to_str()?.to_string(),
-            workload_ids,
+            task_ids,
         })
     }
 }

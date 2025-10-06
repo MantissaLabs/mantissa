@@ -1,7 +1,7 @@
 use capnp::capability::Promise;
 use protocol::{
     gossip::gossip, health::health, node::node, scheduling::scheduler, server::cluster_session,
-    services::services, sync::sync, topology::topology, workload::workload,
+    services::services, sync::sync, task::task, topology::topology,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +13,7 @@ pub struct ClusterSessionImpl {
     gossip: gossip::Client,
     node: node::Client,
     health: health::Client,
-    workload: workload::Client,
+    task: task::Client,
     scheduler: scheduler::Client,
     services: services::Client,
     online: Arc<AtomicBool>,
@@ -26,7 +26,7 @@ impl ClusterSessionImpl {
         gossip: gossip::Client,
         node: node::Client,
         health: health::Client,
-        workload: workload::Client,
+        task: task::Client,
         scheduler: scheduler::Client,
         services: services::Client,
         online: Arc<AtomicBool>,
@@ -37,7 +37,7 @@ impl ClusterSessionImpl {
             gossip,
             node,
             health,
-            workload,
+            task,
             scheduler,
             services,
             online,
@@ -70,7 +70,7 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_topology(self.topology.clone());
         caps.set_sync(self.sync.clone());
         caps.set_health(self.health.clone());
-        caps.set_workload(self.workload.clone());
+        caps.set_task(self.task.clone());
         caps.set_scheduler(self.scheduler.clone());
         caps.set_services(self.services.clone());
 
@@ -129,16 +129,16 @@ impl cluster_session::Server for ClusterSessionImpl {
         Promise::ok(())
     }
 
-    fn get_workload(
+    fn get_task(
         &mut self,
-        _params: cluster_session::GetWorkloadParams,
-        mut results: cluster_session::GetWorkloadResults,
+        _params: cluster_session::GetTaskParams,
+        mut results: cluster_session::GetTaskResults,
     ) -> Promise<(), capnp::Error> {
         if let Err(e) = self.ensure_online() {
             return Promise::err(e);
         }
 
-        results.get().set_workload(self.workload.clone());
+        results.get().set_task(self.task.clone());
         Promise::ok(())
     }
 

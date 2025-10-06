@@ -14,6 +14,6 @@ pub mod server;
 pub mod services;
 pub mod store;
 pub mod sync;
+pub mod task;
 pub mod token;
 pub mod topology;
-pub mod workload;

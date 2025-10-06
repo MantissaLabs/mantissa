@@ -7,7 +7,7 @@ capnp::generated_code!(pub mod info_capnp);
 capnp::generated_code!(pub mod utils_capnp);
 capnp::generated_code!(pub mod sync_capnp);
 capnp::generated_code!(pub mod health_capnp);
-capnp::generated_code!(pub mod workload_capnp);
+capnp::generated_code!(pub mod task_capnp);
 capnp::generated_code!(pub mod services_capnp);
 
 // Flatten inner interface modules (e.g., protocol::gossip::Client),
@@ -72,9 +72,11 @@ pub mod health {
     pub type HealthClient = super::health::health::Client;
 }
 
-pub mod workload {
-    pub use super::workload_capnp::*;
-    pub type WorkloadClient = super::workload::workload::Client;
+pub mod task {
+    pub use super::task_capnp::task;
+    pub use super::task_capnp::task::*;
+    pub use super::task_capnp::*;
+    pub type TaskClient = super::task_capnp::task::Client;
 }
 
 pub mod services {

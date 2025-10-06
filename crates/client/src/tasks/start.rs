@@ -14,9 +14,9 @@ pub async fn start(
 ) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
 
-    let request = client.get_workload_request();
-    let workload = request.send().pipeline.get_workload();
-    let mut request = workload.start_request();
+    let request = client.get_task_request();
+    let task = request.send().pipeline.get_task();
+    let mut request = task.start_request();
 
     {
         let mut builder = request.get().init_request();
@@ -70,7 +70,7 @@ pub async fn start(
 
     tw.flush()?;
     let output = String::from_utf8(tw.into_inner()?)?;
-    println!("started workload:\n{output}");
+    println!("started task:\n{output}");
 
     Ok(())
 }

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use protocol::{
     gossip::GossipClient, health::HealthClient, node::NodeClient,
     scheduling::scheduler::Client as SchedulerClient, services::ServicesClient, sync::SyncClient,
-    topology::TopologyClient, workload::WorkloadClient,
+    task::TaskClient, topology::TopologyClient,
 };
 
 pub mod auth;
@@ -82,7 +82,7 @@ pub struct ServerClients {
     pub gossip_client: GossipClient,
     pub sync_client: SyncClient,
     pub node_client: NodeClient,
-    pub workload_client: WorkloadClient,
+    pub task_client: TaskClient,
     pub scheduler_client: SchedulerClient,
     pub services_client: ServicesClient,
 }
@@ -126,7 +126,7 @@ impl Server {
             self.clients.gossip_client.clone(),
             self.clients.node_client.clone(),
             health_client,
-            self.clients.workload_client.clone(),
+            self.clients.task_client.clone(),
             self.clients.scheduler_client.clone(),
             self.clients.services_client.clone(),
             self.online.clone(),

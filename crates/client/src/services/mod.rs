@@ -8,5 +8,5 @@ pub mod stop;
 pub use deploy::{ReplicaStart, deploy_manifest, render_summary};
 pub use list::list;
 pub use manifest::{ServiceManifest, TaskSpec, load_manifest_from_path};
-pub use run::{StartedWorkload, WorkloadStartParams, run, run_many};
+pub use run::{StartedTask, TaskStartParams, run, run_many};
 pub use stop::stop;

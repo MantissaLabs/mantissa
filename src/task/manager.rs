@@ -5,11 +5,11 @@ use crate::scheduler::{
     Scheduler, SchedulerError, SchedulerSnapshot, SlotCapacity, SlotId, SlotReservationRequest,
     SlotState,
 };
-use crate::store::workload_store::WorkloadStore;
-use crate::workload::container::ContainerState;
-use crate::workload::docker::{ContainerError, ContainerManager};
-use crate::workload::service::read_spec;
-use crate::workload::types::{WorkloadEvent, WorkloadSpec, WorkloadStateFilter, WorkloadValue};
+use crate::store::task_store::TaskStore;
+use crate::task::container::ContainerState;
+use crate::task::docker::{ContainerError, ContainerManager};
+use crate::task::service::read_spec;
+use crate::task::types::{TaskEvent, TaskSpec, TaskStateFilter, TaskValue};
 use anyhow::Context;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
@@ -27,8 +27,8 @@ use rand::rng;
 use rand::seq::SliceRandom;
 
 #[derive(Clone)]
-pub struct WorkloadManager {
-    store: WorkloadStore,
+pub struct TaskManager {
+    store: TaskStore,
     tx: Sender<Message>,
     rx: Receiver<Message>,
     seen_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
@@ -41,7 +41,7 @@ pub struct WorkloadManager {
 }
 
 #[derive(Clone)]
-pub struct ContainerStartRequest {
+pub struct TaskStartRequest {
     pub name: String,
     pub image: String,
     pub command: Vec<String>,
@@ -160,8 +160,8 @@ fn is_scheduler_retryable_message(message: &str) -> bool {
         || message.contains("unknown slots")
 }
 
-impl WorkloadManager {
-    fn build_start_intents(requests: Vec<ContainerStartRequest>) -> Vec<StartIntent> {
+impl TaskManager {
+    fn build_start_intents(requests: Vec<TaskStartRequest>) -> Vec<StartIntent> {
         requests
             .into_iter()
             .enumerate()
@@ -179,7 +179,7 @@ impl WorkloadManager {
     }
 
     pub fn new(
-        store: WorkloadStore,
+        store: TaskStore,
         tx: Sender<Message>,
         rx: Receiver<Message>,
         local_node_id: Uuid,
@@ -232,8 +232,8 @@ impl WorkloadManager {
         command: Vec<String>,
         cpu_millis: u64,
         memory_bytes: u64,
-    ) -> Result<WorkloadSpec, anyhow::Error> {
-        let request = ContainerStartRequest {
+    ) -> Result<TaskSpec, anyhow::Error> {
+        let request = TaskStartRequest {
             name: name.into(),
             image: image.into(),
             command,
@@ -243,16 +243,16 @@ impl WorkloadManager {
             slot_id: None,
         };
 
-        let mut specs = self.start_containers_batch(vec![request]).await?;
+        let mut specs = self.start_tasks_batch(vec![request]).await?;
         Ok(specs
             .pop()
             .expect("batch start with single request should yield one spec"))
     }
 
-    pub async fn start_containers_batch(
+    pub async fn start_tasks_batch(
         &self,
-        requests: Vec<ContainerStartRequest>,
-    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
+        requests: Vec<TaskStartRequest>,
+    ) -> Result<Vec<TaskSpec>, anyhow::Error> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -285,7 +285,7 @@ impl WorkloadManager {
                 }
                 Err(ExecutionError::Retry(err)) => {
                     debug!(
-                        target: "workload",
+                        target: "task",
                         "local reservation conflicted on attempt {attempt}: {err}"
                     );
                     continue;
@@ -299,7 +299,7 @@ impl WorkloadManager {
                 }
                 Err(ExecutionError::Retry(err)) => {
                     debug!(
-                        target: "workload",
+                        target: "task",
                         "remote reservation conflicted on attempt {attempt}: {err}"
                     );
                     if let Some(slots) = reserved_local_slots.take() {
@@ -324,7 +324,7 @@ impl WorkloadManager {
                 }
                 Err(ExecutionError::Retry(err)) => {
                     debug!(
-                        target: "workload",
+                        target: "task",
                         "remote start conflicted on attempt {attempt}: {err}"
                     );
                     self.release_remote_slots(&reserved_remote).await;
@@ -346,15 +346,15 @@ impl WorkloadManager {
 
             match self.start_local_containers(&mut local_plans).await {
                 Ok(local_specs) => {
-                    let mut ordered: Vec<Option<WorkloadSpec>> = vec![None; intents.len()];
+                    let mut ordered: Vec<Option<TaskSpec>> = vec![None; intents.len()];
 
                     for (idx, spec) in remote_specs.into_iter().chain(local_specs.into_iter()) {
                         ordered[idx] = Some(spec);
                     }
 
-                    let specs: Vec<WorkloadSpec> = ordered
+                    let specs: Vec<TaskSpec> = ordered
                         .into_iter()
-                        .map(|spec| spec.expect("missing workload spec after execution"))
+                        .map(|spec| spec.expect("missing task spec after execution"))
                         .collect();
 
                     self.broadcast_remote_specs(&specs).await;
@@ -363,7 +363,7 @@ impl WorkloadManager {
                 }
                 Err(err) => {
                     debug!(
-                        target: "workload",
+                        target: "task",
                         "local execution failed; attempting remote cleanup: {err}"
                     );
                     self.cleanup_remote_specs_from_specs(&remote_specs).await;
@@ -376,7 +376,7 @@ impl WorkloadManager {
         }
 
         Err(anyhow::anyhow!(
-            "failed to schedule workloads after {MAX_ATTEMPTS} attempts"
+            "failed to schedule tasks after {MAX_ATTEMPTS} attempts"
         ))
     }
 
@@ -426,7 +426,7 @@ impl WorkloadManager {
         Ok(assignment)
     }
 
-    /// Prepare an initial `Assignment` containing all workloads that specified
+    /// Prepare an initial `Assignment` containing all tasks that specified
     /// a concrete local slot. The remaining intents plus the list of free local
     /// slots are returned for the distributed placement step.
     fn seed_local_plans<'a>(
@@ -465,7 +465,7 @@ impl WorkloadManager {
                 ));
             }
 
-            // Ensure we own the reservation and (if present) that it references the same workload.
+            // Ensure we own the reservation and (if present) that it references the same task.
             if let SlotState::Reserved(reservation) = &slot.state {
                 if reservation.owner != self.local_node_id {
                     return Err(anyhow::anyhow!(
@@ -473,10 +473,10 @@ impl WorkloadManager {
                     ));
                 }
 
-                if let Some(workload_id) = reservation.workload_id {
-                    if workload_id != intent.id {
+                if let Some(task_id) = reservation.task_id {
+                    if task_id != intent.id {
                         return Err(anyhow::anyhow!(
-                            "preassigned slot {slot_id} reserved for workload {workload_id}"
+                            "preassigned slot {slot_id} reserved for task {task_id}"
                         ));
                     }
                 }
@@ -536,7 +536,7 @@ impl WorkloadManager {
                 Ok(summary) => summary,
                 Err(err) => {
                     debug!(
-                        target: "workload",
+                        target: "task",
                         "scheduler summary fetch failed for peer {peer_id}: {err}"
                     );
                     continue;
@@ -653,7 +653,7 @@ impl WorkloadManager {
     async fn start_local_containers(
         &self,
         plans: &mut [BatchStartPlan],
-    ) -> Result<Vec<(usize, WorkloadSpec)>, anyhow::Error> {
+    ) -> Result<Vec<(usize, TaskSpec)>, anyhow::Error> {
         if plans.is_empty() {
             return Ok(Vec::new());
         }
@@ -703,7 +703,7 @@ impl WorkloadManager {
             requests.push(SlotReservationRequest {
                 slot_id: plan.slot_id,
                 owner: self.local_node_id,
-                workload_id: Some(plan.id),
+                task_id: Some(plan.id),
             });
             newly_reserved.push(plan.slot_id);
         }
@@ -731,7 +731,7 @@ impl WorkloadManager {
         for slot_id in slots {
             if let Err(err) = self.release_slot(*slot_id).await {
                 warn!(
-                    target: "workload",
+                    target: "task",
                     "failed to release local slot {slot_id}: {err}"
                 );
             }
@@ -797,7 +797,7 @@ impl WorkloadManager {
                     let mut entry = intents_builder.reborrow().get(idx as u32);
                     entry.set_slot_id(plan.slot_id);
                     entry.set_owner(plan.peer_id.as_bytes());
-                    entry.set_workload_id(plan.id.as_bytes());
+                    entry.set_task_id(plan.id.as_bytes());
                 }
             }
 
@@ -848,7 +848,7 @@ impl WorkloadManager {
                 Ok(session) => session,
                 Err(err) => {
                     warn!(
-                        target: "workload",
+                        target: "task",
                         "failed to reopen session with peer {peer_id} while releasing slots: {err}"
                     );
                     continue;
@@ -867,7 +867,7 @@ impl WorkloadManager {
                         Ok(client) => client,
                         Err(err) => {
                             warn!(
-                                target: "workload",
+                                target: "task",
                                 "failed to access scheduler for peer {peer_id} while releasing slots: {err}"
                             );
                             continue;
@@ -875,7 +875,7 @@ impl WorkloadManager {
                     },
                     Err(err) => {
                         warn!(
-                            target: "workload",
+                            target: "task",
                             "failed to obtain scheduler response for peer {peer_id}: {err}"
                         );
                         continue;
@@ -883,7 +883,7 @@ impl WorkloadManager {
                 },
                 Err(err) => {
                     warn!(
-                        target: "workload",
+                        target: "task",
                         "failed to send scheduler request to peer {peer_id}: {err}"
                     );
                     continue;
@@ -904,7 +904,7 @@ impl WorkloadManager {
 
             if let Err(err) = release_req.send().promise.await {
                 warn!(
-                    target: "workload",
+                    target: "task",
                     "failed to release slots on peer {peer_id}: {err}"
                 );
             }
@@ -921,12 +921,12 @@ impl WorkloadManager {
             .ok_or_else(|| anyhow::anyhow!("no active session for peer {peer_id}"))
     }
 
-    async fn cleanup_remote_specs_from_specs(&self, specs: &[(usize, WorkloadSpec)]) {
+    async fn cleanup_remote_specs_from_specs(&self, specs: &[(usize, TaskSpec)]) {
         if specs.is_empty() {
             return;
         }
 
-        let mut by_peer: HashMap<Uuid, Vec<&WorkloadSpec>> = HashMap::new();
+        let mut by_peer: HashMap<Uuid, Vec<&TaskSpec>> = HashMap::new();
         for (_, spec) in specs.iter() {
             if spec.node_id == self.local_node_id {
                 continue;
@@ -934,50 +934,50 @@ impl WorkloadManager {
             by_peer.entry(spec.node_id).or_default().push(spec);
         }
 
-        for (peer_id, workloads) in by_peer.into_iter() {
+        for (peer_id, tasks) in by_peer.into_iter() {
             let session = match self.remote_session(peer_id).await {
                 Ok(session) => session,
                 Err(err) => {
                     warn!(
-                        target: "workload",
+                        target: "task",
                         "failed to reopen session with peer {peer_id} during cleanup: {err}"
                     );
                     continue;
                 }
             };
 
-            let workload_client = match session.get_workload_request().send().promise.await {
+            let task_client = match session.get_task_request().send().promise.await {
                 Ok(resp) => match resp.get() {
-                    Ok(result) => match result.get_workload() {
+                    Ok(result) => match result.get_task() {
                         Ok(client) => client,
                         Err(err) => {
                             warn!(
-                                target: "workload",
-                                "failed to access workload capability for peer {peer_id}: {err}"
+                                target: "task",
+                                "failed to access task capability for peer {peer_id}: {err}"
                             );
                             continue;
                         }
                     },
                     Err(err) => {
                         warn!(
-                            target: "workload",
-                            "failed to complete workload capability request for peer {peer_id}: {err}"
+                            target: "task",
+                            "failed to complete task capability request for peer {peer_id}: {err}"
                         );
                         continue;
                     }
                 },
                 Err(err) => {
                     warn!(
-                        target: "workload",
-                        "failed to send workload capability request to peer {peer_id}: {err}"
+                        target: "task",
+                        "failed to send task capability request to peer {peer_id}: {err}"
                     );
                     continue;
                 }
             };
 
-            for spec in workloads {
+            for spec in tasks {
                 // Remote stop is best-effort; failures are logged but do not abort cleanup.
-                let mut stop_req = workload_client.stop_request();
+                let mut stop_req = task_client.stop_request();
                 {
                     let mut inner = stop_req.get().init_request();
                     inner.set_id(spec.id.as_bytes());
@@ -987,16 +987,16 @@ impl WorkloadManager {
                     Ok(response) => {
                         if let Err(err) = response.get() {
                             warn!(
-                                target: "workload",
-                                "failed to stop remote workload {} on peer {peer_id}: {err}",
+                                target: "task",
+                                "failed to stop remote task {} on peer {peer_id}: {err}",
                                 spec.id
                             );
                         }
                     }
                     Err(err) => {
                         warn!(
-                            target: "workload",
-                            "failed to stop remote workload {} on peer {peer_id}: {err}",
+                            target: "task",
+                            "failed to stop remote task {} on peer {peer_id}: {err}",
                             spec.id
                         );
                     }
@@ -1008,7 +1008,7 @@ impl WorkloadManager {
     async fn execute_remote_plans(
         &self,
         plans: &[RemoteStartPlan],
-    ) -> Result<Vec<(usize, WorkloadSpec)>, ExecutionError> {
+    ) -> Result<Vec<(usize, TaskSpec)>, ExecutionError> {
         if plans.is_empty() {
             return Ok(Vec::new());
         }
@@ -1026,18 +1026,18 @@ impl WorkloadManager {
                 .await
                 .map_err(|err| ExecutionError::Retry(err))?;
 
-            let workload_client = session
-                .get_workload_request()
+            let task_client = session
+                .get_task_request()
                 .send()
                 .promise
                 .await
                 .map_err(|err| ExecutionError::Retry(anyhow::anyhow!(err.to_string())))?
                 .get()
                 .map_err(|err| ExecutionError::Retry(anyhow::anyhow!(err.to_string())))?
-                .get_workload()
+                .get_task()
                 .map_err(|err| ExecutionError::Retry(anyhow::anyhow!(err.to_string())))?;
 
-            let mut start_req = workload_client.start_many_request();
+            let mut start_req = task_client.start_many_request();
             {
                 let mut requests_builder = start_req.get().init_requests(peer_plans.len() as u32);
                 for (idx, plan) in peer_plans.iter().enumerate() {
@@ -1051,7 +1051,7 @@ impl WorkloadManager {
                         .checked_add(1)
                         .expect("slot id overflow while encoding reservation");
                     entry.set_slot_id(encoded_slot_id);
-                    entry.set_workload_id(plan.id.as_bytes());
+                    entry.set_task_id(plan.id.as_bytes());
 
                     let mut cmd_builder = entry.reborrow().init_command(plan.command.len() as u32);
                     for (arg_idx, arg) in plan.command.iter().enumerate() {
@@ -1125,14 +1125,14 @@ impl WorkloadManager {
                     None,
                 )
                 .await
-                .with_context(|| format!("docker create failed for workload {}", plan.name))?;
+                .with_context(|| format!("docker create failed for task {}", plan.name))?;
 
             plan.container_id = Some(container_id.clone());
 
             self.container_manager
                 .start_container(&container_id)
                 .await
-                .with_context(|| format!("docker start failed for workload {}", plan.name))?;
+                .with_context(|| format!("docker start failed for task {}", plan.name))?;
 
             plan.created_at = Utc::now();
         }
@@ -1140,15 +1140,12 @@ impl WorkloadManager {
         Ok(())
     }
 
-    async fn commit_batch(
-        &self,
-        plans: &[BatchStartPlan],
-    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
+    async fn commit_batch(&self, plans: &[BatchStartPlan]) -> Result<Vec<TaskSpec>, anyhow::Error> {
         let mut specs = Vec::with_capacity(plans.len());
-        let mut persisted: Vec<WorkloadSpec> = Vec::new();
+        let mut persisted: Vec<TaskSpec> = Vec::new();
 
         for plan in plans {
-            let spec = WorkloadSpec {
+            let spec = TaskSpec {
                 id: plan.id,
                 name: plan.name.clone(),
                 image: plan.image.clone(),
@@ -1166,7 +1163,7 @@ impl WorkloadManager {
                 for rollback in &persisted {
                     let _ = self.remove_spec(rollback.id).await;
                 }
-                return Err(err.context(format!("failed to persist workload spec {}", spec.name)));
+                return Err(err.context(format!("failed to persist task spec {}", spec.name)));
             }
 
             persisted.push(spec.clone());
@@ -1174,13 +1171,10 @@ impl WorkloadManager {
         }
 
         for spec in &specs {
-            if let Err(err) = self
-                .enqueue_gossip(WorkloadEvent::Upsert(spec.clone()))
-                .await
-            {
+            if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(spec.clone())).await {
                 warn!(
-                    target: "workload",
-                    "failed to enqueue workload gossip for {}: {err}",
+                    target: "task",
+                    "failed to enqueue task gossip for {}: {err}",
                     spec.name
                 );
             }
@@ -1207,8 +1201,8 @@ impl WorkloadManager {
                     .await
                 {
                     warn!(
-                        target: "workload",
-                        "failed to stop container {container_id} for workload {}: {err}",
+                        target: "task",
+                        "failed to stop container {container_id} for task {}: {err}",
                         plan.id
                     );
                 }
@@ -1219,8 +1213,8 @@ impl WorkloadManager {
                     .await
                 {
                     warn!(
-                        target: "workload",
-                        "failed to remove container {container_id} for workload {}: {err}",
+                        target: "task",
+                        "failed to remove container {container_id} for task {}: {err}",
                         plan.id
                     );
                 }
@@ -1232,7 +1226,7 @@ impl WorkloadManager {
             if plan.slot_id != 0 {
                 if let Err(err) = self.release_slot(plan.slot_id).await {
                     warn!(
-                        target: "workload",
+                        target: "task",
                         "failed to release slot {} during rollback: {err}",
                         plan.slot_id
                     );
@@ -1243,15 +1237,15 @@ impl WorkloadManager {
         self.cleanup_orphaned_slots().await;
     }
 
-    /// Returns workload specifications filtered according to the provided list policy.
-    pub async fn list_containers(
+    /// Returns task specifications filtered according to the provided list policy.
+    pub async fn list_tasks(
         &self,
-        filter: &WorkloadStateFilter,
-    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
+        filter: &TaskStateFilter,
+    ) -> Result<Vec<TaskSpec>, anyhow::Error> {
         let (actives, _) = self
             .store
             .load_all()
-            .map_err(|e| anyhow::anyhow!("workload store load_all failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
 
         let mut specs = Vec::with_capacity(actives.len());
         for (k, snap) in actives {
@@ -1266,8 +1260,8 @@ impl WorkloadManager {
         Ok(specs)
     }
 
-    async fn persist_spec(&self, spec: &WorkloadSpec) -> Result<(), anyhow::Error> {
-        let value = WorkloadValue::new(
+    async fn persist_spec(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
+        let value = TaskValue::new(
             spec.id,
             spec.name.clone(),
             spec.image.clone(),
@@ -1284,14 +1278,14 @@ impl WorkloadManager {
         self.store
             .upsert(&UuidKey::from(spec.id), value)
             .await
-            .map_err(|e| anyhow::anyhow!("workload upsert failed: {e}"))
+            .map_err(|e| anyhow::anyhow!("task upsert failed: {e}"))
     }
 
     async fn remove_spec(&self, id: Uuid) -> Result<(), anyhow::Error> {
         self.store
             .remove(&UuidKey::from(id))
             .await
-            .map_err(|e| anyhow::anyhow!("workload remove failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("task remove failed: {e}"))?;
         Ok(())
     }
 
@@ -1299,19 +1293,16 @@ impl WorkloadManager {
         self.tx.clone()
     }
 
-    async fn broadcast_remote_specs(&self, specs: &[WorkloadSpec]) {
+    async fn broadcast_remote_specs(&self, specs: &[TaskSpec]) {
         for spec in specs {
             if spec.node_id == self.local_node_id {
                 continue;
             }
 
-            if let Err(err) = self
-                .enqueue_gossip(WorkloadEvent::Upsert(spec.clone()))
-                .await
-            {
+            if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(spec.clone())).await {
                 warn!(
-                    target: "workload",
-                    "failed to relay workload {} from node {}: {err}",
+                    target: "task",
+                    "failed to relay task {} from node {}: {err}",
                     spec.name,
                     spec.node_id
                 );
@@ -1347,7 +1338,7 @@ impl WorkloadManager {
                 Ok(ids) => ids,
                 Err(err) => {
                     warn!(
-                        target: "workload",
+                        target: "task",
                         "failed to collect active slots while cleaning orphans: {err}"
                     );
                     return;
@@ -1373,7 +1364,7 @@ impl WorkloadManager {
                 | Err(SchedulerError::SlotsNotReserved { .. }) => continue,
                 Err(err) => {
                     warn!(
-                        target: "workload",
+                        target: "task",
                         "failed to free orphaned slots {:?}: {err}",
                         to_free
                     );
@@ -1387,7 +1378,7 @@ impl WorkloadManager {
         let (actives, _) = self
             .store
             .load_all()
-            .map_err(|e| anyhow::anyhow!("workload store load_all failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
 
         let mut slots = HashSet::new();
         for (key, snapshot) in actives {
@@ -1406,45 +1397,43 @@ impl WorkloadManager {
         Ok(slots)
     }
 
-    async fn enqueue_gossip(&self, event: WorkloadEvent) -> Result<(), anyhow::Error> {
+    async fn enqueue_gossip(&self, event: TaskEvent) -> Result<(), anyhow::Error> {
         let id = Uuid::new_v4();
-        let message = Message::Workload { id, event };
+        let message = Message::Task { id, event };
         self.tx()
             .send(message)
             .await
-            .map_err(|e| anyhow::anyhow!("failed to enqueue workload gossip: {e}"))
+            .map_err(|e| anyhow::anyhow!("failed to enqueue task gossip: {e}"))
     }
 
-    async fn load_spec(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
+    async fn load_spec(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
         let key = UuidKey::from(id);
         let snapshot = self
             .store
             .get_snapshot(&key)
-            .map_err(|e| anyhow::anyhow!("workload lookup failed: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("unknown workload {id}"))?;
+            .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("unknown task {id}"))?;
 
         let value = snapshot
             .as_slice()
             .last()
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("workload {id} has no value"))?;
+            .ok_or_else(|| anyhow::anyhow!("task {id} has no value"))?;
 
         Ok(value_to_spec(id, value))
     }
 
-    pub async fn workload_owned_locally(&self, id: Uuid) -> Result<bool, anyhow::Error> {
+    pub async fn task_owned_locally(&self, id: Uuid) -> Result<bool, anyhow::Error> {
         let spec = self.load_spec(id).await?;
         Ok(spec.node_id == self.local_node_id)
     }
 
-    pub async fn stop_workload(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
+    pub async fn stop_task(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
         let spec = self.load_spec(id).await?;
         let node_name = spec.node_name.clone();
 
         if spec.node_id != self.local_node_id {
-            return Err(anyhow::anyhow!(
-                "workload {id} is assigned to node {node_name}",
-            ));
+            return Err(anyhow::anyhow!("task {id} is assigned to node {node_name}",));
         }
 
         if matches!(spec.state, ContainerState::Stopped) {
@@ -1465,7 +1454,7 @@ impl WorkloadManager {
         if !matches!(spec.state, ContainerState::Stopping) {
             updated.state = ContainerState::Stopping;
             self.persist_spec(&updated).await?;
-            self.enqueue_gossip(WorkloadEvent::Upsert(updated.clone()))
+            self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
                 .await?;
         }
 
@@ -1477,15 +1466,15 @@ impl WorkloadManager {
             Ok(_) => {}
             Err(ContainerError::NotFound(_)) => {
                 debug!(
-                    target: "workload",
-                    "container {container_identifier} not found while stopping workload {id}; cache_hit={from_cache}"
+                    target: "task",
+                    "container {container_identifier} not found while stopping task {id}; cache_hit={from_cache}"
                 );
             }
             Err(e) => {
                 updated.state = spec.state;
                 if updated.state != ContainerState::Stopping {
                     self.persist_spec(&updated).await?;
-                    self.enqueue_gossip(WorkloadEvent::Upsert(updated.clone()))
+                    self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
                         .await?;
                 }
                 return Err(anyhow::anyhow!("docker stop failed: {e}"));
@@ -1499,11 +1488,11 @@ impl WorkloadManager {
         {
             match e {
                 ContainerError::NotFound(_) => debug!(
-                    target: "workload",
-                    "container {container_identifier} already absent while removing workload {id}"
+                    target: "task",
+                    "container {container_identifier} already absent while removing task {id}"
                 ),
                 other => warn!(
-                    target: "workload",
+                    target: "task",
                     "failed to remove container {container_identifier}: {other}"
                 ),
             }
@@ -1520,7 +1509,7 @@ impl WorkloadManager {
         }
 
         self.persist_spec(&updated).await?;
-        self.enqueue_gossip(WorkloadEvent::Upsert(updated.clone()))
+        self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
             .await?;
         self.cleanup_orphaned_slots().await;
         Ok(updated)
@@ -1534,12 +1523,12 @@ impl WorkloadManager {
     pub async fn run(&mut self) {
         while let Ok(message) = self.rx.recv().await {
             match message {
-                Message::Workload { id, event } => {
+                Message::Task { id, event } => {
                     if !self.record_gossip_id(id).await {
                         continue;
                     }
                     if let Err(e) = self.handle_event(event).await {
-                        tracing::error!(target: "workload", "failed to handle workload event: {e}");
+                        tracing::error!(target: "task", "failed to handle task event: {e}");
                     }
                 }
                 Message::Void { .. } => {}
@@ -1548,21 +1537,21 @@ impl WorkloadManager {
         }
     }
 
-    async fn handle_event(&self, event: WorkloadEvent) -> Result<(), anyhow::Error> {
+    async fn handle_event(&self, event: TaskEvent) -> Result<(), anyhow::Error> {
         match event {
-            WorkloadEvent::Upsert(spec) => {
+            TaskEvent::Upsert(spec) => {
                 if spec.node_id == self.local_node_id && spec.state != ContainerState::Running {
                     self.local_containers.lock().await.remove(&spec.id);
                 }
                 self.persist_spec(&spec).await
             }
-            WorkloadEvent::Remove { id } => self.remove_spec(id).await,
+            TaskEvent::Remove { id } => self.remove_spec(id).await,
         }
     }
 }
 
-fn value_to_spec(id: Uuid, value: WorkloadValue) -> WorkloadSpec {
-    WorkloadSpec {
+fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
+    TaskSpec {
         id,
         name: value.name,
         image: value.image,
@@ -1586,8 +1575,8 @@ mod tests {
     use crate::store::local_session_store::LocalSessionStore;
     use crate::store::peer_store::open_peers_store;
     use crate::store::scheduler_store::open_scheduler_store;
-    use crate::store::workload_store::open_workload_store;
-    use crate::workload::types::{WorkloadStateKind, WorkloadValue};
+    use crate::store::task_store::open_task_store;
+    use crate::task::types::{TaskStateKind, TaskValue};
     use ::health::{Config as HealthConfig, HealthMonitor};
     use async_channel::bounded;
     use async_trait::async_trait;
@@ -1613,8 +1602,8 @@ mod tests {
             _env_vars: Option<Vec<String>>,
             _ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
             _volumes: Option<Vec<String>>,
-            _restart_policy: Option<crate::workload::docker::RestartPolicyConfig>,
-        ) -> crate::workload::docker::ContainerResult<String> {
+            _restart_policy: Option<crate::task::docker::RestartPolicyConfig>,
+        ) -> crate::task::docker::ContainerResult<String> {
             let mut guard = self.created.lock().await;
             let id = format!("container-{}", guard.len());
             guard.push(id.clone());
@@ -1624,7 +1613,7 @@ mod tests {
         async fn start_container(
             &self,
             _container_id: &str,
-        ) -> crate::workload::docker::ContainerResult<()> {
+        ) -> crate::task::docker::ContainerResult<()> {
             Ok(())
         }
 
@@ -1632,7 +1621,7 @@ mod tests {
             &self,
             container_id: &str,
             _timeout: Option<std::time::Duration>,
-        ) -> crate::workload::docker::ContainerResult<()> {
+        ) -> crate::task::docker::ContainerResult<()> {
             self.stopped.lock().await.push(container_id.to_string());
             Ok(())
         }
@@ -1641,7 +1630,7 @@ mod tests {
             &self,
             _container_id: &str,
             _timeout: Option<std::time::Duration>,
-        ) -> crate::workload::docker::ContainerResult<()> {
+        ) -> crate::task::docker::ContainerResult<()> {
             Ok(())
         }
 
@@ -1650,29 +1639,28 @@ mod tests {
             _container_id: &str,
             _force: bool,
             _remove_volumes: bool,
-        ) -> crate::workload::docker::ContainerResult<()> {
+        ) -> crate::task::docker::ContainerResult<()> {
             Ok(())
         }
 
         async fn list_containers(
             &self,
             _filters: Option<HashMap<String, Vec<String>>>,
-        ) -> crate::workload::docker::ContainerResult<Vec<crate::workload::docker::ContainerInfo>>
-        {
+        ) -> crate::task::docker::ContainerResult<Vec<crate::task::docker::ContainerInfo>> {
             Ok(Vec::new())
         }
 
         async fn inspect_container(
             &self,
             _container_id: &str,
-        ) -> crate::workload::docker::ContainerResult<bollard::service::ContainerInspectResponse>
+        ) -> crate::task::docker::ContainerResult<bollard::service::ContainerInspectResponse>
         {
-            Err(crate::workload::docker::ContainerError::OperationFailed(
+            Err(crate::task::docker::ContainerError::OperationFailed(
                 "inspect unsupported in mock".into(),
             ))
         }
 
-        async fn pull_image(&self, _image: &str) -> crate::workload::docker::ContainerResult<()> {
+        async fn pull_image(&self, _image: &str) -> crate::task::docker::ContainerResult<()> {
             Ok(())
         }
     }
@@ -1684,7 +1672,7 @@ mod tests {
         (db, dir)
     }
 
-    async fn setup_manager() -> (WorkloadManager, Rc<Scheduler>, Arc<MockContainerManager>) {
+    async fn setup_manager() -> (TaskManager, Rc<Scheduler>, Arc<MockContainerManager>) {
         let actor = Uuid::new_v4();
         let (scheduler_db, _dir) = temp_db("scheduler");
         let scheduler_store =
@@ -1726,14 +1714,14 @@ mod tests {
             .await
             .expect("init slots");
 
-        let (workload_db, _wd) = temp_db("workload");
-        let workload_store = open_workload_store(workload_db, actor).expect("open workload store");
+        let (task_db, _wd) = temp_db("task");
+        let task_store = open_task_store(task_db, actor).expect("open task store");
 
         let mock_manager = Arc::new(MockContainerManager::default());
         let (tx, rx) = bounded(4);
         let container_manager: Arc<dyn ContainerManager + Send + Sync> = mock_manager.clone();
-        let manager = WorkloadManager::new(
-            workload_store,
+        let manager = TaskManager::new(
+            task_store,
             tx,
             rx,
             actor,
@@ -1775,7 +1763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_workload_releases_slot_and_clears_resources() {
+    async fn stop_task_releases_slot_and_clears_resources() {
         let (manager, scheduler, mock_cm) = setup_manager().await;
 
         let spec = manager
@@ -1784,7 +1772,7 @@ mod tests {
             .expect("start container");
 
         let slot_id = spec.slot_id.expect("slot assigned");
-        let stopped = manager.stop_workload(spec.id).await.expect("stop workload");
+        let stopped = manager.stop_task(spec.id).await.expect("stop task");
 
         assert!(matches!(stopped.state, ContainerState::Stopped));
         let stopped_containers = mock_cm.stopped.lock().await.clone();
@@ -1804,7 +1792,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_workload_uses_container_name_when_cache_missing() {
+    async fn stop_task_uses_container_name_when_cache_missing() {
         let (manager, _scheduler, mock_cm) = setup_manager().await;
 
         let spec = manager
@@ -1821,9 +1809,9 @@ mod tests {
         }
 
         manager
-            .stop_workload(spec.id)
+            .stop_task(spec.id)
             .await
-            .expect("stop workload with fallback");
+            .expect("stop task with fallback");
 
         let expected = format!("mantissa-{}", spec.id);
         let stopped_containers = mock_cm.stopped.lock().await.clone();
@@ -1831,7 +1819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_containers_respects_filters() {
+    async fn list_tasks_respects_filters() {
         let (manager, _scheduler, _mock_cm) = setup_manager().await;
 
         let spec = manager
@@ -1840,27 +1828,27 @@ mod tests {
             .expect("start container");
 
         let active = manager
-            .list_containers(&WorkloadStateFilter::active_only())
+            .list_tasks(&TaskStateFilter::active_only())
             .await
             .expect("list active");
         assert_eq!(active.len(), 1);
         assert!(matches!(active[0].state, ContainerState::Running));
 
-        manager.stop_workload(spec.id).await.expect("stop workload");
+        manager.stop_task(spec.id).await.expect("stop task");
 
         let active_only = manager
-            .list_containers(&WorkloadStateFilter::active_only())
+            .list_tasks(&TaskStateFilter::active_only())
             .await
             .expect("list active after stop");
         assert!(active_only.is_empty());
 
         let with_stopped = manager
-            .list_containers(&WorkloadStateFilter::new([
-                WorkloadStateKind::Pending,
-                WorkloadStateKind::Creating,
-                WorkloadStateKind::Running,
-                WorkloadStateKind::Stopping,
-                WorkloadStateKind::Stopped,
+            .list_tasks(&TaskStateFilter::new([
+                TaskStateKind::Pending,
+                TaskStateKind::Creating,
+                TaskStateKind::Running,
+                TaskStateKind::Stopping,
+                TaskStateKind::Stopped,
             ]))
             .await
             .expect("list active with stopped");
@@ -1868,12 +1856,12 @@ mod tests {
         assert!(matches!(with_stopped[0].state, ContainerState::Stopped));
 
         let all = manager
-            .list_containers(&WorkloadStateFilter::all())
+            .list_tasks(&TaskStateFilter::all())
             .await
             .expect("list all");
 
         let only_stopped = manager
-            .list_containers(&WorkloadStateFilter::new([WorkloadStateKind::Stopped]))
+            .list_tasks(&TaskStateFilter::new([TaskStateKind::Stopped]))
             .await
             .expect("list stopped only");
         assert_eq!(only_stopped.len(), 1);
@@ -1896,12 +1884,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_containers_batch_reserves_every_slot() {
+    async fn start_tasks_batch_reserves_every_slot() {
         let (manager, scheduler, mock_cm) = setup_manager().await;
 
         let specs = manager
-            .start_containers_batch(vec![
-                ContainerStartRequest {
+            .start_tasks_batch(vec![
+                TaskStartRequest {
                     name: "svc-a".into(),
                     image: "img".into(),
                     command: vec![],
@@ -1910,7 +1898,7 @@ mod tests {
                     id: None,
                     slot_id: None,
                 },
-                ContainerStartRequest {
+                TaskStartRequest {
                     name: "svc-b".into(),
                     image: "img".into(),
                     command: vec![],
@@ -1938,10 +1926,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_containers_batch_respects_existing_reservations() {
+    async fn start_tasks_batch_respects_existing_reservations() {
         let (manager, scheduler, mock_cm) = setup_manager().await;
 
-        let workload_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
         let slot_id = 0;
 
         scheduler
@@ -1950,20 +1938,20 @@ mod tests {
                 vec![SlotReservationRequest {
                     slot_id,
                     owner: manager.local_node_id,
-                    workload_id: Some(workload_id),
+                    task_id: Some(task_id),
                 }],
             )
             .await
             .expect("pre-reserve slot");
 
         let specs = manager
-            .start_containers_batch(vec![ContainerStartRequest {
+            .start_tasks_batch(vec![TaskStartRequest {
                 name: "svc-pre".into(),
                 image: "img".into(),
                 command: vec![],
                 cpu_millis: 200,
                 memory_bytes: 64 * 1_024 * 1_024,
-                id: Some(workload_id),
+                id: Some(task_id),
                 slot_id: Some(slot_id),
             }])
             .await
@@ -1984,7 +1972,7 @@ mod tests {
         match &reserved[0].state {
             SlotState::Reserved(reservation) => {
                 assert_eq!(reservation.owner, manager.local_node_id);
-                assert_eq!(reservation.workload_id, Some(workload_id));
+                assert_eq!(reservation.task_id, Some(task_id));
             }
             _ => unreachable!("slot should be reserved"),
         }
@@ -1994,23 +1982,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workload_owned_locally_detects_remote_entries() {
+    async fn task_owned_locally_detects_remote_entries() {
         let (manager, _scheduler, _mock_cm) = setup_manager().await;
 
         let local_spec = manager
             .start_container("local", "img", vec![], 200, 64 * 1_024 * 1_024)
             .await
-            .expect("start local workload");
+            .expect("start local task");
 
         assert!(
             manager
-                .workload_owned_locally(local_spec.id)
+                .task_owned_locally(local_spec.id)
                 .await
                 .expect("local ownership check")
         );
 
         let remote_id = Uuid::new_v4();
-        let remote_value = WorkloadValue::new(
+        let remote_value = TaskValue::new(
             remote_id,
             "remote",
             "img",
@@ -2028,18 +2016,18 @@ mod tests {
         store
             .upsert(&UuidKey::from(remote_id), remote_value)
             .await
-            .expect("insert remote workload value");
+            .expect("insert remote task value");
 
         assert!(
             !manager
-                .workload_owned_locally(remote_id)
+                .task_owned_locally(remote_id)
                 .await
                 .expect("remote ownership check")
         );
     }
 
     #[tokio::test]
-    async fn start_containers_batch_is_atomic_on_capacity_failure() {
+    async fn start_tasks_batch_is_atomic_on_capacity_failure() {
         let (manager, scheduler, mock_cm) = setup_manager().await;
 
         manager
@@ -2050,8 +2038,8 @@ mod tests {
         let created_before = mock_cm.created.lock().await.len();
 
         let err = manager
-            .start_containers_batch(vec![
-                ContainerStartRequest {
+            .start_tasks_batch(vec![
+                TaskStartRequest {
                     name: "svc-c".into(),
                     image: "img".into(),
                     command: vec![],
@@ -2060,7 +2048,7 @@ mod tests {
                     id: None,
                     slot_id: None,
                 },
-                ContainerStartRequest {
+                TaskStartRequest {
                     name: "svc-d".into(),
                     image: "img".into(),
                     command: vec![],

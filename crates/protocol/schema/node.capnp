@@ -22,10 +22,10 @@ interface Node {
 }
 
 interface Executor {
-  # Executor takes tasks descriptions and runs them on the local machine.
+  # Executor takes task descriptions and runs them on the local machine.
 
-  run @0 (workload: Scheduling.Workload) -> ();
-  # Executes a workload from a given order.
+  run @0 (task: Scheduling.Task) -> ();
+  # Executes a task from a given order.
 
   list @1 () -> (tasks :TaskList);
   # List tasks running on the node.
@@ -35,13 +35,13 @@ interface Scheduler {
   # Scheduler describes calls that are used to schedule and cancel tasks.
 
   book @0 (req :Scheduling.SlotRequest) -> (alloc :Scheduling.Allocation);
-  # Book slots. Takes a vector of slots in parameter with necessary workload
-  # informations. Returns a promise of allocation.
+  # Book slots. Takes a vector of slots in parameter with necessary task
+  # information. Returns a promise of allocation.
 
   free @1 (req :Scheduling.SlotRequest) -> ();
   # Free slots. Takes a vector of slots to release.
 
-  schedule @2 (workload: Scheduling.Workload) -> (allocation :Scheduling.Allocation);
+  schedule @2 (task: Scheduling.Task) -> (allocation :Scheduling.Allocation);
   # Schedules a task.
 }
 

@@ -14,11 +14,11 @@ use common::testkit::{ClusterConfig, TestNode};
 use crdt_store::uuid_key::UuidKey;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{ServiceSpecValue, ServiceTaskSpecValue, compute_service_id};
-use mantissa::workload::docker::{
+use mantissa::task::docker::{
     ContainerManager, clear_container_manager_override, set_container_manager_override,
 };
-use mantissa::workload::manager::{ContainerStartRequest, WorkloadManager};
-use mantissa::workload::types::{WorkloadSpec, WorkloadStateFilter};
+use mantissa::task::manager::{TaskManager, TaskStartRequest};
+use mantissa::task::types::{TaskSpec, TaskStateFilter};
 use protocol::services::services;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -97,7 +97,7 @@ local_test!(services_deployment_replicates_across_cluster, {
     let manifest = load_manifest_from_path(Path::new("examples/replicated_service.ron"))
         .expect("load service manifest");
 
-    let (service_id, workloads) = deploy_manifest_via_anchor(&cluster[0], &manifest).await;
+    let (service_id, tasks) = deploy_manifest_via_anchor(&cluster[0], &manifest).await;
 
     for node in &cluster {
         assert!(
@@ -107,33 +107,33 @@ local_test!(services_deployment_replicates_across_cluster, {
         );
     }
 
-    let expected_workload_ids: BTreeSet<Uuid> = workloads.iter().map(|spec| spec.id).collect();
-    let expected_count = expected_workload_ids.len();
+    let expected_task_ids: BTreeSet<Uuid> = tasks.iter().map(|spec| spec.id).collect();
+    let expected_count = expected_task_ids.len();
 
     for node in &cluster {
         assert!(
-            wait_for_workload_count(
-                &node.node.workload_manager,
+            wait_for_task_count(
+                &node.node.task_manager,
                 expected_count,
                 Duration::from_secs(5)
             )
             .await,
-            "node {} should list all workloads",
+            "node {} should list all tasks",
             node.id()
         );
 
-        let filter = WorkloadStateFilter::all();
+        let filter = TaskStateFilter::all();
         let specs = node
             .node
-            .workload_manager
-            .list_containers(&filter)
+            .task_manager
+            .list_tasks(&filter)
             .await
-            .expect("list workloads");
+            .expect("list tasks");
         let ids: BTreeSet<Uuid> = specs.iter().map(|spec| spec.id).collect();
         assert_eq!(
             ids,
-            expected_workload_ids,
-            "node {} workload set mismatch",
+            expected_task_ids,
+            "node {} task set mismatch",
             node.id()
         );
 
@@ -146,11 +146,11 @@ local_test!(services_deployment_replicates_across_cluster, {
             .iter()
             .find(|svc| svc.id == service_id)
             .expect("service should replicate to every node");
-        let service_ids: BTreeSet<Uuid> = service.workload_ids.iter().cloned().collect();
+        let service_ids: BTreeSet<Uuid> = service.task_ids.iter().cloned().collect();
         assert_eq!(
             service_ids,
-            expected_workload_ids,
-            "node {} service workload ids mismatch",
+            expected_task_ids,
+            "node {} service task ids mismatch",
             node.id()
         );
     }
@@ -177,26 +177,26 @@ local_test!(services_sync_recovers_missing_entries, {
     let manifest = load_manifest_from_path(Path::new("examples/replicated_service.ron"))
         .expect("load service manifest");
 
-    let (service_id, workloads) = deploy_manifest_via_anchor(anchor, &manifest).await;
+    let (service_id, tasks) = deploy_manifest_via_anchor(anchor, &manifest).await;
 
     assert!(
         wait_for_service_state(&peer.node.service_controller, service_id, true).await,
         "peer should observe service after initial gossip"
     );
 
-    let expected_workload_ids: Vec<Uuid> = workloads.iter().map(|spec| spec.id).collect();
+    let expected_task_ids: Vec<Uuid> = tasks.iter().map(|spec| spec.id).collect();
 
     peer.node
         .services
         .remove(&UuidKey::from(service_id))
         .await
         .expect("remove service from peer store");
-    for workload_id in &expected_workload_ids {
+    for task_id in &expected_task_ids {
         peer.node
-            .workloads
-            .remove(&UuidKey::from(*workload_id))
+            .tasks
+            .remove(&UuidKey::from(*task_id))
             .await
-            .expect("remove workload from peer store");
+            .expect("remove task from peer store");
     }
 
     let services_after_remove = peer
@@ -208,11 +208,11 @@ local_test!(services_sync_recovers_missing_entries, {
 
     let specs_after_remove = peer
         .node
-        .workload_manager
-        .list_containers(&WorkloadStateFilter::all())
+        .task_manager
+        .list_tasks(&TaskStateFilter::all())
         .await
-        .expect("list workloads after removal");
-    assert!(specs_after_remove.is_empty(), "peer workloads cleared");
+        .expect("list tasks after removal");
+    assert!(specs_after_remove.is_empty(), "peer tasks cleared");
 
     sleep(Duration::from_secs(1)).await;
 
@@ -223,13 +223,13 @@ local_test!(services_sync_recovers_missing_entries, {
 
     let restored_specs = peer
         .node
-        .workload_manager
-        .list_containers(&WorkloadStateFilter::all())
+        .task_manager
+        .list_tasks(&TaskStateFilter::all())
         .await
-        .expect("list workloads after sync");
+        .expect("list tasks after sync");
     let restored_ids: BTreeSet<Uuid> = restored_specs.iter().map(|spec| spec.id).collect();
-    let expected_ids: BTreeSet<Uuid> = expected_workload_ids.iter().cloned().collect();
-    assert_eq!(restored_ids, expected_ids, "sync restored workloads");
+    let expected_ids: BTreeSet<Uuid> = expected_task_ids.iter().cloned().collect();
+    assert_eq!(restored_ids, expected_ids, "sync restored tasks");
 });
 
 async fn register_service_via_rpc(
@@ -254,7 +254,7 @@ async fn register_service_via_rpc(
         let mut command = task.reborrow().init_command(1);
         command.set(0, "--serve");
 
-        spec.reborrow().init_workload_ids(0);
+        spec.reborrow().init_task_ids(0);
     }
 
     upsert
@@ -337,15 +337,15 @@ impl ContainerManager for InMemoryContainerManager {
         _env_vars: Option<Vec<String>>,
         _ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
         _volumes: Option<Vec<String>>,
-        _restart_policy: Option<mantissa::workload::docker::RestartPolicyConfig>,
-    ) -> Result<String, mantissa::workload::docker::ContainerError> {
+        _restart_policy: Option<mantissa::task::docker::RestartPolicyConfig>,
+    ) -> Result<String, mantissa::task::docker::ContainerError> {
         Ok(Uuid::new_v4().to_string())
     }
 
     async fn start_container(
         &self,
         _container_id: &str,
-    ) -> Result<(), mantissa::workload::docker::ContainerError> {
+    ) -> Result<(), mantissa::task::docker::ContainerError> {
         Ok(())
     }
 
@@ -353,7 +353,7 @@ impl ContainerManager for InMemoryContainerManager {
         &self,
         _container_id: &str,
         _timeout: Option<Duration>,
-    ) -> Result<(), mantissa::workload::docker::ContainerError> {
+    ) -> Result<(), mantissa::task::docker::ContainerError> {
         Ok(())
     }
 
@@ -361,7 +361,7 @@ impl ContainerManager for InMemoryContainerManager {
         &self,
         _container_id: &str,
         _timeout: Option<Duration>,
-    ) -> Result<(), mantissa::workload::docker::ContainerError> {
+    ) -> Result<(), mantissa::task::docker::ContainerError> {
         Ok(())
     }
 
@@ -370,36 +370,29 @@ impl ContainerManager for InMemoryContainerManager {
         _container_id: &str,
         _force: bool,
         _remove_volumes: bool,
-    ) -> Result<(), mantissa::workload::docker::ContainerError> {
+    ) -> Result<(), mantissa::task::docker::ContainerError> {
         Ok(())
     }
 
     async fn list_containers(
         &self,
         _filters: Option<HashMap<String, Vec<String>>>,
-    ) -> Result<
-        Vec<mantissa::workload::docker::ContainerInfo>,
-        mantissa::workload::docker::ContainerError,
-    > {
+    ) -> Result<Vec<mantissa::task::docker::ContainerInfo>, mantissa::task::docker::ContainerError>
+    {
         Ok(Vec::new())
     }
 
     async fn inspect_container(
         &self,
         _container_id: &str,
-    ) -> Result<
-        bollard::service::ContainerInspectResponse,
-        mantissa::workload::docker::ContainerError,
-    > {
-        Err(mantissa::workload::docker::ContainerError::OperationFailed(
+    ) -> Result<bollard::service::ContainerInspectResponse, mantissa::task::docker::ContainerError>
+    {
+        Err(mantissa::task::docker::ContainerError::OperationFailed(
             "inspect unsupported in test container manager".into(),
         ))
     }
 
-    async fn pull_image(
-        &self,
-        _image: &str,
-    ) -> Result<(), mantissa::workload::docker::ContainerError> {
+    async fn pull_image(&self, _image: &str) -> Result<(), mantissa::task::docker::ContainerError> {
         Ok(())
     }
 }
@@ -424,16 +417,16 @@ impl Drop for ContainerManagerOverrideGuard {
 async fn deploy_manifest_via_anchor(
     anchor: &TestNode,
     manifest: &ServiceManifest,
-) -> (Uuid, Vec<WorkloadSpec>) {
-    let requests = build_workload_requests(manifest);
+) -> (Uuid, Vec<TaskSpec>) {
+    let requests = build_task_requests(manifest);
     let specs = anchor
         .node
-        .workload_manager
-        .start_containers_batch(requests)
+        .task_manager
+        .start_tasks_batch(requests)
         .await
-        .expect("start workloads via manager");
+        .expect("start tasks via manager");
 
-    let workload_ids: Vec<Uuid> = specs.iter().map(|spec| spec.id).collect();
+    let task_ids: Vec<Uuid> = specs.iter().map(|spec| spec.id).collect();
     let tasks: Vec<ServiceTaskSpecValue> = manifest
         .tasks
         .iter()
@@ -446,13 +439,8 @@ async fn deploy_manifest_via_anchor(
         .collect();
 
     let manifest_id = Uuid::new_v4();
-    let service_spec = ServiceSpecValue::new(
-        manifest_id,
-        &manifest.name,
-        &manifest.name,
-        tasks,
-        workload_ids,
-    );
+    let service_spec =
+        ServiceSpecValue::new(manifest_id, &manifest.name, &manifest.name, tasks, task_ids);
 
     anchor
         .node
@@ -464,7 +452,7 @@ async fn deploy_manifest_via_anchor(
     (compute_service_id(&manifest.name), specs)
 }
 
-fn build_workload_requests(manifest: &ServiceManifest) -> Vec<ContainerStartRequest> {
+fn build_task_requests(manifest: &ServiceManifest) -> Vec<TaskStartRequest> {
     let mut requests = Vec::new();
     for task in &manifest.tasks {
         let base_name = format!("{}-{}", manifest.name, task.name);
@@ -476,7 +464,7 @@ fn build_workload_requests(manifest: &ServiceManifest) -> Vec<ContainerStartRequ
                 base_name.clone()
             };
 
-            requests.push(ContainerStartRequest {
+            requests.push(TaskStartRequest {
                 name,
                 image: task.image.clone(),
                 command: task.command.clone(),
@@ -491,18 +479,14 @@ fn build_workload_requests(manifest: &ServiceManifest) -> Vec<ContainerStartRequ
     requests
 }
 
-async fn wait_for_workload_count(
-    manager: &WorkloadManager,
-    expected: usize,
-    timeout: Duration,
-) -> bool {
+async fn wait_for_task_count(manager: &TaskManager, expected: usize, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
-    let filter = WorkloadStateFilter::all();
+    let filter = TaskStateFilter::all();
     while Instant::now() < deadline {
         let specs = manager
-            .list_containers(&filter)
+            .list_tasks(&filter)
             .await
-            .expect("workload list during wait");
+            .expect("task list during wait");
         if specs.len() == expected {
             return true;
         }

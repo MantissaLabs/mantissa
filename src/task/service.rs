@@ -1,11 +1,11 @@
-use crate::workload::container::ContainerState;
-use crate::workload::manager::{ContainerStartRequest, WorkloadManager};
-use crate::workload::types::{WorkloadEvent, WorkloadSpec, WorkloadStateFilter, WorkloadStateKind};
+use crate::task::container::ContainerState;
+use crate::task::manager::{TaskManager, TaskStartRequest};
+use crate::task::types::{TaskEvent, TaskSpec, TaskStateFilter, TaskStateKind};
 use capnp::Error;
 use capnp::capability::Promise;
 use protocol::gossip::gossip_message;
-use protocol::workload::{
-    ContainerStateFilter, list_request, workload, workload_event, workload_spec,
+use protocol::task::{
+    TaskStateFilter as CapnpTaskStateFilter, task, task_event, task_list_request, task_spec,
 };
 use uuid::Uuid;
 
@@ -47,19 +47,19 @@ fn state_from_str(input: &str) -> ContainerState {
 pub fn add_event(
     list: &mut capnp::struct_list::Builder<gossip_message::Owned>,
     index: u32,
-    event: &WorkloadEvent,
+    event: &TaskEvent,
 ) {
     let msg = list.reborrow().get(index);
-    let mut workload = msg.init_workload();
+    let mut task = msg.init_task();
 
     match event {
-        WorkloadEvent::Upsert(spec) => {
-            workload.set_event(workload_event::EventType::Upsert);
-            write_spec(workload.reborrow().init_spec(), spec);
+        TaskEvent::Upsert(spec) => {
+            task.set_event(task_event::EventType::Upsert);
+            write_spec(task.reborrow().init_spec(), spec);
         }
-        WorkloadEvent::Remove { id } => {
-            workload.set_event(workload_event::EventType::Remove);
-            let mut spec_builder = workload.reborrow().init_spec();
+        TaskEvent::Remove { id } => {
+            task.set_event(task_event::EventType::Remove);
+            let mut spec_builder = task.reborrow().init_spec();
             spec_builder.set_id(id.as_bytes());
             spec_builder.set_name("");
             spec_builder.set_image("");
@@ -75,23 +75,23 @@ pub fn add_event(
     }
 }
 
-pub fn read_event(reader: workload_event::Reader) -> Result<WorkloadEvent, Error> {
+pub fn read_event(reader: task_event::Reader) -> Result<TaskEvent, Error> {
     let event = reader.get_event()?;
     let spec_reader = reader.get_spec()?;
 
     match event {
-        workload_event::EventType::Upsert => {
+        task_event::EventType::Upsert => {
             let spec = read_spec(spec_reader)?;
-            Ok(WorkloadEvent::Upsert(spec))
+            Ok(TaskEvent::Upsert(spec))
         }
-        workload_event::EventType::Remove => {
+        task_event::EventType::Remove => {
             let id = read_spec_id(spec_reader)?;
-            Ok(WorkloadEvent::Remove { id })
+            Ok(TaskEvent::Remove { id })
         }
     }
 }
 
-pub fn write_spec(mut builder: workload_spec::Builder, spec: &WorkloadSpec) {
+pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     builder.set_id(spec.id.as_bytes());
     builder.set_name(&spec.name);
     builder.set_image(&spec.image);
@@ -110,7 +110,7 @@ pub fn write_spec(mut builder: workload_spec::Builder, spec: &WorkloadSpec) {
     builder.set_memory_bytes(spec.memory_bytes);
 }
 
-pub fn read_spec(reader: workload_spec::Reader) -> Result<WorkloadSpec, Error> {
+pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     let id = read_spec_id(reader)?;
     let name = reader.get_name()?.to_str()?.to_string();
     let image = reader.get_image()?.to_str()?.to_string();
@@ -134,7 +134,7 @@ pub fn read_spec(reader: workload_spec::Reader) -> Result<WorkloadSpec, Error> {
     let cpu_millis = reader.get_cpu_millis();
     let memory_bytes = reader.get_memory_bytes();
 
-    Ok(WorkloadSpec {
+    Ok(TaskSpec {
         id,
         name,
         image,
@@ -149,12 +149,12 @@ pub fn read_spec(reader: workload_spec::Reader) -> Result<WorkloadSpec, Error> {
     })
 }
 
-pub fn read_spec_id(reader: workload_spec::Reader) -> Result<Uuid, Error> {
+pub fn read_spec_id(reader: task_spec::Reader) -> Result<Uuid, Error> {
     let bytes = reader.get_id()?.to_owned();
     let slice: [u8; 16] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| Error::failed("invalid workload id length".to_string()))?;
+        .map_err(|_| Error::failed("invalid task id length".to_string()))?;
     Ok(Uuid::from_bytes(slice))
 }
 
@@ -163,26 +163,26 @@ fn read_id_from_data(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
     let slice: [u8; 16] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| Error::failed("invalid workload id length".to_string()))?;
+        .map_err(|_| Error::failed("invalid task id length".to_string()))?;
     Ok(Uuid::from_bytes(slice))
 }
 
 #[derive(Clone)]
-pub struct WorkloadService {
-    manager: WorkloadManager,
+pub struct TaskService {
+    manager: TaskManager,
 }
 
-impl WorkloadService {
-    pub fn new(manager: WorkloadManager) -> Self {
+impl TaskService {
+    pub fn new(manager: TaskManager) -> Self {
         Self { manager }
     }
 }
 
-impl workload::Server for WorkloadService {
+impl task::Server for TaskService {
     fn start(
         &mut self,
-        params: workload::StartParams,
-        mut results: workload::StartResults,
+        params: task::StartParams,
+        mut results: task::StartResults,
     ) -> Promise<(), Error> {
         let manager = self.manager.clone();
 
@@ -211,8 +211,8 @@ impl workload::Server for WorkloadService {
 
     fn start_many(
         &mut self,
-        params: workload::StartManyParams,
-        mut results: workload::StartManyResults,
+        params: task::StartManyParams,
+        mut results: task::StartManyResults,
     ) -> Promise<(), Error> {
         let manager = self.manager.clone();
 
@@ -231,12 +231,12 @@ impl workload::Server for WorkloadService {
                     value => Some(
                         value
                             .checked_sub(1)
-                            .expect("slot id decoding underflow in workload request"),
+                            .expect("slot id decoding underflow in task request"),
                     ),
                 };
 
-                let workload_id = {
-                    let bytes = entry.get_workload_id()?;
+                let task_id = {
+                    let bytes = entry.get_task_id()?;
                     if bytes.len() == 16 {
                         let mut arr = [0u8; 16];
                         arr.copy_from_slice(bytes);
@@ -251,19 +251,19 @@ impl workload::Server for WorkloadService {
                     command.push(arg?.to_str()?.to_string());
                 }
 
-                requests.push(ContainerStartRequest {
+                requests.push(TaskStartRequest {
                     name,
                     image,
                     command,
                     cpu_millis,
                     memory_bytes,
-                    id: workload_id,
+                    id: task_id,
                     slot_id,
                 });
             }
 
             let specs = manager
-                .start_containers_batch(requests)
+                .start_tasks_batch(requests)
                 .await
                 .map_err(|e| Error::failed(e.to_string()))?;
 
@@ -279,8 +279,8 @@ impl workload::Server for WorkloadService {
 
     fn stop(
         &mut self,
-        params: workload::StopParams,
-        mut results: workload::StopResults,
+        params: task::StopParams,
+        mut results: task::StopResults,
     ) -> Promise<(), Error> {
         let manager = self.manager.clone();
 
@@ -289,7 +289,7 @@ impl workload::Server for WorkloadService {
             let id = read_id_from_data(req.get_id()?)?;
 
             let spec = manager
-                .stop_workload(id)
+                .stop_task(id)
                 .await
                 .map_err(|e| Error::failed(e.to_string()))?;
 
@@ -302,8 +302,8 @@ impl workload::Server for WorkloadService {
 
     fn list(
         &mut self,
-        params: workload::ListParams,
-        mut results: workload::ListResults,
+        params: task::ListParams,
+        mut results: task::ListResults,
     ) -> Promise<(), Error> {
         let manager = self.manager.clone();
 
@@ -312,11 +312,11 @@ impl workload::Server for WorkloadService {
             let filter = list_filter_from_request(&request)?;
 
             let specs = manager
-                .list_containers(&filter)
+                .list_tasks(&filter)
                 .await
                 .map_err(|e| Error::failed(e.to_string()))?;
 
-            let mut list = results.get().init_workloads(specs.len() as u32);
+            let mut list = results.get().init_tasks(specs.len() as u32);
             for (idx, spec) in specs.iter().enumerate() {
                 let builder = list.reborrow().get(idx as u32);
                 write_spec(builder, spec);
@@ -327,33 +327,32 @@ impl workload::Server for WorkloadService {
     }
 }
 
-fn list_filter_from_request(request: &list_request::Reader) -> Result<WorkloadStateFilter, Error> {
+fn list_filter_from_request(request: &task_list_request::Reader) -> Result<TaskStateFilter, Error> {
     if !request.has_states() {
-        return Ok(WorkloadStateFilter::active_only());
+        return Ok(TaskStateFilter::active_only());
     }
 
     let states = request.get_states()?;
     if states.len() == 0 {
-        return Ok(WorkloadStateFilter::active_only());
+        return Ok(TaskStateFilter::active_only());
     }
 
     let mut kinds = Vec::with_capacity(states.len() as usize);
     for state in states.iter() {
-        let state =
-            state.map_err(|e| Error::failed(format!("unknown workload state filter: {e}")))?;
+        let state = state.map_err(|e| Error::failed(format!("unknown task state filter: {e}")))?;
         let kind = match state {
-            ContainerStateFilter::Pending => WorkloadStateKind::Pending,
-            ContainerStateFilter::Creating => WorkloadStateKind::Creating,
-            ContainerStateFilter::Running => WorkloadStateKind::Running,
-            ContainerStateFilter::Paused => WorkloadStateKind::Paused,
-            ContainerStateFilter::Stopping => WorkloadStateKind::Stopping,
-            ContainerStateFilter::Stopped => WorkloadStateKind::Stopped,
-            ContainerStateFilter::Failed => WorkloadStateKind::Failed,
-            ContainerStateFilter::Exited => WorkloadStateKind::Exited,
-            ContainerStateFilter::Unknown => WorkloadStateKind::Unknown,
+            CapnpTaskStateFilter::Pending => TaskStateKind::Pending,
+            CapnpTaskStateFilter::Creating => TaskStateKind::Creating,
+            CapnpTaskStateFilter::Running => TaskStateKind::Running,
+            CapnpTaskStateFilter::Paused => TaskStateKind::Paused,
+            CapnpTaskStateFilter::Stopping => TaskStateKind::Stopping,
+            CapnpTaskStateFilter::Stopped => TaskStateKind::Stopped,
+            CapnpTaskStateFilter::Failed => TaskStateKind::Failed,
+            CapnpTaskStateFilter::Exited => TaskStateKind::Exited,
+            CapnpTaskStateFilter::Unknown => TaskStateKind::Unknown,
         };
         kinds.push(kind);
     }
 
-    Ok(WorkloadStateFilter::new(kinds))
+    Ok(TaskStateFilter::new(kinds))
 }

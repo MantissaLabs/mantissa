@@ -1,7 +1,7 @@
 use crate::gossip::Message;
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{ServiceEvent, ServiceSpecValue};
-use crate::workload::manager::WorkloadManager;
+use crate::task::manager::TaskManager;
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use std::collections::HashSet;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct ServiceController {
     registry: ServiceRegistry,
-    workload_manager: WorkloadManager,
+    task_manager: TaskManager,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
     seen_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
@@ -21,13 +21,13 @@ pub struct ServiceController {
 impl ServiceController {
     pub fn new(
         registry: ServiceRegistry,
-        workload_manager: WorkloadManager,
+        task_manager: TaskManager,
         gossip_tx: Sender<Message>,
         gossip_rx: Receiver<Message>,
     ) -> Self {
         Self {
             registry,
-            workload_manager,
+            task_manager,
             gossip_tx,
             gossip_rx,
             seen_ids: Arc::new(AsyncMutex::new(HashSet::new())),
@@ -63,7 +63,7 @@ impl ServiceController {
 
     pub async fn delete_service(&self, id: Uuid) -> anyhow::Result<()> {
         if let Some(spec) = self.registry.get(id)? {
-            self.stop_workloads(&spec).await;
+            self.stop_tasks(&spec).await;
             self.registry.remove_by_id(id).await?;
             self.broadcast(ServiceEvent::Remove { id }).await?;
         }
@@ -81,7 +81,7 @@ impl ServiceController {
             }
             ServiceEvent::Remove { id } => {
                 if let Some(spec) = self.registry.get(id)? {
-                    self.stop_workloads(&spec).await;
+                    self.stop_tasks(&spec).await;
                 }
                 self.registry.remove_by_id(id).await?;
             }
@@ -102,18 +102,14 @@ impl ServiceController {
         guard.insert(id)
     }
 
-    async fn stop_workloads(&self, spec: &ServiceSpecValue) {
-        for workload_id in &spec.workload_ids {
-            match self
-                .workload_manager
-                .workload_owned_locally(*workload_id)
-                .await
-            {
+    async fn stop_tasks(&self, spec: &ServiceSpecValue) {
+        for task_id in &spec.task_ids {
+            match self.task_manager.task_owned_locally(*task_id).await {
                 Ok(true) => {
-                    if let Err(err) = self.workload_manager.stop_workload(*workload_id).await {
+                    if let Err(err) = self.task_manager.stop_task(*task_id).await {
                         tracing::warn!(
                             target: "services",
-                            "failed to stop workload {workload_id} for service {}: {err}",
+                            "failed to stop task {task_id} for service {}: {err}",
                             spec.service_name
                         );
                     }
@@ -121,14 +117,14 @@ impl ServiceController {
                 Ok(false) => {
                     tracing::debug!(
                         target: "services",
-                        "skipping remote workload {workload_id} while stopping service {}",
+                        "skipping remote task {task_id} while stopping service {}",
                         spec.service_name
                     );
                 }
                 Err(err) => {
                     tracing::warn!(
                         target: "services",
-                        "failed to inspect workload {workload_id} for service {}: {err}",
+                        "failed to inspect task {task_id} for service {}: {err}",
                         spec.service_name
                     );
                 }

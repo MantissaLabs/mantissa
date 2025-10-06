@@ -13,7 +13,7 @@ The system needs to be:
 
 ## Project Structure & Module Organization
 
-- `src/`: Rust sources. Entrypoint in `src/main.rs`; public modules in `src/lib.rs` (client, server, node, topology, store, crypto, gossip, workload, etc.).
+- `src/`: Rust sources. Entrypoint in `src/main.rs`; public modules in `src/lib.rs` (client, server, node, topology, store, crypto, gossip, task, etc.).
 - `crates/`: Rust crates for reusable components, contains the merkle search tree store (`mst_store`), `client` (for communication with local socket and capnp rpc service), but also `health` for healthchecks, etc.
 - `src/schema/`: Cap’n Proto schemas compiled by `build.rs`.
 - `tests/`: Integration tests using Tokio and a `TestNode` harness (`tests/common/*`).

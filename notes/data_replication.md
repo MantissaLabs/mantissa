@@ -35,7 +35,7 @@ output across platforms and Rust versions.
 
 ## Efficient diff and delta state merging
 
-We could be using maps in order to track containers and workloads per instance on the mantissa cluster.
+We could be using maps in order to track containers and tasks per instance on the mantissa cluster.
 Although we need to identify how we will leverage those maps, knowing that those could be very large
 (thousands of entries with lots of information about networking, mounts, etc.).
 
@@ -66,7 +66,7 @@ The following attempts at tracking the amount of MSTs to keep track of:
 
 - On startup:
   - Initialize one MST for topology
-  - Initialize an MST for the node and local workload information
+  - Initialize an MST for the node and local task information
 - On splice: split the topology MST into two MSTs or more as required (challenge: how does the split work and how fast can it proceed)
 - On topology change:
   - Add one or more MSTs for each node that have been added to the topology

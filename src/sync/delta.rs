@@ -1,10 +1,10 @@
 use crate::services::types::ServiceSpecValue;
 use crate::store::peer_store::PeersStore;
 use crate::store::service_store::ServiceStore;
-use crate::store::workload_store::WorkloadStore;
+use crate::store::task_store::TaskStore;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
+use crate::task::types::TaskValue;
 use crate::topology::peers::PeerValue;
-use crate::workload::types::WorkloadValue;
 use async_trait::async_trait;
 use bincode;
 use capnp::capability::Promise;
@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 #[derive(Clone)]
 pub struct SyncStores {
     pub peers: PeersStore,
-    pub workloads: WorkloadStore,
+    pub tasks: TaskStore,
     pub services: ServiceStore,
 }
 
@@ -26,7 +26,7 @@ impl SyncStores {
     async fn root_hex(&self, domain: Domain) -> String {
         match domain {
             Domain::Peers => self.peers.root_hex().await,
-            Domain::Workloads => self.workloads.root_hex().await,
+            Domain::Tasks => self.tasks.root_hex().await,
             Domain::Services => self.services.root_hex().await,
         }
     }
@@ -34,7 +34,7 @@ impl SyncStores {
     async fn page_range_summary(&self, domain: Domain) -> crdt_store::Result<Vec<PageDigestRange>> {
         match domain {
             Domain::Peers => self.peers.page_range_summary().await,
-            Domain::Workloads => self.workloads.page_range_summary().await,
+            Domain::Tasks => self.tasks.page_range_summary().await,
             Domain::Services => self.services.page_range_summary().await,
         }
     }
@@ -63,13 +63,8 @@ impl delta_sink::Server for DeltaSinkImpl {
                 Domain::Peers => {
                     apply_chunk(stores.peers.clone(), &chunk, decode_register::<PeerValue>).await?
                 }
-                Domain::Workloads => {
-                    apply_chunk(
-                        stores.workloads.clone(),
-                        &chunk,
-                        decode_register::<WorkloadValue>,
-                    )
-                    .await?
+                Domain::Tasks => {
+                    apply_chunk(stores.tasks.clone(), &chunk, decode_register::<TaskValue>).await?
                 }
                 Domain::Services => {
                     apply_chunk(
@@ -164,10 +159,10 @@ impl DeltaStore<PeerValue> for PeersStore {
 }
 
 #[async_trait]
-impl DeltaStore<WorkloadValue> for WorkloadStore {
+impl DeltaStore<TaskValue> for TaskStore {
     async fn apply_delta(
         self,
-        regs: Vec<(UuidKey, MVReg<WorkloadValue, uuid::Uuid>)>,
+        regs: Vec<(UuidKey, MVReg<TaskValue, uuid::Uuid>)>,
         tombs: Vec<(UuidKey, u64)>,
     ) -> io::Result<()> {
         self.apply_delta_chunk_update_mst(regs, tombs).await
@@ -187,7 +182,7 @@ impl DeltaStore<ServiceSpecValue> for ServiceStore {
 
 pub async fn sync_all_domains(stores: SyncStores, sync_cap: sync::Client) {
     let res: Result<(), capnp::Error> = async {
-        let domains = [Domain::Peers, Domain::Workloads, Domain::Services];
+        let domains = [Domain::Peers, Domain::Tasks, Domain::Services];
 
         let roots_req = sync_cap.get_roots_request();
         let roots_resp = roots_req.send().promise.await?;

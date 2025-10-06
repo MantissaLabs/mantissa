@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Lifecycle state for a workload container or micro VM.
+/// Lifecycle state for a task container or micro VM.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ContainerState {
     Pending,

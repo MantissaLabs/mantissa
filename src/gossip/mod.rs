@@ -7,11 +7,11 @@
 
 use crate::services::service::{read_service_event, write_service_event};
 use crate::services::types::ServiceEvent;
+use crate::task::service as task_service;
+use crate::task::types::TaskEvent;
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
-use crate::workload::service as workload_service;
-use crate::workload::types::WorkloadEvent;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 use capnp::Error;
@@ -55,7 +55,7 @@ pub struct GossipEvents {
 pub enum Message {
     Void { id: Uuid },
     Topology { id: Uuid, event: TopologyEvent },
-    Workload { id: Uuid, event: WorkloadEvent },
+    Task { id: Uuid, event: TaskEvent },
     Service { id: Uuid, event: ServiceEvent },
     // Scheduling(SchedulingEvent),
 }
@@ -65,7 +65,7 @@ impl Message {
         match self {
             Message::Void { id }
             | Message::Topology { id, .. }
-            | Message::Workload { id, .. }
+            | Message::Task { id, .. }
             | Message::Service { id, .. } => *id,
         }
     }
@@ -80,7 +80,7 @@ pub struct Gossip {
 
 pub struct Channels {
     pub topology_events: Sender<Message>,
-    pub workload_events: Sender<Message>,
+    pub task_events: Sender<Message>,
     pub service_events: Sender<Message>,
     // scheduling_events: Sender<SchedulingEvent>,
 }
@@ -98,7 +98,7 @@ impl gossip::Server for Gossip {
         _results: gossip::GossipResults,
     ) -> Promise<(), Error> {
         let topo_tx = self.chans.topology_events.clone();
-        let workload_tx = self.chans.workload_events.clone();
+        let task_tx = self.chans.task_events.clone();
         let service_tx = self.chans.service_events.clone();
 
         Promise::from_future(async move {
@@ -140,19 +140,17 @@ impl gossip::Server for Gossip {
                     Topology(Err(e)) => {
                         eprintln!("Error reading topology: {e}");
                     }
-                    Workload(Ok(reader)) => match workload_service::read_event(reader) {
+                    Task(Ok(reader)) => match task_service::read_event(reader) {
                         Ok(event) => {
-                            let message = Message::Workload { id, event };
-                            workload_tx.send(message).await.map_err(|e| {
-                                capnp::Error::failed(format!(
-                                    "Couldn't send event to workload: {e}"
-                                ))
+                            let message = Message::Task { id, event };
+                            task_tx.send(message).await.map_err(|e| {
+                                capnp::Error::failed(format!("Couldn't send event to task: {e}"))
                             })?;
                         }
-                        Err(e) => eprintln!("Failed to convert workload event: {e}"),
+                        Err(e) => eprintln!("Failed to convert task event: {e}"),
                     },
-                    Workload(Err(e)) => {
-                        eprintln!("Error reading workload: {e}");
+                    Task(Err(e)) => {
+                        eprintln!("Error reading task: {e}");
                     }
                     Service(Ok(reader)) => match read_service_event(reader) {
                         Ok(event) => {
@@ -272,8 +270,8 @@ where
             Message::Topology { event, .. } => {
                 topology::add_event(&mut msgs, idx as u32, event);
             }
-            Message::Workload { event, .. } => {
-                workload_service::add_event(&mut msgs, idx as u32, event);
+            Message::Task { event, .. } => {
+                task_service::add_event(&mut msgs, idx as u32, event);
             }
             Message::Service { event, .. } => {
                 let service_builder = builder.init_service();
@@ -300,8 +298,8 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
             | TopologyEvent::Leave { id }
             | TopologyEvent::Suspect { id } => *id == peer_id,
         },
-        // Workload updates replicate to every peer regardless of assignment so keep them.
-        Message::Workload { .. } => false,
+        // Task updates replicate to every peer regardless of assignment so keep them.
+        Message::Task { .. } => false,
         Message::Service { .. } => false,
     }
 }
