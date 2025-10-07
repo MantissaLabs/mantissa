@@ -20,6 +20,8 @@ pub struct TaskSpec {
     pub slot_id: Option<u64>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    #[serde(default)]
+    pub restart_policy: Option<TaskRestartPolicy>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -125,6 +127,8 @@ pub struct TaskValue {
     pub slot_id: Option<u64>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    #[serde(default)]
+    pub restart_policy: Option<TaskRestartPolicy>,
 }
 
 impl TaskValue {
@@ -155,6 +159,22 @@ impl TaskValue {
             slot_id,
             cpu_millis,
             memory_bytes,
+            restart_policy: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskRestartPolicy {
+    pub name: TaskRestartPolicyKind,
+    #[serde(default)]
+    pub max_retry_count: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TaskRestartPolicyKind {
+    No,
+    Always,
+    OnFailure,
+    UnlessStopped,
 }

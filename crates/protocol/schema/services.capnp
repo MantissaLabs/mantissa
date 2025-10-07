@@ -7,6 +7,19 @@ struct TaskTemplate {
   replicas @3 :UInt16;    # Desired replica count for this task
   cpuMillis @4 :UInt64;   # Requested CPU in milli-cores per replica (0 uses scheduler default)
   memoryBytes @5 :UInt64; # Requested memory in bytes per replica (0 uses scheduler default)
+  restartPolicy @6 :RestartPolicy; # Desired container restart behaviour (optional)
+}
+
+enum RestartPolicyName {
+  no @0;
+  always @1;
+  onFailure @2;
+  unlessStopped @3;
+}
+
+struct RestartPolicy {
+  name @0 :RestartPolicyName;
+  maxRetryCount @1 :Int32; # -1 indicates unset for policies that support retries
 }
 
 struct ServiceUpsertSpec {

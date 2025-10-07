@@ -1,6 +1,8 @@
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
-use crate::task::types::{TaskEvent, TaskSpec, TaskStateFilter, TaskStateKind};
+use crate::task::types::{
+    TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskStateFilter, TaskStateKind,
+};
 use capnp::Error;
 use capnp::capability::Promise;
 use protocol::gossip::gossip_message;
@@ -42,6 +44,41 @@ fn state_from_str(input: &str) -> ContainerState {
             ContainerState::Unknown
         }
     }
+}
+
+fn encode_restart_policy(
+    mut builder: protocol::task::restart_policy::Builder<'_>,
+    policy: &TaskRestartPolicy,
+) {
+    let name = match policy.name {
+        TaskRestartPolicyKind::No => protocol::task::RestartPolicyName::No,
+        TaskRestartPolicyKind::Always => protocol::task::RestartPolicyName::Always,
+        TaskRestartPolicyKind::OnFailure => protocol::task::RestartPolicyName::OnFailure,
+        TaskRestartPolicyKind::UnlessStopped => protocol::task::RestartPolicyName::UnlessStopped,
+    };
+    builder.set_name(name);
+    builder.set_max_retry_count(policy.max_retry_count.unwrap_or(-1));
+}
+
+fn decode_restart_policy(
+    reader: protocol::task::restart_policy::Reader<'_>,
+) -> Result<TaskRestartPolicy, Error> {
+    let name = match reader.get_name()? {
+        protocol::task::RestartPolicyName::No => TaskRestartPolicyKind::No,
+        protocol::task::RestartPolicyName::Always => TaskRestartPolicyKind::Always,
+        protocol::task::RestartPolicyName::OnFailure => TaskRestartPolicyKind::OnFailure,
+        protocol::task::RestartPolicyName::UnlessStopped => TaskRestartPolicyKind::UnlessStopped,
+    };
+
+    let max_retry_count = match reader.get_max_retry_count() {
+        value if value < 0 => None,
+        value => Some(value),
+    };
+
+    Ok(TaskRestartPolicy {
+        name,
+        max_retry_count,
+    })
 }
 
 pub fn add_event(
@@ -111,6 +148,11 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     }
     builder.set_cpu_millis(spec.cpu_millis);
     builder.set_memory_bytes(spec.memory_bytes);
+
+    if let Some(policy) = &spec.restart_policy {
+        let restart_builder = builder.reborrow().init_restart_policy();
+        encode_restart_policy(restart_builder, policy);
+    }
 }
 
 pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
@@ -142,6 +184,12 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
 
     let slot_id = slot_ids.first().copied();
 
+    let restart_policy = if reader.has_restart_policy() {
+        Some(decode_restart_policy(reader.get_restart_policy()?)?)
+    } else {
+        None
+    };
+
     Ok(TaskSpec {
         id,
         name,
@@ -155,6 +203,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         slot_id,
         cpu_millis,
         memory_bytes,
+        restart_policy,
     })
 }
 
@@ -205,9 +254,21 @@ impl task::Server for TaskService {
             }
             let cpu_millis = req.get_cpu_millis();
             let memory_bytes = req.get_memory_bytes();
+            let restart_policy = if req.has_restart_policy() {
+                Some(decode_restart_policy(req.get_restart_policy()?)?)
+            } else {
+                None
+            };
 
             let spec = manager
-                .start_container(name, image, command, cpu_millis, memory_bytes)
+                .start_container(
+                    name,
+                    image,
+                    command,
+                    cpu_millis,
+                    memory_bytes,
+                    restart_policy,
+                )
                 .await
                 .map_err(|e| Error::failed(e.to_string()))?;
 
@@ -256,6 +317,12 @@ impl task::Server for TaskService {
                     command.push(arg?.to_str()?.to_string());
                 }
 
+                let restart_policy = if entry.has_restart_policy() {
+                    Some(decode_restart_policy(entry.get_restart_policy()?)?)
+                } else {
+                    None
+                };
+
                 requests.push(TaskStartRequest {
                     name,
                     image,
@@ -264,6 +331,7 @@ impl task::Server for TaskService {
                     memory_bytes,
                     id: task_id,
                     slot_ids,
+                    restart_policy,
                 });
             }
 

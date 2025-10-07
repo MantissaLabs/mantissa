@@ -49,6 +49,7 @@ pub async fn deploy_manifest(
                 command: task.command.clone(),
                 cpu_millis: task.resources.cpu_millis,
                 memory_bytes: task.resources.memory_bytes(),
+                restart_policy: task.restart_policy.clone(),
             });
             layout.push((task.name.clone(), replica_number));
         }

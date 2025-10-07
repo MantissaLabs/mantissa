@@ -14,6 +14,10 @@
                 cpu_millis: 500,
                 memory_mb: 128,
             ),
+            restart_policy: Some((
+                name: on_failure,
+                max_retry_count: Some(5),
+            )),
         ),
         (
             name: "api",
@@ -23,6 +27,10 @@
                 cpu_millis: 300,
                 memory_mb: 256,
             ),
+            restart_policy: Some((
+                name: unless_stopped,
+                max_retry_count: None,
+            )),
         ),
     ],
 )

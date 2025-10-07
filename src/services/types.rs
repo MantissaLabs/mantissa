@@ -50,6 +50,24 @@ pub struct ServiceTaskSpecValue {
     pub replicas: u16,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    #[serde(default)]
+    pub restart_policy: Option<ServiceTaskRestartPolicy>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceTaskRestartPolicy {
+    pub name: ServiceTaskRestartPolicyKind,
+    #[serde(default)]
+    pub max_retry_count: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTaskRestartPolicyKind {
+    No,
+    Always,
+    OnFailure,
+    UnlessStopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -9,16 +9,21 @@ use std::{
 };
 
 use async_trait::async_trait;
-use client::services::manifest::{ServiceManifest, load_manifest_from_path};
+use client::services::manifest::{
+    RestartPolicyName as ManifestRestartPolicyName, ServiceManifest, load_manifest_from_path,
+};
 use common::testkit::{ClusterConfig, TestNode};
 use crdt_store::uuid_key::UuidKey;
 use mantissa::services::ServiceController;
-use mantissa::services::types::{ServiceSpecValue, ServiceTaskSpecValue, compute_service_id};
+use mantissa::services::types::{
+    ServiceSpecValue, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
+    compute_service_id,
+};
 use mantissa::task::docker::{
     ContainerManager, clear_container_manager_override, set_container_manager_override,
 };
 use mantissa::task::manager::{TaskManager, TaskStartRequest};
-use mantissa::task::types::{TaskSpec, TaskStateFilter};
+use mantissa::task::types::{TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskStateFilter};
 use protocol::services::services;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -437,6 +442,24 @@ async fn deploy_manifest_via_anchor(
             replicas: task.replicas,
             cpu_millis: task.resources.cpu_millis,
             memory_bytes: task.resources.memory_bytes(),
+            restart_policy: task
+                .restart_policy
+                .as_ref()
+                .map(|policy| ServiceTaskRestartPolicy {
+                    name: match policy.name {
+                        ManifestRestartPolicyName::No => ServiceTaskRestartPolicyKind::No,
+                        ManifestRestartPolicyName::Always => ServiceTaskRestartPolicyKind::Always,
+                        ManifestRestartPolicyName::OnFailure => {
+                            ServiceTaskRestartPolicyKind::OnFailure
+                        }
+                        ManifestRestartPolicyName::UnlessStopped => {
+                            ServiceTaskRestartPolicyKind::UnlessStopped
+                        }
+                    },
+                    max_retry_count: policy
+                        .max_retry_count
+                        .map(|value| i32::try_from(value).expect("validated manifest bound")),
+                }),
         })
         .collect();
 
@@ -474,6 +497,24 @@ fn build_task_requests(manifest: &ServiceManifest) -> Vec<TaskStartRequest> {
                 memory_bytes: task.resources.memory_bytes(),
                 id: None,
                 slot_ids: Vec::new(),
+                restart_policy: task
+                    .restart_policy
+                    .as_ref()
+                    .map(|policy| TaskRestartPolicy {
+                        name: match policy.name {
+                            ManifestRestartPolicyName::No => TaskRestartPolicyKind::No,
+                            ManifestRestartPolicyName::Always => TaskRestartPolicyKind::Always,
+                            ManifestRestartPolicyName::OnFailure => {
+                                TaskRestartPolicyKind::OnFailure
+                            }
+                            ManifestRestartPolicyName::UnlessStopped => {
+                                TaskRestartPolicyKind::UnlessStopped
+                            }
+                        },
+                        max_retry_count: policy
+                            .max_retry_count
+                            .map(|value| i32::try_from(value).expect("validated manifest bound")),
+                    }),
             });
         }
     }

@@ -12,6 +12,7 @@ struct TaskSpec {
   slotIds @8 :List(UInt64);
   cpuMillis @9 :UInt64;
   memoryBytes @10 :UInt64;
+  restartPolicy @11 :RestartPolicy;
 }
 
 struct TaskStartRequest {
@@ -22,6 +23,7 @@ struct TaskStartRequest {
   memoryBytes @4 :UInt64;
   slotIds @5 :List(UInt64);
   taskId @6 :Data;
+  restartPolicy @7 :RestartPolicy;
 }
 
 struct TaskStopRequest {
@@ -59,4 +61,16 @@ interface Task {
   list @1 (request :TaskListRequest) -> (tasks :List(TaskSpec));
   stop @2 (request :TaskStopRequest) -> (spec :TaskSpec);
   startMany @3 (requests :List(TaskStartRequest)) -> (specs :List(TaskSpec));
+}
+
+enum RestartPolicyName {
+  no @0;
+  always @1;
+  onFailure @2;
+  unlessStopped @3;
+}
+
+struct RestartPolicy {
+  name @0 :RestartPolicyName;
+  maxRetryCount @1 :Int32; # -1 indicates unset
 }

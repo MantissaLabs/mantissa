@@ -1,5 +1,8 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::services::manifest::{
+    RestartPolicyName as ManifestRestartPolicyName, TaskRestartPolicy,
+};
 use crate::tasks::uuid_to_string;
 use anyhow::{Result, anyhow};
 use protocol::task::task_spec;
@@ -21,6 +24,7 @@ pub struct TaskStartParams {
     pub command: Vec<String>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    pub restart_policy: Option<TaskRestartPolicy>,
 }
 
 /// Run a task via the task service and return its runtime details.
@@ -36,6 +40,7 @@ pub async fn run(
         command: command.to_vec(),
         cpu_millis: 0,
         memory_bytes: 0,
+        restart_policy: None,
     };
 
     let mut tasks = run_many(cfg, vec![params]).await?;
@@ -67,6 +72,24 @@ pub async fn run_many(cfg: &ClientConfig, tasks: Vec<TaskStartParams>) -> Result
             let mut cmd_builder = entry.reborrow().init_command(task.command.len() as u32);
             for (cmd_idx, arg) in task.command.iter().enumerate() {
                 cmd_builder.set(cmd_idx as u32, arg);
+            }
+
+            if let Some(policy) = &task.restart_policy {
+                let mut policy_builder = entry.reborrow().init_restart_policy();
+                let name = match policy.name {
+                    ManifestRestartPolicyName::No => protocol::task::RestartPolicyName::No,
+                    ManifestRestartPolicyName::Always => protocol::task::RestartPolicyName::Always,
+                    ManifestRestartPolicyName::OnFailure => {
+                        protocol::task::RestartPolicyName::OnFailure
+                    }
+                    ManifestRestartPolicyName::UnlessStopped => {
+                        protocol::task::RestartPolicyName::UnlessStopped
+                    }
+                };
+                policy_builder.set_name(name);
+                policy_builder.set_max_retry_count(policy.max_retry_count.map_or(-1, |value| {
+                    i32::try_from(value).expect("validated restart policy bound")
+                }));
             }
         }
     }

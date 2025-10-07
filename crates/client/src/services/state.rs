@@ -1,7 +1,9 @@
 use crate::config::ClientConfig;
 use crate::connection;
 use crate::services::deploy::ReplicaStart;
-use crate::services::manifest::{ServiceManifest, TaskSpec};
+use crate::services::manifest::{
+    RestartPolicyName as ManifestRestartPolicyName, ServiceManifest, TaskSpec,
+};
 use anyhow::{Context, Result};
 use protocol::services::{services, task_template};
 use std::collections::HashMap;
@@ -96,5 +98,23 @@ fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) {
     let mut cmd_builder = builder.reborrow().init_command(task.command.len() as u32);
     for (idx, arg) in task.command.iter().enumerate() {
         cmd_builder.set(idx as u32, arg);
+    }
+
+    if let Some(policy) = &task.restart_policy {
+        let mut policy_builder = builder.reborrow().init_restart_policy();
+        let name = match policy.name {
+            ManifestRestartPolicyName::No => protocol::services::RestartPolicyName::No,
+            ManifestRestartPolicyName::Always => protocol::services::RestartPolicyName::Always,
+            ManifestRestartPolicyName::OnFailure => {
+                protocol::services::RestartPolicyName::OnFailure
+            }
+            ManifestRestartPolicyName::UnlessStopped => {
+                protocol::services::RestartPolicyName::UnlessStopped
+            }
+        };
+        policy_builder.set_name(name);
+        policy_builder.set_max_retry_count(policy.max_retry_count.map_or(-1, |value| {
+            i32::try_from(value).expect("validated restart policy bound")
+        }));
     }
 }

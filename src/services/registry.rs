@@ -103,6 +103,7 @@ mod tests {
                 replicas: 2,
                 cpu_millis: 0,
                 memory_bytes: 0,
+                restart_policy: None,
             }],
             vec![Uuid::new_v4()],
         );
@@ -131,6 +132,7 @@ mod tests {
                 replicas: 3,
                 cpu_millis: 0,
                 memory_bytes: 0,
+                restart_policy: None,
             }],
             vec![Uuid::new_v4(), Uuid::new_v4()],
         );

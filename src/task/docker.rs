@@ -19,6 +19,7 @@ use bollard::service::ContainerInspectResponse;
 use async_trait::async_trait;
 use log::{debug, error, info};
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors that can occur during container operations
@@ -97,12 +98,14 @@ pub trait ContainerManager {
 }
 
 /// Configuration for container restart policy
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RestartPolicyConfig {
     pub name: RestartPolicyType,
-    pub max_retry_count: Option<i64>,
+    pub max_retry_count: Option<i32>,
 }
 
 /// Types of restart policies
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RestartPolicyType {
     No,
     Always,
@@ -221,7 +224,7 @@ impl ContainerManager for DockerContainerManager {
 
             host_config.restart_policy = Some(RestartPolicy {
                 name: Some(name),
-                maximum_retry_count: policy.max_retry_count,
+                maximum_retry_count: policy.max_retry_count.map(|value| i64::from(value)),
             });
         }
 

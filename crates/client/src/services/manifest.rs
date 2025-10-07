@@ -26,6 +26,22 @@ impl TaskResources {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct TaskRestartPolicy {
+    pub name: RestartPolicyName,
+    #[serde(default)]
+    pub max_retry_count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartPolicyName {
+    No,
+    Always,
+    OnFailure,
+    UnlessStopped,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct TaskSpec {
     pub name: String,
     pub image: String,
@@ -35,6 +51,8 @@ pub struct TaskSpec {
     pub replicas: u16,
     #[serde(default)]
     pub resources: TaskResources,
+    #[serde(default)]
+    pub restart_policy: Option<TaskRestartPolicy>,
 }
 
 impl ServiceManifest {
@@ -82,6 +100,27 @@ impl ServiceManifest {
                     "task '{}' must set memory_mb when cpu_millis is specified",
                     task.name
                 ));
+            }
+
+            if let Some(policy) = &task.restart_policy {
+                if policy.max_retry_count.is_some()
+                    && !matches!(policy.name, RestartPolicyName::OnFailure)
+                {
+                    return Err(anyhow!(
+                        "task '{}' can only set max_retry_count with an on_failure restart policy",
+                        task.name
+                    ));
+                }
+
+                if let Some(count) = policy.max_retry_count {
+                    if count > i32::MAX as u32 {
+                        return Err(anyhow!(
+                            "task '{}' must set max_retry_count <= {}",
+                            task.name,
+                            i32::MAX
+                        ));
+                    }
+                }
             }
         }
 

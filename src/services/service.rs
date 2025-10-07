@@ -1,5 +1,8 @@
 use crate::services::manager::ServiceController;
-use crate::services::types::{ServiceEvent, ServiceSpecValue, ServiceTaskSpecValue};
+use crate::services::types::{
+    ServiceEvent, ServiceSpecValue, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
+    ServiceTaskSpecValue,
+};
 use capnp::Error;
 use capnp::capability::Promise;
 use protocol::services::{service_event, service_spec, services, task_template};
@@ -203,6 +206,32 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         command.push(arg?.to_str()?.to_string());
     }
 
+    let restart_policy = if reader.has_restart_policy() {
+        let policy = reader.get_restart_policy()?;
+        let kind = match policy.get_name()? {
+            protocol::services::RestartPolicyName::No => ServiceTaskRestartPolicyKind::No,
+            protocol::services::RestartPolicyName::Always => ServiceTaskRestartPolicyKind::Always,
+            protocol::services::RestartPolicyName::OnFailure => {
+                ServiceTaskRestartPolicyKind::OnFailure
+            }
+            protocol::services::RestartPolicyName::UnlessStopped => {
+                ServiceTaskRestartPolicyKind::UnlessStopped
+            }
+        };
+
+        let max_retry_count = match policy.get_max_retry_count() {
+            value if value < 0 => None,
+            value => Some(value),
+        };
+
+        Some(ServiceTaskRestartPolicy {
+            name: kind,
+            max_retry_count,
+        })
+    } else {
+        None
+    };
+
     Ok(ServiceTaskSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
         image: reader.get_image()?.to_str()?.to_string(),
@@ -210,6 +239,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         replicas: reader.get_replicas(),
         cpu_millis: reader.get_cpu_millis(),
         memory_bytes: reader.get_memory_bytes(),
+        restart_policy,
     })
 }
 
@@ -226,6 +256,22 @@ fn write_task_template(
     let mut cmd_builder = builder.reborrow().init_command(task.command.len() as u32);
     for (idx, arg) in task.command.iter().enumerate() {
         cmd_builder.set(idx as u32, arg);
+    }
+
+    if let Some(policy) = &task.restart_policy {
+        let mut policy_builder = builder.reborrow().init_restart_policy();
+        let name = match policy.name {
+            ServiceTaskRestartPolicyKind::No => protocol::services::RestartPolicyName::No,
+            ServiceTaskRestartPolicyKind::Always => protocol::services::RestartPolicyName::Always,
+            ServiceTaskRestartPolicyKind::OnFailure => {
+                protocol::services::RestartPolicyName::OnFailure
+            }
+            ServiceTaskRestartPolicyKind::UnlessStopped => {
+                protocol::services::RestartPolicyName::UnlessStopped
+            }
+        };
+        policy_builder.set_name(name);
+        policy_builder.set_max_retry_count(policy.max_retry_count.unwrap_or(-1));
     }
 
     Ok(())

@@ -27,6 +27,7 @@ use std::convert::TryFrom;
 use std::sync::Arc;
 use std::time::Duration;
 use topology::PeerHandle;
+use tracing::error;
 use uuid::Uuid;
 
 #[async_trait(?Send)]
@@ -220,7 +221,7 @@ pub async fn start<C>(
                     }
 
                     if let Err(e) = send_gossip(&outbound, peer, &context).await {
-                        eprintln!("Gossip to {} failed: {:?}", peer.address, e);
+                        error!("Gossip to {} failed: {:?}", peer.address, e);
                     }
                 }
 

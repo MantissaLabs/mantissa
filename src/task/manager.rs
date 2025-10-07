@@ -7,9 +7,13 @@ use crate::scheduler::{
 };
 use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
-use crate::task::docker::{ContainerError, ContainerManager};
+use crate::task::docker::{
+    ContainerError, ContainerManager, RestartPolicyConfig, RestartPolicyType,
+};
 use crate::task::service::read_spec;
-use crate::task::types::{TaskEvent, TaskSpec, TaskStateFilter, TaskValue};
+use crate::task::types::{
+    TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskStateFilter, TaskValue,
+};
 use anyhow::Context;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
@@ -49,6 +53,7 @@ pub struct TaskStartRequest {
     pub memory_bytes: u64,
     pub id: Option<Uuid>,
     pub slot_ids: Vec<SlotId>,
+    pub restart_policy: Option<TaskRestartPolicy>,
 }
 
 struct BatchStartPlan {
@@ -64,6 +69,7 @@ struct BatchStartPlan {
     created_at: DateTime<Utc>,
     index: usize,
     preassigned: bool,
+    restart_policy: Option<TaskRestartPolicy>,
 }
 
 impl BatchStartPlan {
@@ -84,6 +90,7 @@ struct StartIntent {
     cpu_millis: u64,
     memory_bytes: u64,
     preassigned_slots: Vec<SlotId>,
+    restart_policy: Option<TaskRestartPolicy>,
 }
 
 #[derive(Clone)]
@@ -200,6 +207,7 @@ struct RemoteStartPlan {
     slots: Vec<SlotChoice>,
     peer_id: Uuid,
     scheduler_version: u64,
+    restart_policy: Option<TaskRestartPolicy>,
 }
 
 struct Assignment {
@@ -238,6 +246,7 @@ impl TaskManager {
                 cpu_millis: request.cpu_millis,
                 memory_bytes: request.memory_bytes,
                 preassigned_slots: request.slot_ids,
+                restart_policy: request.restart_policy,
             })
             .collect()
     }
@@ -296,6 +305,7 @@ impl TaskManager {
         command: Vec<String>,
         cpu_millis: u64,
         memory_bytes: u64,
+        restart_policy: Option<TaskRestartPolicy>,
     ) -> Result<TaskSpec, anyhow::Error> {
         let request = TaskStartRequest {
             name: name.into(),
@@ -305,6 +315,7 @@ impl TaskManager {
             memory_bytes,
             id: None,
             slot_ids: Vec::new(),
+            restart_policy,
         };
 
         let mut specs = self.start_tasks_batch(vec![request]).await?;
@@ -591,6 +602,7 @@ impl TaskManager {
                 created_at: Utc::now(),
                 index: intent.index,
                 preassigned: true,
+                restart_policy: intent.restart_policy.clone(),
             });
         }
 
@@ -723,6 +735,7 @@ impl TaskManager {
                         created_at: Utc::now(),
                         index: intent.index,
                         preassigned: false,
+                        restart_policy: intent.restart_policy.clone(),
                     });
                 }
                 CandidateLocation::Remote { peer_id, version } => {
@@ -737,6 +750,7 @@ impl TaskManager {
                         slots,
                         peer_id,
                         scheduler_version: version,
+                        restart_policy: intent.restart_policy.clone(),
                     });
                 }
             }
@@ -1178,6 +1192,24 @@ impl TaskManager {
                     for (arg_idx, arg) in plan.command.iter().enumerate() {
                         cmd_builder.set(arg_idx as u32, arg);
                     }
+
+                    if let Some(policy) = &plan.restart_policy {
+                        let mut policy_builder = entry.reborrow().init_restart_policy();
+                        let name = match policy.name {
+                            TaskRestartPolicyKind::No => protocol::task::RestartPolicyName::No,
+                            TaskRestartPolicyKind::Always => {
+                                protocol::task::RestartPolicyName::Always
+                            }
+                            TaskRestartPolicyKind::OnFailure => {
+                                protocol::task::RestartPolicyName::OnFailure
+                            }
+                            TaskRestartPolicyKind::UnlessStopped => {
+                                protocol::task::RestartPolicyName::UnlessStopped
+                            }
+                        };
+                        policy_builder.set_name(name);
+                        policy_builder.set_max_retry_count(policy.max_retry_count.unwrap_or(-1));
+                    }
                 }
             }
 
@@ -1230,6 +1262,19 @@ impl TaskManager {
                 .await
                 .with_context(|| format!("docker pull failed for image {}", plan.image))?;
 
+            let restart_policy = plan
+                .restart_policy
+                .as_ref()
+                .map(|policy| RestartPolicyConfig {
+                    name: match policy.name {
+                        TaskRestartPolicyKind::No => RestartPolicyType::No,
+                        TaskRestartPolicyKind::Always => RestartPolicyType::Always,
+                        TaskRestartPolicyKind::OnFailure => RestartPolicyType::OnFailure,
+                        TaskRestartPolicyKind::UnlessStopped => RestartPolicyType::UnlessStopped,
+                    },
+                    max_retry_count: policy.max_retry_count,
+                });
+
             let container_id = self
                 .container_manager
                 .create_container(
@@ -1243,7 +1288,7 @@ impl TaskManager {
                     None,
                     None,
                     None,
-                    None,
+                    restart_policy,
                 )
                 .await
                 .with_context(|| format!("docker create failed for task {}", plan.name))?;
@@ -1288,6 +1333,7 @@ impl TaskManager {
                 slot_id,
                 cpu_millis: plan.requested_cpu_millis,
                 memory_bytes: plan.requested_memory_bytes,
+                restart_policy: plan.restart_policy.clone(),
             };
 
             if let Err(err) = self.persist_spec(&spec).await {
@@ -1392,7 +1438,7 @@ impl TaskManager {
     }
 
     async fn persist_spec(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
-        let value = TaskValue::new(
+        let mut value = TaskValue::new(
             spec.id,
             spec.name.clone(),
             spec.image.clone(),
@@ -1405,6 +1451,8 @@ impl TaskManager {
             spec.cpu_millis,
             spec.memory_bytes,
         );
+
+        value.restart_policy = spec.restart_policy.clone();
 
         self.store
             .upsert(&UuidKey::from(spec.id), value)
@@ -1712,6 +1760,7 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         slot_id,
         cpu_millis: value.cpu_millis,
         memory_bytes: value.memory_bytes,
+        restart_policy: value.restart_policy,
     }
 }
 
@@ -1894,6 +1943,7 @@ mod tests {
                 vec!["--arg".into()],
                 500,
                 256 * 1_024 * 1_024,
+                None,
             )
             .await
             .expect("start container");
@@ -1918,7 +1968,14 @@ mod tests {
         let (manager, scheduler, _cm) = setup_manager().await;
 
         let spec = manager
-            .start_container("svc-multi", "image", vec![], 1_500, 1_536 * 1_024 * 1_024)
+            .start_container(
+                "svc-multi",
+                "image",
+                vec![],
+                1_500,
+                1_536 * 1_024 * 1_024,
+                None,
+            )
             .await
             .expect("start container with multi-slot request");
 
@@ -1945,7 +2002,7 @@ mod tests {
         let (manager, scheduler, mock_cm) = setup_manager().await;
 
         let spec = manager
-            .start_container("svc", "image", vec![], 500, 256 * 1_024 * 1_024)
+            .start_container("svc", "image", vec![], 500, 256 * 1_024 * 1_024, None)
             .await
             .expect("start container");
 
@@ -1975,7 +2032,7 @@ mod tests {
         let (manager, _scheduler, mock_cm) = setup_manager().await;
 
         let spec = manager
-            .start_container("svc", "image", vec![], 500, 256 * 1_024 * 1_024)
+            .start_container("svc", "image", vec![], 500, 256 * 1_024 * 1_024, None)
             .await
             .expect("start container");
 
@@ -2002,7 +2059,7 @@ mod tests {
         let (manager, _scheduler, _mock_cm) = setup_manager().await;
 
         let spec = manager
-            .start_container("svc", "image", vec![], 500, 256 * 1_024 * 1_024)
+            .start_container("svc", "image", vec![], 500, 256 * 1_024 * 1_024, None)
             .await
             .expect("start container");
 
@@ -2053,7 +2110,7 @@ mod tests {
         let (manager, _scheduler, _cm) = setup_manager().await;
 
         let err = manager
-            .start_container("svc", "image", vec![], 2_000, 512 * 1_024 * 1_024)
+            .start_container("svc", "image", vec![], 2_000, 512 * 1_024 * 1_024, None)
             .await
             .expect_err("reservation should fail");
         assert!(
@@ -2076,6 +2133,7 @@ mod tests {
                     memory_bytes: 128 * 1_024 * 1_024,
                     id: None,
                     slot_ids: Vec::new(),
+                    restart_policy: None,
                 },
                 TaskStartRequest {
                     name: "svc-b".into(),
@@ -2085,6 +2143,7 @@ mod tests {
                     memory_bytes: 64 * 1_024 * 1_024,
                     id: None,
                     slot_ids: Vec::new(),
+                    restart_policy: None,
                 },
             ])
             .await
@@ -2140,6 +2199,7 @@ mod tests {
                 memory_bytes: 64 * 1_024 * 1_024,
                 id: Some(task_id),
                 slot_ids: vec![slot_id],
+                restart_policy: None,
             }])
             .await
             .expect("start with pre-reserved slot");
@@ -2176,7 +2236,7 @@ mod tests {
         let (manager, _scheduler, _mock_cm) = setup_manager().await;
 
         let local_spec = manager
-            .start_container("local", "img", vec![], 200, 64 * 1_024 * 1_024)
+            .start_container("local", "img", vec![], 200, 64 * 1_024 * 1_024, None)
             .await
             .expect("start local task");
 
@@ -2221,7 +2281,7 @@ mod tests {
         let (manager, scheduler, mock_cm) = setup_manager().await;
 
         manager
-            .start_container("baseline", "img", vec![], 400, 128 * 1_024 * 1_024)
+            .start_container("baseline", "img", vec![], 400, 128 * 1_024 * 1_024, None)
             .await
             .expect("pre-existing container");
 
@@ -2237,6 +2297,7 @@ mod tests {
                     memory_bytes: 64 * 1_024 * 1_024,
                     id: None,
                     slot_ids: Vec::new(),
+                    restart_policy: None,
                 },
                 TaskStartRequest {
                     name: "svc-d".into(),
@@ -2246,6 +2307,7 @@ mod tests {
                     memory_bytes: 64 * 1_024 * 1_024,
                     id: None,
                     slot_ids: Vec::new(),
+                    restart_policy: None,
                 },
             ])
             .await
