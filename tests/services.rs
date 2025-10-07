@@ -343,6 +343,7 @@ impl ContainerManager for InMemoryContainerManager {
         _ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
         _volumes: Option<Vec<String>>,
         _restart_policy: Option<mantissa::task::docker::RestartPolicyConfig>,
+        _resource_limits: mantissa::task::docker::ResourceLimits,
     ) -> Result<String, mantissa::task::docker::ContainerError> {
         Ok(Uuid::new_v4().to_string())
     }

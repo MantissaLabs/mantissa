@@ -54,6 +54,7 @@ pub trait ContainerManager {
         ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
         volumes: Option<Vec<String>>,
         restart_policy: Option<RestartPolicyConfig>,
+        resource_limits: ResourceLimits,
     ) -> ContainerResult<String>;
 
     /// Start a container
@@ -111,6 +112,59 @@ pub enum RestartPolicyType {
     Always,
     OnFailure,
     UnlessStopped,
+}
+
+/// Resource limits that should be enforced by the container engine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceLimits {
+    pub memory_bytes: Option<i64>,
+    pub nano_cpus: Option<i64>,
+    pub cpu_shares: Option<i64>,
+}
+
+impl ResourceLimits {
+    const MIN_CPU_SHARES: i64 = 2;
+    const MAX_CPU_SHARES: i64 = 262_144;
+
+    /// Builds resource limits from scheduler requests expressed in milli-CPU and bytes.
+    pub fn from_requests(cpu_millis: u64, memory_bytes: u64) -> Self {
+        let memory_bytes = if memory_bytes == 0 {
+            None
+        } else {
+            Some(Self::saturating_i64(memory_bytes as u128))
+        };
+
+        let nano_cpus = if cpu_millis == 0 {
+            None
+        } else {
+            let nanos = (cpu_millis as u128).saturating_mul(1_000_000u128);
+            Some(Self::saturating_i64(nanos))
+        };
+
+        let cpu_shares = if cpu_millis == 0 {
+            None
+        } else {
+            let shares = (cpu_millis as u128).saturating_mul(1024u128) / 1_000u128;
+            let shares = shares
+                .max(Self::MIN_CPU_SHARES as u128)
+                .min(Self::MAX_CPU_SHARES as u128);
+            Some(Self::saturating_i64(shares))
+        };
+
+        Self {
+            memory_bytes,
+            nano_cpus,
+            cpu_shares,
+        }
+    }
+
+    fn saturating_i64(value: u128) -> i64 {
+        if value > i64::MAX as u128 {
+            i64::MAX
+        } else {
+            value as i64
+        }
+    }
 }
 
 /// Container information returned from listing containers
@@ -209,6 +263,7 @@ impl ContainerManager for DockerContainerManager {
         ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
         volumes: Option<Vec<String>>,
         restart_policy: Option<RestartPolicyConfig>,
+        resource_limits: ResourceLimits,
     ) -> ContainerResult<String> {
         // Configure host settings
         let mut host_config = HostConfig::default();
@@ -226,6 +281,19 @@ impl ContainerManager for DockerContainerManager {
                 name: Some(name),
                 maximum_retry_count: policy.max_retry_count.map(|value| i64::from(value)),
             });
+        }
+
+        if let Some(memory) = resource_limits.memory_bytes {
+            host_config.memory = Some(memory);
+            host_config.memory_swap = Some(-1);
+        }
+
+        if let Some(nano_cpus) = resource_limits.nano_cpus {
+            host_config.nano_cpus = Some(nano_cpus);
+        }
+
+        if let Some(cpu_shares) = resource_limits.cpu_shares {
+            host_config.cpu_shares = Some(cpu_shares);
         }
 
         // Set volumes if provided

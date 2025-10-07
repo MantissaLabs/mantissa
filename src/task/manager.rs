@@ -8,7 +8,7 @@ use crate::scheduler::{
 use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
 use crate::task::docker::{
-    ContainerError, ContainerManager, RestartPolicyConfig, RestartPolicyType,
+    ContainerError, ContainerManager, ResourceLimits, RestartPolicyConfig, RestartPolicyType,
 };
 use crate::task::service::read_spec;
 use crate::task::types::{
@@ -1275,6 +1275,11 @@ impl TaskManager {
                     max_retry_count: policy.max_retry_count,
                 });
 
+            let resource_limits = ResourceLimits::from_requests(
+                plan.requested_cpu_millis,
+                plan.requested_memory_bytes,
+            );
+
             let container_id = self
                 .container_manager
                 .create_container(
@@ -1289,6 +1294,7 @@ impl TaskManager {
                     None,
                     None,
                     restart_policy,
+                    resource_limits,
                 )
                 .await
                 .with_context(|| format!("docker create failed for task {}", plan.name))?;
@@ -1788,6 +1794,7 @@ mod tests {
     struct MockContainerManager {
         created: Arc<AsyncMutex<Vec<String>>>,
         stopped: Arc<AsyncMutex<Vec<String>>>,
+        limits: Arc<AsyncMutex<Vec<crate::task::docker::ResourceLimits>>>,
     }
 
     #[async_trait]
@@ -1801,10 +1808,12 @@ mod tests {
             _ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
             _volumes: Option<Vec<String>>,
             _restart_policy: Option<crate::task::docker::RestartPolicyConfig>,
+            resource_limits: crate::task::docker::ResourceLimits,
         ) -> crate::task::docker::ContainerResult<String> {
             let mut guard = self.created.lock().await;
             let id = format!("container-{}", guard.len());
             guard.push(id.clone());
+            self.limits.lock().await.push(resource_limits);
             Ok(id)
         }
 
@@ -1934,7 +1943,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_container_reserves_slot_and_records_resources() {
-        let (manager, scheduler, _cm) = setup_manager().await;
+        let (manager, scheduler, mock_cm) = setup_manager().await;
 
         let spec = manager
             .start_container(
@@ -1961,11 +1970,17 @@ mod tests {
             .find(|s| s.slot_id == slot_id)
             .expect("slot exists");
         assert!(matches!(slot.state, SlotState::Reserved(_)));
+
+        let limits = mock_cm.limits.lock().await;
+        let recorded = limits.last().expect("resource limits recorded");
+        assert_eq!(recorded.memory_bytes, Some((256 * 1_024 * 1_024) as i64));
+        assert_eq!(recorded.nano_cpus, Some(500_000_000));
+        assert_eq!(recorded.cpu_shares, Some(512));
     }
 
     #[tokio::test]
     async fn start_container_reserves_multiple_slots_when_needed() {
-        let (manager, scheduler, _cm) = setup_manager().await;
+        let (manager, scheduler, mock_cm) = setup_manager().await;
 
         let spec = manager
             .start_container(
@@ -1995,6 +2010,12 @@ mod tests {
         for slot in reserved {
             assert!(spec.slot_ids.contains(&slot.slot_id));
         }
+
+        let limits = mock_cm.limits.lock().await;
+        let recorded = limits.last().expect("resource limits recorded");
+        assert_eq!(recorded.memory_bytes, Some((1_536 * 1_024 * 1_024) as i64));
+        assert_eq!(recorded.nano_cpus, Some(1_500_000_000));
+        assert_eq!(recorded.cpu_shares, Some(1_536));
     }
 
     #[tokio::test]
