@@ -140,6 +140,8 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     let cpu_millis = reader.get_cpu_millis();
     let memory_bytes = reader.get_memory_bytes();
 
+    let slot_id = slot_ids.first().copied();
+
     Ok(TaskSpec {
         id,
         name,
@@ -150,6 +152,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         node_id,
         node_name,
         slot_ids,
+        slot_id,
         cpu_millis,
         memory_bytes,
     })
@@ -233,16 +236,8 @@ impl task::Server for TaskService {
                 let memory_bytes = entry.get_memory_bytes();
                 let slots_reader = entry.get_slot_ids()?;
                 let mut slot_ids = Vec::with_capacity(slots_reader.len() as usize);
-                for encoded in slots_reader.iter() {
-                    if encoded == 0 {
-                        return Err(Error::failed(
-                            "slot ids in task request must be encoded as value+1".to_string(),
-                        ));
-                    }
-                    let decoded = encoded
-                        .checked_sub(1)
-                        .expect("slot id decoding underflow in task request");
-                    slot_ids.push(decoded);
+                for slot_id in slots_reader.iter() {
+                    slot_ids.push(slot_id);
                 }
 
                 let task_id = {

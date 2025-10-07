@@ -14,7 +14,10 @@ pub struct TaskSpec {
     pub command: Vec<String>,
     pub node_id: Uuid,
     pub node_name: String,
+    #[serde(default)]
     pub slot_ids: Vec<u64>,
+    #[serde(default)]
+    pub slot_id: Option<u64>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
 }
@@ -116,7 +119,10 @@ pub struct TaskValue {
     pub command: Vec<String>,
     pub node_id: Uuid,
     pub node_name: String,
+    #[serde(default)]
     pub slot_ids: Vec<u64>,
+    #[serde(default)]
+    pub slot_id: Option<u64>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
 }
@@ -135,6 +141,7 @@ impl TaskValue {
         cpu_millis: u64,
         memory_bytes: u64,
     ) -> Self {
+        let slot_id = slot_ids.first().copied();
         Self {
             id,
             name: name.into(),
@@ -145,6 +152,7 @@ impl TaskValue {
             node_id,
             node_name: node_name.into(),
             slot_ids,
+            slot_id,
             cpu_millis,
             memory_bytes,
         }

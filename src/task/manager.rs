@@ -57,6 +57,8 @@ struct BatchStartPlan {
     image: String,
     command: Vec<String>,
     slots: Vec<SlotChoice>,
+    requested_cpu_millis: u64,
+    requested_memory_bytes: u64,
     container_name: String,
     container_id: Option<String>,
     created_at: DateTime<Utc>,
@@ -66,11 +68,9 @@ struct BatchStartPlan {
 
 impl BatchStartPlan {
     fn slot_ids(&self) -> Vec<SlotId> {
-        self.slots.iter().map(|slot| slot.slot_id).collect()
-    }
-
-    fn total_capacity(&self) -> SlotCapacity {
-        aggregate_capacity(&self.slots)
+        let mut ids: Vec<SlotId> = self.slots.iter().map(|slot| slot.slot_id).collect();
+        ids.sort_unstable();
+        ids
     }
 }
 
@@ -90,16 +90,6 @@ struct StartIntent {
 struct SlotChoice {
     slot_id: SlotId,
     capacity: SlotCapacity,
-}
-
-fn aggregate_capacity(slots: &[SlotChoice]) -> SlotCapacity {
-    let cpu_millis = slots
-        .iter()
-        .fold(0u64, |acc, slot| acc + slot.capacity.cpu_millis);
-    let memory_bytes = slots
-        .iter()
-        .fold(0u64, |acc, slot| acc + slot.capacity.memory_bytes);
-    SlotCapacity::new(cpu_millis, memory_bytes)
 }
 
 /// Identifies whether a scheduling candidate refers to this node or a remote peer.
@@ -594,6 +584,8 @@ impl TaskManager {
                 image: intent.image.clone(),
                 command: intent.command.clone(),
                 slots: chosen_slots,
+                requested_cpu_millis: intent.cpu_millis,
+                requested_memory_bytes: intent.memory_bytes,
                 container_name: String::new(),
                 container_id: None,
                 created_at: Utc::now(),
@@ -724,6 +716,8 @@ impl TaskManager {
                         image: intent.image.clone(),
                         command: intent.command.clone(),
                         slots,
+                        requested_cpu_millis: intent.cpu_millis,
+                        requested_memory_bytes: intent.memory_bytes,
                         container_name: String::new(),
                         container_id: None,
                         created_at: Utc::now(),
@@ -831,7 +825,12 @@ impl TaskManager {
     }
 
     async fn release_local_slots(&self, slots: &[SlotId]) {
+        let mut seen = HashSet::new();
         for slot_id in slots {
+            if !seen.insert(*slot_id) {
+                continue;
+            }
+
             if let Err(err) = self.release_slot(*slot_id).await {
                 warn!(
                     target: "task",
@@ -1168,19 +1167,10 @@ impl TaskManager {
                     entry.set_image(&plan.image);
                     entry.set_cpu_millis(plan.cpu_millis);
                     entry.set_memory_bytes(plan.memory_bytes);
-                    let encoded_slots: Vec<u64> = plan
-                        .slots
-                        .iter()
-                        .map(|slot| {
-                            slot.slot_id
-                                .checked_add(1)
-                                .expect("slot id overflow while encoding reservation")
-                        })
-                        .collect();
                     let mut slot_ids_builder =
-                        entry.reborrow().init_slot_ids(encoded_slots.len() as u32);
-                    for (slot_idx, encoded) in encoded_slots.iter().enumerate() {
-                        slot_ids_builder.set(slot_idx as u32, *encoded);
+                        entry.reborrow().init_slot_ids(plan.slots.len() as u32);
+                    for (slot_idx, slot) in plan.slots.iter().enumerate() {
+                        slot_ids_builder.set(slot_idx as u32, slot.slot_id);
                     }
                     entry.set_task_id(plan.id.as_bytes());
 
@@ -1283,7 +1273,8 @@ impl TaskManager {
                 ));
             }
 
-            let total_capacity = plan.total_capacity();
+            let slot_ids = plan.slot_ids();
+            let slot_id = slot_ids.first().copied();
             let spec = TaskSpec {
                 id: plan.id,
                 name: plan.name.clone(),
@@ -1293,9 +1284,10 @@ impl TaskManager {
                 command: plan.command.clone(),
                 node_id: self.local_node_id,
                 node_name: self.local_node_name.clone(),
-                slot_ids: plan.slot_ids(),
-                cpu_millis: total_capacity.cpu_millis,
-                memory_bytes: total_capacity.memory_bytes,
+                slot_ids,
+                slot_id,
+                cpu_millis: plan.requested_cpu_millis,
+                memory_bytes: plan.requested_memory_bytes,
             };
 
             if let Err(err) = self.persist_spec(&spec).await {
@@ -1524,8 +1516,14 @@ impl TaskManager {
             let id = key.to_uuid();
             if let Some(value) = snapshot.as_slice().last() {
                 if value.node_id == self.local_node_id {
-                    for slot_id in &value.slot_ids {
-                        slots.insert(*slot_id);
+                    if value.slot_ids.is_empty() {
+                        if let Some(slot_id) = value.slot_id {
+                            slots.insert(slot_id);
+                        }
+                    } else {
+                        for slot_id in &value.slot_ids {
+                            slots.insert(*slot_id);
+                        }
                     }
                 }
             } else {
@@ -1645,6 +1643,7 @@ impl TaskManager {
                     .with_context(|| "scheduler release failed during stop".to_string())?;
             }
             updated.slot_ids.clear();
+            updated.slot_id = None;
             updated.cpu_millis = 0;
             updated.memory_bytes = 0;
         }
@@ -1692,6 +1691,14 @@ impl TaskManager {
 }
 
 fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
+    let mut slot_ids = value.slot_ids;
+    if slot_ids.is_empty() {
+        if let Some(slot_id) = value.slot_id {
+            slot_ids.push(slot_id);
+        }
+    }
+    let slot_id = slot_ids.first().copied();
+
     TaskSpec {
         id,
         name: value.name,
@@ -1701,7 +1708,8 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         command: value.command,
         node_id: value.node_id,
         node_name: value.node_name,
-        slot_ids: value.slot_ids,
+        slot_ids,
+        slot_id,
         cpu_millis: value.cpu_millis,
         memory_bytes: value.memory_bytes,
     }
@@ -1890,9 +1898,11 @@ mod tests {
             .await
             .expect("start container");
 
-        assert_eq!(spec.cpu_millis, 1_000);
-        assert_eq!(spec.memory_bytes, 1_024 * 1_024 * 1_024);
+        assert_eq!(spec.cpu_millis, 500);
+        assert_eq!(spec.memory_bytes, 256 * 1_024 * 1_024);
+        assert_eq!(spec.slot_ids.len(), 1);
         let slot_id = *spec.slot_ids.first().expect("slot assigned");
+        assert_eq!(spec.slot_id, Some(slot_id));
 
         let snapshot = scheduler.snapshot().await.expect("snapshot");
         let slot = snapshot
@@ -1913,6 +1923,9 @@ mod tests {
             .expect("start container with multi-slot request");
 
         assert_eq!(spec.slot_ids.len(), 2, "expected two slots to be reserved");
+        assert_eq!(spec.cpu_millis, 1_500);
+        assert_eq!(spec.memory_bytes, 1_536 * 1_024 * 1_024);
+        assert_eq!(spec.slot_id, spec.slot_ids.first().copied());
 
         let snapshot = scheduler.snapshot().await.expect("snapshot");
         let reserved: Vec<_> = snapshot
@@ -1944,6 +1957,7 @@ mod tests {
         assert_eq!(stopped_containers, vec!["container-0".to_string()]);
 
         assert!(stopped.slot_ids.is_empty());
+        assert_eq!(stopped.slot_id, None);
         assert_eq!(stopped.cpu_millis, 0);
         assert_eq!(stopped.memory_bytes, 0);
 
@@ -2077,6 +2091,14 @@ mod tests {
             .expect("batch start");
 
         assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].cpu_millis, 400);
+        assert_eq!(specs[1].cpu_millis, 200);
+        assert_eq!(specs[0].memory_bytes, 128 * 1_024 * 1_024);
+        assert_eq!(specs[1].memory_bytes, 64 * 1_024 * 1_024);
+        assert_eq!(specs[0].slot_ids.len(), 1);
+        assert_eq!(specs[1].slot_ids.len(), 1);
+        assert_eq!(specs[0].slot_id, specs[0].slot_ids.first().copied());
+        assert_eq!(specs[1].slot_id, specs[1].slot_ids.first().copied());
 
         let snapshot = scheduler.snapshot().await.expect("snapshot");
         let reserved = snapshot
@@ -2124,6 +2146,9 @@ mod tests {
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].slot_ids, vec![slot_id]);
+        assert_eq!(specs[0].cpu_millis, 200);
+        assert_eq!(specs[0].memory_bytes, 64 * 1_024 * 1_024);
+        assert_eq!(specs[0].slot_id, Some(slot_id));
 
         let snapshot = scheduler.snapshot().await.expect("snapshot");
         assert_eq!(snapshot.version, 1);

@@ -91,7 +91,7 @@ fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) {
     builder.set_image(&task.image);
     builder.set_replicas(task.replicas);
     builder.set_cpu_millis(task.resources.cpu_millis);
-    builder.set_memory_bytes(task.resources.memory_bytes);
+    builder.set_memory_bytes(task.resources.memory_bytes());
 
     let mut cmd_builder = builder.reborrow().init_command(task.command.len() as u32);
     for (idx, arg) in task.command.iter().enumerate() {

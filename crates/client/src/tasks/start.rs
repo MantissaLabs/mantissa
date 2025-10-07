@@ -28,6 +28,7 @@ pub async fn start(
         }
         builder.set_cpu_millis(cpu_millis);
         builder.set_memory_bytes(memory_bytes);
+        builder.reborrow().init_slot_ids(0);
     }
 
     let response = request.send().promise.await?;

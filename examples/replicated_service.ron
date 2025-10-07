@@ -12,7 +12,7 @@
             replicas: 2,
             resources: (
                 cpu_millis: 500,
-                memory_bytes: 134_217_728,
+                memory_mb: 128,
             ),
         ),
         (
@@ -21,7 +21,7 @@
             replicas: 1,
             resources: (
                 cpu_millis: 300,
-                memory_bytes: 2_268_435_456,
+                memory_mb: 256,
             ),
         ),
     ],

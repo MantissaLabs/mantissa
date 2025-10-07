@@ -112,41 +112,68 @@ impl Bootstrap {
     fn derive_slot_specs(node: &node::Node) -> Vec<SlotSpec> {
         let info = &node.system_info.info;
 
-        let mut slot_count = info
+        const MIN_SLOT_MEMORY_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
+        const MAX_SLOTS: u64 = 4_096;
+
+        let logical_cpus = info
             .cpu_info
             .as_ref()
             .map(|cpu| cpu.num_logical_cpus.max(1) as u64)
             .unwrap_or(1);
 
+        let total_memory = info.mem_info.as_ref().map(|mem| mem.total).unwrap_or(0);
+
+        let mut slot_count = if total_memory > 0 {
+            let slots = (total_memory + MIN_SLOT_MEMORY_BYTES - 1) / MIN_SLOT_MEMORY_BYTES;
+            slots.max(1)
+        } else {
+            logical_cpus.max(1)
+        };
+
         if slot_count == 0 {
             slot_count = 1;
         }
 
-        let total_memory = info.mem_info.as_ref().map(|mem| mem.total).unwrap_or(0);
+        slot_count = slot_count.min(MAX_SLOTS.max(1));
 
-        let base_memory = if slot_count > 0 {
-            total_memory / slot_count
-        } else {
-            total_memory
-        };
-        let mut remainder = if slot_count > 0 {
-            total_memory % slot_count
-        } else {
-            0
-        };
+        let total_cpu_millis = logical_cpus.saturating_mul(1_000);
+        let mut remaining_cpu = total_cpu_millis;
+        let mut remaining_memory = total_memory;
 
         let mut specs = Vec::with_capacity(slot_count as usize);
         for slot_idx in 0..slot_count {
-            let extra = if remainder > 0 {
-                remainder -= 1;
-                1
-            } else {
+            let slots_left = slot_count - slot_idx;
+
+            let memory_bytes = if total_memory == 0 || remaining_memory == 0 {
                 0
+            } else if slots_left == 1 {
+                let mem = remaining_memory;
+                remaining_memory = 0;
+                mem
+            } else {
+                let chunk = MIN_SLOT_MEMORY_BYTES.min(remaining_memory);
+                remaining_memory -= chunk;
+                chunk
             };
-            let memory_bytes = base_memory + extra;
+
+            let cpu_millis = if total_cpu_millis == 0 || remaining_cpu == 0 {
+                0
+            } else {
+                let slots_left_cpu = slots_left;
+                let mut chunk = remaining_cpu / slots_left_cpu;
+                if chunk == 0 && remaining_cpu > 0 {
+                    chunk = 1;
+                }
+                if chunk > remaining_cpu {
+                    chunk = remaining_cpu;
+                }
+                remaining_cpu -= chunk;
+                chunk
+            };
+
             specs.push(SlotSpec::new(
                 slot_idx,
-                SlotCapacity::new(1_000, memory_bytes),
+                SlotCapacity::new(cpu_millis, memory_bytes),
             ));
         }
 
