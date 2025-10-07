@@ -14,7 +14,7 @@ pub struct TaskSpec {
     pub command: Vec<String>,
     pub node_id: Uuid,
     pub node_name: String,
-    pub slot_id: Option<u64>,
+    pub slot_ids: Vec<u64>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
 }
@@ -116,7 +116,7 @@ pub struct TaskValue {
     pub command: Vec<String>,
     pub node_id: Uuid,
     pub node_name: String,
-    pub slot_id: Option<u64>,
+    pub slot_ids: Vec<u64>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
 }
@@ -131,7 +131,7 @@ impl TaskValue {
         command: Vec<String>,
         node_id: Uuid,
         node_name: impl Into<String>,
-        slot_id: Option<u64>,
+        slot_ids: Vec<u64>,
         cpu_millis: u64,
         memory_bytes: u64,
     ) -> Self {
@@ -144,7 +144,7 @@ impl TaskValue {
             command,
             node_id,
             node_name: node_name.into(),
-            slot_id,
+            slot_ids,
             cpu_millis,
             memory_bytes,
         }

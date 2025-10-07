@@ -62,6 +62,7 @@ pub async fn run_many(cfg: &ClientConfig, tasks: Vec<TaskStartParams>) -> Result
             entry.set_image(&task.image);
             entry.set_cpu_millis(task.cpu_millis);
             entry.set_memory_bytes(task.memory_bytes);
+            entry.reborrow().init_slot_ids(0);
 
             let mut cmd_builder = entry.reborrow().init_command(task.command.len() as u32);
             for (cmd_idx, arg) in task.command.iter().enumerate() {

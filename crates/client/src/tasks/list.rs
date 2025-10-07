@@ -90,11 +90,15 @@ impl TaskRow {
         let created_at = spec.get_created_at()?.to_str()?.to_string();
         let node_name = spec.get_node_name()?.to_str()?.to_string();
         let node_id = uuid_short(spec.get_node_id()?)?;
-        let slot_raw = spec.get_slot_id();
-        let slot = if slot_raw == 0 {
+        let slots_reader = spec.get_slot_ids()?;
+        let slot = if slots_reader.len() == 0 {
             "-".to_string()
         } else {
-            slot_raw.to_string()
+            let mut rendered = Vec::with_capacity(slots_reader.len() as usize);
+            for slot_id in slots_reader.iter() {
+                rendered.push(slot_id.to_string());
+            }
+            rendered.join(",")
         };
         let cpu_millis = spec.get_cpu_millis();
         let memory_mib = spec.get_memory_bytes() / (1024 * 1024);

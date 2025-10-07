@@ -10,6 +10,14 @@ pub struct ServiceManifest {
     pub tasks: Vec<TaskSpec>,
 }
 
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct TaskResources {
+    #[serde(default)]
+    pub cpu_millis: u64,
+    #[serde(default)]
+    pub memory_bytes: u64,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct TaskSpec {
     pub name: String,
@@ -18,6 +26,8 @@ pub struct TaskSpec {
     pub command: Vec<String>,
     #[serde(default = "default_replicas")]
     pub replicas: u16,
+    #[serde(default)]
+    pub resources: TaskResources,
 }
 
 impl ServiceManifest {
@@ -45,6 +55,24 @@ impl ServiceManifest {
             if task.replicas == 0 {
                 return Err(anyhow!(
                     "task '{}' must request at least one replica",
+                    task.name
+                ));
+            }
+
+            if task.resources.cpu_millis == 0 && task.resources.memory_bytes == 0 {
+                continue;
+            }
+
+            if task.resources.cpu_millis == 0 {
+                return Err(anyhow!(
+                    "task '{}' must set cpu_millis when memory_bytes is specified",
+                    task.name
+                ));
+            }
+
+            if task.resources.memory_bytes == 0 {
+                return Err(anyhow!(
+                    "task '{}' must set memory_bytes when cpu_millis is specified",
                     task.name
                 ));
             }

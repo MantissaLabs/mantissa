@@ -9,7 +9,7 @@ struct TaskSpec {
   command @5 :List(Text);
   nodeId @6 :Data;
   nodeName @7 :Text;
-  slotId @8 :UInt64;
+  slotIds @8 :List(UInt64);
   cpuMillis @9 :UInt64;
   memoryBytes @10 :UInt64;
 }
@@ -20,7 +20,7 @@ struct TaskStartRequest {
   command @2 :List(Text);
   cpuMillis @3 :UInt64;
   memoryBytes @4 :UInt64;
-  slotId @5 :UInt64;
+  slotIds @5 :List(UInt64);
   taskId @6 :Data;
 }
 

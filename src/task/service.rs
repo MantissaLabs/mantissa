@@ -67,7 +67,7 @@ pub fn add_event(
             spec_builder.set_created_at("");
             spec_builder.set_node_id(&[0u8; 16]);
             spec_builder.set_node_name("");
-            spec_builder.set_slot_id(0);
+            spec_builder.reborrow().init_slot_ids(0);
             spec_builder.set_cpu_millis(0);
             spec_builder.set_memory_bytes(0);
             spec_builder.init_command(0);
@@ -105,7 +105,10 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
         cmd_builder.set(idx as u32, arg);
     }
 
-    builder.set_slot_id(spec.slot_id.unwrap_or_default());
+    let mut slots_builder = builder.reborrow().init_slot_ids(spec.slot_ids.len() as u32);
+    for (idx, slot_id) in spec.slot_ids.iter().enumerate() {
+        slots_builder.set(idx as u32, *slot_id);
+    }
     builder.set_cpu_millis(spec.cpu_millis);
     builder.set_memory_bytes(spec.memory_bytes);
 }
@@ -129,8 +132,11 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         command.push(arg?.to_str()?.to_string());
     }
 
-    let slot_id = reader.get_slot_id();
-    let slot_id = if slot_id == 0 { None } else { Some(slot_id) };
+    let slot_ids_reader = reader.get_slot_ids()?;
+    let mut slot_ids = Vec::with_capacity(slot_ids_reader.len() as usize);
+    for encoded in slot_ids_reader.iter() {
+        slot_ids.push(encoded);
+    }
     let cpu_millis = reader.get_cpu_millis();
     let memory_bytes = reader.get_memory_bytes();
 
@@ -143,7 +149,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         command,
         node_id,
         node_name,
-        slot_id,
+        slot_ids,
         cpu_millis,
         memory_bytes,
     })
@@ -225,15 +231,19 @@ impl task::Server for TaskService {
                 let image = entry.get_image()?.to_str()?.to_string();
                 let cpu_millis = entry.get_cpu_millis();
                 let memory_bytes = entry.get_memory_bytes();
-                let raw_slot_id = entry.get_slot_id();
-                let slot_id = match raw_slot_id {
-                    0 => None,
-                    value => Some(
-                        value
-                            .checked_sub(1)
-                            .expect("slot id decoding underflow in task request"),
-                    ),
-                };
+                let slots_reader = entry.get_slot_ids()?;
+                let mut slot_ids = Vec::with_capacity(slots_reader.len() as usize);
+                for encoded in slots_reader.iter() {
+                    if encoded == 0 {
+                        return Err(Error::failed(
+                            "slot ids in task request must be encoded as value+1".to_string(),
+                        ));
+                    }
+                    let decoded = encoded
+                        .checked_sub(1)
+                        .expect("slot id decoding underflow in task request");
+                    slot_ids.push(decoded);
+                }
 
                 let task_id = {
                     let bytes = entry.get_task_id()?;
@@ -258,7 +268,7 @@ impl task::Server for TaskService {
                     cpu_millis,
                     memory_bytes,
                     id: task_id,
-                    slot_id,
+                    slot_ids,
                 });
             }
 

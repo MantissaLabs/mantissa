@@ -48,7 +48,7 @@ pub struct TaskStartRequest {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
     pub id: Option<Uuid>,
-    pub slot_id: Option<SlotId>,
+    pub slot_ids: Vec<SlotId>,
 }
 
 struct BatchStartPlan {
@@ -56,13 +56,22 @@ struct BatchStartPlan {
     name: String,
     image: String,
     command: Vec<String>,
-    slot_id: SlotId,
-    slot_capacity: SlotCapacity,
+    slots: Vec<SlotChoice>,
     container_name: String,
     container_id: Option<String>,
     created_at: DateTime<Utc>,
     index: usize,
     preassigned: bool,
+}
+
+impl BatchStartPlan {
+    fn slot_ids(&self) -> Vec<SlotId> {
+        self.slots.iter().map(|slot| slot.slot_id).collect()
+    }
+
+    fn total_capacity(&self) -> SlotCapacity {
+        aggregate_capacity(&self.slots)
+    }
 }
 
 #[derive(Clone)]
@@ -74,13 +83,23 @@ struct StartIntent {
     command: Vec<String>,
     cpu_millis: u64,
     memory_bytes: u64,
-    preassigned_slot: Option<SlotId>,
+    preassigned_slots: Vec<SlotId>,
 }
 
 #[derive(Clone)]
 struct SlotChoice {
     slot_id: SlotId,
     capacity: SlotCapacity,
+}
+
+fn aggregate_capacity(slots: &[SlotChoice]) -> SlotCapacity {
+    let cpu_millis = slots
+        .iter()
+        .fold(0u64, |acc, slot| acc + slot.capacity.cpu_millis);
+    let memory_bytes = slots
+        .iter()
+        .fold(0u64, |acc, slot| acc + slot.capacity.memory_bytes);
+    SlotCapacity::new(cpu_millis, memory_bytes)
 }
 
 /// Identifies whether a scheduling candidate refers to this node or a remote peer.
@@ -108,16 +127,71 @@ impl Candidate {
         }
     }
 
-    /// Removes and returns the first slot that can satisfy the requested resources.
-    /// Keeping the allocation logic here avoids duplicating the capacity checks.
-    fn allocate(&mut self, cpu_millis: u64, memory_bytes: u64) -> Option<SlotChoice> {
-        if let Some(pos) = self.slots.iter().position(|slot| {
-            slot.capacity.cpu_millis >= cpu_millis && slot.capacity.memory_bytes >= memory_bytes
-        }) {
-            Some(self.slots.remove(pos))
-        } else {
-            None
+    /// Attempts to reserve enough slots to satisfy the requested CPU and memory.
+    /// A greedy selection is used: for each iteration we pick the slot that
+    /// contributes the largest share of the remaining requirement. The
+    /// allocation only succeeds when the accumulated capacity fully covers the
+    /// requested resources.
+    fn allocate(&mut self, cpu_millis: u64, memory_bytes: u64) -> Option<Vec<SlotChoice>> {
+        if self.slots.is_empty() {
+            return None;
         }
+
+        // Zero-capacity requests still require a single slot to run the task so
+        // we keep the previous behaviour.
+        if cpu_millis == 0 && memory_bytes == 0 {
+            let slot = self.slots.remove(0);
+            return Some(vec![slot]);
+        }
+
+        let mut remaining_cpu = cpu_millis;
+        let mut remaining_mem = memory_bytes;
+        let mut selected_indices: Vec<usize> = Vec::new();
+        let mut available_indices: Vec<usize> = (0..self.slots.len()).collect();
+
+        while remaining_cpu > 0 || remaining_mem > 0 {
+            if available_indices.is_empty() {
+                return None;
+            }
+
+            let mut best_choice = None;
+            let mut best_score = 0u128;
+
+            for &idx in &available_indices {
+                let slot = &self.slots[idx];
+                let cpu_contrib = std::cmp::min(slot.capacity.cpu_millis, remaining_cpu);
+                let mem_contrib = std::cmp::min(slot.capacity.memory_bytes, remaining_mem);
+                let score = (cpu_contrib as u128) << 64 | mem_contrib as u128;
+
+                if score > best_score {
+                    best_score = score;
+                    best_choice = Some(idx);
+                }
+            }
+
+            let Some(best_idx) = best_choice else {
+                return None;
+            };
+
+            let slot = &self.slots[best_idx];
+            if slot.capacity.cpu_millis == 0 && slot.capacity.memory_bytes == 0 {
+                // Slot contributes nothing; abort allocation to avoid infinite loop.
+                return None;
+            }
+
+            selected_indices.push(best_idx);
+            remaining_cpu = remaining_cpu.saturating_sub(slot.capacity.cpu_millis);
+            remaining_mem = remaining_mem.saturating_sub(slot.capacity.memory_bytes);
+            available_indices.retain(|&idx| idx != best_idx);
+        }
+
+        selected_indices.sort_unstable_by(|a, b| b.cmp(a));
+        let mut allocated = Vec::with_capacity(selected_indices.len());
+        for idx in selected_indices {
+            allocated.push(self.slots.remove(idx));
+        }
+        allocated.reverse();
+        Some(allocated)
     }
 
     fn is_empty(&self) -> bool {
@@ -133,7 +207,7 @@ struct RemoteStartPlan {
     command: Vec<String>,
     cpu_millis: u64,
     memory_bytes: u64,
-    slot_id: SlotId,
+    slots: Vec<SlotChoice>,
     peer_id: Uuid,
     scheduler_version: u64,
 }
@@ -173,7 +247,7 @@ impl TaskManager {
                 command: request.command,
                 cpu_millis: request.cpu_millis,
                 memory_bytes: request.memory_bytes,
-                preassigned_slot: request.slot_id,
+                preassigned_slots: request.slot_ids,
             })
             .collect()
     }
@@ -240,7 +314,7 @@ impl TaskManager {
             cpu_millis,
             memory_bytes,
             id: None,
-            slot_id: None,
+            slot_ids: Vec::new(),
         };
 
         let mut specs = self.start_tasks_batch(vec![request]).await?;
@@ -449,49 +523,77 @@ impl TaskManager {
 
         let mut local_plans = Vec::new();
         for intent in intents.iter() {
-            let Some(slot_id) = intent.preassigned_slot else {
+            if intent.preassigned_slots.is_empty() {
                 continue;
-            };
-            let slot = slot_lookup
-                .get(&slot_id)
-                .ok_or_else(|| anyhow::anyhow!("unknown preassigned slot {slot_id}"))?;
-
-            // Caller provided a slot ID that does not satisfy the capacity expectations.
-            if slot.capacity.cpu_millis < intent.cpu_millis
-                || slot.capacity.memory_bytes < intent.memory_bytes
-            {
-                return Err(anyhow::anyhow!(
-                    "preassigned slot {slot_id} cannot satisfy requested capacity"
-                ));
             }
 
-            // Ensure we own the reservation and (if present) that it references the same task.
-            if let SlotState::Reserved(reservation) = &slot.state {
-                if reservation.owner != self.local_node_id {
+            let mut seen = HashSet::new();
+            let mut chosen_slots = Vec::new();
+
+            for slot_id in intent.preassigned_slots.iter().copied() {
+                if !seen.insert(slot_id) {
                     return Err(anyhow::anyhow!(
-                        "preassigned slot {slot_id} owned by different node"
+                        "duplicate preassigned slot {slot_id} for task {}",
+                        intent.name
                     ));
                 }
 
-                if let Some(task_id) = reservation.task_id {
-                    if task_id != intent.id {
+                let slot = slot_lookup
+                    .get(&slot_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown preassigned slot {slot_id}"))?;
+
+                if let SlotState::Reserved(reservation) = &slot.state {
+                    if reservation.owner != self.local_node_id {
                         return Err(anyhow::anyhow!(
-                            "preassigned slot {slot_id} reserved for task {task_id}"
+                            "preassigned slot {slot_id} owned by different node"
                         ));
                     }
+
+                    if let Some(task_id) = reservation.task_id {
+                        if task_id != intent.id {
+                            return Err(anyhow::anyhow!(
+                                "preassigned slot {slot_id} reserved for task {task_id}"
+                            ));
+                        }
+                    }
                 }
+
+                available_local_slots.retain(|slot| slot.slot_id != slot_id);
+                chosen_slots.push(SlotChoice {
+                    slot_id,
+                    capacity: slot.capacity,
+                });
             }
 
-            // Remove the slot from the free pool so we do not offer it again later on.
-            available_local_slots.retain(|slot| slot.slot_id != slot_id);
+            if chosen_slots.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "task '{}' must specify at least one preassigned slot",
+                    intent.name
+                ));
+            }
+
+            let total_cpu: u64 = chosen_slots
+                .iter()
+                .map(|slot| slot.capacity.cpu_millis)
+                .sum();
+            let total_mem: u64 = chosen_slots
+                .iter()
+                .map(|slot| slot.capacity.memory_bytes)
+                .sum();
+
+            if intent.cpu_millis > total_cpu || intent.memory_bytes > total_mem {
+                return Err(anyhow::anyhow!(
+                    "preassigned slots for task '{}' provide insufficient capacity",
+                    intent.name
+                ));
+            }
 
             local_plans.push(BatchStartPlan {
                 id: intent.id,
                 name: intent.name.clone(),
                 image: intent.image.clone(),
                 command: intent.command.clone(),
-                slot_id,
-                slot_capacity: slot.capacity,
+                slots: chosen_slots,
                 container_name: String::new(),
                 container_id: None,
                 created_at: Utc::now(),
@@ -507,7 +609,7 @@ impl TaskManager {
         };
         let remaining_intents: Vec<&StartIntent> = intents
             .iter()
-            .filter(|intent| intent.preassigned_slot.is_none())
+            .filter(|intent| intent.preassigned_slots.is_empty())
             .collect();
 
         Ok((assignment, remaining_intents, available_local_slots))
@@ -590,25 +692,25 @@ impl TaskManager {
                 ));
             }
 
-            let mut allocated: Option<(CandidateLocation, SlotChoice)> = None;
+            let mut allocated: Option<(CandidateLocation, Vec<SlotChoice>)> = None;
             for _ in 0..candidate_count {
                 let mut candidate = candidates
                     .pop_front()
                     .expect("candidate deque should not be empty");
 
-                if let Some(slot) = candidate.allocate(intent.cpu_millis, intent.memory_bytes) {
+                if let Some(slots) = candidate.allocate(intent.cpu_millis, intent.memory_bytes) {
                     let location = candidate.location.clone();
                     if !candidate.is_empty() {
                         candidates.push_back(candidate);
                     }
-                    allocated = Some((location, slot));
+                    allocated = Some((location, slots));
                     break;
                 } else {
                     candidates.push_back(candidate);
                 }
             }
 
-            let Some((location, slot)) = allocated else {
+            let Some((location, slots)) = allocated else {
                 return Err(anyhow::anyhow!(
                     "scheduler reservation failed: insufficient capacity for batch"
                 ));
@@ -621,8 +723,7 @@ impl TaskManager {
                         name: intent.name.clone(),
                         image: intent.image.clone(),
                         command: intent.command.clone(),
-                        slot_id: slot.slot_id,
-                        slot_capacity: slot.capacity,
+                        slots,
                         container_name: String::new(),
                         container_id: None,
                         created_at: Utc::now(),
@@ -639,7 +740,7 @@ impl TaskManager {
                         command: intent.command.clone(),
                         cpu_millis: intent.cpu_millis,
                         memory_bytes: intent.memory_bytes,
-                        slot_id: slot.slot_id,
+                        slots,
                         peer_id,
                         scheduler_version: version,
                     });
@@ -692,20 +793,22 @@ impl TaskManager {
             return Ok(Vec::new());
         }
 
-        let mut requests = Vec::with_capacity(plans.len());
-        let mut newly_reserved = Vec::with_capacity(plans.len());
+        let mut requests = Vec::new();
+        let mut newly_reserved = Vec::new();
 
         for plan in plans {
             if plan.preassigned {
                 continue;
             }
 
-            requests.push(SlotReservationRequest {
-                slot_id: plan.slot_id,
-                owner: self.local_node_id,
-                task_id: Some(plan.id),
-            });
-            newly_reserved.push(plan.slot_id);
+            for slot in &plan.slots {
+                requests.push(SlotReservationRequest {
+                    slot_id: slot.slot_id,
+                    owner: self.local_node_id,
+                    task_id: Some(plan.id),
+                });
+                newly_reserved.push(slot.slot_id);
+            }
         }
 
         if requests.is_empty() {
@@ -792,12 +895,23 @@ impl TaskManager {
                     .map(|plan| plan.scheduler_version)
                     .unwrap_or(0);
                 inner.set_expected_version(expected_version);
-                let mut intents_builder = inner.reborrow().init_intents(peer_plans.len() as u32);
-                for (idx, plan) in peer_plans.iter().enumerate() {
-                    let mut entry = intents_builder.reborrow().get(idx as u32);
-                    entry.set_slot_id(plan.slot_id);
-                    entry.set_owner(plan.peer_id.as_bytes());
-                    entry.set_task_id(plan.id.as_bytes());
+                let total_slots: usize = peer_plans.iter().map(|plan| plan.slots.len()).sum();
+                if total_slots == 0 {
+                    return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                        "remote plan missing slot assignments"
+                    )));
+                }
+
+                let mut intents_builder = inner.reborrow().init_intents(total_slots as u32);
+                let mut intent_idx = 0u32;
+                for plan in &peer_plans {
+                    for slot in &plan.slots {
+                        let mut entry = intents_builder.reborrow().get(intent_idx);
+                        entry.set_slot_id(slot.slot_id);
+                        entry.set_owner(plan.peer_id.as_bytes());
+                        entry.set_task_id(plan.id.as_bytes());
+                        intent_idx += 1;
+                    }
                 }
             }
 
@@ -805,8 +919,10 @@ impl TaskManager {
                 Ok(resp) => match resp.get() {
                     Ok(result) => match result.get_response() {
                         Ok(response) => {
-                            let slots: Vec<SlotId> =
-                                peer_plans.iter().map(|plan| plan.slot_id).collect();
+                            let slots: Vec<SlotId> = peer_plans
+                                .iter()
+                                .flat_map(|plan| plan.slots.iter().map(|slot| slot.slot_id))
+                                .collect();
                             let version = response.get_new_version();
                             reservations.insert(peer_id, RemoteReservation { slots, version });
                         }
@@ -1041,16 +1157,31 @@ impl TaskManager {
             {
                 let mut requests_builder = start_req.get().init_requests(peer_plans.len() as u32);
                 for (idx, plan) in peer_plans.iter().enumerate() {
+                    if plan.slots.is_empty() {
+                        return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                            "remote plan missing slot assignments"
+                        )));
+                    }
+
                     let mut entry = requests_builder.reborrow().get(idx as u32);
                     entry.set_name(&plan.name);
                     entry.set_image(&plan.image);
                     entry.set_cpu_millis(plan.cpu_millis);
                     entry.set_memory_bytes(plan.memory_bytes);
-                    let encoded_slot_id = plan
-                        .slot_id
-                        .checked_add(1)
-                        .expect("slot id overflow while encoding reservation");
-                    entry.set_slot_id(encoded_slot_id);
+                    let encoded_slots: Vec<u64> = plan
+                        .slots
+                        .iter()
+                        .map(|slot| {
+                            slot.slot_id
+                                .checked_add(1)
+                                .expect("slot id overflow while encoding reservation")
+                        })
+                        .collect();
+                    let mut slot_ids_builder =
+                        entry.reborrow().init_slot_ids(encoded_slots.len() as u32);
+                    for (slot_idx, encoded) in encoded_slots.iter().enumerate() {
+                        slot_ids_builder.set(slot_idx as u32, *encoded);
+                    }
                     entry.set_task_id(plan.id.as_bytes());
 
                     let mut cmd_builder = entry.reborrow().init_command(plan.command.len() as u32);
@@ -1145,6 +1276,14 @@ impl TaskManager {
         let mut persisted: Vec<TaskSpec> = Vec::new();
 
         for plan in plans {
+            if plan.slots.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "task {} has no slots assigned during commit",
+                    plan.name
+                ));
+            }
+
+            let total_capacity = plan.total_capacity();
             let spec = TaskSpec {
                 id: plan.id,
                 name: plan.name.clone(),
@@ -1154,9 +1293,9 @@ impl TaskManager {
                 command: plan.command.clone(),
                 node_id: self.local_node_id,
                 node_name: self.local_node_name.clone(),
-                slot_id: Some(plan.slot_id),
-                cpu_millis: plan.slot_capacity.cpu_millis,
-                memory_bytes: plan.slot_capacity.memory_bytes,
+                slot_ids: plan.slot_ids(),
+                cpu_millis: total_capacity.cpu_millis,
+                memory_bytes: total_capacity.memory_bytes,
             };
 
             if let Err(err) = self.persist_spec(&spec).await {
@@ -1223,12 +1362,12 @@ impl TaskManager {
                 guard.remove(&plan.id);
             }
 
-            if plan.slot_id != 0 {
-                if let Err(err) = self.release_slot(plan.slot_id).await {
+            for slot in &plan.slots {
+                if let Err(err) = self.release_slot(slot.slot_id).await {
                     warn!(
                         target: "task",
                         "failed to release slot {} during rollback: {err}",
-                        plan.slot_id
+                        slot.slot_id
                     );
                 }
             }
@@ -1270,7 +1409,7 @@ impl TaskManager {
             spec.command.clone(),
             spec.node_id,
             spec.node_name.clone(),
-            spec.slot_id,
+            spec.slot_ids.clone(),
             spec.cpu_millis,
             spec.memory_bytes,
         );
@@ -1385,8 +1524,8 @@ impl TaskManager {
             let id = key.to_uuid();
             if let Some(value) = snapshot.as_slice().last() {
                 if value.node_id == self.local_node_id {
-                    if let Some(slot_id) = value.slot_id {
-                        slots.insert(slot_id);
+                    for slot_id in &value.slot_ids {
+                        slots.insert(*slot_id);
                     }
                 }
             } else {
@@ -1499,11 +1638,13 @@ impl TaskManager {
         }
 
         updated.state = ContainerState::Stopped;
-        if let Some(slot_id) = spec.slot_id {
-            self.release_slot(slot_id)
-                .await
-                .with_context(|| "scheduler release failed during stop".to_string())?;
-            updated.slot_id = None;
+        if !spec.slot_ids.is_empty() {
+            for slot_id in &spec.slot_ids {
+                self.release_slot(*slot_id)
+                    .await
+                    .with_context(|| "scheduler release failed during stop".to_string())?;
+            }
+            updated.slot_ids.clear();
             updated.cpu_millis = 0;
             updated.memory_bytes = 0;
         }
@@ -1560,7 +1701,7 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         command: value.command,
         node_id: value.node_id,
         node_name: value.node_name,
-        slot_id: value.slot_id,
+        slot_ids: value.slot_ids,
         cpu_millis: value.cpu_millis,
         memory_bytes: value.memory_bytes,
     }
@@ -1751,7 +1892,7 @@ mod tests {
 
         assert_eq!(spec.cpu_millis, 1_000);
         assert_eq!(spec.memory_bytes, 1_024 * 1_024 * 1_024);
-        let slot_id = spec.slot_id.expect("slot assigned");
+        let slot_id = *spec.slot_ids.first().expect("slot assigned");
 
         let snapshot = scheduler.snapshot().await.expect("snapshot");
         let slot = snapshot
@@ -1763,6 +1904,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_container_reserves_multiple_slots_when_needed() {
+        let (manager, scheduler, _cm) = setup_manager().await;
+
+        let spec = manager
+            .start_container("svc-multi", "image", vec![], 1_500, 1_536 * 1_024 * 1_024)
+            .await
+            .expect("start container with multi-slot request");
+
+        assert_eq!(spec.slot_ids.len(), 2, "expected two slots to be reserved");
+
+        let snapshot = scheduler.snapshot().await.expect("snapshot");
+        let reserved: Vec<_> = snapshot
+            .slots
+            .iter()
+            .filter(|slot| matches!(slot.state, SlotState::Reserved(_)))
+            .collect();
+        assert_eq!(reserved.len(), 2);
+
+        for slot in reserved {
+            assert!(spec.slot_ids.contains(&slot.slot_id));
+        }
+    }
+
+    #[tokio::test]
     async fn stop_task_releases_slot_and_clears_resources() {
         let (manager, scheduler, mock_cm) = setup_manager().await;
 
@@ -1771,14 +1936,14 @@ mod tests {
             .await
             .expect("start container");
 
-        let slot_id = spec.slot_id.expect("slot assigned");
+        let slot_id = *spec.slot_ids.first().expect("slot assigned");
         let stopped = manager.stop_task(spec.id).await.expect("stop task");
 
         assert!(matches!(stopped.state, ContainerState::Stopped));
         let stopped_containers = mock_cm.stopped.lock().await.clone();
         assert_eq!(stopped_containers, vec!["container-0".to_string()]);
 
-        assert!(stopped.slot_id.is_none());
+        assert!(stopped.slot_ids.is_empty());
         assert_eq!(stopped.cpu_millis, 0);
         assert_eq!(stopped.memory_bytes, 0);
 
@@ -1896,7 +2061,7 @@ mod tests {
                     cpu_millis: 400,
                     memory_bytes: 128 * 1_024 * 1_024,
                     id: None,
-                    slot_id: None,
+                    slot_ids: Vec::new(),
                 },
                 TaskStartRequest {
                     name: "svc-b".into(),
@@ -1905,7 +2070,7 @@ mod tests {
                     cpu_millis: 200,
                     memory_bytes: 64 * 1_024 * 1_024,
                     id: None,
-                    slot_id: None,
+                    slot_ids: Vec::new(),
                 },
             ])
             .await
@@ -1952,13 +2117,13 @@ mod tests {
                 cpu_millis: 200,
                 memory_bytes: 64 * 1_024 * 1_024,
                 id: Some(task_id),
-                slot_id: Some(slot_id),
+                slot_ids: vec![slot_id],
             }])
             .await
             .expect("start with pre-reserved slot");
 
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].slot_id, Some(slot_id));
+        assert_eq!(specs[0].slot_ids, vec![slot_id]);
 
         let snapshot = scheduler.snapshot().await.expect("snapshot");
         assert_eq!(snapshot.version, 1);
@@ -2007,7 +2172,7 @@ mod tests {
             vec![],
             Uuid::new_v4(),
             "remote-node",
-            Some(1),
+            vec![1],
             100,
             64 * 1_024 * 1_024,
         );
@@ -2046,7 +2211,7 @@ mod tests {
                     cpu_millis: 200,
                     memory_bytes: 64 * 1_024 * 1_024,
                     id: None,
-                    slot_id: None,
+                    slot_ids: Vec::new(),
                 },
                 TaskStartRequest {
                     name: "svc-d".into(),
@@ -2055,7 +2220,7 @@ mod tests {
                     cpu_millis: 200,
                     memory_bytes: 64 * 1_024 * 1_024,
                     id: None,
-                    slot_id: None,
+                    slot_ids: Vec::new(),
                 },
             ])
             .await

@@ -48,6 +48,8 @@ pub struct ServiceTaskSpecValue {
     pub image: String,
     pub command: Vec<String>,
     pub replicas: u16,
+    pub cpu_millis: u64,
+    pub memory_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

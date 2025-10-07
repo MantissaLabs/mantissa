@@ -10,11 +10,19 @@
                 "while true; do echo 'demo-service echo replica'; sleep 5; done",
             ],
             replicas: 2,
+            resources: (
+                cpu_millis: 500,
+                memory_bytes: 134_217_728,
+            ),
         ),
         (
             name: "api",
             image: "nginx:1.27-alpine",
             replicas: 1,
+            resources: (
+                cpu_millis: 300,
+                memory_bytes: 2_268_435_456,
+            ),
         ),
     ],
 )

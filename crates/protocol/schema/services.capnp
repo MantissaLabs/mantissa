@@ -5,6 +5,8 @@ struct TaskTemplate {
   image @1 :Text;         # Container image reference (e.g. ghcr.io/org/app:tag)
   command @2 :List(Text); # Container command/args, each entry a UTF-8 string
   replicas @3 :UInt16;    # Desired replica count for this task
+  cpuMillis @4 :UInt64;   # Requested CPU in milli-cores per replica (0 uses scheduler default)
+  memoryBytes @5 :UInt64; # Requested memory in bytes per replica (0 uses scheduler default)
 }
 
 struct ServiceUpsertSpec {

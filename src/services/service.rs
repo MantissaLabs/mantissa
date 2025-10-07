@@ -208,6 +208,8 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         image: reader.get_image()?.to_str()?.to_string(),
         command,
         replicas: reader.get_replicas(),
+        cpu_millis: reader.get_cpu_millis(),
+        memory_bytes: reader.get_memory_bytes(),
     })
 }
 
@@ -218,6 +220,8 @@ fn write_task_template(
     builder.set_name(&task.name);
     builder.set_image(&task.image);
     builder.set_replicas(task.replicas);
+    builder.set_cpu_millis(task.cpu_millis);
+    builder.set_memory_bytes(task.memory_bytes);
 
     let mut cmd_builder = builder.reborrow().init_command(task.command.len() as u32);
     for (idx, arg) in task.command.iter().enumerate() {

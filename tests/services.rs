@@ -435,6 +435,8 @@ async fn deploy_manifest_via_anchor(
             image: task.image.clone(),
             command: task.command.clone(),
             replicas: task.replicas,
+            cpu_millis: task.resources.cpu_millis,
+            memory_bytes: task.resources.memory_bytes,
         })
         .collect();
 
@@ -468,10 +470,10 @@ fn build_task_requests(manifest: &ServiceManifest) -> Vec<TaskStartRequest> {
                 name,
                 image: task.image.clone(),
                 command: task.command.clone(),
-                cpu_millis: 0,
-                memory_bytes: 0,
+                cpu_millis: task.resources.cpu_millis,
+                memory_bytes: task.resources.memory_bytes,
                 id: None,
-                slot_id: None,
+                slot_ids: Vec::new(),
             });
         }
     }

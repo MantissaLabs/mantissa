@@ -101,6 +101,8 @@ mod tests {
                 image: "ghcr.io/demo/web:latest".into(),
                 command: vec!["--port".into(), "8080".into()],
                 replicas: 2,
+                cpu_millis: 0,
+                memory_bytes: 0,
             }],
             vec![Uuid::new_v4()],
         );
@@ -127,6 +129,8 @@ mod tests {
                 image: "ghcr.io/demo/web:v2".into(),
                 command: vec![],
                 replicas: 3,
+                cpu_millis: 0,
+                memory_bytes: 0,
             }],
             vec![Uuid::new_v4(), Uuid::new_v4()],
         );
