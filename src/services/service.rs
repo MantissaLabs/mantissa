@@ -133,12 +133,15 @@ impl services::Server for ServicesRPC {
             let ids = params.get()?.get_ids()?;
             for entry in ids.iter() {
                 let id = read_uuid(entry?)?;
-                if let Err(err) = manager.submit_stop(id).await {
-                    warn!(
-                        target: "services",
-                        "failed to delete service {id}: {err}"
-                    );
-                }
+                let manager = manager.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(err) = manager.submit_stop(id).await {
+                        warn!(
+                            target: "services",
+                            "failed to delete service {id}: {err}"
+                        );
+                    }
+                });
             }
             Ok(())
         })

@@ -8,6 +8,8 @@ use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{TaskRestartPolicy, TaskRestartPolicyKind};
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
+use chrono::{DateTime, Utc};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -54,14 +56,16 @@ impl ServiceController {
     }
 
     pub async fn upsert_service(&self, value: ServiceSpecValue) -> anyhow::Result<()> {
-        if self.registry.get(value.id)?.is_some() {
-            return Err(anyhow!(
-                "service '{}' already exists; stop it before deploying again",
-                value.service_name
-            ));
+        if let Some(existing) = self.registry.get(value.id)? {
+            if existing.status() != ServiceStatus::Stopped {
+                return Err(anyhow!(
+                    "service '{}' already exists; stop it before deploying again",
+                    value.service_name
+                ));
+            }
         }
 
-        self.registry.upsert(value.clone()).await?;
+        self.apply_upsert(value.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(value)).await
     }
 
@@ -95,7 +99,7 @@ impl ServiceController {
         }
 
         spec.set_status(ServiceStatus::Stopping);
-        self.registry.upsert(spec.clone()).await?;
+        self.apply_upsert(spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(spec.clone())).await?;
 
         tracing::info!(
@@ -118,7 +122,9 @@ impl ServiceController {
     }
 
     pub fn list_services(&self) -> anyhow::Result<Vec<ServiceSpecValue>> {
-        self.registry.list()
+        let mut specs = self.registry.list()?;
+        specs.retain(|spec| spec.status() != ServiceStatus::Stopped);
+        Ok(specs)
     }
 
     /// Schedules an asynchronous deployment for the provided service manifest and returns
@@ -134,11 +140,13 @@ impl ServiceController {
         let service_name = service_name.into();
         let service_id = compute_service_id(&service_name);
 
-        if self.registry.get(service_id)?.is_some() {
-            return Err(anyhow!(
-                "service '{}' already exists; stop it before deploying again",
-                service_name
-            ));
+        if let Some(existing) = self.registry.get(service_id)? {
+            if existing.status() != ServiceStatus::Stopped {
+                return Err(anyhow!(
+                    "service '{}' already exists; stop it before deploying again",
+                    service_name
+                ));
+            }
         }
 
         let mut pending_spec = ServiceSpecValue::new(
@@ -149,7 +157,7 @@ impl ServiceController {
             Vec::new(),
         );
         pending_spec.set_status(ServiceStatus::Deploying);
-        self.registry.upsert(pending_spec.clone()).await?;
+        self.apply_upsert(pending_spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(pending_spec)).await?;
 
         let job = ServiceDeploymentJob {
@@ -175,9 +183,12 @@ impl ServiceController {
     async fn handle_event(&self, event: ServiceEvent) -> anyhow::Result<()> {
         match event {
             ServiceEvent::Upsert(spec) => {
-                self.registry.upsert(spec).await?;
+                self.apply_upsert(spec).await?;
             }
-            ServiceEvent::Remove(spec) => self.apply_remote_stop(spec).await?,
+            ServiceEvent::Remove(mut spec) => {
+                spec.set_status(ServiceStatus::Stopped);
+                self.apply_upsert(spec).await?;
+            }
         }
         Ok(())
     }
@@ -215,7 +226,7 @@ impl ServiceController {
                 templates,
                 Vec::new(),
             );
-            self.registry.upsert(spec.clone()).await?;
+            self.apply_upsert(spec.clone()).await?;
             self.broadcast(ServiceEvent::Upsert(spec)).await?;
             tracing::info!(
                 target: "services",
@@ -242,7 +253,7 @@ impl ServiceController {
             templates,
             task_ids,
         );
-        self.registry.upsert(spec.clone()).await?;
+        self.apply_upsert(spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(spec)).await?;
 
         tracing::info!(
@@ -254,27 +265,13 @@ impl ServiceController {
         Ok(())
     }
 
-    /// Applies a service stop event received via gossip by stopping any locally owned replicas
-    /// and clearing the registry entry.
-    async fn apply_remote_stop(&self, mut spec: ServiceSpecValue) -> anyhow::Result<()> {
-        spec.set_status(ServiceStatus::Stopped);
-        self.stop_tasks(&spec).await;
-        if let Err(err) = self.registry.remove_by_id(spec.id).await {
-            tracing::debug!(
-                target: "services",
-                "removing service {} from registry failed after stop: {err}",
-                spec.service_name
-            );
-        }
-        Ok(())
-    }
-
     /// Runs the local stop workflow for a service that originated on this node.
     async fn execute_stop(self, mut spec: ServiceSpecValue) -> anyhow::Result<()> {
-        self.apply_remote_stop(spec.clone()).await?;
         let service_name = spec.service_name.clone();
+        self.stop_tasks(&spec).await;
         spec.set_status(ServiceStatus::Stopped);
-        self.broadcast(ServiceEvent::Remove(spec)).await?;
+        self.apply_upsert(spec.clone()).await?;
+        self.broadcast(ServiceEvent::Upsert(spec)).await?;
         tracing::info!(
             target: "services",
             "service '{}' stop propagated",
@@ -283,31 +280,50 @@ impl ServiceController {
         Ok(())
     }
 
+    async fn apply_upsert(&self, spec: ServiceSpecValue) -> anyhow::Result<()> {
+        let current = self.registry.get(spec.id)?;
+        if !should_accept_update(current.as_ref(), &spec) {
+            tracing::debug!(
+                target: "services",
+                "ignoring service update for '{}'", spec.service_name
+            );
+            return Ok(());
+        }
+
+        let should_stop = should_stop_tasks(current.as_ref(), &spec);
+        let spec_clone = spec.clone();
+
+        self.registry.upsert(spec).await?;
+
+        if should_stop {
+            let controller = self.clone();
+            tokio::task::spawn_local(async move {
+                controller.stop_tasks(&spec_clone).await;
+            });
+        }
+
+        Ok(())
+    }
+
     async fn stop_tasks(&self, spec: &ServiceSpecValue) {
         for task_id in &spec.task_ids {
-            match self.task_manager.task_owned_locally(*task_id).await {
-                Ok(true) => {
-                    if let Err(err) = self.task_manager.stop_task(*task_id).await {
+            match self.task_manager.stop_task(*task_id).await {
+                Ok(_) => {}
+                Err(err) => {
+                    let message = err.to_string();
+                    if message.contains("is assigned to node") {
+                        tracing::debug!(
+                            target: "services",
+                            "skipping remote task {task_id} while stopping service {}",
+                            spec.service_name
+                        );
+                    } else {
                         tracing::warn!(
                             target: "services",
-                            "failed to stop task {task_id} for service {}: {err}",
+                            "failed to stop task {task_id} for service {}: {message}",
                             spec.service_name
                         );
                     }
-                }
-                Ok(false) => {
-                    tracing::debug!(
-                        target: "services",
-                        "skipping remote task {task_id} while stopping service {}",
-                        spec.service_name
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        target: "services",
-                        "failed to inspect task {task_id} for service {}: {err}",
-                        spec.service_name
-                    );
                 }
             }
         }
@@ -368,5 +384,80 @@ fn map_restart_policy(policy: &ServiceTaskRestartPolicy) -> TaskRestartPolicy {
     TaskRestartPolicy {
         name,
         max_retry_count: policy.max_retry_count,
+    }
+}
+
+fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+}
+
+fn status_rank(status: ServiceStatus) -> u8 {
+    match status {
+        ServiceStatus::Deploying => 0,
+        ServiceStatus::Running => 1,
+        ServiceStatus::Stopping => 2,
+        ServiceStatus::Stopped => 3,
+    }
+}
+
+fn should_accept_update(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecValue) -> bool {
+    if let Some(current) = current {
+        if current.manifest_id == incoming.manifest_id {
+            let current_rank = status_rank(current.status());
+            let incoming_rank = status_rank(incoming.status());
+
+            match incoming_rank.cmp(&current_rank) {
+                Ordering::Less => return false,
+                Ordering::Equal => {
+                    if let (Some(current_ts), Some(incoming_ts)) = (
+                        parse_timestamp(&current.updated_at),
+                        parse_timestamp(&incoming.updated_at),
+                    ) {
+                        if incoming_ts <= current_ts {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                Ordering::Greater => {}
+            }
+        } else if current.status() != ServiceStatus::Stopped {
+            if let (Some(current_ts), Some(incoming_ts)) = (
+                parse_timestamp(&current.updated_at),
+                parse_timestamp(&incoming.updated_at),
+            ) {
+                if incoming_ts <= current_ts {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn should_stop_tasks(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecValue) -> bool {
+    use ServiceStatus::{Deploying, Running, Stopped, Stopping};
+
+    let Some(current_spec) = current else {
+        return matches!(incoming.status(), Stopping | Stopped);
+    };
+
+    if current_spec.manifest_id != incoming.manifest_id {
+        return false;
+    }
+
+    match (current_spec.status(), incoming.status()) {
+        (Running, Stopping)
+        | (Deploying, Stopping)
+        | (Running, Stopped)
+        | (Deploying, Stopped)
+        | (Stopping, Stopped) => true,
+        _ => false,
     }
 }

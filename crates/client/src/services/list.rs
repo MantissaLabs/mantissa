@@ -22,17 +22,22 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
         rows.push(ServiceRow::from_reader(spec)?);
     }
 
-    if rows.is_empty() {
+    rows.sort_by(|a, b| a.service_name.cmp(&b.service_name));
+
+    let display_rows: Vec<ServiceRow> = rows
+        .into_iter()
+        .filter(|row| row.status != ServiceStatusRow::Stopped)
+        .collect();
+
+    if display_rows.is_empty() {
         println!("no services registered");
         return Ok(());
     }
 
-    rows.sort_by(|a, b| a.service_name.cmp(&b.service_name));
-
     let mut tw = TabWriter::new(Vec::new());
     writeln!(&mut tw, "SERVICE\tSTATUS\tTASKS\tTASK IDS\tUPDATED\tID")?;
 
-    for row in rows {
+    for row in display_rows {
         let tasks_summary = if row.tasks.is_empty() {
             "-".to_string()
         } else {
@@ -128,7 +133,7 @@ impl ServiceTaskRow {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServiceStatusRow {
     Deploying,
     Running,
