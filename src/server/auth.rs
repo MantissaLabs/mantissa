@@ -71,12 +71,10 @@ impl AuthStore {
         let ticket_opt: Option<Vec<u8>> = {
             let mut rev = w.open_table(T_REVERSE).map_err(ioerr)?;
             let key: [u8; 16] = *peer.as_bytes();
+
             // inner scope ensures AccessGuard is dropped before `rev`
-            let out = {
-                let removed = rev.remove(&key).map_err(ioerr)?;
-                removed.map(|g| g.value().to_vec()) // copy &[u8] -> Vec<u8>
-            };
-            out
+            let removed = rev.remove(&key).map_err(ioerr)?;
+            removed.map(|g| g.value().to_vec()) // copy &[u8] -> Vec<u8>
         };
 
         // 2) ticket -> peer: remove using the copied ticket bytes
@@ -96,11 +94,9 @@ impl AuthStore {
         // 1) ticket -> peer: remove, copy peer bytes, drop guard & table
         let peer_opt: Option<[u8; 16]> = {
             let mut fwd = w.open_table(T_TICKETS).map_err(ioerr)?;
-            let out = {
-                let removed = fwd.remove(ticket).map_err(ioerr)?;
-                removed.map(|g| g.value()) // returns [u8;16] by value
-            };
-            out
+
+            let removed = fwd.remove(ticket).map_err(ioerr)?;
+            removed.map(|g| g.value()) // returns [u8;16] by value
         };
 
         // 2) peer -> ticket: remove using the copied peer bytes

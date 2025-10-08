@@ -166,9 +166,7 @@ impl Candidate {
                 }
             }
 
-            let Some(best_idx) = best_choice else {
-                return None;
-            };
+            let best_idx = best_choice?;
 
             let slot = &self.slots[best_idx];
             if slot.capacity.cpu_millis == 0 && slot.capacity.memory_bytes == 0 {
@@ -1153,7 +1151,7 @@ impl TaskManager {
             let session = self
                 .remote_session(peer_id)
                 .await
-                .map_err(|err| ExecutionError::Retry(err))?;
+                .map_err(ExecutionError::Retry)?;
 
             let task_client = session
                 .get_task_request()

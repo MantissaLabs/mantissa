@@ -406,7 +406,7 @@ fn list_filter_from_request(request: &task_list_request::Reader) -> Result<TaskS
     }
 
     let states = request.get_states()?;
-    if states.len() == 0 {
+    if states.is_empty() {
         return Ok(TaskStateFilter::active_only());
     }
 

@@ -37,7 +37,7 @@ pub fn set_node_id(mut id_builder: protocol::node::node_id::Builder, id: &Uuid) 
 #[inline]
 pub fn read_node_id(id_reader: protocol::node::node_id::Reader) -> Result<Uuid, CapnpError> {
     let bytes = id_reader.get_bytes()?; // &[u8]
-    uuid_from_bytes(bytes).map_err(|e| CapnpError::failed(e))
+    uuid_from_bytes(bytes).map_err(CapnpError::failed)
 }
 
 /// Map a NodeInfo reader to a sortable u128 key (UUID bytes, big-endian).

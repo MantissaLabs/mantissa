@@ -25,7 +25,7 @@ impl Default for NodeInfo {
 ///
 /// This structure contains System wide informations about the machine
 /// such as the operating systems details, hardware components, load, etc.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Info {
     pub device_ip: Option<String>,
     pub os_info: Option<OS>,
@@ -34,20 +34,6 @@ pub struct Info {
     pub load_info: Option<Load>,
     pub mem_info: Option<Memory>,
     pub disk_info: Option<Disk>,
-}
-
-impl Default for Info {
-    fn default() -> Self {
-        Self {
-            device_ip: None,
-            os_info: None,
-            hostname: None,
-            cpu_info: None,
-            load_info: None,
-            mem_info: None,
-            disk_info: None,
-        }
-    }
 }
 
 /// # Description:

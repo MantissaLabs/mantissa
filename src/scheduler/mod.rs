@@ -241,6 +241,100 @@ impl Scheduler {
             .map(|state| state.snapshot.clone())
     }
 
+    /// Derives the initial slot specifications from the node system information so that the scheduler
+    /// can initialise its slot table with reasonable CPU and memory allocations.
+    pub fn derive_slot_specs(node: &crate::node::Node) -> Vec<SlotSpec> {
+        let info = &node.system_info.info;
+
+        const MIN_SLOT_MEMORY_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
+        const MAX_SLOTS: u64 = 4_096;
+
+        let logical_cpus = info
+            .cpu_info
+            .as_ref()
+            .map(|cpu| cpu.num_logical_cpus.max(1) as u64)
+            .unwrap_or(1);
+
+        let total_memory = info.mem_info.as_ref().map(|mem| mem.total).unwrap_or(0);
+
+        let mut slot_count = if total_memory > 0 {
+            total_memory.div_ceil(MIN_SLOT_MEMORY_BYTES).max(1)
+        } else {
+            logical_cpus.max(1)
+        };
+
+        if slot_count == 0 {
+            slot_count = 1;
+        }
+
+        slot_count = slot_count.min(MAX_SLOTS.max(1));
+
+        let total_cpu_millis = logical_cpus.saturating_mul(1_000);
+        let mut remaining_cpu = total_cpu_millis;
+        let mut remaining_memory = total_memory;
+
+        let mut specs = Vec::with_capacity(slot_count as usize);
+        for slot_idx in 0..slot_count {
+            let slots_left = slot_count - slot_idx;
+
+            let memory_bytes = if total_memory == 0 || remaining_memory == 0 {
+                0
+            } else if slots_left == 1 {
+                let mem = remaining_memory;
+                remaining_memory = 0;
+                mem
+            } else {
+                let chunk = MIN_SLOT_MEMORY_BYTES.min(remaining_memory);
+                remaining_memory -= chunk;
+                chunk
+            };
+
+            let cpu_millis = if total_cpu_millis == 0 || remaining_cpu == 0 {
+                0
+            } else {
+                let slots_left_cpu = slots_left;
+                let mut chunk = remaining_cpu / slots_left_cpu;
+                if chunk == 0 && remaining_cpu > 0 {
+                    chunk = 1;
+                }
+                if chunk > remaining_cpu {
+                    chunk = remaining_cpu;
+                }
+                remaining_cpu -= chunk;
+                chunk
+            };
+
+            specs.push(SlotSpec::new(
+                slot_idx,
+                SlotCapacity::new(cpu_millis, memory_bytes),
+            ));
+        }
+
+        if specs.is_empty() {
+            specs.push(SlotSpec::new(0, SlotCapacity::new(1_000, total_memory)));
+        }
+
+        specs
+    }
+
+    /// Initializes the scheduler for the provided node by computing the slot specifications
+    /// and invoking `init_slots` if required, returning the active snapshot either way so
+    /// bootstrap callers can proceed with a consistent view.
+    pub async fn initialize_with_node(
+        &self,
+        node: &crate::node::Node,
+    ) -> Result<SchedulerSnapshot, SchedulerError> {
+        if let Some(snapshot) = self.snapshot().await {
+            return Ok(snapshot);
+        }
+
+        match self.init_slots(Self::derive_slot_specs(node)).await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(SchedulerError::AlreadyInitialized { snapshot }) => Ok(snapshot),
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn reserve_slots(
         &self,
         expected_version: u64,

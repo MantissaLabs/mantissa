@@ -29,8 +29,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 local_test!(services_gossip_propagates_across_peers, {
-    let _guard =
-        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
 
     const SERVICE_NAME: &str = "demo-service";
     const MANIFEST_NAME: &str = "demo-manifest";
@@ -88,8 +87,7 @@ local_test!(services_gossip_propagates_across_peers, {
 });
 
 local_test!(services_deployment_replicates_across_cluster, {
-    let _guard =
-        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
 
     let cluster = TestNode::new_cluster_tcp_with_tick(3, 100)
         .await
@@ -162,8 +160,7 @@ local_test!(services_deployment_replicates_across_cluster, {
 });
 
 local_test!(services_sync_recovers_missing_entries, {
-    let _guard =
-        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),

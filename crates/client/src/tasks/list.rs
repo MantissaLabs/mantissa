@@ -91,7 +91,8 @@ impl TaskRow {
         let node_name = spec.get_node_name()?.to_str()?.to_string();
         let node_id = uuid_short(spec.get_node_id()?)?;
         let slots_reader = spec.get_slot_ids()?;
-        let slot = if slots_reader.len() == 0 {
+
+        let slot = if slots_reader.is_empty() {
             "-".to_string()
         } else {
             let mut rendered = Vec::with_capacity(slots_reader.len() as usize);
@@ -100,6 +101,7 @@ impl TaskRow {
             }
             rendered.join(",")
         };
+
         let cpu_millis = spec.get_cpu_millis();
         let memory_mib = spec.get_memory_bytes() / (1024 * 1024);
 

@@ -1,8 +1,8 @@
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::{DEFAULT_FANOUT, Message};
 use crate::registry::Registry;
+use crate::scheduler::Scheduler;
 use crate::scheduler::service::SchedulerService;
-use crate::scheduler::{Scheduler, SlotCapacity, SlotSpec};
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerStores};
@@ -109,81 +109,6 @@ pub(crate) struct Components {
 }
 
 impl Bootstrap {
-    fn derive_slot_specs(node: &node::Node) -> Vec<SlotSpec> {
-        let info = &node.system_info.info;
-
-        const MIN_SLOT_MEMORY_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
-        const MAX_SLOTS: u64 = 4_096;
-
-        let logical_cpus = info
-            .cpu_info
-            .as_ref()
-            .map(|cpu| cpu.num_logical_cpus.max(1) as u64)
-            .unwrap_or(1);
-
-        let total_memory = info.mem_info.as_ref().map(|mem| mem.total).unwrap_or(0);
-
-        let mut slot_count = if total_memory > 0 {
-            let slots = (total_memory + MIN_SLOT_MEMORY_BYTES - 1) / MIN_SLOT_MEMORY_BYTES;
-            slots.max(1)
-        } else {
-            logical_cpus.max(1)
-        };
-
-        if slot_count == 0 {
-            slot_count = 1;
-        }
-
-        slot_count = slot_count.min(MAX_SLOTS.max(1));
-
-        let total_cpu_millis = logical_cpus.saturating_mul(1_000);
-        let mut remaining_cpu = total_cpu_millis;
-        let mut remaining_memory = total_memory;
-
-        let mut specs = Vec::with_capacity(slot_count as usize);
-        for slot_idx in 0..slot_count {
-            let slots_left = slot_count - slot_idx;
-
-            let memory_bytes = if total_memory == 0 || remaining_memory == 0 {
-                0
-            } else if slots_left == 1 {
-                let mem = remaining_memory;
-                remaining_memory = 0;
-                mem
-            } else {
-                let chunk = MIN_SLOT_MEMORY_BYTES.min(remaining_memory);
-                remaining_memory -= chunk;
-                chunk
-            };
-
-            let cpu_millis = if total_cpu_millis == 0 || remaining_cpu == 0 {
-                0
-            } else {
-                let slots_left_cpu = slots_left;
-                let mut chunk = remaining_cpu / slots_left_cpu;
-                if chunk == 0 && remaining_cpu > 0 {
-                    chunk = 1;
-                }
-                if chunk > remaining_cpu {
-                    chunk = remaining_cpu;
-                }
-                remaining_cpu -= chunk;
-                chunk
-            };
-
-            specs.push(SlotSpec::new(
-                slot_idx,
-                SlotCapacity::new(cpu_millis, memory_bytes),
-            ));
-        }
-
-        if specs.is_empty() {
-            specs.push(SlotSpec::new(0, SlotCapacity::new(1_000, total_memory)));
-        }
-
-        specs
-    }
-
     // Construct a Bootstrap context from injected parts (useful for tests).
     pub(crate) fn from_parts(
         listen_addr: String,
@@ -341,13 +266,12 @@ impl Bootstrap {
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?,
         );
 
-        if scheduler.snapshot().await.is_none() {
-            let specs = Self::derive_slot_specs(&ctx.node);
-            scheduler
-                .init_slots(specs)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-        }
+        // Initialize the scheduler with the node information to create the
+        // slot allocation.
+        scheduler
+            .initialize_with_node(&ctx.node)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
 
         let topology = Topology::new(
             ctx.listen_addr.clone(),

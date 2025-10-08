@@ -21,10 +21,7 @@ use protocol::gossip::gossip::Client as GossipClient;
 use protocol::gossip::gossip_message::Which::*;
 use rand::rng;
 use rand::seq::IndexedRandom;
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::convert::TryFrom;
-use std::sync::Arc;
 use std::time::Duration;
 use topology::PeerHandle;
 use tracing::error;
@@ -42,14 +39,6 @@ pub trait GossipContext: PeerProvider {
     async fn invalidate_peer_capabilities(&self, peer: &PeerHandle) {
         let _ = peer;
     }
-}
-
-/// The Gossip action list
-///
-/// This contains the updates spread amongst nodes
-#[derive(Clone)]
-pub struct GossipEvents {
-    pub events: Arc<RefCell<VecDeque<Message>>>,
 }
 
 #[derive(Clone)]
@@ -84,12 +73,6 @@ pub struct Channels {
     pub task_events: Sender<Message>,
     pub service_events: Sender<Message>,
     // scheduling_events: Sender<SchedulingEvent>,
-}
-
-impl Gossip {
-    pub fn new(chans: Channels) -> Self {
-        Self { chans }
-    }
 }
 
 impl gossip::Server for Gossip {
