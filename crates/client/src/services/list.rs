@@ -3,7 +3,7 @@ use crate::connection;
 use crate::tasks::uuid_to_string;
 use anyhow::Result;
 use capnp::Error as CapnpError;
-use protocol::services::{service_spec, task_template};
+use protocol::services::{ServiceStatus as ProtoServiceStatus, service_spec, task_template};
 use std::io::Write;
 use tabwriter::TabWriter;
 use uuid::Uuid;
@@ -30,7 +30,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     rows.sort_by(|a, b| a.service_name.cmp(&b.service_name));
 
     let mut tw = TabWriter::new(Vec::new());
-    writeln!(&mut tw, "SERVICE\tTASKS\tTASK IDS\tUPDATED\tID")?;
+    writeln!(&mut tw, "SERVICE\tSTATUS\tTASKS\tTASK IDS\tUPDATED\tID")?;
 
     for row in rows {
         let tasks_summary = if row.tasks.is_empty() {
@@ -45,8 +45,9 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
 
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             row.service_name,
+            row.status.to_string(),
             tasks_summary,
             row.task_ids.len(),
             row.updated_at,
@@ -68,6 +69,7 @@ pub struct ServiceRow {
     pub tasks: Vec<ServiceTaskRow>,
     pub updated_at: String,
     pub task_ids: Vec<Uuid>,
+    pub status: ServiceStatusRow,
 }
 
 impl ServiceRow {
@@ -97,6 +99,7 @@ impl ServiceRow {
             tasks,
             updated_at: spec.get_updated_at()?.to_str()?.to_string(),
             task_ids,
+            status: ServiceStatusRow::from_proto(spec.get_status()?),
         })
     }
 }
@@ -122,5 +125,36 @@ impl ServiceTaskRow {
             command,
             replicas: reader.get_replicas(),
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ServiceStatusRow {
+    Deploying,
+    Running,
+    Stopping,
+    Stopped,
+}
+
+impl ServiceStatusRow {
+    fn from_proto(status: ProtoServiceStatus) -> Self {
+        match status {
+            ProtoServiceStatus::Deploying => Self::Deploying,
+            ProtoServiceStatus::Running => Self::Running,
+            ProtoServiceStatus::Stopping => Self::Stopping,
+            ProtoServiceStatus::Stopped => Self::Stopped,
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceStatusRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            ServiceStatusRow::Deploying => "deploying",
+            ServiceStatusRow::Running => "running",
+            ServiceStatusRow::Stopping => "stopping",
+            ServiceStatusRow::Stopped => "stopped",
+        };
+        write!(f, "{}", label)
     }
 }

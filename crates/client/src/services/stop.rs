@@ -19,7 +19,23 @@ pub async fn stop(cfg: &ClientConfig, service_id: &str) -> Result<()> {
     }
     delete.send().promise.await?;
 
-    println!("requested stop for service {}", spec.service_name);
+    println!(
+        "stop requested for service '{}' ({})",
+        spec.service_name, spec.id
+    );
+    match spec.status {
+        crate::services::list::ServiceStatusRow::Stopping => {
+            println!("service is already stopping; check `mantissa services list` for updates");
+        }
+        crate::services::list::ServiceStatusRow::Stopped => {
+            println!("service is already stopped; no further action required");
+        }
+        _ => {
+            println!(
+                "service status will move to 'stopping'; monitor progress with `mantissa services list`"
+            );
+        }
+    }
     Ok(())
 }
 

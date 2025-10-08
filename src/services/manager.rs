@@ -1,8 +1,8 @@
 use crate::gossip::Message;
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServiceEvent, ServiceSpecValue, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
-    ServiceTaskSpecValue, compute_service_id,
+    ServiceEvent, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
+    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, compute_service_id,
 };
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{TaskRestartPolicy, TaskRestartPolicyKind};
@@ -65,12 +65,55 @@ impl ServiceController {
         self.broadcast(ServiceEvent::Upsert(value)).await
     }
 
-    pub async fn delete_service(&self, id: Uuid) -> anyhow::Result<()> {
-        if let Some(spec) = self.registry.get(id)? {
-            self.stop_tasks(&spec).await;
-            self.registry.remove_by_id(id).await?;
-            self.broadcast(ServiceEvent::Remove { id }).await?;
+    /// Schedules an asynchronous stop for the provided service id. The caller receives an
+    /// acknowledgement once the stop request is queued; actual teardown proceeds in the
+    /// background so the CLI stays responsive.
+    pub async fn submit_stop(&self, id: Uuid) -> anyhow::Result<()> {
+        let mut spec = self
+            .registry
+            .get(id)?
+            .ok_or_else(|| anyhow!("service '{}' not found", id))?;
+
+        match spec.status() {
+            ServiceStatus::Stopping => {
+                tracing::info!(
+                    target: "services",
+                    "service '{}' ({id}) already stopping",
+                    spec.service_name
+                );
+                return Ok(());
+            }
+            ServiceStatus::Stopped => {
+                tracing::info!(
+                    target: "services",
+                    "service '{}' ({id}) already stopped",
+                    spec.service_name
+                );
+                return Ok(());
+            }
+            _ => {}
         }
+
+        spec.set_status(ServiceStatus::Stopping);
+        self.registry.upsert(spec.clone()).await?;
+        self.broadcast(ServiceEvent::Upsert(spec.clone())).await?;
+
+        tracing::info!(
+            target: "services",
+            "queuing stop for service '{}' ({id})",
+            spec.service_name
+        );
+
+        let controller = self.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(err) = controller.execute_stop(spec).await {
+                tracing::warn!(
+                    target: "services",
+                    "service stop failed: {err}"
+                );
+            }
+        });
+
         Ok(())
     }
 
@@ -98,6 +141,17 @@ impl ServiceController {
             ));
         }
 
+        let mut pending_spec = ServiceSpecValue::new(
+            manifest_id,
+            manifest_name.clone(),
+            service_name.clone(),
+            tasks.clone(),
+            Vec::new(),
+        );
+        pending_spec.set_status(ServiceStatus::Deploying);
+        self.registry.upsert(pending_spec.clone()).await?;
+        self.broadcast(ServiceEvent::Upsert(pending_spec)).await?;
+
         let job = ServiceDeploymentJob {
             manifest_id,
             manifest_name,
@@ -123,12 +177,7 @@ impl ServiceController {
             ServiceEvent::Upsert(spec) => {
                 self.registry.upsert(spec).await?;
             }
-            ServiceEvent::Remove { id } => {
-                if let Some(spec) = self.registry.get(id)? {
-                    self.stop_tasks(&spec).await;
-                }
-                self.registry.remove_by_id(id).await?;
-            }
+            ServiceEvent::Remove(spec) => self.apply_remote_stop(spec).await?,
         }
         Ok(())
     }
@@ -166,7 +215,8 @@ impl ServiceController {
                 templates,
                 Vec::new(),
             );
-            self.upsert_service(spec).await?;
+            self.registry.upsert(spec.clone()).await?;
+            self.broadcast(ServiceEvent::Upsert(spec)).await?;
             tracing::info!(
                 target: "services",
                 "registered service '{}' with no runnable tasks",
@@ -192,7 +242,8 @@ impl ServiceController {
             templates,
             task_ids,
         );
-        self.upsert_service(spec).await?;
+        self.registry.upsert(spec.clone()).await?;
+        self.broadcast(ServiceEvent::Upsert(spec)).await?;
 
         tracing::info!(
             target: "services",
@@ -200,6 +251,35 @@ impl ServiceController {
             service_name
         );
 
+        Ok(())
+    }
+
+    /// Applies a service stop event received via gossip by stopping any locally owned replicas
+    /// and clearing the registry entry.
+    async fn apply_remote_stop(&self, mut spec: ServiceSpecValue) -> anyhow::Result<()> {
+        spec.set_status(ServiceStatus::Stopped);
+        self.stop_tasks(&spec).await;
+        if let Err(err) = self.registry.remove_by_id(spec.id).await {
+            tracing::debug!(
+                target: "services",
+                "removing service {} from registry failed after stop: {err}",
+                spec.service_name
+            );
+        }
+        Ok(())
+    }
+
+    /// Runs the local stop workflow for a service that originated on this node.
+    async fn execute_stop(self, mut spec: ServiceSpecValue) -> anyhow::Result<()> {
+        self.apply_remote_stop(spec.clone()).await?;
+        let service_name = spec.service_name.clone();
+        spec.set_status(ServiceStatus::Stopped);
+        self.broadcast(ServiceEvent::Remove(spec)).await?;
+        tracing::info!(
+            target: "services",
+            "service '{}' stop propagated",
+            service_name
+        );
         Ok(())
     }
 

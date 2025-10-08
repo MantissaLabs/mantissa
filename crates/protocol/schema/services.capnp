@@ -22,12 +22,20 @@ struct RestartPolicy {
   maxRetryCount @1 :Int32; # -1 indicates unset for policies that support retries
 }
 
+enum ServiceStatus {
+  deploying @0;
+  running @1;
+  stopping @2;
+  stopped @3;
+}
+
 struct ServiceUpsertSpec {
   manifestId @0 :Data;        # 16-byte UUID identifying the manifest revision
   manifestName @1 :Text;      # Human readable manifest/service name
   serviceName @2 :Text;       # Service identifier
   tasks @3 :List(TaskTemplate); # Desired task templates composing the service
   taskIds @4 :List(Data); # Existing task UUIDs (each 16 bytes) tracked for this service
+  status @5 :ServiceStatus;
 }
 
 struct ServiceSpec {
@@ -38,6 +46,7 @@ struct ServiceSpec {
   tasks @4 :List(TaskTemplate); # Desired task templates
   taskIds @5 :List(Data); # Current task UUIDs (16 bytes each)
   updatedAt @6 :Text;         # RFC3339 timestamp when this spec was last updated
+  status @7 :ServiceStatus;
 }
 
 struct ServiceEvent {

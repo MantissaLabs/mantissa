@@ -247,6 +247,7 @@ async fn register_service_via_rpc(
         spec.set_manifest_id(manifest_id.as_bytes());
         spec.set_manifest_name(manifest_name);
         spec.set_service_name(service_name);
+        spec.set_status(protocol::services::ServiceStatus::Running);
 
         let mut tasks = spec.reborrow().init_tasks(1);
         let mut task = tasks.reborrow().get(0);

@@ -1,11 +1,13 @@
 use crate::services::manager::ServiceController;
 use crate::services::types::{
-    ServiceEvent, ServiceSpecValue, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
-    ServiceTaskSpecValue,
+    ServiceEvent, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
+    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
 };
 use capnp::Error;
 use capnp::capability::Promise;
-use protocol::services::{service_event, service_spec, services, task_template};
+use protocol::services::{
+    service_event, service_spec, service_upsert_spec, services, task_template,
+};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -48,13 +50,14 @@ impl services::Server for ServicesRPC {
                     task_ids.push(read_uuid(wid?)?);
                 }
 
-                let value = ServiceSpecValue::new(
+                let mut value = ServiceSpecValue::new(
                     manifest_id,
                     manifest_name.clone(),
                     service_name.clone(),
                     tasks,
                     task_ids,
                 );
+                value.set_status(read_service_status(spec)?);
 
                 manager
                     .upsert_service(value)
@@ -130,7 +133,7 @@ impl services::Server for ServicesRPC {
             let ids = params.get()?.get_ids()?;
             for entry in ids.iter() {
                 let id = read_uuid(entry?)?;
-                if let Err(err) = manager.delete_service(id).await {
+                if let Err(err) = manager.submit_stop(id).await {
                     warn!(
                         target: "services",
                         "failed to delete service {id}: {err}"
@@ -150,6 +153,7 @@ pub(crate) fn write_service_spec(
     builder.set_manifest_id(value.manifest_id.as_bytes());
     builder.set_manifest_name(&value.manifest_name);
     builder.set_service_name(&value.service_name);
+    builder.set_status(service_status_to_proto(value.status));
     builder.set_updated_at(&value.updated_at);
 
     let mut tasks_builder = builder.reborrow().init_tasks(value.tasks.len() as u32);
@@ -177,16 +181,10 @@ pub(crate) fn write_service_event(
             let mut spec_builder = builder.reborrow().init_spec();
             write_service_spec(&mut spec_builder, spec)?;
         }
-        ServiceEvent::Remove { id } => {
+        ServiceEvent::Remove(spec) => {
             builder.set_event(service_event::EventType::Remove);
             let mut spec_builder = builder.reborrow().init_spec();
-            spec_builder.set_id(id.as_bytes());
-            spec_builder.set_manifest_id(&[0u8; 16]);
-            spec_builder.set_manifest_name("");
-            spec_builder.set_service_name("");
-            spec_builder.reborrow().init_tasks(0);
-            spec_builder.reborrow().init_task_ids(0);
-            spec_builder.set_updated_at("");
+            write_service_spec(&mut spec_builder, spec)?;
         }
     }
     Ok(())
@@ -202,8 +200,7 @@ pub(crate) fn read_service_event(reader: service_event::Reader<'_>) -> Result<Se
             Ok(ServiceEvent::Upsert(spec))
         }
         service_event::EventType::Remove => {
-            let id = read_uuid(spec_reader.get_id()?)?;
-            Ok(ServiceEvent::Remove { id })
+            read_service_spec(spec_reader).map(ServiceEvent::Remove)
         }
     }
 }
@@ -228,6 +225,7 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
         ServiceSpecValue::new(manifest_id, manifest_name, service_name, tasks, task_ids);
     value.id = id;
     value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
+    value.status = proto_to_service_status(reader.get_status()?);
     Ok(value)
 }
 
@@ -272,6 +270,28 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         memory_bytes: reader.get_memory_bytes(),
         restart_policy,
     })
+}
+
+fn read_service_status(reader: service_upsert_spec::Reader<'_>) -> Result<ServiceStatus, Error> {
+    Ok(proto_to_service_status(reader.get_status()?))
+}
+
+fn service_status_to_proto(status: ServiceStatus) -> protocol::services::ServiceStatus {
+    match status {
+        ServiceStatus::Deploying => protocol::services::ServiceStatus::Deploying,
+        ServiceStatus::Running => protocol::services::ServiceStatus::Running,
+        ServiceStatus::Stopping => protocol::services::ServiceStatus::Stopping,
+        ServiceStatus::Stopped => protocol::services::ServiceStatus::Stopped,
+    }
+}
+
+fn proto_to_service_status(status: protocol::services::ServiceStatus) -> ServiceStatus {
+    match status {
+        protocol::services::ServiceStatus::Deploying => ServiceStatus::Deploying,
+        protocol::services::ServiceStatus::Running => ServiceStatus::Running,
+        protocol::services::ServiceStatus::Stopping => ServiceStatus::Stopping,
+        protocol::services::ServiceStatus::Stopped => ServiceStatus::Stopped,
+    }
 }
 
 fn write_task_template(

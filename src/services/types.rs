@@ -12,6 +12,8 @@ pub struct ServiceSpecValue {
     pub tasks: Vec<ServiceTaskSpecValue>,
     pub task_ids: Vec<Uuid>,
     pub updated_at: String,
+    #[serde(default)]
+    pub status: ServiceStatus,
 }
 
 impl ServiceSpecValue {
@@ -34,11 +36,21 @@ impl ServiceSpecValue {
             tasks,
             task_ids,
             updated_at: current_timestamp(),
+            status: ServiceStatus::Running,
         }
     }
 
     pub fn touch(&mut self) {
         self.updated_at = current_timestamp();
+    }
+
+    pub fn status(&self) -> ServiceStatus {
+        self.status
+    }
+
+    pub fn set_status(&mut self, status: ServiceStatus) {
+        self.status = status;
+        self.touch();
     }
 }
 
@@ -73,7 +85,22 @@ pub enum ServiceTaskRestartPolicyKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceEvent {
     Upsert(ServiceSpecValue),
-    Remove { id: Uuid },
+    Remove(ServiceSpecValue),
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceStatus {
+    Deploying,
+    Running,
+    Stopping,
+    Stopped,
+}
+
+impl Default for ServiceStatus {
+    fn default() -> Self {
+        ServiceStatus::Running
+    }
 }
 
 fn current_timestamp() -> String {
