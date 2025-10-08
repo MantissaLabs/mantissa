@@ -104,11 +104,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Services { cmd } => match cmd {
             ServicesCommand::Run(args) => {
                 let manifest = client::services::load_manifest_from_path(&args.manifest)?;
-                let deployments = local
+                local
                     .run_until(client::services::deploy_manifest(&cfg, &manifest))
                     .await?;
-                let summary = client::services::render_summary(&manifest, &deployments)?;
-                println!("{summary}");
             }
             ServicesCommand::List(_) => {
                 local.run_until(client::services::list(&cfg)).await?;

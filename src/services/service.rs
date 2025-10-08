@@ -66,6 +66,37 @@ impl services::Server for ServicesRPC {
         })
     }
 
+    fn deploy(
+        &mut self,
+        params: services::DeployParams,
+        mut results: services::DeployResults,
+    ) -> Promise<(), Error> {
+        let manager = self.manager.clone();
+
+        Promise::from_future(async move {
+            let request = params.get()?;
+            let spec = request.get_spec()?;
+
+            let manifest_id =
+                read_optional_uuid(spec.get_manifest_id()?).unwrap_or_else(Uuid::new_v4);
+            let manifest_name = spec.get_manifest_name()?.to_str()?.to_string();
+            let service_name = spec.get_service_name()?.to_str()?.to_string();
+
+            let mut tasks = Vec::new();
+            for tmpl in spec.get_tasks()?.iter() {
+                tasks.push(read_task_template(tmpl)?);
+            }
+
+            let service_id = manager
+                .submit_deployment(manifest_id, manifest_name, service_name, tasks)
+                .await
+                .map_err(|e| Error::failed(e.to_string()))?;
+
+            results.get().set_service_id(service_id.as_bytes());
+            Ok(())
+        })
+    }
+
     fn list(
         &mut self,
         _params: services::ListParams,

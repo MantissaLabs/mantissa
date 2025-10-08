@@ -50,8 +50,16 @@ struct ServiceEvent {
   }
 }
 
+struct ServiceDeploySpec {
+  manifestId @0 :Data;        # 16-byte UUID identifying the manifest revision
+  manifestName @1 :Text;      # Human readable manifest/service name
+  serviceName @2 :Text;       # Service identifier
+  tasks @3 :List(TaskTemplate); # Desired task templates composing the service
+}
+
 interface Services {
   upsert @0 (specs :List(ServiceUpsertSpec));
   list @1 () -> (services :List(ServiceSpec));
   delete @2 (ids :List(Data)); # Each entry is a 16-byte service UUID
+  deploy @3 (spec :ServiceDeploySpec) -> (serviceId :Data);
 }
