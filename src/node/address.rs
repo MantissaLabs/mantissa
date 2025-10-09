@@ -1,5 +1,5 @@
 use std::io;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 
 // TODO: This is a really hacky way of getting the local IP address to send
 // on join request alongside the NodeInfo struct. We should probably get the
@@ -18,8 +18,14 @@ pub fn outbound_ip_for<A: ToSocketAddrs>(dest: A) -> io::Result<IpAddr> {
 
     // Bind wildcard on the same family as dest
     let bind_sa: SocketAddr = match dest_sa {
-        SocketAddr::V4(_) => "0.0.0.0:0".parse::<SocketAddr>().unwrap(),
-        SocketAddr::V6(_) => "[::]:0".parse::<SocketAddr>().unwrap(),
+        SocketAddr::V4(_) => {
+            // Stick to the same address family by binding to 0.0.0.0:0 for IPv4 probes.
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        }
+        SocketAddr::V6(_) => {
+            // Stick to the same address family by binding to [::]:0 for IPv6 probes.
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        }
     };
     let sock = UdpSocket::bind(bind_sa)?;
     sock.connect(dest_sa)?;
