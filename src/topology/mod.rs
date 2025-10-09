@@ -326,10 +326,20 @@ impl Topology {
         let verifying_key = self.signing_key.verifying_key();
         let health = self.health_monitor.clone();
 
+        // Compute advertise address before registering. If this fails we abort so the node
+        // does not appear joined without a reachable address.
+        let advertise = match self.compute_advertise_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                log::error!(
+                    "topology: failed to compute advertise address during server handle setup: {e}"
+                );
+                return Err(handle);
+            }
+        };
+
         // Also ensure our own peer-entry exists in the store
         let peers = self.peers.clone();
-        // TODO: Handle errors properly
-        let advertise = self.compute_advertise_addr().unwrap();
         let host = self
             .node
             .system_info
