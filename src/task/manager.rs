@@ -1932,6 +1932,28 @@ impl TaskManager {
         Ok(value_to_spec(id, value))
     }
 
+    /// Returns the replicated container state for each provided task identifier so higher level
+    /// controllers can determine whether a rollout has converged cluster-wide yet.
+    pub async fn task_state_snapshot(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Option<ContainerState>)>, anyhow::Error> {
+        let mut states = Vec::with_capacity(ids.len());
+        for id in ids {
+            let key = UuidKey::from(*id);
+            let snapshot = self
+                .store
+                .get_snapshot(&key)
+                .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?;
+
+            let state = snapshot
+                .and_then(|snap| snap.as_slice().last().cloned())
+                .map(|value| value.state);
+            states.push((*id, state));
+        }
+        Ok(states)
+    }
+
     pub async fn task_owned_locally(&self, id: Uuid) -> Result<bool, anyhow::Error> {
         let spec = self.load_spec(id).await?;
         Ok(spec.node_id == self.local_node_id)

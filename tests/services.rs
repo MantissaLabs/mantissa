@@ -10,8 +10,8 @@ use common::testkit::{
 use crdt_store::uuid_key::UuidKey;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
-    ServiceSpecValue, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
-    compute_service_id,
+    ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
+    ServiceTaskSpecValue, compute_service_id,
 };
 use mantissa::task::manager::{TaskManager, TaskStartRequest};
 use mantissa::task::types::{TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskStateFilter};
@@ -80,6 +80,54 @@ local_test!(services_gossip_propagates_across_peers, {
     assert!(
         peer_ids.is_empty(),
         "peer service listing should be empty after removal"
+    );
+});
+
+local_test!(services_submit_deployment_waits_for_task_ack, {
+    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let node = TestNode::new().await;
+
+    let manifest_id = Uuid::new_v4();
+    let service_name = "ack-demo";
+    let manifest_name = "manifest-ack";
+    let tasks = vec![ServiceTaskSpecValue {
+        name: "web".into(),
+        image: "ghcr.io/mantissa/demo:web".into(),
+        command: vec!["--serve".into()],
+        replicas: 1,
+        cpu_millis: 0,
+        memory_bytes: 0,
+        restart_policy: None,
+    }];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(manifest_id, manifest_name, service_name, tasks)
+        .await
+        .expect("submit service deployment");
+
+    let initial = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read service from registry")
+        .expect("service spec present after submission");
+    assert_eq!(
+        initial.status(),
+        ServiceStatus::Deploying,
+        "service should remain in deploying state until tasks acknowledge readiness"
+    );
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "service should transition to running after all tasks report running"
     );
 });
 
@@ -298,6 +346,23 @@ async fn wait_for_service_state(
         let present = specs.iter().any(|spec| spec.id == service_id);
         if present == expect_present {
             return true;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+async fn wait_for_service_status(
+    manager: &ServiceController,
+    service_id: Uuid,
+    expected: ServiceStatus,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(Some(spec)) = manager.registry().get(service_id) {
+            if spec.status() == expected {
+                return true;
+            }
         }
         sleep(Duration::from_millis(50)).await;
     }
