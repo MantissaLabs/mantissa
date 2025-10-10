@@ -10,11 +10,10 @@ use common::testkit::{
 use crdt_store::uuid_key::UuidKey;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
-    ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
-    ServiceTaskSpecValue, compute_service_id,
+    ServiceStatus, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
 };
-use mantissa::task::manager::{TaskManager, TaskStartRequest};
-use mantissa::task::types::{TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskStateFilter};
+use mantissa::task::manager::TaskManager;
+use mantissa::task::types::TaskStateFilter;
 use protocol::services::services;
 use std::{
     collections::BTreeSet,
@@ -40,15 +39,35 @@ local_test!(services_gossip_propagates_across_peers, {
     let peer = &cluster[1];
 
     let manifest_id = Uuid::new_v4();
-    let service_id = compute_service_id(SERVICE_NAME);
+    let service_id = anchor
+        .node
+        .service_controller
+        .submit_deployment(
+            manifest_id,
+            MANIFEST_NAME,
+            SERVICE_NAME,
+            vec![ServiceTaskSpecValue {
+                name: "web".into(),
+                image: "ghcr.io/mantissa/demo:web".into(),
+                command: vec!["--serve".into()],
+                replicas: 1,
+                cpu_millis: 0,
+                memory_bytes: 0,
+                restart_policy: None,
+            }],
+        )
+        .await
+        .expect("submit service deployment");
 
-    register_service_via_rpc(
-        &anchor.node.services_client,
-        manifest_id,
-        MANIFEST_NAME,
-        SERVICE_NAME,
-    )
-    .await;
+    assert!(
+        wait_for_service_status(
+            &anchor.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "anchor should observe service running"
+    );
 
     assert!(
         wait_for_service_state(&anchor.node.service_controller, service_id, true).await,
@@ -153,18 +172,49 @@ local_test!(services_deployment_replicates_across_cluster, {
     let manifest = load_manifest_from_path(Path::new("examples/replicated_service.ron"))
         .expect("load service manifest");
 
-    let (service_id, tasks) = deploy_manifest_via_anchor(&cluster[0], &manifest).await;
+    let manifest_id = Uuid::new_v4();
+    let templates = manifest_to_service_templates(&manifest);
+
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(manifest_id, &manifest.name, &manifest.name, templates)
+        .await
+        .expect("submit deployment via controller");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "anchor should observe service running"
+    );
+
+    let expected_spec = cluster[0]
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("lookup service spec on anchor")
+        .expect("service spec present");
+
+    let expected_task_ids: BTreeSet<Uuid> = expected_spec.task_ids.iter().cloned().collect();
+    let expected_count = expected_task_ids.len();
 
     for node in &cluster {
         assert!(
-            wait_for_service_state(&node.node.service_controller, service_id, true).await,
-            "node {} should observe replicated service",
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "node {} should observe running replicated service",
             node.id()
         );
     }
-
-    let expected_task_ids: BTreeSet<Uuid> = tasks.iter().map(|spec| spec.id).collect();
-    let expected_count = expected_task_ids.len();
 
     for node in &cluster {
         assert!(
@@ -232,14 +282,43 @@ local_test!(services_sync_recovers_missing_entries, {
     let manifest = load_manifest_from_path(Path::new("examples/replicated_service.ron"))
         .expect("load service manifest");
 
-    let (service_id, tasks) = deploy_manifest_via_anchor(anchor, &manifest).await;
+    let templates = manifest_to_service_templates(&manifest);
+    let manifest_id = Uuid::new_v4();
+    let service_id = anchor
+        .node
+        .service_controller
+        .submit_deployment(manifest_id, &manifest.name, &manifest.name, templates)
+        .await
+        .expect("submit deployment via anchor");
 
     assert!(
-        wait_for_service_state(&peer.node.service_controller, service_id, true).await,
-        "peer should observe service after initial gossip"
+        wait_for_service_status(
+            &anchor.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "anchor should observe running service"
+    );
+    assert!(
+        wait_for_service_status(
+            &peer.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "peer should observe running service after gossip"
     );
 
-    let expected_task_ids: Vec<Uuid> = tasks.iter().map(|spec| spec.id).collect();
+    let expected_spec = anchor
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("lookup service spec")
+        .expect("service spec present");
+
+    let expected_task_ids: Vec<Uuid> = expected_spec.task_ids.clone();
 
     peer.node
         .services
@@ -286,39 +365,6 @@ local_test!(services_sync_recovers_missing_entries, {
     let expected_ids: BTreeSet<Uuid> = expected_task_ids.iter().cloned().collect();
     assert_eq!(restored_ids, expected_ids, "sync restored tasks");
 });
-
-async fn register_service_via_rpc(
-    client: &services::Client,
-    manifest_id: Uuid,
-    manifest_name: &str,
-    service_name: &str,
-) {
-    let mut upsert = client.upsert_request();
-    {
-        let mut specs = upsert.get().init_specs(1);
-        let mut spec = specs.reborrow().get(0);
-        spec.set_manifest_id(manifest_id.as_bytes());
-        spec.set_manifest_name(manifest_name);
-        spec.set_service_name(service_name);
-        spec.set_status(protocol::services::ServiceStatus::Running);
-
-        let mut tasks = spec.reborrow().init_tasks(1);
-        let mut task = tasks.reborrow().get(0);
-        task.set_name("web");
-        task.set_image("ghcr.io/mantissa/demo:web");
-        task.set_replicas(1);
-        let mut command = task.reborrow().init_command(1);
-        command.set(0, "--serve");
-
-        spec.reborrow().init_task_ids(0);
-    }
-
-    upsert
-        .send()
-        .promise
-        .await
-        .expect("service upsert should succeed");
-}
 
 async fn remove_service_via_rpc(client: &services::Client, service_id: Uuid) {
     let mut delete = client.delete_request();
@@ -369,48 +415,8 @@ async fn wait_for_service_status(
     false
 }
 
-async fn list_service_ids(client: &services::Client) -> Vec<Uuid> {
-    let response = client
-        .list_request()
-        .send()
-        .promise
-        .await
-        .expect("Services.list call should succeed");
-    let reader = response
-        .get()
-        .expect("Services.list should yield result message");
-    let specs = reader
-        .get_services()
-        .expect("Services.list should include services list");
-
-    let mut ids = Vec::with_capacity(specs.len() as usize);
-    for spec in specs.iter() {
-        let data = spec.get_id().expect("service id data").to_owned();
-        if data.len() != 16 {
-            continue;
-        }
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&data);
-        ids.push(Uuid::from_bytes(bytes));
-    }
-
-    ids
-}
-
-async fn deploy_manifest_via_anchor(
-    anchor: &TestNode,
-    manifest: &ServiceManifest,
-) -> (Uuid, Vec<TaskSpec>) {
-    let requests = build_task_requests(manifest);
-    let specs = anchor
-        .node
-        .task_manager
-        .start_tasks_batch(requests)
-        .await
-        .expect("start tasks via manager");
-
-    let task_ids: Vec<Uuid> = specs.iter().map(|spec| spec.id).collect();
-    let tasks: Vec<ServiceTaskSpecValue> = manifest
+fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskSpecValue> {
+    manifest
         .tasks
         .iter()
         .map(|task| ServiceTaskSpecValue {
@@ -439,65 +445,35 @@ async fn deploy_manifest_via_anchor(
                         .map(|value| i32::try_from(value).expect("validated manifest bound")),
                 }),
         })
-        .collect();
-
-    let manifest_id = Uuid::new_v4();
-    let service_spec =
-        ServiceSpecValue::new(manifest_id, &manifest.name, &manifest.name, tasks, task_ids);
-
-    anchor
-        .node
-        .service_controller
-        .upsert_service(service_spec)
-        .await
-        .expect("service upsert through controller");
-
-    (compute_service_id(&manifest.name), specs)
+        .collect()
 }
 
-fn build_task_requests(manifest: &ServiceManifest) -> Vec<TaskStartRequest> {
-    let mut requests = Vec::new();
-    for task in &manifest.tasks {
-        let base_name = format!("{}-{}", manifest.name, task.name);
-        for replica_idx in 0..task.replicas {
-            let replica_number = replica_idx + 1;
-            let name = if task.replicas > 1 {
-                format!("{base_name}-{replica_number}")
-            } else {
-                base_name.clone()
-            };
+async fn list_service_ids(client: &services::Client) -> Vec<Uuid> {
+    let response = client
+        .list_request()
+        .send()
+        .promise
+        .await
+        .expect("Services.list call should succeed");
+    let reader = response
+        .get()
+        .expect("Services.list should yield result message");
+    let specs = reader
+        .get_services()
+        .expect("Services.list should include services list");
 
-            requests.push(TaskStartRequest {
-                name,
-                image: task.image.clone(),
-                command: task.command.clone(),
-                cpu_millis: task.resources.cpu_millis,
-                memory_bytes: task.resources.memory_bytes(),
-                id: None,
-                slot_ids: Vec::new(),
-                restart_policy: task
-                    .restart_policy
-                    .as_ref()
-                    .map(|policy| TaskRestartPolicy {
-                        name: match policy.name {
-                            ManifestRestartPolicyName::No => TaskRestartPolicyKind::No,
-                            ManifestRestartPolicyName::Always => TaskRestartPolicyKind::Always,
-                            ManifestRestartPolicyName::OnFailure => {
-                                TaskRestartPolicyKind::OnFailure
-                            }
-                            ManifestRestartPolicyName::UnlessStopped => {
-                                TaskRestartPolicyKind::UnlessStopped
-                            }
-                        },
-                        max_retry_count: policy
-                            .max_retry_count
-                            .map(|value| i32::try_from(value).expect("validated manifest bound")),
-                    }),
-            });
+    let mut ids = Vec::with_capacity(specs.len() as usize);
+    for spec in specs.iter() {
+        let data = spec.get_id().expect("service id data").to_owned();
+        if data.len() != 16 {
+            continue;
         }
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&data);
+        ids.push(Uuid::from_bytes(bytes));
     }
 
-    requests
+    ids
 }
 
 async fn wait_for_task_count(manager: &TaskManager, expected: usize, timeout: Duration) -> bool {

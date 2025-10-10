@@ -29,23 +29,14 @@ enum ServiceStatus {
   stopped @3;
 }
 
-struct ServiceUpsertSpec {
-  manifestId @0 :Data;        # 16-byte UUID identifying the manifest revision
-  manifestName @1 :Text;      # Human readable manifest/service name
-  serviceName @2 :Text;       # Service identifier
-  tasks @3 :List(TaskTemplate); # Desired task templates composing the service
-  taskIds @4 :List(Data); # Existing task UUIDs (each 16 bytes) tracked for this service
-  status @5 :ServiceStatus;
-}
-
 struct ServiceSpec {
-  id @0 :Data;                # Deterministic service UUID (16 bytes)
-  manifestId @1 :Data;        # Manifest revision UUID (16 bytes)
-  manifestName @2 :Text;      # Current manifest/service name
-  serviceName @3 :Text;       # Service identifier
+  id @0 :Data;                  # Deterministic service UUID (16 bytes)
+  manifestId @1 :Data;          # Manifest revision UUID (16 bytes)
+  manifestName @2 :Text;        # Current manifest/service name
+  serviceName @3 :Text;         # Service identifier
   tasks @4 :List(TaskTemplate); # Desired task templates
-  taskIds @5 :List(Data); # Current task UUIDs (16 bytes each)
-  updatedAt @6 :Text;         # RFC3339 timestamp when this spec was last updated
+  taskIds @5 :List(Data);       # Current task UUIDs (16 bytes each)
+  updatedAt @6 :Text;           # RFC3339 timestamp when this spec was last updated
   status @7 :ServiceStatus;
 }
 
@@ -67,8 +58,7 @@ struct ServiceDeploySpec {
 }
 
 interface Services {
-  upsert @0 (specs :List(ServiceUpsertSpec));
-  list @1 () -> (services :List(ServiceSpec));
-  delete @2 (ids :List(Data)); # Each entry is a 16-byte service UUID
-  deploy @3 (spec :ServiceDeploySpec) -> (serviceId :Data);
+  list @0 () -> (services :List(ServiceSpec));
+  delete @1 (ids :List(Data)); # Each entry is a 16-byte service UUID
+  deploy @2 (spec :ServiceDeploySpec) -> (serviceId :Data);
 }

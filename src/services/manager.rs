@@ -64,20 +64,6 @@ impl ServiceController {
         }
     }
 
-    pub async fn upsert_service(&self, value: ServiceSpecValue) -> anyhow::Result<()> {
-        if let Some(existing) = self.registry.get(value.id)? {
-            if existing.status() != ServiceStatus::Stopped {
-                return Err(anyhow!(
-                    "service '{}' already exists; stop it before deploying again",
-                    value.service_name
-                ));
-            }
-        }
-
-        self.apply_upsert(value.clone()).await?;
-        self.broadcast(ServiceEvent::Upsert(value)).await
-    }
-
     /// Schedules an asynchronous stop for the provided service id. The caller receives an
     /// acknowledgement once the stop request is queued; actual teardown proceeds in the
     /// background so the CLI stays responsive.

@@ -5,9 +5,7 @@ use crate::services::types::{
 };
 use capnp::Error;
 use capnp::capability::Promise;
-use protocol::services::{
-    service_event, service_spec, service_upsert_spec, services, task_template,
-};
+use protocol::services::{service_event, service_spec, services, task_template};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -23,52 +21,6 @@ impl ServicesRPC {
 
 #[async_trait::async_trait(?Send)]
 impl services::Server for ServicesRPC {
-    fn upsert(
-        &mut self,
-        params: services::UpsertParams,
-        _results: services::UpsertResults,
-    ) -> Promise<(), Error> {
-        let manager = self.manager.clone();
-
-        Promise::from_future(async move {
-            let request = params.get()?;
-            let specs = request.get_specs()?;
-
-            for spec in specs.iter() {
-                let manifest_id =
-                    read_optional_uuid(spec.get_manifest_id()?).unwrap_or_else(Uuid::new_v4);
-                let manifest_name = spec.get_manifest_name()?.to_str()?.to_string();
-                let service_name = spec.get_service_name()?.to_str()?.to_string();
-
-                let mut tasks = Vec::new();
-                for tmpl in spec.get_tasks()?.iter() {
-                    tasks.push(read_task_template(tmpl)?);
-                }
-
-                let mut task_ids = Vec::new();
-                for wid in spec.get_task_ids()?.iter() {
-                    task_ids.push(read_uuid(wid?)?);
-                }
-
-                let mut value = ServiceSpecValue::new(
-                    manifest_id,
-                    manifest_name.clone(),
-                    service_name.clone(),
-                    tasks,
-                    task_ids,
-                );
-                value.set_status(read_service_status(spec)?);
-
-                manager
-                    .upsert_service(value)
-                    .await
-                    .map_err(|e| Error::failed(e.to_string()))?;
-            }
-
-            Ok(())
-        })
-    }
-
     fn deploy(
         &mut self,
         params: services::DeployParams,
@@ -273,10 +225,6 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         memory_bytes: reader.get_memory_bytes(),
         restart_policy,
     })
-}
-
-fn read_service_status(reader: service_upsert_spec::Reader<'_>) -> Result<ServiceStatus, Error> {
-    Ok(proto_to_service_status(reader.get_status()?))
 }
 
 fn service_status_to_proto(status: ServiceStatus) -> protocol::services::ServiceStatus {
