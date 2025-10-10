@@ -95,6 +95,7 @@ pub enum ServiceStatus {
     Running,
     Stopping,
     Stopped,
+    Failed,
 }
 
 impl Default for ServiceStatus {

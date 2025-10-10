@@ -139,6 +139,7 @@ pub enum ServiceStatusRow {
     Running,
     Stopping,
     Stopped,
+    Failed,
 }
 
 impl ServiceStatusRow {
@@ -148,6 +149,7 @@ impl ServiceStatusRow {
             ProtoServiceStatus::Running => Self::Running,
             ProtoServiceStatus::Stopping => Self::Stopping,
             ProtoServiceStatus::Stopped => Self::Stopped,
+            ProtoServiceStatus::Failed => Self::Failed,
         }
     }
 }
@@ -159,7 +161,8 @@ impl std::fmt::Display for ServiceStatusRow {
             ServiceStatusRow::Running => "running",
             ServiceStatusRow::Stopping => "stopping",
             ServiceStatusRow::Stopped => "stopped",
+            ServiceStatusRow::Failed => "failed",
         };
-        write!(f, "{}", label)
+        write!(f, "{label}")
     }
 }

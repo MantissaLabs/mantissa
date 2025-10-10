@@ -27,6 +27,7 @@ enum ServiceStatus {
   running @1;
   stopping @2;
   stopped @3;
+  failed @4;
 }
 
 struct ServiceSpec {

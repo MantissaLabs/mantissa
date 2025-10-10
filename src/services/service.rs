@@ -233,6 +233,7 @@ fn service_status_to_proto(status: ServiceStatus) -> protocol::services::Service
         ServiceStatus::Running => protocol::services::ServiceStatus::Running,
         ServiceStatus::Stopping => protocol::services::ServiceStatus::Stopping,
         ServiceStatus::Stopped => protocol::services::ServiceStatus::Stopped,
+        ServiceStatus::Failed => protocol::services::ServiceStatus::Failed,
     }
 }
 
@@ -242,6 +243,7 @@ fn proto_to_service_status(status: protocol::services::ServiceStatus) -> Service
         protocol::services::ServiceStatus::Running => ServiceStatus::Running,
         protocol::services::ServiceStatus::Stopping => ServiceStatus::Stopping,
         protocol::services::ServiceStatus::Stopped => ServiceStatus::Stopped,
+        protocol::services::ServiceStatus::Failed => ServiceStatus::Failed,
     }
 }
 

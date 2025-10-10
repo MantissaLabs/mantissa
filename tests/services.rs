@@ -150,6 +150,51 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
     );
 });
 
+local_test!(services_deployment_exhausts_retries_and_fails, {
+    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let node = TestNode::new().await;
+
+    let manifest_id = Uuid::new_v4();
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(
+            manifest_id,
+            "capacity-starved",
+            "capacity-starved",
+            vec![ServiceTaskSpecValue {
+                name: "heavy".into(),
+                image: "ghcr.io/mantissa/demo:web".into(),
+                command: vec!["--serve".into()],
+                replicas: 1,
+                cpu_millis: 500_000, // intentionally exceeds any single-node capacity
+                memory_bytes: 8 * 1024 * 1024 * 1024, // 8 GiB to force allocation failure
+                restart_policy: None,
+            }],
+        )
+        .await
+        .expect("submit capacity-starved deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Failed
+        )
+        .await,
+        "service should transition to failed after exhausting retries"
+    );
+
+    let failed_spec = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load failed service spec")
+        .expect("service spec present after failure");
+    assert_eq!(failed_spec.status(), ServiceStatus::Failed);
+});
+
 local_test!(services_deployment_replicates_across_cluster, {
     let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
 
