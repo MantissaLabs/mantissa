@@ -165,6 +165,12 @@ impl Registry {
         Ok(ids)
     }
 
+    /// Returns the last recorded hostname for the provided `peer_id`, if available.
+    pub fn peer_hostname(&self, peer_id: Uuid) -> Option<String> {
+        self.peer_latest_value(peer_id)
+            .map(|value| value.hostname.clone())
+    }
+
     pub async fn session_for_peer(&self, peer_id: Uuid) -> Option<cluster_session::Client> {
         let entry = self.ensure_entry(peer_id).await;
         self.ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)

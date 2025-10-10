@@ -2,15 +2,22 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+use async_trait::async_trait;
+use mantissa::task::docker::{
+    ContainerError, ContainerInfo, ContainerManager, ResourceLimits, RestartPolicyConfig,
+    clear_container_manager_override, container_manager_override, set_container_manager_override,
+};
 use mantissa::topology_capnp::topology;
+use mantissa::{node, server::headless::HeadlessNode};
+use once_cell::sync::Lazy;
+use protocol::health::NodeStatus;
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::LocalSet;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
-
-use mantissa::{node, server::headless::HeadlessNode};
-use protocol::health::NodeStatus;
 
 /// Run an async block inside a LocalSet so all `spawn_local` tasks work.
 pub async fn run_local<F, T>(f: F) -> T
@@ -18,6 +25,110 @@ where
     F: Future<Output = T>,
 {
     LocalSet::new().run_until(f).await
+}
+
+#[derive(Default)]
+pub struct InMemoryContainerManager;
+
+#[async_trait]
+impl ContainerManager for InMemoryContainerManager {
+    async fn create_container(
+        &self,
+        _name: &str,
+        _image: &str,
+        _command: Option<Vec<String>>,
+        _env_vars: Option<Vec<String>>,
+        _ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
+        _volumes: Option<Vec<String>>,
+        _restart_policy: Option<RestartPolicyConfig>,
+        _resource_limits: ResourceLimits,
+    ) -> Result<String, ContainerError> {
+        Ok(Uuid::new_v4().to_string())
+    }
+
+    async fn start_container(&self, _container_id: &str) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    async fn stop_container(
+        &self,
+        _container_id: &str,
+        _timeout: Option<Duration>,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    async fn restart_container(
+        &self,
+        _container_id: &str,
+        _timeout: Option<Duration>,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    async fn remove_container(
+        &self,
+        _container_id: &str,
+        _force: bool,
+        _remove_volumes: bool,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    async fn list_containers(
+        &self,
+        _filters: Option<HashMap<String, Vec<String>>>,
+    ) -> Result<Vec<ContainerInfo>, ContainerError> {
+        Ok(Vec::new())
+    }
+
+    async fn inspect_container(
+        &self,
+        _container_id: &str,
+    ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
+        Err(ContainerError::OperationFailed(
+            "inspect unsupported in test container manager".into(),
+        ))
+    }
+
+    async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+        Ok(())
+    }
+}
+
+fn default_container_manager() -> Arc<dyn ContainerManager + Send + Sync> {
+    Arc::new(InMemoryContainerManager::default())
+}
+
+static TEST_CONTAINER_MANAGER: Lazy<()> = Lazy::new(|| {
+    set_container_manager_override(default_container_manager());
+});
+
+pub struct ContainerManagerOverrideGuard {
+    previous: Option<Arc<dyn ContainerManager + Send + Sync>>,
+}
+
+impl ContainerManagerOverrideGuard {
+    pub fn install(manager: Arc<dyn ContainerManager + Send + Sync>) -> Self {
+        let previous = container_manager_override();
+        set_container_manager_override(manager);
+        Self { previous }
+    }
+
+    pub fn install_default() -> Self {
+        Self::install(Arc::new(InMemoryContainerManager::default()))
+    }
+}
+
+impl Drop for ContainerManagerOverrideGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.previous.as_ref() {
+            set_container_manager_override(prev.clone());
+        } else {
+            clear_container_manager_override();
+            set_container_manager_override(default_container_manager());
+        }
+    }
 }
 
 /// A thin, test-friendly wrapper around a real headless node.
@@ -29,8 +140,13 @@ pub struct TestNode {
 }
 
 impl TestNode {
+    fn ensure_test_container_manager() {
+        Lazy::force(&TEST_CONTAINER_MANAGER);
+    }
+
     /// Start a node with in-process transport (fast path).
     pub async fn new() -> Self {
+        Self::ensure_test_container_manager();
         let node = HeadlessNode::new_inproc()
             .await
             .expect("headless inproc node");
@@ -38,6 +154,7 @@ impl TestNode {
     }
 
     pub async fn new_with_fanout(fanout: usize) -> Self {
+        Self::ensure_test_container_manager();
         let node = HeadlessNode::new_inproc_custom(None, None, Some(fanout))
             .await
             .expect("headless inproc node (custom fanout)");
@@ -46,14 +163,18 @@ impl TestNode {
 
     /// Start a node that listens on a random TCP port (Noise + Cap'n Proto over TCP).
     pub async fn new_tcp() -> Self {
-        let node = HeadlessNode::new_tcp_ephemeral()
-            .await
-            .expect("headless tcp node");
-        Self { node }
+        Self::try_new_tcp().await.expect("headless tcp node")
+    }
+
+    pub async fn try_new_tcp() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::ensure_test_container_manager();
+        let node = HeadlessNode::new_tcp_ephemeral().await?;
+        Ok(Self { node })
     }
 
     /// Start a node with in-process transport and a custom periodic sync tick.
     pub async fn new_with_tick_ms(ms: u64) -> Self {
+        Self::ensure_test_container_manager();
         let node =
             HeadlessNode::new_inproc_custom(Some(std::time::Duration::from_millis(ms)), None, None)
                 .await
@@ -63,10 +184,16 @@ impl TestNode {
 
     /// Start a TCP node with a custom periodic sync tick.
     pub async fn new_tcp_with_tick_ms(ms: u64) -> Self {
-        let node = HeadlessNode::new_tcp_ephemeral_with_tick(std::time::Duration::from_millis(ms))
+        Self::try_new_tcp_with_tick_ms(ms)
             .await
-            .expect("headless tcp node (with tick)");
-        Self { node }
+            .expect("headless tcp node (with tick)")
+    }
+
+    pub async fn try_new_tcp_with_tick_ms(ms: u64) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::ensure_test_container_manager();
+        let node =
+            HeadlessNode::new_tcp_ephemeral_with_tick(std::time::Duration::from_millis(ms)).await?;
+        Ok(Self { node })
     }
 
     /// Ask this node to join the cluster whose **anchor** is `anchor`.
@@ -174,7 +301,9 @@ impl TestNode {
         assert!(n >= 1, "cluster size must be >= 1");
 
         // 1) Create anchor and capture the data we need BEFORE moving it.
-        let anchor = TestNode::new_tcp().await;
+        let anchor = TestNode::try_new_tcp()
+            .await
+            .map_err(|err| capnp::Error::failed(err.to_string()))?;
         let anchor_addr = anchor.addr(); // String, cheap clone
         let join_token = anchor.current_join_token().await?; // fetch once
 
@@ -183,7 +312,9 @@ impl TestNode {
         cluster.push(anchor); // move anchor now; we won't borrow it again
 
         for _ in 1..n {
-            let node = TestNode::new_tcp().await;
+            let node = TestNode::try_new_tcp()
+                .await
+                .map_err(|err| capnp::Error::failed(err.to_string()))?;
             node.node
                 .join_anchor_addr(&anchor_addr, &join_token)
                 .await?;
@@ -210,7 +341,9 @@ impl TestNode {
     ) -> Result<Vec<TestNode>, capnp::Error> {
         assert!(n >= 1, "cluster size must be >= 1");
 
-        let anchor = TestNode::new_tcp_with_tick_ms(tick_ms).await;
+        let anchor = TestNode::try_new_tcp_with_tick_ms(tick_ms)
+            .await
+            .map_err(|err| capnp::Error::failed(err.to_string()))?;
         let anchor_addr = anchor.addr();
         let join_token = anchor.current_join_token().await?;
 
@@ -218,7 +351,9 @@ impl TestNode {
         cluster.push(anchor);
 
         for _ in 1..n {
-            let node = TestNode::new_tcp_with_tick_ms(tick_ms).await;
+            let node = TestNode::try_new_tcp_with_tick_ms(tick_ms)
+                .await
+                .map_err(|err| capnp::Error::failed(err.to_string()))?;
             node.node
                 .join_anchor_addr(&anchor_addr, &join_token)
                 .await?;

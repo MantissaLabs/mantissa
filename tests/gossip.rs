@@ -1,10 +1,12 @@
 #[macro_use]
 mod common;
 
-use common::testkit::{ClusterConfig, TestNode};
+use common::testkit::{ClusterConfig, ContainerManagerOverrideGuard, TestNode};
 use std::time::Duration;
 
 local_test!(gossip_spreads_join_with_limited_fanout, {
+    let _guard = ContainerManagerOverrideGuard::install_default();
+
     const FANOUT: usize = 2;
     const NODE_COUNT: usize = 10;
 

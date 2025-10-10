@@ -10,12 +10,12 @@ use crate::task::container::ContainerState;
 use crate::task::docker::{
     ContainerError, ContainerManager, ResourceLimits, RestartPolicyConfig, RestartPolicyType,
 };
-use crate::task::service::read_spec;
 use crate::task::types::{
     TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskStateFilter, TaskValue,
 };
 use anyhow::Context;
 use async_channel::{Receiver, Sender};
+use bollard::errors::Error as BollardError;
 use chrono::{DateTime, Utc};
 use crdt_store::uuid_key::UuidKey;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -390,15 +390,12 @@ impl TaskManager {
                 }
             }
 
-            let remote_specs = match self.execute_remote_plans(&remote_plans).await {
-                Ok(specs) => {
-                    reserved_remote.clear();
-                    specs
-                }
+            let remote_specs = match self.materialize_remote_specs(&remote_plans).await {
+                Ok(specs) => specs,
                 Err(ExecutionError::Retry(err)) => {
                     debug!(
                         target: "task",
-                        "remote start conflicted on attempt {attempt}: {err}"
+                        "remote materialization conflicted on attempt {attempt}: {err}"
                     );
                     self.release_remote_slots(&reserved_remote).await;
                     reserved_remote.clear();
@@ -419,6 +416,7 @@ impl TaskManager {
 
             match self.start_local_containers(&mut local_plans).await {
                 Ok(local_specs) => {
+                    reserved_remote.clear();
                     let mut ordered: Vec<Option<TaskSpec>> = vec![None; intents.len()];
 
                     for (idx, spec) in remote_specs.into_iter().chain(local_specs.into_iter()) {
@@ -437,9 +435,11 @@ impl TaskManager {
                 Err(err) => {
                     debug!(
                         target: "task",
-                        "local execution failed; attempting remote cleanup: {err}"
+                        "local execution failed; rolling back remote tasks: {err}"
                     );
-                    self.cleanup_remote_specs_from_specs(&remote_specs).await;
+                    self.signal_remote_stop(&remote_specs).await;
+                    self.release_remote_slots(&reserved_remote).await;
+                    reserved_remote.clear();
                     if let Some(slots) = reserved_local_slots.take() {
                         self.release_local_slots(&slots).await;
                     }
@@ -1048,91 +1048,46 @@ impl TaskManager {
             .ok_or_else(|| anyhow::anyhow!("no active session for peer {peer_id}"))
     }
 
-    async fn cleanup_remote_specs_from_specs(&self, specs: &[(usize, TaskSpec)]) {
+    async fn signal_remote_stop(&self, specs: &[(usize, TaskSpec)]) {
         if specs.is_empty() {
             return;
         }
 
-        let mut by_peer: HashMap<Uuid, Vec<&TaskSpec>> = HashMap::new();
-        for (_, spec) in specs.iter() {
+        for (_, spec) in specs {
             if spec.node_id == self.local_node_id {
                 continue;
             }
-            by_peer.entry(spec.node_id).or_default().push(spec);
-        }
 
-        for (peer_id, tasks) in by_peer.into_iter() {
-            let session = match self.remote_session(peer_id).await {
-                Ok(session) => session,
-                Err(err) => {
-                    warn!(
-                        target: "task",
-                        "failed to reopen session with peer {peer_id} during cleanup: {err}"
-                    );
-                    continue;
-                }
-            };
+            if matches!(
+                spec.state,
+                ContainerState::Stopping | ContainerState::Stopped
+            ) {
+                continue;
+            }
 
-            let task_client = match session.get_task_request().send().promise.await {
-                Ok(resp) => match resp.get() {
-                    Ok(result) => match result.get_task() {
-                        Ok(client) => client,
-                        Err(err) => {
-                            warn!(
-                                target: "task",
-                                "failed to access task capability for peer {peer_id}: {err}"
-                            );
-                            continue;
-                        }
-                    },
-                    Err(err) => {
-                        warn!(
-                            target: "task",
-                            "failed to complete task capability request for peer {peer_id}: {err}"
-                        );
-                        continue;
-                    }
-                },
-                Err(err) => {
-                    warn!(
-                        target: "task",
-                        "failed to send task capability request to peer {peer_id}: {err}"
-                    );
-                    continue;
-                }
-            };
+            let mut updated = spec.clone();
+            updated.state = ContainerState::Stopping;
 
-            for spec in tasks {
-                // Remote stop is best-effort; failures are logged but do not abort cleanup.
-                let mut stop_req = task_client.stop_request();
-                {
-                    let mut inner = stop_req.get().init_request();
-                    inner.set_id(spec.id.as_bytes());
-                }
+            if let Err(err) = self.persist_spec(&updated).await {
+                warn!(
+                    target: "task",
+                    "failed to persist stopping state for remote task {}: {err}",
+                    spec.id
+                );
+                continue;
+            }
 
-                match stop_req.send().promise.await {
-                    Ok(response) => {
-                        if let Err(err) = response.get() {
-                            warn!(
-                                target: "task",
-                                "failed to stop remote task {} on peer {peer_id}: {err}",
-                                spec.id
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            target: "task",
-                            "failed to stop remote task {} on peer {peer_id}: {err}",
-                            spec.id
-                        );
-                    }
-                }
+            if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(updated)).await {
+                warn!(
+                    target: "task",
+                    "failed to broadcast stopping state for remote task {}: {err}",
+                    spec.id
+                );
             }
         }
     }
 
-    async fn execute_remote_plans(
+    async fn materialize_remote_specs(
         &self,
         plans: &[RemoteStartPlan],
     ) -> Result<Vec<(usize, TaskSpec)>, ExecutionError> {
@@ -1140,110 +1095,66 @@ impl TaskManager {
             return Ok(Vec::new());
         }
 
-        let mut by_peer: HashMap<Uuid, Vec<&RemoteStartPlan>> = HashMap::new();
+        let mut results: Vec<(usize, TaskSpec)> = Vec::new();
+        let mut persisted: Vec<TaskSpec> = Vec::new();
+
         for plan in plans {
-            by_peer.entry(plan.peer_id).or_default().push(plan);
-        }
-
-        let mut results = Vec::new();
-
-        for (peer_id, peer_plans) in by_peer.into_iter() {
-            let session = self
-                .remote_session(peer_id)
-                .await
-                .map_err(ExecutionError::Retry)?;
-
-            let task_client = session
-                .get_task_request()
-                .send()
-                .promise
-                .await
-                .map_err(|err| ExecutionError::Retry(anyhow::anyhow!(err.to_string())))?
-                .get()
-                .map_err(|err| ExecutionError::Retry(anyhow::anyhow!(err.to_string())))?
-                .get_task()
-                .map_err(|err| ExecutionError::Retry(anyhow::anyhow!(err.to_string())))?;
-
-            let mut start_req = task_client.start_many_request();
-            {
-                let mut requests_builder = start_req.get().init_requests(peer_plans.len() as u32);
-                for (idx, plan) in peer_plans.iter().enumerate() {
-                    if plan.slots.is_empty() {
-                        return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                            "remote plan missing slot assignments"
-                        )));
-                    }
-
-                    let mut entry = requests_builder.reborrow().get(idx as u32);
-                    entry.set_name(&plan.name);
-                    entry.set_image(&plan.image);
-                    entry.set_cpu_millis(plan.cpu_millis);
-                    entry.set_memory_bytes(plan.memory_bytes);
-                    let mut slot_ids_builder =
-                        entry.reborrow().init_slot_ids(plan.slots.len() as u32);
-                    for (slot_idx, slot) in plan.slots.iter().enumerate() {
-                        slot_ids_builder.set(slot_idx as u32, slot.slot_id);
-                    }
-                    entry.set_task_id(plan.id.as_bytes());
-
-                    let mut cmd_builder = entry.reborrow().init_command(plan.command.len() as u32);
-                    for (arg_idx, arg) in plan.command.iter().enumerate() {
-                        cmd_builder.set(arg_idx as u32, arg);
-                    }
-
-                    if let Some(policy) = &plan.restart_policy {
-                        let mut policy_builder = entry.reborrow().init_restart_policy();
-                        let name = match policy.name {
-                            TaskRestartPolicyKind::No => protocol::task::RestartPolicyName::No,
-                            TaskRestartPolicyKind::Always => {
-                                protocol::task::RestartPolicyName::Always
-                            }
-                            TaskRestartPolicyKind::OnFailure => {
-                                protocol::task::RestartPolicyName::OnFailure
-                            }
-                            TaskRestartPolicyKind::UnlessStopped => {
-                                protocol::task::RestartPolicyName::UnlessStopped
-                            }
-                        };
-                        policy_builder.set_name(name);
-                        policy_builder.set_max_retry_count(policy.max_retry_count.unwrap_or(-1));
-                    }
-                }
-            }
-
-            let response = match start_req.send().promise.await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    let message = err.to_string();
-                    if message.contains("scheduler reservation failed")
-                        || message.contains("slots unavailable")
-                    {
-                        return Err(ExecutionError::Retry(anyhow::anyhow!(message)));
-                    }
-
-                    return Err(ExecutionError::Fatal(anyhow::anyhow!(message)));
-                }
-            };
-
-            let reader = response
-                .get()
-                .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
-            let specs_reader = reader
-                .get_specs()
-                .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
-
-            if specs_reader.len() as usize != peer_plans.len() {
+            let slot_ids: Vec<SlotId> = plan.slots.iter().map(|slot| slot.slot_id).collect();
+            if slot_ids.is_empty() {
                 return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                    "remote peer {peer_id} returned {} specs but {} plans were sent",
-                    specs_reader.len(),
-                    peer_plans.len()
+                    "remote plan missing slot assignments"
                 )));
             }
 
-            for (plan, spec_reader) in peer_plans.iter().zip(specs_reader.iter()) {
-                let spec = read_spec(spec_reader)
-                    .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
-                results.push((plan.index, spec));
+            let node_name = self
+                .registry
+                .peer_hostname(plan.peer_id)
+                .unwrap_or_else(|| plan.peer_id.to_string());
+
+            let spec = TaskSpec {
+                id: plan.id,
+                name: plan.name.clone(),
+                image: plan.image.clone(),
+                state: ContainerState::Pending,
+                created_at: Utc::now().to_rfc3339(),
+                command: plan.command.clone(),
+                node_id: plan.peer_id,
+                node_name,
+                slot_ids: slot_ids.clone(),
+                slot_id: slot_ids.first().copied(),
+                cpu_millis: plan.cpu_millis,
+                memory_bytes: plan.memory_bytes,
+                restart_policy: plan.restart_policy.clone(),
+            };
+
+            if let Err(err) = self.persist_spec(&spec).await {
+                for rollback in &persisted {
+                    if let Err(cleanup) = self.remove_spec(rollback.id).await {
+                        warn!(
+                            target: "task",
+                            "failed to rollback remote task {} after error: {cleanup}",
+                            rollback.id
+                        );
+                    }
+                }
+                let err = err.context(format!(
+                    "failed to persist remote task spec {} ({})",
+                    spec.name, spec.id
+                ));
+                return Err(ExecutionError::Fatal(err));
+            }
+
+            persisted.push(spec.clone());
+            results.push((plan.index, spec));
+        }
+
+        for (_, spec) in &results {
+            if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(spec.clone())).await {
+                warn!(
+                    target: "task",
+                    "failed to enqueue task gossip for {}: {err}",
+                    spec.name
+                );
             }
         }
 
@@ -1595,40 +1506,12 @@ impl TaskManager {
             .map_err(|e| anyhow::anyhow!("failed to enqueue task gossip: {e}"))
     }
 
-    async fn load_spec(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
-        let key = UuidKey::from(id);
-        let snapshot = self
-            .store
-            .get_snapshot(&key)
-            .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("unknown task {id}"))?;
-
-        let value = snapshot
-            .as_slice()
-            .last()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("task {id} has no value"))?;
-
-        Ok(value_to_spec(id, value))
-    }
-
-    pub async fn task_owned_locally(&self, id: Uuid) -> Result<bool, anyhow::Error> {
-        let spec = self.load_spec(id).await?;
-        Ok(spec.node_id == self.local_node_id)
-    }
-
-    pub async fn stop_task(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
-        let spec = self.load_spec(id).await?;
-        let node_name = spec.node_name.clone();
-
-        if spec.node_id != self.local_node_id {
-            return Err(anyhow::anyhow!("task {id} is assigned to node {node_name}",));
-        }
-
+    async fn perform_local_stop(&self, spec: TaskSpec) -> Result<TaskSpec, anyhow::Error> {
         if matches!(spec.state, ContainerState::Stopped) {
             return Ok(spec);
         }
 
+        let id = spec.id;
         let identifier_entry = {
             let mut guard = self.local_containers.lock().await;
             guard.remove(&id)
@@ -1707,6 +1590,375 @@ impl TaskManager {
         Ok(updated)
     }
 
+    async fn mark_task_failed(&self, mut spec: TaskSpec, error: anyhow::Error) -> anyhow::Error {
+        let task_id = spec.id;
+        warn!(
+            target: "task",
+            "marking task {} ({}) as failed: {error}",
+            spec.name,
+            task_id
+        );
+
+        {
+            let mut guard = self.local_containers.lock().await;
+            guard.remove(&task_id);
+        }
+
+        if !spec.slot_ids.is_empty() {
+            for slot_id in &spec.slot_ids {
+                if let Err(err) = self.release_slot(*slot_id).await {
+                    warn!(
+                        target: "task",
+                        "failed to release slot {} after failure of {}: {err}",
+                        slot_id,
+                        task_id
+                    );
+                }
+            }
+            spec.slot_ids.clear();
+            spec.slot_id = None;
+        }
+
+        spec.state = ContainerState::Failed;
+
+        if let Err(err) = self.persist_spec(&spec).await {
+            warn!(
+                target: "task",
+                "failed to persist failed state for task {}: {err}",
+                task_id
+            );
+        } else if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(spec.clone())).await {
+            warn!(
+                target: "task",
+                "failed to broadcast failed state for task {}: {err}",
+                task_id
+            );
+        }
+
+        self.cleanup_orphaned_slots().await;
+        error
+    }
+
+    fn restart_policy_to_config(policy: &TaskRestartPolicy) -> RestartPolicyConfig {
+        RestartPolicyConfig {
+            name: match policy.name {
+                TaskRestartPolicyKind::No => RestartPolicyType::No,
+                TaskRestartPolicyKind::Always => RestartPolicyType::Always,
+                TaskRestartPolicyKind::OnFailure => RestartPolicyType::OnFailure,
+                TaskRestartPolicyKind::UnlessStopped => RestartPolicyType::UnlessStopped,
+            },
+            max_retry_count: policy.max_retry_count,
+        }
+    }
+
+    async fn ensure_local_tracking(&self, spec: &TaskSpec) {
+        let mut guard = self.local_containers.lock().await;
+        guard
+            .entry(spec.id)
+            .or_insert_with(|| format!("mantissa-{}", spec.id));
+    }
+
+    async fn ensure_task_running(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
+        if matches!(spec.state, ContainerState::Running) {
+            self.ensure_local_tracking(&spec).await;
+            return Ok(());
+        }
+
+        if matches!(
+            spec.state,
+            ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
+        ) {
+            return Ok(());
+        }
+
+        if spec.slot_ids.is_empty() {
+            return Err(anyhow::anyhow!(
+                "task {} ({}) missing scheduler slot assignments",
+                spec.name,
+                spec.id
+            ));
+        }
+
+        let mut working = spec.clone();
+        let task_name = working.name.clone();
+        if !matches!(working.state, ContainerState::Creating) {
+            working.state = ContainerState::Creating;
+            if let Err(err) = self.persist_spec(&working).await {
+                return Err(err);
+            }
+            if let Err(err) = self
+                .enqueue_gossip(TaskEvent::Upsert(working.clone()))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to broadcast creating state for task {}: {err}",
+                    working.id
+                );
+            }
+        }
+
+        if let Err(err) = self
+            .container_manager
+            .pull_image(&working.image)
+            .await
+            .with_context(|| format!("docker pull failed for image {}", working.image))
+        {
+            let err = self.mark_task_failed(working, err).await;
+            return Err(err);
+        }
+
+        let restart_policy = working
+            .restart_policy
+            .as_ref()
+            .map(Self::restart_policy_to_config);
+
+        let resource_limits =
+            ResourceLimits::from_requests(working.cpu_millis, working.memory_bytes);
+
+        let container_name = format!("mantissa-{}", working.id);
+
+        let create_outcome = self
+            .container_manager
+            .create_container(
+                &container_name,
+                &working.image,
+                if working.command.is_empty() {
+                    None
+                } else {
+                    Some(working.command.clone())
+                },
+                None,
+                None,
+                None,
+                restart_policy,
+                resource_limits,
+            )
+            .await;
+
+        let (container_id, created_fresh) = match create_outcome {
+            Ok(id) => (id, true),
+            Err(err) => {
+                if is_name_conflict(&err) {
+                    match self.resolve_existing_container_id(&container_name).await {
+                        Ok(Some(existing_id)) => (existing_id, false),
+                        Ok(None) => {
+                            let err = self
+                                .mark_task_failed(working, wrap_create_error(&task_name, err))
+                                .await;
+                            return Err(err);
+                        }
+                        Err(inspect_err) => {
+                            let err = self
+                                .mark_task_failed(
+                                    working,
+                                    wrap_existing_inspect_error(&task_name, inspect_err),
+                                )
+                                .await;
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    let err = self
+                        .mark_task_failed(working, wrap_create_error(&task_name, err))
+                        .await;
+                    return Err(err);
+                }
+            }
+        };
+
+        match self.container_manager.start_container(&container_id).await {
+            Ok(_) => {}
+            Err(err) => {
+                if container_already_running(&err) {
+                    debug!(
+                        target: "task",
+                        "container {} already running while starting task {}",
+                        container_id,
+                        working.id
+                    );
+                } else {
+                    if created_fresh {
+                        if let Err(remove_err) = self
+                            .container_manager
+                            .remove_container(&container_id, true, true)
+                            .await
+                        {
+                            warn!(
+                                target: "task",
+                                "failed to remove container {} after start failure: {remove_err}",
+                                container_id
+                            );
+                        }
+                    }
+                    let err = self
+                        .mark_task_failed(working, wrap_start_error(&task_name, err))
+                        .await;
+                    return Err(err);
+                }
+            }
+        }
+
+        {
+            let mut guard = self.local_containers.lock().await;
+            guard.insert(working.id, container_id.clone());
+        }
+
+        working.state = ContainerState::Running;
+        working.created_at = Utc::now().to_rfc3339();
+        working.node_id = self.local_node_id;
+        working.node_name = self.local_node_name.clone();
+
+        if let Err(err) = self.persist_spec(&working).await {
+            warn!(
+                target: "task",
+                "failed to persist running state for task {}: {err}",
+                working.id
+            );
+            if let Err(stop_err) = self
+                .container_manager
+                .stop_container(&container_id, Some(Duration::from_secs(10)))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to stop container {} during rollback: {stop_err}",
+                    container_id
+                );
+            }
+            if let Err(remove_err) = self
+                .container_manager
+                .remove_container(&container_id, true, true)
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to remove container {} during rollback: {remove_err}",
+                    container_id
+                );
+            }
+            let err = err.context("task state commit failed after container launch");
+            let err = self.mark_task_failed(working, err).await;
+            return Err(err);
+        }
+
+        if let Err(err) = self
+            .enqueue_gossip(TaskEvent::Upsert(working.clone()))
+            .await
+        {
+            warn!(
+                target: "task",
+                "failed to enqueue task gossip for {}: {err}",
+                working.name
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn resolve_existing_container_id(
+        &self,
+        container_name: &str,
+    ) -> Result<Option<String>, ContainerError> {
+        match self
+            .container_manager
+            .inspect_container(container_name)
+            .await
+        {
+            Ok(info) => {
+                let raw = info.id.unwrap_or_else(|| container_name.to_string());
+                Ok(Some(raw.trim_start_matches('/').to_string()))
+            }
+            Err(ContainerError::NotFound(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn ensure_task_stopped(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
+        if matches!(spec.state, ContainerState::Stopped) {
+            self.local_containers.lock().await.remove(&spec.id);
+            return Ok(());
+        }
+
+        let has_container = {
+            let guard = self.local_containers.lock().await;
+            guard.contains_key(&spec.id)
+        };
+
+        if !has_container {
+            return Ok(());
+        }
+
+        let _ = self.perform_local_stop(spec).await?;
+        Ok(())
+    }
+
+    async fn reconcile_local_task(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
+        match spec.state {
+            ContainerState::Pending | ContainerState::Creating => {
+                self.ensure_task_running(spec).await
+            }
+            ContainerState::Running => {
+                self.ensure_local_tracking(&spec).await;
+                Ok(())
+            }
+            ContainerState::Stopping | ContainerState::Stopped => {
+                self.ensure_task_stopped(spec).await
+            }
+            ContainerState::Paused
+            | ContainerState::Failed
+            | ContainerState::Exited(_)
+            | ContainerState::Unknown => {
+                self.local_containers.lock().await.remove(&spec.id);
+                Ok(())
+            }
+        }
+    }
+
+    async fn load_spec(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
+        let key = UuidKey::from(id);
+        let snapshot = self
+            .store
+            .get_snapshot(&key)
+            .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("unknown task {id}"))?;
+
+        let value = snapshot
+            .as_slice()
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("task {id} has no value"))?;
+
+        Ok(value_to_spec(id, value))
+    }
+
+    pub async fn task_owned_locally(&self, id: Uuid) -> Result<bool, anyhow::Error> {
+        let spec = self.load_spec(id).await?;
+        Ok(spec.node_id == self.local_node_id)
+    }
+
+    pub async fn stop_task(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
+        let spec = self.load_spec(id).await?;
+
+        if spec.node_id != self.local_node_id {
+            if matches!(
+                spec.state,
+                ContainerState::Stopping | ContainerState::Stopped
+            ) {
+                return Ok(spec);
+            }
+
+            let mut updated = spec.clone();
+            updated.state = ContainerState::Stopping;
+            self.persist_spec(&updated).await?;
+            self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
+                .await?;
+            return Ok(updated);
+        }
+
+        self.perform_local_stop(spec).await
+    }
+
     async fn record_gossip_id(&self, id: Uuid) -> bool {
         let mut guard = self.seen_ids.lock().await;
         guard.insert(id)
@@ -1732,14 +1984,67 @@ impl TaskManager {
     async fn handle_event(&self, event: TaskEvent) -> Result<(), anyhow::Error> {
         match event {
             TaskEvent::Upsert(spec) => {
-                if spec.node_id == self.local_node_id && spec.state != ContainerState::Running {
+                let belongs = spec.node_id == self.local_node_id;
+                self.persist_spec(&spec).await?;
+
+                if belongs {
+                    let manager = self.clone();
+                    let spec_for_reconcile = spec.clone();
+                    tokio::task::spawn_local(async move {
+                        if let Err(err) = manager
+                            .reconcile_local_task(spec_for_reconcile.clone())
+                            .await
+                        {
+                            warn!(
+                                target: "task",
+                                "failed to reconcile task {}: {err}",
+                                spec_for_reconcile.id
+                            );
+                        }
+                    });
+                } else if !matches!(spec.state, ContainerState::Running) {
                     self.local_containers.lock().await.remove(&spec.id);
                 }
-                self.persist_spec(&spec).await
+
+                Ok(())
             }
-            TaskEvent::Remove { id } => self.remove_spec(id).await,
+            TaskEvent::Remove { id } => {
+                self.local_containers.lock().await.remove(&id);
+                self.remove_spec(id).await
+            }
         }
     }
+}
+
+fn wrap_create_error(task_name: &str, err: ContainerError) -> anyhow::Error {
+    anyhow::Error::new(err).context(format!("docker create failed for task {}", task_name))
+}
+
+fn wrap_existing_inspect_error(task_name: &str, err: ContainerError) -> anyhow::Error {
+    anyhow::Error::new(err).context(format!(
+        "failed to inspect existing container for task {} after name conflict",
+        task_name
+    ))
+}
+
+fn wrap_start_error(task_name: &str, err: ContainerError) -> anyhow::Error {
+    anyhow::Error::new(err).context(format!("docker start failed for task {}", task_name))
+}
+
+fn is_name_conflict(err: &ContainerError) -> bool {
+    matches!(
+        err,
+        ContainerError::DockerAPI(BollardError::DockerResponseServerError { status_code, .. })
+            if *status_code == 409
+    )
+}
+
+fn container_already_running(err: &ContainerError) -> bool {
+    matches!(
+        err,
+        ContainerError::DockerAPI(BollardError::DockerResponseServerError { status_code, .. })
+            if *status_code == 304
+    )
 }
 
 fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
