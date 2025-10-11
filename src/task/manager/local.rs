@@ -1,0 +1,216 @@
+use std::time::Duration;
+
+use anyhow::Context;
+use chrono::Utc;
+use tracing::warn;
+
+use crate::task::container::ContainerState;
+use crate::task::docker::{ResourceLimits, RestartPolicyConfig, RestartPolicyType};
+use crate::task::types::{TaskEvent, TaskRestartPolicyKind, TaskSpec};
+
+use super::TaskManager;
+use super::planner::BatchStartPlan;
+
+impl TaskManager {
+    /// Starts every local container in the batch and persists their specs in index order.
+    pub(super) async fn start_local_containers(
+        &self,
+        plans: &mut [BatchStartPlan],
+    ) -> Result<Vec<(usize, TaskSpec)>, anyhow::Error> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        for plan in plans.iter_mut() {
+            plan.container_name = format!("mantissa-{}", plan.id);
+        }
+
+        if let Err(err) = self.launch_batch_containers(plans).await {
+            self.cleanup_batch(plans).await;
+            return Err(err);
+        }
+
+        match self.commit_batch(plans).await {
+            Ok(specs) => {
+                let ordered = plans
+                    .iter()
+                    .zip(specs.into_iter())
+                    .map(|(plan, spec)| (plan.index, spec))
+                    .collect();
+                Ok(ordered)
+            }
+            Err(err) => {
+                self.cleanup_batch(plans).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn launch_batch_containers(
+        &self,
+        plans: &mut [BatchStartPlan],
+    ) -> Result<(), anyhow::Error> {
+        for plan in plans.iter_mut() {
+            self.container_manager
+                .pull_image(&plan.image)
+                .await
+                .with_context(|| format!("docker pull failed for image {}", plan.image))?;
+
+            let restart_policy = plan
+                .restart_policy
+                .as_ref()
+                .map(|policy| RestartPolicyConfig {
+                    name: match policy.name {
+                        TaskRestartPolicyKind::No => RestartPolicyType::No,
+                        TaskRestartPolicyKind::Always => RestartPolicyType::Always,
+                        TaskRestartPolicyKind::OnFailure => RestartPolicyType::OnFailure,
+                        TaskRestartPolicyKind::UnlessStopped => RestartPolicyType::UnlessStopped,
+                    },
+                    max_retry_count: policy.max_retry_count,
+                });
+
+            let resource_limits = ResourceLimits::from_requests(
+                plan.requested_cpu_millis,
+                plan.requested_memory_bytes,
+            );
+
+            let container_id = self
+                .container_manager
+                .create_container(
+                    &plan.container_name,
+                    &plan.image,
+                    if plan.command.is_empty() {
+                        None
+                    } else {
+                        Some(plan.command.clone())
+                    },
+                    None,
+                    None,
+                    None,
+                    restart_policy,
+                    resource_limits,
+                )
+                .await
+                .with_context(|| format!("docker create failed for task {}", plan.name))?;
+
+            plan.container_id = Some(container_id.clone());
+
+            self.container_manager
+                .start_container(&container_id)
+                .await
+                .with_context(|| format!("docker start failed for task {}", plan.name))?;
+
+            plan.created_at = Utc::now();
+        }
+
+        Ok(())
+    }
+
+    async fn commit_batch(&self, plans: &[BatchStartPlan]) -> Result<Vec<TaskSpec>, anyhow::Error> {
+        let mut specs = Vec::with_capacity(plans.len());
+        let mut persisted: Vec<TaskSpec> = Vec::new();
+
+        for plan in plans {
+            if plan.slots.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "task {} has no slots assigned during commit",
+                    plan.name
+                ));
+            }
+
+            let slot_ids = plan.slot_ids();
+            let slot_id = slot_ids.first().copied();
+            let spec = TaskSpec {
+                id: plan.id,
+                name: plan.name.clone(),
+                image: plan.image.clone(),
+                state: ContainerState::Running,
+                created_at: plan.created_at.to_rfc3339(),
+                command: plan.command.clone(),
+                node_id: self.local_node_id,
+                node_name: self.local_node_name.clone(),
+                slot_ids,
+                slot_id,
+                cpu_millis: plan.requested_cpu_millis,
+                memory_bytes: plan.requested_memory_bytes,
+                restart_policy: plan.restart_policy.clone(),
+            };
+
+            if let Err(err) = self.persist_spec(&spec).await {
+                for rollback in &persisted {
+                    let _ = self.remove_spec(rollback.id).await;
+                }
+                return Err(err.context(format!("failed to persist task spec {}", spec.name)));
+            }
+
+            persisted.push(spec.clone());
+            specs.push(spec);
+        }
+
+        for spec in &specs {
+            if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(spec.clone())).await {
+                warn!(
+                    target: "task",
+                    "failed to enqueue task gossip for {}: {err}",
+                    spec.name
+                );
+            }
+        }
+
+        {
+            let mut guard = self.local_containers.lock().await;
+            for plan in plans {
+                if let Some(container_id) = plan.container_id.as_ref() {
+                    guard.insert(plan.id, container_id.clone());
+                }
+            }
+        }
+
+        Ok(specs)
+    }
+
+    async fn cleanup_batch(&self, plans: &[BatchStartPlan]) {
+        for plan in plans {
+            if let Some(container_id) = plan.container_id.as_ref() {
+                if let Err(err) = self
+                    .container_manager
+                    .stop_container(container_id, Some(Duration::from_secs(10)))
+                    .await
+                {
+                    warn!(
+                        target: "task",
+                        "failed to stop container {container_id} for task {}: {err}",
+                        plan.id
+                    );
+                }
+
+                if let Err(err) = self
+                    .container_manager
+                    .remove_container(container_id, true, true)
+                    .await
+                {
+                    warn!(
+                        target: "task",
+                        "failed to remove container {container_id} for task {}: {err}",
+                        plan.id
+                    );
+                }
+
+                let mut guard = self.local_containers.lock().await;
+                guard.remove(&plan.id);
+            }
+
+            for slot in &plan.slots {
+                if let Err(err) = self.release_slot(slot.slot_id).await {
+                    warn!(
+                        target: "task",
+                        "failed to release slot {} during rollback: {err}",
+                        slot.slot_id
+                    );
+                }
+            }
+        }
+
+        self.cleanup_orphaned_slots().await;
+    }
+}

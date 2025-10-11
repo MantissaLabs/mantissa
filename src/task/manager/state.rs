@@ -1,0 +1,632 @@
+use std::collections::HashSet;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context};
+use async_channel::Sender;
+use chrono::Utc;
+use crdt_store::uuid_key::UuidKey;
+use tracing::{debug, warn};
+use uuid::Uuid;
+
+use crate::gossip::Message;
+use crate::scheduler::{SchedulerError, SlotId, SlotState};
+use crate::task::container::ContainerState;
+use crate::task::docker::{ContainerError, RestartPolicyConfig, RestartPolicyType};
+use crate::task::types::{
+    TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskValue,
+};
+
+use super::{
+    TaskManager, container_already_running, is_name_conflict, value_to_spec, wrap_create_error,
+    wrap_existing_inspect_error, wrap_start_error,
+};
+
+impl TaskManager {
+    /// Persists a task snapshot in the backing store.
+    pub(super) async fn persist_spec(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
+        let mut value = TaskValue::new(
+            spec.id,
+            spec.name.clone(),
+            spec.image.clone(),
+            spec.state.clone(),
+            spec.created_at.clone(),
+            spec.command.clone(),
+            spec.node_id,
+            spec.node_name.clone(),
+            spec.slot_ids.clone(),
+            spec.cpu_millis,
+            spec.memory_bytes,
+        );
+
+        value.restart_policy = spec.restart_policy.clone();
+
+        self.store
+            .upsert(&UuidKey::from(spec.id), value)
+            .await
+            .map_err(|e| anyhow::anyhow!("task upsert failed: {e}"))
+    }
+
+    /// Removes a task snapshot from the store.
+    pub(super) async fn remove_spec(&self, id: Uuid) -> Result<(), anyhow::Error> {
+        self.store
+            .remove(&UuidKey::from(id))
+            .await
+            .map_err(|e| anyhow::anyhow!("task remove failed: {e}"))?;
+        Ok(())
+    }
+
+    fn tx(&self) -> Sender<Message> {
+        self.tx.clone()
+    }
+
+    /// Broadcasts specs originating from remote peers to the local gossip loop.
+    pub(super) async fn broadcast_remote_specs(&self, specs: &[TaskSpec]) {
+        for spec in specs {
+            if spec.node_id == self.local_node_id {
+                continue;
+            }
+
+            if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(spec.clone())).await {
+                warn!(
+                    target: "task",
+                    "failed to relay task {} from node {}: {err}",
+                    spec.name,
+                    spec.node_id
+                );
+            }
+        }
+    }
+
+    /// Ensures that slots that no longer correspond to running containers are released.
+    pub(super) async fn cleanup_orphaned_slots(&self) {
+        const MAX_ATTEMPTS: usize = 5;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let snapshot = match self.scheduler.snapshot().await {
+                Some(snapshot) => snapshot,
+                None => return,
+            };
+
+            let reserved: Vec<SlotId> = snapshot
+                .slots
+                .iter()
+                .filter_map(|slot| match &slot.state {
+                    SlotState::Reserved(reservation) if reservation.owner == self.local_node_id => {
+                        Some(slot.slot_id)
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            if reserved.is_empty() {
+                return;
+            }
+
+            let active = match self.collect_local_slot_ids().await {
+                Ok(ids) => ids,
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        "failed to collect active slots while cleaning orphans: {err}"
+                    );
+                    return;
+                }
+            };
+
+            let to_free: Vec<SlotId> = reserved
+                .into_iter()
+                .filter(|slot_id| !active.contains(slot_id))
+                .collect();
+
+            if to_free.is_empty() {
+                return;
+            }
+
+            match self
+                .scheduler
+                .free_slots(snapshot.version, to_free.clone())
+                .await
+            {
+                Ok(_) => return,
+                Err(SchedulerError::SnapshotMismatch { .. })
+                | Err(SchedulerError::SlotsNotReserved { .. }) => continue,
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        "failed to free orphaned slots {:?}: {err}",
+                        to_free
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Collects the set of slot IDs that belong to tasks owned by this node.
+    pub(super) async fn collect_local_slot_ids(&self) -> Result<HashSet<SlotId>, anyhow::Error> {
+        let (actives, _) = self
+            .store
+            .load_all()
+            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
+
+        let mut slots = HashSet::new();
+        for (key, snapshot) in actives {
+            let id = key.to_uuid();
+            if let Some(value) = snapshot.as_slice().last() {
+                if value.node_id == self.local_node_id {
+                    if value.slot_ids.is_empty() {
+                        if let Some(slot_id) = value.slot_id {
+                            slots.insert(slot_id);
+                        }
+                    } else {
+                        for slot_id in &value.slot_ids {
+                            slots.insert(*slot_id);
+                        }
+                    }
+                }
+            } else {
+                let _ = self.remove_spec(id).await;
+            }
+        }
+
+        Ok(slots)
+    }
+
+    /// Pushes a gossip event into the dispatcher queue.
+    pub(super) async fn enqueue_gossip(&self, event: TaskEvent) -> Result<(), anyhow::Error> {
+        let id = Uuid::new_v4();
+        let message = Message::Task { id, event };
+        self.tx()
+            .send(message)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to enqueue task gossip: {e}"))
+    }
+
+    /// Performs a graceful stop of a locally owned task and tears down its container.
+    pub(super) async fn perform_local_stop(
+        &self,
+        spec: TaskSpec,
+    ) -> Result<TaskSpec, anyhow::Error> {
+        if matches!(spec.state, ContainerState::Stopped) {
+            return Ok(spec);
+        }
+
+        let id = spec.id;
+        let identifier_entry = {
+            let mut guard = self.local_containers.lock().await;
+            guard.remove(&id)
+        };
+
+        let (container_identifier, from_cache) = match identifier_entry {
+            Some(value) => (value, true),
+            None => (format!("mantissa-{id}"), false),
+        };
+
+        let mut updated = spec.clone();
+        if !matches!(spec.state, ContainerState::Stopping) {
+            updated.state = ContainerState::Stopping;
+            self.persist_spec(&updated).await?;
+            self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
+                .await?;
+        }
+
+        match self
+            .container_manager
+            .stop_container(&container_identifier, Some(Duration::from_secs(10)))
+            .await
+        {
+            Ok(_) => {}
+            Err(ContainerError::NotFound(_)) => {
+                debug!(
+                    target: "task",
+                    "container {container_identifier} not found while stopping task {id}; cache_hit={from_cache}"
+                );
+            }
+            Err(e) => {
+                updated.state = spec.state;
+                if updated.state != ContainerState::Stopping {
+                    self.persist_spec(&updated).await?;
+                    self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
+                        .await?;
+                }
+                return Err(anyhow::anyhow!("docker stop failed: {e}"));
+            }
+        }
+
+        if let Err(e) = self
+            .container_manager
+            .remove_container(&container_identifier, false, true)
+            .await
+        {
+            match e {
+                ContainerError::NotFound(_) => debug!(
+                    target: "task",
+                    "container {container_identifier} already absent while removing task {id}"
+                ),
+                other => warn!(
+                    target: "task",
+                    "failed to remove container {container_identifier}: {other}"
+                ),
+            }
+        }
+
+        updated.state = ContainerState::Stopped;
+        if !spec.slot_ids.is_empty() {
+            for slot_id in &spec.slot_ids {
+                self.release_slot(*slot_id)
+                    .await
+                    .with_context(|| "scheduler release failed during stop".to_string())?;
+            }
+            updated.slot_ids.clear();
+            updated.slot_id = None;
+            updated.cpu_millis = 0;
+            updated.memory_bytes = 0;
+        }
+
+        self.persist_spec(&updated).await?;
+        self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
+            .await?;
+        self.cleanup_orphaned_slots().await;
+        Ok(updated)
+    }
+
+    /// Marks a task as failed and frees any resources it owned.
+    pub(super) async fn mark_task_failed(
+        &self,
+        mut spec: TaskSpec,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let task_id = spec.id;
+        warn!(
+            target: "task",
+            "marking task {} ({}) as failed: {error}",
+            spec.name,
+            task_id
+        );
+
+        {
+            let mut guard = self.local_containers.lock().await;
+            guard.remove(&task_id);
+        }
+
+        if !spec.slot_ids.is_empty() {
+            for slot_id in &spec.slot_ids {
+                if let Err(err) = self.release_slot(*slot_id).await {
+                    warn!(
+                        target: "task",
+                        "failed to release slot {} after failure of {}: {err}",
+                        slot_id,
+                        task_id
+                    );
+                }
+            }
+            spec.slot_ids.clear();
+            spec.slot_id = None;
+        }
+
+        spec.state = ContainerState::Failed;
+
+        if let Err(err) = self.persist_spec(&spec).await {
+            warn!(
+                target: "task",
+                "failed to persist failed state for task {}: {err}",
+                task_id
+            );
+        } else if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(spec.clone())).await {
+            warn!(
+                target: "task",
+                "failed to broadcast failed state for task {}: {err}",
+                task_id
+            );
+        }
+
+        self.cleanup_orphaned_slots().await;
+        error
+    }
+
+    /// Maps a task restart policy into the Docker restart policy configuration.
+    pub(super) fn restart_policy_to_config(policy: &TaskRestartPolicy) -> RestartPolicyConfig {
+        RestartPolicyConfig {
+            name: match policy.name {
+                TaskRestartPolicyKind::No => RestartPolicyType::No,
+                TaskRestartPolicyKind::Always => RestartPolicyType::Always,
+                TaskRestartPolicyKind::OnFailure => RestartPolicyType::OnFailure,
+                TaskRestartPolicyKind::UnlessStopped => RestartPolicyType::UnlessStopped,
+            },
+            max_retry_count: policy.max_retry_count,
+        }
+    }
+
+    /// Ensures the in-memory container tracking reflects the persisted spec.
+    pub(super) async fn ensure_local_tracking(&self, spec: &TaskSpec) {
+        let mut guard = self.local_containers.lock().await;
+        guard
+            .entry(spec.id)
+            .or_insert_with(|| format!("mantissa-{}", spec.id));
+    }
+
+    /// Starts or reuses a container so the task transitions into running state locally.
+    pub(super) async fn ensure_task_running(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
+        let mut working = spec.clone();
+        let task_name = working.name.clone();
+
+        if matches!(working.state, ContainerState::Running) {
+            self.ensure_local_tracking(&working).await;
+            return Ok(());
+        }
+
+        if matches!(
+            spec.state,
+            ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
+        ) {
+            return Ok(());
+        }
+
+        // Never attempt to launch a container unless the scheduler assignment is visible:
+        // otherwise we would leak reservations and confuse remote capability negotiations.
+        if spec.slot_ids.is_empty() {
+            return Err(anyhow!(
+                "task {} ({}) missing scheduler slot assignments",
+                spec.name,
+                spec.id
+            ));
+        }
+
+        // Drive a single state transition to `Creating` so peers observe progress exactly once.
+        if !matches!(working.state, ContainerState::Creating) {
+            working.state = ContainerState::Creating;
+            if let Err(err) = self.persist_spec(&working).await {
+                return Err(err);
+            }
+            if let Err(err) = self
+                .enqueue_gossip(TaskEvent::Upsert(working.clone()))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to broadcast creating state for task {}: {err}",
+                    working.id
+                );
+            }
+        }
+
+        if let Err(err) = self
+            .container_manager
+            .pull_image(&working.image)
+            .await
+            .with_context(|| format!("docker pull failed for image {}", working.image))
+        {
+            let err = self.mark_task_failed(working, err).await;
+            return Err(err);
+        }
+
+        let restart_policy = working
+            .restart_policy
+            .as_ref()
+            .map(Self::restart_policy_to_config);
+
+        let resource_limits = crate::task::docker::ResourceLimits::from_requests(
+            working.cpu_millis,
+            working.memory_bytes,
+        );
+
+        let container_name = format!("mantissa-{}", working.id);
+
+        let create_outcome = self
+            .container_manager
+            .create_container(
+                &container_name,
+                &working.image,
+                if working.command.is_empty() {
+                    None
+                } else {
+                    Some(working.command.clone())
+                },
+                None,
+                None,
+                None,
+                restart_policy,
+                resource_limits,
+            )
+            .await;
+
+        let (container_id, created_fresh): (String, bool) = match create_outcome {
+            Ok(id) => (id, true),
+            Err(err) => {
+                if is_name_conflict(&err) {
+                    match self.resolve_existing_container_id(&container_name).await {
+                        Ok(Some(existing_id)) => (existing_id, false),
+                        Ok(None) => {
+                            let err = self
+                                .mark_task_failed(working, wrap_create_error(&task_name, err))
+                                .await;
+                            return Err(err);
+                        }
+                        Err(inspect_err) => {
+                            let err = self
+                                .mark_task_failed(
+                                    working,
+                                    wrap_existing_inspect_error(&task_name, inspect_err),
+                                )
+                                .await;
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    let err = self
+                        .mark_task_failed(working, wrap_create_error(&task_name, err))
+                        .await;
+                    return Err(err);
+                }
+            }
+        };
+
+        match self.container_manager.start_container(&container_id).await {
+            Ok(_) => {}
+            Err(err) => {
+                if container_already_running(&err) {
+                    debug!(
+                        target: "task",
+                        "container {} already running while starting task {}",
+                        container_id,
+                        working.id
+                    );
+                } else {
+                    if created_fresh {
+                        if let Err(remove_err) = self
+                            .container_manager
+                            .remove_container(&container_id, true, true)
+                            .await
+                        {
+                            warn!(
+                                target: "task",
+                                "failed to remove container {} after start failure: {remove_err}",
+                                container_id
+                            );
+                        }
+                    }
+                    let err = self
+                        .mark_task_failed(working, wrap_start_error(&task_name, err))
+                        .await;
+                    return Err(err);
+                }
+            }
+        }
+
+        {
+            let mut guard = self.local_containers.lock().await;
+            guard.insert(working.id, container_id.clone());
+        }
+
+        working.state = ContainerState::Running;
+        working.created_at = Utc::now().to_rfc3339();
+        working.node_id = self.local_node_id;
+        working.node_name = self.local_node_name.clone();
+
+        if let Err(err) = self.persist_spec(&working).await {
+            warn!(
+                target: "task",
+                "failed to persist running state for task {}: {err}",
+                working.id
+            );
+            if let Err(stop_err) = self
+                .container_manager
+                .stop_container(&container_id, Some(Duration::from_secs(10)))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to stop container {} during rollback: {stop_err}",
+                    container_id
+                );
+            }
+            if let Err(remove_err) = self
+                .container_manager
+                .remove_container(&container_id, true, true)
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to remove container {} during rollback: {remove_err}",
+                    container_id
+                );
+            }
+            let err = err.context("task state commit failed after container launch");
+            let err = self.mark_task_failed(working, err).await;
+            return Err(err);
+        }
+
+        if let Err(err) = self
+            .enqueue_gossip(TaskEvent::Upsert(working.clone()))
+            .await
+        {
+            warn!(
+                target: "task",
+                "failed to enqueue task gossip for {}: {err}",
+                working.name
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Resolves an existing container identifier when a create call hit a name conflict.
+    pub(super) async fn resolve_existing_container_id(
+        &self,
+        container_name: &str,
+    ) -> Result<Option<String>, ContainerError> {
+        match self
+            .container_manager
+            .inspect_container(container_name)
+            .await
+        {
+            Ok(info) => {
+                let raw = info.id.unwrap_or_else(|| container_name.to_string());
+                Ok(Some(raw.trim_start_matches('/').to_string()))
+            }
+            Err(ContainerError::NotFound(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Ensures that a locally tracked task has completely stopped and released resources.
+    pub(super) async fn ensure_task_stopped(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
+        if matches!(spec.state, ContainerState::Stopped) {
+            self.local_containers.lock().await.remove(&spec.id);
+            return Ok(());
+        }
+
+        let has_container = {
+            let guard = self.local_containers.lock().await;
+            guard.contains_key(&spec.id)
+        };
+
+        if !has_container {
+            return Ok(());
+        }
+
+        let _ = self.perform_local_stop(spec).await?;
+        Ok(())
+    }
+
+    /// Reconciles the desired state of a locally owned task with the actual container state.
+    pub(super) async fn reconcile_local_task(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
+        match spec.state {
+            ContainerState::Pending | ContainerState::Creating => {
+                self.ensure_task_running(spec).await
+            }
+            ContainerState::Running => {
+                self.ensure_local_tracking(&spec).await;
+                Ok(())
+            }
+            ContainerState::Stopping | ContainerState::Stopped => {
+                self.ensure_task_stopped(spec).await
+            }
+            ContainerState::Paused
+            | ContainerState::Failed
+            | ContainerState::Exited(_)
+            | ContainerState::Unknown => {
+                self.local_containers.lock().await.remove(&spec.id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Loads the current persisted spec for a task by identifier.
+    pub(super) async fn load_spec(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
+        let key = UuidKey::from(id);
+        let snapshot = self
+            .store
+            .get_snapshot(&key)
+            .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("unknown task {id}"))?;
+
+        let value = snapshot
+            .as_slice()
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("task {id} has no value"))?;
+
+        Ok(value_to_spec(id, value))
+    }
+}
