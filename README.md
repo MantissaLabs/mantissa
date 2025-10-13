@@ -88,7 +88,7 @@ Stop each node with `Ctrl+C` when finished.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [Code-of-Conduct.md](Code-of-Conduct.md) for more information. Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening a pull request.
+Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening a pull request.
 
 ## License
 
