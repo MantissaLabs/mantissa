@@ -1,100 +1,107 @@
 # Mantissa
 
-## Introduction
+## Overview
 
-Mantissa is a distributed and energy-efficient application scheduler and cluster management system. It is mainly designed to be portable across operating systems and integrate between multiple heterogeneous environments (x86, ARM).
+Mantissa is a fully peer-to-peer container orchestration system written in Rust.
+All nodes share the same responsibilities: they gossip topology information, reserve scheduler slots, and persist cluster state without relying on a central control plane. The project combines Cap'n Proto RPC, CRDT-based replication, Merkle Search Trees backed by Redb, and an eBPF-driven data path to target low-latency, failure-tolerant operation at scale.
 
-Mantissa is self-organizing, fault tolerant and self-healing. It both considers deployments on reliable infrastructure with infiniband network interconnections as well as unreliable environments with unreliable network such as cloud infrastructures.
+## Status
 
-It supports Advanced reservation scenarios and Gang Scheduling.
+This repository is under heavy development and APIs are subject to change. The current focus includes:
 
-The goal is to achieve reliability while allowing maximum utilization of the hardware.
+- Decentralized bootstrap/link workflow secured with join tokens.
+- Node, scheduler, task, and service inspection through the CLI.
+- Durable state storage via the `mst_store` crate layered on Redb.
+- Service deployment manifests (RON) and container task lifecycle hooks.
 
-# Features
+## Prerequisites
 
-Mantissa gathers all of the following into a single comprehensive binary:
+- Rust 1.74+ installed via [rustup](https://rustup.rs/).
+- Cap'n Proto tooling (`capnp` plus headers such as `libcapnp-dev` on Debian/Ubuntu).
+- Clang/LLVM toolchain when hacking on networking/eBPF components.
+- Optional: [Lima](https://github.com/lima-vm/lima) to spin up local multi-VM clusters.
 
-- A scheduler
-- Cluster state management (using CRDTs)
-- Network management (Ingress, network policies)
-- Storage (persistent volumes)
-- Secret Management
-- Service discovery
-- Load balancing
-- Cluster / task autoscaler
-- External API
+## Build & Test
 
-Mantissa is easy to use and maintain.
+Run all commands from the repository root:
 
-
-## Setup a cluster
-
-Bootstraping a new cluster with mantissa is rather easy. Nodes taking part in a mantissa cluster are all equal, ie. there are no leader or followers. Each node is responsible for a part of the cluster state and can be used to schedule tasks.
-
-### Initialize a new cluster
-
-To initialize a new cluster, simply type:
-
-```
-$ mantissa bootstrap
+```bash
+cargo build
+cargo test
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
 ```
 
-This will bootstrap a single node with a topology server and an agent server. New members could be added to the cluster by linking to this node.
+## Quickstart: Two Nodes on One Machine
 
-### Join an existing cluster
+1. Start the first node (this blocks and keeps serving traffic):
+   ```bash
+   mantissa init
+   ```
+2. In a second terminal, display the join token advertised by the running node:
+   ```bash
+   mantissa token show
+   ```
+   Copy the token printed on stdout.
+3. Link a second node to the cluster (still on the same host for testing):
+   ```bash
+   mantissa \
+     link \
+     --anchor 127.0.0.1:6578 \
+     --join-token <TOKEN_FROM_STEP_2> \
+     --listen 127.0.0.1:6580
+   ```
+4. Inspect membership and scheduler reservations:
+   ```bash
+   mantissa nodes list
+   mantissa scheduler slots --details
+   ```
+5. Deploy the sample service manifest:
+   ```bash
+   mantissa services run examples/replicated_service.ron
+   mantissa services list
+   ```
 
-To join an existing cluster (locally, for testing), type:
+Stop each node with `Ctrl+C` when finished.
 
-```
-$ mantissa --listen 127.0.0.1:6580 --anchor 127.0.0.1:6578 link
-```
+## CLI Cheatsheet
 
-This will add a new member to the mantissa cluster.
+- `mantissa init` - bootstrap a standalone node (blocking until interrupted).
+- `mantissa token show` / `cargo run -- token rotate` - view or rotate join tokens.
+- `mantissa link --anchor <addr> --join-token <token>` - join an existing cluster.
+- `mantissa leave` - gracefully leave the cluster.
+- `mantissa nodes list [cluster-id]` - inspect known peers.
+- `mantissa tasks list --state running` - filter tasks by lifecycle state.
+- `mantissa tasks start <name> --image <img> --command <arg>...` - launch a task.
+- `mantissa scheduler slots [peer-id] --details` - inspect reserved slots.
+- `mantissa services run|list|stop ...` - manage RON service manifests.
+- `mantissa info` - emit local system and capacity diagnostics.
 
-### List members of the cluster
+## Repository Layout
 
-Mantissa is topology-aware and multi-region enabled by default, which means that we can have multiple sub-clusters in a single, worldwide mantissa.
+- `src/` - main binary (`main.rs`) and subsystems (client, server, node, topology, gossip, scheduler, services, etc.).
+- `crates/` - reusable libraries such as the Merkle Search Tree store, client bindings, and health checks.
+- `src/schema/` - Cap'n Proto schemas compiled by `build.rs`.
+- `tests/` - integration tests and shared harness utilities (`tests/common`).
+- `examples/` - sample service manifests like `replicated_service.ron`.
+- `setup-dev-cluster.sh` - helper script to spawn Lima-based dev clusters.
 
-To list the clusters, simply type:
+## Contributing
 
-```
-$ mantissa clusters list
-ID                   NAME          NODES
-3284900234950425920  aws-region-1  100
-8160031073963094169  aws-region-2  100
-```
-
-We have only one cluster available, so far so good, but let's see how many nodes we have inside that cluster:
-
-```
-$ mantissa nodes list
-ID                    HOSTNAME  ENDPOINT
-10142400562995393014  mantissa  127.0.0.1:6579
-14018497205078696097  mantissa  127.0.0.1:6580
-17777715967294288234  mantissa  127.0.0.1:6578
-```
-
-We have two processes attached to our mantissa cluster. It is ok to have multiple processes on the same node, mantissa is smart enough to detect that, in which case we can allow multiple users or group to share the same machine.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [Code-of-Conduct.md](Code-of-Conduct.md) for more information. Run `cargo fmt`, `cargo clippy`, and `cargo test` before opening a pull request.
 
 ## License
 
 Licensed under either of
 
-* Apache License, Version 2.0, (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
-* MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)
+- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
 at your option.
 
-### Contribution
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [Code-of-Conduct.md](Code-of-Conduct.md) for more information.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this repository by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
-
-### Authors
+## Authors
 
 **Alexandre Beslic**
 
-- [abronan.com](https://abronan.com)
-- [@abronan](https://twitter.com/abronan)
+- <https://abronan.com>
+- <https://twitter.com/abronan>
