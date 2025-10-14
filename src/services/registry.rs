@@ -104,6 +104,8 @@ mod tests {
                 cpu_millis: 0,
                 memory_bytes: 0,
                 restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
             }],
             vec![Uuid::new_v4()],
         );
@@ -133,6 +135,8 @@ mod tests {
                 cpu_millis: 0,
                 memory_bytes: 0,
                 restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
             }],
             vec![Uuid::new_v4(), Uuid::new_v4()],
         );

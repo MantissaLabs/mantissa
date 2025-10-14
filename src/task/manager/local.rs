@@ -134,6 +134,8 @@ impl TaskManager {
                 cpu_millis: plan.requested_cpu_millis,
                 memory_bytes: plan.requested_memory_bytes,
                 restart_policy: plan.restart_policy.clone(),
+                env: plan.env.clone(),
+                secret_files: plan.secret_files.clone(),
             };
 
             if let Err(err) = self.persist_spec(&spec).await {

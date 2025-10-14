@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::scheduler::summary::SchedulerSlotState;
 use crate::scheduler::{SchedulerSnapshot, SlotCapacity, SlotId, SlotState};
-use crate::task::types::TaskRestartPolicy;
+use crate::task::types::{TaskEnvironmentVariable, TaskRestartPolicy, TaskSecretFile};
 
 use super::{TaskManager, TaskStartRequest};
 
@@ -28,6 +28,8 @@ pub(super) struct BatchStartPlan {
     pub(super) index: usize,
     pub(super) preassigned: bool,
     pub(super) restart_policy: Option<TaskRestartPolicy>,
+    pub(super) env: Vec<TaskEnvironmentVariable>,
+    pub(super) secret_files: Vec<TaskSecretFile>,
 }
 
 impl BatchStartPlan {
@@ -50,6 +52,8 @@ pub(super) struct StartIntent {
     pub(super) memory_bytes: u64,
     pub(super) preassigned_slots: Vec<SlotId>,
     pub(super) restart_policy: Option<TaskRestartPolicy>,
+    pub(super) env: Vec<TaskEnvironmentVariable>,
+    pub(super) secret_files: Vec<TaskSecretFile>,
 }
 
 #[derive(Clone)]
@@ -166,6 +170,8 @@ pub(super) struct RemoteStartPlan {
     pub(super) peer_id: Uuid,
     pub(super) scheduler_version: u64,
     pub(super) restart_policy: Option<TaskRestartPolicy>,
+    pub(super) env: Vec<TaskEnvironmentVariable>,
+    pub(super) secret_files: Vec<TaskSecretFile>,
 }
 
 pub(super) struct Assignment {
@@ -190,6 +196,8 @@ impl TaskManager {
                 memory_bytes: request.memory_bytes,
                 preassigned_slots: request.slot_ids,
                 restart_policy: request.restart_policy,
+                env: request.env,
+                secret_files: request.secret_files,
             })
             .collect()
     }
@@ -337,6 +345,8 @@ impl TaskManager {
                 index: intent.index,
                 preassigned: true,
                 restart_policy: intent.restart_policy.clone(),
+                env: intent.env.clone(),
+                secret_files: intent.secret_files.clone(),
             });
         }
 
@@ -470,6 +480,8 @@ impl TaskManager {
                         index: intent.index,
                         preassigned: false,
                         restart_policy: intent.restart_policy.clone(),
+                        env: intent.env.clone(),
+                        secret_files: intent.secret_files.clone(),
                     });
                 }
                 CandidateLocation::Remote { peer_id, version } => {
@@ -485,6 +497,8 @@ impl TaskManager {
                         peer_id,
                         scheduler_version: version,
                         restart_policy: intent.restart_policy.clone(),
+                        env: intent.env.clone(),
+                        secret_files: intent.secret_files.clone(),
                     });
                 }
             }

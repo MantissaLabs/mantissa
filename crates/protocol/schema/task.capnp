@@ -1,5 +1,22 @@
 @0xc040d5aebc3fbc7e;
 
+struct SecretRef {
+  name @0 :Text;
+  versionId @1 :Data; # 16-byte UUID, empty = latest
+}
+
+struct EnvironmentVar {
+  name @0 :Text;
+  value @1 :Text;        # Optional literal value
+  secret @2 :SecretRef;  # Optional secret reference
+}
+
+struct SecretFile {
+  path @0 :Text;
+  secret @1 :SecretRef;
+  mode @2 :UInt32; # POSIX file mode, 0 = default 0o600
+}
+
 struct TaskSpec {
   id @0 :Data;        # UUID v4 as 16 bytes
   name @1 :Text;
@@ -13,6 +30,8 @@ struct TaskSpec {
   cpuMillis @9 :UInt64;
   memoryBytes @10 :UInt64;
   restartPolicy @11 :RestartPolicy;
+  env @12 :List(EnvironmentVar);
+  secretFiles @13 :List(SecretFile);
 }
 
 struct TaskStartRequest {
@@ -24,6 +43,8 @@ struct TaskStartRequest {
   slotIds @5 :List(UInt64);
   taskId @6 :Data;
   restartPolicy @7 :RestartPolicy;
+  env @8 :List(EnvironmentVar);
+  secretFiles @9 :List(SecretFile);
 }
 
 struct TaskStopRequest {

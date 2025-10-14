@@ -126,7 +126,6 @@ impl SecretKeyring {
 #[cfg(test)]
 mod tests {
     use super::SecretKeyring;
-    use crate::secrets::types::SecretCiphertext;
     use uuid::Uuid;
 
     #[test]

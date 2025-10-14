@@ -2,6 +2,7 @@
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use client::tasks::TasksListState;
 use std::path::PathBuf;
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -89,6 +90,13 @@ pub enum Command {
     Services {
         #[command(subcommand)]
         cmd: ServicesCommand,
+    },
+
+    /// Secrets management subcommands
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Secrets {
+        #[command(subcommand)]
+        cmd: SecretsCommand,
     },
 
     /// Submit a job to the cluster
@@ -305,6 +313,62 @@ pub struct ServicesStopArgs {
     /// Service ID (UUID)
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SecretsCommand {
+    /// Create a new secret or replace existing metadata
+    Create(SecretsCreateArgs),
+
+    /// Update an existing secret value
+    Update(SecretsCreateArgs),
+
+    /// List available secrets
+    #[command(alias = "ls")]
+    List,
+
+    /// Delete secrets by name
+    Delete(SecretsDeleteArgs),
+
+    /// Show the latest secret value
+    Show(SecretsShowArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SecretsCreateArgs {
+    /// Secret name
+    #[arg(index = 1, value_name = "NAME")]
+    pub name: String,
+
+    /// Plaintext value (if omitted, read from stdin)
+    #[arg(long = "value", short = 'v')]
+    pub value: Option<String>,
+
+    /// Description attached to the secret
+    #[arg(long = "description")]
+    pub description: Option<String>,
+
+    /// Optional labels in KEY=VALUE form (repeat flag to add multiple labels)
+    #[arg(long = "label", value_name = "KEY=VALUE", action = ArgAction::Append)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SecretsDeleteArgs {
+    /// Secret names to delete
+    #[arg(required = true, value_name = "NAME")]
+    pub names: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SecretsShowArgs {
+    /// Secret name to display
+    #[arg(index = 1, value_name = "NAME")]
+    pub name: String,
+
+    /// Optional secret version (UUID) to display
+    #[arg(long = "version")]
+    pub version: Option<Uuid>,
 }
 
 #[derive(Args, Debug)]

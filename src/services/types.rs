@@ -2,6 +2,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile};
+
 /// Value stored in the replicated service store describing desired service state.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServiceSpecValue {
@@ -64,6 +66,10 @@ pub struct ServiceTaskSpecValue {
     pub memory_bytes: u64,
     #[serde(default)]
     pub restart_policy: Option<ServiceTaskRestartPolicy>,
+    #[serde(default)]
+    pub env: Vec<TaskEnvironmentVariable>,
+    #[serde(default)]
+    pub secret_files: Vec<TaskSecretFile>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]

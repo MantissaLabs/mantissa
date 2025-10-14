@@ -998,6 +998,8 @@ fn make_replica_request(
         id: Some(desired_id),
         slot_ids: Vec::new(),
         restart_policy: template.restart_policy.as_ref().map(map_restart_policy),
+        env: template.env.clone(),
+        secret_files: template.secret_files.clone(),
     }
 }
 

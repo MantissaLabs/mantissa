@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
+use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 pub struct ServiceManifest {
@@ -42,6 +43,30 @@ pub enum RestartPolicyName {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct SecretReference {
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct EnvironmentVariable {
+    pub name: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub secret: Option<SecretReference>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SecretFileProjection {
+    pub path: String,
+    pub secret: SecretReference,
+    #[serde(default)]
+    pub mode: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct TaskSpec {
     pub name: String,
     pub image: String,
@@ -53,6 +78,10 @@ pub struct TaskSpec {
     pub resources: TaskResources,
     #[serde(default)]
     pub restart_policy: Option<TaskRestartPolicy>,
+    #[serde(default)]
+    pub env: Vec<EnvironmentVariable>,
+    #[serde(default)]
+    pub secret_files: Vec<SecretFileProjection>,
 }
 
 impl ServiceManifest {
@@ -118,6 +147,89 @@ impl ServiceManifest {
                             "task '{}' must set max_retry_count <= {}",
                             task.name,
                             i32::MAX
+                        ));
+                    }
+                }
+            }
+
+            for env in &task.env {
+                if env.name.trim().is_empty() {
+                    return Err(anyhow!(
+                        "task '{}' defines an environment variable with an empty name",
+                        task.name
+                    ));
+                }
+
+                if env.value.is_some() && env.secret.is_some() {
+                    return Err(anyhow!(
+                        "task '{}' environment '{}' must set either value or secret reference, not both",
+                        task.name,
+                        env.name
+                    ));
+                }
+
+                if env.value.is_none() && env.secret.is_none() {
+                    return Err(anyhow!(
+                        "task '{}' environment '{}' must set either value or secret reference",
+                        task.name,
+                        env.name
+                    ));
+                }
+
+                if let Some(secret) = &env.secret {
+                    if secret.name.trim().is_empty() {
+                        return Err(anyhow!(
+                            "task '{}' environment '{}' references a secret with an empty name",
+                            task.name,
+                            env.name
+                        ));
+                    }
+                    if let Some(version) = &secret.version {
+                        Uuid::parse_str(version).map_err(|_| {
+                            anyhow!(
+                                "task '{}' environment '{}' references invalid secret version '{}': expected UUID",
+                                task.name,
+                                env.name,
+                                version
+                            )
+                        })?;
+                    }
+                }
+            }
+
+            for file in &task.secret_files {
+                if file.path.trim().is_empty() {
+                    return Err(anyhow!(
+                        "task '{}' secret file path cannot be empty",
+                        task.name
+                    ));
+                }
+
+                if file.secret.name.trim().is_empty() {
+                    return Err(anyhow!(
+                        "task '{}' secret file '{}' references a secret with an empty name",
+                        task.name,
+                        file.path
+                    ));
+                }
+
+                if let Some(version) = &file.secret.version {
+                    Uuid::parse_str(version).map_err(|_| {
+                        anyhow!(
+                            "task '{}' secret file '{}' references invalid secret version '{}': expected UUID",
+                            task.name,
+                            file.path,
+                            version
+                        )
+                    })?;
+                }
+
+                if let Some(mode) = file.mode {
+                    if mode > 0o7777 {
+                        return Err(anyhow!(
+                            "task '{}' secret file '{}' must set a POSIX mode <= 0o7777",
+                            task.name,
+                            file.path
                         ));
                     }
                 }

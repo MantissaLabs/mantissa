@@ -220,6 +220,8 @@ async fn reconcile_rejects_missing_slot_assignments() {
         cpu_millis: 0,
         memory_bytes: 0,
         restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
     };
 
     let err = manager
@@ -377,6 +379,8 @@ async fn start_tasks_batch_reserves_every_slot() {
                 id: None,
                 slot_ids: Vec::new(),
                 restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
             },
             TaskStartRequest {
                 name: "svc-b".into(),
@@ -387,6 +391,8 @@ async fn start_tasks_batch_reserves_every_slot() {
                 id: None,
                 slot_ids: Vec::new(),
                 restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
             },
         ])
         .await
@@ -432,6 +438,8 @@ async fn start_tasks_batch_respects_existing_reservations() {
             id: Some(task_id),
             slot_ids: vec![slot_spec.slot_id],
             restart_policy: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
         }])
         .await
         .expect("start with pre-reserved slot");
@@ -480,6 +488,8 @@ async fn task_owned_locally_detects_remote_entries() {
         vec![1],
         100,
         64 * 1_024 * 1_024,
+        Vec::new(),
+        Vec::new(),
     );
 
     let store = manager.store.clone();
@@ -526,6 +536,8 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 id: None,
                 slot_ids: Vec::new(),
                 restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
             },
             TaskStartRequest {
                 name: "svc-d".into(),
@@ -536,6 +548,8 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 id: None,
                 slot_ids: Vec::new(),
                 restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
             },
         ])
         .await

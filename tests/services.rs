@@ -2,7 +2,8 @@
 mod common;
 
 use client::services::manifest::{
-    RestartPolicyName as ManifestRestartPolicyName, ServiceManifest, load_manifest_from_path,
+    RestartPolicyName as ManifestRestartPolicyName, SecretReference, ServiceManifest,
+    load_manifest_from_path,
 };
 use common::testkit::{
     ClusterConfig, ContainerManagerOverrideGuard, InMemoryContainerManager, TestNode,
@@ -13,7 +14,9 @@ use mantissa::services::types::{
     ServiceStatus, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
 };
 use mantissa::task::manager::TaskManager;
-use mantissa::task::types::TaskStateFilter;
+use mantissa::task::types::{
+    TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskStateFilter,
+};
 use protocol::services::services;
 use std::{
     collections::BTreeSet,
@@ -54,6 +57,8 @@ local_test!(services_gossip_propagates_across_peers, {
                 cpu_millis: 0,
                 memory_bytes: 0,
                 restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
             }],
         )
         .await
@@ -117,6 +122,8 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
         cpu_millis: 0,
         memory_bytes: 0,
         restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
     }];
 
     let service_id = node
@@ -170,6 +177,8 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                 cpu_millis: 500_000, // intentionally exceeds any single-node capacity
                 memory_bytes: 8 * 1024 * 1024 * 1024, // 8 GiB to force allocation failure
                 restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
             }],
         )
         .await
@@ -430,6 +439,8 @@ local_test!(services_redeploy_scales_replicas, {
         cpu_millis: 100,
         memory_bytes: 32 * 1024 * 1024,
         restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
     }];
 
     let service_id = node
@@ -532,6 +543,8 @@ local_test!(services_redeploy_updates_resources, {
         cpu_millis: 100,
         memory_bytes: 64 * 1024 * 1024,
         restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
     }];
 
     let service_id = node
@@ -702,8 +715,39 @@ fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskS
                         .max_retry_count
                         .map(|value| i32::try_from(value).expect("validated manifest bound")),
                 }),
+            env: task
+                .env
+                .iter()
+                .map(|var| TaskEnvironmentVariable {
+                    name: var.name.clone(),
+                    value: var.value.clone(),
+                    secret: var.secret.as_ref().map(|secret| TaskSecretReference {
+                        name: secret.name.clone(),
+                        version_id: parse_secret_version(secret),
+                    }),
+                })
+                .collect(),
+            secret_files: task
+                .secret_files
+                .iter()
+                .map(|file| TaskSecretFile {
+                    path: file.path.clone(),
+                    secret: TaskSecretReference {
+                        name: file.secret.name.clone(),
+                        version_id: parse_secret_version(&file.secret),
+                    },
+                    mode: file.mode,
+                })
+                .collect(),
         })
         .collect()
+}
+
+fn parse_secret_version(reference: &SecretReference) -> Option<Uuid> {
+    reference
+        .version
+        .as_ref()
+        .and_then(|v| Uuid::parse_str(v).ok())
 }
 
 async fn list_service_ids(client: &services::Client) -> Vec<Uuid> {

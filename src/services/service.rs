@@ -3,9 +3,12 @@ use crate::services::types::{
     ServiceEvent, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
     ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
 };
+use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use capnp::Error;
 use capnp::capability::Promise;
+use capnp::struct_list;
 use protocol::services::{service_event, service_spec, services, task_template};
+use protocol::task::{environment_var, secret_file, secret_ref};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -17,6 +20,100 @@ impl ServicesRPC {
     pub fn new(manager: ServiceController) -> Self {
         Self { manager }
     }
+}
+
+fn encode_secret_ref(mut builder: secret_ref::Builder<'_>, reference: &TaskSecretReference) {
+    builder.set_name(&reference.name);
+    if let Some(version_id) = reference.version_id {
+        builder.set_version_id(version_id.as_bytes());
+    } else {
+        builder.set_version_id(&[]);
+    }
+}
+
+fn decode_secret_ref(reader: secret_ref::Reader<'_>) -> Result<TaskSecretReference, Error> {
+    let name = reader.get_name()?.to_str()?.to_string();
+    let data = reader.get_version_id()?;
+    let version_id = if data.len() == 16 {
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&data);
+        Some(Uuid::from_bytes(bytes))
+    } else {
+        None
+    };
+
+    Ok(TaskSecretReference { name, version_id })
+}
+
+fn encode_env_vars(
+    builder: &mut struct_list::Builder<environment_var::Owned>,
+    vars: &[TaskEnvironmentVariable],
+) {
+    for (idx, var) in vars.iter().enumerate() {
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_name(&var.name);
+        if let Some(value) = &var.value {
+            entry.set_value(value);
+        }
+        if let Some(secret) = &var.secret {
+            let secret_builder = entry.reborrow().init_secret();
+            encode_secret_ref(secret_builder, secret);
+        }
+    }
+}
+
+fn decode_env_vars(
+    list: struct_list::Reader<environment_var::Owned>,
+) -> Result<Vec<TaskEnvironmentVariable>, Error> {
+    let mut env = Vec::with_capacity(list.len() as usize);
+    for entry in list.iter() {
+        let name = entry.get_name()?.to_str()?.to_string();
+        let value = if entry.has_value() {
+            Some(entry.get_value()?.to_str()?.to_string())
+        } else {
+            None
+        };
+        let secret = if entry.has_secret() {
+            Some(decode_secret_ref(entry.get_secret()?)?)
+        } else {
+            None
+        };
+        env.push(TaskEnvironmentVariable {
+            name,
+            value,
+            secret,
+        });
+    }
+    Ok(env)
+}
+
+fn encode_secret_files(
+    builder: &mut struct_list::Builder<secret_file::Owned>,
+    files: &[TaskSecretFile],
+) {
+    for (idx, file) in files.iter().enumerate() {
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_path(&file.path);
+        let secret_builder = entry.reborrow().init_secret();
+        encode_secret_ref(secret_builder, &file.secret);
+        entry.set_mode(file.mode.unwrap_or(0));
+    }
+}
+
+fn decode_secret_files(
+    list: struct_list::Reader<secret_file::Owned>,
+) -> Result<Vec<TaskSecretFile>, Error> {
+    let mut files = Vec::with_capacity(list.len() as usize);
+    for entry in list.iter() {
+        let path = entry.get_path()?.to_str()?.to_string();
+        let secret = decode_secret_ref(entry.get_secret()?)?;
+        let mode = match entry.get_mode() {
+            0 => None,
+            value => Some(value),
+        };
+        files.push(TaskSecretFile { path, secret, mode });
+    }
+    Ok(files)
 }
 
 #[async_trait::async_trait(?Send)]
@@ -216,6 +313,9 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         None
     };
 
+    let env = decode_env_vars(reader.get_env()?)?;
+    let secret_files = decode_secret_files(reader.get_secret_files()?)?;
+
     Ok(ServiceTaskSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
         image: reader.get_image()?.to_str()?.to_string(),
@@ -224,6 +324,8 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         cpu_millis: reader.get_cpu_millis(),
         memory_bytes: reader.get_memory_bytes(),
         restart_policy,
+        env,
+        secret_files,
     })
 }
 
@@ -277,6 +379,14 @@ fn write_task_template(
         policy_builder.set_name(name);
         policy_builder.set_max_retry_count(policy.max_retry_count.unwrap_or(-1));
     }
+
+    let mut env_builder = builder.reborrow().init_env(task.env.len() as u32);
+    encode_env_vars(&mut env_builder, &task.env);
+
+    let mut files_builder = builder
+        .reborrow()
+        .init_secret_files(task.secret_files.len() as u32);
+    encode_secret_files(&mut files_builder, &task.secret_files);
 
     Ok(())
 }

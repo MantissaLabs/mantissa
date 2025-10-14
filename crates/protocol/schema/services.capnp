@@ -1,5 +1,7 @@
 @0xf934ee53cdab0910;
 
+using TaskSchema = import "task.capnp";
+
 struct TaskTemplate {
   name @0 :Text;          # Logical task name (free-form string)
   image @1 :Text;         # Container image reference (e.g. ghcr.io/org/app:tag)
@@ -8,6 +10,8 @@ struct TaskTemplate {
   cpuMillis @4 :UInt64;   # Requested CPU in milli-cores per replica (0 uses scheduler default)
   memoryBytes @5 :UInt64; # Requested memory in bytes per replica (0 uses scheduler default)
   restartPolicy @6 :RestartPolicy; # Desired container restart behaviour (optional)
+  env @7 :List(TaskSchema.EnvironmentVar); # Environment variables (literal or secret-backed)
+  secretFiles @8 :List(TaskSchema.SecretFile); # Secret-backed file projections
 }
 
 enum RestartPolicyName {

@@ -1,13 +1,16 @@
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
-    TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskStateFilter, TaskStateKind,
+    TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSecretFile,
+    TaskSecretReference, TaskSpec, TaskStateFilter, TaskStateKind,
 };
 use capnp::Error;
 use capnp::capability::Promise;
+use capnp::struct_list;
 use protocol::gossip::gossip_message;
 use protocol::task::{
-    TaskStateFilter as CapnpTaskStateFilter, task, task_event, task_list_request, task_spec,
+    TaskStateFilter as CapnpTaskStateFilter, environment_var, secret_file, secret_ref, task,
+    task_event, task_list_request, task_spec,
 };
 use uuid::Uuid;
 
@@ -81,6 +84,70 @@ fn decode_restart_policy(
     })
 }
 
+fn encode_secret_ref(mut builder: secret_ref::Builder<'_>, reference: &TaskSecretReference) {
+    builder.set_name(&reference.name);
+    if let Some(version_id) = reference.version_id {
+        builder.set_version_id(version_id.as_bytes());
+    } else {
+        builder.set_version_id(&[]);
+    }
+}
+
+fn decode_secret_ref(reader: secret_ref::Reader<'_>) -> Result<TaskSecretReference, Error> {
+    let name = reader.get_name()?.to_str()?.to_string();
+    let data = reader.get_version_id()?;
+    let version_id = if data.len() == 16 {
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&data);
+        Some(Uuid::from_bytes(bytes))
+    } else {
+        None
+    };
+
+    Ok(TaskSecretReference { name, version_id })
+}
+
+fn decode_env_vars(
+    list: struct_list::Reader<environment_var::Owned>,
+) -> Result<Vec<TaskEnvironmentVariable>, Error> {
+    let mut env = Vec::with_capacity(list.len() as usize);
+    for entry in list.iter() {
+        let name = entry.get_name()?.to_str()?.to_string();
+        let value = if entry.has_value() {
+            Some(entry.get_value()?.to_str()?.to_string())
+        } else {
+            None
+        };
+        let secret = if entry.has_secret() {
+            Some(decode_secret_ref(entry.get_secret()?)?)
+        } else {
+            None
+        };
+        env.push(TaskEnvironmentVariable {
+            name,
+            value,
+            secret,
+        });
+    }
+    Ok(env)
+}
+
+fn decode_secret_files(
+    list: struct_list::Reader<secret_file::Owned>,
+) -> Result<Vec<TaskSecretFile>, Error> {
+    let mut files = Vec::with_capacity(list.len() as usize);
+    for entry in list.iter() {
+        let path = entry.get_path()?.to_str()?.to_string();
+        let secret = decode_secret_ref(entry.get_secret()?)?;
+        let mode = match entry.get_mode() {
+            0 => None,
+            value => Some(value),
+        };
+        files.push(TaskSecretFile { path, secret, mode });
+    }
+    Ok(files)
+}
+
 pub fn add_event(
     list: &mut capnp::struct_list::Builder<gossip_message::Owned>,
     index: u32,
@@ -107,7 +174,9 @@ pub fn add_event(
             spec_builder.reborrow().init_slot_ids(0);
             spec_builder.set_cpu_millis(0);
             spec_builder.set_memory_bytes(0);
-            spec_builder.init_command(0);
+            spec_builder.reborrow().init_command(0);
+            spec_builder.reborrow().init_env(0);
+            spec_builder.reborrow().init_secret_files(0);
         }
     }
 }
@@ -153,6 +222,30 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
         let restart_builder = builder.reborrow().init_restart_policy();
         encode_restart_policy(restart_builder, policy);
     }
+
+    let mut env_builder = builder.reborrow().init_env(spec.env.len() as u32);
+    for (idx, var) in spec.env.iter().enumerate() {
+        let mut entry = env_builder.reborrow().get(idx as u32);
+        entry.set_name(&var.name);
+        if let Some(value) = &var.value {
+            entry.set_value(value);
+        }
+        if let Some(secret) = &var.secret {
+            let secret_builder = entry.reborrow().init_secret();
+            encode_secret_ref(secret_builder, secret);
+        }
+    }
+
+    let mut files_builder = builder
+        .reborrow()
+        .init_secret_files(spec.secret_files.len() as u32);
+    for (idx, file) in spec.secret_files.iter().enumerate() {
+        let mut entry = files_builder.reborrow().get(idx as u32);
+        entry.set_path(&file.path);
+        let secret_builder = entry.reborrow().init_secret();
+        encode_secret_ref(secret_builder, &file.secret);
+        entry.set_mode(file.mode.unwrap_or(0));
+    }
 }
 
 pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
@@ -190,6 +283,9 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         None
     };
 
+    let env = decode_env_vars(reader.get_env()?)?;
+    let secret_files = decode_secret_files(reader.get_secret_files()?)?;
+
     Ok(TaskSpec {
         id,
         name,
@@ -204,6 +300,8 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         cpu_millis,
         memory_bytes,
         restart_policy,
+        env,
+        secret_files,
     })
 }
 
@@ -254,23 +352,39 @@ impl task::Server for TaskService {
             }
             let cpu_millis = req.get_cpu_millis();
             let memory_bytes = req.get_memory_bytes();
+            let mut slot_ids = Vec::new();
+            for slot_id in req.get_slot_ids()?.iter() {
+                slot_ids.push(slot_id);
+            }
             let restart_policy = if req.has_restart_policy() {
                 Some(decode_restart_policy(req.get_restart_policy()?)?)
             } else {
                 None
             };
+            let env = decode_env_vars(req.get_env()?)?;
+            let secret_files = decode_secret_files(req.get_secret_files()?)?;
 
-            let spec = manager
-                .start_container(
-                    name,
-                    image,
-                    command,
-                    cpu_millis,
-                    memory_bytes,
-                    restart_policy,
-                )
+            let request = TaskStartRequest {
+                name,
+                image,
+                command,
+                cpu_millis,
+                memory_bytes,
+                id: None,
+                slot_ids,
+                restart_policy,
+                env,
+                secret_files,
+            };
+
+            let mut specs = manager
+                .start_tasks_batch(vec![request])
                 .await
                 .map_err(|e| Error::failed(e.to_string()))?;
+
+            let spec = specs
+                .pop()
+                .ok_or_else(|| Error::failed("start batch returned no spec".to_string()))?;
 
             let mut out = results.get();
             let spec_builder = out.reborrow().init_spec();
@@ -317,6 +431,9 @@ impl task::Server for TaskService {
                     command.push(arg?.to_str()?.to_string());
                 }
 
+                let env = decode_env_vars(entry.get_env()?)?;
+                let secret_files = decode_secret_files(entry.get_secret_files()?)?;
+
                 let restart_policy = if entry.has_restart_policy() {
                     Some(decode_restart_policy(entry.get_restart_policy()?)?)
                 } else {
@@ -332,6 +449,8 @@ impl task::Server for TaskService {
                     id: task_id,
                     slot_ids,
                     restart_policy,
+                    env,
+                    secret_files,
                 });
             }
 

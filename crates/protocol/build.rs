@@ -11,6 +11,7 @@ fn main() {
         .file("schema/info.capnp")
         .file("schema/utils.capnp")
         .file("schema/sync.capnp")
-        .file("schema/health.capnp");
+        .file("schema/health.capnp")
+        .file("schema/secrets.capnp");
     cmd.run().expect("capnp compile schemas");
 }

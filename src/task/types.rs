@@ -22,6 +22,10 @@ pub struct TaskSpec {
     pub memory_bytes: u64,
     #[serde(default)]
     pub restart_policy: Option<TaskRestartPolicy>,
+    #[serde(default)]
+    pub env: Vec<TaskEnvironmentVariable>,
+    #[serde(default)]
+    pub secret_files: Vec<TaskSecretFile>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -129,6 +133,10 @@ pub struct TaskValue {
     pub memory_bytes: u64,
     #[serde(default)]
     pub restart_policy: Option<TaskRestartPolicy>,
+    #[serde(default)]
+    pub env: Vec<TaskEnvironmentVariable>,
+    #[serde(default)]
+    pub secret_files: Vec<TaskSecretFile>,
 }
 
 impl TaskValue {
@@ -144,6 +152,8 @@ impl TaskValue {
         slot_ids: Vec<u64>,
         cpu_millis: u64,
         memory_bytes: u64,
+        env: Vec<TaskEnvironmentVariable>,
+        secret_files: Vec<TaskSecretFile>,
     ) -> Self {
         let slot_id = slot_ids.first().copied();
         Self {
@@ -160,6 +170,8 @@ impl TaskValue {
             cpu_millis,
             memory_bytes,
             restart_policy: None,
+            env,
+            secret_files,
         }
     }
 }
@@ -177,4 +189,28 @@ pub enum TaskRestartPolicyKind {
     Always,
     OnFailure,
     UnlessStopped,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskSecretReference {
+    pub name: String,
+    #[serde(default)]
+    pub version_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskEnvironmentVariable {
+    pub name: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub secret: Option<TaskSecretReference>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskSecretFile {
+    pub path: String,
+    pub secret: TaskSecretReference,
+    #[serde(default)]
+    pub mode: Option<u32>,
 }

@@ -5,7 +5,10 @@ use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
 use crate::task::docker::ContainerError;
 use crate::task::docker::ContainerManager;
-use crate::task::types::{TaskEvent, TaskRestartPolicy, TaskSpec, TaskStateFilter, TaskValue};
+use crate::task::types::{
+    TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskSpec,
+    TaskStateFilter, TaskValue,
+};
 use async_channel::{Receiver, Sender};
 use bollard::errors::Error as BollardError;
 use crdt_store::uuid_key::UuidKey;
@@ -51,6 +54,8 @@ pub struct TaskStartRequest {
     pub id: Option<Uuid>,
     pub slot_ids: Vec<SlotId>,
     pub restart_policy: Option<TaskRestartPolicy>,
+    pub env: Vec<TaskEnvironmentVariable>,
+    pub secret_files: Vec<TaskSecretFile>,
 }
 
 impl TaskManager {
@@ -96,6 +101,8 @@ impl TaskManager {
             id: None,
             slot_ids: Vec::new(),
             restart_policy,
+            env: Vec::new(),
+            secret_files: Vec::new(),
         };
 
         let mut specs = self.start_tasks_batch(vec![request]).await?;
@@ -368,5 +375,7 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         cpu_millis: value.cpu_millis,
         memory_bytes: value.memory_bytes,
         restart_policy: value.restart_policy,
+        env: value.env,
+        secret_files: value.secret_files,
     }
 }

@@ -1,8 +1,13 @@
-use super::manifest::{RestartPolicyName, ServiceManifest, TaskSpec};
+use super::manifest::{
+    EnvironmentVariable, RestartPolicyName, SecretFileProjection, SecretReference, ServiceManifest,
+    TaskSpec,
+};
 use crate::config::ClientConfig;
 use crate::connection;
 use anyhow::{Context, Result, anyhow};
+use capnp::struct_list;
 use protocol::services::task_template;
+use protocol::task::{environment_var, secret_file, secret_ref};
 use uuid::Uuid;
 
 /// Identifies the asynchronous deployment issued against the cluster so callers can poll status.
@@ -10,6 +15,58 @@ use uuid::Uuid;
 pub struct ServiceDeploymentHandle {
     pub service_id: Uuid,
     pub manifest_id: Uuid,
+}
+
+fn write_secret_reference(
+    mut builder: secret_ref::Builder<'_>,
+    reference: &SecretReference,
+    context: &str,
+) -> Result<()> {
+    builder.set_name(&reference.name);
+    if let Some(version) = &reference.version {
+        let uuid = Uuid::parse_str(version)
+            .with_context(|| format!("invalid secret version '{}' for {context}", version))?;
+        builder.set_version_id(uuid.as_bytes());
+    } else {
+        builder.set_version_id(&[]);
+    }
+    Ok(())
+}
+
+fn write_env_vars(
+    builder: &mut struct_list::Builder<environment_var::Owned>,
+    vars: &[EnvironmentVariable],
+    task_name: &str,
+) -> Result<()> {
+    for (idx, var) in vars.iter().enumerate() {
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_name(&var.name);
+        if let Some(value) = &var.value {
+            entry.set_value(value);
+        }
+        if let Some(secret) = &var.secret {
+            let secret_builder = entry.reborrow().init_secret();
+            let context = format!("task '{}' environment '{}': secret", task_name, var.name);
+            write_secret_reference(secret_builder, secret, &context)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_secret_files(
+    builder: &mut struct_list::Builder<secret_file::Owned>,
+    files: &[SecretFileProjection],
+    task_name: &str,
+) -> Result<()> {
+    for (idx, file) in files.iter().enumerate() {
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_path(&file.path);
+        let secret_builder = entry.reborrow().init_secret();
+        let context = format!("task '{}' secret file '{}': secret", task_name, file.path);
+        write_secret_reference(secret_builder, &file.secret, &context)?;
+        entry.set_mode(file.mode.unwrap_or(0));
+    }
+    Ok(())
 }
 
 /// Submits a service manifest to the local coordinator, returning immediately with the service id.
@@ -32,7 +89,7 @@ pub async fn deploy_manifest(
 
         let mut tasks_builder = spec.reborrow().init_tasks(manifest.tasks.len() as u32);
         for (idx, task) in manifest.tasks.iter().enumerate() {
-            write_task(tasks_builder.reborrow().get(idx as u32), task);
+            write_task(tasks_builder.reborrow().get(idx as u32), task)?;
         }
     }
 
@@ -75,7 +132,7 @@ pub async fn deploy_manifest(
 }
 
 /// Writes a manifest task specification into the Cap'n Proto builder for submission.
-fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) {
+fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) -> Result<()> {
     builder.set_name(&task.name);
     builder.set_image(&task.image);
     builder.set_replicas(task.replicas);
@@ -102,4 +159,14 @@ fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) {
             i32::try_from(value).expect("validated restart policy bound")
         }));
     }
+
+    let mut env_builder = builder.reborrow().init_env(task.env.len() as u32);
+    write_env_vars(&mut env_builder, &task.env, &task.name)?;
+
+    let mut files_builder = builder
+        .reborrow()
+        .init_secret_files(task.secret_files.len() as u32);
+    write_secret_files(&mut files_builder, &task.secret_files, &task.name)?;
+
+    Ok(())
 }

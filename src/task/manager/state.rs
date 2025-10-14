@@ -36,6 +36,8 @@ impl TaskManager {
             spec.slot_ids.clone(),
             spec.cpu_millis,
             spec.memory_bytes,
+            spec.env.clone(),
+            spec.secret_files.clone(),
         );
 
         value.restart_policy = spec.restart_policy.clone();

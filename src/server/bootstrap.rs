@@ -4,6 +4,8 @@ use crate::registry::Registry;
 use crate::scheduler::Scheduler;
 use crate::scheduler::service::SchedulerService;
 use crate::secrets::crypto::SecretKeyring;
+use crate::secrets::registry::SecretRegistry;
+use crate::secrets::service::SecretsService;
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerStores};
@@ -27,6 +29,7 @@ use crate::{node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::scheduling::scheduler::Client as SchedulerClient;
+use protocol::secrets::secrets::Client as SecretsClient;
 use protocol::server::server::Client as ServerClient;
 use protocol::services::services::Client as ServicesClient;
 use protocol::topology::topology::Client as TopologyClient;
@@ -110,6 +113,9 @@ pub(crate) struct Components {
     #[allow(dead_code)]
     pub registry: Registry,
     pub services_client: ServicesClient,
+    #[allow(dead_code)]
+    pub secret_registry: SecretRegistry,
+    pub secrets_client: SecretsClient,
 }
 
 impl Bootstrap {
@@ -347,6 +353,11 @@ impl Bootstrap {
         let services_service = ServicesRPC::new(service_controller.clone());
         let services_client_cap = capnp_rpc::new_client(services_service);
 
+        let secret_registry = SecretRegistry::new(stores.secrets.clone());
+        let secrets_service =
+            SecretsService::new(secret_registry.clone(), stores.secret_keyring.clone());
+        let secrets_client_cap: SecretsClient = capnp_rpc::new_client(secrets_service);
+
         let scheduler_service =
             SchedulerService::new(scheduler.clone(), ctx.self_id, local_node_name.clone());
         let scheduler_client_cap = capnp_rpc::new_client(scheduler_service);
@@ -364,6 +375,8 @@ impl Bootstrap {
                 scheduler_client: scheduler_client_cap,
                 registry,
                 services_client: services_client_cap,
+                secret_registry,
+                secrets_client: secrets_client_cap,
             },
             gossip_rx,
         ))
@@ -386,6 +399,7 @@ impl Bootstrap {
             task_client,
             scheduler_client: comps.scheduler_client.clone(),
             services_client: comps.services_client.clone(),
+            secrets_client: comps.secrets_client.clone(),
         };
 
         let stores_bundle = ServerStores {
