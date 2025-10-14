@@ -61,6 +61,7 @@ impl TaskManager {
             }
             TaskEvent::Remove { id } => {
                 self.local_containers.lock().await.remove(&id);
+                self.cleanup_secret_artifacts(id).await;
                 self.remove_spec(id).await
             }
         }

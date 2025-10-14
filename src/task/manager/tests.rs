@@ -4,9 +4,12 @@ use super::*;
 
 use crate::registry::Registry;
 use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
+use crate::secrets::crypto::SecretKeyring;
+use crate::secrets::registry::SecretRegistry;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::open_peers_store;
 use crate::store::scheduler_store::open_scheduler_store;
+use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
 use crate::task::types::{TaskStateKind, TaskValue};
 use ::health::{Config as HealthConfig, HealthMonitor};
@@ -137,6 +140,16 @@ async fn setup_manager() -> (TaskManager, Rc<Scheduler>, Arc<MockContainerManage
         .await
         .expect("rebuild task store");
 
+    let (secret_db, _secret_dir) = temp_db("secrets");
+    let secret_store = open_secret_store(secret_db.clone(), actor).expect("open secret store");
+    secret_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild secret store");
+    let secret_registry = SecretRegistry::new(secret_store);
+    let secret_keyring =
+        SecretKeyring::derive_from_token("MNTISA-TEST-TOKEN").expect("derive secret keyring");
+
     let (tx, rx) = bounded(64);
     let mock_cm = Arc::new(MockContainerManager::default());
     let signing_key = SigningKey::try_from(&[7u8; 32][..]).expect("signing key");
@@ -161,6 +174,8 @@ async fn setup_manager() -> (TaskManager, Rc<Scheduler>, Arc<MockContainerManage
         scheduler.clone(),
         mock_cm.clone(),
         registry,
+        secret_registry,
+        secret_keyring,
     );
 
     (manager, scheduler, mock_cm)

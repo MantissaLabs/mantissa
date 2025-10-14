@@ -322,6 +322,8 @@ impl Bootstrap {
             .clone()
             .unwrap_or_else(|| ctx.listen_addr.clone());
 
+        let secret_registry = SecretRegistry::new(stores.secrets.clone());
+
         let container_manager: Arc<dyn ContainerManager + Send + Sync> =
             if let Some(manager) = docker::container_manager_override() {
                 manager
@@ -341,6 +343,8 @@ impl Bootstrap {
             scheduler.clone(),
             container_manager,
             registry.clone(),
+            secret_registry.clone(),
+            stores.secret_keyring.clone(),
         );
 
         let service_registry = ServiceRegistry::new(stores.services.clone());
@@ -353,7 +357,6 @@ impl Bootstrap {
         let services_service = ServicesRPC::new(service_controller.clone());
         let services_client_cap = capnp_rpc::new_client(services_service);
 
-        let secret_registry = SecretRegistry::new(stores.secrets.clone());
         let secrets_service =
             SecretsService::new(secret_registry.clone(), stores.secret_keyring.clone());
         let secrets_client_cap: SecretsClient = capnp_rpc::new_client(secrets_service);

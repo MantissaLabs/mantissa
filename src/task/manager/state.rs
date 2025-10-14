@@ -252,6 +252,8 @@ impl TaskManager {
             }
         }
 
+        self.cleanup_secret_artifacts(id).await;
+
         updated.state = ContainerState::Stopped;
         if !spec.slot_ids.is_empty() {
             for slot_id in &spec.slot_ids {
@@ -290,6 +292,8 @@ impl TaskManager {
             let mut guard = self.local_containers.lock().await;
             guard.remove(&task_id);
         }
+
+        self.cleanup_secret_artifacts(task_id).await;
 
         if !spec.slot_ids.is_empty() {
             for slot_id in &spec.slot_ids {
@@ -412,6 +416,20 @@ impl TaskManager {
             working.memory_bytes,
         );
 
+        let mut resolved = self
+            .resolve_runtime_secrets(working.id, &working.env, &working.secret_files)
+            .await?;
+        let env_vars = if resolved.env.is_empty() {
+            None
+        } else {
+            Some(resolved.env.clone())
+        };
+        let volumes = if resolved.mounts.is_empty() {
+            None
+        } else {
+            Some(resolved.mounts.clone())
+        };
+
         let container_name = format!("mantissa-{}", working.id);
 
         let create_outcome = self
@@ -424,9 +442,9 @@ impl TaskManager {
                 } else {
                     Some(working.command.clone())
                 },
+                env_vars,
                 None,
-                None,
-                None,
+                volumes,
                 restart_policy,
                 resource_limits,
             )
@@ -439,12 +457,30 @@ impl TaskManager {
                     match self.resolve_existing_container_id(&container_name).await {
                         Ok(Some(existing_id)) => (existing_id, false),
                         Ok(None) => {
+                            if let Some(artifacts) = resolved.artifacts.take() {
+                                if let Err(clean_err) = artifacts.cleanup().await {
+                                    warn!(
+                                        target: "task",
+                                        "failed to cleanup staged secrets after missing container {}: {clean_err}",
+                                        working.id
+                                    );
+                                }
+                            }
                             let err = self
                                 .mark_task_failed(working, wrap_create_error(&task_name, err))
                                 .await;
                             return Err(err);
                         }
                         Err(inspect_err) => {
+                            if let Some(artifacts) = resolved.artifacts.take() {
+                                if let Err(clean_err) = artifacts.cleanup().await {
+                                    warn!(
+                                        target: "task",
+                                        "failed to cleanup staged secrets after inspect error for {}: {clean_err}",
+                                        working.id
+                                    );
+                                }
+                            }
                             let err = self
                                 .mark_task_failed(
                                     working,
@@ -455,6 +491,15 @@ impl TaskManager {
                         }
                     }
                 } else {
+                    if let Some(artifacts) = resolved.artifacts.take() {
+                        if let Err(clean_err) = artifacts.cleanup().await {
+                            warn!(
+                                target: "task",
+                                "failed to cleanup staged secrets after create error for {}: {clean_err}",
+                                working.id
+                            );
+                        }
+                    }
                     let err = self
                         .mark_task_failed(working, wrap_create_error(&task_name, err))
                         .await;
@@ -462,6 +507,11 @@ impl TaskManager {
                 }
             }
         };
+
+        if let Some(artifacts) = resolved.artifacts.take() {
+            let mut guard = self.secret_artifacts.lock().await;
+            guard.insert(working.id, artifacts);
+        }
 
         match self.container_manager.start_container(&container_id).await {
             Ok(_) => {}
@@ -575,6 +625,7 @@ impl TaskManager {
     pub(super) async fn ensure_task_stopped(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
         if matches!(spec.state, ContainerState::Stopped) {
             self.local_containers.lock().await.remove(&spec.id);
+            self.cleanup_secret_artifacts(spec.id).await;
             return Ok(());
         }
 
@@ -584,6 +635,7 @@ impl TaskManager {
         };
 
         if !has_container {
+            self.cleanup_secret_artifacts(spec.id).await;
             return Ok(());
         }
 

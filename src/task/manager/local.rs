@@ -74,7 +74,21 @@ impl TaskManager {
                 plan.requested_memory_bytes,
             );
 
-            let container_id = self
+            let mut resolved = self
+                .resolve_runtime_secrets(plan.id, &plan.env, &plan.secret_files)
+                .await?;
+            let env_vars = if resolved.env.is_empty() {
+                None
+            } else {
+                Some(resolved.env.clone())
+            };
+            let volumes = if resolved.mounts.is_empty() {
+                None
+            } else {
+                Some(resolved.mounts.clone())
+            };
+
+            let create_result = self
                 .container_manager
                 .create_container(
                     &plan.container_name,
@@ -84,14 +98,36 @@ impl TaskManager {
                     } else {
                         Some(plan.command.clone())
                     },
+                    env_vars,
                     None,
-                    None,
-                    None,
+                    volumes,
                     restart_policy,
                     resource_limits,
                 )
-                .await
-                .with_context(|| format!("docker create failed for task {}", plan.name))?;
+                .await;
+
+            let container_id = match create_result {
+                Ok(id) => id,
+                Err(err) => {
+                    if let Some(artifacts) = resolved.artifacts.take() {
+                        if let Err(clean_err) = artifacts.cleanup().await {
+                            warn!(
+                                target: "task",
+                                "failed to cleanup staged secrets after create error for task {}: {clean_err}",
+                                plan.id
+                            );
+                        }
+                    }
+                    let err = anyhow::Error::from(err)
+                        .context(format!("docker create failed for task {}", plan.name));
+                    return Err(err);
+                }
+            };
+
+            if let Some(artifacts) = resolved.artifacts.take() {
+                let mut guard = self.secret_artifacts.lock().await;
+                guard.insert(plan.id, artifacts);
+            }
 
             plan.container_id = Some(container_id.clone());
 
@@ -201,6 +237,8 @@ impl TaskManager {
                 let mut guard = self.local_containers.lock().await;
                 guard.remove(&plan.id);
             }
+
+            self.cleanup_secret_artifacts(plan.id).await;
 
             for slot in &plan.slots {
                 if let Err(err) = self.release_slot(slot.slot_id).await {

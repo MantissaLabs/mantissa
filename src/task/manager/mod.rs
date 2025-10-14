@@ -1,6 +1,8 @@
 use crate::gossip::Message;
 use crate::registry::Registry;
 use crate::scheduler::{Scheduler, SlotId};
+use crate::secrets::crypto::SecretKeyring;
+use crate::secrets::registry::SecretRegistry;
 use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
 use crate::task::docker::ContainerError;
@@ -13,6 +15,7 @@ use async_channel::{Receiver, Sender};
 use bollard::errors::Error as BollardError;
 use crdt_store::uuid_key::UuidKey;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -23,12 +26,14 @@ mod local;
 mod planner;
 mod reservation;
 mod runtime;
+mod secrets;
 mod state;
 
 #[cfg(test)]
 mod tests;
 
 use self::reservation::{ExecutionError, RemoteReservation};
+use self::secrets::TaskSecretArtifacts;
 
 #[derive(Clone)]
 pub struct TaskManager {
@@ -42,6 +47,10 @@ pub struct TaskManager {
     container_manager: Arc<dyn ContainerManager + Send + Sync>,
     local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
     registry: Registry,
+    secret_registry: SecretRegistry,
+    secret_keyring: SecretKeyring,
+    secret_artifacts: Arc<AsyncMutex<HashMap<Uuid, TaskSecretArtifacts>>>,
+    secret_runtime_root: PathBuf,
 }
 
 #[derive(Clone)]
@@ -68,7 +77,14 @@ impl TaskManager {
         scheduler: Rc<Scheduler>,
         container_manager: Arc<dyn ContainerManager + Send + Sync>,
         registry: Registry,
+        secret_registry: SecretRegistry,
+        secret_keyring: SecretKeyring,
     ) -> Self {
+        let secret_runtime_root = std::env::temp_dir()
+            .join("mantissa")
+            .join("secrets")
+            .join(local_node_id.to_string());
+
         Self {
             store,
             tx,
@@ -80,6 +96,10 @@ impl TaskManager {
             container_manager,
             local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
             registry,
+            secret_registry,
+            secret_keyring,
+            secret_artifacts: Arc::new(AsyncMutex::new(HashMap::new())),
+            secret_runtime_root,
         }
     }
 
