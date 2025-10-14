@@ -1,4 +1,7 @@
 use crate::gossip::Message;
+use crate::services::reconcile::{
+    ReplicaReplacement, ServiceTaskAssignment, compute_change_plan, parse_template_and_replica,
+};
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
     ServiceEvent, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
@@ -11,7 +14,7 @@ use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -140,12 +143,58 @@ impl ServiceController {
         let service_id = compute_service_id(&service_name);
 
         if let Some(existing) = self.registry.get(service_id)? {
-            if existing.status() != ServiceStatus::Stopped {
-                return Err(anyhow!(
-                    "service '{}' already exists; stop it before deploying again",
-                    service_name
-                ));
+            match existing.status() {
+                ServiceStatus::Stopping => {
+                    return Err(anyhow!(
+                        "service '{}' is currently stopping; wait for completion before redeploying",
+                        service_name
+                    ));
+                }
+                ServiceStatus::Deploying => {
+                    return Err(anyhow!(
+                        "service '{}' already has a deployment in progress",
+                        service_name
+                    ));
+                }
+                _ => {}
             }
+
+            let current_spec = existing.clone();
+            let mut pending_spec = existing;
+            pending_spec.manifest_id = manifest_id;
+            pending_spec.manifest_name = manifest_name.clone();
+            pending_spec.tasks = tasks.clone();
+            pending_spec.set_status(ServiceStatus::Deploying);
+
+            tracing::info!(
+                target: "services",
+                "starting redeployment for '{}' with manifest {}",
+                service_name,
+                manifest_id
+            );
+
+            self.apply_upsert(pending_spec.clone()).await?;
+            self.broadcast(ServiceEvent::Upsert(pending_spec)).await?;
+
+            let job = ServiceRedeploymentJob {
+                manifest_id,
+                manifest_name,
+                service_name,
+                templates: tasks,
+                current_spec,
+            };
+
+            let controller = self.clone();
+            let _ = tokio::task::spawn_local(async move {
+                if let Err(err) = controller.execute_redeployment(job).await {
+                    tracing::warn!(
+                        target: "services",
+                        "service redeployment failed: {err}"
+                    );
+                }
+            });
+
+            return Ok(service_id);
         }
 
         let mut pending_spec = ServiceSpecValue::new(
@@ -304,6 +353,183 @@ impl ServiceController {
         );
 
         Ok(())
+    }
+
+    /// Reconciles an existing service with a refreshed manifest by scaling and replacing replicas.
+    async fn execute_redeployment(self, job: ServiceRedeploymentJob) -> anyhow::Result<()> {
+        let ServiceRedeploymentJob {
+            manifest_id,
+            manifest_name,
+            service_name,
+            templates,
+            current_spec,
+        } = job;
+
+        let previous_status = current_spec.status();
+        let assignments = self
+            .collect_assignments(&service_name, &current_spec.task_ids)
+            .await;
+
+        let plan = compute_change_plan(&current_spec.tasks, &templates, assignments);
+
+        if plan.is_noop() {
+            let mut updated = current_spec.clone();
+            updated.manifest_id = manifest_id;
+            updated.manifest_name = manifest_name;
+            updated.tasks = templates;
+            updated.set_status(previous_status);
+            self.apply_upsert(updated.clone()).await?;
+            self.broadcast(ServiceEvent::Upsert(updated)).await?;
+            tracing::info!(
+                target: "services",
+                "redeployment for '{}' detected no changes",
+                service_name
+            );
+            return Ok(());
+        }
+
+        let retain = plan.retain;
+        let replace = plan.replace;
+        let remove = plan.remove;
+
+        tracing::info!(
+            target: "services",
+            "redeployment plan for '{}': {} replacements, {} removals, {} retained replicas",
+            service_name,
+            replace.len(),
+            remove.len(),
+            retain.len()
+        );
+
+        let start_requests = build_replacement_requests(&service_name, &replace);
+        let mut started_specs = Vec::new();
+        if !start_requests.is_empty() {
+            match self.task_manager.start_tasks_batch(start_requests).await {
+                Ok(specs) => {
+                    if specs.len() != replace.len() {
+                        tracing::warn!(
+                            target: "services",
+                            "replacement count mismatch for '{}': expected {}, got {}",
+                            service_name,
+                            replace.len(),
+                            specs.len()
+                        );
+                    }
+                    started_specs = specs;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to launch replacement replicas for '{}': {err}",
+                        service_name
+                    );
+
+                    let mut rollback = current_spec.clone();
+                    rollback.set_status(previous_status);
+                    self.apply_upsert(rollback.clone()).await?;
+                    self.broadcast(ServiceEvent::Upsert(rollback)).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let mut assignment_index: BTreeMap<(String, u16), Uuid> = BTreeMap::new();
+        for assignment in &retain {
+            assignment_index.insert(
+                (assignment.template.clone(), assignment.replica),
+                assignment.task_id,
+            );
+        }
+
+        for (replacement, spec) in replace.iter().zip(started_specs.iter()) {
+            assignment_index.insert(
+                (replacement.template.name.clone(), replacement.replica),
+                spec.id,
+            );
+        }
+
+        let ordered_task_ids = order_task_ids(&service_name, &templates, &assignment_index);
+        let mut next_spec = ServiceSpecValue::new(
+            manifest_id,
+            manifest_name.clone(),
+            service_name.clone(),
+            templates.clone(),
+            ordered_task_ids,
+        );
+        next_spec.set_status(ServiceStatus::Deploying);
+        self.apply_upsert(next_spec.clone()).await?;
+        self.broadcast(ServiceEvent::Upsert(next_spec.clone()))
+            .await?;
+
+        let readiness_spec = next_spec.clone();
+        let controller = self.clone();
+        tokio::task::spawn_local(async move {
+            controller.await_service_readiness(readiness_spec).await;
+        });
+
+        let mut retire = HashSet::new();
+        for assignment in remove {
+            retire.insert(assignment.task_id);
+        }
+        for replacement in &replace {
+            if let Some(previous) = &replacement.previous {
+                retire.insert(previous.task_id);
+            }
+        }
+
+        if !retire.is_empty() {
+            let controller = self.clone();
+            tokio::task::spawn_local(async move {
+                for task_id in retire {
+                    if let Err(err) = controller.task_manager.stop_task(task_id).await {
+                        tracing::warn!(
+                            target: "services",
+                            "failed to stop retired task {task_id}: {err}"
+                        );
+                    }
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Builds the current assignment view for a service by inspecting every tracked task id.
+    async fn collect_assignments(
+        &self,
+        service_name: &str,
+        task_ids: &[Uuid],
+    ) -> Vec<ServiceTaskAssignment> {
+        let mut assignments = Vec::new();
+        for task_id in task_ids {
+            match self.task_manager.inspect_task(*task_id).await {
+                Ok(spec) => {
+                    if let Some((template, replica)) =
+                        parse_template_and_replica(service_name, &spec.name)
+                    {
+                        assignments.push(ServiceTaskAssignment {
+                            task_id: spec.id,
+                            template,
+                            replica,
+                        });
+                    } else {
+                        tracing::debug!(
+                            target: "services",
+                            "unable to map task '{}' back to service '{}' template",
+                            spec.name,
+                            service_name
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to inspect task {task_id} for service '{service_name}': {err}"
+                    );
+                }
+            }
+        }
+        assignments
     }
 
     /// Waits until every task created for a deployment reports a terminal state. Retries failed
@@ -465,6 +691,14 @@ struct ServiceDeploymentJob {
     manifest_name: String,
     service_name: String,
     templates: Vec<ServiceTaskSpecValue>,
+}
+
+struct ServiceRedeploymentJob {
+    manifest_id: Uuid,
+    manifest_name: String,
+    service_name: String,
+    templates: Vec<ServiceTaskSpecValue>,
+    current_spec: ServiceSpecValue,
 }
 
 enum ReadinessOutcome {
@@ -688,28 +922,95 @@ fn build_start_requests(
 ) -> Vec<TaskStartRequest> {
     let mut requests = Vec::new();
     for task in tasks {
-        let base_name = format!("{service_name}-{}", task.name);
         for replica_idx in 0..task.replicas {
             let replica_number = replica_idx + 1;
-            let name = if task.replicas > 1 {
-                format!("{base_name}-{replica_number}")
-            } else {
-                base_name.clone()
-            };
-
-            requests.push(TaskStartRequest {
-                name,
-                image: task.image.clone(),
-                command: task.command.clone(),
-                cpu_millis: task.cpu_millis,
-                memory_bytes: task.memory_bytes,
-                id: None,
-                slot_ids: Vec::new(),
-                restart_policy: task.restart_policy.as_ref().map(map_restart_policy),
-            });
+            let desired_id = Uuid::new_v4();
+            requests.push(make_replica_request(
+                service_name,
+                task,
+                replica_number,
+                desired_id,
+            ));
         }
     }
     requests
+}
+
+/// Builds start requests for replacements so we can map spawn order to replica targets.
+fn build_replacement_requests(
+    service_name: &str,
+    replacements: &[ReplicaReplacement],
+) -> Vec<TaskStartRequest> {
+    replacements
+        .iter()
+        .map(|replacement| {
+            make_replica_request(
+                service_name,
+                &replacement.template,
+                replacement.replica,
+                replacement.desired_id,
+            )
+        })
+        .collect()
+}
+
+/// Computes the ordered task identifiers for the manifest by iterating template/replica pairs.
+fn order_task_ids(
+    service_name: &str,
+    templates: &[ServiceTaskSpecValue],
+    assignments: &BTreeMap<(String, u16), Uuid>,
+) -> Vec<Uuid> {
+    let mut ids = Vec::new();
+    for template in templates {
+        for replica in 1..=template.replicas {
+            let key = (template.name.clone(), replica);
+            match assignments.get(&key) {
+                Some(task_id) => ids.push(*task_id),
+                None => {
+                    tracing::warn!(
+                        target: "services",
+                        "missing replica assignment for template '{}' replica {} while updating '{}'",
+                        template.name,
+                        replica,
+                        service_name
+                    );
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Generates a task start request for a specific manifest replica with deterministic metadata.
+fn make_replica_request(
+    service_name: &str,
+    template: &ServiceTaskSpecValue,
+    replica: u16,
+    desired_id: Uuid,
+) -> TaskStartRequest {
+    let name = format_replica_name(service_name, &template.name, replica, desired_id);
+    TaskStartRequest {
+        name,
+        image: template.image.clone(),
+        command: template.command.clone(),
+        cpu_millis: template.cpu_millis,
+        memory_bytes: template.memory_bytes,
+        id: Some(desired_id),
+        slot_ids: Vec::new(),
+        restart_policy: template.restart_policy.as_ref().map(map_restart_policy),
+    }
+}
+
+/// Formats a human-readable container name that encodes template, replica, and unique identity.
+fn format_replica_name(service_name: &str, template_name: &str, replica: u16, id: Uuid) -> String {
+    let suffix = short_id(&id);
+    format!("{service_name}-{template_name}-{replica}-{suffix}")
+}
+
+/// Produces a stable, human-readable identifier fragment for inclusion in container names.
+fn short_id(id: &Uuid) -> String {
+    let raw = id.as_simple().to_string();
+    raw[..8].to_string()
 }
 
 /// Converts the service restart policy representation into a task manager policy structure.

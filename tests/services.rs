@@ -411,6 +411,219 @@ local_test!(services_sync_recovers_missing_entries, {
     assert_eq!(restored_ids, expected_ids, "sync restored tasks");
 });
 
+local_test!(services_redeploy_scales_replicas, {
+    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let node = TestNode::new().await;
+
+    let service_name = "redeploy-scale";
+    let manifest_name = "redeploy-scale";
+
+    let mut tasks = vec![ServiceTaskSpecValue {
+        name: "echo".into(),
+        image: "alpine:3.20".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "while true; do sleep 1; done".into(),
+        ],
+        replicas: 1,
+        cpu_millis: 100,
+        memory_bytes: 32 * 1024 * 1024,
+        restart_policy: None,
+    }];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
+        .await
+        .expect("submit initial deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "service should reach running state before redeploy"
+    );
+    assert!(
+        wait_for_task_count(&node.node.task_manager, 1, Duration::from_secs(5)).await,
+        "initial deployment should launch a single replica"
+    );
+
+    let initial_spec = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read initial spec")
+        .expect("initial spec present");
+    let initial_ids: BTreeSet<Uuid> = initial_spec.task_ids.iter().cloned().collect();
+    assert_eq!(
+        initial_ids.len(),
+        1,
+        "initial deployment should track one replica id"
+    );
+
+    tasks[0].replicas = 3;
+
+    let redeploy_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
+        .await
+        .expect("submit redeployment");
+    assert_eq!(
+        redeploy_id, service_id,
+        "service identifier should remain stable across redeploys"
+    );
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "service should return to running after scale-out redeploy"
+    );
+    assert!(
+        wait_for_task_count(&node.node.task_manager, 3, Duration::from_secs(8)).await,
+        "scaled service should eventually report three replicas"
+    );
+
+    let updated_spec = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read updated spec")
+        .expect("updated spec present");
+    let updated_ids: BTreeSet<Uuid> = updated_spec.task_ids.iter().cloned().collect();
+    assert_eq!(
+        updated_ids.len(),
+        3,
+        "scaled deployment should record three replica identifiers"
+    );
+    assert!(
+        initial_ids.iter().all(|id| updated_ids.contains(id)),
+        "existing replicas should be preserved during scale-out"
+    );
+});
+
+local_test!(services_redeploy_updates_resources, {
+    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let node = TestNode::new().await;
+
+    let service_name = "redeploy-resources";
+    let manifest_name = "redeploy-resources";
+
+    let mut tasks = vec![ServiceTaskSpecValue {
+        name: "echo".into(),
+        image: "alpine:3.20".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "while true; do sleep 1; done".into(),
+        ],
+        replicas: 1,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        restart_policy: None,
+    }];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
+        .await
+        .expect("submit initial deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "service should reach running state before resource update"
+    );
+    assert!(
+        wait_for_task_count(&node.node.task_manager, 1, Duration::from_secs(5)).await,
+        "baseline deployment should launch a single replica"
+    );
+
+    let initial_spec = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read baseline spec")
+        .expect("baseline spec present");
+    let initial_id = *initial_spec
+        .task_ids
+        .first()
+        .expect("baseline spec should include one task id");
+
+    tasks[0].cpu_millis = 750;
+    tasks[0].memory_bytes = 256 * 1024 * 1024;
+
+    let redeploy_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
+        .await
+        .expect("submit redeployment with new resources");
+    assert_eq!(
+        redeploy_id, service_id,
+        "redeploy should target existing service identifier"
+    );
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "service should return to running after resource refresh"
+    );
+    let updated_spec = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read updated spec")
+        .expect("updated spec present");
+    assert_eq!(
+        updated_spec.task_ids.len(),
+        1,
+        "resource refresh should maintain a single replica"
+    );
+    let replacement_id = updated_spec.task_ids[0];
+    assert_ne!(
+        replacement_id, initial_id,
+        "resource change should replace the existing replica"
+    );
+
+    let replacement_spec = node
+        .node
+        .task_manager
+        .inspect_task(replacement_id)
+        .await
+        .expect("inspect updated task");
+    assert_eq!(
+        replacement_spec.cpu_millis, tasks[0].cpu_millis,
+        "updated task should honour new cpu allocation"
+    );
+    assert_eq!(
+        replacement_spec.memory_bytes, tasks[0].memory_bytes,
+        "updated task should honour new memory allocation"
+    );
+});
+
 async fn remove_service_via_rpc(client: &services::Client, service_id: Uuid) {
     let mut delete = client.delete_request();
     {

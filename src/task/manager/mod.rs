@@ -280,6 +280,12 @@ impl TaskManager {
         Ok(states)
     }
 
+    /// Fetches the latest replicated task spec for the provided identifier so higher level
+    /// reconcilers can reason about service-to-task relationships without mutating state.
+    pub async fn inspect_task(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
+        self.load_spec(id).await
+    }
+
     pub async fn task_owned_locally(&self, id: Uuid) -> Result<bool, anyhow::Error> {
         let spec = self.load_spec(id).await?;
         Ok(spec.node_id == self.local_node_id)

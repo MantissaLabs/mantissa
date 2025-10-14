@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_channel::Sender;
 use chrono::Utc;
 use crdt_store::uuid_key::UuidKey;
