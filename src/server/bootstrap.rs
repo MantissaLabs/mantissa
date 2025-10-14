@@ -3,6 +3,7 @@ use crate::gossip::{DEFAULT_FANOUT, Message};
 use crate::registry::Registry;
 use crate::scheduler::Scheduler;
 use crate::scheduler::service::SchedulerService;
+use crate::secrets::crypto::SecretKeyring;
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerStores};
@@ -13,6 +14,7 @@ use crate::store::local_session_store::LocalSessionStore;
 use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
 use crate::store::scheduler_store::{SchedulerStore, open_scheduler_store};
+use crate::store::secret_store::{SecretStore, open_secret_store};
 use crate::store::service_store::{ServiceStore, open_service_store};
 use crate::store::task_store::{TaskStore, open_task_store};
 use crate::sync::SyncService;
@@ -91,6 +93,8 @@ pub(crate) struct Stores {
     pub tasks: TaskStore,
     pub scheduler_store: SchedulerStore,
     pub services: ServiceStore,
+    pub secrets: SecretStore,
+    pub secret_keyring: SecretKeyring,
 }
 
 pub(crate) struct Components {
@@ -182,6 +186,9 @@ impl Bootstrap {
 
         // Join token store. Generate new token if none exists.
         let token_store = TokenStore::load(ctx.db.clone()).expect("load persistent join token");
+        let current_token = token_store.current_token().await;
+        let secret_keyring = SecretKeyring::derive_from_token(&current_token)
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
 
         // Debug dump mst root for peers store.
         peers.debug_dump_root("peers").await;
@@ -195,6 +202,9 @@ impl Bootstrap {
         let services = open_service_store(ctx.db.clone(), ctx.self_id)?;
         services.rebuild_mst_from_disk().await?;
 
+        let secrets = open_secret_store(ctx.db.clone(), ctx.self_id)?;
+        secrets.rebuild_mst_from_disk().await?;
+
         Ok(Stores {
             peers,
             session_auth,
@@ -204,6 +214,8 @@ impl Bootstrap {
             tasks,
             scheduler_store,
             services,
+            secrets,
+            secret_keyring,
         })
     }
 
@@ -242,6 +254,7 @@ impl Bootstrap {
             token_store: stores.token_store.clone(),
             tasks: stores.tasks.clone(),
             services: stores.services.clone(),
+            secrets: stores.secrets.clone(),
         };
 
         let keys = Keys {
@@ -291,6 +304,7 @@ impl Bootstrap {
             topology_stores.peers.clone(),
             stores.tasks.clone(),
             stores.services.clone(),
+            stores.secrets.clone(),
         );
         let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
 
@@ -377,6 +391,7 @@ impl Bootstrap {
         let stores_bundle = ServerStores {
             token_store: stores.token_store.clone(),
             session_store: stores.session_auth.clone(),
+            secret_keyring: stores.secret_keyring.clone(),
         };
 
         let topology = comps.topology.clone();

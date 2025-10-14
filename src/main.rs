@@ -10,6 +10,7 @@ mod node;
 mod registry;
 mod scheduler;
 mod server;
+mod secrets;
 mod services;
 mod store;
 mod sync;

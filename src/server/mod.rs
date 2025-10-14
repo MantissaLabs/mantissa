@@ -1,3 +1,4 @@
+use crate::secrets::crypto::SecretKeyring;
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::session::ClusterSessionImpl;
@@ -91,6 +92,7 @@ pub struct ServerClients {
 pub struct ServerStores {
     pub token_store: TokenStore,
     pub session_store: AuthStore,
+    pub secret_keyring: SecretKeyring,
 }
 
 impl Server {

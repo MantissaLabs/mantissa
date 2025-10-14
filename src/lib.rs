@@ -10,6 +10,7 @@ pub mod logger;
 pub mod node;
 pub mod registry;
 pub mod scheduler;
+pub mod secrets;
 pub mod server;
 pub mod services;
 pub mod store;

@@ -6,6 +6,7 @@ use crate::registry::Registry;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
+use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
 use crate::sync::delta::{SyncStores, sync_all_domains};
@@ -54,6 +55,7 @@ pub struct TopologyStores {
     pub token_store: TokenStore,
     pub tasks: TaskStore,
     pub services: ServiceStore,
+    pub secrets: SecretStore,
 }
 
 /// Keys and signing material used by the topology service.
@@ -222,6 +224,7 @@ pub struct Topology {
     peers: PeersStore,
     tasks: TaskStore,
     services: ServiceStore,
+    secrets: SecretStore,
 
     /// Cached Peers snapshot to avoid hitting storage on every tick.
     peer_snapshot_cache: Arc<AsyncMutex<PeerSnapshotCache>>,
@@ -272,6 +275,7 @@ impl Topology {
             token_store,
             tasks,
             services,
+            secrets,
         } = stores;
 
         let Keys {
@@ -286,6 +290,7 @@ impl Topology {
             peers,
             tasks,
             services,
+            secrets,
             peer_snapshot_cache: Arc::new(AsyncMutex::new(PeerSnapshotCache::new())),
             local_sessions: sessions,
             local_credential_store: credentials,
@@ -704,6 +709,7 @@ impl Topology {
                 peers: self.peers.clone(),
                 tasks: self.tasks.clone(),
                 services: self.services.clone(),
+                secrets: self.secrets.clone(),
             };
 
             sync_all_domains(stores, sync_cap).await;

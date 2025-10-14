@@ -1,5 +1,7 @@
+use crate::secrets::types::SecretValue;
 use crate::services::types::ServiceSpecValue;
 use crate::store::peer_store::PeersStore;
+use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
@@ -20,6 +22,7 @@ pub struct SyncStores {
     pub peers: PeersStore,
     pub tasks: TaskStore,
     pub services: ServiceStore,
+    pub secrets: SecretStore,
 }
 
 impl SyncStores {
@@ -28,6 +31,7 @@ impl SyncStores {
             Domain::Peers => self.peers.root_hex().await,
             Domain::Tasks => self.tasks.root_hex().await,
             Domain::Services => self.services.root_hex().await,
+            Domain::Secrets => self.secrets.root_hex().await,
         }
     }
 
@@ -36,6 +40,7 @@ impl SyncStores {
             Domain::Peers => self.peers.page_range_summary().await,
             Domain::Tasks => self.tasks.page_range_summary().await,
             Domain::Services => self.services.page_range_summary().await,
+            Domain::Secrets => self.secrets.page_range_summary().await,
         }
     }
 }
@@ -71,6 +76,14 @@ impl delta_sink::Server for DeltaSinkImpl {
                         stores.services.clone(),
                         &chunk,
                         decode_register::<ServiceSpecValue>,
+                    )
+                    .await?
+                }
+                Domain::Secrets => {
+                    apply_chunk(
+                        stores.secrets.clone(),
+                        &chunk,
+                        decode_register::<SecretValue>,
                     )
                     .await?
                 }
@@ -180,9 +193,25 @@ impl DeltaStore<ServiceSpecValue> for ServiceStore {
     }
 }
 
+#[async_trait]
+impl DeltaStore<SecretValue> for SecretStore {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<SecretValue, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()> {
+        self.apply_delta_chunk_update_mst(regs, tombs).await
+    }
+}
+
 pub async fn sync_all_domains(stores: SyncStores, sync_cap: sync::Client) {
     let res: Result<(), capnp::Error> = async {
-        let domains = [Domain::Peers, Domain::Tasks, Domain::Services];
+        let domains = [
+            Domain::Peers,
+            Domain::Tasks,
+            Domain::Services,
+            Domain::Secrets,
+        ];
 
         let roots_req = sync_cap.get_roots_request();
         let roots_resp = roots_req.send().promise.await?;
