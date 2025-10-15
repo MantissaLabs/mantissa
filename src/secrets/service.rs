@@ -136,7 +136,7 @@ impl secrets::Server for SecretsService {
                 .map_err(|e| Error::failed(e.to_string()))?
                 .is_some()
             {
-                return Err(Error::failed(format!("secret '{}' already exists", name)));
+                return Err(Error::failed(format!("secret '{name}' already exists")));
             }
 
             let plaintext = plaintext_from_reader(request.get_plaintext()?);
@@ -191,7 +191,7 @@ impl secrets::Server for SecretsService {
             let existing = registry
                 .get_by_name(&name)
                 .map_err(|e| Error::failed(e.to_string()))?
-                .ok_or_else(|| Error::failed(format!("secret '{}' not found", name)))?;
+                .ok_or_else(|| Error::failed(format!("secret '{name}' not found")))?;
 
             let plaintext = plaintext_from_reader(request.get_plaintext()?);
             let description_raw = request.get_description()?.to_str()?.trim().to_string();
@@ -271,7 +271,7 @@ impl secrets::Server for SecretsService {
                 let data = request.get_version_id()?;
                 if data.len() == 16 {
                     let mut bytes = [0u8; 16];
-                    bytes.copy_from_slice(&data);
+                    bytes.copy_from_slice(data);
                     Some(Uuid::from_bytes(bytes))
                 } else {
                     None
@@ -281,14 +281,13 @@ impl secrets::Server for SecretsService {
             let value = registry
                 .get_by_name(&name)
                 .map_err(|e| Error::failed(e.to_string()))?
-                .ok_or_else(|| Error::failed(format!("secret '{}' not found", name)))?;
+                .ok_or_else(|| Error::failed(format!("secret '{name}' not found")))?;
 
             let version_id = value.current_version.version_id;
             if let Some(requested) = requested_version {
                 if requested != version_id {
                     return Err(Error::failed(format!(
-                        "secret '{}' version {} not found",
-                        name, requested
+                        "secret '{name}' version {requested} not found"
                     )));
                 }
             }

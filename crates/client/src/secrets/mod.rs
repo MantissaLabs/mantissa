@@ -1,10 +1,20 @@
-use crate::config::ClientConfig;
-use crate::connection;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use protocol::secrets::secret_metadata_entry;
 use protocol::secrets::{secret_spec, secret_version_data};
 use std::collections::BTreeMap;
 use uuid::Uuid;
+
+pub mod create;
+pub mod delete;
+pub mod list;
+pub mod show;
+pub mod update;
+
+pub use create::create;
+pub use delete::delete;
+pub use list::list;
+pub use show::show;
+pub use update::update;
 
 #[derive(Debug, Clone)]
 pub struct SecretSummary {
@@ -22,7 +32,7 @@ pub struct SecretDetail {
     pub plaintext: Vec<u8>,
 }
 
-fn parse_secret_spec(reader: secret_spec::Reader<'_>) -> Result<SecretSummary> {
+pub(super) fn parse_secret_spec(reader: secret_spec::Reader<'_>) -> Result<SecretSummary> {
     let name = reader.get_name()?.to_str()?.to_string();
     let description_raw = reader.get_description()?.to_str()?.to_string();
     let description = if description_raw.trim().is_empty() {
@@ -66,13 +76,13 @@ fn parse_secret_spec(reader: secret_spec::Reader<'_>) -> Result<SecretSummary> {
     })
 }
 
-fn parse_secret_detail(reader: secret_version_data::Reader<'_>) -> Result<SecretDetail> {
+pub(super) fn parse_secret_detail(reader: secret_version_data::Reader<'_>) -> Result<SecretDetail> {
     let summary = parse_secret_spec(reader.get_spec()?)?;
     let plaintext = reader.get_plaintext()?.to_owned();
     Ok(SecretDetail { summary, plaintext })
 }
 
-fn set_metadata(
+pub(super) fn set_metadata(
     metadata_builder: &mut capnp::struct_list::Builder<secret_metadata_entry::Owned>,
     labels: &[(String, String)],
 ) {
@@ -83,137 +93,10 @@ fn set_metadata(
     }
 }
 
-fn normalize_labels(raw: &[(String, String)]) -> Vec<(String, String)> {
+pub(super) fn normalize_labels(raw: &[(String, String)]) -> Vec<(String, String)> {
     let mut map = BTreeMap::new();
     for (key, value) in raw {
         map.insert(key.trim().to_string(), value.trim().to_string());
     }
     map.into_iter().collect()
-}
-
-pub async fn list(cfg: &ClientConfig) -> Result<Vec<SecretSummary>> {
-    let session = connection::get_local_session(cfg).await?;
-    let request = session.get_secrets_request();
-    let secrets_client = request.send().pipeline.get_secrets();
-    let response = secrets_client
-        .list_request()
-        .send()
-        .promise
-        .await
-        .context("secrets list request failed")?;
-    let reader = response.get()?.get_secrets()?;
-
-    let mut summaries = Vec::with_capacity(reader.len() as usize);
-    for spec in reader.iter() {
-        summaries.push(parse_secret_spec(spec)?);
-    }
-    Ok(summaries)
-}
-
-pub async fn create(
-    cfg: &ClientConfig,
-    name: &str,
-    plaintext: &[u8],
-    description: Option<&str>,
-    labels: &[(String, String)],
-) -> Result<SecretSummary> {
-    let session = connection::get_local_session(cfg).await?;
-    let request = session.get_secrets_request();
-    let secrets_client = request.send().pipeline.get_secrets();
-    let mut create = secrets_client.create_request();
-    {
-        let mut inner = create.get().init_request();
-        inner.set_name(name);
-        inner.set_plaintext(plaintext);
-        inner.set_description(description.unwrap_or(""));
-        let normalized = normalize_labels(labels);
-        let mut metadata_builder = inner.reborrow().init_metadata(normalized.len() as u32);
-        set_metadata(&mut metadata_builder, &normalized);
-    }
-
-    let response = create
-        .send()
-        .promise
-        .await
-        .context("secrets create request failed")?;
-    let reader = response.get()?.get_secret()?;
-    parse_secret_spec(reader)
-}
-
-pub async fn update(
-    cfg: &ClientConfig,
-    name: &str,
-    plaintext: &[u8],
-    description: Option<&str>,
-    labels: &[(String, String)],
-) -> Result<SecretSummary> {
-    let session = connection::get_local_session(cfg).await?;
-    let request = session.get_secrets_request();
-    let secrets_client = request.send().pipeline.get_secrets();
-    let mut update = secrets_client.update_request();
-    {
-        let mut inner = update.get().init_request();
-        inner.set_name(name);
-        inner.set_plaintext(plaintext);
-        inner.set_description(description.unwrap_or(""));
-        let normalized = normalize_labels(labels);
-        let mut metadata_builder = inner.reborrow().init_metadata(normalized.len() as u32);
-        set_metadata(&mut metadata_builder, &normalized);
-    }
-
-    let response = update
-        .send()
-        .promise
-        .await
-        .context("secrets update request failed")?;
-    let reader = response.get()?.get_secret()?;
-    parse_secret_spec(reader)
-}
-
-pub async fn delete(cfg: &ClientConfig, names: &[String]) -> Result<()> {
-    if names.is_empty() {
-        return Ok(());
-    }
-
-    let session = connection::get_local_session(cfg).await?;
-    let request = session.get_secrets_request();
-    let secrets_client = request.send().pipeline.get_secrets();
-    let mut delete = secrets_client.delete_request();
-    {
-        let mut list = delete.get().init_names(names.len() as u32);
-        for (idx, name) in names.iter().enumerate() {
-            list.set(idx as u32, name);
-        }
-    }
-
-    delete
-        .send()
-        .promise
-        .await
-        .context("secrets delete request failed")?;
-    Ok(())
-}
-
-pub async fn show(cfg: &ClientConfig, name: &str, version: Option<Uuid>) -> Result<SecretDetail> {
-    let session = connection::get_local_session(cfg).await?;
-    let request = session.get_secrets_request();
-    let secrets_client = request.send().pipeline.get_secrets();
-    let mut get_req = secrets_client.get_request();
-    {
-        let mut inner = get_req.get();
-        inner.set_name(name);
-        if let Some(version) = version {
-            inner.set_version_id(version.as_bytes());
-        } else {
-            inner.set_version_id(&[]);
-        }
-    }
-
-    let response = get_req
-        .send()
-        .promise
-        .await
-        .context("secrets get request failed")?;
-    let reader = response.get()?.get_version()?;
-    parse_secret_detail(reader)
 }

@@ -37,6 +37,7 @@ The system needs to be:
 - All methods need to have a header comment describing what it does and its role in a larger context.
 - Code needs to be well-structured and maintainable, following best practices for Rust programming.
 - Lines that are ambiguous need to be commented profusely to avoid later confusion.
+- Use variables directly inside print statements, ie. instead of `print!("{}", output);` use `print!("{output}");`.
 
 ## Testing Guidelines
 
