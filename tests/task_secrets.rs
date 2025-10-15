@@ -27,7 +27,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::fs;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio::time::Duration;
 use uuid::Uuid;
 
@@ -185,6 +185,7 @@ async fn setup_task_manager() -> TestHarness {
     let secret_registry = SecretRegistry::new(secret_store);
     let secret_keyring =
         SecretKeyring::derive_from_token("MANTISSA-TEST-TOKEN").expect("derive secret keyring");
+    let secret_keyring_arc = Arc::new(RwLock::new(secret_keyring.clone()));
 
     let container_manager = Arc::new(RecordingContainerManager::default());
 
@@ -213,7 +214,7 @@ async fn setup_task_manager() -> TestHarness {
         container_manager.clone(),
         registry,
         secret_registry.clone(),
-        secret_keyring.clone(),
+        secret_keyring_arc.clone(),
     );
 
     TestHarness {
@@ -276,14 +277,14 @@ local_test!(task_manager_stages_secret_env_and_files, {
             value: None,
             secret: Some(TaskSecretReference {
                 name: secret_name.to_string(),
-                version_id: Some(version_id),
+                version_id: None,
             }),
         }],
         secret_files: vec![TaskSecretFile {
             path: "/run/secrets/db-password".into(),
             secret: TaskSecretReference {
                 name: secret_name.to_string(),
-                version_id: Some(version_id),
+                version_id: None,
             },
             mode: Some(0o440),
         }],

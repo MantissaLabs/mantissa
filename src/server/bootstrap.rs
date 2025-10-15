@@ -34,6 +34,8 @@ use protocol::server::server::Client as ServerClient;
 use protocol::services::services::Client as ServicesClient;
 use protocol::topology::topology::Client as TopologyClient;
 
+use tokio::sync::RwLock;
+
 use async_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;
 use std::rc::Rc;
@@ -97,7 +99,7 @@ pub(crate) struct Stores {
     pub scheduler_store: SchedulerStore,
     pub services: ServiceStore,
     pub secrets: SecretStore,
-    pub secret_keyring: SecretKeyring,
+    pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
 pub(crate) struct Components {
@@ -195,6 +197,7 @@ impl Bootstrap {
         let current_token = token_store.current_token().await;
         let secret_keyring = SecretKeyring::derive_from_token(&current_token)
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        let secret_keyring = Arc::new(RwLock::new(secret_keyring));
 
         // Debug dump mst root for peers store.
         peers.debug_dump_root("peers").await;
@@ -261,6 +264,7 @@ impl Bootstrap {
             tasks: stores.tasks.clone(),
             services: stores.services.clone(),
             secrets: stores.secrets.clone(),
+            secret_keyring: stores.secret_keyring.clone(),
         };
 
         let keys = Keys {

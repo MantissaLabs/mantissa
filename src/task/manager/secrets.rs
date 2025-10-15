@@ -1,8 +1,12 @@
-use super::TaskManager;
-use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
+use super::{TaskManager, TaskStartRequest};
+use crate::secrets::crypto::SecretKeyring;
+use crate::secrets::types::SecretValue;
+use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile};
 use anyhow::{Context, Result, anyhow};
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
@@ -36,6 +40,21 @@ pub(super) struct ResolvedTaskSecrets {
 }
 
 impl TaskManager {
+    /// Ensures every task start request references secrets that exist locally with compatible versions.
+    pub(super) fn ensure_secret_dependencies(&self, requests: &[TaskStartRequest]) -> Result<()> {
+        for request in requests {
+            for var in &request.env {
+                if let Some(secret) = &var.secret {
+                    self.load_secret_value(&secret.name)?;
+                }
+            }
+            for file in &request.secret_files {
+                self.load_secret_value(&file.secret.name)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Resolves environment variables and secret file projections into concrete runtime artifacts.
     ///
     /// This is invoked when the scheduler hands control to the TaskManager for a local launch.
@@ -50,12 +69,29 @@ impl TaskManager {
         // Clear any stale staging content in case a previous attempt failed.
         self.cleanup_secret_artifacts(task_id).await;
 
+        let keyring = { self.secret_keyring.read().await.clone() };
+        let mut value_cache: HashMap<String, SecretValue> = HashMap::new();
+        let mut plaintext_cache: HashMap<Uuid, Arc<[u8]>> = HashMap::new();
+
         let mut resolved_env = Vec::with_capacity(env.len());
         for var in env {
-            resolved_env.push(self.build_env_assignment(var)?);
+            resolved_env.push(self.build_env_assignment(
+                var,
+                &mut value_cache,
+                &mut plaintext_cache,
+                &keyring,
+            )?);
         }
 
-        let (mounts, artifacts) = self.stage_secret_files(task_id, secret_files).await?;
+        let (mounts, artifacts) = self
+            .stage_secret_files(
+                task_id,
+                secret_files,
+                &mut value_cache,
+                &mut plaintext_cache,
+                &keyring,
+            )
+            .await?;
 
         Ok(ResolvedTaskSecrets {
             env: resolved_env,
@@ -85,7 +121,13 @@ impl TaskManager {
     }
 
     /// Constructs an environment variable assignment, decrypting a referenced secret when needed.
-    fn build_env_assignment(&self, var: &TaskEnvironmentVariable) -> Result<String> {
+    fn build_env_assignment(
+        &self,
+        var: &TaskEnvironmentVariable,
+        value_cache: &mut HashMap<String, SecretValue>,
+        plaintext_cache: &mut HashMap<Uuid, Arc<[u8]>>,
+        keyring: &SecretKeyring,
+    ) -> Result<String> {
         let name = var.name.trim();
         if name.is_empty() {
             return Err(anyhow!(
@@ -101,8 +143,13 @@ impl TaskManager {
         match (&var.value, &var.secret) {
             (Some(value), None) => Ok(format!("{name}={value}")),
             (None, Some(secret_ref)) => {
-                let plaintext = self.load_secret_plaintext(secret_ref)?;
-                let value = String::from_utf8(plaintext).map_err(|_| {
+                let plaintext = self.decrypt_secret_cached(
+                    &secret_ref.name,
+                    value_cache,
+                    plaintext_cache,
+                    keyring,
+                )?;
+                let value = String::from_utf8(plaintext.as_ref().to_vec()).map_err(|_| {
                     anyhow!(
                         "secret '{}' contains non UTF-8 data and cannot populate env var '{}'",
                         secret_ref.name,
@@ -125,6 +172,9 @@ impl TaskManager {
         &self,
         task_id: Uuid,
         files: &[TaskSecretFile],
+        value_cache: &mut HashMap<String, SecretValue>,
+        plaintext_cache: &mut HashMap<Uuid, Arc<[u8]>>,
+        keyring: &SecretKeyring,
     ) -> Result<(Vec<String>, Option<TaskSecretArtifacts>)> {
         if files.is_empty() {
             return Ok((Vec::new(), None));
@@ -179,7 +229,12 @@ impl TaskManager {
                 ));
             }
 
-            let plaintext = match self.load_secret_plaintext(&file.secret) {
+            let plaintext = match self.decrypt_secret_cached(
+                &file.secret.name,
+                value_cache,
+                plaintext_cache,
+                keyring,
+            ) {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     cleanup_dir_quietly(&root_dir).await;
@@ -207,7 +262,7 @@ impl TaskManager {
                 }
             };
 
-            if let Err(err) = handle.write_all(&plaintext).await {
+            if let Err(err) = handle.write_all(plaintext.as_ref()).await {
                 cleanup_dir_quietly(&root_dir).await;
                 return Err(anyhow!(
                     "failed to write secret '{}' into {}: {err}",
@@ -256,33 +311,52 @@ impl TaskManager {
         Ok((mounts, Some(TaskSecretArtifacts { root_dir })))
     }
 
-    /// Loads and decrypts the secret referenced by `reference`.
-    fn load_secret_plaintext(&self, reference: &TaskSecretReference) -> Result<Vec<u8>> {
-        let name = reference.name.trim();
+    /// Loads the current value for a secret by logical name.
+    fn load_secret_value(&self, name: &str) -> Result<SecretValue> {
+        let name = name.trim();
         if name.is_empty() {
             return Err(anyhow!("secret reference name cannot be empty"));
         }
 
-        let value = self
-            .secret_registry
+        self.secret_registry
             .get_by_name(name)
             .map_err(|e| anyhow!("failed to lookup secret '{name}': {e}"))?
-            .ok_or_else(|| anyhow!("secret '{name}' not found"))?;
+            .ok_or_else(|| anyhow!("secret '{name}' not found"))
+    }
 
-        let current_version = value.current_version.version_id;
-        if let Some(expected) = reference.version_id {
-            if expected != current_version {
-                return Err(anyhow!(
-                    "secret '{name}' version mismatch: expected {}, found {}",
-                    expected,
-                    current_version
-                ));
-            }
+    /// Decrypts a secret reference, caching metadata and plaintext so repeated lookups stay cheap.
+    fn decrypt_secret_cached(
+        &self,
+        name: &str,
+        value_cache: &mut HashMap<String, SecretValue>,
+        plaintext_cache: &mut HashMap<Uuid, Arc<[u8]>>,
+        keyring: &SecretKeyring,
+    ) -> Result<Arc<[u8]>> {
+        let key = name.trim().to_string();
+        if key.is_empty() {
+            return Err(anyhow!("secret reference name cannot be empty"));
         }
 
-        self.secret_keyring
-            .decrypt(value.id, current_version, &value.current_version.ciphertext)
-            .map_err(|e| anyhow!("failed to decrypt secret '{name}': {e}"))
+        let value = if let Some(value) = value_cache.get(&key) {
+            value.clone()
+        } else {
+            let value = self.load_secret_value(&key)?;
+            value_cache.insert(key.clone(), value.clone());
+            value
+        };
+
+        let version_id = value.current_version.version_id;
+        if let Some(bytes) = plaintext_cache.get(&version_id) {
+            return Ok(bytes.clone());
+        }
+
+        let plaintext = keyring
+            .decrypt(value.id, version_id, &value.current_version.ciphertext)
+            .map_err(|e| anyhow!("failed to decrypt secret '{}': {e}", key))?;
+
+        let arc: Arc<[u8]> = Arc::from(plaintext.into_boxed_slice());
+        plaintext_cache.insert(version_id, arc.clone());
+        Ok(arc)
     }
 }
 

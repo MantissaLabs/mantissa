@@ -33,6 +33,11 @@ impl TokenStoreInMemory {
         self.generate().await
     }
 
+    /// Replace the current token with `token`.
+    pub async fn set(&self, token: &str) {
+        *self.inner.write().await = token.to_string();
+    }
+
     /// Current token if set.
     pub async fn current(&self) -> Option<String> {
         let s = self.inner.read().await.clone();
@@ -115,6 +120,13 @@ impl TokenStore {
         let new_token = self.in_memory.rotate().await;
         self.local_store.write(&new_token)?;
         Ok(new_token)
+    }
+
+    /// Replace the token with `token` and persist it.
+    pub async fn set_and_persist(&self, token: &str) -> io::Result<()> {
+        self.in_memory.set(token).await;
+        self.local_store.write(token)?;
+        Ok(())
     }
 
     /// Convenience for server join checks.

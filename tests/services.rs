@@ -1,6 +1,7 @@
 #[macro_use]
 mod common;
 
+use capnp::Error as CapnpError;
 use client::services::manifest::{
     RestartPolicyName as ManifestRestartPolicyName, SecretReference, ServiceManifest,
     load_manifest_from_path,
@@ -17,6 +18,7 @@ use mantissa::task::manager::TaskManager;
 use mantissa::task::types::{
     TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskStateFilter,
 };
+use protocol::secrets::secrets;
 use protocol::services::services;
 use std::{
     collections::BTreeSet,
@@ -42,6 +44,34 @@ local_test!(services_gossip_propagates_across_peers, {
     let peer = &cluster[1];
 
     let manifest_id = Uuid::new_v4();
+    let secret_name = "demo-service-secret";
+    create_secret(&anchor.node.secrets_client, secret_name, b"super-secret")
+        .await
+        .expect("create secret for service");
+    assert!(
+        wait_for_secret(
+            &anchor.node.secrets_client,
+            secret_name,
+            Duration::from_secs(5)
+        )
+        .await,
+        "anchor should observe created secret"
+    );
+    assert!(
+        wait_for_secret(
+            &peer.node.secrets_client,
+            secret_name,
+            Duration::from_secs(5)
+        )
+        .await,
+        "peer should replicate secret"
+    );
+
+    let secret_ref = TaskSecretReference {
+        name: secret_name.to_string(),
+        version_id: None,
+    };
+
     let service_id = anchor
         .node
         .service_controller
@@ -57,8 +87,16 @@ local_test!(services_gossip_propagates_across_peers, {
                 cpu_millis: 0,
                 memory_bytes: 0,
                 restart_policy: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
+                env: vec![TaskEnvironmentVariable {
+                    name: "DEMO_SECRET".into(),
+                    value: None,
+                    secret: Some(secret_ref.clone()),
+                }],
+                secret_files: vec![TaskSecretFile {
+                    path: "/run/secrets/demo-service-secret".into(),
+                    secret: secret_ref.clone(),
+                    mode: Some(0o440),
+                }],
             }],
         )
         .await
@@ -114,6 +152,24 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
     let manifest_id = Uuid::new_v4();
     let service_name = "ack-demo";
     let manifest_name = "manifest-ack";
+    let secret_name = "ack-demo-secret";
+    create_secret(&node.node.secrets_client, secret_name, b"ack-secret")
+        .await
+        .expect("create ack secret");
+    assert!(
+        wait_for_secret(
+            &node.node.secrets_client,
+            secret_name,
+            Duration::from_secs(2)
+        )
+        .await,
+        "node should observe ack secret"
+    );
+    let secret_ref = TaskSecretReference {
+        name: secret_name.to_string(),
+        version_id: None,
+    };
+
     let tasks = vec![ServiceTaskSpecValue {
         name: "web".into(),
         image: "ghcr.io/mantissa/demo:web".into(),
@@ -122,8 +178,16 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
         cpu_millis: 0,
         memory_bytes: 0,
         restart_policy: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
+        env: vec![TaskEnvironmentVariable {
+            name: "ACK_SECRET".into(),
+            value: None,
+            secret: Some(secret_ref.clone()),
+        }],
+        secret_files: vec![TaskSecretFile {
+            path: "/run/secrets/ack-demo-secret".into(),
+            secret: secret_ref,
+            mode: Some(0o440),
+        }],
     }];
 
     let service_id = node
@@ -162,6 +226,24 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
     let node = TestNode::new().await;
 
     let manifest_id = Uuid::new_v4();
+    let secret_name = "capacity-secret";
+    create_secret(&node.node.secrets_client, secret_name, b"overcommit-secret")
+        .await
+        .expect("create capacity secret");
+    assert!(
+        wait_for_secret(
+            &node.node.secrets_client,
+            secret_name,
+            Duration::from_secs(2)
+        )
+        .await,
+        "node should observe capacity secret"
+    );
+    let secret_ref = TaskSecretReference {
+        name: secret_name.to_string(),
+        version_id: None,
+    };
+
     let service_id = node
         .node
         .service_controller
@@ -177,8 +259,16 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                 cpu_millis: 500_000, // intentionally exceeds any single-node capacity
                 memory_bytes: 8 * 1024 * 1024 * 1024, // 8 GiB to force allocation failure
                 restart_policy: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
+                env: vec![TaskEnvironmentVariable {
+                    name: "CAPACITY_SECRET".into(),
+                    value: None,
+                    secret: Some(secret_ref.clone()),
+                }],
+                secret_files: vec![TaskSecretFile {
+                    path: "/run/secrets/capacity-secret".into(),
+                    secret: secret_ref,
+                    mode: Some(0o440),
+                }],
             }],
         )
         .await
@@ -787,6 +877,64 @@ async fn wait_for_task_count(manager: &TaskManager, expected: usize, timeout: Du
             .await
             .expect("task list during wait");
         if specs.len() == expected {
+            return true;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+async fn create_secret(
+    client: &secrets::Client,
+    name: &str,
+    plaintext: &[u8],
+) -> Result<(), CapnpError> {
+    let mut req = client.create_request();
+    {
+        let mut inner = req.get().init_request();
+        inner.set_name(name);
+        inner.set_plaintext(plaintext);
+        inner.set_description("");
+        inner.init_metadata(0);
+    }
+    let response = req.send().promise.await?;
+    let _ = response.get()?.get_secret()?;
+    Ok(())
+}
+
+async fn list_secret_names(client: &secrets::Client) -> Vec<String> {
+    let response = client
+        .list_request()
+        .send()
+        .promise
+        .await
+        .expect("secrets list request");
+    let reader = response
+        .get()
+        .expect("secret list result")
+        .get_secrets()
+        .expect("secret list reader");
+    let mut names = Vec::with_capacity(reader.len() as usize);
+    for entry in reader.iter() {
+        let name = entry
+            .get_name()
+            .expect("secret name data")
+            .to_str()
+            .expect("secret name utf8")
+            .to_string();
+        names.push(name);
+    }
+    names
+}
+
+async fn wait_for_secret(client: &secrets::Client, name: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if list_secret_names(client)
+            .await
+            .into_iter()
+            .any(|candidate| candidate == name)
+        {
             return true;
         }
         sleep(Duration::from_millis(50)).await;

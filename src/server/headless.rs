@@ -14,6 +14,7 @@ use crate::{
     task::manager::TaskManager,
 };
 use net::noise::NoiseKeys;
+use protocol::secrets::secrets;
 use protocol::sync::Domain;
 use protocol::topology::topology;
 
@@ -68,6 +69,7 @@ pub struct HeadlessNode {
     pub server_client: protocol::server::server::Client,
     pub sync_client: protocol::sync::sync::Client,
     pub services_client: protocol::services::services::Client,
+    pub secrets_client: secrets::Client,
     pub service_controller: ServiceController,
     pub task_manager: TaskManager,
 
@@ -203,6 +205,7 @@ impl HeadlessNode {
             server_client,
             sync_client: comps.sync_client.clone(),
             services_client: comps.services_client.clone(),
+            secrets_client: comps.secrets_client.clone(),
             service_controller: comps.service_controller.clone(),
             task_manager: comps.task_manager.clone(),
             peers: stores.peers.clone(),

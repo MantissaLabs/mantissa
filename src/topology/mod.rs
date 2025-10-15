@@ -3,6 +3,7 @@ use crate::node::Node;
 use crate::node::address::compute_advertise_ip;
 use crate::node::id::set_node_id;
 use crate::registry::Registry;
+use crate::secrets::crypto::SecretKeyring;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
@@ -28,7 +29,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -56,6 +57,7 @@ pub struct TopologyStores {
     pub tasks: TaskStore,
     pub services: ServiceStore,
     pub secrets: SecretStore,
+    pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
 /// Keys and signing material used by the topology service.
@@ -253,6 +255,9 @@ pub struct Topology {
     /// Persistent token store, holding the current token for joining the cluster.
     token_store: TokenStore,
 
+    /// Shared secret keyring used to encrypt/decrypt secrets.
+    secret_keyring: Arc<RwLock<SecretKeyring>>,
+
     /// Shared health monitor tracking peer liveness observations.
     health_monitor: Arc<HealthMonitor>,
 }
@@ -276,6 +281,7 @@ impl Topology {
             tasks,
             services,
             secrets,
+            secret_keyring,
         } = stores;
 
         let Keys {
@@ -300,6 +306,7 @@ impl Topology {
             signing_key,
             sync: SyncState::new(Duration::from_secs(5)),
             token_store,
+            secret_keyring,
             health_monitor,
         })
     }

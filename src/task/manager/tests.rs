@@ -23,6 +23,7 @@ use std::convert::TryFrom;
 use std::rc::Rc;
 use std::sync::Arc;
 use tempfile::tempdir;
+use tokio::sync::RwLock;
 
 #[derive(Clone, Default)]
 struct MockContainerManager {
@@ -147,8 +148,9 @@ async fn setup_manager() -> (TaskManager, Rc<Scheduler>, Arc<MockContainerManage
         .await
         .expect("rebuild secret store");
     let secret_registry = SecretRegistry::new(secret_store);
-    let secret_keyring =
-        SecretKeyring::derive_from_token("MNTISA-TEST-TOKEN").expect("derive secret keyring");
+    let secret_keyring = Arc::new(RwLock::new(
+        SecretKeyring::derive_from_token("MNTISA-TEST-TOKEN").expect("derive secret keyring"),
+    ));
 
     let (tx, rx) = bounded(64);
     let mock_cm = Arc::new(MockContainerManager::default());
@@ -175,7 +177,7 @@ async fn setup_manager() -> (TaskManager, Rc<Scheduler>, Arc<MockContainerManage
         mock_cm.clone(),
         registry,
         secret_registry,
-        secret_keyring,
+        secret_keyring.clone(),
     );
 
     (manager, scheduler, mock_cm)

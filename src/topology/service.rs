@@ -1,6 +1,7 @@
 use super::{Topology, types::TopologyEvent};
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::pubkey_from_slice;
+use crate::secrets::crypto::SecretKeyring;
 use crate::server::credential::ClusterCredential;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
@@ -168,6 +169,8 @@ impl topology::Server for Topology {
         let peers = self.peers.clone();
         let local_sessions = self.local_sessions.clone();
         let local_creds = self.local_credential_store.clone();
+        let token_store = self.token_store.clone();
+        let secret_keyring = self.secret_keyring.clone();
         let topology = self.clone();
 
         Promise::from_future(async move {
@@ -208,6 +211,18 @@ impl topology::Server for Topology {
                 &credential,
             )
             .await?;
+
+            token_store
+                .set_and_persist(&inputs.join_token)
+                .await
+                .map_err(|e| Error::failed(format!("failed to persist join token: {e}")))?;
+
+            let derived = SecretKeyring::derive_from_token(&inputs.join_token)
+                .map_err(|e| Error::failed(format!("failed to derive secret keyring: {e}")))?;
+            {
+                let mut guard = secret_keyring.write().await;
+                *guard = derived;
+            }
 
             ClusterCredential::from_bytes_verified(&credential).map_err(Error::failed)?;
 
@@ -341,9 +356,16 @@ impl topology::Server for Topology {
         mut results: topology::RotateTokenResults,
     ) -> Promise<(), Error> {
         let store: TokenStore = self.token_store.clone();
+        let secret_keyring = self.secret_keyring.clone();
 
         Promise::from_future(async move {
             let new_token = store.rotate_and_persist().await?;
+            let derived = SecretKeyring::derive_from_token(&new_token)
+                .map_err(|e| Error::failed(format!("failed to derive secret keyring: {e}")))?;
+            {
+                let mut guard = secret_keyring.write().await;
+                *guard = derived;
+            }
             results.get().set_token(&new_token);
             Ok(())
         })

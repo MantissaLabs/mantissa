@@ -11,6 +11,7 @@ use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskSpec,
     TaskStateFilter, TaskValue,
 };
+use anyhow::Context;
 use async_channel::{Receiver, Sender};
 use bollard::errors::Error as BollardError;
 use crdt_store::uuid_key::UuidKey;
@@ -18,7 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::time::{Duration, sleep};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -32,6 +34,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+use self::planner::RemoteStartPlan;
 use self::reservation::{ExecutionError, RemoteReservation};
 use self::secrets::TaskSecretArtifacts;
 
@@ -48,7 +51,7 @@ pub struct TaskManager {
     local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
     registry: Registry,
     secret_registry: SecretRegistry,
-    secret_keyring: SecretKeyring,
+    secret_keyring: Arc<RwLock<SecretKeyring>>,
     secret_artifacts: Arc<AsyncMutex<HashMap<Uuid, TaskSecretArtifacts>>>,
     secret_runtime_root: PathBuf,
 }
@@ -78,7 +81,7 @@ impl TaskManager {
         container_manager: Arc<dyn ContainerManager + Send + Sync>,
         registry: Registry,
         secret_registry: SecretRegistry,
-        secret_keyring: SecretKeyring,
+        secret_keyring: Arc<RwLock<SecretKeyring>>,
     ) -> Self {
         let secret_runtime_root = std::env::temp_dir()
             .join("mantissa")
@@ -139,6 +142,8 @@ impl TaskManager {
             return Ok(Vec::new());
         }
 
+        self.ensure_secret_dependencies(&requests)?;
+
         let intents = Self::build_start_intents(requests);
 
         const MAX_ATTEMPTS: usize = 5;
@@ -158,6 +163,15 @@ impl TaskManager {
 
             let mut reserved_local_slots: Option<Vec<SlotId>> = None;
             let mut reserved_remote: HashMap<Uuid, RemoteReservation> = HashMap::new();
+
+            if let Err(err) = self.ensure_remote_secret_availability(&remote_plans).await {
+                debug!(
+                    target: "task",
+                    "remote secrets unavailable on attempt {attempt}: {err}"
+                );
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
 
             match self.reserve_local_slots(&local_plans, local_version).await {
                 Ok(slots) => {
@@ -338,6 +352,79 @@ impl TaskManager {
         }
 
         self.perform_local_stop(spec).await
+    }
+
+    async fn ensure_remote_secret_availability(
+        &self,
+        plans: &[RemoteStartPlan],
+    ) -> Result<(), anyhow::Error> {
+        if plans.is_empty() {
+            return Ok(());
+        }
+
+        let mut required: HashMap<Uuid, HashSet<String>> = HashMap::new();
+        for plan in plans {
+            let entry = required.entry(plan.peer_id).or_default();
+            for env in &plan.env {
+                if let Some(secret) = &env.secret {
+                    entry.insert(secret.name.clone());
+                }
+            }
+            for file in &plan.secret_files {
+                entry.insert(file.secret.name.clone());
+            }
+        }
+
+        for (peer_id, secrets) in &required {
+            if secrets.is_empty() {
+                continue;
+            }
+
+            let session = self
+                .registry
+                .session_for_peer(*peer_id)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("no active session for peer {peer_id}"))?;
+            let request = session.get_secrets_request();
+            let secrets_client = request.send().pipeline.get_secrets();
+
+            let response = secrets_client
+                .list_request()
+                .send()
+                .promise
+                .await
+                .context(format!(
+                    "failed to query secrets on peer {peer_id} while verifying availability"
+                ))?;
+            let reader = response
+                .get()
+                .context(format!(
+                    "invalid secrets response from peer {peer_id} while verifying availability"
+                ))?
+                .get_secrets()
+                .context(format!(
+                    "failed to decode secrets list from peer {peer_id} while verifying availability"
+                ))?;
+
+            let mut available: HashSet<String> = HashSet::new();
+            for entry in reader.iter() {
+                let name = entry
+                    .get_name()
+                    .context("secrets list missing name entry")?
+                    .to_str()
+                    .context("secrets list name is not utf8")?
+                    .to_string();
+                available.insert(name);
+            }
+
+            for name in secrets {
+                if !available.contains(name) {
+                    return Err(anyhow::anyhow!("peer {peer_id} missing secret '{name}'"));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

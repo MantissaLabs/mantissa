@@ -9,6 +9,7 @@ use net::noise::NoiseKeys;
 use protocol::server::cluster_session;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::RwLock;
 use tracing::error;
 use uuid::Uuid;
 
@@ -93,7 +94,7 @@ pub struct ServerClients {
 pub struct ServerStores {
     pub token_store: TokenStore,
     pub session_store: AuthStore,
-    pub secret_keyring: SecretKeyring,
+    pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
 impl Server {

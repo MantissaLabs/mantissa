@@ -9,19 +9,21 @@ use capnp::struct_list;
 use chrono::Utc;
 use protocol::secrets::{secret_metadata_entry, secret_spec, secrets};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub struct SecretsService {
     registry: SecretRegistry,
-    keyring: SecretKeyring,
+    keyring: Arc<RwLock<SecretKeyring>>,
 }
 
 impl SecretsService {
-    pub fn new(registry: SecretRegistry, keyring: SecretKeyring) -> Self {
+    pub fn new(registry: SecretRegistry, keyring: Arc<RwLock<SecretKeyring>>) -> Self {
         Self { registry, keyring }
     }
 
-    fn keyring(&self) -> SecretKeyring {
+    fn keyring(&self) -> Arc<RwLock<SecretKeyring>> {
         self.keyring.clone()
     }
 
@@ -148,9 +150,12 @@ impl secrets::Server for SecretsService {
 
             let secret_id = compute_secret_id(&name);
             let version_id = Uuid::new_v4();
-            let ciphertext = keyring
-                .encrypt(secret_id, version_id, &plaintext)
-                .map_err(|e| Error::failed(e.to_string()))?;
+            let ciphertext = {
+                let guard = keyring.read().await;
+                guard
+                    .encrypt(secret_id, version_id, &plaintext)
+                    .map_err(|e| Error::failed(e.to_string()))?
+            };
             let ciphertext = secret_ciphertext_from_encryption(ciphertext);
 
             let now = Utc::now().to_rfc3339();
@@ -198,9 +203,12 @@ impl secrets::Server for SecretsService {
             let metadata = metadata_from_entries(request.get_metadata()?, description);
 
             let version_id = Uuid::new_v4();
-            let ciphertext = keyring
-                .encrypt(existing.id, version_id, &plaintext)
-                .map_err(|e| Error::failed(e.to_string()))?;
+            let ciphertext = {
+                let guard = keyring.read().await;
+                guard
+                    .encrypt(existing.id, version_id, &plaintext)
+                    .map_err(|e| Error::failed(e.to_string()))?
+            };
             let ciphertext = secret_ciphertext_from_encryption(ciphertext);
 
             let now = Utc::now().to_rfc3339();
@@ -285,9 +293,12 @@ impl secrets::Server for SecretsService {
                 }
             }
 
-            let plaintext = keyring
-                .decrypt(value.id, version_id, &value.current_version.ciphertext)
-                .map_err(|e| Error::failed(e.to_string()))?;
+            let plaintext = {
+                let guard = keyring.read().await;
+                guard
+                    .decrypt(value.id, version_id, &value.current_version.ciphertext)
+                    .map_err(|e| Error::failed(e.to_string()))?
+            };
 
             let mut data_builder = results.get().init_version();
             let spec_builder = data_builder.reborrow().init_spec();
