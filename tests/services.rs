@@ -317,6 +317,7 @@ local_test!(services_deployment_replicates_across_cluster, {
         .expect("load service manifest");
 
     let manifest_id = Uuid::new_v4();
+    ensure_demo_manifest_secrets(&cluster).await;
     let templates = manifest_to_service_templates(&manifest);
 
     let service_id = cluster[0]
@@ -428,6 +429,7 @@ local_test!(services_sync_recovers_missing_entries, {
 
     let templates = manifest_to_service_templates(&manifest);
     let manifest_id = Uuid::new_v4();
+    ensure_demo_manifest_secrets(&cluster).await;
     let service_id = anchor
         .node
         .service_controller
@@ -774,6 +776,43 @@ async fn wait_for_service_status(
         sleep(Duration::from_millis(50)).await;
     }
     false
+}
+
+async fn ensure_demo_manifest_secrets(cluster: &[TestNode]) {
+    assert!(
+        !cluster.is_empty(),
+        "cluster must contain at least one node to seed secrets"
+    );
+
+    let secrets: [(&str, &[u8]); 3] = [
+        ("demo-api-token", b"demo-api-token-secret"),
+        ("demo-db-password", b"demo-db-password"),
+        ("demo-nginx-key", b"demo-nginx-key"),
+    ];
+
+    for (name, plaintext) in secrets {
+        create_secret(&cluster[0].node.secrets_client, name, plaintext)
+            .await
+            .unwrap_or_else(|err| panic!("create secret '{name}' failed: {err}"));
+
+        assert!(
+            wait_for_secret(
+                &cluster[0].node.secrets_client,
+                name,
+                Duration::from_secs(5)
+            )
+            .await,
+            "anchor should observe secret '{name}'"
+        );
+
+        for peer in cluster.iter().skip(1) {
+            assert!(
+                wait_for_secret(&peer.node.secrets_client, name, Duration::from_secs(5)).await,
+                "node {} should replicate secret '{name}'",
+                peer.id()
+            );
+        }
+    }
 }
 
 fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskSpecValue> {

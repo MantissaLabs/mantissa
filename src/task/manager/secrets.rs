@@ -248,7 +248,9 @@ impl TaskManager {
 
             #[cfg(unix)]
             {
-                options.mode(file.mode.unwrap_or(0o400));
+                // Use a permissive mode during creation to avoid permission races on filesystems
+                // that reject immediate read-only creation, then tighten permissions below.
+                options.mode(0o600);
             }
 
             let mut handle = match options.open(&host_path).await {
