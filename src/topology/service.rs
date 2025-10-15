@@ -1,11 +1,11 @@
 use super::{Topology, types::TopologyEvent};
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::pubkey_from_slice;
-use crate::secrets::crypto::SecretKeyring;
 use crate::server::credential::ClusterCredential;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
+use crate::store::secret_master_store::MasterKeyRecord;
 use crate::sync::delta::{SyncStores, sync_all_domains};
 use crate::token::TokenStore;
 use crate::topology::health::status_to_node_status;
@@ -149,6 +149,44 @@ impl Topology {
 
         Ok(())
     }
+
+    /// Retrieves and installs the cluster master key returned by the anchor during join.
+    async fn install_master_key_from_anchor(
+        &self,
+        session: cluster_session::Client,
+    ) -> Result<(), Error> {
+        let request = session.get_secrets_request();
+        let response = request.send().promise.await?;
+        let secrets_client = response.get()?.get_secrets()?;
+
+        let mk_request = secrets_client.get_master_key_request();
+        let mk_response = mk_request.send().promise.await?;
+        let envelope = mk_response.get()?.get_envelope()?;
+
+        let version = envelope.get_version();
+        let key_bytes = envelope.get_key()?;
+        if key_bytes.len() != 32 {
+            return Err(Error::failed(
+                "anchor provided master key with invalid length".to_string(),
+            ));
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(key_bytes);
+
+        let record = MasterKeyRecord::new(version, key)
+            .map_err(|e| Error::failed(format!("invalid master key payload: {e}")))?;
+
+        self.secret_master_store
+            .import_current(&record)
+            .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
+
+        {
+            let guard = self.secret_keyring.write().await;
+            guard.install_current(record);
+        }
+
+        Ok(())
+    }
 }
 
 impl topology::Server for Topology {
@@ -170,7 +208,6 @@ impl topology::Server for Topology {
         let local_sessions = self.local_sessions.clone();
         let local_creds = self.local_credential_store.clone();
         let token_store = self.token_store.clone();
-        let secret_keyring = self.secret_keyring.clone();
         let topology = self.clone();
 
         Promise::from_future(async move {
@@ -217,12 +254,9 @@ impl topology::Server for Topology {
                 .await
                 .map_err(|e| Error::failed(format!("failed to persist join token: {e}")))?;
 
-            let derived = SecretKeyring::derive_from_token(&inputs.join_token)
-                .map_err(|e| Error::failed(format!("failed to derive secret keyring: {e}")))?;
-            {
-                let mut guard = secret_keyring.write().await;
-                *guard = derived;
-            }
+            topology
+                .install_master_key_from_anchor(session.clone())
+                .await?;
 
             ClusterCredential::from_bytes_verified(&credential).map_err(Error::failed)?;
 
@@ -356,16 +390,9 @@ impl topology::Server for Topology {
         mut results: topology::RotateTokenResults,
     ) -> Promise<(), Error> {
         let store: TokenStore = self.token_store.clone();
-        let secret_keyring = self.secret_keyring.clone();
 
         Promise::from_future(async move {
             let new_token = store.rotate_and_persist().await?;
-            let derived = SecretKeyring::derive_from_token(&new_token)
-                .map_err(|e| Error::failed(format!("failed to derive secret keyring: {e}")))?;
-            {
-                let mut guard = secret_keyring.write().await;
-                *guard = derived;
-            }
             results.get().set_token(&new_token);
             Ok(())
         })

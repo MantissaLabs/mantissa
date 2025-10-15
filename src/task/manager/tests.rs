@@ -9,6 +9,7 @@ use crate::secrets::registry::SecretRegistry;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::open_peers_store;
 use crate::store::scheduler_store::open_scheduler_store;
+use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
 use crate::task::types::{TaskStateKind, TaskValue};
@@ -148,9 +149,15 @@ async fn setup_manager() -> (TaskManager, Rc<Scheduler>, Arc<MockContainerManage
         .await
         .expect("rebuild secret store");
     let secret_registry = SecretRegistry::new(secret_store);
-    let secret_keyring = Arc::new(RwLock::new(
-        SecretKeyring::derive_from_token("MNTISA-TEST-TOKEN").expect("derive secret keyring"),
-    ));
+    let (master_db, _master_dir) = temp_db("master");
+    let master_store = SecretMasterStore::new(master_db.clone()).expect("open master store");
+    let master_record = master_store
+        .ensure_current()
+        .expect("ensure master key record");
+    let secret_keyring = Arc::new(RwLock::new(SecretKeyring::new(
+        master_store.clone(),
+        master_record,
+    )));
 
     let (tx, rx) = bounded(64);
     let mock_cm = Arc::new(MockContainerManager::default());

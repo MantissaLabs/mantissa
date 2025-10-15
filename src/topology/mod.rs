@@ -7,6 +7,7 @@ use crate::secrets::crypto::SecretKeyring;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
+use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
@@ -54,6 +55,7 @@ pub struct TopologyStores {
     pub sessions: LocalSessionStore,
     pub peers: PeersStore,
     pub token_store: TokenStore,
+    pub secret_master_store: SecretMasterStore,
     pub tasks: TaskStore,
     pub services: ServiceStore,
     pub secrets: SecretStore,
@@ -255,6 +257,9 @@ pub struct Topology {
     /// Persistent token store, holding the current token for joining the cluster.
     token_store: TokenStore,
 
+    /// Durable secret master key store used for key distribution and rotation.
+    secret_master_store: SecretMasterStore,
+
     /// Shared secret keyring used to encrypt/decrypt secrets.
     secret_keyring: Arc<RwLock<SecretKeyring>>,
 
@@ -278,6 +283,7 @@ impl Topology {
             sessions,
             peers,
             token_store,
+            secret_master_store,
             tasks,
             services,
             secrets,
@@ -306,6 +312,7 @@ impl Topology {
             signing_key,
             sync: SyncState::new(Duration::from_secs(5)),
             token_store,
+            secret_master_store,
             secret_keyring,
             health_monitor,
         })

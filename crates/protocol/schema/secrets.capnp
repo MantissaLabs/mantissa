@@ -14,12 +14,14 @@ struct SecretVersion {
   versionId @0 :Data;  # 16-byte UUID
   createdAt @1 :Text;  # RFC3339 timestamp
   createdBy @2 :Data;  # 16-byte UUID, optional (empty = unknown)
+  masterKeyVersion @3 :UInt64;
 }
 
 struct SecretCiphertext {
   nonce @0 :Data;      # 12-byte ChaCha20-Poly1305 nonce
   ciphertext @1 :Data; # encrypted payload bytes (includes Poly1305 tag)
   digest @2 :Data;     # 32-byte Blake3 digest of plaintext
+  masterKeyVersion @3 :UInt64;
 }
 
 struct SecretSpec {
@@ -44,6 +46,11 @@ struct SecretUpsertRequest {
   metadata @3 :List(SecretMetadataEntry);
 }
 
+struct SecretMasterKey {
+  version @0 :UInt64;
+  key @1 :Data; # 32-byte cluster master key
+}
+
 interface Secrets {
   list @0 () -> (secrets :List(SecretSpec));
 
@@ -54,4 +61,8 @@ interface Secrets {
   delete @3 (names :List(Text));
 
   get @4 (name :Text, versionId :Data) -> (version :SecretVersionData);
+
+  getMasterKey @5 () -> (envelope :SecretMasterKey);
+
+  rotateMasterKey @6 () -> (version :UInt64);
 }

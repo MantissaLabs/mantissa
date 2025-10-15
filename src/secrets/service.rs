@@ -3,6 +3,7 @@ use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::{
     SecretCiphertext, SecretMetadata, SecretValue, SecretVersion, compute_secret_id,
 };
+use crate::store::secret_master_store::SecretMasterStore;
 use capnp::Error;
 use capnp::capability::Promise;
 use capnp::struct_list;
@@ -16,11 +17,21 @@ use uuid::Uuid;
 pub struct SecretsService {
     registry: SecretRegistry,
     keyring: Arc<RwLock<SecretKeyring>>,
+    master_store: SecretMasterStore,
 }
 
 impl SecretsService {
-    pub fn new(registry: SecretRegistry, keyring: Arc<RwLock<SecretKeyring>>) -> Self {
-        Self { registry, keyring }
+    /// Constructs the secrets RPC surface with access to registry, keyring, and master store.
+    pub fn new(
+        registry: SecretRegistry,
+        keyring: Arc<RwLock<SecretKeyring>>,
+        master_store: SecretMasterStore,
+    ) -> Self {
+        Self {
+            registry,
+            keyring,
+            master_store,
+        }
     }
 
     fn keyring(&self) -> Arc<RwLock<SecretKeyring>> {
@@ -29,6 +40,10 @@ impl SecretsService {
 
     fn registry(&self) -> SecretRegistry {
         self.registry.clone()
+    }
+
+    fn master_store(&self) -> SecretMasterStore {
+        self.master_store.clone()
     }
 }
 
@@ -85,6 +100,7 @@ fn write_secret_spec(mut builder: secret_spec::Builder<'_>, value: &SecretValue)
     } else {
         version_builder.set_created_by(&[]);
     }
+    version_builder.set_master_key_version(value.current_version.master_key_version);
 }
 
 fn secret_ciphertext_from_encryption(result: SecretCiphertext) -> SecretCiphertext {
@@ -157,9 +173,16 @@ impl secrets::Server for SecretsService {
                     .map_err(|e| Error::failed(e.to_string()))?
             };
             let ciphertext = secret_ciphertext_from_encryption(ciphertext);
+            let master_key_version = ciphertext.master_key_version;
 
             let now = Utc::now().to_rfc3339();
-            let version = SecretVersion::new(version_id, ciphertext, now.clone(), None);
+            let version = SecretVersion::new(
+                version_id,
+                ciphertext,
+                now.clone(),
+                None,
+                master_key_version,
+            );
             let value = SecretValue::new(name.clone(), metadata, now, version);
 
             registry
@@ -210,9 +233,16 @@ impl secrets::Server for SecretsService {
                     .map_err(|e| Error::failed(e.to_string()))?
             };
             let ciphertext = secret_ciphertext_from_encryption(ciphertext);
+            let master_key_version = ciphertext.master_key_version;
 
             let now = Utc::now().to_rfc3339();
-            let version = SecretVersion::new(version_id, ciphertext, now.clone(), None);
+            let version = SecretVersion::new(
+                version_id,
+                ciphertext,
+                now.clone(),
+                None,
+                master_key_version,
+            );
             let mut updated = existing.clone();
             updated.metadata = metadata;
             updated.set_version(version, now);
@@ -303,6 +333,86 @@ impl secrets::Server for SecretsService {
             let spec_builder = data_builder.reborrow().init_spec();
             write_secret_spec(spec_builder, &value);
             data_builder.set_plaintext(&plaintext);
+            Ok(())
+        })
+    }
+
+    /// Exposes the currently active master key so authenticated peers can bootstrap.
+    fn get_master_key(
+        &mut self,
+        _params: secrets::GetMasterKeyParams,
+        mut results: secrets::GetMasterKeyResults,
+    ) -> Promise<(), Error> {
+        let store = self.master_store();
+
+        Promise::from_future(async move {
+            let record = store
+                .current()
+                .map_err(|e| Error::failed(format!("failed to load master key: {e}")))?;
+            let mut envelope = results.get().init_envelope();
+            envelope.set_version(record.version);
+            envelope.set_key(&record.key);
+            Ok(())
+        })
+    }
+
+    /// Rotates the cluster master key, re-encrypting all stored secrets with the new version.
+    fn rotate_master_key(
+        &mut self,
+        _params: secrets::RotateMasterKeyParams,
+        mut results: secrets::RotateMasterKeyResults,
+    ) -> Promise<(), Error> {
+        let registry = self.registry();
+        let keyring_handle = self.keyring();
+        let master_store = self.master_store();
+
+        Promise::from_future(async move {
+            let new_record = master_store
+                .rotate()
+                .map_err(|e| Error::failed(format!("failed to rotate master key: {e}")))?;
+
+            let (previous_version, keyring_clone) = {
+                let guard = keyring_handle.write().await;
+                let prev = guard.current_version();
+                guard.install_current(new_record);
+                (prev, guard.clone())
+            };
+
+            let secrets = registry.list().map_err(|e| Error::failed(e.to_string()))?;
+
+            for mut value in secrets {
+                let plaintext = keyring_clone
+                    .decrypt(
+                        value.id,
+                        value.current_version.version_id,
+                        &value.current_version.ciphertext,
+                    )
+                    .map_err(|e| Error::failed(e.to_string()))?;
+
+                let ciphertext = keyring_clone
+                    .encrypt(value.id, value.current_version.version_id, &plaintext)
+                    .map_err(|e| Error::failed(e.to_string()))?;
+                let ciphertext = secret_ciphertext_from_encryption(ciphertext);
+
+                value.current_version.master_key_version = ciphertext.master_key_version;
+                value.current_version.ciphertext = ciphertext;
+                value.touch(Utc::now().to_rfc3339());
+
+                registry
+                    .upsert(value)
+                    .await
+                    .map_err(|e| Error::failed(e.to_string()))?;
+            }
+
+            if previous_version != new_record.version {
+                master_store
+                    .retire_versions(&[previous_version])
+                    .map_err(|e| Error::failed(format!("failed to retire master key: {e}")))?;
+                let guard = keyring_handle.write().await;
+                guard.retire_versions(&[previous_version]);
+            }
+
+            results.get().set_version(new_record.version);
             Ok(())
         })
     }

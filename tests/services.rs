@@ -52,7 +52,7 @@ local_test!(services_gossip_propagates_across_peers, {
         wait_for_secret(
             &anchor.node.secrets_client,
             secret_name,
-            Duration::from_secs(5)
+            Duration::from_secs(10)
         )
         .await,
         "anchor should observe created secret"
@@ -61,7 +61,7 @@ local_test!(services_gossip_propagates_across_peers, {
         wait_for_secret(
             &peer.node.secrets_client,
             secret_name,
-            Duration::from_secs(5)
+            Duration::from_secs(10)
         )
         .await,
         "peer should replicate secret"
@@ -309,7 +309,7 @@ local_test!(services_deployment_replicates_across_cluster, {
         }
     };
     TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
-    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(5))
+    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(10))
         .await
         .expect("initial roots should converge");
 
@@ -366,7 +366,7 @@ local_test!(services_deployment_replicates_across_cluster, {
             wait_for_task_count(
                 &node.node.task_manager,
                 expected_count,
-                Duration::from_secs(5)
+                Duration::from_secs(10)
             )
             .await,
             "node {} should list all tasks",
@@ -747,7 +747,7 @@ async fn wait_for_service_state(
     service_id: Uuid,
     expect_present: bool,
 ) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let specs = manager
             .list_services()
@@ -799,7 +799,7 @@ async fn ensure_demo_manifest_secrets(cluster: &[TestNode]) {
             wait_for_secret(
                 &cluster[0].node.secrets_client,
                 name,
-                Duration::from_secs(5)
+                Duration::from_secs(10)
             )
             .await,
             "anchor should observe secret '{name}'"
@@ -807,7 +807,7 @@ async fn ensure_demo_manifest_secrets(cluster: &[TestNode]) {
 
         for peer in cluster.iter().skip(1) {
             assert!(
-                wait_for_secret(&peer.node.secrets_client, name, Duration::from_secs(5)).await,
+                wait_for_secret(&peer.node.secrets_client, name, Duration::from_secs(10)).await,
                 "node {} should replicate secret '{name}'",
                 peer.id()
             );

@@ -332,6 +332,9 @@ pub enum SecretsCommand {
 
     /// Show the latest secret value
     Show(SecretsShowArgs),
+
+    /// Rotate the cluster-wide secret master key
+    RotateMasterKey,
 }
 
 #[derive(Args, Debug)]

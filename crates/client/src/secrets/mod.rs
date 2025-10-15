@@ -7,12 +7,14 @@ use uuid::Uuid;
 pub mod create;
 pub mod delete;
 pub mod list;
+pub mod rotate;
 pub mod show;
 pub mod update;
 
 pub use create::create;
 pub use delete::delete;
 pub use list::list;
+pub use rotate::rotate_master_key;
 pub use show::show;
 pub use update::update;
 

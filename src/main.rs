@@ -197,6 +197,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .await?;
                 println!("deleted {} secret(s)", args.names.len());
             }
+            SecretsCommand::RotateMasterKey => {
+                let version = local
+                    .run_until(client::secrets::rotate_master_key(&cfg))
+                    .await?;
+                println!("rotated secret master key to version {}", version);
+            }
             SecretsCommand::Show(args) => {
                 let detail = local
                     .run_until(client::secrets::show(&cfg, &args.name, args.version))

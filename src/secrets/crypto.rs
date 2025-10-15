@@ -1,44 +1,103 @@
 use crate::secrets::types::SecretCiphertext;
+use crate::store::secret_master_store::{MasterKeyRecord, SecretMasterStore};
 use blake3::Hash;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use hkdf::Hkdf;
-use sha2::Sha256;
+use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
-const MASTER_KDF_SALT: &[u8] = b"mantissa.secret.master.salt.v1";
-const MASTER_KDF_INFO: &[u8] = b"mantissa/secret/master/key";
 const AAD_PREFIX: &[u8] = b"mantissa.secret.v1";
+const MASTER_KEY_SIZE: usize = 32;
 
 /// In-memory key material used to encrypt and decrypt secret payloads.
 #[derive(Clone)]
 pub struct SecretKeyring {
-    master_key: [u8; 32],
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    master_store: SecretMasterStore,
+    cache: RwLock<HashMap<u64, [u8; MASTER_KEY_SIZE]>>,
+    current_version: AtomicU64,
 }
 
 impl SecretKeyring {
-    /// Derives a deterministic 256-bit master key from the current join token.
-    pub fn derive_from_token(token: &str) -> io::Result<Self> {
-        if token.trim().is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "join token cannot be empty when deriving secret keyring",
-            ));
+    /// Constructs a keyring bound to the provided master key store and active record.
+    pub fn new(master_store: SecretMasterStore, active: MasterKeyRecord) -> Self {
+        let mut cache = HashMap::new();
+        cache.insert(active.version, active.key);
+        let inner = Inner {
+            master_store,
+            cache: RwLock::new(cache),
+            current_version: AtomicU64::new(active.version),
+        };
+        Self {
+            inner: Arc::new(inner),
         }
-
-        let hk = Hkdf::<Sha256>::new(Some(MASTER_KDF_SALT), token.as_bytes());
-        let mut master_key = [0u8; 32];
-        hk.expand(MASTER_KDF_INFO, &mut master_key)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "hkdf expand failed"))?;
-        Ok(Self { master_key })
     }
 
-    /// Returns the raw master key bytes (used for tests or advanced integrations).
-    pub fn master_key(&self) -> &[u8; 32] {
-        &self.master_key
+    /// Generates a fresh cryptographically random master key suitable for cluster-wide use.
+    pub fn generate_master_key() -> io::Result<[u8; MASTER_KEY_SIZE]> {
+        let mut master_key = [0u8; MASTER_KEY_SIZE];
+        getrandom::getrandom(&mut master_key)?;
+        Ok(master_key)
+    }
+
+    /// Returns the current encrypted master key version identifier.
+    pub fn current_version(&self) -> u64 {
+        self.inner.current_version.load(Ordering::SeqCst)
+    }
+
+    /// Installs `record` as the new active master key while caching its material.
+    pub fn install_current(&self, record: MasterKeyRecord) {
+        {
+            let mut cache = self.inner.cache.write().expect("poisoned master cache");
+            cache.insert(record.version, record.key);
+        }
+        self.inner
+            .current_version
+            .store(record.version, Ordering::SeqCst);
+    }
+
+    /// Removes the provided versions from the in-memory cache (no-op for the current key).
+    pub fn retire_versions(&self, versions: &[u64]) {
+        if versions.is_empty() {
+            return;
+        }
+        let current = self.current_version();
+        let mut cache = self.inner.cache.write().expect("poisoned master cache");
+        for version in versions {
+            if *version == current {
+                continue;
+            }
+            cache.remove(version);
+        }
+    }
+
+    fn master_key_for(&self, version: u64) -> io::Result<[u8; MASTER_KEY_SIZE]> {
+        {
+            let cache = self.inner.cache.read().expect("poisoned master cache");
+            if let Some(key) = cache.get(&version) {
+                return Ok(*key);
+            }
+        }
+
+        let record = self
+            .inner
+            .master_store
+            .load_version(version)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "master key version missing"))?;
+
+        {
+            let mut cache = self.inner.cache.write().expect("poisoned master cache");
+            let entry = cache.entry(record.version).or_insert(record.key);
+            return Ok(*entry);
+        }
     }
 
     /// Encrypts `plaintext` for the provided secret/version identifiers.
@@ -49,7 +108,9 @@ impl SecretKeyring {
         plaintext: &[u8],
     ) -> io::Result<SecretCiphertext> {
         let nonce = Self::random_nonce()?;
-        let aead = ChaCha20Poly1305::new(Key::from_slice(&self.master_key));
+        let version = self.current_version();
+        let master_key = self.master_key_for(version)?;
+        let aead = ChaCha20Poly1305::new(Key::from_slice(&master_key));
         let aad = Self::aad(secret_id, version_id);
         let ciphertext = aead
             .encrypt(
@@ -64,6 +125,7 @@ impl SecretKeyring {
         let digest = Self::digest_bytes(blake3::hash(plaintext));
 
         Ok(SecretCiphertext {
+            master_key_version: version,
             nonce,
             ciphertext,
             digest,
@@ -77,7 +139,8 @@ impl SecretKeyring {
         version_id: Uuid,
         envelope: &SecretCiphertext,
     ) -> io::Result<Vec<u8>> {
-        let aead = ChaCha20Poly1305::new(Key::from_slice(&self.master_key));
+        let master_key = self.master_key_for(envelope.master_key_version)?;
+        let aead = ChaCha20Poly1305::new(Key::from_slice(&master_key));
         let aad = Self::aad(secret_id, version_id);
         let plaintext = aead
             .decrypt(
@@ -116,8 +179,8 @@ impl SecretKeyring {
         aad
     }
 
-    fn digest_bytes(hash: Hash) -> [u8; 32] {
-        let mut out = [0u8; 32];
+    fn digest_bytes(hash: Hash) -> [u8; MASTER_KEY_SIZE] {
+        let mut out = [0u8; MASTER_KEY_SIZE];
         out.copy_from_slice(hash.as_bytes());
         out
     }
@@ -126,21 +189,25 @@ impl SecretKeyring {
 #[cfg(test)]
 mod tests {
     use super::SecretKeyring;
+    use crate::store::secret_master_store::SecretMasterStore;
+    use redb::Database;
+    use std::sync::Arc;
+    use tempfile::tempdir;
     use uuid::Uuid;
 
-    #[test]
-    fn derive_from_token_is_deterministic() {
-        let a = SecretKeyring::derive_from_token("MNTISA-1-abc234").unwrap();
-        let b = SecretKeyring::derive_from_token("MNTISA-1-abc234").unwrap();
-        let c = SecretKeyring::derive_from_token("MNTISA-1-different").unwrap();
-
-        assert_eq!(a.master_key(), b.master_key());
-        assert_ne!(a.master_key(), c.master_key());
+    fn temp_store() -> (SecretMasterStore, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).unwrap());
+        let store = SecretMasterStore::new(db).expect("open store");
+        (store, dir)
     }
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let keyring = SecretKeyring::derive_from_token("MNTISA-1-super-secret").unwrap();
+        let (store, _dir) = temp_store();
+        let record = store.ensure_current().expect("ensure master");
+        let keyring = SecretKeyring::new(store.clone(), record);
         let secret_id = Uuid::new_v4();
         let version_id = Uuid::new_v4();
         let plaintext = b"cluster db password";
@@ -156,7 +223,9 @@ mod tests {
 
     #[test]
     fn detect_digest_mismatch() {
-        let keyring = SecretKeyring::derive_from_token("MNTISA-1-super-secret").unwrap();
+        let (store, _dir) = temp_store();
+        let record = store.ensure_current().expect("ensure master");
+        let keyring = SecretKeyring::new(store.clone(), record);
         let secret_id = Uuid::new_v4();
         let version_id = Uuid::new_v4();
         let plaintext = b"mutable secret";
@@ -170,5 +239,34 @@ mod tests {
             .decrypt(secret_id, version_id, &cipher)
             .expect_err("digest mismatch must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn installing_new_master_keeps_previous_material_available() {
+        let (store, _dir) = temp_store();
+        let initial = store.ensure_current().expect("ensure master");
+        let keyring = SecretKeyring::new(store.clone(), initial);
+
+        let secret_id = Uuid::new_v4();
+        let version_id = Uuid::new_v4();
+        let payload = b"rotation payload";
+
+        let cipher_old = keyring
+            .encrypt(secret_id, version_id, payload)
+            .expect("encrypt with initial key");
+        assert_eq!(cipher_old.master_key_version, initial.version);
+
+        let rotated = store.rotate().expect("rotate master key");
+        keyring.install_current(rotated);
+
+        let cipher_new = keyring
+            .encrypt(secret_id, version_id, payload)
+            .expect("encrypt with rotated key");
+        assert_eq!(cipher_new.master_key_version, rotated.version);
+
+        let plain_old = keyring
+            .decrypt(secret_id, version_id, &cipher_old)
+            .expect("decrypt with legacy key");
+        assert_eq!(plain_old.as_slice(), payload);
     }
 }

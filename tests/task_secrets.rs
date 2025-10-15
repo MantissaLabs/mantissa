@@ -2,6 +2,7 @@
 mod common;
 
 use async_trait::async_trait;
+use capnp_rpc::new_client as capnp_new_client;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use mantissa::registry::Registry;
@@ -9,10 +10,12 @@ use mantissa::scheduler::Scheduler;
 use mantissa::scheduler::{SlotCapacity, SlotSpec};
 use mantissa::secrets::crypto::SecretKeyring;
 use mantissa::secrets::registry::SecretRegistry;
+use mantissa::secrets::service::SecretsService;
 use mantissa::secrets::types::{SecretMetadata, SecretValue, SecretVersion, compute_secret_id};
 use mantissa::store::local_session_store::LocalSessionStore;
 use mantissa::store::peer_store::open_peers_store;
 use mantissa::store::scheduler_store::open_scheduler_store;
+use mantissa::store::secret_master_store::SecretMasterStore;
 use mantissa::store::secret_store::open_secret_store;
 use mantissa::store::task_store::open_task_store;
 use mantissa::task::docker::{
@@ -21,6 +24,7 @@ use mantissa::task::docker::{
 use mantissa::task::manager::{TaskManager, TaskStartRequest};
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use net::noise::NoiseKeys;
+use protocol::secrets::secrets;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -126,7 +130,9 @@ struct TestHarness {
     scheduler: Rc<Scheduler>,
     container_manager: Arc<RecordingContainerManager>,
     secret_registry: SecretRegistry,
+    secret_master_store: SecretMasterStore,
     secret_keyring: SecretKeyring,
+    secret_keyring_handle: Arc<RwLock<SecretKeyring>>,
     node_id: Uuid,
 }
 
@@ -183,8 +189,17 @@ async fn setup_task_manager() -> TestHarness {
         .await
         .expect("rebuild secret store");
     let secret_registry = SecretRegistry::new(secret_store);
-    let secret_keyring =
-        SecretKeyring::derive_from_token("MANTISSA-TEST-TOKEN").expect("derive secret keyring");
+
+    let master_dir = tempdir().expect("master tempdir");
+    let master_path = master_dir
+        .path()
+        .join(format!("master-{}.redb", Uuid::new_v4()));
+    let master_db = Arc::new(redb::Database::create(master_path).expect("create master db"));
+    let master_store = SecretMasterStore::new(master_db.clone()).expect("open master store");
+    let master_record = master_store
+        .ensure_current()
+        .expect("ensure master key record");
+    let secret_keyring = SecretKeyring::new(master_store.clone(), master_record);
     let secret_keyring_arc = Arc::new(RwLock::new(secret_keyring.clone()));
 
     let container_manager = Arc::new(RecordingContainerManager::default());
@@ -222,7 +237,9 @@ async fn setup_task_manager() -> TestHarness {
         scheduler,
         container_manager,
         secret_registry,
+        secret_master_store: master_store,
         secret_keyring,
+        secret_keyring_handle: secret_keyring_arc,
         node_id: actor,
     }
 }
@@ -233,7 +250,9 @@ local_test!(task_manager_stages_secret_env_and_files, {
         scheduler,
         container_manager,
         secret_registry,
+        secret_master_store: _,
         secret_keyring,
+        secret_keyring_handle: _,
         node_id,
     } = setup_task_manager().await;
 
@@ -251,7 +270,14 @@ local_test!(task_manager_stages_secret_env_and_files, {
         .encrypt(secret_id, version_id, secret_plaintext)
         .expect("encrypt secret");
     let now = Utc::now().to_rfc3339();
-    let version = SecretVersion::new(version_id, ciphertext, now.clone(), None);
+    let master_key_version = ciphertext.master_key_version;
+    let version = SecretVersion::new(
+        version_id,
+        ciphertext,
+        now.clone(),
+        None,
+        master_key_version,
+    );
     let value = SecretValue::new(
         secret_name.to_string(),
         SecretMetadata::default(),
@@ -402,5 +428,89 @@ local_test!(task_manager_rejects_missing_secret_reference, {
         container_manager.create_calls().await,
         0,
         "container creation must not be attempted when secrets fail"
+    );
+});
+
+local_test!(rotate_master_key_rewraps_secrets, {
+    let TestHarness {
+        secret_registry,
+        secret_master_store,
+        secret_keyring,
+        secret_keyring_handle,
+        ..
+    } = setup_task_manager().await;
+
+    let secret_name = "db-password";
+    let secret_plaintext = b"rotate-me";
+    let secret_id = compute_secret_id(secret_name);
+    let version_id = Uuid::new_v4();
+    let old_version = secret_keyring.current_version();
+
+    let ciphertext = secret_keyring
+        .encrypt(secret_id, version_id, secret_plaintext)
+        .expect("encrypt secret");
+    let old_ciphertext = ciphertext.clone();
+    let master_key_version = ciphertext.master_key_version;
+    let now = Utc::now().to_rfc3339();
+    let version = SecretVersion::new(
+        version_id,
+        ciphertext,
+        now.clone(),
+        None,
+        master_key_version,
+    );
+    let value = SecretValue::new(
+        secret_name.to_string(),
+        SecretMetadata::default(),
+        now,
+        version,
+    );
+
+    secret_registry
+        .upsert(value.clone())
+        .await
+        .expect("seed secret registry");
+
+    let service = SecretsService::new(
+        secret_registry.clone(),
+        secret_keyring_handle.clone(),
+        secret_master_store.clone(),
+    );
+    let client: secrets::Client = capnp_new_client(service);
+    let response = client
+        .rotate_master_key_request()
+        .send()
+        .promise
+        .await
+        .expect("rotate master key");
+    let new_version = response.get().expect("response").get_version();
+
+    assert!(new_version > old_version);
+
+    let updated = secret_registry
+        .get_by_name(secret_name)
+        .expect("fetch secret")
+        .expect("secret missing after rotation");
+    assert_eq!(updated.current_version.master_key_version, new_version);
+
+    let maybe_old = secret_master_store
+        .load_version(old_version)
+        .expect("load master key version");
+    assert!(maybe_old.is_none(), "old master key must be retired");
+
+    let keyring = secret_keyring_handle.read().await;
+    let decrypted = keyring
+        .decrypt(
+            updated.id,
+            updated.current_version.version_id,
+            &updated.current_version.ciphertext,
+        )
+        .expect("decrypt with new master key");
+    assert_eq!(decrypted.as_slice(), secret_plaintext);
+
+    let legacy = keyring.decrypt(secret_id, version_id, &old_ciphertext);
+    assert!(
+        legacy.is_err(),
+        "legacy ciphertext must fail after rotation"
     );
 });

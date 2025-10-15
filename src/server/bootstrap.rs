@@ -16,6 +16,7 @@ use crate::store::local_session_store::LocalSessionStore;
 use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
 use crate::store::scheduler_store::{SchedulerStore, open_scheduler_store};
+use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::{SecretStore, open_secret_store};
 use crate::store::service_store::{ServiceStore, open_service_store};
 use crate::store::task_store::{TaskStore, open_task_store};
@@ -95,6 +96,7 @@ pub(crate) struct Stores {
     pub local_sessions: LocalSessionStore, // client-side resume tickets (encrypted)
     pub local_creds: LocalCredentialStore, // short-lived cluster creds
     pub token_store: TokenStore,           // join token rotator
+    pub secret_master_store: SecretMasterStore,
     pub tasks: TaskStore,
     pub scheduler_store: SchedulerStore,
     pub services: ServiceStore,
@@ -194,10 +196,16 @@ impl Bootstrap {
 
         // Join token store. Generate new token if none exists.
         let token_store = TokenStore::load(ctx.db.clone()).expect("load persistent join token");
-        let current_token = token_store.current_token().await;
-        let secret_keyring = SecretKeyring::derive_from_token(&current_token)
+
+        let secret_master_store =
+            SecretMasterStore::new(ctx.db.clone()).expect("open secret master key store");
+        let master_record = secret_master_store
+            .ensure_current()
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-        let secret_keyring = Arc::new(RwLock::new(secret_keyring));
+        let secret_keyring = Arc::new(RwLock::new(SecretKeyring::new(
+            secret_master_store.clone(),
+            master_record,
+        )));
 
         // Debug dump mst root for peers store.
         peers.debug_dump_root("peers").await;
@@ -220,6 +228,7 @@ impl Bootstrap {
             local_sessions,
             local_creds,
             token_store,
+            secret_master_store,
             tasks,
             scheduler_store,
             services,
@@ -261,6 +270,7 @@ impl Bootstrap {
             sessions: stores.local_sessions.clone(),
             peers: stores.peers.clone(),
             token_store: stores.token_store.clone(),
+            secret_master_store: stores.secret_master_store.clone(),
             tasks: stores.tasks.clone(),
             services: stores.services.clone(),
             secrets: stores.secrets.clone(),
@@ -361,8 +371,11 @@ impl Bootstrap {
         let services_service = ServicesRPC::new(service_controller.clone());
         let services_client_cap = capnp_rpc::new_client(services_service);
 
-        let secrets_service =
-            SecretsService::new(secret_registry.clone(), stores.secret_keyring.clone());
+        let secrets_service = SecretsService::new(
+            secret_registry.clone(),
+            stores.secret_keyring.clone(),
+            stores.secret_master_store.clone(),
+        );
         let secrets_client_cap: SecretsClient = capnp_rpc::new_client(secrets_service);
 
         let scheduler_service =
