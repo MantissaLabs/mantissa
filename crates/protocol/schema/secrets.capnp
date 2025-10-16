@@ -64,5 +64,7 @@ interface Secrets {
 
   getMasterKey @5 () -> (envelope :SecretMasterKey);
 
-  rotateMasterKey @6 () -> (version :UInt64);
+  installMasterKey @6 (envelope :SecretMasterKey);
+
+  rotateMasterKey @7 () -> (version :UInt64);
 }

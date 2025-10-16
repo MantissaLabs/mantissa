@@ -71,6 +71,11 @@ impl SecretMasterStore {
     }
 
     /// Fetches the master key record associated with `version` if it exists.
+    ///
+    /// Historical versions remain available so peers can continue decrypting
+    /// data during cluster-wide convergence after a rotation. Once all nodes
+    /// have installed the newer key, older entries can be garbage-collected
+    /// separately.
     pub fn load_version(&self, version: u64) -> io::Result<Option<MasterKeyRecord>> {
         let read_tx = self.db.begin_read().map_err(ioerr)?;
         let table = read_tx.open_table(T_MASTER_KEYS).map_err(ioerr)?;
@@ -108,27 +113,6 @@ impl SecretMasterStore {
         let new_key = SecretKeyring::generate_master_key()?;
         self.persist_new_version(next_version, &new_key)?;
         MasterKeyRecord::new(next_version, new_key)
-    }
-
-    /// Removes the specified versions from durable storage (skipping the current key).
-    pub fn retire_versions(&self, versions: &[u64]) -> io::Result<()> {
-        if versions.is_empty() {
-            return Ok(());
-        }
-
-        let current = self.current_version()?;
-        let write_tx = self.db.begin_write().map_err(ioerr)?;
-        {
-            let mut keys = write_tx.open_table(T_MASTER_KEYS).map_err(ioerr)?;
-            for &version in versions {
-                if Some(version) == current {
-                    continue;
-                }
-                keys.remove(version).map_err(ioerr)?;
-            }
-        }
-        write_tx.commit().map_err(ioerr)?;
-        Ok(())
     }
 
     /// Loads the currently active master key record if one has been persisted.

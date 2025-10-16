@@ -3,7 +3,8 @@ use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::{
     SecretCiphertext, SecretMetadata, SecretValue, SecretVersion, compute_secret_id,
 };
-use crate::store::secret_master_store::SecretMasterStore;
+use crate::store::secret_master_store::{MasterKeyRecord, SecretMasterStore};
+use crate::topology::Topology;
 use capnp::Error;
 use capnp::capability::Promise;
 use capnp::struct_list;
@@ -12,12 +13,14 @@ use protocol::secrets::{secret_metadata_entry, secret_spec, secrets};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::warn;
 use uuid::Uuid;
 
 pub struct SecretsService {
     registry: SecretRegistry,
     keyring: Arc<RwLock<SecretKeyring>>,
     master_store: SecretMasterStore,
+    topology: Option<Topology>,
 }
 
 impl SecretsService {
@@ -26,11 +29,13 @@ impl SecretsService {
         registry: SecretRegistry,
         keyring: Arc<RwLock<SecretKeyring>>,
         master_store: SecretMasterStore,
+        topology: Option<Topology>,
     ) -> Self {
         Self {
             registry,
             keyring,
             master_store,
+            topology,
         }
     }
 
@@ -44,6 +49,10 @@ impl SecretsService {
 
     fn master_store(&self) -> SecretMasterStore {
         self.master_store.clone()
+    }
+
+    fn topology(&self) -> Option<Topology> {
+        self.topology.clone()
     }
 }
 
@@ -365,17 +374,20 @@ impl secrets::Server for SecretsService {
         let registry = self.registry();
         let keyring_handle = self.keyring();
         let master_store = self.master_store();
+        let topology = self.topology();
 
+        // Note: We keep previous master-key material around after rotation so peers still
+        // decrypt pre-rotation ciphertext while convergence happens. We push the new version
+        // to every known peer below. Once the cluster settles, the old key can be GC’d later.
         Promise::from_future(async move {
             let new_record = master_store
                 .rotate()
                 .map_err(|e| Error::failed(format!("failed to rotate master key: {e}")))?;
 
-            let (previous_version, keyring_clone) = {
+            let keyring_clone = {
                 let guard = keyring_handle.write().await;
-                let prev = guard.current_version();
                 guard.install_current(new_record);
-                (prev, guard.clone())
+                guard.clone()
             };
 
             let secrets = registry.list().map_err(|e| Error::failed(e.to_string()))?;
@@ -404,16 +416,79 @@ impl secrets::Server for SecretsService {
                     .map_err(|e| Error::failed(e.to_string()))?;
             }
 
-            if previous_version != new_record.version {
-                master_store
-                    .retire_versions(&[previous_version])
-                    .map_err(|e| Error::failed(format!("failed to retire master key: {e}")))?;
-                let guard = keyring_handle.write().await;
-                guard.retire_versions(&[previous_version]);
+            if let Some(topology) = topology {
+                if let Err(e) = distribute_master_key(topology, new_record).await {
+                    warn!(target: "secrets", "failed to distribute master key v{}: {e}", new_record.version);
+                }
             }
 
             results.get().set_version(new_record.version);
             Ok(())
         })
     }
+
+    fn install_master_key(
+        &mut self,
+        params: secrets::InstallMasterKeyParams,
+        _results: secrets::InstallMasterKeyResults,
+    ) -> Promise<(), Error> {
+        let store = self.master_store();
+        let keyring = self.keyring();
+
+        Promise::from_future(async move {
+            let envelope = params.get()?.get_envelope()?;
+            let key_bytes = envelope.get_key()?;
+            if key_bytes.len() != 32 {
+                return Err(Error::failed(
+                    "master key payload must be exactly 32 bytes".into(),
+                ));
+            }
+
+            let mut key = [0u8; 32];
+            key.copy_from_slice(key_bytes);
+            let record = MasterKeyRecord::new(envelope.get_version(), key)
+                .map_err(|e| Error::failed(e.to_string()))?;
+
+            store
+                .import_current(&record)
+                .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
+
+            {
+                let guard = keyring.write().await;
+                guard.install_current(record);
+            }
+
+            Ok(())
+        })
+    }
+}
+
+async fn distribute_master_key(topology: Topology, record: MasterKeyRecord) -> Result<(), Error> {
+    let registry = topology.registry();
+    let peers = registry
+        .known_peers()
+        .map_err(|e| Error::failed(format!("failed to load peer list: {e}")))?;
+
+    for peer in peers {
+        let Some(session) = registry.session_for_peer(peer).await else {
+            continue;
+        };
+        let request = session.get_secrets_request();
+        let secrets_client = request.send().pipeline.get_secrets();
+        let mut install = secrets_client.install_master_key_request();
+        let mut envelope = install.get().init_envelope();
+        envelope.set_version(record.version);
+        envelope.set_key(&record.key);
+
+        if let Err(e) = install.send().promise.await {
+            warn!(
+                target: "secrets",
+                peer = %peer,
+                "install master key v{} failed: {e}",
+                record.version
+            );
+        }
+    }
+
+    Ok(())
 }

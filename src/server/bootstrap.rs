@@ -375,6 +375,7 @@ impl Bootstrap {
             secret_registry.clone(),
             stores.secret_keyring.clone(),
             stores.secret_master_store.clone(),
+            Some(topology.clone()),
         );
         let secrets_client_cap: SecretsClient = capnp_rpc::new_client(secrets_service);
 

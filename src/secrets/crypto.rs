@@ -55,6 +55,10 @@ impl SecretKeyring {
 
     /// Installs `record` as the new active master key while caching its material.
     pub fn install_current(&self, record: MasterKeyRecord) {
+        // NOTE: we intentionally preserve older key versions in the cache/store so peers can
+        // still decrypt ciphertext that was encrypted before they applied the new version.
+        // Rotation re-wraps secrets with `record.version`, but remote nodes might serve reads
+        // against the previous version until they receive the broadcast.
         {
             let mut cache = self.inner.cache.write().expect("poisoned master cache");
             cache.insert(record.version, record.key);
@@ -62,21 +66,6 @@ impl SecretKeyring {
         self.inner
             .current_version
             .store(record.version, Ordering::SeqCst);
-    }
-
-    /// Removes the provided versions from the in-memory cache (no-op for the current key).
-    pub fn retire_versions(&self, versions: &[u64]) {
-        if versions.is_empty() {
-            return;
-        }
-        let current = self.current_version();
-        let mut cache = self.inner.cache.write().expect("poisoned master cache");
-        for version in versions {
-            if *version == current {
-                continue;
-            }
-            cache.remove(version);
-        }
     }
 
     fn master_key_for(&self, version: u64) -> io::Result<[u8; MASTER_KEY_SIZE]> {

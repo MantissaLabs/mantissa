@@ -475,6 +475,7 @@ local_test!(rotate_master_key_rewraps_secrets, {
         secret_registry.clone(),
         secret_keyring_handle.clone(),
         secret_master_store.clone(),
+        None,
     );
     let client: secrets::Client = capnp_new_client(service);
     let response = client
@@ -496,7 +497,7 @@ local_test!(rotate_master_key_rewraps_secrets, {
     let maybe_old = secret_master_store
         .load_version(old_version)
         .expect("load master key version");
-    assert!(maybe_old.is_none(), "old master key must be retired");
+    assert!(maybe_old.is_some(), "previous master key should remain available for convergence");
 
     let keyring = secret_keyring_handle.read().await;
     let decrypted = keyring
@@ -508,9 +509,8 @@ local_test!(rotate_master_key_rewraps_secrets, {
         .expect("decrypt with new master key");
     assert_eq!(decrypted.as_slice(), secret_plaintext);
 
-    let legacy = keyring.decrypt(secret_id, version_id, &old_ciphertext);
-    assert!(
-        legacy.is_err(),
-        "legacy ciphertext must fail after rotation"
-    );
+    let legacy = keyring
+        .decrypt(secret_id, version_id, &old_ciphertext)
+        .expect("legacy ciphertext must remain decryptable while cluster converges");
+    assert_eq!(legacy.as_slice(), secret_plaintext);
 });

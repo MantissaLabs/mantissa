@@ -324,6 +324,10 @@ impl Topology {
         self.gossip.send(Message::Topology { id, event }).await
     }
 
+    pub fn registry(&self) -> Registry {
+        self.registry.clone()
+    }
+
     pub fn set_bound_addr(&self, sa: SocketAddr) {
         self.networking.set_bound(sa);
     }
