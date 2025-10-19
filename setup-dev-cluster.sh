@@ -94,13 +94,40 @@ provision:
         curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
       fi
       sudo chmod a+r /etc/apt/keyrings/docker.gpg
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo \$VERSION_CODENAME) stable" | \
-        sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+      # Determine the apt codename for Docker's repository with sensible fallbacks.
+      CODENAME=""
+      if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+      fi
+      if [ -z "$CODENAME" ] && command -v lsb_release >/dev/null 2>&1; then
+        CODENAME="$(lsb_release -cs)"
+      fi
+      if [ -z "$CODENAME" ]; then
+        echo "Unable to determine OS codename for Docker repository." >&2
+        exit 1
+      fi
+
+      DOCKER_SOURCE_LINE="deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian ${CODENAME} stable"
+      if ! grep -Fxq "$DOCKER_SOURCE_LINE" /etc/apt/sources.list.d/docker.list 2>/dev/null; then
+        printf '%s\n' "$DOCKER_SOURCE_LINE" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+      fi
       sudo apt-get update
       sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-      sudo systemctl enable docker
-      sudo systemctl start docker
-      sudo usermod -aG docker "$USER"
+
+      # Add current user to docker group.
+      if ! getent group docker >/dev/null; then
+        sudo groupadd docker
+      fi
+      if ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
+        sudo usermod -aG docker "$USER"
+      fi
+
+      # Follow Docker post-install guidance: enable daemon
+      sudo systemctl enable docker.service
+      sudo systemctl start docker.service
 
       # Rust toolchain
       if ! command -v rustup >/dev/null 2>&1; then
