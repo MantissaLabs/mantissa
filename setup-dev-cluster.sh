@@ -183,6 +183,13 @@ PROVISION_1
   echo "Starting ${NAME} (SSH port ${SSHPORT})…"
   limactl start --name="${NAME}" "${TMPYAML}"
   rm -f "${TMPYAML}"
+
+  # Ensure any pre-existing SSH ControlMaster session is closed so future shells
+  # pick up updated group membership (e.g. docker) without requiring a VM restart.
+  local SSH_CONFIG="${HOME}/.lima/${NAME}/ssh.config"
+  if [[ -f "${SSH_CONFIG}" ]]; then
+    ssh -F "${SSH_CONFIG}" -O exit "lima-${NAME}" >/dev/null 2>&1 || true
+  fi
 }
 
 # Create and start N VMs
