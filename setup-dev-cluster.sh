@@ -88,7 +88,7 @@ provision:
       sudo apt-get update && sudo apt-get upgrade -y
 
       # Install docker
-      sudo apt-get install -y ca-certificates curl build-essential git capnproto libcapnp-dev libssl-dev pkg-config iputils-ping
+      sudo apt-get install -y ca-certificates curl build-essential git capnproto libcapnp-dev libssl-dev pkg-config iputils-ping linux-perf bpftool
       sudo install -m 0755 -d /etc/apt/keyrings
       if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
         curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -124,6 +124,26 @@ provision:
         echo 'export MANTISSA_BIN="/mantissa/target/debug"' >> ~/.profile
         echo 'export PATH="$PATH:$MANTISSA_BIN"' >> ~/.profile
         echo "alias mts='RUST_LOG=debug mantissa'" >> ~/.profile
+      fi
+
+      if ! grep -q 'alias dockerclean=' ~/.bashrc; then
+        echo "alias dockerclean='docker rm -f \$(docker ps -aq)'" >> ~/.bashrc
+      fi
+      if ! grep -q 'alias dockerclean=' ~/.profile; then
+        echo "alias dockerclean='docker rm -f \$(docker ps -aq)'" >> ~/.profile
+      fi
+
+      if [ -f "$HOME/.cargo/env" ]; then
+        # shellcheck disable=SC1090
+        source "$HOME/.cargo/env"
+      fi
+      export PATH="$HOME/.cargo/bin:$PATH"
+
+      rustup toolchain install nightly-aarch64-unknown-linux-gnu
+      rustup component add rust-src --toolchain nightly-aarch64-unknown-linux-gnu
+
+      if ! cargo install --list | grep -q '^flamegraph v'; then
+        cargo install flamegraph
       fi
 PROVISION_1
     # Separate step to set hostname with ${NAME} (needs host-side expansion)
