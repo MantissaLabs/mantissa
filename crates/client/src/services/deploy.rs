@@ -163,6 +163,11 @@ fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) -> Resul
     let mut env_builder = builder.reborrow().init_env(task.env.len() as u32);
     write_env_vars(&mut env_builder, &task.env, &task.name)?;
 
+    let mut networks_builder = builder.reborrow().init_networks(task.networks.len() as u32);
+    for (idx, network) in task.networks.iter().enumerate() {
+        networks_builder.set(idx as u32, network.trim());
+    }
+
     let mut files_builder = builder
         .reborrow()
         .init_secret_files(task.secret_files.len() as u32);

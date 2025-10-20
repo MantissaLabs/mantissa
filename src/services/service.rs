@@ -1,7 +1,8 @@
+use crate::network::types::compute_network_id;
 use crate::services::manager::ServiceController;
 use crate::services::types::{
-    ServiceEvent, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
-    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
+    ServiceEvent, ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement,
+    ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
 };
 use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use capnp::Error;
@@ -9,6 +10,7 @@ use capnp::capability::Promise;
 use capnp::struct_list;
 use protocol::services::{service_event, service_spec, services, task_template};
 use protocol::task::{environment_var, secret_file, secret_ref};
+use std::collections::HashSet;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -316,6 +318,26 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
     let env = decode_env_vars(reader.get_env()?)?;
     let secret_files = decode_secret_files(reader.get_secret_files()?)?;
 
+    let mut networks = Vec::new();
+    let mut seen_networks = HashSet::new();
+    for entry in reader.get_networks()?.iter() {
+        let raw = entry?.to_str()?.trim().to_string();
+        if raw.is_empty() {
+            return Err(Error::failed("network names must be non-empty".to_string()));
+        }
+
+        if !seen_networks.insert(raw.clone()) {
+            return Err(Error::failed(format!(
+                "duplicate network '{}' in task template",
+                raw
+            )));
+        }
+
+        let network_id = compute_network_id(&raw);
+        networks.push(ServiceTaskNetworkRequirement::new(raw, network_id));
+    }
+    networks.sort_by(|a, b| a.network_id.cmp(&b.network_id));
+
     Ok(ServiceTaskSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
         image: reader.get_image()?.to_str()?.to_string(),
@@ -326,6 +348,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         restart_policy,
         env,
         secret_files,
+        networks,
     })
 }
 
@@ -382,6 +405,11 @@ fn write_task_template(
 
     let mut env_builder = builder.reborrow().init_env(task.env.len() as u32);
     encode_env_vars(&mut env_builder, &task.env);
+
+    let mut networks_builder = builder.reborrow().init_networks(task.networks.len() as u32);
+    for (idx, network) in task.networks.iter().enumerate() {
+        networks_builder.set(idx as u32, &network.name);
+    }
 
     let mut files_builder = builder
         .reborrow()

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use uuid::Uuid;
@@ -82,6 +83,8 @@ pub struct TaskSpec {
     pub env: Vec<EnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<SecretFileProjection>,
+    #[serde(default)]
+    pub networks: Vec<String>,
 }
 
 impl ServiceManifest {
@@ -232,6 +235,25 @@ impl ServiceManifest {
                             file.path
                         ));
                     }
+                }
+            }
+
+            let mut seen_networks = HashSet::new();
+            for network in &task.networks {
+                let trimmed = network.trim();
+                if trimmed.is_empty() {
+                    return Err(anyhow!(
+                        "task '{}' references a network with an empty name",
+                        task.name
+                    ));
+                }
+
+                if !seen_networks.insert(trimmed.to_string()) {
+                    return Err(anyhow!(
+                        "task '{}' references network '{}' multiple times",
+                        task.name,
+                        trimmed
+                    ));
                 }
             }
         }

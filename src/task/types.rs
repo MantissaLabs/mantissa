@@ -26,6 +26,8 @@ pub struct TaskSpec {
     pub env: Vec<TaskEnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,
+    #[serde(default)]
+    pub networks: Vec<Uuid>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,6 +139,8 @@ pub struct TaskValue {
     pub env: Vec<TaskEnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,
+    #[serde(default)]
+    pub networks: Vec<Uuid>,
 }
 
 impl TaskValue {
@@ -150,6 +154,7 @@ impl TaskValue {
         node_id: Uuid,
         node_name: impl Into<String>,
         slot_ids: Vec<u64>,
+        networks: Vec<Uuid>,
         cpu_millis: u64,
         memory_bytes: u64,
         env: Vec<TaskEnvironmentVariable>,
@@ -167,6 +172,7 @@ impl TaskValue {
             node_name: node_name.into(),
             slot_ids,
             slot_id,
+            networks,
             cpu_millis,
             memory_bytes,
             restart_policy: None,

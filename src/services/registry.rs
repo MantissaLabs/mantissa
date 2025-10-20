@@ -106,6 +106,7 @@ mod tests {
                 restart_policy: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                networks: Vec::new(),
             }],
             vec![Uuid::new_v4()],
         );
@@ -137,6 +138,7 @@ mod tests {
                 restart_policy: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                networks: Vec::new(),
             }],
             vec![Uuid::new_v4(), Uuid::new_v4()],
         );

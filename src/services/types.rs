@@ -70,6 +70,32 @@ pub struct ServiceTaskSpecValue {
     pub env: Vec<TaskEnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,
+    #[serde(default)]
+    pub networks: Vec<ServiceTaskNetworkRequirement>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceTaskNetworkRequirement {
+    pub name: String,
+    pub network_id: Uuid,
+}
+
+impl ServiceTaskNetworkRequirement {
+    pub fn new(name: impl Into<String>, network_id: Uuid) -> Self {
+        Self {
+            name: name.into(),
+            network_id,
+        }
+    }
+}
+
+impl ServiceTaskSpecValue {
+    pub fn required_network_ids(&self) -> Vec<Uuid> {
+        self.networks
+            .iter()
+            .map(|network| network.network_id)
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]

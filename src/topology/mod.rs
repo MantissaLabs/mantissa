@@ -6,7 +6,7 @@ use crate::registry::Registry;
 use crate::secrets::crypto::SecretKeyring;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
-use crate::store::network_store::{NetworkPeerStore, NetworkSpecStore};
+use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
 use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::SecretStore;
@@ -62,6 +62,7 @@ pub struct TopologyStores {
     pub secrets: SecretStore,
     pub networks: NetworkSpecStore,
     pub network_peers: NetworkPeerStore,
+    pub network_attachments: NetworkAttachmentStore,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
@@ -234,6 +235,7 @@ pub struct Topology {
     secrets: SecretStore,
     networks: NetworkSpecStore,
     network_peers: NetworkPeerStore,
+    network_attachments: NetworkAttachmentStore,
 
     /// Cached Peers snapshot to avoid hitting storage on every tick.
     peer_snapshot_cache: Arc<AsyncMutex<PeerSnapshotCache>>,
@@ -294,6 +296,7 @@ impl Topology {
             secrets,
             networks,
             network_peers,
+            network_attachments,
             secret_keyring,
         } = stores;
 
@@ -312,6 +315,7 @@ impl Topology {
             secrets,
             networks,
             network_peers,
+            network_attachments,
             peer_snapshot_cache: Arc::new(AsyncMutex::new(PeerSnapshotCache::new())),
             local_sessions: sessions,
             local_credential_store: credentials,
@@ -739,6 +743,7 @@ impl Topology {
                 secrets: self.secrets.clone(),
                 networks: self.networks.clone(),
                 network_peers: self.network_peers.clone(),
+                network_attachments: self.network_attachments.clone(),
             };
 
             sync_all_domains(stores, sync_cap).await;

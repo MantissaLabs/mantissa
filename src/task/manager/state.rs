@@ -34,6 +34,7 @@ impl TaskManager {
             spec.node_id,
             spec.node_name.clone(),
             spec.slot_ids.clone(),
+            spec.networks.clone(),
             spec.cpu_millis,
             spec.memory_bytes,
             spec.env.clone(),

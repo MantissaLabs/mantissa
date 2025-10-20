@@ -1,4 +1,5 @@
 use crate::gossip::Message;
+use crate::network::registry::NetworkRegistry;
 use crate::registry::Registry;
 use crate::scheduler::{Scheduler, SlotId};
 use crate::secrets::crypto::SecretKeyring;
@@ -11,7 +12,7 @@ use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskSpec,
     TaskStateFilter, TaskValue,
 };
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use bollard::errors::Error as BollardError;
 use crdt_store::uuid_key::UuidKey;
@@ -54,6 +55,7 @@ pub struct TaskManager {
     secret_keyring: Arc<RwLock<SecretKeyring>>,
     secret_artifacts: Arc<AsyncMutex<HashMap<Uuid, TaskSecretArtifacts>>>,
     secret_runtime_root: PathBuf,
+    network_registry: NetworkRegistry,
 }
 
 #[derive(Clone)]
@@ -68,6 +70,7 @@ pub struct TaskStartRequest {
     pub restart_policy: Option<TaskRestartPolicy>,
     pub env: Vec<TaskEnvironmentVariable>,
     pub secret_files: Vec<TaskSecretFile>,
+    pub networks: Vec<Uuid>,
 }
 
 impl TaskManager {
@@ -80,6 +83,7 @@ impl TaskManager {
         scheduler: Rc<Scheduler>,
         container_manager: Arc<dyn ContainerManager + Send + Sync>,
         registry: Registry,
+        network_registry: NetworkRegistry,
         secret_registry: SecretRegistry,
         secret_keyring: Arc<RwLock<SecretKeyring>>,
     ) -> Self {
@@ -99,6 +103,7 @@ impl TaskManager {
             container_manager,
             local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
             registry,
+            network_registry,
             secret_registry,
             secret_keyring,
             secret_artifacts: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -126,6 +131,7 @@ impl TaskManager {
             restart_policy,
             env: Vec::new(),
             secret_files: Vec::new(),
+            networks: Vec::new(),
         };
 
         let mut specs = self.start_tasks_batch(vec![request]).await?;
@@ -426,6 +432,25 @@ impl TaskManager {
 
         Ok(())
     }
+
+    fn collect_network_readiness(&self) -> Result<HashMap<Uuid, HashSet<Uuid>>, anyhow::Error> {
+        let mut readiness: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+        let states = self
+            .network_registry
+            .list_peer_states(None)
+            .map_err(|e| anyhow!("failed to load network peer states: {e}"))?;
+
+        for state in states {
+            if state.state.is_ready() {
+                readiness
+                    .entry(state.peer_id)
+                    .or_insert_with(HashSet::new)
+                    .insert(state.network_id);
+            }
+        }
+
+        Ok(readiness)
+    }
 }
 
 fn wrap_create_error(task_name: &str, err: ContainerError) -> anyhow::Error {
@@ -484,5 +509,6 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         restart_policy: value.restart_policy,
         env: value.env,
         secret_files: value.secret_files,
+        networks: value.networks,
     }
 }

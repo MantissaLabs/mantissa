@@ -32,6 +32,7 @@ struct TaskSpec {
   restartPolicy @11 :RestartPolicy;
   env @12 :List(EnvironmentVar);
   secretFiles @13 :List(SecretFile);
+  networks @14 :List(Data); # Each entry is a 16-byte network UUID
 }
 
 struct TaskStartRequest {
@@ -45,6 +46,7 @@ struct TaskStartRequest {
   restartPolicy @7 :RestartPolicy;
   env @8 :List(EnvironmentVar);
   secretFiles @9 :List(SecretFile);
+  networks @10 :List(Data); # Required networks as 16-byte UUIDs
 }
 
 struct TaskStopRequest {

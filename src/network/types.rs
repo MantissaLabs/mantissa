@@ -45,6 +45,7 @@ impl Default for NetworkStatus {
 
 impl NetworkStatus {
     /// Convert from protocol enumeration into the internal representation.
+    #[allow(dead_code)]
     pub fn from_proto(status: protocol::network::NetworkStatus) -> Self {
         match status {
             protocol::network::NetworkStatus::Pending => NetworkStatus::Pending,
@@ -93,6 +94,7 @@ impl NetworkPeerState {
     }
 
     /// Convert from the protocol enumeration into the internal representation.
+    #[allow(dead_code)]
     pub fn from_proto(state: protocol::network::PeerState) -> Self {
         match state {
             protocol::network::PeerState::AwaitingSpec => NetworkPeerState::AwaitingSpec,
@@ -238,6 +240,7 @@ impl NetworkPeerStateValue {
     }
 
     /// Update the peer state and error context.
+    #[allow(dead_code)]
     pub fn set_state(&mut self, state: NetworkPeerState, error: Option<String>) {
         self.state = state;
         self.error = error;
@@ -267,6 +270,104 @@ pub fn compute_network_peer_state_id(network_id: Uuid, peer_id: Uuid) -> Uuid {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest.as_bytes()[..16]);
     Uuid::from_bytes(bytes)
+}
+
+/// Lifecycle states describing how an attachment is progressing through reconciliation.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkAttachmentState {
+    Pending,
+    Configuring,
+    Ready,
+    Removing,
+    Error,
+}
+
+impl NetworkAttachmentState {
+    pub fn to_proto(self) -> protocol::network::AttachmentState {
+        match self {
+            NetworkAttachmentState::Pending => protocol::network::AttachmentState::Pending,
+            NetworkAttachmentState::Configuring => protocol::network::AttachmentState::Configuring,
+            NetworkAttachmentState::Ready => protocol::network::AttachmentState::Ready,
+            NetworkAttachmentState::Removing => protocol::network::AttachmentState::Removing,
+            NetworkAttachmentState::Error => protocol::network::AttachmentState::Error,
+        }
+    }
+
+    pub fn from_proto(state: protocol::network::AttachmentState) -> Self {
+        match state {
+            protocol::network::AttachmentState::Pending => NetworkAttachmentState::Pending,
+            protocol::network::AttachmentState::Configuring => NetworkAttachmentState::Configuring,
+            protocol::network::AttachmentState::Ready => NetworkAttachmentState::Ready,
+            protocol::network::AttachmentState::Removing => NetworkAttachmentState::Removing,
+            protocol::network::AttachmentState::Error => NetworkAttachmentState::Error,
+        }
+    }
+}
+
+/// Attachment intent/state replicated for workloads connected to overlay networks.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NetworkAttachmentValue {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub container_id: String,
+    pub network_id: Uuid,
+    #[serde(default)]
+    pub requested_ip: Option<String>,
+    #[serde(default)]
+    pub assigned_ip: Option<String>,
+    #[serde(default)]
+    pub mac: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub state: NetworkAttachmentState,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl NetworkAttachmentValue {
+    pub fn new(
+        id: Uuid,
+        task_id: Uuid,
+        container_id: impl Into<String>,
+        network_id: Uuid,
+        requested_ip: Option<String>,
+        assigned_ip: Option<String>,
+        mac: Option<String>,
+        state: NetworkAttachmentState,
+        error: Option<String>,
+    ) -> Self {
+        let created_at = current_timestamp();
+        Self {
+            id,
+            task_id,
+            container_id: container_id.into(),
+            network_id,
+            requested_ip,
+            assigned_ip,
+            mac,
+            created_at: created_at.clone(),
+            updated_at: created_at,
+            state,
+            error,
+        }
+    }
+
+    pub fn set_state(&mut self, state: NetworkAttachmentState, error: Option<String>) {
+        self.state = state;
+        self.error = error;
+        self.touch();
+    }
+
+    pub fn set_assignment(&mut self, assigned_ip: Option<String>, mac: Option<String>) {
+        self.assigned_ip = assigned_ip;
+        self.mac = mac;
+        self.touch();
+    }
+
+    pub fn touch(&mut self) {
+        self.updated_at = current_timestamp();
+    }
 }
 
 fn current_timestamp() -> String {

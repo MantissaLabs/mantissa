@@ -12,6 +12,7 @@ struct TaskTemplate {
   restartPolicy @6 :RestartPolicy; # Desired container restart behaviour (optional)
   env @7 :List(TaskSchema.EnvironmentVar); # Environment variables (literal or secret-backed)
   secretFiles @8 :List(TaskSchema.SecretFile); # Secret-backed file projections
+  networks @9 :List(Text); # Required overlay network names
 }
 
 enum RestartPolicyName {

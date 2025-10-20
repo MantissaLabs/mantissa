@@ -177,6 +177,7 @@ pub fn add_event(
             spec_builder.reborrow().init_command(0);
             spec_builder.reborrow().init_env(0);
             spec_builder.reborrow().init_secret_files(0);
+            spec_builder.reborrow().init_networks(0);
         }
     }
 }
@@ -236,6 +237,11 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
         }
     }
 
+    let mut networks_builder = builder.reborrow().init_networks(spec.networks.len() as u32);
+    for (idx, network_id) in spec.networks.iter().enumerate() {
+        networks_builder.set(idx as u32, network_id.as_bytes());
+    }
+
     let mut files_builder = builder
         .reborrow()
         .init_secret_files(spec.secret_files.len() as u32);
@@ -286,6 +292,17 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     let env = decode_env_vars(reader.get_env()?)?;
     let secret_files = decode_secret_files(reader.get_secret_files()?)?;
 
+    let mut networks = Vec::new();
+    for entry in reader.get_networks()?.iter() {
+        let data = entry?;
+        if data.len() != 16 {
+            return Err(Error::failed("invalid network id length".to_string()));
+        }
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&data);
+        networks.push(Uuid::from_bytes(bytes));
+    }
+
     Ok(TaskSpec {
         id,
         name,
@@ -302,6 +319,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         restart_policy,
         env,
         secret_files,
+        networks,
     })
 }
 
@@ -364,6 +382,17 @@ impl task::Server for TaskService {
             let env = decode_env_vars(req.get_env()?)?;
             let secret_files = decode_secret_files(req.get_secret_files()?)?;
 
+            let mut networks = Vec::new();
+            for entry in req.get_networks()?.iter() {
+                let data = entry?;
+                if data.len() != 16 {
+                    return Err(Error::failed("invalid network id length".to_string()));
+                }
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&data);
+                networks.push(Uuid::from_bytes(bytes));
+            }
+
             let request = TaskStartRequest {
                 name,
                 image,
@@ -375,6 +404,7 @@ impl task::Server for TaskService {
                 restart_policy,
                 env,
                 secret_files,
+                networks,
             };
 
             let mut specs = manager
@@ -434,6 +464,17 @@ impl task::Server for TaskService {
                 let env = decode_env_vars(entry.get_env()?)?;
                 let secret_files = decode_secret_files(entry.get_secret_files()?)?;
 
+                let mut networks = Vec::new();
+                for net in entry.get_networks()?.iter() {
+                    let data = net?;
+                    if data.len() != 16 {
+                        return Err(Error::failed("invalid network id length".to_string()));
+                    }
+                    let mut bytes = [0u8; 16];
+                    bytes.copy_from_slice(&data);
+                    networks.push(Uuid::from_bytes(bytes));
+                }
+
                 let restart_policy = if entry.has_restart_policy() {
                     Some(decode_restart_policy(entry.get_restart_policy()?)?)
                 } else {
@@ -451,6 +492,7 @@ impl task::Server for TaskService {
                     restart_policy,
                     env,
                     secret_files,
+                    networks,
                 });
             }
 

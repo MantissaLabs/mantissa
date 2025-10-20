@@ -1,13 +1,16 @@
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    NetworkDriver, NetworkPeerStateValue, NetworkSpecValue, NetworkStatus, compute_network_id,
+    NetworkAttachmentValue, NetworkDriver, NetworkPeerStateValue, NetworkSpecValue, NetworkStatus,
+    compute_network_id,
 };
 use capnp::Error;
 use capnp::capability::Promise;
 use protocol::network::{
-    network_create_spec, network_peer_status, network_spec, network_summary, networks,
+    network_attachment_spec, network_create_spec, network_peer_status, network_spec,
+    network_summary, networks,
 };
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use uuid::Uuid;
 
 /// Cap'n Proto RPC surface for creating, listing, and inspecting overlay networks.
@@ -107,6 +110,27 @@ impl NetworksRpc {
         builder.set_state(state.state.to_proto());
         builder.set_updated_at(&state.updated_at);
         if let Some(err) = &state.error {
+            builder.set_error(err);
+        } else {
+            builder.set_error("");
+        }
+    }
+
+    fn write_attachment(
+        mut builder: network_attachment_spec::Builder<'_>,
+        attachment: &NetworkAttachmentValue,
+    ) {
+        builder.set_attachment_id(attachment.id.as_bytes());
+        builder.set_task_id(attachment.task_id.as_bytes());
+        builder.set_container_id(&attachment.container_id);
+        builder.set_network_id(attachment.network_id.as_bytes());
+        builder.set_requested_ip(attachment.requested_ip.as_deref().unwrap_or_default());
+        builder.set_assigned_ip(attachment.assigned_ip.as_deref().unwrap_or_default());
+        builder.set_mac(attachment.mac.as_deref().unwrap_or_default());
+        builder.set_created_at(&attachment.created_at);
+        builder.set_updated_at(&attachment.updated_at);
+        builder.set_state(attachment.state.to_proto());
+        if let Some(err) = &attachment.error {
             builder.set_error(err);
         } else {
             builder.set_error("");
@@ -265,6 +289,13 @@ impl networks::Server for NetworksRpc {
                 .list_peer_states(Some(id))
                 .map_err(Self::to_capnp)?;
 
+            let attachment_counts = registry.attachment_counts().map_err(Self::to_capnp)?;
+            let attachment_count = attachment_counts
+                .get(&id)
+                .copied()
+                .and_then(|count| u32::try_from(count).ok())
+                .unwrap_or(0);
+
             let mut builder = results.get().init_network();
             {
                 let spec_builder = builder.reborrow().init_spec();
@@ -277,7 +308,7 @@ impl networks::Server for NetworksRpc {
                 Self::write_peer_status(entry, peer);
             }
 
-            builder.set_attachment_count(0);
+            builder.set_attachment_count(attachment_count);
             Ok(())
         })
     }
@@ -308,8 +339,20 @@ impl networks::Server for NetworksRpc {
         params: networks::AttachmentsParams,
         mut results: networks::AttachmentsResults,
     ) -> Promise<(), Error> {
-        let _ = params;
-        results.get().init_attachments(0);
-        Promise::ok(())
+        let registry = self.registry.clone();
+        Promise::from_future(async move {
+            let id = Self::read_uuid(params.get()?.get_id()?)?;
+            let attachments = registry
+                .list_attachments(Some(id))
+                .map_err(Self::to_capnp)?;
+
+            let mut list = results.get().init_attachments(attachments.len() as u32);
+            for (idx, attachment) in attachments.iter().enumerate() {
+                let builder = list.reborrow().get(idx as u32);
+                Self::write_attachment(builder, attachment);
+            }
+
+            Ok(())
+        })
     }
 }

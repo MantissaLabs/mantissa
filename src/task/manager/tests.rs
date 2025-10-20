@@ -2,11 +2,15 @@
 
 use super::*;
 
+use crate::network::registry::NetworkRegistry;
 use crate::registry::Registry;
 use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::store::local_session_store::LocalSessionStore;
+use crate::store::network_store::{
+    open_network_attachment_store, open_network_peer_store, open_network_spec_store,
+};
 use crate::store::peer_store::open_peers_store;
 use crate::store::scheduler_store::open_scheduler_store;
 use crate::store::secret_master_store::SecretMasterStore;
@@ -142,6 +146,28 @@ async fn setup_manager() -> (TaskManager, Rc<Scheduler>, Arc<MockContainerManage
         .await
         .expect("rebuild task store");
 
+    let (network_db, _network_dir) = temp_db("networks");
+    let network_spec_store =
+        open_network_spec_store(network_db.clone(), actor).expect("open network spec store");
+    network_spec_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild network spec store");
+
+    let network_peer_store =
+        open_network_peer_store(network_db.clone(), actor).expect("open network peer store");
+    network_peer_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild network peer store");
+
+    let network_attachment_store = open_network_attachment_store(network_db.clone(), actor)
+        .expect("open network attachment store");
+    network_attachment_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild network attachment store");
+
     let (secret_db, _secret_dir) = temp_db("secrets");
     let secret_store = open_secret_store(secret_db.clone(), actor).expect("open secret store");
     secret_store
@@ -174,6 +200,12 @@ async fn setup_manager() -> (TaskManager, Rc<Scheduler>, Arc<MockContainerManage
         Scheduler::new(scheduler_store.clone(), registry.clone(), actor).expect("create scheduler"),
     );
 
+    let network_registry = NetworkRegistry::new(
+        network_spec_store,
+        network_peer_store,
+        network_attachment_store,
+    );
+
     let manager = TaskManager::new(
         task_store,
         tx,
@@ -183,6 +215,7 @@ async fn setup_manager() -> (TaskManager, Rc<Scheduler>, Arc<MockContainerManage
         scheduler.clone(),
         mock_cm.clone(),
         registry,
+        network_registry,
         secret_registry,
         secret_keyring.clone(),
     );
@@ -246,6 +279,7 @@ async fn reconcile_rejects_missing_slot_assignments() {
         restart_policy: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        networks: Vec::new(),
     };
 
     let err = manager
@@ -405,6 +439,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 restart_policy: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                networks: Vec::new(),
             },
             TaskStartRequest {
                 name: "svc-b".into(),
@@ -417,6 +452,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 restart_policy: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                networks: Vec::new(),
             },
         ])
         .await
@@ -464,6 +500,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
             restart_policy: None,
             env: Vec::new(),
             secret_files: Vec::new(),
+            networks: Vec::new(),
         }])
         .await
         .expect("start with pre-reserved slot");
@@ -510,6 +547,7 @@ async fn task_owned_locally_detects_remote_entries() {
         Uuid::new_v4(),
         "remote-node",
         vec![1],
+        Vec::new(),
         100,
         64 * 1_024 * 1_024,
         Vec::new(),
@@ -562,6 +600,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 restart_policy: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                networks: Vec::new(),
             },
             TaskStartRequest {
                 name: "svc-d".into(),
@@ -574,6 +613,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 restart_policy: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                networks: Vec::new(),
             },
         ])
         .await

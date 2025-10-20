@@ -172,6 +172,7 @@ impl TaskManager {
                 restart_policy: plan.restart_policy.clone(),
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),
+                networks: plan.networks.clone(),
             };
 
             if let Err(err) = self.persist_spec(&spec).await {

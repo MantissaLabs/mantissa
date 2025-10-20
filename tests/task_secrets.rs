@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use capnp_rpc::new_client as capnp_new_client;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
+use mantissa::network::registry::NetworkRegistry;
 use mantissa::registry::Registry;
 use mantissa::scheduler::Scheduler;
 use mantissa::scheduler::{SlotCapacity, SlotSpec};
@@ -13,6 +14,9 @@ use mantissa::secrets::registry::SecretRegistry;
 use mantissa::secrets::service::SecretsService;
 use mantissa::secrets::types::{SecretMetadata, SecretValue, SecretVersion, compute_secret_id};
 use mantissa::store::local_session_store::LocalSessionStore;
+use mantissa::store::network_store::{
+    open_network_attachment_store, open_network_peer_store, open_network_spec_store,
+};
 use mantissa::store::peer_store::open_peers_store;
 use mantissa::store::scheduler_store::open_scheduler_store;
 use mantissa::store::secret_master_store::SecretMasterStore;
@@ -178,6 +182,32 @@ async fn setup_task_manager() -> TestHarness {
         .await
         .expect("rebuild task store");
 
+    let network_dir = tempdir().expect("network tempdir");
+    let network_path = network_dir
+        .path()
+        .join(format!("network-{}.redb", Uuid::new_v4()));
+    let network_db = Arc::new(redb::Database::create(network_path).expect("create network db"));
+    let network_spec_store =
+        open_network_spec_store(network_db.clone(), actor).expect("open network spec store");
+    network_spec_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild network spec store");
+
+    let network_peer_store =
+        open_network_peer_store(network_db.clone(), actor).expect("open network peer store");
+    network_peer_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild network peer store");
+
+    let network_attachment_store = open_network_attachment_store(network_db.clone(), actor)
+        .expect("open network attachment store");
+    network_attachment_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild network attachment store");
+
     let secret_dir = tempdir().expect("secret tempdir");
     let secret_path = secret_dir
         .path()
@@ -228,6 +258,11 @@ async fn setup_task_manager() -> TestHarness {
         scheduler.clone(),
         container_manager.clone(),
         registry,
+        NetworkRegistry::new(
+            network_spec_store,
+            network_peer_store,
+            network_attachment_store,
+        ),
         secret_registry.clone(),
         secret_keyring_arc.clone(),
     );
@@ -314,6 +349,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
             },
             mode: Some(0o440),
         }],
+        networks: Vec::new(),
     };
 
     let mut specs = manager
@@ -412,6 +448,7 @@ local_test!(task_manager_rejects_missing_secret_reference, {
             }),
         }],
         secret_files: Vec::new(),
+        networks: Vec::new(),
     };
 
     let err = manager

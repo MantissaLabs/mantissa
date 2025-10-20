@@ -126,4 +126,5 @@ fn template_attributes_changed(
         || current.cpu_millis != desired.cpu_millis
         || current.memory_bytes != desired.memory_bytes
         || current.restart_policy != desired.restart_policy
+        || current.networks != desired.networks
 }

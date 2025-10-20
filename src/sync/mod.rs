@@ -1,4 +1,4 @@
-use crate::store::network_store::{NetworkPeerStore, NetworkSpecStore};
+use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
@@ -23,6 +23,7 @@ pub struct SyncService {
     secrets: SecretStore,
     networks: NetworkSpecStore,
     network_peers: NetworkPeerStore,
+    network_attachments: NetworkAttachmentStore,
 }
 
 impl SyncService {
@@ -33,6 +34,7 @@ impl SyncService {
         secrets: SecretStore,
         networks: NetworkSpecStore,
         network_peers: NetworkPeerStore,
+        network_attachments: NetworkAttachmentStore,
     ) -> Self {
         Self {
             peers,
@@ -41,6 +43,7 @@ impl SyncService {
             secrets,
             networks,
             network_peers,
+            network_attachments,
         }
     }
 }
@@ -57,14 +60,16 @@ impl sync::Server for SyncService {
         let secrets = self.secrets.clone();
         let networks = self.networks.clone();
         let network_peers = self.network_peers.clone();
+        let network_attachments = self.network_attachments.clone();
         Promise::from_future(async move {
-            const DOMAINS: [Domain; 6] = [
+            const DOMAINS: [Domain; 7] = [
                 Domain::Peers,
                 Domain::Tasks,
                 Domain::Services,
                 Domain::Secrets,
                 Domain::Networks,
                 Domain::NetworkPeers,
+                Domain::NetworkAttachments,
             ];
 
             let mut list = results.get().init_roots(DOMAINS.len() as u32);
@@ -76,6 +81,7 @@ impl sync::Server for SyncService {
                     Domain::Secrets => secrets.root_hex().await,
                     Domain::Networks => networks.root_hex().await,
                     Domain::NetworkPeers => network_peers.root_hex().await,
+                    Domain::NetworkAttachments => network_attachments.root_hex().await,
                 };
                 let mut entry = list.reborrow().get(idx as u32);
                 entry.set_domain(*domain);
@@ -97,6 +103,7 @@ impl sync::Server for SyncService {
         let secrets = self.secrets.clone();
         let networks = self.networks.clone();
         let network_peers = self.network_peers.clone();
+        let network_attachments = self.network_attachments.clone();
 
         Promise::from_future(async move {
             let requested_domains: Vec<Domain> = {
@@ -109,6 +116,7 @@ impl sync::Server for SyncService {
                         Domain::Secrets,
                         Domain::Networks,
                         Domain::NetworkPeers,
+                        Domain::NetworkAttachments,
                     ]
                 } else {
                     let mut out = Vec::with_capacity(domains_reader.len() as usize);
@@ -220,6 +228,23 @@ impl sync::Server for SyncService {
                         let summary = entry.reborrow().init_summary();
                         capnp_fill_ranges(&ranges, summary)?;
                     }
+                    Domain::NetworkAttachments => {
+                        debug!("getRanges: received (network attachments)");
+                        network_attachments
+                            .debug_dump_root("server.before.get_ranges.network_attachments")
+                            .await;
+                        network_attachments
+                            .debug_dump_ranges("server.before.get_ranges.network_attachments", 5)
+                            .await;
+                        let ranges = network_attachments
+                            .page_range_summary()
+                            .await
+                            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+                        let mut entry = list.reborrow().get(idx as u32);
+                        entry.set_domain(Domain::NetworkAttachments);
+                        let summary = entry.reborrow().init_summary();
+                        capnp_fill_ranges(&ranges, summary)?;
+                    }
                 }
             }
 
@@ -238,6 +263,7 @@ impl sync::Server for SyncService {
         let secrets = self.secrets.clone();
         let networks = self.networks.clone();
         let network_peers = self.network_peers.clone();
+        let network_attachments = self.network_attachments.clone();
 
         Promise::from_future(async move {
             let p = params.get()?;
@@ -342,6 +368,21 @@ impl sync::Server for SyncService {
                             .debug_dump_ranges("server.before.open_delta.network_peers", 5)
                             .await;
                         let (regs, tombs) = network_peers
+                            .export_page_ranges_delta(&want_ranges)
+                            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+                        if send_chunks(domain, regs, tombs, &sink).await? {
+                            sent_chunks = true;
+                        }
+                    }
+                    Domain::NetworkAttachments => {
+                        debug!(target: "delta", "open_delta: received (network attachments)");
+                        network_attachments
+                            .debug_dump_root("server.before.open_delta.network_attachments")
+                            .await;
+                        network_attachments
+                            .debug_dump_ranges("server.before.open_delta.network_attachments", 5)
+                            .await;
+                        let (regs, tombs) = network_attachments
                             .export_page_ranges_delta(&want_ranges)
                             .map_err(|e| capnp::Error::failed(e.to_string()))?;
                         if send_chunks(domain, regs, tombs, &sink).await? {

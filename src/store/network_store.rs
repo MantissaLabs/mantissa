@@ -1,4 +1,4 @@
-use crate::network::types::{NetworkPeerStateValue, NetworkSpecValue};
+use crate::network::types::{NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue};
 use crdt_store::adapter::MvRegAdapterSorted;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
@@ -25,6 +25,15 @@ impl TableSet for NetworkPeerTables {
     const META: &'static str = "network_peer_meta";
 }
 
+/// Redb table names for replicated network attachments.
+pub struct NetworkAttachmentTables;
+
+impl TableSet for NetworkAttachmentTables {
+    const VALUES: &'static str = "network_attachment_values";
+    const TOMBS: &'static str = "network_attachment_tombs";
+    const META: &'static str = "network_attachment_meta";
+}
+
 /// Specialized MST/CRDT store for network specifications.
 pub type NetworkSpecStoreInner =
     CrdtMstStore<MvRegAdapterSorted<UuidKey, NetworkSpecValue, Uuid>, XXHash128, NetworkSpecTables>;
@@ -42,6 +51,16 @@ pub type NetworkPeerStoreInner = CrdtMstStore<
 /// Shared handle to the network peer state store.
 pub type NetworkPeerStore = Arc<NetworkPeerStoreInner>;
 
+/// Specialized MST/CRDT store for network attachment state.
+pub type NetworkAttachmentStoreInner = CrdtMstStore<
+    MvRegAdapterSorted<UuidKey, NetworkAttachmentValue, Uuid>,
+    XXHash128,
+    NetworkAttachmentTables,
+>;
+
+/// Shared handle to the network attachment store.
+pub type NetworkAttachmentStore = Arc<NetworkAttachmentStoreInner>;
+
 /// Open or create the network specification store scoped to the provided actor.
 pub fn open_network_spec_store(
     db: Arc<redb::Database>,
@@ -57,5 +76,14 @@ pub fn open_network_peer_store(
     actor: Uuid,
 ) -> std::io::Result<NetworkPeerStore> {
     let inner = NetworkPeerStoreInner::open(db, actor)?;
+    Ok(Arc::new(inner))
+}
+
+/// Open or create the network attachment store scoped to the provided actor.
+pub fn open_network_attachment_store(
+    db: Arc<redb::Database>,
+    actor: Uuid,
+) -> std::io::Result<NetworkAttachmentStore> {
+    let inner = NetworkAttachmentStoreInner::open(db, actor)?;
     Ok(Arc::new(inner))
 }

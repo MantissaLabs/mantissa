@@ -30,6 +30,7 @@ pub(super) struct BatchStartPlan {
     pub(super) restart_policy: Option<TaskRestartPolicy>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
     pub(super) secret_files: Vec<TaskSecretFile>,
+    pub(super) networks: Vec<Uuid>,
 }
 
 impl BatchStartPlan {
@@ -54,6 +55,7 @@ pub(super) struct StartIntent {
     pub(super) restart_policy: Option<TaskRestartPolicy>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
     pub(super) secret_files: Vec<TaskSecretFile>,
+    pub(super) networks: Vec<Uuid>,
 }
 
 #[derive(Clone)]
@@ -74,17 +76,30 @@ enum CandidateLocation {
 struct Candidate {
     location: CandidateLocation,
     slots: Vec<SlotChoice>,
+    ready_networks: HashSet<Uuid>,
 }
 
 impl Candidate {
     /// Returns `Some` when the node has at least one usable slot; otherwise we
     /// drop the candidate early so later stages don't need to handle empties.
-    fn new(location: CandidateLocation, slots: Vec<SlotChoice>) -> Option<Self> {
+    fn new(
+        location: CandidateLocation,
+        slots: Vec<SlotChoice>,
+        ready_networks: HashSet<Uuid>,
+    ) -> Option<Self> {
         if slots.is_empty() {
             None
         } else {
-            Some(Self { location, slots })
+            Some(Self {
+                location,
+                slots,
+                ready_networks,
+            })
         }
+    }
+
+    fn can_host(&self, networks: &[Uuid]) -> bool {
+        networks.iter().all(|net| self.ready_networks.contains(net))
     }
 
     /// Attempts to reserve enough slots to satisfy the requested CPU and memory.
@@ -172,6 +187,7 @@ pub(super) struct RemoteStartPlan {
     pub(super) restart_policy: Option<TaskRestartPolicy>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
     pub(super) secret_files: Vec<TaskSecretFile>,
+    pub(super) networks: Vec<Uuid>,
 }
 
 pub(super) struct Assignment {
@@ -198,6 +214,7 @@ impl TaskManager {
                 restart_policy: request.restart_policy,
                 env: request.env,
                 secret_files: request.secret_files,
+                networks: request.networks,
             })
             .collect()
     }
@@ -222,15 +239,22 @@ impl TaskManager {
             .ok_or_else(|| anyhow::anyhow!("scheduler snapshot unavailable"))?;
 
         let local_version = snapshot.version;
+        let readiness_map = self.collect_network_readiness()?;
+        let local_ready = readiness_map
+            .get(&self.local_node_id)
+            .cloned()
+            .unwrap_or_else(HashSet::new);
         let (mut assignment, remaining_intents, available_slots) =
-            self.seed_local_plans(intents, &snapshot, local_version)?;
+            self.seed_local_plans(intents, &snapshot, local_version, &local_ready)?;
 
         if remaining_intents.is_empty() {
             assignment.local.sort_by_key(|plan| plan.index);
             return Ok(assignment);
         }
 
-        let mut candidates = self.build_candidate_queue(available_slots).await?;
+        let mut candidates = self
+            .build_candidate_queue(available_slots, &readiness_map, &local_ready)
+            .await?;
         if candidates.is_empty() {
             return Err(anyhow::anyhow!(
                 "scheduler reservation failed: no available capacity across cluster"
@@ -251,6 +275,7 @@ impl TaskManager {
         intents: &'a [StartIntent],
         snapshot: &SchedulerSnapshot,
         local_version: u64,
+        local_ready: &HashSet<Uuid>,
     ) -> Result<(Assignment, Vec<&'a StartIntent>, Vec<SlotChoice>), anyhow::Error> {
         let mut slot_lookup = HashMap::new();
         let mut available_local_slots = Vec::new();
@@ -268,6 +293,13 @@ impl TaskManager {
         for intent in intents.iter() {
             if intent.preassigned_slots.is_empty() {
                 continue;
+            }
+
+            if !intent.networks.iter().all(|net| local_ready.contains(net)) {
+                return Err(anyhow::anyhow!(
+                    "local node lacks required networks for task '{}'",
+                    intent.name
+                ));
             }
 
             let mut seen = HashSet::new();
@@ -347,6 +379,7 @@ impl TaskManager {
                 restart_policy: intent.restart_policy.clone(),
                 env: intent.env.clone(),
                 secret_files: intent.secret_files.clone(),
+                networks: intent.networks.clone(),
             });
         }
 
@@ -369,9 +402,13 @@ impl TaskManager {
     async fn build_candidate_queue(
         &self,
         local_slots: Vec<SlotChoice>,
+        readiness: &HashMap<Uuid, HashSet<Uuid>>,
+        local_ready: &HashSet<Uuid>,
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
-        if let Some(local_candidate) = Candidate::new(CandidateLocation::Local, local_slots) {
+        if let Some(local_candidate) =
+            Candidate::new(CandidateLocation::Local, local_slots, local_ready.clone())
+        {
             queue.push_back(local_candidate);
         }
 
@@ -403,12 +440,18 @@ impl TaskManager {
                 })
                 .collect();
 
+            let ready_networks = readiness
+                .get(&peer_id)
+                .cloned()
+                .unwrap_or_else(HashSet::new);
+
             if let Some(candidate) = Candidate::new(
                 CandidateLocation::Remote {
                     peer_id,
                     version: summary.version,
                 },
                 slots,
+                ready_networks,
             ) {
                 remote_candidates.push(candidate);
             }
@@ -441,10 +484,17 @@ impl TaskManager {
             }
 
             let mut allocated: Option<(CandidateLocation, Vec<SlotChoice>)> = None;
+            let mut skipped_for_networks = false;
             for _ in 0..candidate_count {
                 let mut candidate = candidates
                     .pop_front()
                     .expect("candidate deque should not be empty");
+
+                if !candidate.can_host(&intent.networks) {
+                    skipped_for_networks = true;
+                    candidates.push_back(candidate);
+                    continue;
+                }
 
                 if let Some(slots) = candidate.allocate(intent.cpu_millis, intent.memory_bytes) {
                     let location = candidate.location.clone();
@@ -459,9 +509,18 @@ impl TaskManager {
             }
 
             let Some((location, slots)) = allocated else {
-                return Err(anyhow::anyhow!(
-                    "scheduler reservation failed: insufficient capacity for batch"
-                ));
+                if skipped_for_networks {
+                    let networks: Vec<String> =
+                        intent.networks.iter().map(|id| id.to_string()).collect();
+                    return Err(anyhow::anyhow!(
+                        "scheduler reservation failed: networks {:?} unavailable on any candidate",
+                        networks
+                    ));
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "scheduler reservation failed: insufficient capacity for batch"
+                    ));
+                }
             };
 
             match location {
@@ -482,6 +541,7 @@ impl TaskManager {
                         restart_policy: intent.restart_policy.clone(),
                         env: intent.env.clone(),
                         secret_files: intent.secret_files.clone(),
+                        networks: intent.networks.clone(),
                     });
                 }
                 CandidateLocation::Remote { peer_id, version } => {
@@ -499,6 +559,7 @@ impl TaskManager {
                         restart_policy: intent.restart_policy.clone(),
                         env: intent.env.clone(),
                         secret_files: intent.secret_files.clone(),
+                        networks: intent.networks.clone(),
                     });
                 }
             }

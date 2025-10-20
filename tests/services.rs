@@ -10,9 +10,11 @@ use common::testkit::{
     ClusterConfig, ContainerManagerOverrideGuard, InMemoryContainerManager, TestNode,
 };
 use crdt_store::uuid_key::UuidKey;
+use mantissa::network::types::compute_network_id;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
-    ServiceStatus, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
+    ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
+    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
 };
 use mantissa::task::manager::TaskManager;
 use mantissa::task::types::{
@@ -97,6 +99,7 @@ local_test!(services_gossip_propagates_across_peers, {
                     secret: secret_ref.clone(),
                     mode: Some(0o440),
                 }],
+                networks: Vec::new(),
             }],
         )
         .await
@@ -188,6 +191,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
             secret: secret_ref,
             mode: Some(0o440),
         }],
+        networks: Vec::new(),
     }];
 
     let service_id = node
@@ -269,6 +273,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                     secret: secret_ref,
                     mode: Some(0o440),
                 }],
+                networks: Vec::new(),
             }],
         )
         .await
@@ -533,6 +538,7 @@ local_test!(services_redeploy_scales_replicas, {
         restart_policy: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        networks: Vec::new(),
     }];
 
     let service_id = node
@@ -637,6 +643,7 @@ local_test!(services_redeploy_updates_resources, {
         restart_policy: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        networks: Vec::new(),
     }];
 
     let service_id = node
@@ -819,55 +826,71 @@ fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskS
     manifest
         .tasks
         .iter()
-        .map(|task| ServiceTaskSpecValue {
-            name: task.name.clone(),
-            image: task.image.clone(),
-            command: task.command.clone(),
-            replicas: task.replicas,
-            cpu_millis: task.resources.cpu_millis,
-            memory_bytes: task.resources.memory_bytes(),
-            restart_policy: task
-                .restart_policy
-                .as_ref()
-                .map(|policy| ServiceTaskRestartPolicy {
-                    name: match policy.name {
-                        ManifestRestartPolicyName::No => ServiceTaskRestartPolicyKind::No,
-                        ManifestRestartPolicyName::Always => ServiceTaskRestartPolicyKind::Always,
-                        ManifestRestartPolicyName::OnFailure => {
-                            ServiceTaskRestartPolicyKind::OnFailure
-                        }
-                        ManifestRestartPolicyName::UnlessStopped => {
-                            ServiceTaskRestartPolicyKind::UnlessStopped
-                        }
-                    },
-                    max_retry_count: policy
-                        .max_retry_count
-                        .map(|value| i32::try_from(value).expect("validated manifest bound")),
+        .map(|task| {
+            let mut networks: Vec<ServiceTaskNetworkRequirement> = task
+                .networks
+                .iter()
+                .map(|network| {
+                    let name = network.trim().to_string();
+                    let network_id = compute_network_id(&name);
+                    ServiceTaskNetworkRequirement::new(name, network_id)
+                })
+                .collect();
+            networks.sort_by(|a, b| a.network_id.cmp(&b.network_id));
+            networks.dedup_by(|a, b| a.network_id == b.network_id);
+
+            ServiceTaskSpecValue {
+                name: task.name.clone(),
+                image: task.image.clone(),
+                command: task.command.clone(),
+                replicas: task.replicas,
+                cpu_millis: task.resources.cpu_millis,
+                memory_bytes: task.resources.memory_bytes(),
+                restart_policy: task.restart_policy.as_ref().map(|policy| {
+                    ServiceTaskRestartPolicy {
+                        name: match policy.name {
+                            ManifestRestartPolicyName::No => ServiceTaskRestartPolicyKind::No,
+                            ManifestRestartPolicyName::Always => {
+                                ServiceTaskRestartPolicyKind::Always
+                            }
+                            ManifestRestartPolicyName::OnFailure => {
+                                ServiceTaskRestartPolicyKind::OnFailure
+                            }
+                            ManifestRestartPolicyName::UnlessStopped => {
+                                ServiceTaskRestartPolicyKind::UnlessStopped
+                            }
+                        },
+                        max_retry_count: policy
+                            .max_retry_count
+                            .map(|value| i32::try_from(value).expect("validated manifest bound")),
+                    }
                 }),
-            env: task
-                .env
-                .iter()
-                .map(|var| TaskEnvironmentVariable {
-                    name: var.name.clone(),
-                    value: var.value.clone(),
-                    secret: var.secret.as_ref().map(|secret| TaskSecretReference {
-                        name: secret.name.clone(),
-                        version_id: parse_secret_version(secret),
-                    }),
-                })
-                .collect(),
-            secret_files: task
-                .secret_files
-                .iter()
-                .map(|file| TaskSecretFile {
-                    path: file.path.clone(),
-                    secret: TaskSecretReference {
-                        name: file.secret.name.clone(),
-                        version_id: parse_secret_version(&file.secret),
-                    },
-                    mode: file.mode,
-                })
-                .collect(),
+                env: task
+                    .env
+                    .iter()
+                    .map(|var| TaskEnvironmentVariable {
+                        name: var.name.clone(),
+                        value: var.value.clone(),
+                        secret: var.secret.as_ref().map(|secret| TaskSecretReference {
+                            name: secret.name.clone(),
+                            version_id: parse_secret_version(secret),
+                        }),
+                    })
+                    .collect(),
+                secret_files: task
+                    .secret_files
+                    .iter()
+                    .map(|file| TaskSecretFile {
+                        path: file.path.clone(),
+                        secret: TaskSecretReference {
+                            name: file.secret.name.clone(),
+                            version_id: parse_secret_version(&file.secret),
+                        },
+                        mode: file.mode,
+                    })
+                    .collect(),
+                networks,
+            }
         })
         .collect()
 }
