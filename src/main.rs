@@ -6,6 +6,7 @@ mod cli;
 mod crypto;
 mod gossip;
 mod logger;
+mod network;
 mod node;
 mod registry;
 mod scheduler;
@@ -224,6 +225,131 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("Labels: {}", labels.join(", "));
                 }
                 println!("Plaintext: {}", display_secret_plaintext(&detail.plaintext));
+            }
+        },
+
+        Command::Networks { cmd } => match cmd {
+            NetworksCommand::Create(args) => {
+                let driver = match args.driver {
+                    NetworkDriverOpt::Vxlan => client::networks::NetworkDriver::Vxlan,
+                };
+
+                let request = client::networks::NetworkCreateRequest {
+                    name: args.name.clone(),
+                    description: args.description.clone(),
+                    driver,
+                    subnet_cidr: args.subnet.clone(),
+                    vni: args.vni,
+                    mtu: args.mtu,
+                    bpf_programs: args.bpf_programs.clone(),
+                    sealed: args.sealed,
+                };
+
+                let network_id = local
+                    .run_until(client::networks::create(&cfg, &request))
+                    .await?;
+                println!("network '{}' created with id {}", request.name, network_id);
+            }
+            NetworksCommand::Delete(args) => {
+                let count = args.ids.len();
+                local
+                    .run_until(client::networks::delete(&cfg, &args.ids))
+                    .await?;
+                println!("requested deletion of {count} network(s)");
+            }
+            NetworksCommand::List(_) => {
+                let mut rows = local.run_until(client::networks::list(&cfg)).await?;
+                if rows.is_empty() {
+                    println!("no networks registered");
+                } else {
+                    rows.sort_by(|a, b| a.name.cmp(&b.name));
+
+                    let mut tw = TabWriter::new(Vec::new());
+                    writeln!(
+                        &mut tw,
+                        "ID\tNAME\tDRIVER\tSTATUS\tVNI\tPEERS\tREADY\tSUBNET\tUPDATED"
+                    )?;
+                    for row in rows {
+                        writeln!(
+                            &mut tw,
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            row.id,
+                            row.name,
+                            row.driver,
+                            row.status,
+                            row.vni,
+                            row.peer_count,
+                            row.ready_peers,
+                            row.subnet_cidr,
+                            row.updated_at,
+                        )?;
+                    }
+                    tw.flush()?;
+                    let output = String::from_utf8(tw.into_inner()?)?;
+                    print!("{}", output);
+                }
+            }
+            NetworksCommand::Inspect(args) => {
+                let info = local
+                    .run_until(client::networks::inspect(&cfg, &args.id))
+                    .await?;
+                println!("network {} ({})", info.spec.name, info.spec.id);
+                println!("  status: {}", info.spec.status);
+                println!(
+                    "  driver: {} vni={} mtu={}",
+                    info.spec.driver, info.spec.vni, info.spec.mtu
+                );
+                println!("  subnet: {}", info.spec.subnet_cidr);
+                if !info.spec.description.is_empty() {
+                    println!("  description: {}", info.spec.description);
+                }
+                if info.spec.sealed {
+                    println!("  sealed: true");
+                }
+                if !info.spec.bpf_programs.is_empty() {
+                    println!("  bpf programs: {}", info.spec.bpf_programs.join(", "));
+                }
+                println!("  created: {}", info.spec.created_at);
+                println!("  updated: {}", info.spec.updated_at);
+                println!("  attachments: {}", info.attachment_count);
+
+                if info.peers.is_empty() {
+                    println!("  no peer status available");
+                } else {
+                    println!("  peers:");
+                    for peer in info.peers {
+                        if let Some(err) = peer.error {
+                            println!(
+                                "    {} ({}) - {} [{}]",
+                                peer.peer_name, peer.peer_id, peer.state, err
+                            );
+                        } else {
+                            println!("    {} ({}) - {}", peer.peer_name, peer.peer_id, peer.state);
+                        }
+                    }
+                }
+            }
+            NetworksCommand::Status(args) => {
+                let peers = local
+                    .run_until(client::networks::peer_status(&cfg, &args.id))
+                    .await?;
+                if peers.is_empty() {
+                    println!("no peer status reported yet");
+                } else {
+                    let mut tw = TabWriter::new(Vec::new());
+                    writeln!(&mut tw, "PEER\tID\tSTATE\tUPDATED\tERROR")?;
+                    for peer in peers {
+                        let error = peer.error.unwrap_or_default();
+                        writeln!(
+                            &mut tw,
+                            "{}\t{}\t{}\t{}\t{}",
+                            peer.peer_name, peer.peer_id, peer.state, peer.updated_at, error
+                        )?;
+                    }
+                    tw.flush()?;
+                    let output = String::from_utf8(tw.into_inner()?)?;
+                    print!("{}", output);
+                }
             }
         },
 

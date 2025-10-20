@@ -1,6 +1,7 @@
 pub mod config;
 pub mod connection;
 mod errors;
+pub mod networks;
 pub mod node;
 pub mod scheduler;
 pub mod secrets;

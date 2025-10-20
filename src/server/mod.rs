@@ -14,7 +14,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use protocol::{
-    gossip::GossipClient, health::HealthClient, node::NodeClient,
+    gossip::GossipClient, health::HealthClient, network::NetworksClient, node::NodeClient,
     scheduling::scheduler::Client as SchedulerClient, secrets::secrets::Client as SecretsClient,
     services::ServicesClient, sync::SyncClient, task::TaskClient, topology::TopologyClient,
 };
@@ -88,6 +88,7 @@ pub struct ServerClients {
     pub scheduler_client: SchedulerClient,
     pub services_client: ServicesClient,
     pub secrets_client: SecretsClient,
+    pub networks_client: NetworksClient,
 }
 
 #[derive(Clone)]
@@ -134,6 +135,7 @@ impl Server {
             self.clients.scheduler_client.clone(),
             self.clients.services_client.clone(),
             self.clients.secrets_client.clone(),
+            self.clients.networks_client.clone(),
             self.online.clone(),
         );
 

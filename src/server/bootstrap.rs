@@ -1,5 +1,6 @@
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::{DEFAULT_FANOUT, Message};
+use crate::network::service::NetworksRpc;
 use crate::registry::Registry;
 use crate::scheduler::Scheduler;
 use crate::scheduler::service::SchedulerService;
@@ -29,6 +30,7 @@ use crate::topology::{Keys, Topology, TopologyStores};
 use crate::{node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
+use protocol::network::networks::Client as NetworksClient;
 use protocol::scheduling::scheduler::Client as SchedulerClient;
 use protocol::secrets::secrets::Client as SecretsClient;
 use protocol::server::server::Client as ServerClient;
@@ -120,6 +122,7 @@ pub(crate) struct Components {
     #[allow(dead_code)]
     pub secret_registry: SecretRegistry,
     pub secrets_client: SecretsClient,
+    pub networks_client: NetworksClient,
 }
 
 impl Bootstrap {
@@ -379,6 +382,9 @@ impl Bootstrap {
         );
         let secrets_client_cap: SecretsClient = capnp_rpc::new_client(secrets_service);
 
+        let networks_service = NetworksRpc::new();
+        let networks_client_cap: NetworksClient = capnp_rpc::new_client(networks_service);
+
         let scheduler_service =
             SchedulerService::new(scheduler.clone(), ctx.self_id, local_node_name.clone());
         let scheduler_client_cap = capnp_rpc::new_client(scheduler_service);
@@ -398,6 +404,7 @@ impl Bootstrap {
                 services_client: services_client_cap,
                 secret_registry,
                 secrets_client: secrets_client_cap,
+                networks_client: networks_client_cap,
             },
             gossip_rx,
         ))
@@ -421,6 +428,7 @@ impl Bootstrap {
             scheduler_client: comps.scheduler_client.clone(),
             services_client: comps.services_client.clone(),
             secrets_client: comps.secrets_client.clone(),
+            networks_client: comps.networks_client.clone(),
         };
 
         let stores_bundle = ServerStores {

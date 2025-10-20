@@ -1,7 +1,8 @@
 use capnp::capability::Promise;
 use protocol::{
-    gossip::gossip, health::health, node::node, scheduling::scheduler, secrets::secrets,
-    server::cluster_session, services::services, sync::sync, task::task, topology::topology,
+    gossip::gossip, health::health, network::networks, node::node, scheduling::scheduler,
+    secrets::secrets, server::cluster_session, services::services, sync::sync, task::task,
+    topology::topology,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,7 @@ pub struct ClusterSessionImpl {
     scheduler: scheduler::Client,
     services: services::Client,
     secrets: secrets::Client,
+    networks: networks::Client,
     online: Arc<AtomicBool>,
 }
 
@@ -31,6 +33,7 @@ impl ClusterSessionImpl {
         scheduler: scheduler::Client,
         services: services::Client,
         secrets: secrets::Client,
+        networks: networks::Client,
         online: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -43,6 +46,7 @@ impl ClusterSessionImpl {
             scheduler,
             services,
             secrets,
+            networks,
             online,
         }
     }
@@ -77,6 +81,7 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_scheduler(self.scheduler.clone());
         caps.set_services(self.services.clone());
         caps.set_secrets(self.secrets.clone());
+        caps.set_networks(self.networks.clone());
 
         Promise::ok(())
     }
@@ -182,6 +187,19 @@ impl cluster_session::Server for ClusterSessionImpl {
         }
 
         results.get().set_secrets(self.secrets.clone());
+        Promise::ok(())
+    }
+
+    fn get_networks(
+        &mut self,
+        _params: cluster_session::GetNetworksParams,
+        mut results: cluster_session::GetNetworksResults,
+    ) -> Promise<(), capnp::Error> {
+        if let Err(e) = self.ensure_online() {
+            return Promise::err(e);
+        }
+
+        results.get().set_networks(self.networks.clone());
         Promise::ok(())
     }
 }

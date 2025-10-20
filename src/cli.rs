@@ -99,6 +99,17 @@ pub enum Command {
         cmd: SecretsCommand,
     },
 
+    /// Network management subcommands
+    #[command(
+        alias = "net",
+        subcommand_required = true,
+        arg_required_else_help = true
+    )]
+    Networks {
+        #[command(subcommand)]
+        cmd: NetworksCommand,
+    },
+
     /// Submit a job to the cluster
     Submit(SubmitArgs),
 
@@ -372,6 +383,89 @@ pub struct SecretsShowArgs {
     /// Optional secret version (UUID) to display
     #[arg(long = "version")]
     pub version: Option<Uuid>,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum NetworkDriverOpt {
+    Vxlan,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NetworksCommand {
+    /// Create a new overlay network in the cluster
+    Create(NetworksCreateArgs),
+
+    /// Delete one or more overlay networks
+    Delete(NetworksDeleteArgs),
+
+    /// List configured overlay networks
+    #[command(alias = "ls")]
+    List(NetworksListArgs),
+
+    /// Inspect a specific network and its attached peers
+    Inspect(NetworksInspectArgs),
+
+    /// Show per-peer readiness for a network
+    Status(NetworksStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct NetworksCreateArgs {
+    /// Human-friendly network name
+    #[arg(long = "name", value_name = "NAME")]
+    pub name: String,
+
+    /// Optional description for operators
+    #[arg(long = "description", value_name = "TEXT")]
+    pub description: Option<String>,
+
+    /// Overlay driver to use
+    #[arg(long = "driver", value_enum, default_value = "vxlan")]
+    pub driver: NetworkDriverOpt,
+
+    /// CIDR range allocated to the overlay (e.g. 10.24.0.0/16)
+    #[arg(long = "subnet", value_name = "CIDR")]
+    pub subnet: String,
+
+    /// Explicit VXLAN identifier (auto-assigned when omitted)
+    #[arg(long = "vni", value_name = "VNI")]
+    pub vni: Option<u32>,
+
+    /// MTU for the overlay (0 uses driver default)
+    #[arg(long = "mtu", value_name = "BYTES")]
+    pub mtu: Option<u32>,
+
+    /// Optional BPF program identifiers to attach (repeat flag)
+    #[arg(long = "bpf-program", value_name = "PROGRAM", action = ArgAction::Append)]
+    pub bpf_programs: Vec<String>,
+
+    /// Mark the network spec read-only after creation
+    #[arg(long = "sealed", action = ArgAction::SetTrue)]
+    pub sealed: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct NetworksDeleteArgs {
+    /// Network UUIDs to delete
+    #[arg(index = 1, value_name = "ID", required = true, num_args = 1..)]
+    pub ids: Vec<String>,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct NetworksListArgs {}
+
+#[derive(Args, Debug)]
+pub struct NetworksInspectArgs {
+    /// Network UUID to inspect
+    #[arg(index = 1, value_name = "ID")]
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct NetworksStatusArgs {
+    /// Network UUID to query
+    #[arg(index = 1, value_name = "ID")]
+    pub id: String,
 }
 
 #[derive(Args, Debug)]

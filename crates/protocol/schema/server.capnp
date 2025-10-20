@@ -9,6 +9,7 @@ using import "task.capnp".Task;
 using import "services.capnp".Services;
 using import "scheduling.capnp".Scheduler;
 using import "secrets.capnp".Secrets;
+using import "network.capnp".Networks;
 
 interface Server {
   registerNode @0 (info :Node.NodeInfo, token :Text) -> (session :ClusterSession, ticket :Data, nodeInfo :Node.NodeInfo, credential :Data);
@@ -41,6 +42,7 @@ interface ClusterSession {
   getScheduler @7 () -> (scheduler :Scheduler);
   getServices @8 () -> (services :Services);
   getSecrets @9 () -> (secrets :Secrets);
+  getNetworks @10 () -> (networks :Networks);
 }
 
 struct Capabilities {
@@ -53,4 +55,5 @@ struct Capabilities {
   scheduler @6 :Scheduler;
   services @7 :Services;
   secrets @8 :Secrets;
+  networks @9 :Networks;
 }

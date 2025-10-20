@@ -7,6 +7,7 @@ pub mod cli;
 pub mod crypto;
 pub mod gossip;
 pub mod logger;
+pub mod network;
 pub mod node;
 pub mod registry;
 pub mod scheduler;
