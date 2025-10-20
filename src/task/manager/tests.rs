@@ -3,6 +3,10 @@
 use super::*;
 
 use crate::network::registry::NetworkRegistry;
+use crate::network::types::{
+    NetworkAttachmentState, NetworkDriver, NetworkPeerState, NetworkPeerStateValue,
+    NetworkSpecValue,
+};
 use crate::registry::Registry;
 use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
 use crate::secrets::crypto::SecretKeyring;
@@ -118,7 +122,12 @@ fn temp_db(prefix: &str) -> (Arc<redb::Database>, tempfile::TempDir) {
     (db, dir)
 }
 
-async fn setup_manager() -> (TaskManager, Rc<Scheduler>, Arc<MockContainerManager>) {
+async fn setup_manager() -> (
+    TaskManager,
+    Rc<Scheduler>,
+    Arc<MockContainerManager>,
+    NetworkRegistry,
+) {
     let actor = Uuid::new_v4();
     let (scheduler_db, _dir) = temp_db("scheduler");
     let scheduler_store =
@@ -215,17 +224,17 @@ async fn setup_manager() -> (TaskManager, Rc<Scheduler>, Arc<MockContainerManage
         scheduler.clone(),
         mock_cm.clone(),
         registry,
-        network_registry,
+        network_registry.clone(),
         secret_registry,
         secret_keyring.clone(),
     );
 
-    (manager, scheduler, mock_cm)
+    (manager, scheduler, mock_cm, network_registry)
 }
 
 #[tokio::test]
 async fn start_container_reserves_slot_and_records_resources() {
-    let (manager, scheduler, mock_cm) = setup_manager().await;
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024));
     scheduler
@@ -261,7 +270,7 @@ async fn start_container_reserves_slot_and_records_resources() {
 
 #[tokio::test]
 async fn reconcile_rejects_missing_slot_assignments() {
-    let (manager, _scheduler, _mock_cm) = setup_manager().await;
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let spec = TaskSpec {
         id: Uuid::new_v4(),
@@ -295,7 +304,7 @@ async fn reconcile_rejects_missing_slot_assignments() {
 
 #[tokio::test]
 async fn start_container_reserves_multiple_slots_when_needed() {
-    let (manager, scheduler, mock_cm) = setup_manager().await;
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_a = SlotSpec::new(1, SlotCapacity::new(200, 64 * 1_024 * 1_024));
     let slot_b = SlotSpec::new(2, SlotCapacity::new(200, 64 * 1_024 * 1_024));
@@ -319,7 +328,7 @@ async fn start_container_reserves_multiple_slots_when_needed() {
 
 #[tokio::test]
 async fn stop_task_releases_slot_and_clears_resources() {
-    let (manager, scheduler, mock_cm) = setup_manager().await;
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024));
     scheduler
@@ -344,7 +353,7 @@ async fn stop_task_releases_slot_and_clears_resources() {
 
 #[tokio::test]
 async fn stop_task_uses_container_name_when_cache_missing() {
-    let (manager, scheduler, _mock_cm) = setup_manager().await;
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024));
     scheduler
@@ -368,7 +377,7 @@ async fn stop_task_uses_container_name_when_cache_missing() {
 
 #[tokio::test]
 async fn list_tasks_respects_filters() {
-    let (manager, scheduler, _mock_cm) = setup_manager().await;
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024));
     scheduler
@@ -408,7 +417,7 @@ async fn list_tasks_respects_filters() {
 
 #[tokio::test]
 async fn start_container_fails_when_no_matching_slot() {
-    let (manager, _scheduler, _mock_cm) = setup_manager().await;
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let result = manager
         .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
@@ -419,7 +428,7 @@ async fn start_container_fails_when_no_matching_slot() {
 
 #[tokio::test]
 async fn start_tasks_batch_reserves_every_slot() {
-    let (manager, scheduler, mock_cm) = setup_manager().await;
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slots: Vec<_> = (1..=3)
         .map(|id| SlotSpec::new(id, SlotCapacity::new(200, 64 * 1_024 * 1_024)))
@@ -467,7 +476,7 @@ async fn start_tasks_batch_reserves_every_slot() {
 
 #[tokio::test]
 async fn start_tasks_batch_respects_existing_reservations() {
-    let (manager, scheduler, mock_cm) = setup_manager().await;
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(400, 128 * 1_024 * 1_024));
     scheduler
@@ -514,7 +523,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
 
 #[tokio::test]
 async fn task_owned_locally_detects_remote_entries() {
-    let (manager, scheduler, _mock_cm) = setup_manager().await;
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     scheduler
         .init_slots(vec![SlotSpec::new(
@@ -570,7 +579,7 @@ async fn task_owned_locally_detects_remote_entries() {
 
 #[tokio::test]
 async fn start_tasks_batch_is_atomic_on_capacity_failure() {
-    let (manager, scheduler, mock_cm) = setup_manager().await;
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     scheduler
         .init_slots(vec![
@@ -634,4 +643,201 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
         .filter(|slot| matches!(slot.state, SlotState::Reserved(_)))
         .count();
     assert_eq!(reserved, 1);
+}
+
+#[tokio::test]
+async fn runtime_attachments_created_and_removed_on_stop() {
+    let (manager, scheduler, mock_cm, network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024),
+        )])
+        .await
+        .expect("init slots");
+
+    let spec = NetworkSpecValue::new(
+        "test-net",
+        "test network",
+        NetworkDriver::Vxlan,
+        "10.42.0.0/24",
+        0,
+        0,
+        false,
+        vec![],
+    );
+    network_registry
+        .upsert_spec(spec.clone())
+        .await
+        .expect("upsert network spec");
+
+    let peer_state = NetworkPeerStateValue::new(
+        spec.id,
+        manager.local_node_id,
+        "local-node",
+        NetworkPeerState::Ready,
+        None,
+    );
+    network_registry
+        .upsert_peer_state(peer_state)
+        .await
+        .expect("upsert peer state");
+
+    let request = TaskStartRequest {
+        name: "with-net".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 200,
+        memory_bytes: 64 * 1_024 * 1_024,
+        id: None,
+        slot_ids: Vec::new(),
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: vec![spec.id],
+    };
+
+    let mut specs = manager
+        .start_tasks_batch(vec![request])
+        .await
+        .expect("start batch with network");
+    assert_eq!(specs.len(), 1);
+
+    let task_spec = specs.remove(0);
+    let attachments = network_registry
+        .list_attachments_for_task(task_spec.id)
+        .expect("list attachments");
+    assert_eq!(attachments.len(), 1);
+    let attachment = &attachments[0];
+    assert_eq!(attachment.network_id, spec.id);
+    assert_eq!(attachment.state, NetworkAttachmentState::Ready);
+    assert!(attachment.assigned_ip.is_some());
+    assert!(attachment.mac.is_some());
+
+    assert_eq!(mock_cm.created.lock().await.len(), 1);
+
+    let stopped = manager
+        .stop_task(task_spec.id)
+        .await
+        .expect("stop networked task");
+    assert!(matches!(stopped.state, ContainerState::Stopped));
+
+    let attachments_after = network_registry
+        .list_attachments_for_task(task_spec.id)
+        .expect("list attachments after stop");
+    assert!(attachments_after.is_empty());
+}
+
+#[tokio::test]
+async fn runtime_attachments_reconcile_removes_stale_entries() {
+    let (manager, scheduler, _mock_cm, network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024),
+        )])
+        .await
+        .expect("init slots");
+
+    let spec_a = NetworkSpecValue::new(
+        "net-a",
+        "network a",
+        NetworkDriver::Vxlan,
+        "10.43.0.0/24",
+        0,
+        0,
+        false,
+        vec![],
+    );
+    let spec_b = NetworkSpecValue::new(
+        "net-b",
+        "network b",
+        NetworkDriver::Vxlan,
+        "10.44.0.0/24",
+        0,
+        0,
+        false,
+        vec![],
+    );
+
+    network_registry
+        .upsert_spec(spec_a.clone())
+        .await
+        .expect("upsert network a");
+    network_registry
+        .upsert_spec(spec_b.clone())
+        .await
+        .expect("upsert network b");
+
+    let peer_state_a = NetworkPeerStateValue::new(
+        spec_a.id,
+        manager.local_node_id,
+        "local-node",
+        NetworkPeerState::Ready,
+        None,
+    );
+    let peer_state_b = NetworkPeerStateValue::new(
+        spec_b.id,
+        manager.local_node_id,
+        "local-node",
+        NetworkPeerState::Ready,
+        None,
+    );
+    network_registry
+        .upsert_peer_state(peer_state_a)
+        .await
+        .expect("upsert peer a");
+    network_registry
+        .upsert_peer_state(peer_state_b)
+        .await
+        .expect("upsert peer b");
+
+    let request = TaskStartRequest {
+        name: "two-nets".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 200,
+        memory_bytes: 64 * 1_024 * 1_024,
+        id: None,
+        slot_ids: Vec::new(),
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: vec![spec_a.id, spec_b.id],
+    };
+
+    let mut specs = manager
+        .start_tasks_batch(vec![request])
+        .await
+        .expect("start batch with two networks");
+    let task_spec = specs
+        .pop()
+        .expect("task created with two network attachments");
+
+    let container_id = {
+        let guard = manager.local_containers.lock().await;
+        guard
+            .get(&task_spec.id)
+            .cloned()
+            .expect("container id recorded")
+    };
+
+    let initial = network_registry
+        .list_attachments_for_task(task_spec.id)
+        .expect("list initial attachments");
+    assert_eq!(initial.len(), 2);
+
+    manager
+        .ensure_runtime_attachments(task_spec.id, &container_id, &[spec_a.id])
+        .await
+        .expect("reconcile attachments");
+
+    let reconciled = network_registry
+        .list_attachments_for_task(task_spec.id)
+        .expect("list reconciled attachments");
+    assert_eq!(reconciled.len(), 1);
+    assert_eq!(reconciled[0].network_id, spec_a.id);
+    assert_eq!(reconciled[0].state, NetworkAttachmentState::Ready);
 }

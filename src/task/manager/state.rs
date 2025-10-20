@@ -255,6 +255,14 @@ impl TaskManager {
 
         self.cleanup_secret_artifacts(id).await;
 
+        if let Err(err) = self.teardown_runtime_attachments(id, HashSet::new()).await {
+            warn!(
+                target: "task",
+                "failed to teardown network attachments for task {}: {err}",
+                id
+            );
+        }
+
         updated.state = ContainerState::Stopped;
         if !spec.slot_ids.is_empty() {
             for slot_id in &spec.slot_ids {
@@ -295,6 +303,17 @@ impl TaskManager {
         }
 
         self.cleanup_secret_artifacts(task_id).await;
+
+        if let Err(err) = self
+            .teardown_runtime_attachments(task_id, HashSet::new())
+            .await
+        {
+            warn!(
+                target: "task",
+                "failed to teardown attachments after failure of {}: {err}",
+                task_id
+            );
+        }
 
         if !spec.slot_ids.is_empty() {
             for slot_id in &spec.slot_ids {
@@ -551,6 +570,50 @@ impl TaskManager {
             guard.insert(working.id, container_id.clone());
         }
 
+        if let Err(err) = self
+            .ensure_runtime_attachments(working.id, &container_id, &working.networks)
+            .await
+        {
+            let err = err.context(format!(
+                "failed to configure runtime network attachments for task {}",
+                working.name
+            ));
+            if let Err(teardown_err) = self
+                .teardown_runtime_attachments(working.id, HashSet::new())
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to cleanup partial attachments for task {}: {teardown_err}",
+                    working.id
+                );
+            }
+            if let Err(stop_err) = self
+                .container_manager
+                .stop_container(&container_id, Some(Duration::from_secs(10)))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to stop container {} after attachment setup failure: {stop_err}",
+                    container_id
+                );
+            }
+            if let Err(remove_err) = self
+                .container_manager
+                .remove_container(&container_id, true, true)
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to remove container {} after attachment setup failure: {remove_err}",
+                    container_id
+                );
+            }
+            let err = self.mark_task_failed(working, err).await;
+            return Err(err);
+        }
+
         working.state = ContainerState::Running;
         working.created_at = Utc::now().to_rfc3339();
         working.node_id = self.local_node_id;
@@ -627,6 +690,16 @@ impl TaskManager {
         if matches!(spec.state, ContainerState::Stopped) {
             self.local_containers.lock().await.remove(&spec.id);
             self.cleanup_secret_artifacts(spec.id).await;
+            if let Err(err) = self
+                .teardown_runtime_attachments(spec.id, HashSet::new())
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to cleanup attachments for stopped task {}: {err}",
+                    spec.id
+                );
+            }
             return Ok(());
         }
 
@@ -637,6 +710,16 @@ impl TaskManager {
 
         if !has_container {
             self.cleanup_secret_artifacts(spec.id).await;
+            if let Err(err) = self
+                .teardown_runtime_attachments(spec.id, HashSet::new())
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to cleanup attachments for containerless task {}: {err}",
+                    spec.id
+                );
+            }
             return Ok(());
         }
 

@@ -272,6 +272,17 @@ pub fn compute_network_peer_state_id(network_id: Uuid, peer_id: Uuid) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+/// Deterministic identifier for an attachment based on task and network identifiers.
+pub fn compute_network_attachment_id(task_id: Uuid, network_id: Uuid) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(task_id.as_bytes());
+    hasher.update(network_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
+}
+
 /// Lifecycle states describing how an attachment is progressing through reconciliation.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]

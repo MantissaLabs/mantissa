@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -135,6 +136,41 @@ impl TaskManager {
                 .start_container(&container_id)
                 .await
                 .with_context(|| format!("docker start failed for task {}", plan.name))?;
+
+            if let Err(err) = self
+                .ensure_runtime_attachments(plan.id, &container_id, &plan.networks)
+                .await
+            {
+                let err = err.context(format!(
+                    "failed to configure runtime network attachments for task {}",
+                    plan.name
+                ));
+
+                if let Err(stop_err) = self
+                    .container_manager
+                    .stop_container(&container_id, Some(Duration::from_secs(10)))
+                    .await
+                {
+                    warn!(
+                        target: "task",
+                        "failed to stop container {container_id} after network setup error: {stop_err}"
+                    );
+                }
+                if let Err(remove_err) = self
+                    .container_manager
+                    .remove_container(&container_id, true, true)
+                    .await
+                {
+                    warn!(
+                        target: "task",
+                        "failed to remove container {container_id} after network setup error: {remove_err}"
+                    );
+                }
+                let _ = self
+                    .teardown_runtime_attachments(plan.id, HashSet::new())
+                    .await;
+                return Err(err);
+            }
 
             plan.created_at = Utc::now();
         }
