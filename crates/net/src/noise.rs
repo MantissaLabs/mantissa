@@ -1,8 +1,9 @@
+use crate::paths::{ensure_mantissa_group, ensure_state_dir, running_as_root};
 use futures::lock::Mutex;
 use getrandom::getrandom;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{fs, io, path::Path};
+use std::{fs, io};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -287,38 +288,10 @@ fn spawn_noise_io_bridge(
     app_end
 }
 
-/// Prefer `/var/lib/mantissa/noise.key`; fallback to `~/.mantissa/noise.key`.
+/// Prefer `/var/lib/mantissa` when privileged, otherwise fallback to `~/.mantissa`.
 pub fn resolve_noise_key_path() -> io::Result<PathBuf> {
-    let primary = PathBuf::from("/var/lib/mantissa/noise.key");
-
-    // Try to ensure the system dir exists; if we can create it, we likely can write the key there.
-    if let Some(parent) = primary.parent() {
-        match fs::create_dir_all(parent) {
-            Ok(_) => return Ok(primary),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => { /* fall back */ }
-            Err(e) => {
-                // If it failed for another reason (e.g., read-only FS), also fall back.
-                eprintln!(
-                    "warn: cannot use {} ({e}); falling back to HOME",
-                    parent.display()
-                );
-            }
-        }
-    }
-
-    // Fallback: ~/.mantissa/noise.key
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
-    let mut p = PathBuf::from(home);
-    p.push(".mantissa");
-    fs::create_dir_all(&p)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
-    }
-    p.push("noise.key");
-    Ok(p)
+    let dir = ensure_state_dir()?;
+    Ok(dir.join("noise.key"))
 }
 
 /// Load a 32-byte private key from `path`, or generate and persist a new one.
@@ -333,6 +306,14 @@ pub fn load_or_generate_noise_keys(path: impl AsRef<Path>) -> io::Result<NoiseKe
                 "noise private key must be 32 bytes",
             )
         })?;
+        #[cfg(unix)]
+        {
+            if running_as_root() {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o640));
+                ensure_mantissa_group(path);
+            }
+        }
         arr
     } else {
         let mut sk = [0u8; 32];
@@ -341,7 +322,11 @@ pub fn load_or_generate_noise_keys(path: impl AsRef<Path>) -> io::Result<NoiseKe
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            let mode = if running_as_root() { 0o640 } else { 0o600 };
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+            if running_as_root() {
+                ensure_mantissa_group(path);
+            }
         }
         sk
     };

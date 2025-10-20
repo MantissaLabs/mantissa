@@ -1,3 +1,4 @@
+use crate::paths::{ensure_mantissa_group, running_as_root};
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use protocol::server::cluster_session;
@@ -10,6 +11,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::info;
 
+/// List potential Unix socket locations ordered by preference.
 pub fn candidate_unix_socket_paths() -> Vec<PathBuf> {
     let mut v = Vec::new();
     v.push(PathBuf::from("/var/run/mantissa.sock")); // default
@@ -21,11 +23,16 @@ pub fn candidate_unix_socket_paths() -> Vec<PathBuf> {
     v
 }
 
+/// Remove lingering socket files and pre-create parent directories with sane permissions.
 fn prepare_socket_file(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         if parent != Path::new("/var/run") && parent != Path::new("/run") {
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            let mode = if running_as_root() { 0o770 } else { 0o700 };
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(mode));
+            if running_as_root() {
+                ensure_mantissa_group(parent);
+            }
         }
     }
     if path.exists() {
@@ -51,7 +58,12 @@ pub async fn start_unix_socket_server_auto(
         }
         match UnixListener::bind(&path) {
             Ok(listener) => {
-                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+                if running_as_root() {
+                    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o660));
+                    ensure_mantissa_group(&path);
+                } else {
+                    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+                }
                 info!(target: "server", "Local UnixSocket listening at {}", path.display());
                 tokio::task::spawn_local(accept_loop(listener, server_handle.clone()));
                 return Ok(path);

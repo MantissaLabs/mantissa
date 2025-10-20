@@ -1,5 +1,6 @@
 use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey};
 use getrandom::getrandom;
+use net::paths::{ensure_mantissa_group, ensure_state_dir, running_as_root};
 use std::{fs, io, path::Path};
 
 pub struct SignKeys {
@@ -8,22 +9,13 @@ pub struct SignKeys {
     pub sk: SigningKey,
 }
 
+/// Resolve the signing key path, honouring root-aware system defaults.
 pub fn resolve_signing_key_path() -> io::Result<std::path::PathBuf> {
-    // e.g. ~/.mantissa/ed25519.key (mirror your noise path layout)
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
-    let mut p = std::path::PathBuf::from(home);
-    p.push(".mantissa");
-    fs::create_dir_all(&p)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
-    }
-    p.push("ed25519.key");
-    Ok(p)
+    let dir = ensure_state_dir()?;
+    Ok(dir.join("ed25519.key"))
 }
 
+/// Load or generate the Ed25519 signing keys for API authentication.
 pub fn load_or_generate_sign_keys(path: impl AsRef<Path>) -> io::Result<SignKeys> {
     let path = path.as_ref();
     let sk_bytes = if path.exists() {
@@ -36,6 +28,14 @@ pub fn load_or_generate_sign_keys(path: impl AsRef<Path>) -> io::Result<SignKeys
         }
         let mut arr = [0u8; SECRET_KEY_LENGTH];
         arr.copy_from_slice(&b);
+        #[cfg(unix)]
+        {
+            if running_as_root() {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o640));
+                ensure_mantissa_group(path);
+            }
+        }
         arr
     } else {
         let mut arr = [0u8; SECRET_KEY_LENGTH];
@@ -44,7 +44,11 @@ pub fn load_or_generate_sign_keys(path: impl AsRef<Path>) -> io::Result<SignKeys
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            let mode = if running_as_root() { 0o640 } else { 0o600 };
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+            if running_as_root() {
+                ensure_mantissa_group(path);
+            }
         }
         arr
     };

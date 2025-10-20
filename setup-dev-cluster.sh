@@ -125,6 +125,14 @@ provision:
         sudo usermod -aG docker "$USER"
       fi
 
+      if ! getent group mantissa >/dev/null; then
+        sudo groupadd --system mantissa
+      fi
+      if ! id -nG "$USER" | tr ' ' '\n' | grep -qx mantissa; then
+        sudo usermod -aG mantissa "$USER"
+      fi
+      sudo install -d -m 0750 -o root -g mantissa /var/lib/mantissa
+
       # Follow Docker post-install guidance: enable daemon
       sudo systemctl enable docker.service
       sudo systemctl start docker.service
@@ -141,17 +149,18 @@ provision:
         echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.profile
       fi
 
-      # Mantissa dev bin and alias
+      # Mantissa dev bin path for convenience
       if ! grep -q 'MANTISSA_BIN=' ~/.bashrc; then
         echo 'export MANTISSA_BIN="/mantissa/target/debug"' >> ~/.bashrc
         echo 'export PATH="$PATH:$MANTISSA_BIN"' >> ~/.bashrc
-        echo "alias mts='RUST_LOG=debug mantissa'" >> ~/.bashrc
       fi
       if ! grep -q 'MANTISSA_BIN=' ~/.profile; then
         echo 'export MANTISSA_BIN="/mantissa/target/debug"' >> ~/.profile
         echo 'export PATH="$PATH:$MANTISSA_BIN"' >> ~/.profile
-        echo "alias mts='RUST_LOG=debug mantissa'" >> ~/.profile
       fi
+
+      # System-wide symlink so both the user and sudo see the freshly built binary.
+      sudo ln -sfn /mantissa/target/debug/mantissa /usr/local/bin/mantissa
 
       if ! grep -q 'alias dockerclean=' ~/.bashrc; then
         echo "alias dockerclean='docker rm -f \$(docker ps -aq)'" >> ~/.bashrc
@@ -210,7 +219,7 @@ echo
 echo "Inside each VM (open a new shell so env/alias apply):"
 echo "  cd /mantissa"
 echo "  cargo build -p mantissa"
-echo "  mts init    # alias for 'mantissa'"
+echo "  sudo mantissa init"
 echo
 echo "VMs can reach each other via DNS and IP:"
 echo "  ping -c1 lima-mantissa-2.internal     # from mantissa-1"
@@ -220,13 +229,13 @@ if [[ "${COUNT}" -ge 2 ]]; then
   cat <<'JOIN'
 Join example:
   # On mantissa-2:
-  mts token show
+  sudo mantissa token show
   # Copy the token
 
   # On mantissa-1 (use DNS name or IP):
-  mts link --anchor lima-mantissa-2.internal:6578 --join-token <TOKEN>
+  sudo mantissa link --anchor lima-mantissa-2.internal:6578 --join-token <TOKEN>
   # or:
-  mts link --anchor <IP_OF_MANTISSA_2>:6578 --join-token <TOKEN>
+  sudo mantissa link --anchor <IP_OF_MANTISSA_2>:6578 --join-token <TOKEN>
 JOIN
 fi
 

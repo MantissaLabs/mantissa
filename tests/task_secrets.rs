@@ -497,7 +497,10 @@ local_test!(rotate_master_key_rewraps_secrets, {
     let maybe_old = secret_master_store
         .load_version(old_version)
         .expect("load master key version");
-    assert!(maybe_old.is_some(), "previous master key should remain available for convergence");
+    assert!(
+        maybe_old.is_some(),
+        "previous master key should remain available for convergence"
+    );
 
     let keyring = secret_keyring_handle.read().await;
     let decrypted = keyring
