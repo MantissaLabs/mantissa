@@ -1,5 +1,6 @@
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::{DEFAULT_FANOUT, Message};
+use crate::network::registry::NetworkRegistry;
 use crate::network::service::NetworksRpc;
 use crate::registry::Registry;
 use crate::scheduler::Scheduler;
@@ -14,6 +15,9 @@ use crate::services::{ServiceController, ServiceRegistry, ServicesRPC};
 use crate::store::local::load_or_create_node_id;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
+use crate::store::network_store::{
+    NetworkPeerStore, NetworkSpecStore, open_network_peer_store, open_network_spec_store,
+};
 use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
 use crate::store::scheduler_store::{SchedulerStore, open_scheduler_store};
@@ -103,6 +107,8 @@ pub(crate) struct Stores {
     pub scheduler_store: SchedulerStore,
     pub services: ServiceStore,
     pub secrets: SecretStore,
+    pub networks: NetworkSpecStore,
+    pub network_peers: NetworkPeerStore,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
@@ -123,6 +129,8 @@ pub(crate) struct Components {
     pub secret_registry: SecretRegistry,
     pub secrets_client: SecretsClient,
     pub networks_client: NetworksClient,
+    #[allow(dead_code)]
+    pub network_registry: NetworkRegistry,
 }
 
 impl Bootstrap {
@@ -225,6 +233,12 @@ impl Bootstrap {
         let secrets = open_secret_store(ctx.db.clone(), ctx.self_id)?;
         secrets.rebuild_mst_from_disk().await?;
 
+        let networks = open_network_spec_store(ctx.db.clone(), ctx.self_id)?;
+        networks.rebuild_mst_from_disk().await?;
+
+        let network_peers = open_network_peer_store(ctx.db.clone(), ctx.self_id)?;
+        network_peers.rebuild_mst_from_disk().await?;
+
         Ok(Stores {
             peers,
             session_auth,
@@ -236,6 +250,8 @@ impl Bootstrap {
             scheduler_store,
             services,
             secrets,
+            networks,
+            network_peers,
             secret_keyring,
         })
     }
@@ -277,6 +293,8 @@ impl Bootstrap {
             tasks: stores.tasks.clone(),
             services: stores.services.clone(),
             secrets: stores.secrets.clone(),
+            networks: stores.networks.clone(),
+            network_peers: stores.network_peers.clone(),
             secret_keyring: stores.secret_keyring.clone(),
         };
 
@@ -328,6 +346,8 @@ impl Bootstrap {
             stores.tasks.clone(),
             stores.services.clone(),
             stores.secrets.clone(),
+            stores.networks.clone(),
+            stores.network_peers.clone(),
         );
         let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
 
@@ -374,6 +394,11 @@ impl Bootstrap {
         let services_service = ServicesRPC::new(service_controller.clone());
         let services_client_cap = capnp_rpc::new_client(services_service);
 
+        let network_registry =
+            NetworkRegistry::new(stores.networks.clone(), stores.network_peers.clone());
+        let networks_service = NetworksRpc::new(network_registry.clone());
+        let networks_client_cap: NetworksClient = capnp_rpc::new_client(networks_service);
+
         let secrets_service = SecretsService::new(
             secret_registry.clone(),
             stores.secret_keyring.clone(),
@@ -381,9 +406,6 @@ impl Bootstrap {
             Some(topology.clone()),
         );
         let secrets_client_cap: SecretsClient = capnp_rpc::new_client(secrets_service);
-
-        let networks_service = NetworksRpc::new();
-        let networks_client_cap: NetworksClient = capnp_rpc::new_client(networks_service);
 
         let scheduler_service =
             SchedulerService::new(scheduler.clone(), ctx.self_id, local_node_name.clone());
@@ -405,6 +427,7 @@ impl Bootstrap {
                 secret_registry,
                 secrets_client: secrets_client_cap,
                 networks_client: networks_client_cap,
+                network_registry,
             },
             gossip_rx,
         ))

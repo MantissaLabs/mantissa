@@ -1,5 +1,7 @@
+use crate::network::types::{NetworkPeerStateValue, NetworkSpecValue};
 use crate::secrets::types::SecretValue;
 use crate::services::types::ServiceSpecValue;
+use crate::store::network_store::{NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
@@ -23,6 +25,8 @@ pub struct SyncStores {
     pub tasks: TaskStore,
     pub services: ServiceStore,
     pub secrets: SecretStore,
+    pub networks: NetworkSpecStore,
+    pub network_peers: NetworkPeerStore,
 }
 
 impl SyncStores {
@@ -32,6 +36,8 @@ impl SyncStores {
             Domain::Tasks => self.tasks.root_hex().await,
             Domain::Services => self.services.root_hex().await,
             Domain::Secrets => self.secrets.root_hex().await,
+            Domain::Networks => self.networks.root_hex().await,
+            Domain::NetworkPeers => self.network_peers.root_hex().await,
         }
     }
 
@@ -41,6 +47,8 @@ impl SyncStores {
             Domain::Tasks => self.tasks.page_range_summary().await,
             Domain::Services => self.services.page_range_summary().await,
             Domain::Secrets => self.secrets.page_range_summary().await,
+            Domain::Networks => self.networks.page_range_summary().await,
+            Domain::NetworkPeers => self.network_peers.page_range_summary().await,
         }
     }
 }
@@ -84,6 +92,22 @@ impl delta_sink::Server for DeltaSinkImpl {
                         stores.secrets.clone(),
                         &chunk,
                         decode_register::<SecretValue>,
+                    )
+                    .await?
+                }
+                Domain::Networks => {
+                    apply_chunk(
+                        stores.networks.clone(),
+                        &chunk,
+                        decode_register::<NetworkSpecValue>,
+                    )
+                    .await?
+                }
+                Domain::NetworkPeers => {
+                    apply_chunk(
+                        stores.network_peers.clone(),
+                        &chunk,
+                        decode_register::<NetworkPeerStateValue>,
                     )
                     .await?
                 }
@@ -204,6 +228,28 @@ impl DeltaStore<SecretValue> for SecretStore {
     }
 }
 
+#[async_trait]
+impl DeltaStore<NetworkSpecValue> for NetworkSpecStore {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<NetworkSpecValue, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()> {
+        self.apply_delta_chunk_update_mst(regs, tombs).await
+    }
+}
+
+#[async_trait]
+impl DeltaStore<NetworkPeerStateValue> for NetworkPeerStore {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<NetworkPeerStateValue, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()> {
+        self.apply_delta_chunk_update_mst(regs, tombs).await
+    }
+}
+
 pub async fn sync_all_domains(stores: SyncStores, sync_cap: sync::Client) {
     let res: Result<(), capnp::Error> = async {
         let domains = [
@@ -211,6 +257,8 @@ pub async fn sync_all_domains(stores: SyncStores, sync_cap: sync::Client) {
             Domain::Tasks,
             Domain::Services,
             Domain::Secrets,
+            Domain::Networks,
+            Domain::NetworkPeers,
         ];
 
         let roots_req = sync_cap.get_roots_request();

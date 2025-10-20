@@ -275,6 +275,8 @@ impl topology::Server for Topology {
                 tasks: topology.tasks.clone(),
                 services: topology.services.clone(),
                 secrets: topology.secrets.clone(),
+                networks: topology.networks.clone(),
+                network_peers: topology.network_peers.clone(),
             };
 
             tokio::task::spawn_local({

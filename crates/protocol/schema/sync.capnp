@@ -5,6 +5,8 @@ enum Domain {
   tasks @1;
   services @2;
   secrets @3;
+  networks @4;
+  networkPeers @5;
 }
 
 struct PageRange {
