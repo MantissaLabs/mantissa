@@ -189,9 +189,20 @@ impl networks::Server for NetworksRpc {
 
             let network_id = compute_network_id(&name);
             let existing_spec = registry.get_spec(network_id).map_err(Self::to_capnp)?;
-            let is_new = existing_spec.is_none();
 
-            let mut spec_value = match existing_spec {
+            let (mut spec_value, is_new) = match existing_spec {
+                Some(mut current) if current.is_deleted() => {
+                    current.reset_for_recreate(
+                        description.clone(),
+                        driver,
+                        subnet.clone(),
+                        vni,
+                        mtu,
+                        sealed,
+                        programs.clone(),
+                    );
+                    (current, true)
+                }
                 Some(mut current) => {
                     if current.is_sealed() {
                         return Err(Error::failed(format!(
@@ -208,21 +219,24 @@ impl networks::Server for NetworksRpc {
                         sealed,
                         programs.clone(),
                     );
-                    current
+                    (current, false)
                 }
-                None => NetworkSpecValue::new(
-                    name.clone(),
-                    description.clone(),
-                    driver,
-                    subnet.clone(),
-                    vni,
-                    mtu,
-                    sealed,
-                    programs.clone(),
+                None => (
+                    NetworkSpecValue::new(
+                        name.clone(),
+                        description.clone(),
+                        driver,
+                        subnet.clone(),
+                        vni,
+                        mtu,
+                        sealed,
+                        programs.clone(),
+                    ),
+                    true,
                 ),
             };
 
-            // Newly created networks start as pending; ensure we maintain the status unless updating.
+            // Newly created or revived networks start as pending.
             if is_new {
                 spec_value.set_status(NetworkStatus::Pending);
             }
@@ -246,7 +260,20 @@ impl networks::Server for NetworksRpc {
             let ids_reader = params.get()?.get_ids()?;
             for entry in ids_reader.iter() {
                 let uuid = Self::read_uuid(entry?)?;
-                registry.remove_spec(uuid).await.map_err(Self::to_capnp)?;
+                if let Some(mut spec) = registry.get_spec(uuid).map_err(Self::to_capnp)? {
+                    spec.mark_deleted();
+                    registry.upsert_spec(spec).await.map_err(Self::to_capnp)?;
+                }
+
+                registry
+                    .remove_peer_states_for_network(uuid)
+                    .await
+                    .map_err(Self::to_capnp)?;
+
+                registry
+                    .remove_attachments_for_network(uuid)
+                    .await
+                    .map_err(Self::to_capnp)?;
             }
             Ok(())
         })
@@ -261,10 +288,14 @@ impl networks::Server for NetworksRpc {
 
         Promise::from_future(async move {
             let specs = registry.list_specs().map_err(Self::to_capnp)?;
-            let counts = Self::aggregate_peer_counts(&specs, &registry)?;
+            let visible_specs: Vec<_> = specs
+                .into_iter()
+                .filter(|spec| !spec.is_deleted())
+                .collect();
+            let counts = Self::aggregate_peer_counts(&visible_specs, &registry)?;
 
-            let mut list = results.get().init_networks(specs.len() as u32);
-            for (idx, spec) in specs.iter().enumerate() {
+            let mut list = results.get().init_networks(visible_specs.len() as u32);
+            for (idx, spec) in visible_specs.iter().enumerate() {
                 let peer_counts = counts.get(&spec.id).copied().unwrap_or((0, 0));
                 let builder = list.reborrow().get(idx as u32);
                 Self::write_summary(builder, spec, &peer_counts);

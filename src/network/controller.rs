@@ -100,6 +100,18 @@ impl NetworkController {
 
         let mut desired: HashSet<Uuid> = HashSet::with_capacity(specs.len());
         for spec in specs {
+            if spec.is_deleted() {
+                if let Err(err) = self.teardown_deleted_network(&spec).await {
+                    warn!(
+                        target: "network",
+                        "failed to process deleted network {} ({}): {err:#}",
+                        spec.name,
+                        spec.id
+                    );
+                }
+                continue;
+            }
+
             desired.insert(spec.id);
             if let Err(err) = self.reconcile_network(spec.clone()).await {
                 warn!(
@@ -170,29 +182,55 @@ impl NetworkController {
                 );
             }
 
-            self.inner
-                .registry
-                .remove_peer_states_for_network(id)
+            self.cleanup_network_state(id)
                 .await
-                .context("remove peer state for deleted network")?;
-
-            self.inner
-                .registry
-                .remove_attachments_for_network(id)
-                .await
-                .context("remove attachments for deleted network")?;
-
-            {
-                let mut guard = self.inner.remote_fdb.lock().await;
-                guard.remove(&id);
-            }
-
-            {
-                let mut guard = self.inner.flood_entries.lock().await;
-                guard.remove(&id);
-            }
-
+                .context("cleanup network state for deleted network")?;
             active.remove(&id);
+        }
+
+        Ok(())
+    }
+
+    async fn teardown_deleted_network(&self, spec: &NetworkSpecValue) -> Result<()> {
+        let plan = NetworkPlan::from_id(spec.id);
+        if let Err(err) = self.inner.provisioner.teardown_network(&plan).await {
+            warn!(
+                target: "network",
+                "failed to tear down deleted network {}: {err:#}",
+                spec.id
+            );
+        }
+
+        self.cleanup_network_state(spec.id)
+            .await
+            .context("cleanup network state for deleted spec")?;
+
+        let mut active = self.inner.active_networks.lock().await;
+        active.remove(&spec.id);
+        Ok(())
+    }
+
+    async fn cleanup_network_state(&self, network_id: Uuid) -> Result<()> {
+        self.inner
+            .registry
+            .remove_peer_states_for_network(network_id)
+            .await
+            .context("remove peer state for network")?;
+
+        self.inner
+            .registry
+            .remove_attachments_for_network(network_id)
+            .await
+            .context("remove attachments for network")?;
+
+        {
+            let mut guard = self.inner.remote_fdb.lock().await;
+            guard.remove(&network_id);
+        }
+
+        {
+            let mut guard = self.inner.flood_entries.lock().await;
+            guard.remove(&network_id);
         }
 
         Ok(())
@@ -218,7 +256,7 @@ impl NetworkController {
         let suffix = short_id(spec.id);
         let plan = NetworkPlan {
             network_id: spec.id,
-            vxlan_name: format!("mnt-vxlan-{suffix}"),
+            vxlan_name: format!("mvx-{suffix}"),
             bridge_name: format!("mnt-br-{suffix}"),
             vni: spec.vni,
             mtu: spec.mtu,
@@ -411,7 +449,7 @@ impl NetworkPlan {
         let suffix = short_id(network_id);
         Self {
             network_id,
-            vxlan_name: format!("mnt-vxlan-{suffix}"),
+            vxlan_name: format!("mvx-{suffix}"),
             bridge_name: format!("mnt-br-{suffix}"),
             vni: compute_deterministic_vni(network_id),
             mtu: DEFAULT_MTU,

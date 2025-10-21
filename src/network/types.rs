@@ -204,6 +204,40 @@ impl NetworkSpecValue {
         self.status = status;
         self.touch();
     }
+
+    /// Returns true if the network spec has been marked as deleted.
+    pub fn is_deleted(&self) -> bool {
+        matches!(self.status, NetworkStatus::Deleted)
+    }
+
+    /// Mark the specification as deleted and seal it against further updates.
+    pub fn mark_deleted(&mut self) {
+        self.sealed = true;
+        self.set_status(NetworkStatus::Deleted);
+    }
+
+    /// Reset a previously deleted specification so it can be recreated with new parameters.
+    pub fn reset_for_recreate(
+        &mut self,
+        description: impl Into<String>,
+        driver: NetworkDriver,
+        subnet_cidr: impl Into<String>,
+        vni: u32,
+        mtu: u32,
+        sealed: bool,
+        mut bpf_programs: Vec<String>,
+    ) {
+        self.description = description.into();
+        self.driver = driver;
+        self.subnet_cidr = subnet_cidr.into();
+        self.vni = vni;
+        self.mtu = mtu;
+        self.sealed = sealed;
+        bpf_programs.sort();
+        self.bpf_programs = bpf_programs;
+        self.status = NetworkStatus::Pending;
+        self.touch();
+    }
 }
 
 /// Replicated peer reconciliation state for a network.

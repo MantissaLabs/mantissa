@@ -79,8 +79,17 @@ With that symlink in place, run privileged commands explicitly (`sudo mantissa i
    mantissa nodes list
    mantissa scheduler slots --details
    ```
-5. (Optional) Seed the demo secrets used by the sample manifest (see [Using Secrets in Service Manifests](#using-secrets-in-service-manifests)).
-6. Deploy the sample service manifest:
+5. Create the overlay network referenced by the sample manifest (the manifest expects a network named `demo-overlay`):
+   ```bash
+   mantissa networks create \
+     --name demo-overlay \
+     --description "Overlay for demo-service" \
+     --subnet 10.240.0.0/16
+   mantissa networks list
+   ```
+   The `networks create` command prints a UUID; Mantissa resolves the `demo-overlay` label in the manifest to that network specification when scheduling tasks.
+6. (Optional) Seed the demo secrets used by the sample manifest (see [Using Secrets in Service Manifests](#using-secrets-in-service-manifests)).
+7. Deploy the sample service manifest:
    ```bash
    mantissa services run examples/replicated_service.ron
    mantissa services list
@@ -163,6 +172,7 @@ Secrets are resolved on the node that launches the task: environment variables r
 After creating the secrets, deploy the manifest and inspect the resulting tasks:
 
 ```bash
+mantissa networks list
 mantissa services run examples/replicated_service.ron
 mantissa services list
 mantissa tasks list --state running
