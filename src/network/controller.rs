@@ -11,7 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Duration, sleep};
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -139,11 +139,31 @@ impl NetworkController {
                 .context("persist network spec update")?;
         }
 
+        info!("blablabla2");
+
+        info!(
+            target: "network",
+            network_id = %plan.network_id,
+            node_id = %self.inner.node_id,
+            node = %self.inner.node_name,
+            vxlan = %plan.vxlan_name,
+            bridge = %plan.bridge_name,
+            vni = plan.vni,
+            mtu = plan.mtu,
+            "ensuring network resources"
+        );
         self.inner
             .provisioner
             .ensure_network(&plan)
             .await
             .with_context(|| format!("ensure network {}", plan.network_id))?;
+        info!(
+            target: "network",
+            network_id = %plan.network_id,
+            vxlan = %plan.vxlan_name,
+            bridge = %plan.bridge_name,
+            "network resources ensured"
+        );
 
         self.mark_peer_ready(plan.network_id).await?;
 
@@ -474,33 +494,112 @@ fn compute_deterministic_vni(network_id: Uuid) -> u32 {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{NetworkPlan, VXLAN_PORT};
-    use anyhow::{Context, Result};
+    use anyhow::{Context, Result, anyhow};
     use futures::TryStreamExt;
-    use rtnetlink::{Handle, LinkBridge, LinkUnspec, LinkVxlan, new_connection};
+    use libc;
+    use rtnetlink::packet_route::address::AddressAttribute;
+    use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags};
+    use rtnetlink::{
+        Error as RtnetlinkError, Handle, LinkBridge, LinkUnspec, LinkVxlan, new_connection,
+    };
+    use std::io;
+    use std::net::IpAddr;
+    use std::process::Command;
+    use std::sync::Arc;
+    use tokio::sync::Mutex as AsyncMutex;
+    use tracing::{debug, info, warn};
 
     #[derive(Clone)]
     pub struct NetworkProvisioner {
         handle: Handle,
+        underlay: Arc<AsyncMutex<Option<(u32, IpAddr)>>>,
     }
 
     impl NetworkProvisioner {
         pub fn new() -> Result<Self> {
+            Self::ensure_vxlan_module().context("load vxlan kernel module")?;
+
             let (connection, handle, _) =
                 new_connection().context("failed to open rtnetlink connection")?;
 
             tokio::spawn(connection);
 
-            Ok(Self { handle })
+            Ok(Self {
+                handle,
+                underlay: Arc::new(AsyncMutex::new(None)),
+            })
         }
 
         pub async fn ensure_network(&self, plan: &NetworkPlan) -> Result<()> {
-            let vxlan_index = self.ensure_vxlan(plan).await?;
-            let bridge_index = self.ensure_bridge(plan).await?;
-            self.attach_master(vxlan_index, bridge_index).await?;
-            self.set_up(vxlan_index).await?;
-            self.set_up(bridge_index).await?;
-            self.set_mtu(vxlan_index, plan.mtu).await?;
-            self.set_mtu(bridge_index, plan.mtu).await?;
+            info!(
+                target: "network",
+                vxlan = %plan.vxlan_name,
+                bridge = %plan.bridge_name,
+                vni = plan.vni,
+                mtu = plan.mtu,
+                "provisioner: ensuring kernel interfaces"
+            );
+            let vxlan_index = self
+                .ensure_vxlan(plan)
+                .await
+                .with_context(|| format!("ensure vxlan interface {}", plan.vxlan_name))?;
+            info!(
+                target: "network",
+                vxlan = %plan.vxlan_name,
+                vxlan_index,
+                "provisioner: vxlan interface ready"
+            );
+
+            let bridge_index = self
+                .ensure_bridge(plan)
+                .await
+                .with_context(|| format!("ensure bridge {}", plan.bridge_name))?;
+            info!(
+                target: "network",
+                bridge = %plan.bridge_name,
+                bridge_index,
+                "provisioner: bridge interface ready"
+            );
+
+            self.attach_master(vxlan_index, bridge_index)
+                .await
+                .with_context(|| {
+                    format!(
+                        "attach vxlan {} (idx {}) to bridge {} (idx {})",
+                        plan.vxlan_name, vxlan_index, plan.bridge_name, bridge_index
+                    )
+                })?;
+
+            self.set_up(vxlan_index).await.with_context(|| {
+                format!("bring link {} (idx {}) up", plan.vxlan_name, vxlan_index)
+            })?;
+            self.set_up(bridge_index).await.with_context(|| {
+                format!("bring link {} (idx {}) up", plan.bridge_name, bridge_index)
+            })?;
+
+            if plan.mtu > 0 {
+                self.set_mtu(vxlan_index, plan.mtu).await.with_context(|| {
+                    format!(
+                        "set mtu {} on vxlan {} (idx {})",
+                        plan.mtu, plan.vxlan_name, vxlan_index
+                    )
+                })?;
+                self.set_mtu(bridge_index, plan.mtu)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "set mtu {} on bridge {} (idx {})",
+                            plan.mtu, plan.bridge_name, bridge_index
+                        )
+                    })?;
+            }
+
+            info!(
+                target: "network",
+                vxlan = %plan.vxlan_name,
+                bridge = %plan.bridge_name,
+                "provisioner: kernel interfaces ensured"
+            );
             Ok(())
         }
 
@@ -528,33 +627,174 @@ mod platform {
 
         async fn ensure_vxlan(&self, plan: &NetworkPlan) -> Result<u32> {
             if let Some(index) = self.find_link(&plan.vxlan_name).await? {
+                info!(
+                    target: "network",
+                    vxlan = %plan.vxlan_name,
+                    vxlan_index = index,
+                    "provisioner: reusing existing vxlan interface"
+                );
                 return Ok(index);
             }
 
-            self.handle
-                .link()
-                .add(
-                    LinkVxlan::new(&plan.vxlan_name, plan.vni)
+            let mut last_error: Option<anyhow::Error> = None;
+
+            for attempt in 0..=1 {
+                debug!("LOL3");
+                let (underlay_index, underlay_ip) = self
+                    .underlay_info()
+                    .await
+                    .context("resolve underlay interface for vxlan")?;
+
+                let underlay_name = match self.link_name(underlay_index).await {
+                    Ok(Some(name)) => name,
+                    Ok(None) => {
+                        warn!(
+                            target: "network",
+                            underlay_index,
+                            attempt,
+                            "underlay index missing while preparing vxlan; will fall back to numeric name"
+                        );
+                        format!("ifindex{underlay_index}")
+                    }
+                    Err(err) => {
+                        warn!(
+                            target: "network",
+                            underlay_index,
+                            attempt,
+                            error = %err,
+                            "failed to resolve underlay name before vxlan creation; falling back to numeric name"
+                        );
+                        format!("ifindex{underlay_index}")
+                    }
+                };
+
+                info!(
+                    target: "network",
+                    attempt,
+                    "creating vxlan {} (vni {}) on underlay {} (index {}, ip {})",
+                    plan.vxlan_name,
+                    plan.vni,
+                    underlay_name,
+                    underlay_index,
+                    underlay_ip
+                );
+
+                let builder = {
+                    let base = LinkVxlan::new(&plan.vxlan_name, plan.vni)
+                        .dev(underlay_index)
                         .learning(true)
                         .port(VXLAN_PORT)
-                        .build(),
-                )
-                .execute()
-                .await
-                .with_context(|| format!("create vxlan {}", plan.vxlan_name))?;
+                        .link(underlay_index);
+                    match underlay_ip {
+                        IpAddr::V4(ip) => base.local(ip),
+                        IpAddr::V6(ip) => base.local6(ip),
+                    }
+                };
 
-            let index = self
-                .find_link(&plan.vxlan_name)
-                .await?
-                .context("vxlan interface missing after creation")?;
-            Ok(index)
+                match self.handle.link().add(builder.build()).execute().await {
+                    Ok(()) => {
+                        let index = self
+                            .find_link(&plan.vxlan_name)
+                            .await?
+                            .context("vxlan interface missing after creation")?;
+                        debug!(
+                            target: "network",
+                            attempt,
+                            vxlan = %plan.vxlan_name,
+                            index,
+                            underlay = underlay_name,
+                            underlay_index,
+                            "vxlan interface provisioned"
+                        );
+                        return Ok(index);
+                    }
+                    Err(err) => {
+                        let (raw_code, errno) = match &err {
+                            RtnetlinkError::NetlinkError(msg) => {
+                                let raw = msg.raw_code();
+                                (raw, raw.abs())
+                            }
+                            _ => (0, 0),
+                        };
+                        let errno_name = if errno != 0 {
+                            std::io::Error::from_raw_os_error(errno).to_string()
+                        } else {
+                            "unknown".into()
+                        };
+
+                        let inventory = match self.collect_link_inventory().await {
+                            Ok(entries) if !entries.is_empty() => entries.join("; "),
+                            Ok(_) => "<no interfaces enumerated>".into(),
+                            Err(inv_err) => format!("failed to enumerate interfaces: {inv_err:#}"),
+                        };
+
+                        let mut message = format!(
+                            "failed to create vxlan {} (vni {}) on underlay {} (idx {}, ip {}): kernel returned {} ({errno_name}); available links [{}]",
+                            plan.vxlan_name,
+                            plan.vni,
+                            underlay_name,
+                            underlay_index,
+                            underlay_ip,
+                            errno,
+                            inventory
+                        );
+                        if raw_code != errno {
+                            message.push_str(&format!(" raw_code={raw_code}"));
+                        }
+
+                        warn!(
+                            target: "network",
+                            attempt,
+                            vxlan = %plan.vxlan_name,
+                            vni = plan.vni,
+                            underlay = %underlay_name,
+                            underlay_index,
+                            errno,
+                            errno_name = %errno_name,
+                            raw_code,
+                            available_links = %inventory,
+                            error = %err,
+                            message = %message
+                        );
+
+                        if attempt == 0 && errno == libc::ENODEV {
+                            warn!(
+                                target: "network",
+                                attempt,
+                                underlay = %underlay_name,
+                                underlay_index,
+                                "vxlan creation returned ENODEV; refreshing underlay cache and retrying"
+                            );
+                            let mut guard = self.underlay.lock().await;
+                            *guard = None;
+                            last_error = Some(anyhow!(message));
+                            continue;
+                        }
+
+                        return Err(anyhow!(message));
+                    }
+                }
+            }
+
+            Err(last_error.unwrap_or_else(|| anyhow!("vxlan creation failed after retries")))
         }
 
         async fn ensure_bridge(&self, plan: &NetworkPlan) -> Result<u32> {
             if let Some(index) = self.find_link(&plan.bridge_name).await? {
+                info!(
+                    target: "network",
+                    bridge = %plan.bridge_name,
+                    bridge_index = index,
+                    "provisioner: reusing existing bridge"
+                );
                 return Ok(index);
             }
 
+            info!(
+                target: "network",
+                bridge = %plan.bridge_name,
+                "provisioner: creating bridge"
+            );
             self.handle
                 .link()
                 .add(LinkBridge::new(&plan.bridge_name).build())
@@ -570,12 +810,29 @@ mod platform {
         }
 
         async fn set_up(&self, index: u32) -> Result<()> {
+            let name = self
+                .link_name(index)
+                .await
+                .context("resolve link name before bringing link up")?
+                .unwrap_or_else(|| format!("ifindex{index}"));
+            info!(
+                target: "network",
+                link = %name,
+                link_index = index,
+                "provisioner: bringing link up"
+            );
             self.handle
                 .link()
                 .set(LinkUnspec::new_with_index(index).up().build())
                 .execute()
                 .await
-                .with_context(|| format!("bring link {index} up"))?;
+                .with_context(|| format!("bring link {name} (index {index}) up"))?;
+            info!(
+                target: "network",
+                link = %name,
+                link_index = index,
+                "provisioner: link is up"
+            );
             Ok(())
         }
 
@@ -583,18 +840,55 @@ mod platform {
             if mtu == 0 {
                 return Ok(());
             }
+            let name = self
+                .link_name(index)
+                .await
+                .context("resolve link name before setting mtu")?
+                .unwrap_or_else(|| format!("ifindex{index}"));
+            info!(
+                target: "network",
+                link = %name,
+                link_index = index,
+                mtu,
+                "provisioner: updating mtu"
+            );
             self.handle
                 .link()
                 .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
                 .execute()
                 .await
-                .with_context(|| format!("set mtu {mtu} on link {index}"))?;
+                .with_context(|| format!("set mtu {mtu} on link {name} (index {index})"))?;
+            info!(
+                target: "network",
+                link = %name,
+                link_index = index,
+                mtu,
+                "provisioner: mtu updated"
+            );
             Ok(())
         }
 
         async fn attach_master(&self, link_index: u32, master_index: u32) -> Result<()> {
-            if let Err(err) = self
-                .handle
+            let link_name = self
+                .link_name(link_index)
+                .await
+                .context("resolve link name before attaching to bridge")?
+                .unwrap_or_else(|| format!("ifindex{link_index}"));
+            let master_name = self
+                .link_name(master_index)
+                .await
+                .context("resolve bridge name before attaching interface")?
+                .unwrap_or_else(|| format!("ifindex{master_index}"));
+
+            info!(
+                target: "network",
+                link = %link_name,
+                link_index,
+                bridge = %master_name,
+                bridge_index = master_index,
+                "provisioner: attaching link to bridge"
+            );
+            self.handle
                 .link()
                 .set(
                     LinkUnspec::new_with_index(link_index)
@@ -603,27 +897,247 @@ mod platform {
                 )
                 .execute()
                 .await
-            {
-                tracing::warn!(
-                    target: "network",
-                    "failed to attach link {link_index} to bridge {master_index}: {err:#}"
-                );
-            }
+                .with_context(|| {
+                    format!(
+                        "attach link {link_name} (index {link_index}) to bridge {master_name} (index {master_index})"
+                    )
+                })?;
+            info!(
+                target: "network",
+                link = %link_name,
+                link_index,
+                bridge = %master_name,
+                bridge_index = master_index,
+                "provisioner: link attached to bridge"
+            );
             Ok(())
         }
 
         async fn find_link(&self, name: &str) -> Result<Option<u32>> {
-            let mut links = self
+            let mut stream = self
                 .handle
                 .link()
                 .get()
                 .match_name(name.to_string())
                 .execute();
 
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(link)) => return Ok(Some(link.header.index)),
+                    Ok(None) => break,
+                    Err(RtnetlinkError::NetlinkError(msg)) => {
+                        let raw = msg.raw_code();
+                        let errno = raw.abs();
+                        if errno == libc::ENODEV || errno == libc::ENOENT {
+                            debug!(
+                                target: "network",
+                                link = name,
+                                errno,
+                                raw_code = raw,
+                                "link lookup returned ENODEV/ENOENT; treating as absent"
+                            );
+                            return Ok(None);
+                        }
+                        return Err(RtnetlinkError::NetlinkError(msg).into());
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+
+            Ok(None)
+        }
+
+        async fn underlay_info(&self) -> Result<(u32, IpAddr)> {
+            let cached = {
+                let guard = self.underlay.lock().await;
+                *guard
+            };
+
+            if let Some(info) = cached {
+                let name = self
+                    .link_name(info.0)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| format!("ifindex{}", info.0));
+                debug!(
+                    target: "network",
+                    underlay = %name,
+                    underlay_index = info.0,
+                    underlay_ip = %info.1,
+                    "provisioner: reusing cached underlay interface"
+                );
+                return Ok(info);
+            }
+
+            let info = self.detect_underlay_info().await?;
+            {
+                let mut guard = self.underlay.lock().await;
+                *guard = Some(info);
+            }
+            let name = self
+                .link_name(info.0)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| format!("ifindex{}", info.0));
+            info!(
+                target: "network",
+                underlay = %name,
+                underlay_index = info.0,
+                underlay_ip = %info.1,
+                "provisioner: detected underlay interface"
+            );
+            Ok(info)
+        }
+
+        async fn detect_underlay_info(&self) -> Result<(u32, IpAddr)> {
+            // Walk all links and choose the first non-loopback interface that is up
+            // and has an assigned IP address. Prefer IPv4 addresses but fall back to
+            // IPv6 if needed.
+            let mut link_stream = self.handle.link().get().execute();
+
+            while let Some(link) = link_stream
+                .try_next()
+                .await
+                .context("enumerate link devices via rtnetlink")?
+            {
+                let index = link.header.index;
+                let name = link
+                    .attributes
+                    .iter()
+                    .find_map(|attr| match attr {
+                        LinkAttribute::IfName(name) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| format!("ifindex{index}"));
+
+                let flags = link.header.flags;
+                if !flags.contains(LinkFlags::Up) {
+                    warn!(
+                        target: "network",
+                        "skipping underlay candidate {} (index {}) because it is down",
+                        name,
+                        index
+                    );
+                    continue;
+                }
+                if flags.contains(LinkFlags::Loopback) {
+                    warn!(
+                        target: "network",
+                        "skipping underlay candidate {} (index {}) because it is loopback",
+                        name,
+                        index
+                    );
+                    continue;
+                }
+
+                let mut addr_stream = self
+                    .handle
+                    .address()
+                    .get()
+                    .set_link_index_filter(index)
+                    .execute();
+
+                let mut ipv6_candidate: Option<IpAddr> = None;
+
+                while let Some(msg) = addr_stream
+                    .try_next()
+                    .await
+                    .context("enumerate interface addresses via rtnetlink")?
+                {
+                    for attr in msg.attributes.iter() {
+                        if let AddressAttribute::Address(addr) | AddressAttribute::Local(addr) =
+                            attr
+                        {
+                            let ip = addr.clone();
+                            if ip.is_loopback() {
+                                continue;
+                            }
+
+                            match ip {
+                                IpAddr::V4(_) => {
+                                    info!(
+                                        target: "network",
+                                        "selected underlay interface {name} (index {index}) with address {ip}"
+                                    );
+                                    return Ok((index, ip));
+                                }
+                                IpAddr::V6(_) => {
+                                    if ipv6_candidate.is_none() {
+                                        ipv6_candidate = Some(ip);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ip) = ipv6_candidate {
+                    info!(
+                        target: "network",
+                        "selected underlay interface {name} (index {index}) with address {ip}"
+                    );
+                    return Ok((index, ip));
+                }
+
+                warn!(
+                    target: "network",
+                    "no usable addresses found on underlay candidate {name} (index {index}), continuing"
+                );
+            }
+
+            Err(anyhow!(
+                "unable to locate a non-loopback interface with an IP address for vxlan underlay"
+            ))
+        }
+
+        async fn link_name(&self, index: u32) -> Result<Option<String>> {
+            let mut links = self.handle.link().get().match_index(index).execute();
             while let Some(link) = links.try_next().await? {
-                return Ok(Some(link.header.index));
+                for nla in link.attributes.into_iter() {
+                    if let LinkAttribute::IfName(name) = nla {
+                        return Ok(Some(name));
+                    }
+                }
             }
             Ok(None)
+        }
+
+        async fn collect_link_inventory(&self) -> Result<Vec<String>> {
+            let mut entries = Vec::new();
+            let mut stream = self.handle.link().get().execute();
+            while let Some(link) = stream.try_next().await? {
+                let index = link.header.index;
+                let mut name = format!("ifindex{index}");
+                let mut master: Option<u32> = None;
+                let mut lower: Option<u32> = None;
+                for attr in link.attributes.iter() {
+                    match attr {
+                        LinkAttribute::IfName(ifname) => name = ifname.clone(),
+                        LinkAttribute::Controller(idx) => master = Some(*idx),
+                        LinkAttribute::Link(idx) => lower = Some(*idx),
+                        _ => {}
+                    }
+                }
+                let flags = format!("{:?}", link.header.flags);
+                entries.push(format!(
+                    "idx={} name={} flags={} master={:?} link={:?}",
+                    index, name, flags, master, lower
+                ));
+            }
+            Ok(entries)
+        }
+
+        fn ensure_vxlan_module() -> Result<()> {
+            match Command::new("modprobe").arg("vxlan").status() {
+                Ok(status) if status.success() => Ok(()),
+                Ok(status) => Err(anyhow!("modprobe vxlan exited with status {status}")),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
+                    "modprobe binary not found; ensure the vxlan module is available"
+                )),
+                Err(err) => Err(err.into()),
+            }
         }
     }
 }
