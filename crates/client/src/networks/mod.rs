@@ -1,3 +1,4 @@
+mod attachments;
 mod create;
 mod delete;
 mod inspect;
@@ -5,6 +6,7 @@ mod list;
 mod status;
 mod types;
 
+pub use attachments::attachments;
 pub use create::{NetworkCreateRequest, create};
 pub use delete::delete;
 pub use inspect::inspect;

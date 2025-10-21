@@ -351,6 +351,49 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     print!("{}", output);
                 }
             }
+            NetworksCommand::Attachments(args) => {
+                let mut attachments = local
+                    .run_until(client::networks::attachments(&cfg, &args.id))
+                    .await?;
+
+                if attachments.is_empty() {
+                    println!("no network attachments registered");
+                } else {
+                    attachments.sort_by(|a, b| {
+                        a.node_id
+                            .cmp(&b.node_id)
+                            .then(a.task_id.cmp(&b.task_id))
+                            .then(a.attachment_id.cmp(&b.attachment_id))
+                    });
+
+                    let mut tw = TabWriter::new(Vec::new());
+                    writeln!(
+                        &mut tw,
+                        "ATTACHMENT\tTASK\tNODE\tCONTAINER\tIP\tMAC\tSTATE\tUPDATED\tERROR"
+                    )?;
+                    for attachment in attachments {
+                        let ip = attachment.assigned_ip.unwrap_or_else(|| "-".to_string());
+                        let mac = attachment.mac.unwrap_or_else(|| "-".to_string());
+                        let error = attachment.error.unwrap_or_default();
+                        writeln!(
+                            &mut tw,
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            attachment.attachment_id,
+                            attachment.task_id,
+                            attachment.node_id,
+                            attachment.container_id,
+                            ip,
+                            mac,
+                            attachment.state,
+                            attachment.updated_at,
+                            error
+                        )?;
+                    }
+                    tw.flush()?;
+                    let output = String::from_utf8(tw.into_inner()?)?;
+                    print!("{}", output);
+                }
+            }
         },
 
         Command::Submit(_s) => {

@@ -407,6 +407,9 @@ pub enum NetworksCommand {
 
     /// Show per-peer readiness for a network
     Status(NetworksStatusArgs),
+
+    /// List network attachments and their assigned addresses
+    Attachments(NetworksAttachmentsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -464,6 +467,13 @@ pub struct NetworksInspectArgs {
 #[derive(Args, Debug)]
 pub struct NetworksStatusArgs {
     /// Network UUID to query
+    #[arg(index = 1, value_name = "ID")]
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct NetworksAttachmentsArgs {
+    /// Network UUID whose attachments should be listed
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
 }

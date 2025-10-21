@@ -502,7 +502,6 @@ mod platform {
     use rtnetlink::{
         Error as RtnetlinkError, Handle, LinkBridge, LinkUnspec, LinkVxlan, new_connection,
     };
-    use std::io;
     use std::net::IpAddr;
     use std::process::Command;
     use std::sync::Arc;

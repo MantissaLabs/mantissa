@@ -10,6 +10,7 @@ use rtnetlink::packet_route::neighbour::{
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
 use rtnetlink::{Handle, LinkUnspec, LinkVeth};
 use std::net::{IpAddr, Ipv4Addr};
+use tracing::debug;
 use uuid::Uuid;
 
 use super::{container_iface_name, host_iface_name};
@@ -183,9 +184,24 @@ impl AttachmentProvisioner {
             .context("vxlan interface missing while programming fdb")?;
 
         let mac_bytes = parse_mac(mac)?;
-        self.program_fdb_entry(vxlan_index, &mac_bytes, dst)
-            .await
-            .with_context(|| format!("failed to program fdb entry {mac} -> {dst}"))?;
+        match self.program_fdb_entry(vxlan_index, &mac_bytes, dst).await {
+            Ok(()) => {}
+            Err(rtnetlink::Error::NetlinkError(message))
+                if message.raw_code().abs() == libc::EOPNOTSUPP =>
+            {
+                debug!(
+                    target: "network",
+                    vxlan = vxlan_name,
+                    mac,
+                    dst = %dst,
+                    "kernel rejected static fdb entry (unsupported); continuing"
+                );
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to program fdb entry {mac} -> {dst}"));
+            }
+        }
 
         Ok(())
     }
