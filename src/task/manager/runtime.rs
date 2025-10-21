@@ -5,7 +5,9 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::gossip::Message;
-use crate::network::allocator::allocate_overlay_address;
+use crate::network::allocator::{allocate_overlay_address, parse_ipv4_cidr};
+use crate::network::attachment::bridge_name;
+use crate::network::controller::DEFAULT_MTU;
 use crate::network::types::{
     NetworkAttachmentState, NetworkAttachmentValue, compute_network_attachment_id,
 };
@@ -94,6 +96,27 @@ impl TaskManager {
             return Ok(());
         }
 
+        let inspect = self
+            .container_manager
+            .inspect_container(container_id)
+            .await
+            .with_context(|| {
+                format!("inspect container {container_id} for network attachment provisioning")
+            })?;
+
+        let pid = inspect
+            .state
+            .as_ref()
+            .and_then(|state| state.pid)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "container {container_id} missing pid while configuring attachments"
+                )
+            })?;
+
+        let container_pid = i32::try_from(pid)
+            .context("container pid exceeds 32-bit range for attachment provisioning")?;
+
         let desired: HashSet<Uuid> = network_ids.iter().copied().collect();
         let existing_list = self
             .network_registry
@@ -114,6 +137,7 @@ impl TaskManager {
                 None => NetworkAttachmentValue::new(
                     compute_network_attachment_id(task_id, *network_id),
                     task_id,
+                    self.local_node_id,
                     container_id,
                     *network_id,
                     None,
@@ -133,10 +157,50 @@ impl TaskManager {
             let allocation = allocate_overlay_address(&spec, task_id)
                 .context("failed to allocate overlay address")?;
 
+            let (_, prefix) = parse_ipv4_cidr(&spec.subnet_cidr)
+                .context("failed to parse network subnet for attachment")?;
+            let mtu = if spec.mtu == 0 { DEFAULT_MTU } else { spec.mtu };
+            let bridge = bridge_name(spec.id);
+
             attachment.set_assignment(
                 Some(allocation.assigned_ip.clone()),
                 Some(allocation.mac_address.clone()),
             );
+
+            let provisioned = self
+                .attachment_provisioner
+                .attachment_exists(attachment.id)
+                .await
+                .context("check existing attachment state")?;
+
+            if !provisioned {
+                attachment.set_state(NetworkAttachmentState::Configuring, None);
+                self.network_registry
+                    .upsert_attachment(attachment.clone())
+                    .await
+                    .context("persist configuring attachment state")?;
+
+                if let Err(err) = self
+                    .attachment_provisioner
+                    .ensure_attachment(
+                        spec.id,
+                        &bridge,
+                        mtu,
+                        attachment.id,
+                        container_pid,
+                        &allocation.assigned_ip,
+                        prefix,
+                        &allocation.mac_address,
+                    )
+                    .await
+                {
+                    let mut errored = attachment.clone();
+                    errored.set_state(NetworkAttachmentState::Error, Some(err.to_string()));
+                    let _ = self.network_registry.upsert_attachment(errored).await;
+                    return Err(err);
+                }
+            }
+
             attachment.set_state(NetworkAttachmentState::Ready, None);
 
             self.network_registry
@@ -181,10 +245,28 @@ impl TaskManager {
                 );
             }
 
-            self.network_registry
-                .remove_attachment(attachment.id)
+            match self
+                .attachment_provisioner
+                .teardown_attachment(attachment.id)
                 .await
-                .context("failed to remove runtime attachment entry")?;
+            {
+                Ok(_) => {
+                    self.network_registry
+                        .remove_attachment(attachment.id)
+                        .await
+                        .context("failed to remove runtime attachment entry")?;
+                }
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        "failed to teardown attachment {}: {err}",
+                        attachment.id
+                    );
+                    let mut errored = attachment.clone();
+                    errored.set_state(NetworkAttachmentState::Error, Some(err.to_string()));
+                    let _ = self.network_registry.upsert_attachment(errored).await;
+                }
+            }
         }
 
         Ok(())

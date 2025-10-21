@@ -18,20 +18,7 @@ pub fn allocate_overlay_address(
     network: &NetworkSpecValue,
     task_id: Uuid,
 ) -> Result<AttachmentAllocation> {
-    let (base_ip_text, prefix_text) = network
-        .subnet_cidr
-        .split_once('/')
-        .context("invalid subnet CIDR: missing '/' delimiter")?;
-
-    let prefix: u8 = prefix_text
-        .parse()
-        .context("invalid subnet CIDR: prefix is not a number")?;
-    if prefix > 32 {
-        bail!("invalid subnet CIDR: prefix {prefix} exceeds /32");
-    }
-
-    let base_ip = Ipv4Addr::from_str(base_ip_text)
-        .context("invalid subnet CIDR: base address is not IPv4")?;
+    let (base_ip, prefix) = parse_ipv4_cidr(&network.subnet_cidr)?;
     let base: u32 = u32::from(base_ip);
     let host_bits = 32u8.saturating_sub(prefix);
 
@@ -83,4 +70,22 @@ pub fn allocate_overlay_address(
         assigned_ip: assigned.to_string(),
         mac_address,
     })
+}
+
+pub fn parse_ipv4_cidr(cidr: &str) -> Result<(Ipv4Addr, u8)> {
+    let (base_ip_text, prefix_text) = cidr
+        .split_once('/')
+        .context("invalid subnet CIDR: missing '/' delimiter")?;
+
+    let prefix: u8 = prefix_text
+        .parse()
+        .context("invalid subnet CIDR: prefix is not a number")?;
+    if prefix > 32 {
+        bail!("invalid subnet CIDR: prefix {prefix} exceeds /32");
+    }
+
+    let base_ip = Ipv4Addr::from_str(base_ip_text)
+        .context("invalid subnet CIDR: base address is not IPv4")?;
+
+    Ok((base_ip, prefix))
 }

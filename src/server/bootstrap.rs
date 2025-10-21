@@ -414,6 +414,7 @@ impl Bootstrap {
 
         let network_controller = NetworkController::new(
             network_registry.clone(),
+            registry.clone(),
             ctx.self_id,
             local_node_name.clone(),
         )

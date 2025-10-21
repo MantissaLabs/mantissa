@@ -39,6 +39,7 @@ struct MockContainerManager {
     created: Arc<AsyncMutex<Vec<String>>>,
     stopped: Arc<AsyncMutex<Vec<String>>>,
     limits: Arc<AsyncMutex<Vec<crate::task::docker::ResourceLimits>>>,
+    inspect: Arc<AsyncMutex<HashMap<String, bollard::service::ContainerInspectResponse>>>,
 }
 
 #[async_trait]
@@ -58,6 +59,14 @@ impl ContainerManager for MockContainerManager {
         let id = format!("container-{}", guard.len());
         guard.push(id.clone());
         self.limits.lock().await.push(resource_limits);
+
+        let mut inspect = self.inspect.lock().await;
+        let mut state = bollard::models::ContainerState::default();
+        state.pid = Some(10_000 + inspect.len() as i64);
+        let mut response = bollard::service::ContainerInspectResponse::default();
+        response.id = Some(id.clone());
+        response.state = Some(state);
+        inspect.insert(id.clone(), response);
         Ok(id)
     }
 
@@ -103,11 +112,13 @@ impl ContainerManager for MockContainerManager {
 
     async fn inspect_container(
         &self,
-        _container_id: &str,
+        container_id: &str,
     ) -> crate::task::docker::ContainerResult<bollard::service::ContainerInspectResponse> {
-        Err(crate::task::docker::ContainerError::OperationFailed(
-            "inspect unsupported in mock".into(),
-        ))
+        let guard = self.inspect.lock().await;
+        guard
+            .get(container_id)
+            .cloned()
+            .ok_or_else(|| crate::task::docker::ContainerError::NotFound(container_id.into()))
     }
 
     async fn pull_image(&self, _image: &str) -> crate::task::docker::ContainerResult<()> {
@@ -712,6 +723,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
     let attachment = &attachments[0];
     assert_eq!(attachment.network_id, spec.id);
     assert_eq!(attachment.state, NetworkAttachmentState::Ready);
+    assert_eq!(attachment.node_id, manager.local_node_id);
     assert!(attachment.assigned_ip.is_some());
     assert!(attachment.mac.is_some());
 

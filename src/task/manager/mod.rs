@@ -1,4 +1,5 @@
 use crate::gossip::Message;
+use crate::network::attachment::AttachmentProvisioner;
 use crate::network::registry::NetworkRegistry;
 use crate::registry::Registry;
 use crate::scheduler::{Scheduler, SlotId};
@@ -22,7 +23,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio::time::{Duration, sleep};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 mod local;
@@ -56,6 +57,7 @@ pub struct TaskManager {
     secret_artifacts: Arc<AsyncMutex<HashMap<Uuid, TaskSecretArtifacts>>>,
     secret_runtime_root: PathBuf,
     network_registry: NetworkRegistry,
+    attachment_provisioner: AttachmentProvisioner,
 }
 
 #[derive(Clone)]
@@ -92,6 +94,14 @@ impl TaskManager {
             .join("secrets")
             .join(local_node_id.to_string());
 
+        let attachment_provisioner = AttachmentProvisioner::new().unwrap_or_else(|err| {
+            warn!(
+                target: "network",
+                "failed to initialize attachment provisioner: {err}"
+            );
+            AttachmentProvisioner::default()
+        });
+
         Self {
             store,
             tx,
@@ -108,6 +118,7 @@ impl TaskManager {
             secret_keyring,
             secret_artifacts: Arc::new(AsyncMutex::new(HashMap::new())),
             secret_runtime_root,
+            attachment_provisioner,
         }
     }
 

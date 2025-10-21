@@ -321,6 +321,7 @@ impl NetworkAttachmentState {
 pub struct NetworkAttachmentValue {
     pub id: Uuid,
     pub task_id: Uuid,
+    pub node_id: Uuid,
     pub container_id: String,
     pub network_id: Uuid,
     #[serde(default)]
@@ -340,6 +341,7 @@ impl NetworkAttachmentValue {
     pub fn new(
         id: Uuid,
         task_id: Uuid,
+        node_id: Uuid,
         container_id: impl Into<String>,
         network_id: Uuid,
         requested_ip: Option<String>,
@@ -352,6 +354,7 @@ impl NetworkAttachmentValue {
         Self {
             id,
             task_id,
+            node_id,
             container_id: container_id.into(),
             network_id,
             requested_ip,

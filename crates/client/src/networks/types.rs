@@ -273,6 +273,7 @@ impl NetworkInspect {
 pub struct NetworkAttachment {
     pub attachment_id: Uuid,
     pub task_id: Uuid,
+    pub node_id: Uuid,
     pub container_id: String,
     pub network_id: Uuid,
     pub requested_ip: Option<String>,
@@ -290,6 +291,7 @@ impl NetworkAttachment {
         Ok(Self {
             attachment_id: read_uuid(reader.get_attachment_id()?)?,
             task_id: read_uuid(reader.get_task_id()?)?,
+            node_id: read_uuid(reader.get_node_id()?)?,
             container_id: reader.get_container_id()?.to_str()?.to_string(),
             network_id: read_uuid(reader.get_network_id()?)?,
             requested_ip: optional_text(reader.get_requested_ip()?)?,

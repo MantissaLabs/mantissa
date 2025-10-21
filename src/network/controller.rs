@@ -1,9 +1,13 @@
+use crate::network::attachment::PlatformAttachmentProvisioner;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue, NetworkStatus,
+    NetworkAttachmentState, NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue,
+    NetworkStatus,
 };
+use crate::registry::Registry;
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Duration, sleep};
@@ -11,7 +15,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
-const DEFAULT_MTU: u32 = 1450;
+pub(crate) const DEFAULT_MTU: u32 = 1450;
 #[cfg(target_os = "linux")]
 const VXLAN_PORT: u16 = 4789;
 
@@ -24,8 +28,12 @@ struct NetworkControllerInner {
     registry: NetworkRegistry,
     node_id: Uuid,
     node_name: String,
+    cluster_registry: Registry,
     provisioner: platform::NetworkProvisioner,
     active_networks: AsyncMutex<HashSet<Uuid>>,
+    remote_fdb: AsyncMutex<HashMap<Uuid, HashMap<String, IpAddr>>>,
+    flood_entries: AsyncMutex<HashMap<Uuid, HashSet<IpAddr>>>,
+    attachment: PlatformAttachmentProvisioner,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -39,15 +47,29 @@ struct NetworkPlan {
 }
 
 impl NetworkController {
-    pub fn new(registry: NetworkRegistry, node_id: Uuid, node_name: String) -> Result<Self> {
+    pub fn new(
+        registry: NetworkRegistry,
+        cluster_registry: Registry,
+        node_id: Uuid,
+        node_name: String,
+    ) -> Result<Self> {
         let provisioner = platform::NetworkProvisioner::new()?;
+        let attachment = PlatformAttachmentProvisioner::new().unwrap_or_else(|err| {
+            warn!(target: "network", "failed to initialize attachment provisioner: {err}");
+            PlatformAttachmentProvisioner::default()
+        });
+
         Ok(Self {
             inner: Arc::new(NetworkControllerInner {
                 registry,
                 node_id,
                 node_name,
+                cluster_registry,
                 provisioner,
                 active_networks: AsyncMutex::new(HashSet::new()),
+                remote_fdb: AsyncMutex::new(HashMap::new()),
+                flood_entries: AsyncMutex::new(HashMap::new()),
+                attachment,
             }),
         })
     }
@@ -123,6 +145,8 @@ impl NetworkController {
                 .context("update network status to ready")?;
         }
 
+        self.reconcile_remote_forwarding(&plan).await?;
+
         let mut active = self.inner.active_networks.lock().await;
         active.insert(plan.network_id);
         Ok(())
@@ -157,6 +181,16 @@ impl NetworkController {
                 .remove_attachments_for_network(id)
                 .await
                 .context("remove attachments for deleted network")?;
+
+            {
+                let mut guard = self.inner.remote_fdb.lock().await;
+                guard.remove(&id);
+            }
+
+            {
+                let mut guard = self.inner.flood_entries.lock().await;
+                guard.remove(&id);
+            }
 
             active.remove(&id);
         }
@@ -226,6 +260,150 @@ impl NetworkController {
             .await
             .context("persist peer state error")
     }
+
+    async fn reconcile_remote_forwarding(&self, plan: &NetworkPlan) -> Result<()> {
+        let attachments = self
+            .inner
+            .registry
+            .list_attachments(Some(plan.network_id))
+            .context("list attachments for forwarding")?;
+
+        let mut desired: HashMap<String, IpAddr> = HashMap::new();
+        let mut flood_targets: HashMap<IpAddr, usize> = HashMap::new();
+
+        for attachment in attachments {
+            if attachment.node_id == self.inner.node_id {
+                continue;
+            }
+
+            if !matches!(attachment.state, NetworkAttachmentState::Ready) {
+                continue;
+            }
+
+            let mac = match attachment.mac.as_ref() {
+                Some(mac) if !mac.is_empty() => mac.clone(),
+                _ => continue,
+            };
+
+            let peer_ip = match self.peer_ip_for_node(attachment.node_id) {
+                Some(ip) => ip,
+                None => continue,
+            };
+
+            desired.insert(mac, peer_ip);
+            *flood_targets.entry(peer_ip).or_insert(0) += 1;
+        }
+
+        {
+            let mut guard = self.inner.remote_fdb.lock().await;
+            let entry = guard.entry(plan.network_id).or_default();
+
+            // Apply desired entries
+            for (mac, ip) in &desired {
+                let needs_update = entry
+                    .get(mac)
+                    .map(|existing| existing != ip)
+                    .unwrap_or(true);
+
+                if needs_update {
+                    self.inner
+                        .attachment
+                        .ensure_remote_fdb(&plan.vxlan_name, mac, *ip)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "ensure remote fdb entry for mac {mac} to {ip} on {}",
+                                plan.vxlan_name
+                            )
+                        })?;
+                }
+
+                entry.insert(mac.clone(), *ip);
+            }
+
+            let stale: Vec<(String, IpAddr)> = entry
+                .iter()
+                .filter(|(mac, ip)| desired.get(*mac).map_or(true, |want| want != *ip))
+                .map(|(mac, ip)| (mac.clone(), *ip))
+                .collect();
+
+            for (mac, ip) in stale {
+                if let Err(err) = self
+                    .inner
+                    .attachment
+                    .remove_remote_fdb(&plan.vxlan_name, &mac, ip)
+                    .await
+                {
+                    warn!(
+                        target: "network",
+                        "failed to remove stale fdb entry for mac {mac} dst {ip}: {err}"
+                    );
+                }
+                entry.remove(&mac);
+            }
+        }
+
+        let mut flood_guard = self.inner.flood_entries.lock().await;
+        let flood_entry = flood_guard.entry(plan.network_id).or_default();
+
+        for ip in flood_targets.keys() {
+            if flood_entry.insert(*ip) {
+                self.inner
+                    .attachment
+                    .ensure_flood_entry(&plan.vxlan_name, *ip)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "ensure broadcast forwarding for {} towards {}",
+                            plan.vxlan_name, ip
+                        )
+                    })?;
+            }
+        }
+
+        let obsolete: Vec<IpAddr> = flood_entry
+            .iter()
+            .copied()
+            .filter(|ip| !flood_targets.contains_key(ip))
+            .collect();
+
+        for ip in obsolete {
+            if let Err(err) = self
+                .inner
+                .attachment
+                .remove_flood_entry(&plan.vxlan_name, ip)
+                .await
+            {
+                warn!(
+                    target: "network",
+                    "failed to remove broadcast forwarding for {} towards {}: {err}",
+                    plan.vxlan_name,
+                    ip
+                );
+            }
+            flood_entry.remove(&ip);
+        }
+
+        Ok(())
+    }
+
+    fn peer_ip_for_node(&self, peer_id: Uuid) -> Option<IpAddr> {
+        if peer_id == self.inner.node_id {
+            return None;
+        }
+
+        let address = self.inner.cluster_registry.peer_address(peer_id)?;
+        match address.parse::<SocketAddr>() {
+            Ok(sock) => Some(sock.ip()),
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    "failed to parse peer address '{address}' for {peer_id}: {err}"
+                );
+                None
+            }
+        }
+    }
 }
 
 impl NetworkPlan {
@@ -260,7 +438,7 @@ mod platform {
     use super::{NetworkPlan, VXLAN_PORT};
     use anyhow::{Context, Result};
     use futures::TryStreamExt;
-    use rtnetlink::{Handle, new_connection};
+    use rtnetlink::{Handle, LinkBridge, LinkUnspec, LinkVxlan, new_connection};
 
     #[derive(Clone)]
     pub struct NetworkProvisioner {
@@ -317,10 +495,12 @@ mod platform {
 
             self.handle
                 .link()
-                .add()
-                .vxlan(plan.vxlan_name.clone(), plan.vni)
-                .learning(1)
-                .port(VXLAN_PORT)
+                .add(
+                    LinkVxlan::new(&plan.vxlan_name, plan.vni)
+                        .learning(true)
+                        .port(VXLAN_PORT)
+                        .build(),
+                )
                 .execute()
                 .await
                 .with_context(|| format!("create vxlan {}", plan.vxlan_name))?;
@@ -339,8 +519,7 @@ mod platform {
 
             self.handle
                 .link()
-                .add()
-                .bridge(plan.bridge_name.clone())
+                .add(LinkBridge::new(&plan.bridge_name).build())
                 .execute()
                 .await
                 .with_context(|| format!("create bridge {}", plan.bridge_name))?;
@@ -355,8 +534,7 @@ mod platform {
         async fn set_up(&self, index: u32) -> Result<()> {
             self.handle
                 .link()
-                .set(index)
-                .up()
+                .set(LinkUnspec::new_with_index(index).up().build())
                 .execute()
                 .await
                 .with_context(|| format!("bring link {index} up"))?;
@@ -369,8 +547,7 @@ mod platform {
             }
             self.handle
                 .link()
-                .set(index)
-                .mtu(mtu)
+                .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
                 .execute()
                 .await
                 .with_context(|| format!("set mtu {mtu} on link {index}"))?;
@@ -381,8 +558,11 @@ mod platform {
             if let Err(err) = self
                 .handle
                 .link()
-                .set(link_index)
-                .master(master_index)
+                .set(
+                    LinkUnspec::new_with_index(link_index)
+                        .controller(master_index)
+                        .build(),
+                )
                 .execute()
                 .await
             {

@@ -38,6 +38,7 @@
                     mode: Some(0o440),
                 ),
             ],
+            networks: ["demo-overlay"],
         ),
         (
             name: "api",
@@ -71,6 +72,7 @@
                     mode: Some(0o400),
                 ),
             ],
+            networks: ["demo-overlay"],
         ),
     ],
 )

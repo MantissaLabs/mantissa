@@ -112,7 +112,8 @@ anyhow = "1"
 # eBPF / Networking
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = "0.13.1"
-rtnetlink = { version = "0.11.0", default-features = false, features = ["tokio_socket"] }
+rtnetlink = { version = "0.18.1", default-features = false, features = ["tokio_socket"] }
+netlink-packet-route = "0.19"
 
 [features]
 default = []

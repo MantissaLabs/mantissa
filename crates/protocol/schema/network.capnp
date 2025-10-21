@@ -85,6 +85,7 @@ struct NetworkInspect {
 struct NetworkAttachmentSpec {
   attachmentId @0 :Data; # UUID for the attachment
   taskId @1 :Data;
+  nodeId @11 :Data;
   containerId @2 :Text;
   networkId @3 :Data;
   requestedIp @4 :Text;
