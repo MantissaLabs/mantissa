@@ -174,6 +174,19 @@ impl TaskManager {
                 .context("check existing attachment state")?;
 
             if !provisioned {
+                tracing::debug!(
+                    target: "task",
+                    task_id = %task_id,
+                    network_id = %spec.id,
+                    attachment = %attachment.id,
+                    bridge = %bridge,
+                    mtu,
+                    pid = container_pid,
+                    assigned_ip = %allocation.assigned_ip,
+                    mac = %allocation.mac_address,
+                    "provisioning new runtime attachment"
+                );
+
                 attachment.set_state(NetworkAttachmentState::Configuring, None);
                 self.network_registry
                     .upsert_attachment(attachment.clone())
@@ -194,9 +207,23 @@ impl TaskManager {
                     )
                     .await
                 {
+                    tracing::warn!(
+                        target: "task",
+                        task_id = %task_id,
+                        network_id = %spec.id,
+                        attachment = %attachment.id,
+                        bridge = %bridge,
+                        error = ?err,
+                        "runtime attachment provisioning failed"
+                    );
                     let mut errored = attachment.clone();
-                    errored.set_state(NetworkAttachmentState::Error, Some(err.to_string()));
+                    let err_string = err.to_string();
+                    errored.set_state(NetworkAttachmentState::Error, Some(err_string));
                     let _ = self.network_registry.upsert_attachment(errored).await;
+                    let err = err.context(format!(
+                        "ensure attachment {} for network {} on bridge {}",
+                        attachment.id, spec.id, bridge
+                    ));
                     return Err(err);
                 }
             }

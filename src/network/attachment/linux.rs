@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use futures::{StreamExt, TryStreamExt};
+use libc;
 use rtnetlink::packet_core::{
     NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
 };
@@ -230,15 +231,35 @@ impl AttachmentProvisioner {
     }
 
     async fn link_index(&self, name: &str) -> Result<Option<u32>> {
-        let mut links = self
+        let mut stream = self
             .handle
             .link()
             .get()
             .match_name(name.to_string())
             .execute();
 
-        while let Some(msg) = links.try_next().await.context("query link state")? {
-            return Ok(Some(msg.header.index));
+        loop {
+            match stream.try_next().await {
+                Ok(Some(msg)) => return Ok(Some(msg.header.index)),
+                Ok(None) => break,
+                Err(rtnetlink::Error::NetlinkError(message)) => {
+                    let raw = message.raw_code();
+                    let errno = raw.abs();
+                    if errno == libc::ENODEV || errno == libc::ENOENT {
+                        tracing::debug!(
+                            target: "task",
+                            link = name,
+                            errno,
+                            raw_code = raw,
+                            "link lookup returned ENODEV/ENOENT; treating as absent"
+                        );
+                        return Ok(None);
+                    }
+                    return Err(rtnetlink::Error::NetlinkError(message))
+                        .context("query link state");
+                }
+                Err(err) => return Err(err).context("query link state"),
+            }
         }
 
         Ok(None)

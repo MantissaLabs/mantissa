@@ -292,9 +292,11 @@ impl TaskManager {
         let task_id = spec.id;
         warn!(
             target: "task",
-            "marking task {} ({}) as failed: {error}",
-            spec.name,
-            task_id
+            error = %error,
+            error_chain = %format!("{error:#}"),
+            task = %spec.name,
+            task_id = %task_id,
+            "marking task as failed"
         );
 
         {
