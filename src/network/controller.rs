@@ -12,7 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, mpsc::UnboundedReceiver};
 use tokio::time::{Duration, sleep};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -422,27 +422,41 @@ impl NetworkController {
             let mut guard = self.inner.remote_fdb.lock().await;
             let entry = guard.entry(plan.network_id).or_default();
 
-            // Apply desired entries
+            // Apply desired entries; retry when the kernel previously rejected them.
             for (mac, ip) in &desired {
                 let needs_update = entry
                     .get(mac)
                     .map(|existing| existing != ip)
                     .unwrap_or(true);
 
-                if needs_update {
-                    self.inner
-                        .attachment
-                        .ensure_remote_fdb(&plan.vxlan_name, mac, *ip)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "ensure remote fdb entry for mac {mac} to {ip} on {}",
-                                plan.vxlan_name
-                            )
-                        })?;
+                if !needs_update {
+                    continue;
                 }
 
-                entry.insert(mac.clone(), *ip);
+                let installed = self
+                    .inner
+                    .attachment
+                    .ensure_remote_fdb(&plan.vxlan_name, mac, *ip)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "ensure remote fdb entry for mac {mac} to {ip} on {}",
+                            plan.vxlan_name
+                        )
+                    })?;
+
+                if installed {
+                    entry.insert(mac.clone(), *ip);
+                } else {
+                    entry.remove(mac);
+                    debug!(
+                        target: "network",
+                        vxlan = %plan.vxlan_name,
+                        mac,
+                        dst = %ip,
+                        "deferring remote fdb entry; kernel reported unsupported"
+                    );
+                }
             }
 
             let stale: Vec<(String, IpAddr)> = entry
@@ -471,17 +485,31 @@ impl NetworkController {
         let flood_entry = flood_guard.entry(plan.network_id).or_default();
 
         for ip in flood_targets.keys() {
-            if flood_entry.insert(*ip) {
-                self.inner
-                    .attachment
-                    .ensure_flood_entry(&plan.vxlan_name, *ip)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "ensure broadcast forwarding for {} towards {}",
-                            plan.vxlan_name, ip
-                        )
-                    })?;
+            if flood_entry.contains(ip) {
+                continue;
+            }
+
+            let installed = self
+                .inner
+                .attachment
+                .ensure_flood_entry(&plan.vxlan_name, *ip)
+                .await
+                .with_context(|| {
+                    format!(
+                        "ensure broadcast forwarding for {} towards {}",
+                        plan.vxlan_name, ip
+                    )
+                })?;
+
+            if installed {
+                flood_entry.insert(*ip);
+            } else {
+                debug!(
+                    target: "network",
+                    vxlan = %plan.vxlan_name,
+                    dst = %ip,
+                    "deferring flood entry; kernel reported unsupported"
+                );
             }
         }
 
@@ -563,7 +591,8 @@ mod platform {
     use anyhow::{Context, Result, anyhow};
     use futures::TryStreamExt;
     use libc;
-    use netlink_packet_core::DefaultNla;
+    use netlink_packet_core::{DefaultNla, Nla};
+    use netlink_packet_utils::nla::{NLA_ALIGNTO, NLA_F_NESTED, NLA_HEADER_SIZE, NlaBuffer};
     use rtnetlink::packet_route::AddressFamily;
     use rtnetlink::packet_route::address::AddressAttribute;
     use rtnetlink::packet_route::link::{
@@ -586,6 +615,7 @@ mod platform {
         underlay: Arc<AsyncMutex<Option<(u32, IpAddr)>>>,
     }
 
+    const IFLA_PROTINFO: u16 = 12;
     const BRPORT_ATTR_LEARNING: u16 = 8;
     const BRPORT_ATTR_UNICAST_FLOOD: u16 = 9;
     const BRPORT_ATTR_NEIGH_SUPPRESS: u16 = 32;
@@ -776,7 +806,7 @@ mod platform {
                     let base = LinkVxlan::new(&plan.vxlan_name, plan.vni)
                         .dev(underlay_index)
                         .learning(false)
-                        .proxy(true)
+                        .proxy(false)
                         .rsc(true)
                         .l2miss(false)
                         .l3miss(false)
@@ -890,7 +920,7 @@ mod platform {
             let request = LinkMessageBuilder::<LinkVxlan>::new_with_info_kind(InfoKind::Vxlan)
                 .index(index)
                 .learning(false)
-                .proxy(true)
+                .proxy(false)
                 .rsc(true)
                 .l2miss(false)
                 .l3miss(false)
@@ -910,13 +940,44 @@ mod platform {
             _bridge_index: u32,
             name: &str,
         ) -> Result<()> {
-            let proto_attrs = vec![
-                LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_LEARNING, vec![0])),
-                LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_NEIGH_SUPPRESS, vec![0])),
-                LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_UNICAST_FLOOD, vec![1])),
-                LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_MULTICAST_FLOOD, vec![1])),
-                LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_BROADCAST_FLOOD, vec![1])),
-            ];
+            // Encode the bridge proto info attributes manually so we can set the
+            // NLA_F_NESTED flag on IFLA_PROTINFO. The kernel rejects the update
+            // if the payload is not marked nested.
+            let payload = {
+                let proto_attrs = [
+                    LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_LEARNING, vec![0])),
+                    LinkProtoInfoBridge::Other(DefaultNla::new(
+                        BRPORT_ATTR_NEIGH_SUPPRESS,
+                        vec![0],
+                    )),
+                    LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_UNICAST_FLOOD, vec![1])),
+                    LinkProtoInfoBridge::Other(DefaultNla::new(
+                        BRPORT_ATTR_MULTICAST_FLOOD,
+                        vec![1],
+                    )),
+                    LinkProtoInfoBridge::Other(DefaultNla::new(
+                        BRPORT_ATTR_BROADCAST_FLOOD,
+                        vec![1],
+                    )),
+                ];
+
+                let mut buf: Vec<u8> = Vec::with_capacity(64);
+                for attr in &proto_attrs {
+                    let value_len = attr.value_len();
+                    let attr_len = (NLA_HEADER_SIZE + value_len) as u16;
+                    let aligned_len = ((attr_len as usize) + (NLA_ALIGNTO as usize) - 1)
+                        & !(NLA_ALIGNTO as usize - 1);
+                    let start = buf.len();
+                    buf.resize(start + aligned_len, 0);
+                    {
+                        let mut nla_buf = NlaBuffer::new(&mut buf[start..start + aligned_len]);
+                        nla_buf.set_kind(attr.kind());
+                        nla_buf.set_length(attr_len);
+                        attr.emit_value(nla_buf.value_mut());
+                    }
+                }
+                buf
+            };
 
             let request = LinkMessageBuilder::<LinkUnspec>::default()
                 .set_header(LinkHeader {
@@ -925,7 +986,10 @@ mod platform {
                     ..Default::default()
                 })
                 .name(name.to_string())
-                .append_extra_attribute(LinkAttribute::ProtoInfoBridge(proto_attrs))
+                .append_extra_attribute(LinkAttribute::Other(DefaultNla::new(
+                    IFLA_PROTINFO | NLA_F_NESTED,
+                    payload,
+                )))
                 .build();
 
             self.handle

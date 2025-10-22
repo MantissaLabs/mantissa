@@ -54,8 +54,8 @@ impl AttachmentProvisioner {
         _vxlan_name: &str,
         _mac: &str,
         _dst: IpAddr,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<bool> {
+        Ok(true)
     }
 
     pub async fn remove_remote_fdb(
@@ -67,8 +67,8 @@ impl AttachmentProvisioner {
         Ok(())
     }
 
-    pub async fn ensure_flood_entry(&self, _vxlan_name: &str, _dst: IpAddr) -> Result<()> {
-        Ok(())
+    pub async fn ensure_flood_entry(&self, _vxlan_name: &str, _dst: IpAddr) -> Result<bool> {
+        Ok(true)
     }
 
     pub async fn remove_flood_entry(&self, _vxlan_name: &str, _dst: IpAddr) -> Result<()> {

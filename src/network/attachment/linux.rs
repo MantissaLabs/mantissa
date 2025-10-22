@@ -2,12 +2,12 @@ use anyhow::{Context, Result, anyhow};
 use futures::{StreamExt, TryStreamExt};
 use libc;
 use rtnetlink::packet_core::{
-    NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
+    NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
 };
 use rtnetlink::packet_route::neighbour::{
     NeighbourAddress, NeighbourAttribute, NeighbourFlags, NeighbourMessage, NeighbourState,
 };
-use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
+use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage, route::RouteType};
 use rtnetlink::{Handle, LinkUnspec, LinkVeth};
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr};
@@ -181,7 +181,7 @@ impl AttachmentProvisioner {
         vxlan_name: &str,
         mac: &str,
         dst: std::net::IpAddr,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let vxlan_index = self
             .link_index(vxlan_name)
             .await?
@@ -189,7 +189,16 @@ impl AttachmentProvisioner {
 
         let mac_bytes = parse_mac(mac)?;
         match self.program_fdb_entry(vxlan_index, &mac_bytes, dst).await {
-            Ok(()) => {}
+            Ok(()) => {
+                debug!(
+                    target: "network",
+                    vxlan = vxlan_name,
+                    mac,
+                    dst = %dst,
+                    "programmed static vxlan fdb entry"
+                );
+                return Ok(true);
+            }
             Err(rtnetlink::Error::NetlinkError(message))
                 if message.raw_code().abs() == libc::EOPNOTSUPP =>
             {
@@ -200,14 +209,13 @@ impl AttachmentProvisioner {
                     dst = %dst,
                     "kernel rejected static fdb entry (unsupported); continuing"
                 );
+                return Ok(false);
             }
             Err(err) => {
                 return Err(err)
                     .with_context(|| format!("failed to program fdb entry {mac} -> {dst}"));
             }
         }
-
-        Ok(())
     }
 
     pub async fn remove_remote_fdb(
@@ -230,7 +238,11 @@ impl AttachmentProvisioner {
         Ok(())
     }
 
-    pub async fn ensure_flood_entry(&self, vxlan_name: &str, dst: std::net::IpAddr) -> Result<()> {
+    pub async fn ensure_flood_entry(
+        &self,
+        vxlan_name: &str,
+        dst: std::net::IpAddr,
+    ) -> Result<bool> {
         self.ensure_remote_fdb(vxlan_name, "00:00:00:00:00:00", dst)
             .await
     }
@@ -291,25 +303,38 @@ impl AttachmentProvisioner {
         mac: &[u8],
         dst: IpAddr,
     ) -> Result<(), rtnetlink::Error> {
-        let mut message = NeighbourMessage::default();
-        message.header.family = AddressFamily::Bridge;
-        message.header.ifindex = vxlan_index;
-        message.header.state = NeighbourState::Permanent;
-        message.header.flags = NeighbourFlags::Own;
+        let is_flood = mac.iter().all(|byte| *byte == 0);
+        if is_flood {
+            let mut message = NeighbourMessage::default();
+            message.header.family = AddressFamily::Bridge;
+            message.header.ifindex = vxlan_index;
+            message.header.state = NeighbourState::Permanent;
+            message.header.flags = NeighbourFlags::Own;
+            message.header.kind = RouteType::Unspec;
 
-        message
-            .attributes
-            .push(NeighbourAttribute::LinkLocalAddress(mac.to_vec()));
-        message
-            .attributes
-            .push(NeighbourAttribute::Destination(match dst {
-                IpAddr::V4(v4) => NeighbourAddress::from(v4),
-                IpAddr::V6(v6) => NeighbourAddress::from(v6),
-            }));
+            message
+                .attributes
+                .push(NeighbourAttribute::LinkLocalAddress(mac.to_vec()));
+            message
+                .attributes
+                .push(NeighbourAttribute::Destination(match dst {
+                    IpAddr::V4(v4) => NeighbourAddress::from(v4),
+                    IpAddr::V6(v6) => NeighbourAddress::from(v6),
+                }));
 
-        let mut request = NetlinkMessage::from(RouteNetlinkMessage::NewNeighbour(message));
-        request.header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
-        self.submit_request(request).await
+            let mut request = NetlinkMessage::from(RouteNetlinkMessage::NewNeighbour(message));
+            request.header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_APPEND;
+            return self.submit_request(request).await;
+        }
+
+        self.handle
+            .neighbours()
+            .add_bridge(vxlan_index, mac)
+            .flags(NeighbourFlags::Own)
+            .destination(dst)
+            .replace()
+            .execute()
+            .await
     }
 
     async fn delete_fdb_entry(
@@ -321,6 +346,7 @@ impl AttachmentProvisioner {
         let mut message = NeighbourMessage::default();
         message.header.family = AddressFamily::Bridge;
         message.header.ifindex = vxlan_index;
+        message.header.state = NeighbourState::Permanent;
         message.header.flags = NeighbourFlags::Own;
 
         message
