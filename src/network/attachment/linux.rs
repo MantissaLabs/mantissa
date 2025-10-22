@@ -9,11 +9,15 @@ use rtnetlink::packet_route::neighbour::{
 };
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
 use rtnetlink::{Handle, LinkUnspec, LinkVeth};
+use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr};
+use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::task::spawn_blocking;
 use tracing::debug;
 use uuid::Uuid;
 
 use super::{container_iface_name, host_iface_name};
+use nix::sched::{CloneFlags, setns};
 
 #[derive(Clone)]
 pub struct AttachmentProvisioner {
@@ -75,13 +79,6 @@ impl AttachmentProvisioner {
                 .execute()
                 .await
                 .with_context(|| format!("failed to set mtu {mtu} on {host_if}"))?;
-
-            self.handle
-                .link()
-                .set(LinkUnspec::new_with_index(container_index).mtu(mtu).build())
-                .execute()
-                .await
-                .with_context(|| format!("failed to set mtu {mtu} on {container_if}"))?;
         }
 
         let bridge_index = self
@@ -107,40 +104,6 @@ impl AttachmentProvisioner {
             .await
             .with_context(|| format!("failed to bring {host_if} up"))?;
 
-        let mac_bytes = parse_mac(mac)?;
-        self.handle
-            .link()
-            .set(
-                LinkUnspec::new_with_index(container_index)
-                    .address(mac_bytes.clone())
-                    .build(),
-            )
-            .execute()
-            .await
-            .with_context(|| format!("failed to assign mac {mac} to {container_if}"))?;
-
-        let addr: IpAddr = assigned_ip
-            .parse::<Ipv4Addr>()
-            .map(IpAddr::V4)
-            .context("invalid IPv4 address for attachment")?;
-
-        self.handle
-            .address()
-            .add(container_index, addr, prefix.into())
-            .replace()
-            .execute()
-            .await
-            .with_context(|| {
-                format!("failed to assign {assigned_ip}/{prefix} to {container_if}")
-            })?;
-
-        self.handle
-            .link()
-            .set(LinkUnspec::new_with_index(container_index).up().build())
-            .execute()
-            .await
-            .with_context(|| format!("failed to bring {container_if} up"))?;
-
         let netns_pid: u32 = container_pid
             .try_into()
             .context("container pid is negative")?;
@@ -155,6 +118,47 @@ impl AttachmentProvisioner {
             .execute()
             .await
             .with_context(|| format!("failed to move {container_if} to pid {container_pid}"))?;
+
+        self.configure_container_interface(
+            container_if.clone(),
+            mtu,
+            assigned_ip.to_string(),
+            prefix,
+            mac.to_string(),
+            container_pid,
+        )
+        .await
+        .with_context(|| format!("configure container interface {container_if}"))?;
+
+        Ok(())
+    }
+
+    async fn configure_container_interface(
+        &self,
+        iface: String,
+        mtu: u32,
+        assigned_ip: String,
+        prefix: u8,
+        mac: String,
+        container_pid: i32,
+    ) -> Result<()> {
+        let assigned_addr = assigned_ip
+            .parse::<Ipv4Addr>()
+            .context("invalid IPv4 address for attachment")?;
+        let mac_bytes = parse_mac(&mac)?;
+
+        spawn_blocking(move || {
+            configure_container_interface_blocking(
+                iface,
+                mtu,
+                assigned_addr,
+                prefix,
+                mac_bytes,
+                container_pid,
+            )
+        })
+        .await
+        .context("configure container interface task failed")??;
 
         Ok(())
     }
@@ -377,4 +381,102 @@ fn warn_unless_not_found(err: rtnetlink::Error, context: impl FnOnce() -> String
         }
     }
     warn!(target: "network", "{}: {err}", context());
+}
+
+fn configure_container_interface_blocking(
+    iface: String,
+    mtu: u32,
+    assigned_ip: Ipv4Addr,
+    prefix: u8,
+    mac_bytes: Vec<u8>,
+    container_pid: i32,
+) -> Result<()> {
+    let host_ns = File::open("/proc/self/ns/net").context("open host network namespace")?;
+    let target_ns = File::open(format!("/proc/{container_pid}/ns/net"))
+        .context("open container network namespace")?;
+
+    unsafe { setns(&target_ns, CloneFlags::empty()) }
+        .context("enter container network namespace")?;
+
+    let configure_result =
+        configure_interface_in_current_ns(&iface, mtu, assigned_ip, prefix, mac_bytes);
+
+    let restore_result =
+        unsafe { setns(&host_ns, CloneFlags::empty()) }.context("restore host network namespace");
+
+    if let Err(err) = configure_result {
+        // Ensure we restore even when configuration fails.
+        restore_result?;
+        return Err(err);
+    }
+
+    restore_result?;
+    configure_result
+}
+
+fn configure_interface_in_current_ns(
+    iface: &str,
+    mtu: u32,
+    assigned_ip: Ipv4Addr,
+    prefix: u8,
+    mac_bytes: Vec<u8>,
+) -> Result<()> {
+    let rt = RuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create runtime for container network namespace operations")?;
+
+    rt.block_on(async move {
+        let (connection, handle, _) = rtnetlink::new_connection()
+            .context("open rtnetlink connection in container namespace")?;
+        tokio::spawn(connection);
+
+        let mut links = handle.link().get().match_name(iface.to_string()).execute();
+
+        let link = links
+            .try_next()
+            .await
+            .context("query container interface state")?
+            .context("container interface missing after namespace move")?;
+        let index = link.header.index;
+
+        if mtu > 0 {
+            handle
+                .link()
+                .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
+                .execute()
+                .await
+                .context("set container interface mtu")?;
+        }
+
+        handle
+            .link()
+            .set(
+                LinkUnspec::new_with_index(index)
+                    .address(mac_bytes.clone())
+                    .build(),
+            )
+            .execute()
+            .await
+            .context("assign container interface mac")?;
+
+        handle
+            .address()
+            .add(index, IpAddr::V4(assigned_ip), prefix.into())
+            .replace()
+            .execute()
+            .await
+            .context("assign overlay ip to container interface")?;
+
+        handle
+            .link()
+            .set(LinkUnspec::new_with_index(index).up().build())
+            .execute()
+            .await
+            .context("bring container overlay interface up")?;
+
+        // A connected route for the prefix is added automatically when the
+        // address is configured. Nothing further required here.
+        Ok(())
+    })
 }

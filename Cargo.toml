@@ -114,6 +114,7 @@ anyhow = "1"
 aya = "0.13.1"
 rtnetlink = { version = "0.18.1", default-features = false, features = ["tokio_socket"] }
 netlink-packet-route = "0.19"
+nix = { version = "0.29", default-features = false, features = ["sched"] }
 
 [features]
 default = []

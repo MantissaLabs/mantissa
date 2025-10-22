@@ -1575,6 +1575,7 @@ dependencies = [
  "merkle-search-tree",
  "net",
  "netlink-packet-route 0.19.0",
+ "nix",
  "once_cell",
  "protocol",
  "rand 0.9.2",
