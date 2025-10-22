@@ -2,6 +2,7 @@
 
 use super::*;
 
+use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     NetworkAttachmentState, NetworkDriver, NetworkPeerState, NetworkPeerStateValue,
@@ -32,7 +33,7 @@ use std::convert::TryFrom;
 use std::rc::Rc;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 #[derive(Clone, Default)]
 struct MockContainerManager {
@@ -139,6 +140,17 @@ async fn setup_manager() -> (
     Arc<MockContainerManager>,
     NetworkRegistry,
 ) {
+    setup_manager_with_forwarding(None).await
+}
+
+async fn setup_manager_with_forwarding(
+    forwarding_events: Option<mpsc::UnboundedSender<ForwardingEvent>>,
+) -> (
+    TaskManager,
+    Rc<Scheduler>,
+    Arc<MockContainerManager>,
+    NetworkRegistry,
+) {
     let actor = Uuid::new_v4();
     let (scheduler_db, _dir) = temp_db("scheduler");
     let scheduler_store =
@@ -238,6 +250,7 @@ async fn setup_manager() -> (
         network_registry.clone(),
         secret_registry,
         secret_keyring.clone(),
+        forwarding_events,
     );
 
     (manager, scheduler, mock_cm, network_registry)
@@ -739,6 +752,86 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         .list_attachments_for_task(task_spec.id)
         .expect("list attachments after stop");
     assert!(attachments_after.is_empty());
+}
+
+#[tokio::test]
+async fn attachment_ready_triggers_forwarding_event() {
+    #[cfg(target_os = "linux")]
+    {
+        match crate::network::attachment::AttachmentProvisioner::new() {
+            Ok(provisioner) => drop(provisioner),
+            Err(_) => {
+                // Skip the test when rtnetlink cannot be opened (e.g., missing CAP_NET_ADMIN).
+                return;
+            }
+        }
+    }
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (manager, scheduler, _mock_cm, network_registry) =
+        setup_manager_with_forwarding(Some(event_tx)).await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024),
+        )])
+        .await
+        .expect("init slots");
+
+    let spec = NetworkSpecValue::new(
+        "forwarding-net",
+        "forwarding network",
+        NetworkDriver::Vxlan,
+        "10.55.0.0/24",
+        0,
+        0,
+        false,
+        vec![],
+    );
+    network_registry
+        .upsert_spec(spec.clone())
+        .await
+        .expect("upsert network spec");
+
+    let peer_state = NetworkPeerStateValue::new(
+        spec.id,
+        manager.local_node_id,
+        "local-node",
+        NetworkPeerState::Ready,
+        None,
+    );
+    network_registry
+        .upsert_peer_state(peer_state)
+        .await
+        .expect("upsert peer state");
+
+    let request = TaskStartRequest {
+        name: "with-forwarding".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 200,
+        memory_bytes: 64 * 1_024 * 1_024,
+        id: None,
+        slot_ids: Vec::new(),
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: vec![spec.id],
+    };
+
+    let _specs = manager
+        .start_tasks_batch(vec![request])
+        .await
+        .expect("start networked task");
+
+    let event = event_rx
+        .recv()
+        .await
+        .expect("forwarding event should be emitted");
+    match event {
+        ForwardingEvent::AttachmentReady { network_id } => assert_eq!(network_id, spec.id),
+    }
 }
 
 #[tokio::test]

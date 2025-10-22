@@ -1,4 +1,5 @@
 use crate::network::attachment::PlatformAttachmentProvisioner;
+use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     NetworkAttachmentState, NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue,
@@ -9,7 +10,7 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, mpsc::UnboundedReceiver};
 use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -34,6 +35,8 @@ struct NetworkControllerInner {
     remote_fdb: AsyncMutex<HashMap<Uuid, HashMap<String, IpAddr>>>,
     flood_entries: AsyncMutex<HashMap<Uuid, HashSet<IpAddr>>>,
     attachment: PlatformAttachmentProvisioner,
+    pending_forwarding: AsyncMutex<HashSet<Uuid>>,
+    forwarding_events: AsyncMutex<Option<UnboundedReceiver<ForwardingEvent>>>,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -52,6 +55,7 @@ impl NetworkController {
         cluster_registry: Registry,
         node_id: Uuid,
         node_name: String,
+        forwarding_events: Option<UnboundedReceiver<ForwardingEvent>>,
     ) -> Result<Self> {
         let provisioner = platform::NetworkProvisioner::new()?;
         let attachment = PlatformAttachmentProvisioner::new().unwrap_or_else(|err| {
@@ -70,24 +74,88 @@ impl NetworkController {
                 remote_fdb: AsyncMutex::new(HashMap::new()),
                 flood_entries: AsyncMutex::new(HashMap::new()),
                 attachment,
+                pending_forwarding: AsyncMutex::new(HashSet::new()),
+                forwarding_events: AsyncMutex::new(forwarding_events),
             }),
         })
     }
 
     /// Spawn the reconciliation loop on the current local executor.
     pub fn spawn(&self) {
+        self.spawn_forwarding_listener();
         let controller = self.clone();
         tokio::task::spawn_local(async move {
             controller.run().await;
         });
     }
 
+    fn spawn_forwarding_listener(&self) {
+        let controller = self.clone();
+        tokio::task::spawn_local(async move {
+            controller.forwarding_event_loop().await;
+        });
+    }
+
     async fn run(&self) {
         loop {
+            if let Err(err) = self.reconcile_pending_forwarding().await {
+                warn!(
+                    target: "network",
+                    "pending forwarding reconcile failed: {err:#}"
+                );
+            }
             if let Err(err) = self.reconcile_once().await {
                 warn!(target: "network", "network reconciliation failed: {err:#}");
             }
             sleep(RECONCILE_INTERVAL).await;
+        }
+    }
+
+    async fn reconcile_pending_forwarding(&self) -> Result<()> {
+        let pending: Vec<Uuid> = {
+            let mut guard = self.inner.pending_forwarding.lock().await;
+            guard.drain().collect()
+        };
+
+        for network_id in pending {
+            let spec_opt = self.inner.registry.get_spec(network_id)?;
+            let Some(spec) = spec_opt else {
+                continue;
+            };
+
+            if let Err(err) = self.reconcile_network(spec).await {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    "event-triggered network reconcile failed: {err:#}"
+                );
+                self.update_peer_state_error(network_id, err.to_string())
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn forwarding_event_loop(&self) {
+        let mut receiver = {
+            let mut guard = self.inner.forwarding_events.lock().await;
+            guard.take()
+        };
+
+        let Some(mut receiver) = receiver else {
+            return;
+        };
+
+        while let Some(event) = receiver.recv().await {
+            match event {
+                ForwardingEvent::AttachmentReady { network_id } => {
+                    // Mark the network for a targeted reconcile so remote FDB entries
+                    // are refreshed immediately after the attachment finished configuring.
+                    let mut guard = self.inner.pending_forwarding.lock().await;
+                    guard.insert(network_id);
+                }
+            }
         }
     }
 
@@ -138,8 +206,6 @@ impl NetworkController {
                 .await
                 .context("persist network spec update")?;
         }
-
-        info!("blablabla2");
 
         info!(
             target: "network",
@@ -497,10 +563,16 @@ mod platform {
     use anyhow::{Context, Result, anyhow};
     use futures::TryStreamExt;
     use libc;
+    use netlink_packet_core::DefaultNla;
+    use rtnetlink::packet_route::AddressFamily;
     use rtnetlink::packet_route::address::AddressAttribute;
-    use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags};
+    use rtnetlink::packet_route::link::{
+        InfoBridgePort, InfoKind, InfoPortData, LinkAttribute, LinkFlags, LinkHeader, LinkInfo,
+        LinkProtoInfoBridge,
+    };
     use rtnetlink::{
-        Error as RtnetlinkError, Handle, LinkBridge, LinkUnspec, LinkVxlan, new_connection,
+        Error as RtnetlinkError, Handle, LinkBridge, LinkMessageBuilder, LinkUnspec, LinkVxlan,
+        new_connection,
     };
     use std::net::IpAddr;
     use std::process::Command;
@@ -513,6 +585,12 @@ mod platform {
         handle: Handle,
         underlay: Arc<AsyncMutex<Option<(u32, IpAddr)>>>,
     }
+
+    const BRPORT_ATTR_LEARNING: u16 = 8;
+    const BRPORT_ATTR_UNICAST_FLOOD: u16 = 9;
+    const BRPORT_ATTR_NEIGH_SUPPRESS: u16 = 32;
+    const BRPORT_ATTR_MULTICAST_FLOOD: u16 = 27;
+    const BRPORT_ATTR_BROADCAST_FLOOD: u16 = 30;
 
     impl NetworkProvisioner {
         pub fn new() -> Result<Self> {
@@ -565,6 +643,15 @@ mod platform {
                 .with_context(|| {
                     format!(
                         "attach vxlan {} (idx {}) to bridge {} (idx {})",
+                        plan.vxlan_name, vxlan_index, plan.bridge_name, bridge_index
+                    )
+                })?;
+
+            self.configure_bridge_port(vxlan_index, bridge_index, &plan.vxlan_name)
+                .await
+                .with_context(|| {
+                    format!(
+                        "configure bridge port for vxlan {} (idx {}) on bridge {} (idx {})",
                         plan.vxlan_name, vxlan_index, plan.bridge_name, bridge_index
                     )
                 })?;
@@ -626,6 +713,14 @@ mod platform {
 
         async fn ensure_vxlan(&self, plan: &NetworkPlan) -> Result<u32> {
             if let Some(index) = self.find_link(&plan.vxlan_name).await? {
+                if let Err(err) = self.configure_existing_vxlan(index, &plan.vxlan_name).await {
+                    warn!(
+                        target: "network",
+                        vxlan = %plan.vxlan_name,
+                        error = %err,
+                        "failed to update vxlan configuration while reusing interface"
+                    );
+                }
                 info!(
                     target: "network",
                     vxlan = %plan.vxlan_name,
@@ -638,7 +733,6 @@ mod platform {
             let mut last_error: Option<anyhow::Error> = None;
 
             for attempt in 0..=1 {
-                debug!("LOL3");
                 let (underlay_index, underlay_ip) = self
                     .underlay_info()
                     .await
@@ -681,7 +775,11 @@ mod platform {
                 let builder = {
                     let base = LinkVxlan::new(&plan.vxlan_name, plan.vni)
                         .dev(underlay_index)
-                        .learning(true)
+                        .learning(false)
+                        .proxy(true)
+                        .rsc(true)
+                        .l2miss(false)
+                        .l3miss(false)
                         .port(VXLAN_PORT)
                         .link(underlay_index);
                     match underlay_ip {
@@ -705,6 +803,16 @@ mod platform {
                             underlay_index,
                             "vxlan interface provisioned"
                         );
+                        if let Err(err) =
+                            self.configure_existing_vxlan(index, &plan.vxlan_name).await
+                        {
+                            warn!(
+                                target: "network",
+                                vxlan = %plan.vxlan_name,
+                                error = %err,
+                                "failed to apply vxlan configuration after creation"
+                            );
+                        }
                         return Ok(index);
                     }
                     Err(err) => {
@@ -776,6 +884,124 @@ mod platform {
             }
 
             Err(last_error.unwrap_or_else(|| anyhow!("vxlan creation failed after retries")))
+        }
+
+        async fn configure_existing_vxlan(&self, index: u32, name: &str) -> Result<()> {
+            let request = LinkMessageBuilder::<LinkVxlan>::new_with_info_kind(InfoKind::Vxlan)
+                .index(index)
+                .learning(false)
+                .proxy(true)
+                .rsc(true)
+                .l2miss(false)
+                .l3miss(false)
+                .build();
+
+            self.handle
+                .link()
+                .set(request)
+                .execute()
+                .await
+                .with_context(|| format!("configure vxlan {} (idx {})", name, index))
+        }
+
+        async fn configure_bridge_port(
+            &self,
+            vxlan_index: u32,
+            _bridge_index: u32,
+            name: &str,
+        ) -> Result<()> {
+            let proto_attrs = vec![
+                LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_LEARNING, vec![0])),
+                LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_NEIGH_SUPPRESS, vec![0])),
+                LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_UNICAST_FLOOD, vec![1])),
+                LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_MULTICAST_FLOOD, vec![1])),
+                LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_BROADCAST_FLOOD, vec![1])),
+            ];
+
+            let request = LinkMessageBuilder::<LinkUnspec>::default()
+                .set_header(LinkHeader {
+                    interface_family: AddressFamily::Bridge,
+                    index: vxlan_index,
+                    ..Default::default()
+                })
+                .name(name.to_string())
+                .append_extra_attribute(LinkAttribute::ProtoInfoBridge(proto_attrs))
+                .build();
+
+            self.handle
+                .link()
+                .set(request)
+                .execute()
+                .await
+                .with_context(|| {
+                    format!(
+                        "configure bridge port attributes for vxlan {} (idx {})",
+                        name, vxlan_index
+                    )
+                })
+                .map(|_| ())?;
+
+            if let Err(err) = self.log_bridge_port_state(vxlan_index, name).await {
+                debug!(
+                    target: "network",
+                    vxlan = %name,
+                    error = %err,
+                    "[bridge-config] failed to inspect bridge port after applying settings"
+                );
+            }
+
+            Ok(())
+        }
+
+        async fn log_bridge_port_state(&self, index: u32, name: &str) -> Result<()> {
+            let mut stream = self.handle.link().get().match_index(index).execute();
+            while let Some(msg) = stream.try_next().await? {
+                let mut learning = None;
+                let mut neigh_suppress = None;
+                let mut unicast_flood = None;
+                let mut multicast_flood = None;
+                let mut broadcast_flood = None;
+
+                for attr in &msg.attributes {
+                    if let LinkAttribute::LinkInfo(infos) = attr {
+                        for info in infos {
+                            if let LinkInfo::PortData(InfoPortData::BridgePort(entries)) = info {
+                                for entry in entries {
+                                    match entry {
+                                        InfoBridgePort::Learning(value) => learning = Some(*value),
+                                        InfoBridgePort::NeighSupress(value) => {
+                                            neigh_suppress = Some(*value)
+                                        }
+                                        InfoBridgePort::UnicastFlood(value) => {
+                                            unicast_flood = Some(*value)
+                                        }
+                                        InfoBridgePort::MulticastFlood(value) => {
+                                            multicast_flood = Some(*value)
+                                        }
+                                        InfoBridgePort::BroadcastFlood(value) => {
+                                            broadcast_flood = Some(*value)
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                debug!(
+                    target: "network",
+                    vxlan = %name,
+                    learning = ?learning,
+                    neigh_suppress = ?neigh_suppress,
+                    unicast_flood = ?unicast_flood,
+                    multicast_flood = ?multicast_flood,
+                    broadcast_flood = ?broadcast_flood,
+                    "[bridge-config] bridge port state after configuration"
+                );
+            }
+
+            Ok(())
         }
 
         async fn ensure_bridge(&self, plan: &NetworkPlan) -> Result<u32> {

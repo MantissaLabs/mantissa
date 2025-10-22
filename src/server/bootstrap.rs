@@ -43,7 +43,7 @@ use protocol::server::server::Client as ServerClient;
 use protocol::services::services::Client as ServicesClient;
 use protocol::topology::topology::Client as TopologyClient;
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 use async_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;
@@ -388,6 +388,8 @@ impl Bootstrap {
             stores.network_attachments.clone(),
         );
 
+        let (forwarding_tx, forwarding_rx) = mpsc::unbounded_channel();
+
         let task_manager = TaskManager::new(
             stores.tasks.clone(),
             gossip_tx.clone(),
@@ -400,6 +402,7 @@ impl Bootstrap {
             network_registry.clone(),
             secret_registry.clone(),
             stores.secret_keyring.clone(),
+            Some(forwarding_tx),
         );
 
         let service_registry = ServiceRegistry::new(stores.services.clone());
@@ -417,6 +420,7 @@ impl Bootstrap {
             registry.clone(),
             ctx.self_id,
             local_node_name.clone(),
+            Some(forwarding_rx),
         )
         .map_err(|e| -> Box<dyn std::error::Error> { Box::<dyn std::error::Error>::from(e) })?;
         let networks_service = NetworksRpc::new(network_registry.clone());

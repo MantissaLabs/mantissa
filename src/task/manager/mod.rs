@@ -1,5 +1,6 @@
 use crate::gossip::Message;
 use crate::network::attachment::AttachmentProvisioner;
+use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::registry::Registry;
 use crate::scheduler::{Scheduler, SlotId};
@@ -21,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc::UnboundedSender};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -58,6 +59,7 @@ pub struct TaskManager {
     secret_runtime_root: PathBuf,
     network_registry: NetworkRegistry,
     attachment_provisioner: AttachmentProvisioner,
+    forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
 }
 
 #[derive(Clone)]
@@ -88,6 +90,7 @@ impl TaskManager {
         network_registry: NetworkRegistry,
         secret_registry: SecretRegistry,
         secret_keyring: Arc<RwLock<SecretKeyring>>,
+        forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
     ) -> Self {
         let secret_runtime_root = std::env::temp_dir()
             .join("mantissa")
@@ -119,6 +122,7 @@ impl TaskManager {
             secret_artifacts: Arc::new(AsyncMutex::new(HashMap::new())),
             secret_runtime_root,
             attachment_provisioner,
+            forwarding_events,
         }
     }
 

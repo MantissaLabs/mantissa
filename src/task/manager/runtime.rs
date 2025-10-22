@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
+use crdt_store::uuid_key::UuidKey;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -8,6 +9,7 @@ use crate::gossip::Message;
 use crate::network::allocator::{allocate_overlay_address, parse_ipv4_cidr};
 use crate::network::attachment::bridge_name;
 use crate::network::controller::DEFAULT_MTU;
+use crate::network::events::ForwardingEvent;
 use crate::network::types::{
     NetworkAttachmentState, NetworkAttachmentValue, compute_network_attachment_id,
 };
@@ -92,6 +94,10 @@ impl TaskManager {
         container_id: &str,
         network_ids: &[Uuid],
     ) -> Result<()> {
+        self.cleanup_orphaned_local_attachments()
+            .await
+            .context("cleanup orphaned network attachments")?;
+
         if network_ids.is_empty() {
             return Ok(());
         }
@@ -128,25 +134,36 @@ impl TaskManager {
             existing.entry(attachment.network_id).or_insert(attachment);
         }
 
+        let mut touched_networks: HashSet<Uuid> = HashSet::new();
+
         for network_id in &desired {
-            let mut attachment = match existing.remove(network_id) {
-                Some(mut value) => {
-                    value.container_id = container_id.to_string();
-                    value
-                }
-                None => NetworkAttachmentValue::new(
-                    compute_network_attachment_id(task_id, *network_id),
-                    task_id,
-                    self.local_node_id,
-                    container_id,
-                    *network_id,
-                    None,
-                    None,
-                    None,
-                    NetworkAttachmentState::Pending,
-                    None,
-                ),
-            };
+            let (mut attachment, previous_state, previous_ip, previous_mac) =
+                match existing.remove(network_id) {
+                    Some(mut value) => {
+                        let prev_state = value.state;
+                        let prev_ip = value.assigned_ip.clone();
+                        let prev_mac = value.mac.clone();
+                        value.container_id = container_id.to_string();
+                        (value, Some(prev_state), prev_ip, prev_mac)
+                    }
+                    None => (
+                        NetworkAttachmentValue::new(
+                            compute_network_attachment_id(task_id, *network_id),
+                            task_id,
+                            self.local_node_id,
+                            container_id,
+                            *network_id,
+                            None,
+                            None,
+                            None,
+                            NetworkAttachmentState::Pending,
+                            None,
+                        ),
+                        None,
+                        None,
+                        None,
+                    ),
+                };
 
             let spec = self
                 .network_registry
@@ -166,6 +183,10 @@ impl TaskManager {
                 Some(allocation.assigned_ip.clone()),
                 Some(allocation.mac_address.clone()),
             );
+
+            let assignment_changed =
+                previous_ip != attachment.assigned_ip || previous_mac != attachment.mac;
+            let mut notify_forwarding = false;
 
             let provisioned = self
                 .attachment_provisioner
@@ -229,11 +250,25 @@ impl TaskManager {
             }
 
             attachment.set_state(NetworkAttachmentState::Ready, None);
+            let was_ready = matches!(previous_state, Some(NetworkAttachmentState::Ready));
+            notify_forwarding = !was_ready || assignment_changed;
 
             self.network_registry
                 .upsert_attachment(attachment)
                 .await
                 .context("failed to persist runtime attachment state")?;
+
+            if notify_forwarding {
+                touched_networks.insert(spec.id);
+            }
+        }
+
+        if let Some(sender) = &self.forwarding_events {
+            for network_id in touched_networks {
+                // Forwarding refresh is best-effort; ignore send failures if the controller
+                // has already shut down.
+                let _ = sender.send(ForwardingEvent::AttachmentReady { network_id });
+            }
         }
 
         if existing.is_empty() {
@@ -241,6 +276,52 @@ impl TaskManager {
         }
 
         self.teardown_runtime_attachments(task_id, desired).await
+    }
+
+    async fn cleanup_orphaned_local_attachments(&self) -> Result<()> {
+        let attachments = self
+            .network_registry
+            .list_attachments(None)
+            .context("list attachments for orphan cleanup")?;
+
+        for attachment in attachments {
+            let task_exists = self
+                .store
+                .get_snapshot(&UuidKey::from(attachment.task_id))
+                .with_context(|| format!("lookup task {}", attachment.task_id))?
+                .and_then(|snap| snap.as_slice().last().cloned())
+                .is_some();
+
+            if task_exists {
+                continue;
+            }
+
+            if attachment.node_id == self.local_node_id {
+                if let Err(err) = self
+                    .attachment_provisioner
+                    .teardown_attachment(attachment.id)
+                    .await
+                {
+                    warn!(
+                        target: "task",
+                        attachment = %attachment.id,
+                        error = %err,
+                        "failed to teardown orphaned attachment interface"
+                    );
+                }
+            }
+
+            if let Err(err) = self.network_registry.remove_attachment(attachment.id).await {
+                warn!(
+                    target: "task",
+                    attachment = %attachment.id,
+                    error = %err,
+                    "failed to remove orphaned attachment record"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Removes runtime network attachments that are no longer referenced by the task.
