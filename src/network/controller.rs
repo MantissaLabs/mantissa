@@ -368,6 +368,29 @@ impl NetworkController {
     }
 
     async fn teardown_deleted_network(&self, spec: &NetworkSpecValue) -> Result<()> {
+        let has_active = {
+            let active = self.inner.active_networks.lock().await;
+            active.contains(&spec.id)
+        };
+
+        let has_peers = !self
+            .inner
+            .registry
+            .list_peer_states(Some(spec.id))?
+            .is_empty();
+
+        let has_attachments = !self
+            .inner
+            .registry
+            .list_attachments(Some(spec.id))?
+            .is_empty();
+
+        let should_teardown = has_active || has_peers || has_attachments;
+
+        if !should_teardown {
+            return Ok(());
+        }
+
         let plan = NetworkPlan::from_id(spec.id);
         if let Err(err) = self.inner.provisioner.teardown_network(&plan).await {
             warn!(
