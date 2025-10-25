@@ -266,6 +266,7 @@ async fn setup_task_manager() -> TestHarness {
         secret_registry.clone(),
         secret_keyring_arc.clone(),
         None,
+        None,
     );
 
     TestHarness {

@@ -403,6 +403,7 @@ impl Bootstrap {
             secret_registry.clone(),
             stores.secret_keyring.clone(),
             Some(forwarding_tx),
+            None,
         );
 
         let service_registry = ServiceRegistry::new(stores.services.clone());

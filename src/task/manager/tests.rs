@@ -2,6 +2,7 @@
 
 use super::*;
 
+use crate::network::attachment::{AttachmentProvisioner, AttachmentProvisionerApi};
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
@@ -23,12 +24,13 @@ use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
 use crate::task::types::{TaskStateKind, TaskValue};
 use ::health::{Config as HealthConfig, HealthMonitor};
+use anyhow::Result;
 use async_channel::bounded;
 use async_trait::async_trait;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use net::noise::NoiseKeys;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -127,6 +129,67 @@ impl ContainerManager for MockContainerManager {
     }
 }
 
+#[derive(Default)]
+struct FakeAttachmentProvisioner {
+    attachments: AsyncMutex<HashSet<Uuid>>,
+}
+
+#[async_trait]
+impl AttachmentProvisionerApi for FakeAttachmentProvisioner {
+    async fn attachment_exists(&self, attachment_id: Uuid) -> Result<bool> {
+        let guard = self.attachments.lock().await;
+        Ok(guard.contains(&attachment_id))
+    }
+
+    async fn ensure_attachment(
+        &self,
+        _network_id: Uuid,
+        _bridge_name: &str,
+        _mtu: u32,
+        attachment_id: Uuid,
+        _container_pid: i32,
+        _assigned_ip: &str,
+        _prefix: u8,
+        _mac: &str,
+    ) -> Result<()> {
+        let mut guard = self.attachments.lock().await;
+        guard.insert(attachment_id);
+        Ok(())
+    }
+
+    async fn teardown_attachment(&self, attachment_id: Uuid) -> Result<()> {
+        let mut guard = self.attachments.lock().await;
+        guard.remove(&attachment_id);
+        Ok(())
+    }
+
+    async fn ensure_remote_fdb(
+        &self,
+        _vxlan_name: &str,
+        _mac: &str,
+        _dst: std::net::IpAddr,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn remove_remote_fdb(
+        &self,
+        _vxlan_name: &str,
+        _mac: &str,
+        _dst: std::net::IpAddr,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn ensure_flood_entry(&self, _vxlan_name: &str, _dst: std::net::IpAddr) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn remove_flood_entry(&self, _vxlan_name: &str, _dst: std::net::IpAddr) -> Result<()> {
+        Ok(())
+    }
+}
+
 fn temp_db(prefix: &str) -> (Arc<redb::Database>, tempfile::TempDir) {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join(format!("{prefix}-{}.redb", Uuid::new_v4()));
@@ -140,11 +203,12 @@ async fn setup_manager() -> (
     Arc<MockContainerManager>,
     NetworkRegistry,
 ) {
-    setup_manager_with_forwarding(None).await
+    setup_manager_with_forwarding(None, None).await
 }
 
 async fn setup_manager_with_forwarding(
     forwarding_events: Option<mpsc::UnboundedSender<ForwardingEvent>>,
+    attachment_override: Option<Arc<dyn AttachmentProvisionerApi>>,
 ) -> (
     TaskManager,
     Rc<Scheduler>,
@@ -238,6 +302,10 @@ async fn setup_manager_with_forwarding(
         network_attachment_store,
     );
 
+    let attachment = attachment_override.unwrap_or_else(|| {
+        Arc::new(FakeAttachmentProvisioner::default()) as Arc<dyn AttachmentProvisionerApi>
+    });
+
     let manager = TaskManager::new(
         task_store,
         tx,
@@ -251,6 +319,7 @@ async fn setup_manager_with_forwarding(
         secret_registry,
         secret_keyring.clone(),
         forwarding_events,
+        Some(attachment),
     );
 
     (manager, scheduler, mock_cm, network_registry)
@@ -756,20 +825,9 @@ async fn runtime_attachments_created_and_removed_on_stop() {
 
 #[tokio::test]
 async fn attachment_ready_triggers_forwarding_event() {
-    #[cfg(target_os = "linux")]
-    {
-        match crate::network::attachment::AttachmentProvisioner::new() {
-            Ok(provisioner) => drop(provisioner),
-            Err(_) => {
-                // Skip the test when rtnetlink cannot be opened (e.g., missing CAP_NET_ADMIN).
-                return;
-            }
-        }
-    }
-
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (manager, scheduler, _mock_cm, network_registry) =
-        setup_manager_with_forwarding(Some(event_tx)).await;
+        setup_manager_with_forwarding(Some(event_tx), None).await;
 
     scheduler
         .init_slots(vec![SlotSpec::new(
@@ -945,4 +1003,102 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
     assert_eq!(reconciled.len(), 1);
     assert_eq!(reconciled[0].network_id, spec_a.id);
     assert_eq!(reconciled[0].state, NetworkAttachmentState::Ready);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn runtime_attachments_real_provisioning_runs_when_enabled() {
+    if std::env::var("MANTISSA_NETWORK_TESTS").ok().as_deref() != Some("1") {
+        eprintln!("skipping real networking test; set MANTISSA_NETWORK_TESTS=1 to enable");
+        return;
+    }
+
+    let provisioner = match AttachmentProvisioner::new() {
+        Ok(provisioner) => Arc::new(provisioner) as Arc<dyn AttachmentProvisionerApi>,
+        Err(err) => {
+            eprintln!("skipping real networking test; failed to initialize rtnetlink: {err}");
+            return;
+        }
+    };
+
+    let (manager, scheduler, _mock_cm, network_registry) =
+        setup_manager_with_forwarding(None, Some(provisioner)).await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024),
+        )])
+        .await
+        .expect("init slots");
+
+    let spec = NetworkSpecValue::new(
+        "real-net",
+        "real networking",
+        NetworkDriver::Vxlan,
+        "10.46.0.0/24",
+        0,
+        0,
+        false,
+        vec![],
+    );
+    network_registry
+        .upsert_spec(spec.clone())
+        .await
+        .expect("upsert network spec");
+
+    let peer_state = NetworkPeerStateValue::new(
+        spec.id,
+        manager.local_node_id,
+        "local-node",
+        NetworkPeerState::Ready,
+        None,
+    );
+    network_registry
+        .upsert_peer_state(peer_state)
+        .await
+        .expect("upsert peer state");
+
+    let request = TaskStartRequest {
+        name: "real-net-task".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 200,
+        memory_bytes: 64 * 1_024 * 1_024,
+        id: None,
+        slot_ids: Vec::new(),
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: vec![spec.id],
+    };
+
+    let mut specs = match manager.start_tasks_batch(vec![request]).await {
+        Ok(specs) => specs,
+        Err(err) => {
+            if err
+                .chain()
+                .any(|cause| cause.to_string().contains("Operation not permitted"))
+            {
+                eprintln!("skipping real networking test; missing CAP_NET_ADMIN privileges: {err}");
+                return;
+            }
+            panic!("failed to start networked task: {err:#}");
+        }
+    };
+
+    let task_spec = specs.remove(0);
+    let attachments = network_registry
+        .list_attachments_for_task(task_spec.id)
+        .expect("list attachments");
+    assert_eq!(attachments.len(), 1);
+    let attachment = &attachments[0];
+    assert_eq!(attachment.network_id, spec.id);
+    assert_eq!(attachment.state, NetworkAttachmentState::Ready);
+
+    let stopped = manager
+        .stop_task(task_spec.id)
+        .await
+        .expect("stop real networked task");
+    assert!(matches!(stopped.state, ContainerState::Stopped));
 }

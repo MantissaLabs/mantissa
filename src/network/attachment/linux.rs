@@ -16,7 +16,8 @@ use tokio::task::spawn_blocking;
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{container_iface_name, host_iface_name};
+use super::{AttachmentProvisionerApi, container_iface_name, host_iface_name};
+use async_trait::async_trait;
 use nix::sched::{CloneFlags, setns};
 
 #[derive(Clone)]
@@ -420,6 +421,58 @@ impl AttachmentProvisioner {
             }
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl AttachmentProvisionerApi for AttachmentProvisioner {
+    async fn attachment_exists(&self, attachment_id: Uuid) -> Result<bool> {
+        AttachmentProvisioner::attachment_exists(self, attachment_id).await
+    }
+
+    async fn ensure_attachment(
+        &self,
+        network_id: Uuid,
+        bridge_name: &str,
+        mtu: u32,
+        attachment_id: Uuid,
+        container_pid: i32,
+        assigned_ip: &str,
+        prefix: u8,
+        mac: &str,
+    ) -> Result<()> {
+        AttachmentProvisioner::ensure_attachment(
+            self,
+            network_id,
+            bridge_name,
+            mtu,
+            attachment_id,
+            container_pid,
+            assigned_ip,
+            prefix,
+            mac,
+        )
+        .await
+    }
+
+    async fn teardown_attachment(&self, attachment_id: Uuid) -> Result<()> {
+        AttachmentProvisioner::teardown_attachment(self, attachment_id).await
+    }
+
+    async fn ensure_remote_fdb(&self, vxlan_name: &str, mac: &str, dst: IpAddr) -> Result<bool> {
+        AttachmentProvisioner::ensure_remote_fdb(self, vxlan_name, mac, dst).await
+    }
+
+    async fn remove_remote_fdb(&self, vxlan_name: &str, mac: &str, dst: IpAddr) -> Result<()> {
+        AttachmentProvisioner::remove_remote_fdb(self, vxlan_name, mac, dst).await
+    }
+
+    async fn ensure_flood_entry(&self, vxlan_name: &str, dst: IpAddr) -> Result<bool> {
+        AttachmentProvisioner::ensure_flood_entry(self, vxlan_name, dst).await
+    }
+
+    async fn remove_flood_entry(&self, vxlan_name: &str, dst: IpAddr) -> Result<()> {
+        AttachmentProvisioner::remove_flood_entry(self, vxlan_name, dst).await
     }
 }
 

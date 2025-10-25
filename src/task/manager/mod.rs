@@ -1,5 +1,5 @@
 use crate::gossip::Message;
-use crate::network::attachment::AttachmentProvisioner;
+use crate::network::attachment::{AttachmentProvisioner, AttachmentProvisionerApi};
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::registry::Registry;
@@ -60,7 +60,7 @@ pub struct TaskManager {
     secret_artifacts: Arc<AsyncMutex<HashMap<Uuid, TaskSecretArtifacts>>>,
     secret_runtime_root: PathBuf,
     network_registry: NetworkRegistry,
-    attachment_provisioner: AttachmentProvisioner,
+    attachment_provisioner: Arc<dyn AttachmentProvisionerApi>,
     forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
 }
 
@@ -93,16 +93,23 @@ impl TaskManager {
         secret_registry: SecretRegistry,
         secret_keyring: Arc<RwLock<SecretKeyring>>,
         forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
+        attachment_override: Option<Arc<dyn AttachmentProvisionerApi>>,
     ) -> Self {
         let secret_runtime_root = resolve_secret_runtime_root(local_node_id);
 
-        let attachment_provisioner = AttachmentProvisioner::new().unwrap_or_else(|err| {
-            warn!(
-                target: "network",
-                "failed to initialize attachment provisioner: {err}"
-            );
-            AttachmentProvisioner::unavailable()
-        });
+        let attachment_provisioner: Arc<dyn AttachmentProvisionerApi> = match attachment_override {
+            Some(provisioner) => provisioner,
+            None => {
+                let provisioner = AttachmentProvisioner::new().unwrap_or_else(|err| {
+                    warn!(
+                        target: "network",
+                        "failed to initialize attachment provisioner: {err}"
+                    );
+                    AttachmentProvisioner::unavailable()
+                });
+                Arc::new(provisioner)
+            }
+        };
 
         Self {
             store,
