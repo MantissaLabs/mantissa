@@ -1,8 +1,9 @@
+use crate::network::controller::NetworkController;
 use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    NetworkAttachmentValue, NetworkDriver, NetworkEvent, NetworkPeerStateValue, NetworkSpecValue,
-    NetworkStatus, compute_network_id,
+    NetworkAttachmentValue, NetworkDriver, NetworkEvent, NetworkPeerState, NetworkPeerStateValue,
+    NetworkSpecValue, NetworkStatus, compute_network_id,
 };
 use capnp::Error;
 use capnp::capability::Promise;
@@ -18,12 +19,21 @@ use uuid::Uuid;
 pub struct NetworksRpc {
     registry: NetworkRegistry,
     gossiper: NetworkGossiper,
+    controller: NetworkController,
 }
 
 impl NetworksRpc {
     /// Construct the RPC service backed by the provided registry.
-    pub fn new(registry: NetworkRegistry, gossiper: NetworkGossiper) -> Self {
-        Self { registry, gossiper }
+    pub fn new(
+        registry: NetworkRegistry,
+        gossiper: NetworkGossiper,
+        controller: NetworkController,
+    ) -> Self {
+        Self {
+            registry,
+            gossiper,
+            controller,
+        }
     }
 
     fn read_non_empty_text(text: capnp::text::Reader<'_>, field: &str) -> Result<String, Error> {
@@ -201,6 +211,35 @@ fn read_network_spec(reader: network_spec::Reader<'_>) -> Result<NetworkSpecValu
     })
 }
 
+fn read_peer_state(
+    reader: network_peer_status::Reader<'_>,
+    id_bytes: capnp::data::Reader<'_>,
+    network_id_bytes: capnp::data::Reader<'_>,
+) -> Result<NetworkPeerStateValue, Error> {
+    let id = read_uuid(id_bytes)?;
+    let network_id = read_uuid(network_id_bytes)?;
+    let peer_id = read_uuid(reader.get_peer_id()?)?;
+    let peer_name = reader.get_peer_name()?.to_str()?.to_string();
+    let state = NetworkPeerState::from_proto(reader.get_state()?);
+    let error_text = reader.get_error()?.to_str()?.to_string();
+    let error = if error_text.is_empty() {
+        None
+    } else {
+        Some(error_text)
+    };
+    let updated_at = reader.get_updated_at()?.to_str()?.to_string();
+
+    Ok(NetworkPeerStateValue {
+        id,
+        network_id,
+        peer_id,
+        peer_name,
+        state,
+        error,
+        updated_at,
+    })
+}
+
 pub(crate) fn write_network_event(
     mut builder: network_event::Builder<'_>,
     event: &NetworkEvent,
@@ -210,6 +249,19 @@ pub(crate) fn write_network_event(
             builder.set_event(network_event::EventType::Upsert);
             let spec_builder = builder.reborrow().init_spec();
             write_network_spec(spec_builder, spec);
+        }
+        NetworkEvent::PeerUpsert(state) => {
+            builder.set_event(network_event::EventType::PeerUpsert);
+            let status_builder = builder.reborrow().init_peer_state();
+            write_network_peer_status(status_builder, state);
+            builder.reborrow().set_peer_state_id(state.id.as_bytes());
+            builder
+                .reborrow()
+                .set_peer_network_id(state.network_id.as_bytes());
+        }
+        NetworkEvent::PeerRemove(id) => {
+            builder.set_event(network_event::EventType::PeerRemove);
+            builder.reborrow().set_peer_state_id(id.as_bytes());
         }
     }
     Ok(())
@@ -221,6 +273,19 @@ pub(crate) fn read_network_event(reader: network_event::Reader<'_>) -> Result<Ne
             let spec_reader = reader.get_spec()?;
             let spec = read_network_spec(spec_reader)?;
             Ok(NetworkEvent::Upsert(spec))
+        }
+        network_event::EventType::PeerUpsert => {
+            let status_reader = reader.get_peer_state()?;
+            let state = read_peer_state(
+                status_reader,
+                reader.get_peer_state_id()?,
+                reader.get_peer_network_id()?,
+            )?;
+            Ok(NetworkEvent::PeerUpsert(state))
+        }
+        network_event::EventType::PeerRemove => {
+            let id = read_uuid(reader.get_peer_state_id()?)?;
+            Ok(NetworkEvent::PeerRemove(id))
         }
     }
 }
@@ -234,6 +299,7 @@ impl networks::Server for NetworksRpc {
     ) -> Promise<(), Error> {
         let registry = self.registry.clone();
         let gossiper = self.gossiper.clone();
+        let controller = self.controller.clone();
 
         Promise::from_future(async move {
             let request = params.get()?;
@@ -312,6 +378,8 @@ impl networks::Server for NetworksRpc {
                 .await
                 .map_err(|e| Error::failed(e.to_string()))?;
 
+            controller.schedule_spec_change(spec_value.id).await;
+
             results.get().set_network_id(spec_value.id.as_bytes());
             Ok(())
         })
@@ -324,6 +392,7 @@ impl networks::Server for NetworksRpc {
     ) -> Promise<(), Error> {
         let registry = self.registry.clone();
         let gossiper = self.gossiper.clone();
+        let controller = self.controller.clone();
         Promise::from_future(async move {
             let ids_reader = params.get()?.get_ids()?;
             for entry in ids_reader.iter() {
@@ -336,6 +405,7 @@ impl networks::Server for NetworksRpc {
                         .broadcast(NetworkEvent::Upsert(spec_clone))
                         .await
                         .map_err(|e| Error::failed(e.to_string()))?;
+                    controller.schedule_spec_change(uuid).await;
                 }
 
                 registry

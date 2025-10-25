@@ -1,4 +1,5 @@
 use crate::gossip::Message;
+use crate::network::controller::NetworkController;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::NetworkEvent;
 use anyhow::{Result, anyhow};
@@ -13,6 +14,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct NetworkGossiper {
     registry: NetworkRegistry,
+    controller: NetworkController,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
     seen_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
@@ -22,11 +24,13 @@ impl NetworkGossiper {
     /// Construct a gossip handler that applies incoming network events to the provided registry.
     pub fn new(
         registry: NetworkRegistry,
+        controller: NetworkController,
         gossip_tx: Sender<Message>,
         gossip_rx: Receiver<Message>,
     ) -> Self {
         Self {
             registry,
+            controller,
             gossip_tx,
             gossip_rx,
             seen_ids: Arc::new(AsyncMutex::new(HashSet::new())),
@@ -66,7 +70,19 @@ impl NetworkGossiper {
 
     async fn apply_event(&self, event: NetworkEvent) -> Result<()> {
         match event {
-            NetworkEvent::Upsert(spec) => self.registry.upsert_spec(spec).await?,
+            NetworkEvent::Upsert(spec) => {
+                let network_id = spec.id;
+                self.registry.upsert_spec(spec).await?;
+                self.controller.schedule_spec_change(network_id).await;
+            }
+            NetworkEvent::PeerUpsert(state) => {
+                self.registry.upsert_peer_state(state).await?;
+            }
+            NetworkEvent::PeerRemove(id) => {
+                if let Err(err) = self.registry.remove_peer_state(id).await {
+                    warn!(target: "network", "failed to remove peer state via gossip: {err:#}");
+                }
+            }
         }
         Ok(())
     }

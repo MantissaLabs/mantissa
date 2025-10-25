@@ -245,6 +245,10 @@ impl NetworkSpecValue {
 pub enum NetworkEvent {
     /// Insert or update a network specification snapshot.
     Upsert(NetworkSpecValue),
+    /// Insert or update a peer reconciliation state entry.
+    PeerUpsert(NetworkPeerStateValue),
+    /// Remove a peer reconciliation state entry by identifier.
+    PeerRemove(Uuid),
 }
 
 /// Replicated peer reconciliation state for a network.

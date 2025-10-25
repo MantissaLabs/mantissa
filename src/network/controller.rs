@@ -1,17 +1,19 @@
+use crate::gossip::Message;
 use crate::network::attachment::PlatformAttachmentProvisioner;
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    NetworkAttachmentState, NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue,
-    NetworkStatus,
+    NetworkAttachmentState, NetworkEvent, NetworkPeerState, NetworkPeerStateValue,
+    NetworkSpecValue, NetworkStatus,
 };
 use crate::registry::Registry;
 use anyhow::{Context, Result};
+use async_channel::Sender;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::{Mutex as AsyncMutex, mpsc::UnboundedReceiver};
-use tokio::time::{Duration, sleep};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc::UnboundedReceiver};
+use tokio::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -37,6 +39,9 @@ struct NetworkControllerInner {
     attachment: PlatformAttachmentProvisioner,
     pending_forwarding: AsyncMutex<HashSet<Uuid>>,
     forwarding_events: AsyncMutex<Option<UnboundedReceiver<ForwardingEvent>>>,
+    pending_specs: AsyncMutex<HashSet<Uuid>>,
+    wake: Notify,
+    gossip_tx: Sender<Message>,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -55,6 +60,7 @@ impl NetworkController {
         cluster_registry: Registry,
         node_id: Uuid,
         node_name: String,
+        gossip_tx: Sender<Message>,
         forwarding_events: Option<UnboundedReceiver<ForwardingEvent>>,
     ) -> Result<Self> {
         let provisioner = platform::NetworkProvisioner::new()?;
@@ -76,6 +82,9 @@ impl NetworkController {
                 attachment,
                 pending_forwarding: AsyncMutex::new(HashSet::new()),
                 forwarding_events: AsyncMutex::new(forwarding_events),
+                pending_specs: AsyncMutex::new(HashSet::new()),
+                wake: Notify::new(),
+                gossip_tx,
             }),
         })
     }
@@ -89,6 +98,29 @@ impl NetworkController {
         });
     }
 
+    /// Request an immediate reconcile for the provided network identifier.
+    pub async fn schedule_spec_change(&self, network_id: Uuid) {
+        let mut guard = self.inner.pending_specs.lock().await;
+        let inserted = guard.insert(network_id);
+        drop(guard);
+        if inserted {
+            self.inner.wake.notify_one();
+        }
+    }
+
+    async fn send_event(&self, event: NetworkEvent) {
+        let tx = self.inner.gossip_tx.clone();
+        if let Err(err) = tx
+            .send(Message::Network {
+                id: Uuid::new_v4(),
+                event,
+            })
+            .await
+        {
+            warn!(target: "network", "failed to broadcast network gossip: {err}");
+        }
+    }
+
     fn spawn_forwarding_listener(&self) {
         let controller = self.clone();
         tokio::task::spawn_local(async move {
@@ -97,6 +129,7 @@ impl NetworkController {
     }
 
     async fn run(&self) {
+        let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
         loop {
             if let Err(err) = self.reconcile_pending_forwarding().await {
                 warn!(
@@ -104,10 +137,20 @@ impl NetworkController {
                     "pending forwarding reconcile failed: {err:#}"
                 );
             }
-            if let Err(err) = self.reconcile_once().await {
-                warn!(target: "network", "network reconciliation failed: {err:#}");
+            if let Err(err) = self.reconcile_pending_specs().await {
+                warn!(target: "network", "pending spec reconcile failed: {err:#}");
             }
-            sleep(RECONCILE_INTERVAL).await;
+
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(err) = self.reconcile_once().await {
+                        warn!(target: "network", "network reconciliation failed: {err:#}");
+                    }
+                }
+                _ = self.inner.wake.notified() => {
+                    // loop again immediately to process pending work
+                }
+            }
         }
     }
 
@@ -137,6 +180,47 @@ impl NetworkController {
         Ok(())
     }
 
+    async fn reconcile_pending_specs(&self) -> Result<()> {
+        let queued: Vec<Uuid> = {
+            let mut guard = self.inner.pending_specs.lock().await;
+            guard.drain().collect()
+        };
+
+        for network_id in queued {
+            match self.inner.registry.get_spec(network_id) {
+                Ok(Some(spec)) => {
+                    if spec.is_deleted() {
+                        if let Err(err) = self.teardown_deleted_network(&spec).await {
+                            warn!(
+                                target: "network",
+                                network = %network_id,
+                                "teardown after gossip failed: {err:#}"
+                            );
+                        }
+                    } else if let Err(err) = self.reconcile_network(spec.clone()).await {
+                        warn!(
+                            target: "network",
+                            network = %network_id,
+                            "immediate reconcile failed: {err:#}"
+                        );
+                        self.update_peer_state_error(network_id, err.to_string())
+                            .await?;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        target: "network",
+                        network = %network_id,
+                        "failed to load spec for immediate reconcile: {err:#}"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn forwarding_event_loop(&self) {
         let receiver = {
             let mut guard = self.inner.forwarding_events.lock().await;
@@ -153,7 +237,11 @@ impl NetworkController {
                     // Mark the network for a targeted reconcile so remote FDB entries
                     // are refreshed immediately after the attachment finished configuring.
                     let mut guard = self.inner.pending_forwarding.lock().await;
-                    guard.insert(network_id);
+                    let inserted = guard.insert(network_id);
+                    drop(guard);
+                    if inserted {
+                        self.inner.wake.notify_one();
+                    }
                 }
             }
         }
@@ -205,6 +293,7 @@ impl NetworkController {
                 .upsert_spec(spec.clone())
                 .await
                 .context("persist network spec update")?;
+            self.send_event(NetworkEvent::Upsert(spec.clone())).await;
         }
 
         info!(
@@ -238,9 +327,10 @@ impl NetworkController {
             updated_spec.set_status(NetworkStatus::Ready);
             self.inner
                 .registry
-                .upsert_spec(updated_spec)
+                .upsert_spec(updated_spec.clone())
                 .await
                 .context("update network status to ready")?;
+            self.send_event(NetworkEvent::Upsert(updated_spec)).await;
         }
 
         self.reconcile_remote_forwarding(&plan).await?;
@@ -299,15 +389,20 @@ impl NetworkController {
     async fn cleanup_network_state(&self, network_id: Uuid) -> Result<()> {
         self.inner
             .registry
-            .remove_peer_states_for_network(network_id)
-            .await
-            .context("remove peer state for network")?;
-
-        self.inner
-            .registry
             .remove_attachments_for_network(network_id)
             .await
             .context("remove attachments for network")?;
+
+        let peer_states = self
+            .inner
+            .registry
+            .list_peer_states(Some(network_id))
+            .context("list peer states for cleanup")?;
+
+        for state in peer_states {
+            let _ = self.inner.registry.remove_peer_state(state.id).await;
+            self.send_event(NetworkEvent::PeerRemove(state.id)).await;
+        }
 
         {
             let mut guard = self.inner.remote_fdb.lock().await;
@@ -363,9 +458,12 @@ impl NetworkController {
 
         self.inner
             .registry
-            .upsert_peer_state(state)
+            .upsert_peer_state(state.clone())
             .await
-            .context("persist peer state ready")
+            .context("persist peer state ready")?;
+
+        self.send_event(NetworkEvent::PeerUpsert(state)).await;
+        Ok(())
     }
 
     async fn update_peer_state_error(&self, network_id: Uuid, message: String) -> Result<()> {
@@ -380,9 +478,11 @@ impl NetworkController {
 
         self.inner
             .registry
-            .upsert_peer_state(state)
+            .upsert_peer_state(state.clone())
             .await
-            .context("persist peer state error")
+            .context("persist peer state error")?;
+        self.send_event(NetworkEvent::PeerUpsert(state)).await;
+        Ok(())
     }
 
     async fn reconcile_remote_forwarding(&self, plan: &NetworkPlan) -> Result<()> {

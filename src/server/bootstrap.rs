@@ -393,10 +393,24 @@ impl Bootstrap {
             stores.network_attachments.clone(),
         );
 
-        let network_gossiper =
-            NetworkGossiper::new(network_registry.clone(), gossip_tx.clone(), network_rx);
-
         let (forwarding_tx, forwarding_rx) = mpsc::unbounded_channel();
+
+        let network_controller = NetworkController::new(
+            network_registry.clone(),
+            registry.clone(),
+            ctx.self_id,
+            local_node_name.clone(),
+            gossip_tx.clone(),
+            Some(forwarding_rx),
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::<dyn std::error::Error>::from(e) })?;
+
+        let network_gossiper = NetworkGossiper::new(
+            network_registry.clone(),
+            network_controller.clone(),
+            gossip_tx.clone(),
+            network_rx,
+        );
 
         let task_manager = TaskManager::new(
             stores.tasks.clone(),
@@ -424,15 +438,11 @@ impl Bootstrap {
         let services_service = ServicesRPC::new(service_controller.clone());
         let services_client_cap = capnp_rpc::new_client(services_service);
 
-        let network_controller = NetworkController::new(
+        let networks_service = NetworksRpc::new(
             network_registry.clone(),
-            registry.clone(),
-            ctx.self_id,
-            local_node_name.clone(),
-            Some(forwarding_rx),
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::<dyn std::error::Error>::from(e) })?;
-        let networks_service = NetworksRpc::new(network_registry.clone(), network_gossiper.clone());
+            network_gossiper.clone(),
+            network_controller.clone(),
+        );
         let networks_client_cap: NetworksClient = capnp_rpc::new_client(networks_service);
 
         let secrets_service = SecretsService::new(

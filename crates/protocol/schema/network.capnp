@@ -100,9 +100,14 @@ struct NetworkAttachmentSpec {
 struct NetworkEvent {
   event @0 :EventType;
   spec @1 :NetworkSpec;
+  peerState @2 :NetworkPeerStatus;
+  peerStateId @3 :Data;
+  peerNetworkId @4 :Data;
 
   enum EventType {
     upsert @0;
+    peerUpsert @1;
+    peerRemove @2;
   }
 }
 
