@@ -571,28 +571,26 @@ impl Topology {
                         continue;
                     }
 
-                    let event_clone = event.clone();
-
                     match event {
                         TopologyEvent::Join {
                             id,
-                            address,
-                            hostname,
-                            root_hash: _root_hash,
-                            client,
-                            noise_static_pub,
-                            signing_pub,
+                            ref address,
+                            ref hostname,
+                            root_hash: _,
+                            ref client,
+                            ref noise_static_pub,
+                            ref signing_pub,
                         } => {
                             info!(target: "topology", "Node joined: {id} at {address}");
 
                             let v = PeerValue {
-                                address,
-                                hostname,
+                                address: address.clone(),
+                                hostname: hostname.clone(),
                                 noise_static_pub: noise_static_pub.to_bytes(),
                                 signing_pub: signing_pub.to_bytes(),
                             };
 
-                            if let Err(e) = self.register_peer(id, &v, client).await {
+                            if let Err(e) = self.register_peer(id, &v, client.clone()).await {
                                 error!("Failed to register peer: {e}");
                                 continue;
                             }
@@ -612,6 +610,33 @@ impl Topology {
                             // update heartbeat timestamp if tracking
                         }
                     }
+
+                    let event_clone = match event.clone() {
+                        TopologyEvent::Join {
+                            id,
+                            hostname,
+                            address,
+                            root_hash,
+                            client,
+                            noise_static_pub,
+                            signing_pub,
+                        } => {
+                            // Never re-gossip a capability we only know as an import. Cap’n Proto
+                            // will panic if we hand a borrowed client handle back to the peer that
+                            // exported it, so we drop the handle unless we are describing ourselves.
+                            let client = if id == self.node.id { client } else { None };
+                            TopologyEvent::Join {
+                                id,
+                                hostname,
+                                address,
+                                root_hash,
+                                client,
+                                noise_static_pub,
+                                signing_pub,
+                            }
+                        }
+                        evt => evt,
+                    };
 
                     if let Err(e) = self
                         .gossip
@@ -643,10 +668,19 @@ impl Topology {
         &self,
         id: Uuid,
         val: &PeerValue,
-        handle: server::Client,
+        handle: Option<server::Client>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.peers.upsert(&UuidKey::from(id), val.clone()).await?;
-        self.registry.register_peer_handle(id, handle).await;
+        match handle {
+            Some(handle) => {
+                self.registry.register_peer_handle(id, handle).await;
+            }
+            None => {
+                // If the gossip message did not carry a usable handle, clear any stale capability
+                // cache so later connection attempts fall back to dialing the advertised address.
+                self.registry.invalidate_peer_capabilities(id).await;
+            }
+        }
         Ok(())
     }
 

@@ -77,7 +77,7 @@ impl protocol::server::Server for Server {
 
             server
                 .topology
-                .register_peer(joiner_id, &peer, handle.clone())
+                .register_peer(joiner_id, &peer, Some(handle.clone()))
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
@@ -120,7 +120,7 @@ impl protocol::server::Server for Server {
                 hostname: peer.hostname.clone(),
                 address: peer.address.clone(),
                 root_hash,
-                client: handle.clone(),
+                client: Some(handle.clone()),
                 noise_static_pub: pubkey,
                 signing_pub: Box::new(signing_vk),
             };

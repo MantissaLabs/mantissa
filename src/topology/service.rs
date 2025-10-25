@@ -419,15 +419,23 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
     let signing_pub = verifying_key_from_data(node.get_signing_key()?)?;
 
     let event = match reader.get_event()? {
-        EventType::Add => TopologyEvent::Join {
-            id,
-            hostname: node.get_hostname()?.to_str()?.to_string(),
-            address: node.get_addr()?.to_str()?.to_string(),
-            root_hash: node.get_root_hash()?.to_str()?.to_string(),
-            client: node.get_handle()?,
-            noise_static_pub: pubkey,
-            signing_pub: Box::new(signing_pub),
-        },
+        EventType::Add => {
+            let client = if node.has_handle() {
+                Some(node.get_handle()?)
+            } else {
+                None
+            };
+
+            TopologyEvent::Join {
+                id,
+                hostname: node.get_hostname()?.to_str()?.to_string(),
+                address: node.get_addr()?.to_str()?.to_string(),
+                root_hash: node.get_root_hash()?.to_str()?.to_string(),
+                client,
+                noise_static_pub: pubkey,
+                signing_pub: Box::new(signing_pub),
+            }
+        }
         EventType::Remove => TopologyEvent::Leave { id },
         EventType::Suspect => TopologyEvent::Suspect { id },
     };
@@ -464,8 +472,12 @@ pub fn add_event(
             node.set_public_key(&noise_static_pub.to_bytes());
             node.set_signing_key(&signing_pub.to_bytes());
 
-            // Set the handle as a Cap’n Proto client
-            node.set_handle(client.clone());
+            if let Some(client) = client {
+                // Only embed our own handle; forwarding a capability learned from another peer
+                // can’t be re-exported on this connection safely.
+                // Set the handle as a Cap’n Proto client only when available locally.
+                node.set_handle(client.clone());
+            }
         }
 
         TopologyEvent::Leave { id } => {

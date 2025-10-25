@@ -39,7 +39,11 @@ pub enum TopologyEvent {
         hostname: String,
         address: String,
         root_hash: String,
-        client: server::Client,
+        /// Server capability exported by the node that originated the gossip message.
+        /// We keep this optional so downstream peers can drop handles they cannot re-export
+        /// safely (re-exporting an imported capability over the same connection causes capnp
+        /// to panic).
+        client: Option<server::Client>,
         noise_static_pub: PublicKey,
         signing_pub: Box<VerifyingKey>,
     },
