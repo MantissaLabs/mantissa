@@ -21,7 +21,7 @@ use nix::sched::{CloneFlags, setns};
 
 #[derive(Clone)]
 pub struct AttachmentProvisioner {
-    handle: Handle,
+    handle: Option<Handle>,
 }
 
 impl Default for AttachmentProvisioner {
@@ -35,14 +35,28 @@ impl AttachmentProvisioner {
         let (connection, handle, _) =
             rtnetlink::new_connection().context("failed to open rtnetlink connection")?;
         tokio::spawn(connection);
-        Ok(Self { handle })
+        Ok(Self {
+            handle: Some(handle),
+        })
+    }
+
+    pub fn unavailable() -> Self {
+        Self { handle: None }
+    }
+
+    fn handle(&self) -> Option<&Handle> {
+        self.handle.as_ref()
     }
 
     pub async fn attachment_exists(&self, attachment_id: Uuid) -> Result<bool> {
+        let Some(handle) = self.handle() else {
+            return Ok(false);
+        };
         let host_if = host_iface_name(attachment_id);
-        Ok(self.link_index(&host_if).await?.is_some())
+        Ok(self.link_index_inner(handle, &host_if).await?.is_some())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn ensure_attachment(
         &self,
         _network_id: Uuid,
@@ -54,26 +68,35 @@ impl AttachmentProvisioner {
         prefix: u8,
         mac: &str,
     ) -> Result<()> {
+        let Some(handle) = self.handle() else {
+            debug!(
+                target: "task",
+                attachment = %attachment_id,
+                "skipping attachment provisioning; rtnetlink unavailable"
+            );
+            return Ok(());
+        };
+
         let host_if = host_iface_name(attachment_id);
         let container_if = container_iface_name(attachment_id);
 
-        let host_index = match self.link_index(&host_if).await? {
+        let host_index = match self.link_index_inner(handle, &host_if).await? {
             Some(index) => index,
             None => {
-                self.create_veth(&host_if, &container_if).await?;
-                self.link_index(&host_if)
+                self.create_veth(handle, &host_if, &container_if).await?;
+                self.link_index_inner(handle, &host_if)
                     .await?
                     .context("veth host interface missing after creation")?
             }
         };
 
         let container_index = self
-            .link_index(&container_if)
+            .link_index_inner(handle, &container_if)
             .await?
             .context("veth peer interface missing after creation")?;
 
         if mtu > 0 {
-            self.handle
+            handle
                 .link()
                 .set(LinkUnspec::new_with_index(host_index).mtu(mtu).build())
                 .execute()
@@ -82,11 +105,11 @@ impl AttachmentProvisioner {
         }
 
         let bridge_index = self
-            .link_index(bridge_name)
+            .link_index_inner(handle, bridge_name)
             .await?
             .context("bridge missing while configuring attachment")?;
 
-        self.handle
+        handle
             .link()
             .set(
                 LinkUnspec::new_with_index(host_index)
@@ -97,7 +120,7 @@ impl AttachmentProvisioner {
             .await
             .with_context(|| format!("failed to enslave {host_if} to {bridge_name}"))?;
 
-        self.handle
+        handle
             .link()
             .set(LinkUnspec::new_with_index(host_index).up().build())
             .execute()
@@ -108,7 +131,7 @@ impl AttachmentProvisioner {
             .try_into()
             .context("container pid is negative")?;
 
-        self.handle
+        handle
             .link()
             .set(
                 LinkUnspec::new_with_index(container_index)
@@ -164,9 +187,12 @@ impl AttachmentProvisioner {
     }
 
     pub async fn teardown_attachment(&self, attachment_id: Uuid) -> Result<()> {
+        let Some(handle) = self.handle() else {
+            return Ok(());
+        };
         let host_if = host_iface_name(attachment_id);
-        if let Some(index) = self.link_index(&host_if).await? {
-            self.handle
+        if let Some(index) = self.link_index_inner(handle, &host_if).await? {
+            handle
                 .link()
                 .del(index)
                 .execute()
@@ -182,13 +208,19 @@ impl AttachmentProvisioner {
         mac: &str,
         dst: std::net::IpAddr,
     ) -> Result<bool> {
+        let Some(handle) = self.handle() else {
+            return Ok(false);
+        };
         let vxlan_index = self
-            .link_index(vxlan_name)
+            .link_index_inner(handle, vxlan_name)
             .await?
             .context("vxlan interface missing while programming fdb")?;
 
         let mac_bytes = parse_mac(mac)?;
-        match self.program_fdb_entry(vxlan_index, &mac_bytes, dst).await {
+        match self
+            .program_fdb_entry(handle, vxlan_index, &mac_bytes, dst)
+            .await
+        {
             Ok(()) => {
                 debug!(
                     target: "network",
@@ -224,14 +256,20 @@ impl AttachmentProvisioner {
         mac: &str,
         dst: std::net::IpAddr,
     ) -> Result<()> {
-        let vxlan_index = match self.link_index(vxlan_name).await? {
+        let Some(handle) = self.handle() else {
+            return Ok(());
+        };
+        let vxlan_index = match self.link_index_inner(handle, vxlan_name).await? {
             Some(idx) => idx,
             None => return Ok(()),
         };
 
         let mac_bytes = parse_mac(mac)?;
 
-        if let Err(err) = self.delete_fdb_entry(vxlan_index, &mac_bytes, dst).await {
+        if let Err(err) = self
+            .delete_fdb_entry(handle, vxlan_index, &mac_bytes, dst)
+            .await
+        {
             warn_unless_not_found(err, || format!("remove fdb entry {mac} -> {dst}"));
         }
 
@@ -252,8 +290,8 @@ impl AttachmentProvisioner {
             .await
     }
 
-    async fn create_veth(&self, host_if: &str, container_if: &str) -> Result<()> {
-        self.handle
+    async fn create_veth(&self, handle: &Handle, host_if: &str, container_if: &str) -> Result<()> {
+        handle
             .link()
             .add(LinkVeth::new(host_if, container_if).build())
             .execute()
@@ -263,12 +301,14 @@ impl AttachmentProvisioner {
     }
 
     async fn link_index(&self, name: &str) -> Result<Option<u32>> {
-        let mut stream = self
-            .handle
-            .link()
-            .get()
-            .match_name(name.to_string())
-            .execute();
+        let Some(handle) = self.handle() else {
+            return Ok(None);
+        };
+        self.link_index_inner(handle, name).await
+    }
+
+    async fn link_index_inner(&self, handle: &Handle, name: &str) -> Result<Option<u32>> {
+        let mut stream = handle.link().get().match_name(name.to_string()).execute();
 
         loop {
             match stream.try_next().await {
@@ -278,7 +318,7 @@ impl AttachmentProvisioner {
                     let raw = message.raw_code();
                     let errno = raw.abs();
                     if errno == libc::ENODEV || errno == libc::ENOENT {
-                        tracing::debug!(
+                        debug!(
                             target: "task",
                             link = name,
                             errno,
@@ -299,6 +339,7 @@ impl AttachmentProvisioner {
 
     async fn program_fdb_entry(
         &self,
+        handle: &Handle,
         vxlan_index: u32,
         mac: &[u8],
         dst: IpAddr,
@@ -327,7 +368,7 @@ impl AttachmentProvisioner {
             return self.submit_request(request).await;
         }
 
-        self.handle
+        handle
             .neighbours()
             .add_bridge(vxlan_index, mac)
             .flags(NeighbourFlags::Own)
@@ -339,6 +380,7 @@ impl AttachmentProvisioner {
 
     async fn delete_fdb_entry(
         &self,
+        _handle: &Handle,
         vxlan_index: u32,
         mac: &[u8],
         dst: IpAddr,
@@ -364,14 +406,14 @@ impl AttachmentProvisioner {
         self.submit_request(request).await
     }
 
-    /// Send a raw rtnetlink message through the shared handle and drain the
-    /// response stream so that ACK or error messages are handled immediately.
     async fn submit_request(
         &self,
         request: NetlinkMessage<RouteNetlinkMessage>,
     ) -> Result<(), rtnetlink::Error> {
-        let mut handle = self.handle.clone();
-        let mut responses = handle.request(request)?;
+        let Some(handle) = self.handle() else {
+            return Ok(());
+        };
+        let mut responses = handle.clone().request(request)?;
         while let Some(message) = responses.next().await {
             if let NetlinkPayload::Error(err) = message.payload {
                 return Err(rtnetlink::Error::NetlinkError(err));
@@ -421,17 +463,15 @@ fn configure_container_interface_blocking(
     let target_ns = File::open(format!("/proc/{container_pid}/ns/net"))
         .context("open container network namespace")?;
 
-    unsafe { setns(&target_ns, CloneFlags::empty()) }
-        .context("enter container network namespace")?;
+    setns(&target_ns, CloneFlags::empty()).context("enter container network namespace")?;
 
     let configure_result =
         configure_interface_in_current_ns(&iface, mtu, assigned_ip, prefix, mac_bytes);
 
     let restore_result =
-        unsafe { setns(&host_ns, CloneFlags::empty()) }.context("restore host network namespace");
+        setns(&host_ns, CloneFlags::empty()).context("restore host network namespace");
 
     if let Err(err) = configure_result {
-        // Ensure we restore even when configuration fails.
         restore_result?;
         return Err(err);
     }
@@ -501,8 +541,6 @@ fn configure_interface_in_current_ns(
             .await
             .context("bring container overlay interface up")?;
 
-        // A connected route for the prefix is added automatically when the
-        // address is configured. Nothing further required here.
         Ok(())
     })
 }

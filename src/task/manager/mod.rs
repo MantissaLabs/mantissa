@@ -19,7 +19,9 @@ use async_channel::{Receiver, Sender};
 use bollard::errors::Error as BollardError;
 use crdt_store::uuid_key::UuidKey;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc::UnboundedSender};
@@ -92,17 +94,14 @@ impl TaskManager {
         secret_keyring: Arc<RwLock<SecretKeyring>>,
         forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
     ) -> Self {
-        let secret_runtime_root = std::env::temp_dir()
-            .join("mantissa")
-            .join("secrets")
-            .join(local_node_id.to_string());
+        let secret_runtime_root = resolve_secret_runtime_root(local_node_id);
 
         let attachment_provisioner = AttachmentProvisioner::new().unwrap_or_else(|err| {
             warn!(
                 target: "network",
                 "failed to initialize attachment provisioner: {err}"
             );
-            AttachmentProvisioner::default()
+            AttachmentProvisioner::unavailable()
         });
 
         Self {
@@ -465,6 +464,66 @@ impl TaskManager {
         }
 
         Ok(readiness)
+    }
+}
+
+fn resolve_secret_runtime_root(local_node_id: Uuid) -> PathBuf {
+    let tmp_root = std::env::temp_dir();
+    let mut bases: Vec<PathBuf> = Vec::new();
+    bases.push(tmp_root.join("mantissa").join("secrets"));
+    if let Some(user_tag) = temp_user_tag() {
+        bases.push(
+            tmp_root
+                .join(format!("mantissa-{user_tag}"))
+                .join("secrets"),
+        );
+    }
+    bases.push(
+        tmp_root
+            .join(format!("mantissa-pid-{}", std::process::id()))
+            .join("secrets"),
+    );
+    if let Ok(cwd) = std::env::current_dir() {
+        bases.push(cwd.join("tmp").join("mantissa").join("secrets"));
+    }
+
+    for base in bases {
+        if ensure_dir_writable(&base).is_ok() {
+            return base.join(local_node_id.to_string());
+        }
+    }
+
+    let fallback_base = tmp_root.join(format!("mantissa-fallback-{}", Uuid::new_v4()));
+    ensure_dir_writable(&fallback_base)
+        .expect("unable to provision writable secret staging base directory");
+    fallback_base.join(local_node_id.to_string())
+}
+
+fn temp_user_tag() -> Option<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn ensure_dir_writable(base: &Path) -> io::Result<()> {
+    fs::create_dir_all(base)?;
+    let probe = base.join(".write_check");
+    match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            fs::remove_file(&probe)?;
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => Err(err),
+        Err(err) => {
+            fs::remove_file(&probe).ok();
+            Err(err)
+        }
     }
 }
 

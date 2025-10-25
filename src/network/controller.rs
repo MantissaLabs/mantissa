@@ -60,7 +60,7 @@ impl NetworkController {
         let provisioner = platform::NetworkProvisioner::new()?;
         let attachment = PlatformAttachmentProvisioner::new().unwrap_or_else(|err| {
             warn!(target: "network", "failed to initialize attachment provisioner: {err}");
-            PlatformAttachmentProvisioner::default()
+            PlatformAttachmentProvisioner::unavailable()
         });
 
         Ok(Self {
@@ -138,7 +138,7 @@ impl NetworkController {
     }
 
     async fn forwarding_event_loop(&self) {
-        let mut receiver = {
+        let receiver = {
             let mut guard = self.inner.forwarding_events.lock().await;
             guard.take()
         };
@@ -611,7 +611,7 @@ mod platform {
 
     #[derive(Clone)]
     pub struct NetworkProvisioner {
-        handle: Handle,
+        handle: Option<Handle>,
         underlay: Arc<AsyncMutex<Option<(u32, IpAddr)>>>,
     }
 
@@ -626,18 +626,48 @@ mod platform {
         pub fn new() -> Result<Self> {
             Self::ensure_vxlan_module().context("load vxlan kernel module")?;
 
-            let (connection, handle, _) =
-                new_connection().context("failed to open rtnetlink connection")?;
+            match new_connection() {
+                Ok((connection, handle, _)) => {
+                    tokio::spawn(connection);
+                    Ok(Self {
+                        handle: Some(handle),
+                        underlay: Arc::new(AsyncMutex::new(None)),
+                    })
+                }
+                Err(err) => {
+                    debug!(
+                        target: "network",
+                        "failed to open rtnetlink connection for network provisioner: {err}"
+                    );
+                    Ok(Self::unavailable())
+                }
+            }
+        }
 
-            tokio::spawn(connection);
-
-            Ok(Self {
-                handle,
+        /// Returns a provisioning stub for environments without kernel networking access.
+        pub fn unavailable() -> Self {
+            Self {
+                handle: None,
                 underlay: Arc::new(AsyncMutex::new(None)),
-            })
+            }
+        }
+
+        fn handle(&self) -> Option<&Handle> {
+            self.handle.as_ref()
         }
 
         pub async fn ensure_network(&self, plan: &NetworkPlan) -> Result<()> {
+            if self.handle.is_none() {
+                debug!(
+                    target: "network",
+                    network = %plan.network_id,
+                    vxlan = %plan.vxlan_name,
+                    bridge = %plan.bridge_name,
+                    "skipping network provisioning; rtnetlink unavailable"
+                );
+                return Ok(());
+            }
+
             info!(
                 target: "network",
                 vxlan = %plan.vxlan_name,
@@ -720,8 +750,12 @@ mod platform {
         }
 
         pub async fn teardown_network(&self, plan: &NetworkPlan) -> Result<()> {
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
             if let Some(index) = self.find_link(&plan.vxlan_name).await? {
-                self.handle
+                handle
                     .link()
                     .del(index)
                     .execute()
@@ -730,7 +764,7 @@ mod platform {
             }
 
             if let Some(index) = self.find_link(&plan.bridge_name).await? {
-                self.handle
+                handle
                     .link()
                     .del(index)
                     .execute()
@@ -742,6 +776,10 @@ mod platform {
         }
 
         async fn ensure_vxlan(&self, plan: &NetworkPlan) -> Result<u32> {
+            let handle = self
+                .handle()
+                .ok_or_else(|| anyhow!("rtnetlink handle unavailable"))?;
+
             if let Some(index) = self.find_link(&plan.vxlan_name).await? {
                 if let Err(err) = self.configure_existing_vxlan(index, &plan.vxlan_name).await {
                     warn!(
@@ -818,7 +856,7 @@ mod platform {
                     }
                 };
 
-                match self.handle.link().add(builder.build()).execute().await {
+                match handle.link().add(builder.build()).execute().await {
                     Ok(()) => {
                         let index = self
                             .find_link(&plan.vxlan_name)
@@ -917,6 +955,10 @@ mod platform {
         }
 
         async fn configure_existing_vxlan(&self, index: u32, name: &str) -> Result<()> {
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
             let request = LinkMessageBuilder::<LinkVxlan>::new_with_info_kind(InfoKind::Vxlan)
                 .index(index)
                 .learning(false)
@@ -926,7 +968,7 @@ mod platform {
                 .l3miss(false)
                 .build();
 
-            self.handle
+            handle
                 .link()
                 .set(request)
                 .execute()
@@ -940,6 +982,10 @@ mod platform {
             _bridge_index: u32,
             name: &str,
         ) -> Result<()> {
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
             // Encode the bridge proto info attributes manually so we can set the
             // NLA_F_NESTED flag on IFLA_PROTINFO. The kernel rejects the update
             // if the payload is not marked nested.
@@ -992,7 +1038,7 @@ mod platform {
                 )))
                 .build();
 
-            self.handle
+            handle
                 .link()
                 .set(request)
                 .execute()
@@ -1018,7 +1064,11 @@ mod platform {
         }
 
         async fn log_bridge_port_state(&self, index: u32, name: &str) -> Result<()> {
-            let mut stream = self.handle.link().get().match_index(index).execute();
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
+            let mut stream = handle.link().get().match_index(index).execute();
             while let Some(msg) = stream.try_next().await? {
                 let mut learning = None;
                 let mut neigh_suppress = None;
@@ -1084,7 +1134,12 @@ mod platform {
                 bridge = %plan.bridge_name,
                 "provisioner: creating bridge"
             );
-            self.handle
+
+            let handle = self
+                .handle()
+                .ok_or_else(|| anyhow!("rtnetlink handle unavailable"))?;
+
+            handle
                 .link()
                 .add(LinkBridge::new(&plan.bridge_name).build())
                 .execute()
@@ -1099,6 +1154,10 @@ mod platform {
         }
 
         async fn set_up(&self, index: u32) -> Result<()> {
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
             let name = self
                 .link_name(index)
                 .await
@@ -1110,7 +1169,7 @@ mod platform {
                 link_index = index,
                 "provisioner: bringing link up"
             );
-            self.handle
+            handle
                 .link()
                 .set(LinkUnspec::new_with_index(index).up().build())
                 .execute()
@@ -1129,6 +1188,11 @@ mod platform {
             if mtu == 0 {
                 return Ok(());
             }
+
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
             let name = self
                 .link_name(index)
                 .await
@@ -1141,7 +1205,7 @@ mod platform {
                 mtu,
                 "provisioner: updating mtu"
             );
-            self.handle
+            handle
                 .link()
                 .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
                 .execute()
@@ -1158,6 +1222,10 @@ mod platform {
         }
 
         async fn attach_master(&self, link_index: u32, master_index: u32) -> Result<()> {
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
             let link_name = self
                 .link_name(link_index)
                 .await
@@ -1177,7 +1245,7 @@ mod platform {
                 bridge_index = master_index,
                 "provisioner: attaching link to bridge"
             );
-            self.handle
+            handle
                 .link()
                 .set(
                     LinkUnspec::new_with_index(link_index)
@@ -1203,12 +1271,11 @@ mod platform {
         }
 
         async fn find_link(&self, name: &str) -> Result<Option<u32>> {
-            let mut stream = self
-                .handle
-                .link()
-                .get()
-                .match_name(name.to_string())
-                .execute();
+            let Some(handle) = self.handle() else {
+                return Ok(None);
+            };
+
+            let mut stream = handle.link().get().match_name(name.to_string()).execute();
 
             loop {
                 match stream.try_next().await {
@@ -1284,7 +1351,11 @@ mod platform {
             // Walk all links and choose the first non-loopback interface that is up
             // and has an assigned IP address. Prefer IPv4 addresses but fall back to
             // IPv6 if needed.
-            let mut link_stream = self.handle.link().get().execute();
+            let Some(handle) = self.handle() else {
+                return Err(anyhow!("rtnetlink handle unavailable"));
+            };
+
+            let mut link_stream = handle.link().get().execute();
 
             while let Some(link) = link_stream
                 .try_next()
@@ -1321,8 +1392,7 @@ mod platform {
                     continue;
                 }
 
-                let mut addr_stream = self
-                    .handle
+                let mut addr_stream = handle
                     .address()
                     .get()
                     .set_link_index_filter(index)
@@ -1382,7 +1452,11 @@ mod platform {
         }
 
         async fn link_name(&self, index: u32) -> Result<Option<String>> {
-            let mut links = self.handle.link().get().match_index(index).execute();
+            let Some(handle) = self.handle() else {
+                return Ok(None);
+            };
+
+            let mut links = handle.link().get().match_index(index).execute();
             while let Some(link) = links.try_next().await? {
                 for nla in link.attributes.into_iter() {
                     if let LinkAttribute::IfName(name) = nla {
@@ -1395,7 +1469,11 @@ mod platform {
 
         async fn collect_link_inventory(&self) -> Result<Vec<String>> {
             let mut entries = Vec::new();
-            let mut stream = self.handle.link().get().execute();
+            let Some(handle) = self.handle() else {
+                return Ok(entries);
+            };
+
+            let mut stream = handle.link().get().execute();
             while let Some(link) = stream.try_next().await? {
                 let index = link.header.index;
                 let mut name = format!("ifindex{index}");

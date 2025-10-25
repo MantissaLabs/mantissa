@@ -26,6 +26,10 @@ impl AttachmentProvisioner {
         Ok(Self)
     }
 
+    pub fn unavailable() -> Self {
+        Self
+    }
+
     pub async fn attachment_exists(&self, _attachment_id: Uuid) -> Result<bool> {
         Ok(false)
     }

@@ -10,7 +10,6 @@ use common::testkit::{
     ClusterConfig, ContainerManagerOverrideGuard, InMemoryContainerManager, TestNode,
 };
 use crdt_store::uuid_key::UuidKey;
-use mantissa::network::types::compute_network_id;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
     ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
@@ -827,17 +826,9 @@ fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskS
         .tasks
         .iter()
         .map(|task| {
-            let mut networks: Vec<ServiceTaskNetworkRequirement> = task
-                .networks
-                .iter()
-                .map(|network| {
-                    let name = network.trim().to_string();
-                    let network_id = compute_network_id(&name);
-                    ServiceTaskNetworkRequirement::new(name, network_id)
-                })
-                .collect();
-            networks.sort_by(|a, b| a.network_id.cmp(&b.network_id));
-            networks.dedup_by(|a, b| a.network_id == b.network_id);
+            // Tests run without kernel networking support, so we avoid provisioning
+            // any overlay interfaces by submitting empty network requirements.
+            let networks: Vec<ServiceTaskNetworkRequirement> = Vec::new();
 
             ServiceTaskSpecValue {
                 name: task.name.clone(),
