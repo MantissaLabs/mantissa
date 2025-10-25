@@ -396,16 +396,27 @@ local_test!(task_manager_stages_secret_env_and_files, {
     let data = fs::read(&host_path).await.expect("read staged secret");
     assert_eq!(data, secret_plaintext);
 
-    let expected_root = std::env::temp_dir()
-        .join("mantissa")
-        .join("secrets")
-        .join(node_id.to_string())
-        .join(spec.id.to_string());
-    assert!(
-        host_path.starts_with(&expected_root),
-        "staged secret should live under {}, actual {}",
-        expected_root.display(),
-        host_path.display()
+    let staging_dir = host_path
+        .parent()
+        .expect("staged secret file should have parent directory");
+    assert_eq!(
+        staging_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("staged directory name"),
+        spec.id.to_string(),
+        "staged directory should match task id"
+    );
+    let node_dir = staging_dir
+        .parent()
+        .expect("staged directory should have node parent");
+    assert_eq!(
+        node_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("node directory name"),
+        node_id.to_string(),
+        "staged path should contain node id"
     );
 
     manager
