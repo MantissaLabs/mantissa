@@ -240,6 +240,13 @@ impl NetworkSpecValue {
     }
 }
 
+/// Gossip-carried updates to the replicated network specification set.
+#[derive(Clone, Debug)]
+pub enum NetworkEvent {
+    /// Insert or update a network specification snapshot.
+    Upsert(NetworkSpecValue),
+}
+
 /// Replicated peer reconciliation state for a network.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NetworkPeerStateValue {

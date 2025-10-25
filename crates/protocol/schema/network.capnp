@@ -97,6 +97,15 @@ struct NetworkAttachmentSpec {
   error @10 :Text;
 }
 
+struct NetworkEvent {
+  event @0 :EventType;
+  spec @1 :NetworkSpec;
+
+  enum EventType {
+    upsert @0;
+  }
+}
+
 interface Networks {
   create @0 (spec :NetworkCreateSpec) -> (networkId :Data);
   delete @1 (ids :List(Data));

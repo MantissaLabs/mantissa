@@ -5,6 +5,8 @@
 //! other nodes in the cluster based on events and updates to be applied.
 //!
 
+use crate::network::service::{read_network_event, write_network_event};
+use crate::network::types::NetworkEvent;
 use crate::services::service::{read_service_event, write_service_event};
 use crate::services::types::ServiceEvent;
 use crate::task::service as task_service;
@@ -47,6 +49,7 @@ pub enum Message {
     Topology { id: Uuid, event: TopologyEvent },
     Task { id: Uuid, event: TaskEvent },
     Service { id: Uuid, event: ServiceEvent },
+    Network { id: Uuid, event: NetworkEvent },
     // Scheduling(SchedulingEvent),
 }
 
@@ -56,7 +59,8 @@ impl Message {
             Message::Void { id }
             | Message::Topology { id, .. }
             | Message::Task { id, .. }
-            | Message::Service { id, .. } => *id,
+            | Message::Service { id, .. }
+            | Message::Network { id, .. } => *id,
         }
     }
 }
@@ -72,6 +76,7 @@ pub struct Channels {
     pub topology_events: Sender<Message>,
     pub task_events: Sender<Message>,
     pub service_events: Sender<Message>,
+    pub network_events: Sender<Message>,
     // scheduling_events: Sender<SchedulingEvent>,
 }
 
@@ -84,6 +89,7 @@ impl gossip::Server for Gossip {
         let topo_tx = self.chans.topology_events.clone();
         let task_tx = self.chans.task_events.clone();
         let service_tx = self.chans.service_events.clone();
+        let network_tx = self.chans.network_events.clone();
 
         Promise::from_future(async move {
             let msgs = params.get().unwrap().get_messages();
@@ -149,6 +155,20 @@ impl gossip::Server for Gossip {
                     },
                     Service(Err(e)) => {
                         eprintln!("Error reading service: {e}");
+                    }
+                    Network(Ok(reader)) => match read_network_event(reader) {
+                        Ok(event) => {
+                            let message = Message::Network { id, event };
+                            network_tx.send(message).await.map_err(|e| {
+                                capnp::Error::failed(format!(
+                                    "Couldn't send event to networks: {e}"
+                                ))
+                            })?;
+                        }
+                        Err(e) => eprintln!("Failed to convert network event: {e}"),
+                    },
+                    Network(Err(e)) => {
+                        eprintln!("Error reading network: {e}");
                     }
                 }
             }
@@ -261,6 +281,10 @@ where
                 let service_builder = builder.init_service();
                 write_service_event(service_builder, event)?;
             }
+            Message::Network { event, .. } => {
+                let network_builder = builder.init_network();
+                write_network_event(network_builder, event)?;
+            }
         }
     }
 
@@ -285,6 +309,7 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
         // Task updates replicate to every peer regardless of assignment so keep them.
         Message::Task { .. } => false,
         Message::Service { .. } => false,
+        Message::Network { .. } => false,
     }
 }
 

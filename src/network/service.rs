@@ -1,12 +1,13 @@
+use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    NetworkAttachmentValue, NetworkDriver, NetworkPeerStateValue, NetworkSpecValue, NetworkStatus,
-    compute_network_id,
+    NetworkAttachmentValue, NetworkDriver, NetworkEvent, NetworkPeerStateValue, NetworkSpecValue,
+    NetworkStatus, compute_network_id,
 };
 use capnp::Error;
 use capnp::capability::Promise;
 use protocol::network::{
-    network_attachment_spec, network_create_spec, network_peer_status, network_spec,
+    network_attachment_spec, network_create_spec, network_event, network_peer_status, network_spec,
     network_summary, networks,
 };
 use std::collections::HashMap;
@@ -16,27 +17,13 @@ use uuid::Uuid;
 /// Cap'n Proto RPC surface for creating, listing, and inspecting overlay networks.
 pub struct NetworksRpc {
     registry: NetworkRegistry,
+    gossiper: NetworkGossiper,
 }
 
 impl NetworksRpc {
     /// Construct the RPC service backed by the provided registry.
-    pub fn new(registry: NetworkRegistry) -> Self {
-        Self { registry }
-    }
-
-    fn to_capnp<E: std::fmt::Display>(error: E) -> Error {
-        Error::failed(error.to_string())
-    }
-
-    fn read_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
-        let data = bytes.to_owned();
-        if data.len() != 16 {
-            return Err(Error::failed(format!(
-                "invalid uuid length (expected 16, got {})",
-                data.len()
-            )));
-        }
-        Uuid::from_slice(&data).map_err(Self::to_capnp)
+    pub fn new(registry: NetworkRegistry, gossiper: NetworkGossiper) -> Self {
+        Self { registry, gossiper }
     }
 
     fn read_non_empty_text(text: capnp::text::Reader<'_>, field: &str) -> Result<String, Error> {
@@ -59,109 +46,182 @@ impl NetworksRpc {
             .to_string())
     }
 
-    fn convert_driver(driver: protocol::network::NetworkDriver) -> NetworkDriver {
-        NetworkDriver::from_proto(driver)
-    }
-
-    fn write_spec(mut builder: network_spec::Builder<'_>, spec: &NetworkSpecValue) {
-        builder.set_id(spec.id.as_bytes());
-        builder.set_name(&spec.name);
-        builder.set_description(&spec.description);
-        builder.set_driver(spec.driver.to_proto());
-        builder.set_subnet_cidr(&spec.subnet_cidr);
-        builder.set_vni(spec.vni);
-        builder.set_mtu(spec.mtu);
-        builder.set_created_at(&spec.created_at);
-        builder.set_updated_at(&spec.updated_at);
-        builder.set_status(spec.status.to_proto());
-        builder.set_sealed(spec.sealed);
-
-        let mut programs = builder
-            .reborrow()
-            .init_bpf_programs(spec.bpf_programs.len() as u32);
-        for (idx, program) in spec.bpf_programs.iter().enumerate() {
-            programs.set(idx as u32, program);
-        }
-    }
-
-    fn write_summary(
-        mut builder: network_summary::Builder<'_>,
-        spec: &NetworkSpecValue,
-        peer_counts: &(u32, u32),
-    ) {
-        builder.set_id(spec.id.as_bytes());
-        builder.set_name(&spec.name);
-        builder.set_driver(spec.driver.to_proto());
-        builder.set_status(spec.status.to_proto());
-        builder.set_vni(spec.vni);
-        builder.set_subnet_cidr(&spec.subnet_cidr);
-        builder.set_peer_count(peer_counts.0);
-        builder.set_ready_peers(peer_counts.1);
-        builder.set_created_at(&spec.created_at);
-        builder.set_updated_at(&spec.updated_at);
-    }
-
-    fn write_peer_status(
-        mut builder: network_peer_status::Builder<'_>,
-        state: &NetworkPeerStateValue,
-    ) {
-        builder.set_peer_id(state.peer_id.as_bytes());
-        builder.set_peer_name(&state.peer_name);
-        builder.set_state(state.state.to_proto());
-        builder.set_updated_at(&state.updated_at);
-        if let Some(err) = &state.error {
-            builder.set_error(err);
-        } else {
-            builder.set_error("");
-        }
-    }
-
-    fn write_attachment(
-        mut builder: network_attachment_spec::Builder<'_>,
-        attachment: &NetworkAttachmentValue,
-    ) {
-        builder.set_attachment_id(attachment.id.as_bytes());
-        builder.set_task_id(attachment.task_id.as_bytes());
-        builder.set_node_id(attachment.node_id.as_bytes());
-        builder.set_container_id(&attachment.container_id);
-        builder.set_network_id(attachment.network_id.as_bytes());
-        builder.set_requested_ip(attachment.requested_ip.as_deref().unwrap_or_default());
-        builder.set_assigned_ip(attachment.assigned_ip.as_deref().unwrap_or_default());
-        builder.set_mac(attachment.mac.as_deref().unwrap_or_default());
-        builder.set_created_at(&attachment.created_at);
-        builder.set_updated_at(&attachment.updated_at);
-        builder.set_state(attachment.state.to_proto());
-        if let Some(err) = &attachment.error {
-            builder.set_error(err);
-        } else {
-            builder.set_error("");
-        }
-    }
-
     fn driver_from_request(spec: &network_create_spec::Reader<'_>) -> Result<NetworkDriver, Error> {
         let driver = spec
             .get_driver()
             .map_err(|_| Error::failed("unsupported network driver".to_string()))?;
-        Ok(Self::convert_driver(driver))
+        Ok(convert_driver(driver))
+    }
+}
+
+fn to_capnp<E: std::fmt::Display>(error: E) -> Error {
+    Error::failed(error.to_string())
+}
+
+fn read_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
+    let data = bytes.to_owned();
+    if data.len() != 16 {
+        return Err(Error::failed(format!(
+            "invalid uuid length (expected 16, got {})",
+            data.len()
+        )));
+    }
+    Uuid::from_slice(&data).map_err(to_capnp)
+}
+
+fn convert_driver(driver: protocol::network::NetworkDriver) -> NetworkDriver {
+    NetworkDriver::from_proto(driver)
+}
+
+fn collect_bpf_programs(spec: &network_create_spec::Reader<'_>) -> Result<Vec<String>, Error> {
+    let mut programs = Vec::new();
+    for entry in spec.get_bpf_programs()?.iter() {
+        programs.push(entry?.to_str()?.to_string());
+    }
+    Ok(programs)
+}
+
+fn write_network_spec(mut builder: network_spec::Builder<'_>, spec: &NetworkSpecValue) {
+    builder.set_id(spec.id.as_bytes());
+    builder.set_name(&spec.name);
+    builder.set_description(&spec.description);
+    builder.set_driver(spec.driver.to_proto());
+    builder.set_subnet_cidr(&spec.subnet_cidr);
+    builder.set_vni(spec.vni);
+    builder.set_mtu(spec.mtu);
+    builder.set_created_at(&spec.created_at);
+    builder.set_updated_at(&spec.updated_at);
+    builder.set_status(spec.status.to_proto());
+    builder.set_sealed(spec.sealed);
+
+    let mut programs = builder
+        .reborrow()
+        .init_bpf_programs(spec.bpf_programs.len() as u32);
+    for (idx, program) in spec.bpf_programs.iter().enumerate() {
+        programs.set(idx as u32, program);
+    }
+}
+
+fn write_network_summary(
+    mut builder: network_summary::Builder<'_>,
+    spec: &NetworkSpecValue,
+    peer_counts: &(u32, u32),
+) {
+    builder.set_id(spec.id.as_bytes());
+    builder.set_name(&spec.name);
+    builder.set_driver(spec.driver.to_proto());
+    builder.set_status(spec.status.to_proto());
+    builder.set_vni(spec.vni);
+    builder.set_subnet_cidr(&spec.subnet_cidr);
+    builder.set_peer_count(peer_counts.0);
+    builder.set_ready_peers(peer_counts.1);
+    builder.set_created_at(&spec.created_at);
+    builder.set_updated_at(&spec.updated_at);
+}
+
+fn write_network_peer_status(
+    mut builder: network_peer_status::Builder<'_>,
+    state: &NetworkPeerStateValue,
+) {
+    builder.set_peer_id(state.peer_id.as_bytes());
+    builder.set_peer_name(&state.peer_name);
+    builder.set_state(state.state.to_proto());
+    builder.set_updated_at(&state.updated_at);
+    if let Some(err) = &state.error {
+        builder.set_error(err);
+    } else {
+        builder.set_error("");
+    }
+}
+
+fn write_network_attachment(
+    mut builder: network_attachment_spec::Builder<'_>,
+    attachment: &NetworkAttachmentValue,
+) {
+    builder.set_attachment_id(attachment.id.as_bytes());
+    builder.set_task_id(attachment.task_id.as_bytes());
+    builder.set_node_id(attachment.node_id.as_bytes());
+    builder.set_container_id(&attachment.container_id);
+    builder.set_network_id(attachment.network_id.as_bytes());
+    builder.set_requested_ip(attachment.requested_ip.as_deref().unwrap_or_default());
+    builder.set_assigned_ip(attachment.assigned_ip.as_deref().unwrap_or_default());
+    builder.set_mac(attachment.mac.as_deref().unwrap_or_default());
+    builder.set_created_at(&attachment.created_at);
+    builder.set_updated_at(&attachment.updated_at);
+    builder.set_state(attachment.state.to_proto());
+    if let Some(err) = &attachment.error {
+        builder.set_error(err);
+    } else {
+        builder.set_error("");
+    }
+}
+
+fn aggregate_peer_counts(
+    specs: &[NetworkSpecValue],
+    registry: &NetworkRegistry,
+) -> Result<HashMap<Uuid, (u32, u32)>, Error> {
+    let mut counts = registry.peer_counts().map_err(to_capnp)?;
+    for spec in specs {
+        counts.entry(spec.id).or_insert((0, 0));
+    }
+    Ok(counts)
+}
+
+fn read_network_spec(reader: network_spec::Reader<'_>) -> Result<NetworkSpecValue, Error> {
+    let id = read_uuid(reader.get_id()?)?;
+    let name = reader.get_name()?.to_str()?.to_string();
+    let description = reader.get_description()?.to_str()?.to_string();
+    let driver = convert_driver(reader.get_driver()?);
+    let subnet_cidr = reader.get_subnet_cidr()?.to_str()?.to_string();
+    let vni = reader.get_vni();
+    let mtu = reader.get_mtu();
+    let created_at = reader.get_created_at()?.to_str()?.to_string();
+    let updated_at = reader.get_updated_at()?.to_str()?.to_string();
+    let status = NetworkStatus::from_proto(reader.get_status()?);
+    let sealed = reader.get_sealed();
+
+    let mut bpf_programs = Vec::new();
+    for entry in reader.get_bpf_programs()?.iter() {
+        bpf_programs.push(entry?.to_str()?.to_string());
     }
 
-    fn collect_bpf_programs(spec: &network_create_spec::Reader<'_>) -> Result<Vec<String>, Error> {
-        let mut programs = Vec::new();
-        for entry in spec.get_bpf_programs()?.iter() {
-            programs.push(entry?.to_str()?.to_string());
-        }
-        Ok(programs)
-    }
+    Ok(NetworkSpecValue {
+        id,
+        name,
+        description,
+        driver,
+        subnet_cidr,
+        vni,
+        mtu,
+        created_at,
+        updated_at,
+        status,
+        sealed,
+        bpf_programs,
+    })
+}
 
-    fn aggregate_peer_counts(
-        specs: &[NetworkSpecValue],
-        registry: &NetworkRegistry,
-    ) -> Result<HashMap<Uuid, (u32, u32)>, Error> {
-        let mut counts = registry.peer_counts().map_err(Self::to_capnp)?;
-        for spec in specs {
-            counts.entry(spec.id).or_insert((0, 0));
+pub(crate) fn write_network_event(
+    mut builder: network_event::Builder<'_>,
+    event: &NetworkEvent,
+) -> Result<(), Error> {
+    match event {
+        NetworkEvent::Upsert(spec) => {
+            builder.set_event(network_event::EventType::Upsert);
+            let spec_builder = builder.reborrow().init_spec();
+            write_network_spec(spec_builder, spec);
         }
-        Ok(counts)
+    }
+    Ok(())
+}
+
+pub(crate) fn read_network_event(reader: network_event::Reader<'_>) -> Result<NetworkEvent, Error> {
+    match reader.get_event()? {
+        network_event::EventType::Upsert => {
+            let spec_reader = reader.get_spec()?;
+            let spec = read_network_spec(spec_reader)?;
+            Ok(NetworkEvent::Upsert(spec))
+        }
     }
 }
 
@@ -173,6 +233,7 @@ impl networks::Server for NetworksRpc {
         mut results: networks::CreateResults,
     ) -> Promise<(), Error> {
         let registry = self.registry.clone();
+        let gossiper = self.gossiper.clone();
 
         Promise::from_future(async move {
             let request = params.get()?;
@@ -185,10 +246,10 @@ impl networks::Server for NetworksRpc {
             let vni = spec_reader.get_vni();
             let mtu = spec_reader.get_mtu();
             let sealed = spec_reader.get_sealed();
-            let programs = Self::collect_bpf_programs(&spec_reader)?;
+            let programs = collect_bpf_programs(&spec_reader)?;
 
             let network_id = compute_network_id(&name);
-            let existing_spec = registry.get_spec(network_id).map_err(Self::to_capnp)?;
+            let existing_spec = registry.get_spec(network_id).map_err(to_capnp)?;
 
             let (mut spec_value, is_new) = match existing_spec {
                 Some(mut current) if current.is_deleted() => {
@@ -244,7 +305,13 @@ impl networks::Server for NetworksRpc {
             registry
                 .upsert_spec(spec_value.clone())
                 .await
-                .map_err(Self::to_capnp)?;
+                .map_err(to_capnp)?;
+
+            gossiper
+                .broadcast(NetworkEvent::Upsert(spec_value.clone()))
+                .await
+                .map_err(|e| Error::failed(e.to_string()))?;
+
             results.get().set_network_id(spec_value.id.as_bytes());
             Ok(())
         })
@@ -256,24 +323,30 @@ impl networks::Server for NetworksRpc {
         _results: networks::DeleteResults,
     ) -> Promise<(), Error> {
         let registry = self.registry.clone();
+        let gossiper = self.gossiper.clone();
         Promise::from_future(async move {
             let ids_reader = params.get()?.get_ids()?;
             for entry in ids_reader.iter() {
-                let uuid = Self::read_uuid(entry?)?;
-                if let Some(mut spec) = registry.get_spec(uuid).map_err(Self::to_capnp)? {
+                let uuid = read_uuid(entry?)?;
+                if let Some(mut spec) = registry.get_spec(uuid).map_err(to_capnp)? {
                     spec.mark_deleted();
-                    registry.upsert_spec(spec).await.map_err(Self::to_capnp)?;
+                    let spec_clone = spec.clone();
+                    registry.upsert_spec(spec).await.map_err(to_capnp)?;
+                    gossiper
+                        .broadcast(NetworkEvent::Upsert(spec_clone))
+                        .await
+                        .map_err(|e| Error::failed(e.to_string()))?;
                 }
 
                 registry
                     .remove_peer_states_for_network(uuid)
                     .await
-                    .map_err(Self::to_capnp)?;
+                    .map_err(to_capnp)?;
 
                 registry
                     .remove_attachments_for_network(uuid)
                     .await
-                    .map_err(Self::to_capnp)?;
+                    .map_err(to_capnp)?;
             }
             Ok(())
         })
@@ -287,18 +360,18 @@ impl networks::Server for NetworksRpc {
         let registry = self.registry.clone();
 
         Promise::from_future(async move {
-            let specs = registry.list_specs().map_err(Self::to_capnp)?;
+            let specs = registry.list_specs().map_err(to_capnp)?;
             let visible_specs: Vec<_> = specs
                 .into_iter()
                 .filter(|spec| !spec.is_deleted())
                 .collect();
-            let counts = Self::aggregate_peer_counts(&visible_specs, &registry)?;
+            let counts = aggregate_peer_counts(&visible_specs, &registry)?;
 
             let mut list = results.get().init_networks(visible_specs.len() as u32);
             for (idx, spec) in visible_specs.iter().enumerate() {
                 let peer_counts = counts.get(&spec.id).copied().unwrap_or((0, 0));
                 let builder = list.reborrow().get(idx as u32);
-                Self::write_summary(builder, spec, &peer_counts);
+                write_network_summary(builder, spec, &peer_counts);
             }
             Ok(())
         })
@@ -311,17 +384,15 @@ impl networks::Server for NetworksRpc {
     ) -> Promise<(), Error> {
         let registry = self.registry.clone();
         Promise::from_future(async move {
-            let id = Self::read_uuid(params.get()?.get_id()?)?;
+            let id = read_uuid(params.get()?.get_id()?)?;
             let spec = registry
                 .get_spec(id)
-                .map_err(Self::to_capnp)?
+                .map_err(to_capnp)?
                 .ok_or_else(|| Error::failed(format!("network {id} not found")))?;
 
-            let peers = registry
-                .list_peer_states(Some(id))
-                .map_err(Self::to_capnp)?;
+            let peers = registry.list_peer_states(Some(id)).map_err(to_capnp)?;
 
-            let attachment_counts = registry.attachment_counts().map_err(Self::to_capnp)?;
+            let attachment_counts = registry.attachment_counts().map_err(to_capnp)?;
             let attachment_count = attachment_counts
                 .get(&id)
                 .copied()
@@ -331,13 +402,13 @@ impl networks::Server for NetworksRpc {
             let mut builder = results.get().init_network();
             {
                 let spec_builder = builder.reborrow().init_spec();
-                Self::write_spec(spec_builder, &spec);
+                write_network_spec(spec_builder, &spec);
             }
 
             let mut peers_builder = builder.reborrow().init_peers(peers.len() as u32);
             for (idx, peer) in peers.iter().enumerate() {
                 let entry = peers_builder.reborrow().get(idx as u32);
-                Self::write_peer_status(entry, peer);
+                write_network_peer_status(entry, peer);
             }
 
             builder.set_attachment_count(attachment_count);
@@ -352,15 +423,13 @@ impl networks::Server for NetworksRpc {
     ) -> Promise<(), Error> {
         let registry = self.registry.clone();
         Promise::from_future(async move {
-            let id = Self::read_uuid(params.get()?.get_id()?)?;
-            let peers = registry
-                .list_peer_states(Some(id))
-                .map_err(Self::to_capnp)?;
+            let id = read_uuid(params.get()?.get_id()?)?;
+            let peers = registry.list_peer_states(Some(id)).map_err(to_capnp)?;
 
             let mut list = results.get().init_peers(peers.len() as u32);
             for (idx, peer) in peers.iter().enumerate() {
                 let entry = list.reborrow().get(idx as u32);
-                Self::write_peer_status(entry, peer);
+                write_network_peer_status(entry, peer);
             }
             Ok(())
         })
@@ -373,15 +442,13 @@ impl networks::Server for NetworksRpc {
     ) -> Promise<(), Error> {
         let registry = self.registry.clone();
         Promise::from_future(async move {
-            let id = Self::read_uuid(params.get()?.get_id()?)?;
-            let attachments = registry
-                .list_attachments(Some(id))
-                .map_err(Self::to_capnp)?;
+            let id = read_uuid(params.get()?.get_id()?)?;
+            let attachments = registry.list_attachments(Some(id)).map_err(to_capnp)?;
 
             let mut list = results.get().init_attachments(attachments.len() as u32);
             for (idx, attachment) in attachments.iter().enumerate() {
                 let builder = list.reborrow().get(idx as u32);
-                Self::write_attachment(builder, attachment);
+                write_network_attachment(builder, attachment);
             }
 
             Ok(())

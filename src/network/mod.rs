@@ -4,6 +4,8 @@ pub mod attachment;
 pub mod controller;
 pub mod events;
 #[cfg(target_os = "linux")]
+pub mod gossip;
+#[cfg(target_os = "linux")]
 pub mod registry;
 pub mod service;
 pub mod types;

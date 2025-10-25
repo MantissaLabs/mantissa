@@ -649,7 +649,9 @@ impl Topology {
                         error!("Failed to forward gossip event: {e}");
                     }
                 }
-                Ok(Message::Task { .. }) | Ok(Message::Service { .. }) => {
+                Ok(Message::Task { .. })
+                | Ok(Message::Service { .. })
+                | Ok(Message::Network { .. }) => {
                     // Intentionally ignored: handled by dedicated managers.
                 }
                 Err(async_channel::RecvError) => {

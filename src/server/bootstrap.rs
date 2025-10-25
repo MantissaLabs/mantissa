@@ -1,6 +1,7 @@
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::{DEFAULT_FANOUT, Message};
 use crate::network::controller::NetworkController;
+use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::service::NetworksRpc;
 use crate::registry::Registry;
@@ -136,6 +137,7 @@ pub(crate) struct Components {
     pub network_registry: NetworkRegistry,
     #[allow(dead_code)]
     pub network_controller: NetworkController,
+    pub network_gossiper: NetworkGossiper,
 }
 
 impl Bootstrap {
@@ -277,6 +279,8 @@ impl Bootstrap {
         let (task_tx, task_rx): (Sender<Message>, Receiver<Message>) = async_channel::bounded(128);
         let (service_tx, service_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(128);
+        let (network_tx, network_rx): (Sender<Message>, Receiver<Message>) =
+            async_channel::bounded(128);
 
         // gossip capability
         let gossip = crate::gossip::Gossip {
@@ -284,6 +288,7 @@ impl Bootstrap {
                 topology_events: topology_tx.clone(),
                 task_events: task_tx.clone(),
                 service_events: service_tx.clone(),
+                network_events: network_tx.clone(),
             },
         };
         let gossip_client = capnp_rpc::new_client(gossip);
@@ -388,6 +393,9 @@ impl Bootstrap {
             stores.network_attachments.clone(),
         );
 
+        let network_gossiper =
+            NetworkGossiper::new(network_registry.clone(), gossip_tx.clone(), network_rx);
+
         let (forwarding_tx, forwarding_rx) = mpsc::unbounded_channel();
 
         let task_manager = TaskManager::new(
@@ -424,7 +432,7 @@ impl Bootstrap {
             Some(forwarding_rx),
         )
         .map_err(|e| -> Box<dyn std::error::Error> { Box::<dyn std::error::Error>::from(e) })?;
-        let networks_service = NetworksRpc::new(network_registry.clone());
+        let networks_service = NetworksRpc::new(network_registry.clone(), network_gossiper.clone());
         let networks_client_cap: NetworksClient = capnp_rpc::new_client(networks_service);
 
         let secrets_service = SecretsService::new(
@@ -457,6 +465,7 @@ impl Bootstrap {
                 networks_client: networks_client_cap,
                 network_registry,
                 network_controller,
+                network_gossiper: network_gossiper,
             },
             gossip_rx,
         ))
@@ -559,6 +568,11 @@ impl Bootstrap {
         let mut service_runner = comps.service_controller.clone();
         tokio::task::spawn_local(async move {
             service_runner.run().await;
+        });
+
+        let gossiper = comps.network_gossiper.clone();
+        tokio::task::spawn_local(async move {
+            gossiper.run().await;
         });
 
         // Spawn gossip loop
