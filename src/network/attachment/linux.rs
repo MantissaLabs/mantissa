@@ -193,12 +193,31 @@ impl AttachmentProvisioner {
         };
         let host_if = host_iface_name(attachment_id);
         if let Some(index) = self.link_index_inner(handle, &host_if).await? {
-            handle
-                .link()
-                .del(index)
-                .execute()
-                .await
-                .with_context(|| format!("failed to delete interface {host_if}"))?;
+            if let Err(err) = handle.link().del(index).execute().await {
+                match err {
+                    rtnetlink::Error::NetlinkError(message) => {
+                        let raw = message.raw_code();
+                        let errno = raw.abs();
+                        if errno == libc::ENODEV || errno == libc::ENOENT || errno == libc::ENXIO {
+                            debug!(
+                                target: "task",
+                                link = host_if,
+                                errno,
+                                raw_code = raw,
+                                "interface already removed while deleting; ignoring"
+                            );
+                        } else {
+                            return Err(rtnetlink::Error::NetlinkError(message))
+                                .with_context(|| format!("failed to delete interface {host_if}"));
+                        }
+                    }
+                    other => {
+                        return Err(other).with_context(|| {
+                            format!("failed to delete interface {host_if}")
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }

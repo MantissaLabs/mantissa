@@ -24,7 +24,7 @@ use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
 use crate::task::types::{TaskStateKind, TaskValue};
 use ::health::{Config as HealthConfig, HealthMonitor};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_channel::bounded;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -158,6 +158,75 @@ impl AttachmentProvisionerApi for FakeAttachmentProvisioner {
     }
 
     async fn teardown_attachment(&self, attachment_id: Uuid) -> Result<()> {
+        let mut guard = self.attachments.lock().await;
+        guard.remove(&attachment_id);
+        Ok(())
+    }
+
+    async fn ensure_remote_fdb(
+        &self,
+        _vxlan_name: &str,
+        _mac: &str,
+        _dst: std::net::IpAddr,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn remove_remote_fdb(
+        &self,
+        _vxlan_name: &str,
+        _mac: &str,
+        _dst: std::net::IpAddr,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn ensure_flood_entry(&self, _vxlan_name: &str, _dst: std::net::IpAddr) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn remove_flood_entry(&self, _vxlan_name: &str, _dst: std::net::IpAddr) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FlakyAttachmentProvisioner {
+    attachments: AsyncMutex<HashSet<Uuid>>,
+    fail_next: AsyncMutex<bool>,
+}
+
+#[async_trait]
+impl AttachmentProvisionerApi for FlakyAttachmentProvisioner {
+    async fn attachment_exists(&self, attachment_id: Uuid) -> Result<bool> {
+        let guard = self.attachments.lock().await;
+        Ok(guard.contains(&attachment_id))
+    }
+
+    async fn ensure_attachment(
+        &self,
+        _network_id: Uuid,
+        _bridge_name: &str,
+        _mtu: u32,
+        attachment_id: Uuid,
+        _container_pid: i32,
+        _assigned_ip: &str,
+        _prefix: u8,
+        _mac: &str,
+    ) -> Result<()> {
+        let mut guard = self.attachments.lock().await;
+        guard.insert(attachment_id);
+        Ok(())
+    }
+
+    async fn teardown_attachment(&self, attachment_id: Uuid) -> Result<()> {
+        let mut flag = self.fail_next.lock().await;
+        if *flag {
+            *flag = false;
+            return Err(anyhow!("synthetic teardown failure"));
+        }
+        drop(flag);
+
         let mut guard = self.attachments.lock().await;
         guard.remove(&attachment_id);
         Ok(())
@@ -438,6 +507,8 @@ async fn stop_task_releases_slot_and_clears_resources() {
     assert!(matches!(stopped.state, ContainerState::Stopped));
     assert!(stopped.slot_ids.is_empty());
 
+    assert!(manager.inspect_task(spec.id).await.is_err());
+
     let created = mock_cm.created.lock().await.clone();
     assert_eq!(created.len(), 1);
     let stopped_list = mock_cm.stopped.lock().await.clone();
@@ -490,22 +561,17 @@ async fn list_tasks_respects_filters() {
         .list_tasks(&filter_running)
         .await
         .expect("list running");
-    assert!(
-        running_tasks
-            .iter()
-            .all(|task| matches!(task.state, ContainerState::Running))
-    );
+    assert!(running_tasks.is_empty());
 
     let filter_stopped = TaskStateFilter::new([TaskStateKind::Stopped]);
     let stopped_tasks = manager
         .list_tasks(&filter_stopped)
         .await
         .expect("list stopped");
-    assert!(
-        stopped_tasks
-            .iter()
-            .all(|task| matches!(task.state, ContainerState::Stopped))
-    );
+    assert!(stopped_tasks.is_empty());
+
+    let all_tasks = manager.list_tasks(&TaskStateFilter::all()).await.expect("list all");
+    assert!(all_tasks.is_empty());
 }
 
 #[tokio::test]
@@ -821,6 +887,84 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         .list_attachments_for_task(task_spec.id)
         .expect("list attachments after stop");
     assert!(attachments_after.is_empty());
+
+    assert!(manager.inspect_task(task_spec.id).await.is_err());
+}
+
+#[tokio::test]
+async fn stop_task_cleans_up_after_teardown_failure() {
+    let attachment: Arc<dyn AttachmentProvisionerApi> =
+        Arc::new(FlakyAttachmentProvisioner::default());
+    let (manager, scheduler, _mock_cm, network_registry) =
+        setup_manager_with_forwarding(None, Some(attachment)).await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024),
+        )])
+        .await
+        .expect("init slots");
+
+    let spec = NetworkSpecValue::new(
+        "flaky-net",
+        "flaky network",
+        NetworkDriver::Vxlan,
+        "10.99.0.0/24",
+        0,
+        0,
+        false,
+        vec![],
+    );
+    network_registry
+        .upsert_spec(spec.clone())
+        .await
+        .expect("upsert network spec");
+
+    let peer_state = NetworkPeerStateValue::new(
+        spec.id,
+        manager.local_node_id,
+        "local-node",
+        NetworkPeerState::Ready,
+        None,
+    );
+    network_registry
+        .upsert_peer_state(peer_state)
+        .await
+        .expect("upsert peer state");
+
+    let request = TaskStartRequest {
+        name: "flaky-task".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 200,
+        memory_bytes: 64 * 1_024 * 1_024,
+        id: None,
+        slot_ids: Vec::new(),
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: vec![spec.id],
+    };
+
+    let mut specs = manager
+        .start_tasks_batch(vec![request])
+        .await
+        .expect("start batch with network");
+    let task_spec = specs.remove(0);
+
+    manager
+        .stop_task(task_spec.id)
+        .await
+        .expect("stop flaky networked task");
+
+    let attachments_after = network_registry
+        .list_attachments(Some(spec.id))
+        .expect("list attachments after flaky stop");
+    assert!(
+        attachments_after.is_empty(),
+        "expected attachments to be purged after teardown failure"
+    );
 }
 
 #[tokio::test]

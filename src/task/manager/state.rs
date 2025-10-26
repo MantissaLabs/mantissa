@@ -280,6 +280,15 @@ impl TaskManager {
         self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
             .await?;
         self.cleanup_orphaned_slots().await;
+        self.remove_spec(id).await?;
+        self.enqueue_gossip(TaskEvent::Remove { id }).await?;
+        if let Err(err) = self.cleanup_orphaned_local_attachments().await {
+            warn!(
+                target: "task",
+                task = %id,
+                "failed to run orphaned attachment cleanup after stop: {err}"
+            );
+        }
         Ok(updated)
     }
 
@@ -702,6 +711,15 @@ impl TaskManager {
                     spec.id
                 );
             }
+            self.remove_spec(spec.id).await?;
+            self.enqueue_gossip(TaskEvent::Remove { id: spec.id }).await?;
+            if let Err(err) = self.cleanup_orphaned_local_attachments().await {
+                warn!(
+                    target: "task",
+                    task = %spec.id,
+                    "failed to run orphaned attachment cleanup for stopped task: {err}"
+                );
+            }
             return Ok(());
         }
 
@@ -720,6 +738,15 @@ impl TaskManager {
                     target: "task",
                     "failed to cleanup attachments for containerless task {}: {err}",
                     spec.id
+                );
+            }
+            self.remove_spec(spec.id).await?;
+            self.enqueue_gossip(TaskEvent::Remove { id: spec.id }).await?;
+            if let Err(err) = self.cleanup_orphaned_local_attachments().await {
+                warn!(
+                    target: "task",
+                    task = %spec.id,
+                    "failed to run orphaned attachment cleanup for containerless task: {err}"
                 );
             }
             return Ok(());

@@ -278,7 +278,7 @@ impl TaskManager {
         self.teardown_runtime_attachments(task_id, desired).await
     }
 
-    async fn cleanup_orphaned_local_attachments(&self) -> Result<()> {
+    pub(super) async fn cleanup_orphaned_local_attachments(&self) -> Result<()> {
         let attachments = self
             .network_registry
             .list_attachments(None)
