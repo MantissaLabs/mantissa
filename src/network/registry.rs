@@ -1,9 +1,11 @@
 use crate::network::types::{
-    NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue, compute_network_peer_state_id,
+    NetworkAttachmentValue, NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue,
+    compute_network_peer_state_id,
 };
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use anyhow::{Result, anyhow};
 use crdt_store::uuid_key::UuidKey;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -123,7 +125,7 @@ impl NetworkRegistry {
 
         let mut states = Vec::with_capacity(entries.len());
         for (_key, snapshot) in entries {
-            if let Some(value) = snapshot.as_slice().last().cloned() {
+            if let Some(value) = Self::select_latest_peer_state(snapshot.as_slice()) {
                 if let Some(filter) = network_filter {
                     if value.network_id != filter {
                         continue;
@@ -239,5 +241,88 @@ impl NetworkRegistry {
     #[allow(dead_code)]
     pub fn derive_peer_state_id(&self, network_id: Uuid, peer_id: Uuid) -> Uuid {
         compute_network_peer_state_id(network_id, peer_id)
+    }
+
+    /// Determine the most recent peer state to represent a replicated register snapshot so higher
+    /// layers observe stable readiness counts even when concurrent MVReg values exist.
+    fn select_latest_peer_state(
+        snapshot: &[NetworkPeerStateValue],
+    ) -> Option<NetworkPeerStateValue> {
+        snapshot
+            .iter()
+            .max_by(|a, b| match a.updated_at.cmp(&b.updated_at) {
+                Ordering::Equal => {
+                    Self::peer_state_priority(a.state).cmp(&Self::peer_state_priority(b.state))
+                }
+                other => other,
+            })
+            .cloned()
+    }
+
+    /// Provide a deterministic priority for peer state variants when timestamps match so we retain
+    /// the most operationally useful entry (prefer Ready over Removing, for example).
+    fn peer_state_priority(state: NetworkPeerState) -> u8 {
+        match state {
+            NetworkPeerState::Ready => 5,
+            NetworkPeerState::Configuring => 4,
+            NetworkPeerState::AwaitingSpec => 3,
+            NetworkPeerState::Error => 2,
+            NetworkPeerState::Removing => 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensure the selector returns the entry with the most recent timestamp so readiness counts do
+    /// not regress when older MVReg values remain in the snapshot.
+    #[test]
+    fn selects_newest_peer_state_by_timestamp() {
+        let network_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+
+        let mut older = NetworkPeerStateValue::new(
+            network_id,
+            peer_id,
+            "peer-a",
+            NetworkPeerState::Configuring,
+            None,
+        );
+        older.updated_at = "2024-01-01T00:00:00Z".to_string();
+
+        let mut newer = older.clone();
+        newer.state = NetworkPeerState::Ready;
+        newer.updated_at = "2025-01-01T00:00:00Z".to_string();
+
+        let chosen =
+            NetworkRegistry::select_latest_peer_state(&[older.clone(), newer.clone()]).unwrap();
+        assert_eq!(chosen.state, NetworkPeerState::Ready);
+        assert_eq!(chosen.updated_at, newer.updated_at);
+    }
+
+    /// Ensure the selector prefers Ready over Removing when timestamps are identical so deleting
+    /// ghosts cannot suppress the readiness counters.
+    #[test]
+    fn prefers_ready_when_timestamps_match() {
+        let network_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+
+        let mut ready = NetworkPeerStateValue::new(
+            network_id,
+            peer_id,
+            "peer-a",
+            NetworkPeerState::Ready,
+            None,
+        );
+        ready.updated_at = "2025-01-01T00:00:00Z".to_string();
+
+        let mut removing = ready.clone();
+        removing.state = NetworkPeerState::Removing;
+
+        let chosen =
+            NetworkRegistry::select_latest_peer_state(&[ready.clone(), removing.clone()]).unwrap();
+        assert_eq!(chosen.state, NetworkPeerState::Ready);
     }
 }
