@@ -32,6 +32,7 @@ use tokio::task::LocalSet;
 use crate::cli::*;
 use crate::server::RunMode;
 use client::config::ClientConfig;
+use client::output;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -189,7 +190,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     tw.flush()?;
                     let output = String::from_utf8(tw.into_inner()?)?;
-                    print!("{}", output);
+                    output::emit_block(output);
                 }
             }
             SecretsCommand::Delete(args) => {
@@ -286,7 +287,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     tw.flush()?;
                     let output = String::from_utf8(tw.into_inner()?)?;
-                    print!("{}", output);
+                    output::emit_block(output);
                 }
             }
             NetworksCommand::Inspect(args) => {
@@ -348,7 +349,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     tw.flush()?;
                     let output = String::from_utf8(tw.into_inner()?)?;
-                    print!("{}", output);
+                    output::emit_block(output);
                 }
             }
             NetworksCommand::Attachments(args) => {
@@ -391,7 +392,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     tw.flush()?;
                     let output = String::from_utf8(tw.into_inner()?)?;
-                    print!("{}", output);
+                    output::emit_block(output);
                 }
             }
         },

@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::output;
 use crate::tasks::{uuid_short, uuid_to_string};
 use anyhow::Result;
 use capnp::Error as CapnpError;
@@ -63,7 +64,7 @@ pub async fn list(cfg: &ClientConfig, states: &[TasksListState]) -> Result<()> {
 
     tw.flush()?;
     let output = String::from_utf8(tw.into_inner()?)?;
-    println!("{output}");
+    output::emit_block(output);
 
     Ok(())
 }

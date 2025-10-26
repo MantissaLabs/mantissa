@@ -3,6 +3,7 @@ pub mod connection;
 mod errors;
 pub mod networks;
 pub mod node;
+pub mod output;
 pub mod scheduler;
 pub mod secrets;
 pub mod services;

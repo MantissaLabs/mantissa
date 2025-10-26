@@ -1,4 +1,4 @@
-use crate::{config::ClientConfig, connection};
+use crate::{config::ClientConfig, connection, output};
 use anyhow::Result;
 
 pub async fn show(cfg: &ClientConfig) -> Result<()> {
@@ -10,8 +10,7 @@ pub async fn show(cfg: &ClientConfig) -> Result<()> {
 
     let response = request.send().promise.await?;
     let token = response.get()?.get_token()?.to_string()?;
-
-    println!("{token}");
+    output::emit_line(token);
 
     Ok(())
 }

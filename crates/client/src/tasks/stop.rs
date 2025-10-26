@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::output;
 use crate::tasks::uuid_from_data;
 use anyhow::{Result, anyhow};
 use std::io::Write;
@@ -44,7 +45,7 @@ pub async fn stop(cfg: &ClientConfig, id: &str) -> Result<()> {
 
     tw.flush()?;
     let output = String::from_utf8(tw.into_inner()?)?;
-    println!("stopped task:\n{output}");
+    output::emit_block(format!("stopped task:\n{output}"));
 
     Ok(())
 }

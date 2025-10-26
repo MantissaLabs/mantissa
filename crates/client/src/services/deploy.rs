@@ -121,8 +121,7 @@ pub async fn deploy_manifest(
         manifest.name, service_id
     );
     println!(
-        "deployment is running in the background; track it with `mantissa services list` or stop it with `mantissa services stop {}`",
-        service_id
+        "deployment is running in the background; track it with `mantissa services list` or stop it with `mantissa services stop {service_id}`"
     );
 
     Ok(ServiceDeploymentHandle {

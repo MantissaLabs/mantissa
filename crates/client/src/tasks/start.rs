@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::output;
 use crate::tasks::uuid_to_string;
 use anyhow::Result;
 use std::io::Write;
@@ -71,7 +72,7 @@ pub async fn start(
 
     tw.flush()?;
     let output = String::from_utf8(tw.into_inner()?)?;
-    println!("started task:\n{output}");
+    output::emit_block(format!("started task:\n{output}"));
 
     Ok(())
 }

@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::output;
 use anyhow::Result;
 use protocol::topology::node_info::Reader as NodeInfo;
 use std::io::Write;
@@ -35,8 +36,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
 
     tw.flush().unwrap();
     let output = String::from_utf8(tw.into_inner().unwrap()).unwrap();
-
-    println!("{output}");
+    output::emit_block(output);
 
     Ok(())
 }

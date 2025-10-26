@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::output;
 use anyhow::{Result, anyhow};
 use protocol::scheduling;
 use std::io::Write;
@@ -40,7 +41,7 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
     let reserved = summary.get_reserved_slots();
     let version = summary.get_version();
 
-    println!(
+    output::emit_block(format!(
         "Scheduler Summary:\n  Node: {} ({})\n  Total slots: {}\n  Free slots: {}\n  Reserved slots: {}\n  Snapshot version: {}",
         if node_name.is_empty() {
             "<unknown>".to_string()
@@ -52,7 +53,7 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
         free,
         reserved,
         version,
-    );
+    ));
 
     if details {
         let details_reader = summary.get_details()?;
@@ -84,7 +85,7 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
 
             tw.flush()?;
             let output = String::from_utf8(tw.into_inner()?)?;
-            println!("\nSlot Details:\n{output}");
+            output::emit_block(format!("\nSlot Details:\n{output}"));
         } else {
             println!("\nNo slot details available.");
         }
