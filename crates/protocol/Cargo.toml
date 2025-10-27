@@ -5,7 +5,7 @@ edition = "2024"
 build = "build.rs"
 
 [build-dependencies]
-capnpc = { git = "https://github.com/capnproto/capnproto-rust", branch = "master" }
+capnpc = "0.22"
 
 [dependencies]
-capnp = { git = "https://github.com/capnproto/capnproto-rust", branch = "master" }
+capnp = "0.22"

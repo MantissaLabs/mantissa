@@ -390,16 +390,18 @@ dependencies = [
 
 [[package]]
 name = "capnp"
-version = "0.22.0-alpha"
-source = "git+https://github.com/capnproto/capnproto-rust?branch=master#9cc47a0c15facf9635877def28639be2e59c4169"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "015e45130949bb49a7776b7aa96d78d0cb7a8ddba8a8357c2103e77aebbb66ad"
 dependencies = [
  "embedded-io",
 ]
 
 [[package]]
 name = "capnp-futures"
-version = "0.22.0-alpha"
-source = "git+https://github.com/capnproto/capnproto-rust?branch=master#9cc47a0c15facf9635877def28639be2e59c4169"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "372a2b9991da19b3f7d8632e9c645f299d2ea8a48c6d3d289921a8c44ccd2fb6"
 dependencies = [
  "capnp",
  "futures-channel",
@@ -408,8 +410,9 @@ dependencies = [
 
 [[package]]
 name = "capnp-rpc"
-version = "0.22.0-alpha"
-source = "git+https://github.com/capnproto/capnproto-rust?branch=master#9cc47a0c15facf9635877def28639be2e59c4169"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4fbb471e71f50ba0acce73536924035b1bfefad6feef3ef6acc46614553c760"
 dependencies = [
  "capnp",
  "capnp-futures",
@@ -418,8 +421,9 @@ dependencies = [
 
 [[package]]
 name = "capnpc"
-version = "0.22.0-alpha"
-source = "git+https://github.com/capnproto/capnproto-rust?branch=master#9cc47a0c15facf9635877def28639be2e59c4169"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1af1ceeadd28bef56425e170308d287dad0e28f43978cd6b02d3bb1bf7b822fe"
 dependencies = [
  "capnp",
 ]
