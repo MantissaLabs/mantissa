@@ -274,17 +274,29 @@ pub struct Topology {
     health_monitor: Arc<HealthMonitor>,
 }
 
+pub struct TopologyConfig {
+    pub addr: String,
+    pub gossip_receiver: Receiver<Message>,
+    pub gossip_sender: Sender<Message>,
+    pub node: Node,
+    pub stores: TopologyStores,
+    pub crypto: Keys,
+    pub registry: Registry,
+    pub health_monitor: Arc<HealthMonitor>,
+}
+
 impl Topology {
-    pub fn new(
-        addr: String,
-        gossip_receiver: Receiver<Message>,
-        gossip_sender: Sender<Message>,
-        node: Node,
-        stores: TopologyStores,
-        crypto: Keys,
-        registry: Registry,
-        health_monitor: Arc<HealthMonitor>,
-    ) -> Result<Self, Error> {
+    pub fn new(config: TopologyConfig) -> Result<Self, Error> {
+        let TopologyConfig {
+            addr,
+            gossip_receiver,
+            gossip_sender,
+            node,
+            stores,
+            crypto,
+            registry,
+            health_monitor,
+        } = config;
         let TopologyStores {
             credentials,
             sessions,
@@ -473,6 +485,7 @@ impl Topology {
     }
 
     /// Return true if we have a stored ticket for `peer_id` in local sessions.
+    #[allow(dead_code)]
     pub fn has_ticket(&self, peer_id: Uuid) -> bool {
         matches!(self.local_sessions.get(peer_id), Ok(Some(_)))
     }
@@ -662,6 +675,7 @@ impl Topology {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn restore_peers(&self) -> std::io::Result<()> {
         self.peers.rebuild_mst_from_disk().await.map_err(Into::into)
     }
@@ -710,6 +724,7 @@ impl Topology {
     ///  - connect securely to the peer's Server,
     ///  - call getSession(ticket) to obtain a ClusterSession,
     ///  - attach the server handle so higher-level code can use it.
+    #[allow(dead_code)]
     pub async fn resume_sessions_on_boot(&self) {
         self.registry
             .resume_sessions_on_boot(self.networking.configured())

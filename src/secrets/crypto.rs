@@ -82,11 +82,9 @@ impl SecretKeyring {
             .load_version(version)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "master key version missing"))?;
 
-        {
-            let mut cache = self.inner.cache.write().expect("poisoned master cache");
-            let entry = cache.entry(record.version).or_insert(record.key);
-            return Ok(*entry);
-        }
+        let mut cache = self.inner.cache.write().expect("poisoned master cache");
+        let entry = cache.entry(record.version).or_insert(record.key);
+        Ok(*entry)
     }
 
     /// Encrypts `plaintext` for the provided secret/version identifiers.
@@ -109,7 +107,7 @@ impl SecretKeyring {
                     aad: &aad,
                 },
             )
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "secret encryption failed"))?;
+            .map_err(|_| io::Error::other("secret encryption failed"))?;
 
         let digest = Self::digest_bytes(blake3::hash(plaintext));
 

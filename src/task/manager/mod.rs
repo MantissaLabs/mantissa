@@ -79,22 +79,40 @@ pub struct TaskStartRequest {
     pub networks: Vec<Uuid>,
 }
 
+#[derive(Clone)]
+pub struct TaskManagerConfig {
+    pub store: TaskStore,
+    pub tx: Sender<Message>,
+    pub rx: Receiver<Message>,
+    pub local_node_id: Uuid,
+    pub local_node_name: String,
+    pub scheduler: Rc<Scheduler>,
+    pub container_manager: Arc<dyn ContainerManager + Send + Sync>,
+    pub registry: Registry,
+    pub network_registry: NetworkRegistry,
+    pub secret_registry: SecretRegistry,
+    pub secret_keyring: Arc<RwLock<SecretKeyring>>,
+    pub forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
+    pub attachment_override: Option<Arc<dyn AttachmentProvisionerApi>>,
+}
+
 impl TaskManager {
-    pub fn new(
-        store: TaskStore,
-        tx: Sender<Message>,
-        rx: Receiver<Message>,
-        local_node_id: Uuid,
-        local_node_name: impl Into<String>,
-        scheduler: Rc<Scheduler>,
-        container_manager: Arc<dyn ContainerManager + Send + Sync>,
-        registry: Registry,
-        network_registry: NetworkRegistry,
-        secret_registry: SecretRegistry,
-        secret_keyring: Arc<RwLock<SecretKeyring>>,
-        forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
-        attachment_override: Option<Arc<dyn AttachmentProvisionerApi>>,
-    ) -> Self {
+    pub fn new(config: TaskManagerConfig) -> Self {
+        let TaskManagerConfig {
+            store,
+            tx,
+            rx,
+            local_node_id,
+            local_node_name,
+            scheduler,
+            container_manager,
+            registry,
+            network_registry,
+            secret_registry,
+            secret_keyring,
+            forwarding_events,
+            attachment_override,
+        } = config;
         let secret_runtime_root = resolve_secret_runtime_root(local_node_id);
 
         let attachment_provisioner: Arc<dyn AttachmentProvisionerApi> = match attachment_override {
@@ -117,7 +135,7 @@ impl TaskManager {
             rx,
             seen_ids: Arc::new(AsyncMutex::new(HashSet::new())),
             local_node_id,
-            local_node_name: local_node_name.into(),
+            local_node_name,
             scheduler,
             container_manager,
             local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -132,6 +150,7 @@ impl TaskManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn start_container(
         &self,
         name: impl Into<String>,
@@ -354,6 +373,7 @@ impl TaskManager {
         self.load_spec(id).await
     }
 
+    #[allow(dead_code)]
     pub async fn task_owned_locally(&self, id: Uuid) -> Result<bool, anyhow::Error> {
         let spec = self.load_spec(id).await?;
         Ok(spec.node_id == self.local_node_id)
@@ -373,7 +393,7 @@ impl TaskManager {
             let mut updated = spec.clone();
             updated.state = ContainerState::Stopping;
             self.persist_spec(&updated).await?;
-            self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
+            self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
                 .await?;
             return Ok(updated);
         }
@@ -465,7 +485,7 @@ impl TaskManager {
             if state.state.is_ready() {
                 readiness
                     .entry(state.peer_id)
-                    .or_insert_with(HashSet::new)
+                    .or_default()
                     .insert(state.network_id);
             }
         }
@@ -535,18 +555,17 @@ fn ensure_dir_writable(base: &Path) -> io::Result<()> {
 }
 
 fn wrap_create_error(task_name: &str, err: ContainerError) -> anyhow::Error {
-    anyhow::Error::new(err).context(format!("docker create failed for task {}", task_name))
+    anyhow::Error::new(err).context(format!("docker create failed for task {task_name}"))
 }
 
 fn wrap_existing_inspect_error(task_name: &str, err: ContainerError) -> anyhow::Error {
     anyhow::Error::new(err).context(format!(
-        "failed to inspect existing container for task {} after name conflict",
-        task_name
+        "failed to inspect existing container for task {task_name} after name conflict"
     ))
 }
 
 fn wrap_start_error(task_name: &str, err: ContainerError) -> anyhow::Error {
-    anyhow::Error::new(err).context(format!("docker start failed for task {}", task_name))
+    anyhow::Error::new(err).context(format!("docker start failed for task {task_name}"))
 }
 
 fn is_name_conflict(err: &ContainerError) -> bool {

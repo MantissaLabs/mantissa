@@ -64,6 +64,7 @@ impl AuthStore {
     }
 
     /// Revoke by peer UUID: remove reverse mapping and then forward mapping.
+    #[allow(dead_code)]
     pub fn revoke_by_peer(&self, peer: Uuid) -> io::Result<()> {
         let w = self.db.begin_write().map_err(ioerr)?;
 
@@ -88,6 +89,7 @@ impl AuthStore {
     }
 
     /// Revoke by ticket: remove forward mapping and then reverse mapping.
+    #[allow(dead_code)]
     pub fn revoke_by_ticket(&self, ticket: &[u8]) -> io::Result<()> {
         let w = self.db.begin_write().map_err(ioerr)?;
 

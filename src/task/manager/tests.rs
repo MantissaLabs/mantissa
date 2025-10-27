@@ -2,12 +2,12 @@
 
 use super::*;
 
-use crate::network::attachment::{AttachmentProvisioner, AttachmentProvisionerApi};
+use crate::network::attachment::{AttachmentProvisionerApi, AttachmentProvisioningRequest};
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     NetworkAttachmentState, NetworkDriver, NetworkPeerState, NetworkPeerStateValue,
-    NetworkSpecValue,
+    NetworkSpecDraft, NetworkSpecValue,
 };
 use crate::registry::Registry;
 use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
@@ -22,7 +22,7 @@ use crate::store::scheduler_store::open_scheduler_store;
 use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
-use crate::task::types::{TaskStateKind, TaskValue};
+use crate::task::types::{TaskStateKind, TaskValue, TaskValueDraft};
 use ::health::{Config as HealthConfig, HealthMonitor};
 use anyhow::{Result, anyhow};
 use async_channel::bounded;
@@ -49,26 +49,24 @@ struct MockContainerManager {
 impl ContainerManager for MockContainerManager {
     async fn create_container(
         &self,
-        _name: &str,
-        _image: &str,
-        _command: Option<Vec<String>>,
-        _env_vars: Option<Vec<String>>,
-        _ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
-        _volumes: Option<Vec<String>>,
-        _restart_policy: Option<crate::task::docker::RestartPolicyConfig>,
-        resource_limits: crate::task::docker::ResourceLimits,
+        request: crate::task::docker::ContainerCreateRequest,
     ) -> crate::task::docker::ContainerResult<String> {
+        let resource_limits = request.resource_limits;
         let mut guard = self.created.lock().await;
         let id = format!("container-{}", guard.len());
         guard.push(id.clone());
         self.limits.lock().await.push(resource_limits);
 
         let mut inspect = self.inspect.lock().await;
-        let mut state = bollard::models::ContainerState::default();
-        state.pid = Some(10_000 + inspect.len() as i64);
-        let mut response = bollard::service::ContainerInspectResponse::default();
-        response.id = Some(id.clone());
-        response.state = Some(state);
+        let state = bollard::models::ContainerState {
+            pid: Some(10_000 + inspect.len() as i64),
+            ..Default::default()
+        };
+        let response = bollard::service::ContainerInspectResponse {
+            id: Some(id.clone()),
+            state: Some(state),
+            ..Default::default()
+        };
         inspect.insert(id.clone(), response);
         Ok(id)
     }
@@ -141,19 +139,9 @@ impl AttachmentProvisionerApi for FakeAttachmentProvisioner {
         Ok(guard.contains(&attachment_id))
     }
 
-    async fn ensure_attachment(
-        &self,
-        _network_id: Uuid,
-        _bridge_name: &str,
-        _mtu: u32,
-        attachment_id: Uuid,
-        _container_pid: i32,
-        _assigned_ip: &str,
-        _prefix: u8,
-        _mac: &str,
-    ) -> Result<()> {
+    async fn ensure_attachment(&self, request: &AttachmentProvisioningRequest<'_>) -> Result<()> {
         let mut guard = self.attachments.lock().await;
-        guard.insert(attachment_id);
+        guard.insert(request.attachment_id);
         Ok(())
     }
 
@@ -203,19 +191,9 @@ impl AttachmentProvisionerApi for FlakyAttachmentProvisioner {
         Ok(guard.contains(&attachment_id))
     }
 
-    async fn ensure_attachment(
-        &self,
-        _network_id: Uuid,
-        _bridge_name: &str,
-        _mtu: u32,
-        attachment_id: Uuid,
-        _container_pid: i32,
-        _assigned_ip: &str,
-        _prefix: u8,
-        _mac: &str,
-    ) -> Result<()> {
+    async fn ensure_attachment(&self, request: &AttachmentProvisioningRequest<'_>) -> Result<()> {
         let mut guard = self.attachments.lock().await;
-        guard.insert(attachment_id);
+        guard.insert(request.attachment_id);
         Ok(())
     }
 
@@ -375,21 +353,21 @@ async fn setup_manager_with_forwarding(
         Arc::new(FakeAttachmentProvisioner::default()) as Arc<dyn AttachmentProvisionerApi>
     });
 
-    let manager = TaskManager::new(
-        task_store,
+    let manager = TaskManager::new(TaskManagerConfig {
+        store: task_store,
         tx,
         rx,
-        actor,
-        "local-node",
-        scheduler.clone(),
-        mock_cm.clone(),
+        local_node_id: actor,
+        local_node_name: "local-node".to_string(),
+        scheduler: scheduler.clone(),
+        container_manager: mock_cm.clone(),
         registry,
-        network_registry.clone(),
+        network_registry: network_registry.clone(),
         secret_registry,
-        secret_keyring.clone(),
+        secret_keyring: secret_keyring.clone(),
         forwarding_events,
-        Some(attachment),
-    );
+        attachment_override: Some(attachment),
+    });
 
     (manager, scheduler, mock_cm, network_registry)
 }
@@ -708,22 +686,22 @@ async fn task_owned_locally_detects_remote_entries() {
     );
 
     let remote_id = Uuid::new_v4();
-    let remote_value = TaskValue::new(
-        remote_id,
-        "remote",
-        "img",
-        ContainerState::Running,
-        Utc::now().to_rfc3339(),
-        vec![],
-        Uuid::new_v4(),
-        "remote-node",
-        vec![1],
-        Vec::new(),
-        100,
-        64 * 1_024 * 1_024,
-        Vec::new(),
-        Vec::new(),
-    );
+    let remote_value = TaskValue::new(TaskValueDraft {
+        id: remote_id,
+        name: "remote".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Running,
+        created_at: Utc::now().to_rfc3339(),
+        command: vec![],
+        node_id: Uuid::new_v4(),
+        node_name: "remote-node".to_string(),
+        slot_ids: vec![1],
+        networks: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+    });
 
     let store = manager.store.clone();
     store
@@ -819,16 +797,16 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         .await
         .expect("init slots");
 
-    let spec = NetworkSpecValue::new(
-        "test-net",
-        "test network",
-        NetworkDriver::Vxlan,
-        "10.42.0.0/24",
-        0,
-        0,
-        false,
-        vec![],
-    );
+    let spec = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "test-net".to_string(),
+        description: "test network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.42.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
     network_registry
         .upsert_spec(spec.clone())
         .await
@@ -909,16 +887,16 @@ async fn stop_task_cleans_up_after_teardown_failure() {
         .await
         .expect("init slots");
 
-    let spec = NetworkSpecValue::new(
-        "flaky-net",
-        "flaky network",
-        NetworkDriver::Vxlan,
-        "10.99.0.0/24",
-        0,
-        0,
-        false,
-        vec![],
-    );
+    let spec = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "flaky-net".to_string(),
+        description: "flaky network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.99.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
     network_registry
         .upsert_spec(spec.clone())
         .await
@@ -984,16 +962,16 @@ async fn attachment_ready_triggers_forwarding_event() {
         .await
         .expect("init slots");
 
-    let spec = NetworkSpecValue::new(
-        "forwarding-net",
-        "forwarding network",
-        NetworkDriver::Vxlan,
-        "10.55.0.0/24",
-        0,
-        0,
-        false,
-        vec![],
-    );
+    let spec = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "forwarding-net".to_string(),
+        description: "forwarding network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.55.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
     network_registry
         .upsert_spec(spec.clone())
         .await
@@ -1051,26 +1029,26 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         .await
         .expect("init slots");
 
-    let spec_a = NetworkSpecValue::new(
-        "net-a",
-        "network a",
-        NetworkDriver::Vxlan,
-        "10.43.0.0/24",
-        0,
-        0,
-        false,
-        vec![],
-    );
-    let spec_b = NetworkSpecValue::new(
-        "net-b",
-        "network b",
-        NetworkDriver::Vxlan,
-        "10.44.0.0/24",
-        0,
-        0,
-        false,
-        vec![],
-    );
+    let spec_a = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "net-a".to_string(),
+        description: "network a".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.43.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
+    let spec_b = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "net-b".to_string(),
+        description: "network b".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.44.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
 
     network_registry
         .upsert_spec(spec_a.clone())
@@ -1179,16 +1157,16 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         .await
         .expect("init slots");
 
-    let spec = NetworkSpecValue::new(
-        "real-net",
-        "real networking",
-        NetworkDriver::Vxlan,
-        "10.46.0.0/24",
-        0,
-        0,
-        false,
-        vec![],
-    );
+    let spec = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "real-net".to_string(),
+        description: "real networking".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.46.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
     network_registry
         .upsert_spec(spec.clone())
         .await

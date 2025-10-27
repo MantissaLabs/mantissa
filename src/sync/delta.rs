@@ -18,6 +18,9 @@ use protocol::sync::{self, Domain, delta_chunk, delta_sink};
 use std::io;
 use tracing::{debug, warn};
 
+type RegisterDelta<V> = Vec<(UuidKey, MVReg<V, uuid::Uuid>)>;
+type TombstoneDelta = Vec<(UuidKey, u64)>;
+
 #[derive(Clone)]
 pub struct SyncStores {
     pub peers: PeersStore,
@@ -151,7 +154,7 @@ async fn apply_chunk<V, F>(
 ) -> Result<(), capnp::Error>
 where
     V: Clone + Send + Sync + 'static,
-    F: Fn(&delta_chunk::Reader<'_>) -> Result<Vec<(UuidKey, MVReg<V, uuid::Uuid>)>, capnp::Error>,
+    F: Fn(&delta_chunk::Reader<'_>) -> Result<RegisterDelta<V>, capnp::Error>,
 {
     let regs = decode(chunk)?;
     let tombs = collect_tombstones(chunk)?;
@@ -159,9 +162,7 @@ where
     store.apply_delta(regs, tombs).await.map_err(to_capnp)
 }
 
-fn collect_tombstones(
-    chunk: &delta_chunk::Reader<'_>,
-) -> Result<Vec<(UuidKey, u64)>, capnp::Error> {
+fn collect_tombstones(chunk: &delta_chunk::Reader<'_>) -> Result<TombstoneDelta, capnp::Error> {
     let mut tombs = Vec::new();
     for entry in chunk.get_tombs()?.iter() {
         let key =
@@ -171,9 +172,7 @@ fn collect_tombstones(
     Ok(tombs)
 }
 
-fn decode_register<V>(
-    chunk: &delta_chunk::Reader<'_>,
-) -> Result<Vec<(UuidKey, MVReg<V, uuid::Uuid>)>, capnp::Error>
+fn decode_register<V>(chunk: &delta_chunk::Reader<'_>) -> Result<RegisterDelta<V>, capnp::Error>
 where
     V: for<'de> serde::Deserialize<'de>,
 {
@@ -194,11 +193,7 @@ fn to_capnp<E: std::fmt::Display>(e: E) -> capnp::Error {
 
 #[async_trait]
 trait DeltaStore<V>: Clone + Send + Sync + 'static {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<V, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()>;
+    async fn apply_delta(self, regs: RegisterDelta<V>, tombs: TombstoneDelta) -> io::Result<()>;
 }
 
 #[async_trait]

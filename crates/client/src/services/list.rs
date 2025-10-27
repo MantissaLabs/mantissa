@@ -53,7 +53,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             &mut tw,
             "{}\t{}\t{}\t{}\t{}\t{}",
             row.service_name,
-            row.status.to_string(),
+            row.status,
             tasks_summary,
             row.task_ids.len(),
             row.updated_at,

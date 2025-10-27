@@ -27,6 +27,7 @@ impl Default for NodeInfo {
 /// such as the operating systems details, hardware components, load, etc.
 #[derive(Clone, Debug, Default)]
 pub struct Info {
+    #[allow(dead_code)]
     pub device_ip: Option<String>,
     pub os_info: Option<OS>,
     pub hostname: Option<String>,
@@ -105,9 +106,11 @@ pub struct Memory {
     pub total: u64,
     pub free: u64,
     pub available: u64,
+    #[allow(dead_code)]
     pub used: u64,
 
     pub swap_total: u64,
+    #[allow(dead_code)]
     pub swap_used: u64,
     pub swap_free: u64,
 }

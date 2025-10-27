@@ -11,9 +11,11 @@ use uuid::Uuid;
 use crate::gossip::Message;
 use crate::scheduler::{SchedulerError, SlotId, SlotState};
 use crate::task::container::ContainerState;
-use crate::task::docker::{ContainerError, RestartPolicyConfig, RestartPolicyType};
+use crate::task::docker::{
+    ContainerCreateRequest, ContainerError, ResourceLimits, RestartPolicyConfig, RestartPolicyType,
+};
 use crate::task::types::{
-    TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskValue,
+    TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskValue, TaskValueDraft,
 };
 
 use super::{
@@ -24,22 +26,22 @@ use super::{
 impl TaskManager {
     /// Persists a task snapshot in the backing store.
     pub(super) async fn persist_spec(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
-        let mut value = TaskValue::new(
-            spec.id,
-            spec.name.clone(),
-            spec.image.clone(),
-            spec.state.clone(),
-            spec.created_at.clone(),
-            spec.command.clone(),
-            spec.node_id,
-            spec.node_name.clone(),
-            spec.slot_ids.clone(),
-            spec.networks.clone(),
-            spec.cpu_millis,
-            spec.memory_bytes,
-            spec.env.clone(),
-            spec.secret_files.clone(),
-        );
+        let mut value = TaskValue::new(TaskValueDraft {
+            id: spec.id,
+            name: spec.name.clone(),
+            image: spec.image.clone(),
+            state: spec.state.clone(),
+            created_at: spec.created_at.clone(),
+            command: spec.command.clone(),
+            node_id: spec.node_id,
+            node_name: spec.node_name.clone(),
+            slot_ids: spec.slot_ids.clone(),
+            networks: spec.networks.clone(),
+            cpu_millis: spec.cpu_millis,
+            memory_bytes: spec.memory_bytes,
+            env: spec.env.clone(),
+            secret_files: spec.secret_files.clone(),
+        });
 
         value.restart_policy = spec.restart_policy.clone();
 
@@ -69,7 +71,10 @@ impl TaskManager {
                 continue;
             }
 
-            if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(spec.clone())).await {
+            if let Err(err) = self
+                .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+                .await
+            {
                 warn!(
                     target: "task",
                     "failed to relay task {} from node {}: {err}",
@@ -209,7 +214,7 @@ impl TaskManager {
         if !matches!(spec.state, ContainerState::Stopping) {
             updated.state = ContainerState::Stopping;
             self.persist_spec(&updated).await?;
-            self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
+            self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
                 .await?;
         }
 
@@ -229,7 +234,7 @@ impl TaskManager {
                 updated.state = spec.state;
                 if updated.state != ContainerState::Stopping {
                     self.persist_spec(&updated).await?;
-                    self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
+                    self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
                         .await?;
                 }
                 return Err(anyhow::anyhow!("docker stop failed: {e}"));
@@ -277,7 +282,7 @@ impl TaskManager {
         }
 
         self.persist_spec(&updated).await?;
-        self.enqueue_gossip(TaskEvent::Upsert(updated.clone()))
+        self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
             .await?;
         self.cleanup_orphaned_slots().await;
         self.remove_spec(id).await?;
@@ -349,7 +354,10 @@ impl TaskManager {
                 "failed to persist failed state for task {}: {err}",
                 task_id
             );
-        } else if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(spec.clone())).await {
+        } else if let Err(err) = self
+            .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+            .await
+        {
             warn!(
                 target: "task",
                 "failed to broadcast failed state for task {}: {err}",
@@ -412,11 +420,9 @@ impl TaskManager {
         // Drive a single state transition to `Creating` so peers observe progress exactly once.
         if !matches!(working.state, ContainerState::Creating) {
             working.state = ContainerState::Creating;
-            if let Err(err) = self.persist_spec(&working).await {
-                return Err(err);
-            }
+            self.persist_spec(&working).await?;
             if let Err(err) = self
-                .enqueue_gossip(TaskEvent::Upsert(working.clone()))
+                .enqueue_gossip(TaskEvent::Upsert(Box::new(working.clone())))
                 .await
             {
                 warn!(
@@ -442,10 +448,8 @@ impl TaskManager {
             .as_ref()
             .map(Self::restart_policy_to_config);
 
-        let resource_limits = crate::task::docker::ResourceLimits::from_requests(
-            working.cpu_millis,
-            working.memory_bytes,
-        );
+        let resource_limits =
+            ResourceLimits::from_requests(working.cpu_millis, working.memory_bytes);
 
         let mut resolved = self
             .resolve_runtime_secrets(working.id, &working.env, &working.secret_files)
@@ -463,22 +467,24 @@ impl TaskManager {
 
         let container_name = format!("mantissa-{}", working.id);
 
+        let create_request = ContainerCreateRequest {
+            name: container_name.clone(),
+            image: working.image.clone(),
+            command: if working.command.is_empty() {
+                None
+            } else {
+                Some(working.command.clone())
+            },
+            env_vars,
+            ports: None,
+            volumes,
+            restart_policy,
+            resource_limits,
+        };
+
         let create_outcome = self
             .container_manager
-            .create_container(
-                &container_name,
-                &working.image,
-                if working.command.is_empty() {
-                    None
-                } else {
-                    Some(working.command.clone())
-                },
-                env_vars,
-                None,
-                volumes,
-                restart_policy,
-                resource_limits,
-            )
+            .create_container(create_request)
             .await;
 
         let (container_id, created_fresh): (String, bool) = match create_outcome {
@@ -664,7 +670,7 @@ impl TaskManager {
         }
 
         if let Err(err) = self
-            .enqueue_gossip(TaskEvent::Upsert(working.clone()))
+            .enqueue_gossip(TaskEvent::Upsert(Box::new(working.clone())))
             .await
         {
             warn!(

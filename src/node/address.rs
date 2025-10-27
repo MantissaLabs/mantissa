@@ -58,6 +58,7 @@ pub fn compute_advertise_ip(
 /// - "hostname.local:8080"
 /// - "[fe80::1%eth0]:9000"
 /// - "fe80::1:9000"          // fallback: last ':' is treated as the port separator
+#[allow(dead_code)]
 pub fn extract_port(addr: &str) -> Result<u16, io::Error> {
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return Ok(sa.port());

@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use mantissa::task::docker::{
-    ContainerError, ContainerInfo, ContainerManager, ResourceLimits, RestartPolicyConfig,
+    ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager,
     clear_container_manager_override, container_manager_override, set_container_manager_override,
 };
 use mantissa::topology_capnp::topology;
@@ -34,14 +34,7 @@ pub struct InMemoryContainerManager;
 impl ContainerManager for InMemoryContainerManager {
     async fn create_container(
         &self,
-        _name: &str,
-        _image: &str,
-        _command: Option<Vec<String>>,
-        _env_vars: Option<Vec<String>>,
-        _ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
-        _volumes: Option<Vec<String>>,
-        _restart_policy: Option<RestartPolicyConfig>,
-        _resource_limits: ResourceLimits,
+        _request: ContainerCreateRequest,
     ) -> Result<String, ContainerError> {
         Ok(Uuid::new_v4().to_string())
     }
@@ -97,7 +90,7 @@ impl ContainerManager for InMemoryContainerManager {
 }
 
 fn default_container_manager() -> Arc<dyn ContainerManager + Send + Sync> {
-    Arc::new(InMemoryContainerManager::default())
+    Arc::new(InMemoryContainerManager)
 }
 
 static TEST_CONTAINER_MANAGER: Lazy<()> = Lazy::new(|| {
@@ -116,7 +109,7 @@ impl ContainerManagerOverrideGuard {
     }
 
     pub fn install_default() -> Self {
-        Self::install(Arc::new(InMemoryContainerManager::default()))
+        Self::install(Arc::new(InMemoryContainerManager))
     }
 }
 

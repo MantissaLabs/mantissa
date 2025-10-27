@@ -11,7 +11,9 @@ impl Default for Config {
 #[derive(Clone)]
 pub struct Config {
     pub listen_addr: String,
+    #[allow(dead_code)]
     pub join_token: String,
+    #[allow(dead_code)]
     pub anchors: Vec<String>,
 }
 
@@ -25,6 +27,7 @@ impl Config {
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_join_token(&mut self, token: String) -> &mut Config {
         self.join_token = token;
         self

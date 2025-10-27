@@ -23,9 +23,9 @@ use mantissa::store::secret_master_store::SecretMasterStore;
 use mantissa::store::secret_store::open_secret_store;
 use mantissa::store::task_store::open_task_store;
 use mantissa::task::docker::{
-    ContainerError, ContainerInfo, ContainerManager, ResourceLimits, RestartPolicyConfig,
+    ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager,
 };
-use mantissa::task::manager::{TaskManager, TaskStartRequest};
+use mantissa::task::manager::{TaskManager, TaskManagerConfig, TaskStartRequest};
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use net::noise::NoiseKeys;
 use protocol::secrets::secrets;
@@ -64,16 +64,16 @@ impl RecordingContainerManager {
 impl ContainerManager for RecordingContainerManager {
     async fn create_container(
         &self,
-        name: &str,
-        _image: &str,
-        _command: Option<Vec<String>>,
-        env_vars: Option<Vec<String>>,
-        _ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
-        volumes: Option<Vec<String>>,
-        _restart_policy: Option<RestartPolicyConfig>,
-        _resource_limits: ResourceLimits,
+        request: ContainerCreateRequest,
     ) -> Result<String, ContainerError> {
-        self.created.lock().await.push(name.to_string());
+        let ContainerCreateRequest {
+            name,
+            env_vars,
+            volumes,
+            ..
+        } = request;
+
+        self.created.lock().await.push(name);
         self.envs.lock().await.push(env_vars.unwrap_or_default());
         self.volumes.lock().await.push(volumes.unwrap_or_default());
         Ok(Uuid::new_v4().to_string())
@@ -249,25 +249,25 @@ async fn setup_task_manager() -> TestHarness {
 
     let (tx, rx) = async_channel::bounded(128);
 
-    let manager = TaskManager::new(
-        task_store,
+    let manager = TaskManager::new(TaskManagerConfig {
+        store: task_store,
         tx,
         rx,
-        actor,
-        "test-node",
-        scheduler.clone(),
-        container_manager.clone(),
+        local_node_id: actor,
+        local_node_name: "test-node".to_string(),
+        scheduler: scheduler.clone(),
+        container_manager: container_manager.clone(),
         registry,
-        NetworkRegistry::new(
+        network_registry: NetworkRegistry::new(
             network_spec_store,
             network_peer_store,
             network_attachment_store,
         ),
-        secret_registry.clone(),
-        secret_keyring_arc.clone(),
-        None,
-        None,
-    );
+        secret_registry: secret_registry.clone(),
+        secret_keyring: secret_keyring_arc.clone(),
+        forwarding_events: None,
+        attachment_override: None,
+    });
 
     TestHarness {
         manager,

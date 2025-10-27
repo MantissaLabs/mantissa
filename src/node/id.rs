@@ -23,6 +23,7 @@ pub fn uuid_from_bytes(b: &[u8]) -> Result<Uuid, String> {
 /// Sort key: interpret the 16 bytes as a big-endian u128.
 /// (For UUIDv7, this preserves chronological order.)
 #[inline]
+#[allow(dead_code)]
 pub fn uuid_sort_key(u: &Uuid) -> u128 {
     u128::from_be_bytes(*u.as_bytes())
 }
@@ -43,6 +44,7 @@ pub fn read_node_id(id_reader: protocol::node::node_id::Reader) -> Result<Uuid, 
 /// Map a NodeInfo reader to a sortable u128 key (UUID bytes, big-endian).
 /// On any parse error, returns u128::MAX to push the row to the end.
 #[inline]
+#[allow(dead_code)]
 pub fn id_sort_key_uuid_bytes(n: &NodeInfo) -> u128 {
     match n
         .get_id()
@@ -57,6 +59,7 @@ pub fn id_sort_key_uuid_bytes(n: &NodeInfo) -> u128 {
 
 /// Pretty string for the UUID in NodeInfo (for printing)
 #[inline]
+#[allow(dead_code)]
 pub fn id_string(n: &NodeInfo) -> Result<String, CapnpError> {
     let bytes = n.get_id()?.get_bytes()?;
     let u = Uuid::from_slice(bytes).map_err(|e| CapnpError::failed(e.to_string()))?;

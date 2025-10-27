@@ -185,7 +185,7 @@ impl ServiceController {
             };
 
             let controller = self.clone();
-            let _ = tokio::task::spawn_local(async move {
+            tokio::task::spawn_local(async move {
                 if let Err(err) = controller.execute_redeployment(job).await {
                     tracing::warn!(
                         target: "services",
@@ -216,7 +216,7 @@ impl ServiceController {
         };
 
         let controller = self.clone();
-        let _ = tokio::task::spawn_local(async move {
+        tokio::task::spawn_local(async move {
             if let Err(err) = controller.execute_deployment(job).await {
                 tracing::warn!(
                     target: "services",
@@ -681,6 +681,7 @@ impl ServiceController {
         }
     }
 
+    #[allow(dead_code)]
     pub fn registry(&self) -> &ServiceRegistry {
         &self.registry
     }
@@ -1099,17 +1100,17 @@ fn should_stop_tasks(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecV
         return false;
     }
 
-    match (current_spec.status(), incoming.status()) {
+    matches!(
+        (current_spec.status(), incoming.status()),
         (Running, Stopping)
-        | (Deploying, Stopping)
-        | (Running, Stopped)
-        | (Deploying, Stopped)
-        | (Stopping, Stopped)
-        | (Running, ServiceStatus::Failed)
-        | (Deploying, ServiceStatus::Failed)
-        | (Stopping, ServiceStatus::Failed) => true,
-        _ => false,
-    }
+            | (Deploying, Stopping)
+            | (Running, Stopped)
+            | (Deploying, Stopped)
+            | (Stopping, Stopped)
+            | (Running, ServiceStatus::Failed)
+            | (Deploying, ServiceStatus::Failed)
+            | (Stopping, ServiceStatus::Failed)
+    )
 }
 
 /// Builds a compact human-readable summary of the last observed container states for logging.

@@ -109,7 +109,7 @@ impl SecretMasterStore {
 
         let next_version = current_version
             .checked_add(1)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "master key version overflow"))?;
+            .ok_or_else(|| io::Error::other("master key version overflow"))?;
         let new_key = SecretKeyring::generate_master_key()?;
         self.persist_new_version(next_version, &new_key)?;
         MasterKeyRecord::new(next_version, new_key)

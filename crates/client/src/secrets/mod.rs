@@ -56,7 +56,7 @@ pub(super) fn parse_secret_spec(reader: secret_spec::Reader<'_>) -> Result<Secre
         ));
     }
     let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&version_bytes);
+    bytes.copy_from_slice(version_bytes);
     let version_id = Uuid::from_bytes(bytes);
 
     let mut labels = Vec::new();

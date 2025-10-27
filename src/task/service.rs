@@ -97,7 +97,7 @@ fn decode_secret_ref(reader: secret_ref::Reader<'_>) -> Result<TaskSecretReferen
     let data = reader.get_version_id()?;
     let version_id = if data.len() == 16 {
         let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&data);
+        bytes.copy_from_slice(data);
         Some(Uuid::from_bytes(bytes))
     } else {
         None
@@ -158,7 +158,7 @@ pub fn add_event(
     match event {
         TaskEvent::Upsert(spec) => {
             task.set_event(task_event::EventType::Upsert);
-            write_spec(task.reborrow().init_spec(), spec);
+            write_spec(task.reborrow().init_spec(), spec.as_ref());
         }
         TaskEvent::Remove { id } => {
             task.set_event(task_event::EventType::Remove);
@@ -188,7 +188,7 @@ pub fn read_event(reader: task_event::Reader) -> Result<TaskEvent, Error> {
     match event {
         task_event::EventType::Upsert => {
             let spec = read_spec(spec_reader)?;
-            Ok(TaskEvent::Upsert(spec))
+            Ok(TaskEvent::Upsert(Box::new(spec)))
         }
         task_event::EventType::Remove => {
             let id = read_spec_id(spec_reader)?;
@@ -298,7 +298,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
             return Err(Error::failed("invalid network id length".to_string()));
         }
         let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&data);
+        bytes.copy_from_slice(data);
         networks.push(Uuid::from_bytes(bytes));
     }
 
@@ -385,7 +385,7 @@ impl task::Server for TaskService {
                 return Err(Error::failed("invalid network id length".to_string()));
             }
             let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&data);
+            bytes.copy_from_slice(data);
             networks.push(Uuid::from_bytes(bytes));
         }
 
@@ -464,7 +464,7 @@ impl task::Server for TaskService {
                     return Err(Error::failed("invalid network id length".to_string()));
                 }
                 let mut bytes = [0u8; 16];
-                bytes.copy_from_slice(&data);
+                bytes.copy_from_slice(data);
                 networks.push(Uuid::from_bytes(bytes));
             }
 

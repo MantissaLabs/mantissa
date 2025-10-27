@@ -37,7 +37,7 @@ fn decode_secret_ref(reader: secret_ref::Reader<'_>) -> Result<TaskSecretReferen
     let data = reader.get_version_id()?;
     let version_id = if data.len() == 16 {
         let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&data);
+        bytes.copy_from_slice(data);
         Some(Uuid::from_bytes(bytes))
     } else {
         None
@@ -315,8 +315,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
 
         if !seen_networks.insert(raw.clone()) {
             return Err(Error::failed(format!(
-                "duplicate network '{}' in task template",
-                raw
+                "duplicate network '{raw}' in task template"
             )));
         }
 

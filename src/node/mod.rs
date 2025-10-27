@@ -14,6 +14,7 @@ pub mod info;
 // NodeState contains all of the node transitions during its lifetime.
 // Change in state could occur when receiving messages from other peers,
 // or performing actions like joining or leaving the cluster.
+#[allow(dead_code)]
 pub enum NodeState {
     // Node is initializing hardware, setting up network interfaces, etc.
     Initializing,

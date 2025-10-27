@@ -55,6 +55,7 @@ struct NetworkPlan {
 }
 
 impl NetworkController {
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(
         registry: NetworkRegistry,
         cluster_registry: Registry,
@@ -584,7 +585,7 @@ impl NetworkController {
 
             let stale: Vec<(String, IpAddr)> = entry
                 .iter()
-                .filter(|(mac, ip)| desired.get(*mac).map_or(true, |want| want != *ip))
+                .filter(|(mac, ip)| desired.get(*mac) != Some(ip))
                 .map(|(mac, ip)| (mac.clone(), *ip))
                 .collect();
 

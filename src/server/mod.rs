@@ -1,7 +1,7 @@
 use crate::secrets::crypto::SecretKeyring;
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
-use crate::server::session::ClusterSessionImpl;
+use crate::server::session::{ClusterSessionClients, ClusterSessionImpl};
 use crate::token::TokenStore;
 use crate::topology::Topology;
 use ed25519_dalek::SigningKey;
@@ -95,6 +95,7 @@ pub struct ServerClients {
 pub struct ServerStores {
     pub token_store: TokenStore,
     pub session_store: AuthStore,
+    #[allow(dead_code)]
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
@@ -125,19 +126,19 @@ impl Server {
         let health_srv = crate::topology::health::Health::new(self.topology.clone());
         let health_client: HealthClient = capnp_rpc::new_client(health_srv);
 
-        let session = ClusterSessionImpl::new(
-            self.clients.topology_client.clone(),
-            self.clients.sync_client.clone(),
-            self.clients.gossip_client.clone(),
-            self.clients.node_client.clone(),
-            health_client,
-            self.clients.task_client.clone(),
-            self.clients.scheduler_client.clone(),
-            self.clients.services_client.clone(),
-            self.clients.secrets_client.clone(),
-            self.clients.networks_client.clone(),
-            self.online.clone(),
-        );
+        let session_clients = ClusterSessionClients {
+            topology: self.clients.topology_client.clone(),
+            sync: self.clients.sync_client.clone(),
+            gossip: self.clients.gossip_client.clone(),
+            node: self.clients.node_client.clone(),
+            health: health_client,
+            task: self.clients.task_client.clone(),
+            scheduler: self.clients.scheduler_client.clone(),
+            services: self.clients.services_client.clone(),
+            secrets: self.clients.secrets_client.clone(),
+            networks: self.clients.networks_client.clone(),
+        };
+        let session = ClusterSessionImpl::new(session_clients, self.online.clone());
 
         capnp_rpc::new_client(session)
     }
@@ -231,6 +232,7 @@ impl Server {
     }
 
     /// Backward-compatible wrapper (kept for the daemon path).
+    #[allow(dead_code)]
     pub async fn start_daemon(
         self,
         enable_unix_socket: bool,

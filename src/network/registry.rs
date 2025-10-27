@@ -73,6 +73,7 @@ impl NetworkRegistry {
     }
 
     /// Delete the specified network and cascade removal to its peer state entries.
+    #[allow(dead_code)]
     pub async fn remove_spec(&self, id: Uuid) -> Result<()> {
         self.specs
             .remove(&UuidKey::from(id))

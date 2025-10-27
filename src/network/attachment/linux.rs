@@ -16,7 +16,9 @@ use tokio::task::spawn_blocking;
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{AttachmentProvisionerApi, container_iface_name, host_iface_name};
+use super::{
+    AttachmentProvisionerApi, AttachmentProvisioningRequest, container_iface_name, host_iface_name,
+};
 use async_trait::async_trait;
 use nix::sched::{CloneFlags, setns};
 
@@ -54,59 +56,57 @@ impl AttachmentProvisioner {
             return Ok(false);
         };
         let host_if = host_iface_name(attachment_id);
-        Ok(self.link_index_inner(handle, &host_if).await?.is_some())
+        Ok(self.link_index(handle, &host_if).await?.is_some())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn ensure_attachment(
         &self,
-        _network_id: Uuid,
-        bridge_name: &str,
-        mtu: u32,
-        attachment_id: Uuid,
-        container_pid: i32,
-        assigned_ip: &str,
-        prefix: u8,
-        mac: &str,
+        request: &AttachmentProvisioningRequest<'_>,
     ) -> Result<()> {
         let Some(handle) = self.handle() else {
             debug!(
                 target: "task",
-                attachment = %attachment_id,
+                attachment = %request.attachment_id,
                 "skipping attachment provisioning; rtnetlink unavailable"
             );
             return Ok(());
         };
 
-        let host_if = host_iface_name(attachment_id);
-        let container_if = container_iface_name(attachment_id);
+        let host_if = host_iface_name(request.attachment_id);
+        let container_if = container_iface_name(request.attachment_id);
 
-        let host_index = match self.link_index_inner(handle, &host_if).await? {
+        let bridge_name = request.bridge_name;
+
+        let host_index = match self.link_index(handle, &host_if).await? {
             Some(index) => index,
             None => {
                 self.create_veth(handle, &host_if, &container_if).await?;
-                self.link_index_inner(handle, &host_if)
+                self.link_index(handle, &host_if)
                     .await?
                     .context("veth host interface missing after creation")?
             }
         };
 
         let container_index = self
-            .link_index_inner(handle, &container_if)
+            .link_index(handle, &container_if)
             .await?
             .context("veth peer interface missing after creation")?;
 
-        if mtu > 0 {
+        if request.mtu > 0 {
             handle
                 .link()
-                .set(LinkUnspec::new_with_index(host_index).mtu(mtu).build())
+                .set(
+                    LinkUnspec::new_with_index(host_index)
+                        .mtu(request.mtu)
+                        .build(),
+                )
                 .execute()
                 .await
-                .with_context(|| format!("failed to set mtu {mtu} on {host_if}"))?;
+                .with_context(|| format!("failed to set mtu {} on {host_if}", request.mtu))?;
         }
 
         let bridge_index = self
-            .link_index_inner(handle, bridge_name)
+            .link_index(handle, bridge_name)
             .await?
             .context("bridge missing while configuring attachment")?;
 
@@ -128,7 +128,8 @@ impl AttachmentProvisioner {
             .await
             .with_context(|| format!("failed to bring {host_if} up"))?;
 
-        let netns_pid: u32 = container_pid
+        let netns_pid: u32 = request
+            .container_pid
             .try_into()
             .context("container pid is negative")?;
 
@@ -141,15 +142,20 @@ impl AttachmentProvisioner {
             )
             .execute()
             .await
-            .with_context(|| format!("failed to move {container_if} to pid {container_pid}"))?;
+            .with_context(|| {
+                format!(
+                    "failed to move {container_if} to pid {}",
+                    request.container_pid
+                )
+            })?;
 
         self.configure_container_interface(
             container_if.clone(),
-            mtu,
-            assigned_ip.to_string(),
-            prefix,
-            mac.to_string(),
-            container_pid,
+            request.mtu,
+            request.assigned_ip.to_string(),
+            request.prefix,
+            request.mac.to_string(),
+            request.container_pid,
         )
         .await
         .with_context(|| format!("configure container interface {container_if}"))?;
@@ -192,7 +198,7 @@ impl AttachmentProvisioner {
             return Ok(());
         };
         let host_if = host_iface_name(attachment_id);
-        if let Some(index) = self.link_index_inner(handle, &host_if).await? {
+        if let Some(index) = self.link_index(handle, &host_if).await? {
             if let Err(err) = handle.link().del(index).execute().await {
                 match err {
                     rtnetlink::Error::NetlinkError(message) => {
@@ -231,7 +237,7 @@ impl AttachmentProvisioner {
             return Ok(false);
         };
         let vxlan_index = self
-            .link_index_inner(handle, vxlan_name)
+            .link_index(handle, vxlan_name)
             .await?
             .context("vxlan interface missing while programming fdb")?;
 
@@ -278,7 +284,7 @@ impl AttachmentProvisioner {
         let Some(handle) = self.handle() else {
             return Ok(());
         };
-        let vxlan_index = match self.link_index_inner(handle, vxlan_name).await? {
+        let vxlan_index = match self.link_index(handle, vxlan_name).await? {
             Some(idx) => idx,
             None => return Ok(()),
         };
@@ -319,14 +325,7 @@ impl AttachmentProvisioner {
         Ok(())
     }
 
-    async fn link_index(&self, name: &str) -> Result<Option<u32>> {
-        let Some(handle) = self.handle() else {
-            return Ok(None);
-        };
-        self.link_index_inner(handle, name).await
-    }
-
-    async fn link_index_inner(&self, handle: &Handle, name: &str) -> Result<Option<u32>> {
+    async fn link_index(&self, handle: &Handle, name: &str) -> Result<Option<u32>> {
         let mut stream = handle.link().get().match_name(name.to_string()).execute();
 
         loop {
@@ -448,29 +447,8 @@ impl AttachmentProvisionerApi for AttachmentProvisioner {
         AttachmentProvisioner::attachment_exists(self, attachment_id).await
     }
 
-    async fn ensure_attachment(
-        &self,
-        network_id: Uuid,
-        bridge_name: &str,
-        mtu: u32,
-        attachment_id: Uuid,
-        container_pid: i32,
-        assigned_ip: &str,
-        prefix: u8,
-        mac: &str,
-    ) -> Result<()> {
-        AttachmentProvisioner::ensure_attachment(
-            self,
-            network_id,
-            bridge_name,
-            mtu,
-            attachment_id,
-            container_pid,
-            assigned_ip,
-            prefix,
-            mac,
-        )
-        .await
+    async fn ensure_attachment(&self, request: &AttachmentProvisioningRequest<'_>) -> Result<()> {
+        AttachmentProvisioner::ensure_attachment(self, request).await
     }
 
     async fn teardown_attachment(&self, attachment_id: Uuid) -> Result<()> {

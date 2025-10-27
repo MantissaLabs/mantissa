@@ -351,7 +351,10 @@ impl TaskManager {
                 continue;
             }
 
-            if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(updated)).await {
+            if let Err(err) = self
+                .enqueue_gossip(TaskEvent::Upsert(Box::new(updated)))
+                .await
+            {
                 warn!(
                     target: "task",
                     "failed to broadcast stopping state for remote task {}: {err}",
@@ -427,7 +430,10 @@ impl TaskManager {
         }
 
         for (_, spec) in &results {
-            if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(spec.clone())).await {
+            if let Err(err) = self
+                .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+                .await
+            {
                 warn!(
                     target: "task",
                     "failed to enqueue task gossip for {}: {err}",

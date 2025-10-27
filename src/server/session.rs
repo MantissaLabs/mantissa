@@ -7,47 +7,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone)]
+pub struct ClusterSessionClients {
+    pub topology: topology::Client,
+    pub sync: sync::Client,
+    pub gossip: gossip::Client,
+    pub node: node::Client,
+    pub health: health::Client,
+    pub task: task::Client,
+    pub scheduler: scheduler::Client,
+    pub services: services::Client,
+    pub secrets: secrets::Client,
+    pub networks: networks::Client,
+}
+
+#[derive(Clone)]
 pub struct ClusterSessionImpl {
-    topology: topology::Client,
-    sync: sync::Client,
-    gossip: gossip::Client,
-    node: node::Client,
-    health: health::Client,
-    task: task::Client,
-    scheduler: scheduler::Client,
-    services: services::Client,
-    secrets: secrets::Client,
-    networks: networks::Client,
+    clients: ClusterSessionClients,
     online: Arc<AtomicBool>,
 }
 
 impl ClusterSessionImpl {
-    pub fn new(
-        topology: topology::Client,
-        sync: sync::Client,
-        gossip: gossip::Client,
-        node: node::Client,
-        health: health::Client,
-        task: task::Client,
-        scheduler: scheduler::Client,
-        services: services::Client,
-        secrets: secrets::Client,
-        networks: networks::Client,
-        online: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            topology,
-            sync,
-            gossip,
-            node,
-            health,
-            task,
-            scheduler,
-            services,
-            secrets,
-            networks,
-            online,
-        }
+    pub fn new(clients: ClusterSessionClients, online: Arc<AtomicBool>) -> Self {
+        Self { clients, online }
     }
 
     fn ensure_online(&self) -> Result<(), capnp::Error> {
@@ -70,15 +51,15 @@ impl cluster_session::Server for ClusterSessionImpl {
 
         let mut caps = results.get().init_caps();
 
-        caps.set_gossip(self.gossip.clone());
-        caps.set_topology(self.topology.clone());
-        caps.set_sync(self.sync.clone());
-        caps.set_health(self.health.clone());
-        caps.set_task(self.task.clone());
-        caps.set_scheduler(self.scheduler.clone());
-        caps.set_services(self.services.clone());
-        caps.set_secrets(self.secrets.clone());
-        caps.set_networks(self.networks.clone());
+        caps.set_gossip(self.clients.gossip.clone());
+        caps.set_topology(self.clients.topology.clone());
+        caps.set_sync(self.clients.sync.clone());
+        caps.set_health(self.clients.health.clone());
+        caps.set_task(self.clients.task.clone());
+        caps.set_scheduler(self.clients.scheduler.clone());
+        caps.set_services(self.clients.services.clone());
+        caps.set_secrets(self.clients.secrets.clone());
+        caps.set_networks(self.clients.networks.clone());
 
         Ok(())
     }
@@ -90,7 +71,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_topology(self.topology.clone());
+        results.get().set_topology(self.clients.topology.clone());
         Ok(())
     }
 
@@ -101,7 +82,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_sync(self.sync.clone());
+        results.get().set_sync(self.clients.sync.clone());
         Ok(())
     }
 
@@ -112,7 +93,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_gossip(self.gossip.clone());
+        results.get().set_gossip(self.clients.gossip.clone());
         Ok(())
     }
 
@@ -123,7 +104,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_node(self.node.clone());
+        results.get().set_node(self.clients.node.clone());
         Ok(())
     }
 
@@ -134,7 +115,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_task(self.task.clone());
+        results.get().set_task(self.clients.task.clone());
         Ok(())
     }
 
@@ -145,7 +126,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_scheduler(self.scheduler.clone());
+        results.get().set_scheduler(self.clients.scheduler.clone());
         Ok(())
     }
 
@@ -156,7 +137,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_services(self.services.clone());
+        results.get().set_services(self.clients.services.clone());
         Ok(())
     }
 
@@ -167,7 +148,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_secrets(self.secrets.clone());
+        results.get().set_secrets(self.clients.secrets.clone());
         Ok(())
     }
 
@@ -178,7 +159,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_networks(self.networks.clone());
+        results.get().set_networks(self.clients.networks.clone());
         Ok(())
     }
 }

@@ -3,7 +3,7 @@ use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     NetworkAttachmentValue, NetworkDriver, NetworkEvent, NetworkPeerState, NetworkPeerStateValue,
-    NetworkSpecValue, NetworkStatus, compute_network_id,
+    NetworkSpecDraft, NetworkSpecUpdate, NetworkSpecValue, NetworkStatus, compute_network_id,
 };
 use capnp::Error;
 use protocol::network::{
@@ -310,17 +310,19 @@ impl networks::Server for NetworksRpc {
         let network_id = compute_network_id(&name);
         let existing_spec = self.registry.get_spec(network_id).map_err(to_capnp)?;
 
+        let update = NetworkSpecUpdate {
+            description: description.clone(),
+            driver,
+            subnet_cidr: subnet.clone(),
+            vni,
+            mtu,
+            sealed,
+            bpf_programs: programs.clone(),
+        };
+
         let (mut spec_value, is_new) = match existing_spec {
             Some(mut current) if current.is_deleted() => {
-                current.reset_for_recreate(
-                    description.clone(),
-                    driver,
-                    subnet.clone(),
-                    vni,
-                    mtu,
-                    sealed,
-                    programs.clone(),
-                );
+                current.reset_for_recreate(update.clone());
                 (current, true)
             }
             Some(mut current) => {
@@ -330,28 +332,20 @@ impl networks::Server for NetworksRpc {
                         current.name
                     )));
                 }
-                current.apply_update(
-                    description.clone(),
-                    driver,
-                    subnet.clone(),
-                    vni,
-                    mtu,
-                    sealed,
-                    programs.clone(),
-                );
+                current.apply_update(update.clone());
                 (current, false)
             }
             None => (
-                NetworkSpecValue::new(
-                    name.clone(),
-                    description.clone(),
+                NetworkSpecValue::new(NetworkSpecDraft {
+                    name: name.clone(),
+                    description: description.clone(),
                     driver,
-                    subnet.clone(),
+                    subnet_cidr: subnet.clone(),
                     vni,
                     mtu,
                     sealed,
-                    programs.clone(),
-                ),
+                    bpf_programs: programs.clone(),
+                }),
                 true,
             ),
         };

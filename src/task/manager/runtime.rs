@@ -7,11 +7,12 @@ use uuid::Uuid;
 
 use crate::gossip::Message;
 use crate::network::allocator::{allocate_overlay_address, parse_ipv4_cidr};
-use crate::network::attachment::bridge_name;
+use crate::network::attachment::{AttachmentProvisioningRequest, bridge_name};
 use crate::network::controller::DEFAULT_MTU;
 use crate::network::events::ForwardingEvent;
 use crate::network::types::{
-    NetworkAttachmentState, NetworkAttachmentValue, compute_network_attachment_id,
+    NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue,
+    compute_network_attachment_id,
 };
 use crate::task::container::ContainerState;
 use crate::task::types::TaskEvent;
@@ -46,7 +47,8 @@ impl TaskManager {
     /// Handles a gossip event by updating local state and reconciling as needed.
     async fn handle_event(&self, event: TaskEvent) -> Result<(), anyhow::Error> {
         match event {
-            TaskEvent::Upsert(spec) => {
+            TaskEvent::Upsert(spec_box) => {
+                let spec = *spec_box;
                 let belongs = spec.node_id == self.local_node_id;
                 self.persist_spec(&spec).await?;
 
@@ -147,18 +149,18 @@ impl TaskManager {
                         (value, Some(prev_state), prev_ip, prev_mac)
                     }
                     None => (
-                        NetworkAttachmentValue::new(
-                            compute_network_attachment_id(task_id, *network_id),
+                        NetworkAttachmentValue::new(NetworkAttachmentDraft {
+                            id: compute_network_attachment_id(task_id, *network_id),
                             task_id,
-                            self.local_node_id,
-                            container_id,
-                            *network_id,
-                            None,
-                            None,
-                            None,
-                            NetworkAttachmentState::Pending,
-                            None,
-                        ),
+                            node_id: self.local_node_id,
+                            container_id: container_id.to_string(),
+                            network_id: *network_id,
+                            requested_ip: None,
+                            assigned_ip: None,
+                            mac: None,
+                            state: NetworkAttachmentState::Pending,
+                            error: None,
+                        }),
                         None,
                         None,
                         None,
@@ -186,7 +188,6 @@ impl TaskManager {
 
             let assignment_changed =
                 previous_ip != attachment.assigned_ip || previous_mac != attachment.mac;
-            let mut notify_forwarding = false;
 
             let provisioned = self
                 .attachment_provisioner
@@ -214,18 +215,19 @@ impl TaskManager {
                     .await
                     .context("persist configuring attachment state")?;
 
+                let provisioning = AttachmentProvisioningRequest {
+                    bridge_name: &bridge,
+                    mtu,
+                    attachment_id: attachment.id,
+                    container_pid,
+                    assigned_ip: &allocation.assigned_ip,
+                    prefix,
+                    mac: &allocation.mac_address,
+                };
+
                 if let Err(err) = self
                     .attachment_provisioner
-                    .ensure_attachment(
-                        spec.id,
-                        &bridge,
-                        mtu,
-                        attachment.id,
-                        container_pid,
-                        &allocation.assigned_ip,
-                        prefix,
-                        &allocation.mac_address,
-                    )
+                    .ensure_attachment(&provisioning)
                     .await
                 {
                     tracing::warn!(
@@ -251,7 +253,7 @@ impl TaskManager {
 
             attachment.set_state(NetworkAttachmentState::Ready, None);
             let was_ready = matches!(previous_state, Some(NetworkAttachmentState::Ready));
-            notify_forwarding = !was_ready || assignment_changed;
+            let notify_forwarding = !was_ready || assignment_changed;
 
             self.network_registry
                 .upsert_attachment(attachment)

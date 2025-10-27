@@ -71,6 +71,7 @@ enum SessionStrategy {
 }
 
 impl Registry {
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(
         peers: PeersStore,
         sessions: LocalSessionStore,
@@ -255,6 +256,7 @@ impl Registry {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn resume_sessions_on_boot(&self, local_addr: &str) {
         println!("Resuming sessions with peers...");
 
@@ -456,6 +458,7 @@ impl Registry {
     }
 
     /// Ensures a capability entry exists for `peer_id`, creating one if necessary.
+    #[allow(clippy::arc_with_non_send_sync)]
     async fn ensure_entry(&self, peer_id: Uuid) -> PeerEntry {
         let mut guard = self.cache.write().await;
         guard

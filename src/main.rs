@@ -203,7 +203,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let version = local
                     .run_until(client::secrets::rotate_master_key(&cfg))
                     .await?;
-                println!("rotated secret master key to version {}", version);
+                println!("rotated secret master key to version {version}");
             }
             SecretsCommand::Show(args) => {
                 let detail = local
@@ -214,14 +214,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("Version: {}", detail.summary.version_id);
                 println!("Updated: {}", detail.summary.updated_at);
                 if let Some(desc) = detail.summary.description.as_ref() {
-                    println!("Description: {}", desc);
+                    println!("Description: {desc}");
                 }
                 if !detail.summary.labels.is_empty() {
                     let labels: Vec<String> = detail
                         .summary
                         .labels
                         .iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
+                        .map(|(k, v)| format!("{k}={v}"))
                         .collect();
                     println!("Labels: {}", labels.join(", "));
                 }

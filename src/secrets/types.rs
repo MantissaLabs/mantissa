@@ -28,6 +28,7 @@ pub struct SecretCiphertext {
 
 impl SecretCiphertext {
     /// Returns the Blake3 digest recorded when encrypting the plaintext.
+    #[allow(dead_code)]
     pub fn digest(&self) -> Hash {
         Hash::from_bytes(self.digest)
     }
@@ -108,6 +109,7 @@ impl SecretValue {
     }
 
     /// Returns a reference to the currently active version.
+    #[allow(dead_code)]
     pub fn version(&self) -> &SecretVersion {
         &self.current_version
     }

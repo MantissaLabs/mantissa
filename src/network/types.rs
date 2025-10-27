@@ -26,21 +26,18 @@ impl NetworkDriver {
 }
 
 /// Lifecycle state for an overlay network.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkStatus {
+    #[default]
     Pending,
     Provisioning,
     Ready,
     Degraded,
     Deleting,
     Deleted,
-}
-
-impl Default for NetworkStatus {
-    fn default() -> Self {
-        NetworkStatus::Pending
-    }
 }
 
 impl NetworkStatus {
@@ -71,20 +68,17 @@ impl NetworkStatus {
 }
 
 /// Per-peer state for a provisioned network.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkPeerState {
+    #[default]
     AwaitingSpec,
     Configuring,
     Ready,
     Error,
     Removing,
-}
-
-impl Default for NetworkPeerState {
-    fn default() -> Self {
-        NetworkPeerState::AwaitingSpec
-    }
 }
 
 impl NetworkPeerState {
@@ -134,36 +128,52 @@ pub struct NetworkSpecValue {
     pub bpf_programs: Vec<String>,
 }
 
+/// Parameters required when creating a new network specification.
+#[derive(Clone, Debug)]
+pub struct NetworkSpecDraft {
+    pub name: String,
+    pub description: String,
+    pub driver: NetworkDriver,
+    pub subnet_cidr: String,
+    pub vni: u32,
+    pub mtu: u32,
+    pub sealed: bool,
+    pub bpf_programs: Vec<String>,
+}
+
+/// Field bundle applied when updating an existing network specification.
+#[derive(Clone, Debug)]
+pub struct NetworkSpecUpdate {
+    pub description: String,
+    pub driver: NetworkDriver,
+    pub subnet_cidr: String,
+    pub vni: u32,
+    pub mtu: u32,
+    pub sealed: bool,
+    pub bpf_programs: Vec<String>,
+}
+
 impl NetworkSpecValue {
     /// Construct a new network specification with timestamps aligned to creation time.
-    pub fn new(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        driver: NetworkDriver,
-        subnet_cidr: impl Into<String>,
-        vni: u32,
-        mtu: u32,
-        sealed: bool,
-        mut bpf_programs: Vec<String>,
-    ) -> Self {
-        let name = name.into();
-        let id = compute_network_id(&name);
+    pub fn new(draft: NetworkSpecDraft) -> Self {
+        let mut draft = draft;
+        draft.bpf_programs.sort();
+        let id = compute_network_id(&draft.name);
         let created_at = current_timestamp();
-        bpf_programs.sort();
 
         Self {
             id,
-            name,
-            description: description.into(),
-            driver,
-            subnet_cidr: subnet_cidr.into(),
-            vni,
-            mtu,
+            name: draft.name,
+            description: draft.description,
+            driver: draft.driver,
+            subnet_cidr: draft.subnet_cidr,
+            vni: draft.vni,
+            mtu: draft.mtu,
             created_at: created_at.clone(),
             updated_at: created_at,
             status: NetworkStatus::Pending,
-            sealed,
-            bpf_programs,
+            sealed: draft.sealed,
+            bpf_programs: draft.bpf_programs,
         }
     }
 
@@ -178,24 +188,16 @@ impl NetworkSpecValue {
     }
 
     /// Apply a partial update from a builder while preserving immutable fields.
-    pub fn apply_update(
-        &mut self,
-        description: impl Into<String>,
-        driver: NetworkDriver,
-        subnet_cidr: impl Into<String>,
-        vni: u32,
-        mtu: u32,
-        sealed: bool,
-        mut bpf_programs: Vec<String>,
-    ) {
-        self.description = description.into();
-        self.driver = driver;
-        self.subnet_cidr = subnet_cidr.into();
-        self.vni = vni;
-        self.mtu = mtu;
-        self.sealed |= sealed;
-        bpf_programs.sort();
-        self.bpf_programs = bpf_programs;
+    pub fn apply_update(&mut self, update: NetworkSpecUpdate) {
+        let mut update = update;
+        update.bpf_programs.sort();
+        self.description = update.description;
+        self.driver = update.driver;
+        self.subnet_cidr = update.subnet_cidr;
+        self.vni = update.vni;
+        self.mtu = update.mtu;
+        self.sealed |= update.sealed;
+        self.bpf_programs = update.bpf_programs;
         self.touch();
     }
 
@@ -217,24 +219,16 @@ impl NetworkSpecValue {
     }
 
     /// Reset a previously deleted specification so it can be recreated with new parameters.
-    pub fn reset_for_recreate(
-        &mut self,
-        description: impl Into<String>,
-        driver: NetworkDriver,
-        subnet_cidr: impl Into<String>,
-        vni: u32,
-        mtu: u32,
-        sealed: bool,
-        mut bpf_programs: Vec<String>,
-    ) {
-        self.description = description.into();
-        self.driver = driver;
-        self.subnet_cidr = subnet_cidr.into();
-        self.vni = vni;
-        self.mtu = mtu;
-        self.sealed = sealed;
-        bpf_programs.sort();
-        self.bpf_programs = bpf_programs;
+    pub fn reset_for_recreate(&mut self, update: NetworkSpecUpdate) {
+        let mut update = update;
+        update.bpf_programs.sort();
+        self.description = update.description;
+        self.driver = update.driver;
+        self.subnet_cidr = update.subnet_cidr;
+        self.vni = update.vni;
+        self.mtu = update.mtu;
+        self.sealed = update.sealed;
+        self.bpf_programs = update.bpf_programs;
         self.status = NetworkStatus::Pending;
         self.touch();
     }
@@ -350,6 +344,7 @@ impl NetworkAttachmentState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_proto(state: protocol::network::AttachmentState) -> Self {
         match state {
             protocol::network::AttachmentState::Pending => NetworkAttachmentState::Pending,
@@ -382,33 +377,37 @@ pub struct NetworkAttachmentValue {
     pub error: Option<String>,
 }
 
+/// Parameters captured when creating a new network attachment record.
+#[derive(Clone, Debug)]
+pub struct NetworkAttachmentDraft {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub node_id: Uuid,
+    pub container_id: String,
+    pub network_id: Uuid,
+    pub requested_ip: Option<String>,
+    pub assigned_ip: Option<String>,
+    pub mac: Option<String>,
+    pub state: NetworkAttachmentState,
+    pub error: Option<String>,
+}
+
 impl NetworkAttachmentValue {
-    pub fn new(
-        id: Uuid,
-        task_id: Uuid,
-        node_id: Uuid,
-        container_id: impl Into<String>,
-        network_id: Uuid,
-        requested_ip: Option<String>,
-        assigned_ip: Option<String>,
-        mac: Option<String>,
-        state: NetworkAttachmentState,
-        error: Option<String>,
-    ) -> Self {
+    pub fn new(draft: NetworkAttachmentDraft) -> Self {
         let created_at = current_timestamp();
         Self {
-            id,
-            task_id,
-            node_id,
-            container_id: container_id.into(),
-            network_id,
-            requested_ip,
-            assigned_ip,
-            mac,
+            id: draft.id,
+            task_id: draft.task_id,
+            node_id: draft.node_id,
+            container_id: draft.container_id,
+            network_id: draft.network_id,
+            requested_ip: draft.requested_ip,
+            assigned_ip: draft.assigned_ip,
+            mac: draft.mac,
             created_at: created_at.clone(),
             updated_at: created_at,
-            state,
-            error,
+            state: draft.state,
+            error: draft.error,
         }
     }
 

@@ -26,6 +26,7 @@ impl ServiceRegistry {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn remove_by_id(&self, id: Uuid) -> Result<()> {
         self.store
             .remove(&UuidKey::from(id))
@@ -66,6 +67,7 @@ impl ServiceRegistry {
         Ok(values)
     }
 
+    #[allow(dead_code)]
     pub fn compute_id(&self, service_name: &str) -> Uuid {
         compute_service_id(service_name)
     }

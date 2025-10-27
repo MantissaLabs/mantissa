@@ -25,7 +25,7 @@ fn write_secret_reference(
     builder.set_name(&reference.name);
     if let Some(version) = &reference.version {
         let uuid = Uuid::parse_str(version)
-            .with_context(|| format!("invalid secret version '{}' for {context}", version))?;
+            .with_context(|| format!("invalid secret version '{version}' for {context}"))?;
         builder.set_version_id(uuid.as_bytes());
     } else {
         builder.set_version_id(&[]);

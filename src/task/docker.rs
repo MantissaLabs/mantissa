@@ -28,9 +28,11 @@ pub enum ContainerError {
     #[error("Docker API error: {0}")]
     DockerAPI(#[from] bollard::errors::Error),
 
+    #[allow(dead_code)]
     #[error("Container not found: {0}")]
     NotFound(String),
 
+    #[allow(dead_code)]
     #[error("Container operation timeout")]
     Timeout,
 
@@ -41,21 +43,24 @@ pub enum ContainerError {
 /// Result type for container operations
 pub type ContainerResult<T> = Result<T, ContainerError>;
 
+/// Parameters describing how to launch a container.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContainerCreateRequest {
+    pub name: String,
+    pub image: String,
+    pub command: Option<Vec<String>>,
+    pub env_vars: Option<Vec<String>>,
+    pub ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
+    pub volumes: Option<Vec<String>>,
+    pub restart_policy: Option<RestartPolicyConfig>,
+    pub resource_limits: ResourceLimits,
+}
+
 /// Interface for container management operations
 #[async_trait]
 pub trait ContainerManager {
     /// Create a new container
-    async fn create_container(
-        &self,
-        name: &str,
-        image: &str,
-        command: Option<Vec<String>>,
-        env_vars: Option<Vec<String>>,
-        ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
-        volumes: Option<Vec<String>>,
-        restart_policy: Option<RestartPolicyConfig>,
-        resource_limits: ResourceLimits,
-    ) -> ContainerResult<String>;
+    async fn create_container(&self, request: ContainerCreateRequest) -> ContainerResult<String>;
 
     /// Start a container
     async fn start_container(&self, container_id: &str) -> ContainerResult<()>;
@@ -68,6 +73,7 @@ pub trait ContainerManager {
     ) -> ContainerResult<()>;
 
     /// Restart a container
+    #[allow(dead_code)]
     async fn restart_container(
         &self,
         container_id: &str,
@@ -83,6 +89,7 @@ pub trait ContainerManager {
     ) -> ContainerResult<()>;
 
     /// List containers with optional filters
+    #[allow(dead_code)]
     async fn list_containers(
         &self,
         filters: Option<HashMap<String, Vec<String>>>,
@@ -169,6 +176,7 @@ impl ResourceLimits {
 
 /// Container information returned from listing containers
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ContainerInfo {
     pub id: String,
     pub name: String,
@@ -254,17 +262,18 @@ pub fn clear_container_manager_override() {
 
 #[async_trait]
 impl ContainerManager for DockerContainerManager {
-    async fn create_container(
-        &self,
-        name: &str,
-        image: &str,
-        command: Option<Vec<String>>,
-        env_vars: Option<Vec<String>>,
-        ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
-        volumes: Option<Vec<String>>,
-        restart_policy: Option<RestartPolicyConfig>,
-        resource_limits: ResourceLimits,
-    ) -> ContainerResult<String> {
+    async fn create_container(&self, request: ContainerCreateRequest) -> ContainerResult<String> {
+        let ContainerCreateRequest {
+            name,
+            image,
+            command,
+            env_vars,
+            ports,
+            volumes,
+            restart_policy,
+            resource_limits,
+        } = request;
+
         // Configure host settings
         let mut host_config = HostConfig::default();
 
@@ -279,7 +288,7 @@ impl ContainerManager for DockerContainerManager {
 
             host_config.restart_policy = Some(RestartPolicy {
                 name: Some(name),
-                maximum_retry_count: policy.max_retry_count.map(|value| i64::from(value)),
+                maximum_retry_count: policy.max_retry_count.map(i64::from),
             });
         }
 
@@ -303,7 +312,7 @@ impl ContainerManager for DockerContainerManager {
 
         // Create container config
         let config = Config {
-            image: Some(image.to_string()),
+            image: Some(image.clone()),
             env: env_vars,
             cmd: command,
             exposed_ports: if let Some(ports_map) = ports {
@@ -322,7 +331,7 @@ impl ContainerManager for DockerContainerManager {
 
         // Set container name options
         let options = Some(CreateContainerOptions {
-            name,
+            name: &name,
             platform: None,
         });
 
@@ -531,5 +540,92 @@ impl ContainerManager for DockerContainerManager {
 
         info!("Image pulled: {}", image);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct NullContainerManager;
+
+    #[async_trait]
+    impl ContainerManager for NullContainerManager {
+        async fn create_container(
+            &self,
+            _request: ContainerCreateRequest,
+        ) -> ContainerResult<String> {
+            Ok(String::from("noop"))
+        }
+
+        async fn start_container(&self, _container_id: &str) -> ContainerResult<()> {
+            Ok(())
+        }
+
+        async fn stop_container(
+            &self,
+            _container_id: &str,
+            _timeout: Option<Duration>,
+        ) -> ContainerResult<()> {
+            Ok(())
+        }
+
+        async fn restart_container(
+            &self,
+            _container_id: &str,
+            _timeout: Option<Duration>,
+        ) -> ContainerResult<()> {
+            Ok(())
+        }
+
+        async fn remove_container(
+            &self,
+            _container_id: &str,
+            _force: bool,
+            _remove_volumes: bool,
+        ) -> ContainerResult<()> {
+            Ok(())
+        }
+
+        async fn list_containers(
+            &self,
+            _filters: Option<HashMap<String, Vec<String>>>,
+        ) -> ContainerResult<Vec<ContainerInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn inspect_container(
+            &self,
+            _container_id: &str,
+        ) -> ContainerResult<ContainerInspectResponse> {
+            Err(ContainerError::OperationFailed("noop".into()))
+        }
+
+        async fn pull_image(&self, _image: &str) -> ContainerResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn container_manager_override_round_trip() {
+        let previous = container_manager_override();
+        clear_container_manager_override();
+
+        let manager: Arc<dyn ContainerManager + Send + Sync> = Arc::new(NullContainerManager);
+        set_container_manager_override(manager.clone());
+
+        let current = container_manager_override().expect("override installed");
+        assert!(Arc::ptr_eq(&current, &manager));
+
+        clear_container_manager_override();
+
+        if let Some(previous_manager) = previous {
+            set_container_manager_override(previous_manager);
+        }
     }
 }

@@ -12,6 +12,9 @@ use tracing::debug;
 pub mod delta;
 pub mod ranges;
 
+type EncodedRegister = (Vec<u8>, Vec<u8>);
+type EncodedRegisters = Vec<EncodedRegister>;
+
 // Chunk size used when streaming delta from server to client. Adjust as needed.
 pub const DELTA_CHUNK_MAX: usize = 1024;
 
@@ -396,11 +399,11 @@ impl sync::Server for SyncService {
     }
 }
 
-fn encode_registers<R>(regs: Registers<UuidKey, R>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, capnp::Error>
+fn encode_registers<R>(regs: Registers<UuidKey, R>) -> Result<EncodedRegisters, capnp::Error>
 where
     R: serde::Serialize,
 {
-    let mut out = Vec::with_capacity(regs.len());
+    let mut out = EncodedRegisters::with_capacity(regs.len());
     for (k, r) in regs {
         let key_bytes = k.as_ref().to_vec();
         let reg_bytes = bincode::serialize(&r).map_err(|e| capnp::Error::failed(e.to_string()))?;

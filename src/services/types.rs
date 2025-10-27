@@ -120,20 +120,17 @@ pub enum ServiceEvent {
     Remove(ServiceSpecValue),
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceStatus {
     Deploying,
+    #[default]
     Running,
     Stopping,
     Stopped,
     Failed,
-}
-
-impl Default for ServiceStatus {
-    fn default() -> Self {
-        ServiceStatus::Running
-    }
 }
 
 fn current_timestamp() -> String {

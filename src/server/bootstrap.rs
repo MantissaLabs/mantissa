@@ -30,10 +30,10 @@ use crate::store::service_store::{ServiceStore, open_service_store};
 use crate::store::task_store::{TaskStore, open_task_store};
 use crate::sync::SyncService;
 use crate::task::docker::{self, ContainerManager, DockerContainerManager};
-use crate::task::manager::TaskManager;
+use crate::task::manager::{TaskManager, TaskManagerConfig};
 use crate::task::service::TaskService;
 use crate::token::TokenStore;
-use crate::topology::{Keys, Topology, TopologyStores};
+use crate::topology::{Keys, Topology, TopologyConfig, TopologyStores};
 use crate::{node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
@@ -342,16 +342,16 @@ impl Bootstrap {
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
 
-        let topology = Topology::new(
-            ctx.listen_addr.clone(),
-            topology_rx,
-            gossip_tx.clone(),
-            ctx.node.clone(),
-            topology_stores.clone(),
-            keys,
-            registry.clone(),
-            health_monitor.clone(),
-        )?;
+        let topology = Topology::new(TopologyConfig {
+            addr: ctx.listen_addr.clone(),
+            gossip_receiver: topology_rx,
+            gossip_sender: gossip_tx.clone(),
+            node: ctx.node.clone(),
+            stores: topology_stores.clone(),
+            crypto: keys,
+            registry: registry.clone(),
+            health_monitor: health_monitor.clone(),
+        })?;
 
         let topology_client: TopologyClient = capnp_rpc::new_client(topology.clone());
 
@@ -412,21 +412,21 @@ impl Bootstrap {
             network_rx,
         );
 
-        let task_manager = TaskManager::new(
-            stores.tasks.clone(),
-            gossip_tx.clone(),
-            task_rx,
-            ctx.self_id,
-            local_node_name.clone(),
-            scheduler.clone(),
+        let task_manager = TaskManager::new(TaskManagerConfig {
+            store: stores.tasks.clone(),
+            tx: gossip_tx.clone(),
+            rx: task_rx,
+            local_node_id: ctx.self_id,
+            local_node_name: local_node_name.clone(),
+            scheduler: scheduler.clone(),
             container_manager,
-            registry.clone(),
-            network_registry.clone(),
-            secret_registry.clone(),
-            stores.secret_keyring.clone(),
-            Some(forwarding_tx),
-            None,
-        );
+            registry: registry.clone(),
+            network_registry: network_registry.clone(),
+            secret_registry: secret_registry.clone(),
+            secret_keyring: stores.secret_keyring.clone(),
+            forwarding_events: Some(forwarding_tx),
+            attachment_override: None,
+        });
 
         let service_registry = ServiceRegistry::new(stores.services.clone());
         let service_controller = ServiceController::new(
@@ -475,7 +475,7 @@ impl Bootstrap {
                 networks_client: networks_client_cap,
                 network_registry,
                 network_controller,
-                network_gossiper: network_gossiper,
+                network_gossiper,
             },
             gossip_rx,
         ))

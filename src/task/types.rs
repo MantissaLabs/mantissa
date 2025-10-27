@@ -32,7 +32,7 @@ pub struct TaskSpec {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TaskEvent {
-    Upsert(TaskSpec),
+    Upsert(Box<TaskSpec>),
     Remove { id: Uuid },
 }
 
@@ -96,6 +96,7 @@ impl TaskStateFilter {
     }
 
     /// Fully permissive filter that matches all lifecycle states.
+    #[allow(dead_code)]
     pub fn all() -> Self {
         Self::new([
             TaskStateKind::Pending,
@@ -143,41 +144,44 @@ pub struct TaskValue {
     pub networks: Vec<Uuid>,
 }
 
+#[derive(Clone, Debug)]
+pub struct TaskValueDraft {
+    pub id: Uuid,
+    pub name: String,
+    pub image: String,
+    pub state: ContainerState,
+    pub created_at: String,
+    pub command: Vec<String>,
+    pub node_id: Uuid,
+    pub node_name: String,
+    pub slot_ids: Vec<u64>,
+    pub networks: Vec<Uuid>,
+    pub cpu_millis: u64,
+    pub memory_bytes: u64,
+    pub env: Vec<TaskEnvironmentVariable>,
+    pub secret_files: Vec<TaskSecretFile>,
+}
+
 impl TaskValue {
-    pub fn new(
-        id: Uuid,
-        name: impl Into<String>,
-        image: impl Into<String>,
-        state: ContainerState,
-        created_at: impl Into<String>,
-        command: Vec<String>,
-        node_id: Uuid,
-        node_name: impl Into<String>,
-        slot_ids: Vec<u64>,
-        networks: Vec<Uuid>,
-        cpu_millis: u64,
-        memory_bytes: u64,
-        env: Vec<TaskEnvironmentVariable>,
-        secret_files: Vec<TaskSecretFile>,
-    ) -> Self {
-        let slot_id = slot_ids.first().copied();
+    pub fn new(draft: TaskValueDraft) -> Self {
+        let slot_id = draft.slot_ids.first().copied();
         Self {
-            id,
-            name: name.into(),
-            image: image.into(),
-            state,
-            created_at: created_at.into(),
-            command,
-            node_id,
-            node_name: node_name.into(),
-            slot_ids,
+            id: draft.id,
+            name: draft.name,
+            image: draft.image,
+            state: draft.state,
+            created_at: draft.created_at,
+            command: draft.command,
+            node_id: draft.node_id,
+            node_name: draft.node_name,
+            slot_ids: draft.slot_ids,
             slot_id,
-            networks,
-            cpu_millis,
-            memory_bytes,
+            networks: draft.networks,
+            cpu_millis: draft.cpu_millis,
+            memory_bytes: draft.memory_bytes,
             restart_policy: None,
-            env,
-            secret_files,
+            env: draft.env,
+            secret_files: draft.secret_files,
         }
     }
 }

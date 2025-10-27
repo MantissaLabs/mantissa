@@ -112,6 +112,7 @@ impl LocalSessionStore {
     }
 
     /// Remove ticket for `peer`.
+    #[allow(dead_code)]
     pub fn remove(&self, peer: Uuid) -> io::Result<()> {
         let w = self.db.begin_write().map_err(ioerr)?;
         {
@@ -123,6 +124,7 @@ impl LocalSessionStore {
     }
 
     /// List all peers with their ticket bytes (returns even if expired).
+    #[allow(dead_code)]
     pub fn list(&self) -> io::Result<Vec<(Uuid, Vec<u8>)>> {
         Ok(self
             .list_records()?
@@ -176,6 +178,7 @@ impl LocalSessionStore {
     }
 
     // Return full record only if not expired (and optionally auto-purge).
+    #[allow(dead_code)]
     pub fn get_valid_record(
         &self,
         peer: Uuid,
@@ -219,6 +222,7 @@ impl LocalSessionStore {
     }
 
     /// Purge expired entries; returns the number removed.
+    #[allow(dead_code)]
     pub fn purge_expired(&self) -> io::Result<usize> {
         let peers = self
             .list_records()?

@@ -6,7 +6,9 @@ use chrono::Utc;
 use tracing::warn;
 
 use crate::task::container::ContainerState;
-use crate::task::docker::{ResourceLimits, RestartPolicyConfig, RestartPolicyType};
+use crate::task::docker::{
+    ContainerCreateRequest, ResourceLimits, RestartPolicyConfig, RestartPolicyType,
+};
 use crate::task::types::{TaskEvent, TaskRestartPolicyKind, TaskSpec};
 
 use super::TaskManager;
@@ -89,22 +91,24 @@ impl TaskManager {
                 Some(resolved.mounts.clone())
             };
 
+            let create_request = ContainerCreateRequest {
+                name: plan.container_name.clone(),
+                image: plan.image.clone(),
+                command: if plan.command.is_empty() {
+                    None
+                } else {
+                    Some(plan.command.clone())
+                },
+                env_vars,
+                ports: None,
+                volumes,
+                restart_policy,
+                resource_limits,
+            };
+
             let create_result = self
                 .container_manager
-                .create_container(
-                    &plan.container_name,
-                    &plan.image,
-                    if plan.command.is_empty() {
-                        None
-                    } else {
-                        Some(plan.command.clone())
-                    },
-                    env_vars,
-                    None,
-                    volumes,
-                    restart_policy,
-                    resource_limits,
-                )
+                .create_container(create_request)
                 .await;
 
             let container_id = match create_result {
@@ -223,7 +227,10 @@ impl TaskManager {
         }
 
         for spec in &specs {
-            if let Err(err) = self.enqueue_gossip(TaskEvent::Upsert(spec.clone())).await {
+            if let Err(err) = self
+                .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+                .await
+            {
                 warn!(
                     target: "task",
                     "failed to enqueue task gossip for {}: {err}",

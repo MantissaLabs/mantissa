@@ -38,6 +38,7 @@ impl LocalCredentialStore {
     }
 
     /// Get credential for `peer` (if any).
+    #[allow(dead_code)]
     pub fn get(&self, peer: Uuid) -> io::Result<Option<Vec<u8>>> {
         let r = self.db.begin_read().map_err(ioerr)?;
         let t = r.open_table(T_CRED).map_err(ioerr)?;
@@ -48,6 +49,7 @@ impl LocalCredentialStore {
         Ok(out)
     }
 
+    #[allow(dead_code)]
     pub fn remove(&self, peer: Uuid) -> io::Result<()> {
         let w = self.db.begin_write().map_err(ioerr)?;
         {

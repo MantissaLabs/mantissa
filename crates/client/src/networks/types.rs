@@ -313,7 +313,7 @@ fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, CapnpError> {
             bytes.len()
         )));
     }
-    Ok(Uuid::from_slice(&bytes).map_err(|e| CapnpError::failed(e.to_string()))?)
+    Uuid::from_slice(&bytes).map_err(|e| CapnpError::failed(e.to_string()))
 }
 
 fn optional_text(reader: capnp::text::Reader<'_>) -> Result<Option<String>, CapnpError> {
