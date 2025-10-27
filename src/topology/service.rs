@@ -10,8 +10,8 @@ use crate::sync::delta::{SyncStores, sync_all_domains};
 use crate::token::TokenStore;
 use crate::topology::health::status_to_node_status;
 use crate::topology::peers::PeerValue;
+use capnp::Error;
 use capnp::data;
-use capnp::{Error, capability::Promise};
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::VerifyingKey;
 use protocol::gossip::gossip_message;
@@ -193,15 +193,12 @@ impl topology::Server for Topology {
     /// Join the cluster and adds our client handle to the `Memberlist`
     /// Returns an instance of `Membership` to the caller to track its
     /// status.
-    fn join(
-        &mut self,
+    async fn join(
+        &self,
         params: topology::JoinParams,
         mut _results: topology::JoinResults,
-    ) -> Promise<(), Error> {
-        let payload = match self.build_join_payload() {
-            Ok(p) => p,
-            Err(e) => return Promise::err(e),
-        };
+    ) -> Result<(), Error> {
+        let payload = self.build_join_payload()?;
 
         let self_addr = self.networking.configured().to_string();
         let peers = self.peers.clone();
@@ -210,99 +207,96 @@ impl topology::Server for Topology {
         let token_store = self.token_store.clone();
         let topology = self.clone();
 
-        Promise::from_future(async move {
-            let inputs = JoinInputs::from_params(params)?;
+        let inputs = JoinInputs::from_params(params)?;
 
-            if inputs.anchor == self_addr {
-                return Err(capnp::Error::failed("cannot join own address".to_string()));
-            }
+        if inputs.anchor == self_addr {
+            return Err(capnp::Error::failed("cannot join own address".to_string()));
+        }
 
-            let client = client::connection::get_client_secure(&inputs.anchor)
-                .await
-                .map_err(|e| {
-                    Error::failed(format!(
-                        "could not connect to anchor {}: {e}",
-                        inputs.anchor
-                    ))
-                })?;
-            let anchor_handle = client.clone();
+        let client = client::connection::get_client_secure(&inputs.anchor)
+            .await
+            .map_err(|e| {
+                Error::failed(format!(
+                    "could not connect to anchor {}: {e}",
+                    inputs.anchor
+                ))
+            })?;
+        let anchor_handle = client.clone();
 
-            let response =
-                Topology::register_with_anchor(client, &payload, &inputs.join_token).await?;
+        let response = Topology::register_with_anchor(client, &payload, &inputs.join_token).await?;
 
-            let JoinResponse {
-                peer_id,
-                peer_value,
-                ticket,
-                credential,
-                session,
-            } = response;
+        let JoinResponse {
+            peer_id,
+            peer_value,
+            ticket,
+            credential,
+            session,
+        } = response;
 
-            Topology::persist_join_state(
-                peers.clone(),
-                local_sessions.clone(),
-                local_creds.clone(),
-                peer_id,
-                &peer_value,
-                &ticket,
-                &credential,
-            )
+        Topology::persist_join_state(
+            peers.clone(),
+            local_sessions.clone(),
+            local_creds.clone(),
+            peer_id,
+            &peer_value,
+            &ticket,
+            &credential,
+        )
+        .await?;
+
+        token_store
+            .set_and_persist(&inputs.join_token)
+            .await
+            .map_err(|e| Error::failed(format!("failed to persist join token: {e}")))?;
+
+        topology
+            .install_master_key_from_anchor(session.clone())
             .await?;
 
-            token_store
-                .set_and_persist(&inputs.join_token)
-                .await
-                .map_err(|e| Error::failed(format!("failed to persist join token: {e}")))?;
+        ClusterCredential::from_bytes_verified(&credential).map_err(Error::failed)?;
 
-            topology
-                .install_master_key_from_anchor(session.clone())
-                .await?;
+        topology.mark_seen(peer_id);
 
-            ClusterCredential::from_bytes_verified(&credential).map_err(Error::failed)?;
+        topology.attach_handle_only(peer_id, anchor_handle).await;
 
-            topology.mark_seen(peer_id);
+        let sync_cap = {
+            let req = session.get_sync_request();
+            let resp = req.send().promise.await?;
+            resp.get()?.get_sync()?
+        };
 
-            topology.attach_handle_only(peer_id, anchor_handle).await;
+        let sync_stores = SyncStores {
+            peers: peers.clone(),
+            tasks: topology.tasks.clone(),
+            services: topology.services.clone(),
+            secrets: topology.secrets.clone(),
+            networks: topology.networks.clone(),
+            network_peers: topology.network_peers.clone(),
+            network_attachments: topology.network_attachments.clone(),
+        };
 
-            let sync_cap = {
-                let req = session.get_sync_request();
-                let resp = req.send().promise.await?;
-                resp.get()?.get_sync()?
-            };
+        tokio::task::spawn_local({
+            let stores = sync_stores;
+            async move {
+                sync_all_domains(stores, sync_cap).await;
+            }
+        });
 
-            let sync_stores = SyncStores {
-                peers: peers.clone(),
-                tasks: topology.tasks.clone(),
-                services: topology.services.clone(),
-                secrets: topology.secrets.clone(),
-                networks: topology.networks.clone(),
-                network_peers: topology.network_peers.clone(),
-                network_attachments: topology.network_attachments.clone(),
-            };
+        topology.ensure_periodic_sync();
+        topology.sync_once_now();
 
-            tokio::task::spawn_local({
-                let stores = sync_stores;
-                async move {
-                    sync_all_domains(stores, sync_cap).await;
-                }
-            });
-
-            topology.ensure_periodic_sync();
-            topology.sync_once_now();
-
-            Ok(())
-        })
+        Ok(())
     }
 
     /// Leave the cluster: tombstone *this node* in its local Peers store and
     /// trigger an immediate sync so peers learn about the removal quickly.
-    fn leave(
-        &mut self,
+    async fn leave(
+        &self,
         _params: topology::LeaveParams,
         _results: topology::LeaveResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> Result<(), capnp::Error> {
         if !self.sync.is_running() {
-            return Promise::err(capnp::Error::failed("node is not part of a cluster".into()));
+            return Err(capnp::Error::failed("node is not part of a cluster".into()));
         }
 
         let self_id = self.node.id;
@@ -310,95 +304,86 @@ impl topology::Server for Topology {
         let registry = self.registry.clone();
         let topology = self.clone();
 
-        Promise::from_future(async move {
-            // Tombstone our own entry locally
-            peers
-                .remove(&UuidKey::from(self_id))
-                .await
-                .map_err(|e| capnp::Error::failed(format!("leave: tombstone failed: {e}")))?;
+        peers
+            .remove(&UuidKey::from(self_id))
+            .await
+            .map_err(|e| capnp::Error::failed(format!("leave: tombstone failed: {e}")))?;
 
-            registry.clear().await;
+        registry.clear().await;
 
-            // Stop the loop so this node is quiescent and can rejoin elsewhere
-            topology.stop_periodic_sync();
+        // Stop the loop so this node is quiescent and can rejoin elsewhere
+        topology.stop_periodic_sync();
 
-            Ok(())
-        })
+        Ok(())
     }
 
     /// List members of the network. Returns a list of nodes with their
     /// relevant information.
-    fn list(
-        &mut self,
+    async fn list(
+        &self,
         _params: topology::ListParams,
         mut results: topology::ListResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         info!(target: "topology", "Listing nodes");
 
         let peers = self.peers.clone();
         let health_snapshot = self.health_monitor.snapshot();
 
-        Promise::from_future(async move {
-            let (actives, _) = peers
-                .load_all()
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let (actives, _) = peers
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-            let list_builder = results.get().init_nodes();
-            let mut node_list = list_builder.init_nodes(actives.len() as u32);
+        let list_builder = results.get().init_nodes();
+        let mut node_list = list_builder.init_nodes(actives.len() as u32);
 
-            for (i, (k, snap)) in actives.into_iter().enumerate() {
-                let id = k.to_uuid();
-                let mut node = node_list.reborrow().get(i as u32);
-                set_node_id(node.reborrow().init_id(), &id);
+        for (i, (k, snap)) in actives.into_iter().enumerate() {
+            let id = k.to_uuid();
+            let mut node = node_list.reborrow().get(i as u32);
+            set_node_id(node.reborrow().init_id(), &id);
 
-                if let Some(val) = snap.as_slice().last().cloned() {
-                    node.set_addr(&val.address);
-                    node.set_hostname(&val.hostname);
-                    node.set_public_key(&val.noise_static_pub);
-                }
-
-                // Map health snapshot to NodeStatus.
-                let health_status = health_snapshot
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or(::health::Status::Unknown);
-                let node_status = status_to_node_status(health_status);
-                node.set_health(node_status);
+            if let Some(val) = snap.as_slice().last().cloned() {
+                node.set_addr(&val.address);
+                node.set_hostname(&val.hostname);
+                node.set_public_key(&val.noise_static_pub);
             }
 
-            Ok(())
-        })
+            // Map health snapshot to NodeStatus.
+            let health_status = health_snapshot
+                .get(&id)
+                .cloned()
+                .unwrap_or(::health::Status::Unknown);
+            let node_status = status_to_node_status(health_status);
+            node.set_health(node_status);
+        }
+
+        Ok(())
     }
 
     /// Returns the current join token for other nodes to use
     /// to join the cluster from this node.
-    fn show_token(
-        &mut self,
+    async fn show_token(
+        &self,
         _params: topology::ShowTokenParams,
         mut results: topology::ShowTokenResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let store: TokenStore = self.token_store.clone();
 
-        Promise::from_future(async move {
-            let token = store.current_token().await;
-            results.get().set_token(&token);
-            Ok(())
-        })
+        let token = store.current_token().await;
+        results.get().set_token(&token);
+        Ok(())
     }
 
     /// Rotates the token used to join the cluster.
-    fn rotate_token(
-        &mut self,
+    async fn rotate_token(
+        &self,
         _params: topology::RotateTokenParams,
         mut results: topology::RotateTokenResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let store: TokenStore = self.token_store.clone();
 
-        Promise::from_future(async move {
-            let new_token = store.rotate_and_persist().await?;
-            results.get().set_token(&new_token);
-            Ok(())
-        })
+        let new_token = store.rotate_and_persist().await?;
+        results.get().set_token(&new_token);
+        Ok(())
     }
 }
 

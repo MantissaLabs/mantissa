@@ -570,7 +570,10 @@ async fn list_tasks_respects_filters() {
         .expect("list stopped");
     assert!(stopped_tasks.is_empty());
 
-    let all_tasks = manager.list_tasks(&TaskStateFilter::all()).await.expect("list all");
+    let all_tasks = manager
+        .list_tasks(&TaskStateFilter::all())
+        .await
+        .expect("list all");
     assert!(all_tasks.is_empty());
 }
 

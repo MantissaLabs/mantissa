@@ -17,7 +17,6 @@ use crate::topology::peer_provider::PeerProvider;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 use capnp::Error;
-use capnp::capability::Promise;
 use protocol::gossip;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::gossip::gossip_message::Which::*;
@@ -81,99 +80,91 @@ pub struct Channels {
 }
 
 impl gossip::Server for Gossip {
-    fn gossip(
-        &mut self,
+    async fn gossip(
+        &self,
         params: gossip::GossipParams,
         _results: gossip::GossipResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let topo_tx = self.chans.topology_events.clone();
         let task_tx = self.chans.task_events.clone();
         let service_tx = self.chans.service_events.clone();
         let network_tx = self.chans.network_events.clone();
 
-        Promise::from_future(async move {
-            let msgs = params.get().unwrap().get_messages();
+        let msgs = params.get().unwrap().get_messages();
 
-            for msg in msgs.unwrap().get_messages().unwrap().iter() {
-                let id = match msg.get_id() {
-                    Ok(data) => {
-                        let bytes = data.to_owned();
-                        match <[u8; 16]>::try_from(bytes.as_slice()) {
-                            Ok(arr) => Uuid::from_bytes(arr),
-                            Err(_) => {
-                                eprintln!("Invalid gossip id length");
-                                continue;
-                            }
+        for msg in msgs.unwrap().get_messages().unwrap().iter() {
+            let id = match msg.get_id() {
+                Ok(data) => {
+                    let bytes = data.to_owned();
+                    match <[u8; 16]>::try_from(bytes.as_slice()) {
+                        Ok(arr) => Uuid::from_bytes(arr),
+                        Err(_) => {
+                            eprintln!("Invalid gossip id length");
+                            continue;
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("Missing gossip id: {e}");
-                        continue;
-                    }
-                };
-
-                match msg.reborrow().which().expect("failed to read variant") {
-                    Void(_) => {
-                        let _ = topo_tx.send(Message::Void { id }).await;
-                    }
-                    Topology(Ok(reader)) => match topology::read_topology_event(reader) {
-                        Ok(event) => {
-                            let message = Message::Topology { id, event };
-                            topo_tx.send(message).await.map_err(|e| {
-                                capnp::Error::failed(format!(
-                                    "Couldn't sent event to topology: {e}"
-                                ))
-                            })?;
-                        }
-                        Err(e) => eprintln!("Failed to convert topology event: {e}"),
-                    },
-                    Topology(Err(e)) => {
-                        eprintln!("Error reading topology: {e}");
-                    }
-                    Task(Ok(reader)) => match task_service::read_event(reader) {
-                        Ok(event) => {
-                            let message = Message::Task { id, event };
-                            task_tx.send(message).await.map_err(|e| {
-                                capnp::Error::failed(format!("Couldn't send event to task: {e}"))
-                            })?;
-                        }
-                        Err(e) => eprintln!("Failed to convert task event: {e}"),
-                    },
-                    Task(Err(e)) => {
-                        eprintln!("Error reading task: {e}");
-                    }
-                    Service(Ok(reader)) => match read_service_event(reader) {
-                        Ok(event) => {
-                            let message = Message::Service { id, event };
-                            service_tx.send(message).await.map_err(|e| {
-                                capnp::Error::failed(format!(
-                                    "Couldn't send event to services: {e}"
-                                ))
-                            })?;
-                        }
-                        Err(e) => eprintln!("Failed to convert service event: {e}"),
-                    },
-                    Service(Err(e)) => {
-                        eprintln!("Error reading service: {e}");
-                    }
-                    Network(Ok(reader)) => match read_network_event(reader) {
-                        Ok(event) => {
-                            let message = Message::Network { id, event };
-                            network_tx.send(message).await.map_err(|e| {
-                                capnp::Error::failed(format!(
-                                    "Couldn't send event to networks: {e}"
-                                ))
-                            })?;
-                        }
-                        Err(e) => eprintln!("Failed to convert network event: {e}"),
-                    },
-                    Network(Err(e)) => {
-                        eprintln!("Error reading network: {e}");
                     }
                 }
+                Err(e) => {
+                    eprintln!("Missing gossip id: {e}");
+                    continue;
+                }
+            };
+
+            match msg.reborrow().which().expect("failed to read variant") {
+                Void(_) => {
+                    let _ = topo_tx.send(Message::Void { id }).await;
+                }
+                Topology(Ok(reader)) => match topology::read_topology_event(reader) {
+                    Ok(event) => {
+                        let message = Message::Topology { id, event };
+                        topo_tx.send(message).await.map_err(|e| {
+                            capnp::Error::failed(format!("Couldn't sent event to topology: {e}"))
+                        })?;
+                    }
+                    Err(e) => eprintln!("Failed to convert topology event: {e}"),
+                },
+                Topology(Err(e)) => {
+                    eprintln!("Error reading topology: {e}");
+                }
+                Task(Ok(reader)) => match task_service::read_event(reader) {
+                    Ok(event) => {
+                        let message = Message::Task { id, event };
+                        task_tx.send(message).await.map_err(|e| {
+                            capnp::Error::failed(format!("Couldn't send event to task: {e}"))
+                        })?;
+                    }
+                    Err(e) => eprintln!("Failed to convert task event: {e}"),
+                },
+                Task(Err(e)) => {
+                    eprintln!("Error reading task: {e}");
+                }
+                Service(Ok(reader)) => match read_service_event(reader) {
+                    Ok(event) => {
+                        let message = Message::Service { id, event };
+                        service_tx.send(message).await.map_err(|e| {
+                            capnp::Error::failed(format!("Couldn't send event to services: {e}"))
+                        })?;
+                    }
+                    Err(e) => eprintln!("Failed to convert service event: {e}"),
+                },
+                Service(Err(e)) => {
+                    eprintln!("Error reading service: {e}");
+                }
+                Network(Ok(reader)) => match read_network_event(reader) {
+                    Ok(event) => {
+                        let message = Message::Network { id, event };
+                        network_tx.send(message).await.map_err(|e| {
+                            capnp::Error::failed(format!("Couldn't send event to networks: {e}"))
+                        })?;
+                    }
+                    Err(e) => eprintln!("Failed to convert network event: {e}"),
+                },
+                Network(Err(e)) => {
+                    eprintln!("Error reading network: {e}");
+                }
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 }
 

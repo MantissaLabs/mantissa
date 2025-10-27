@@ -712,7 +712,8 @@ impl TaskManager {
                 );
             }
             self.remove_spec(spec.id).await?;
-            self.enqueue_gossip(TaskEvent::Remove { id: spec.id }).await?;
+            self.enqueue_gossip(TaskEvent::Remove { id: spec.id })
+                .await?;
             if let Err(err) = self.cleanup_orphaned_local_attachments().await {
                 warn!(
                     target: "task",
@@ -741,7 +742,8 @@ impl TaskManager {
                 );
             }
             self.remove_spec(spec.id).await?;
-            self.enqueue_gossip(TaskEvent::Remove { id: spec.id }).await?;
+            self.enqueue_gossip(TaskEvent::Remove { id: spec.id })
+                .await?;
             if let Err(err) = self.cleanup_orphaned_local_attachments().await {
                 warn!(
                     target: "task",

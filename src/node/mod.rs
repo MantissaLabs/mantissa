@@ -2,7 +2,6 @@ use crate::info_capnp::info as SystemInfo;
 use crate::node::id::new_node_id_v7;
 use crate::node::info::NodeInfo;
 use capnp::Error;
-use capnp::capability::Promise;
 use capnp::message::Builder;
 use protocol::node;
 use tracing::info;
@@ -94,11 +93,11 @@ impl node::Server for Node {
     ///
     /// This method returns general informations such as load average,
     /// CPU specs, amount of Memory, Disk capacity, etc. to print on cli.
-    fn info(
-        &mut self,
+    async fn info(
+        &self,
         _params: node::InfoParams,
         mut results: node::InfoResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         info!(target: "node", "Collecting system information...");
 
         let mut builder = Builder::new_default();
@@ -184,11 +183,11 @@ impl node::Server for Node {
         }
 
         match builder.get_root::<SystemInfo::Builder>() {
-            Ok(system_reader) => match results.get().set_info(system_reader.into_reader()) {
-                Ok(_) => Promise::ok(()),
-                Err(e) => Promise::err(e),
-            },
-            Err(e) => Promise::err(e),
+            Ok(system_reader) => {
+                results.get().set_info(system_reader.into_reader())?;
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
     }
 }

@@ -212,9 +212,8 @@ impl AttachmentProvisioner {
                         }
                     }
                     other => {
-                        return Err(other).with_context(|| {
-                            format!("failed to delete interface {host_if}")
-                        });
+                        return Err(other)
+                            .with_context(|| format!("failed to delete interface {host_if}"));
                     }
                 }
             }

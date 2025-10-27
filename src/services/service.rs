@@ -6,7 +6,6 @@ use crate::services::types::{
 };
 use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use capnp::Error;
-use capnp::capability::Promise;
 use capnp::struct_list;
 use protocol::services::{service_event, service_spec, services, task_template};
 use protocol::task::{environment_var, secret_file, secret_ref};
@@ -118,84 +117,76 @@ fn decode_secret_files(
     Ok(files)
 }
 
-#[async_trait::async_trait(?Send)]
 impl services::Server for ServicesRPC {
-    fn deploy(
-        &mut self,
+    async fn deploy(
+        &self,
         params: services::DeployParams,
         mut results: services::DeployResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let manager = self.manager.clone();
 
-        Promise::from_future(async move {
-            let request = params.get()?;
-            let spec = request.get_spec()?;
+        let request = params.get()?;
+        let spec = request.get_spec()?;
 
-            let manifest_id =
-                read_optional_uuid(spec.get_manifest_id()?).unwrap_or_else(Uuid::new_v4);
-            let manifest_name = spec.get_manifest_name()?.to_str()?.to_string();
-            let service_name = spec.get_service_name()?.to_str()?.to_string();
+        let manifest_id = read_optional_uuid(spec.get_manifest_id()?).unwrap_or_else(Uuid::new_v4);
+        let manifest_name = spec.get_manifest_name()?.to_str()?.to_string();
+        let service_name = spec.get_service_name()?.to_str()?.to_string();
 
-            let mut tasks = Vec::new();
-            for tmpl in spec.get_tasks()?.iter() {
-                tasks.push(read_task_template(tmpl)?);
-            }
+        let mut tasks = Vec::new();
+        for tmpl in spec.get_tasks()?.iter() {
+            tasks.push(read_task_template(tmpl)?);
+        }
 
-            let service_id = manager
-                .submit_deployment(manifest_id, manifest_name, service_name, tasks)
-                .await
-                .map_err(|e| Error::failed(e.to_string()))?;
+        let service_id = manager
+            .submit_deployment(manifest_id, manifest_name, service_name, tasks)
+            .await
+            .map_err(|e| Error::failed(e.to_string()))?;
 
-            results.get().set_service_id(service_id.as_bytes());
-            Ok(())
-        })
+        results.get().set_service_id(service_id.as_bytes());
+        Ok(())
     }
 
-    fn list(
-        &mut self,
+    async fn list(
+        &self,
         _params: services::ListParams,
         mut results: services::ListResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let manager = self.manager.clone();
 
-        Promise::from_future(async move {
-            let services = manager
-                .list_services()
-                .map_err(|e| Error::failed(e.to_string()))?;
+        let services = manager
+            .list_services()
+            .map_err(|e| Error::failed(e.to_string()))?;
 
-            let mut list = results.get().init_services(services.len() as u32);
-            for (idx, service) in services.iter().enumerate() {
-                let mut builder = list.reborrow().get(idx as u32);
-                write_service_spec(&mut builder, service)?;
-            }
+        let mut list = results.get().init_services(services.len() as u32);
+        for (idx, service) in services.iter().enumerate() {
+            let mut builder = list.reborrow().get(idx as u32);
+            write_service_spec(&mut builder, service)?;
+        }
 
-            Ok(())
-        })
+        Ok(())
     }
 
-    fn delete(
-        &mut self,
+    async fn delete(
+        &self,
         params: services::DeleteParams,
         _results: services::DeleteResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let manager = self.manager.clone();
 
-        Promise::from_future(async move {
-            let ids = params.get()?.get_ids()?;
-            for entry in ids.iter() {
-                let id = read_uuid(entry?)?;
-                let manager = manager.clone();
-                tokio::task::spawn_local(async move {
-                    if let Err(err) = manager.submit_stop(id).await {
-                        warn!(
-                            target: "services",
-                            "failed to delete service {id}: {err}"
-                        );
-                    }
-                });
-            }
-            Ok(())
-        })
+        let ids = params.get()?.get_ids()?;
+        for entry in ids.iter() {
+            let id = read_uuid(entry?)?;
+            let manager = manager.clone();
+            tokio::task::spawn_local(async move {
+                if let Err(err) = manager.submit_stop(id).await {
+                    warn!(
+                        target: "services",
+                        "failed to delete service {id}: {err}"
+                    );
+                }
+            });
+        }
+        Ok(())
     }
 }
 

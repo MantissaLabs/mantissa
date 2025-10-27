@@ -6,7 +6,6 @@ use crate::secrets::types::{
 use crate::store::secret_master_store::{MasterKeyRecord, SecretMasterStore};
 use crate::topology::Topology;
 use capnp::Error;
-use capnp::capability::Promise;
 use capnp::struct_list;
 use chrono::Utc;
 use protocol::secrets::{secret_metadata_entry, secret_spec, secrets};
@@ -120,257 +119,244 @@ fn plaintext_from_reader(reader: capnp::data::Reader<'_>) -> Vec<u8> {
     reader.to_owned()
 }
 
-#[async_trait::async_trait(?Send)]
 impl secrets::Server for SecretsService {
-    fn list(
-        &mut self,
+    async fn list(
+        &self,
         _params: secrets::ListParams,
         mut results: secrets::ListResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let registry = self.registry();
-        Promise::from_future(async move {
-            let secrets = registry.list().map_err(|e| Error::failed(e.to_string()))?;
+        let secrets = registry.list().map_err(|e| Error::failed(e.to_string()))?;
 
-            let mut list_builder = results.get().init_secrets(secrets.len() as u32);
-            for (idx, value) in secrets.iter().enumerate() {
-                let spec_builder = list_builder.reborrow().get(idx as u32);
-                write_secret_spec(spec_builder, value);
-            }
+        let mut list_builder = results.get().init_secrets(secrets.len() as u32);
+        for (idx, value) in secrets.iter().enumerate() {
+            let spec_builder = list_builder.reborrow().get(idx as u32);
+            write_secret_spec(spec_builder, value);
+        }
 
-            Ok(())
-        })
+        Ok(())
     }
 
-    fn create(
-        &mut self,
+    async fn create(
+        &self,
         params: secrets::CreateParams,
         mut results: secrets::CreateResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let registry = self.registry();
         let keyring = self.keyring();
 
-        Promise::from_future(async move {
-            let request = params.get()?.get_request()?;
-            let name = request.get_name()?.to_str()?.trim().to_string();
-            if name.is_empty() {
-                return Err(Error::failed("secret name cannot be empty".into()));
-            }
+        let request = params.get()?.get_request()?;
+        let name = request.get_name()?.to_str()?.trim().to_string();
+        if name.is_empty() {
+            return Err(Error::failed("secret name cannot be empty".into()));
+        }
 
-            if registry
-                .get_by_name(&name)
+        if registry
+            .get_by_name(&name)
+            .map_err(|e| Error::failed(e.to_string()))?
+            .is_some()
+        {
+            return Err(Error::failed(format!("secret '{name}' already exists")));
+        }
+
+        let plaintext = plaintext_from_reader(request.get_plaintext()?);
+        let description_raw = request.get_description()?.to_str()?.trim().to_string();
+        let description = if description_raw.is_empty() {
+            None
+        } else {
+            Some(description_raw)
+        };
+        let metadata = metadata_from_entries(request.get_metadata()?, description);
+
+        let secret_id = compute_secret_id(&name);
+        let version_id = Uuid::new_v4();
+        let ciphertext = {
+            let guard = keyring.read().await;
+            guard
+                .encrypt(secret_id, version_id, &plaintext)
                 .map_err(|e| Error::failed(e.to_string()))?
-                .is_some()
-            {
-                return Err(Error::failed(format!("secret '{name}' already exists")));
-            }
+        };
+        let ciphertext = secret_ciphertext_from_encryption(ciphertext);
+        let master_key_version = ciphertext.master_key_version;
 
-            let plaintext = plaintext_from_reader(request.get_plaintext()?);
-            let description_raw = request.get_description()?.to_str()?.trim().to_string();
-            let description = if description_raw.is_empty() {
-                None
-            } else {
-                Some(description_raw)
-            };
-            let metadata = metadata_from_entries(request.get_metadata()?, description);
+        let now = Utc::now().to_rfc3339();
+        let version = SecretVersion::new(
+            version_id,
+            ciphertext,
+            now.clone(),
+            None,
+            master_key_version,
+        );
+        let value = SecretValue::new(name.clone(), metadata, now, version);
 
-            let secret_id = compute_secret_id(&name);
-            let version_id = Uuid::new_v4();
-            let ciphertext = {
-                let guard = keyring.read().await;
-                guard
-                    .encrypt(secret_id, version_id, &plaintext)
-                    .map_err(|e| Error::failed(e.to_string()))?
-            };
-            let ciphertext = secret_ciphertext_from_encryption(ciphertext);
-            let master_key_version = ciphertext.master_key_version;
+        registry
+            .upsert(value.clone())
+            .await
+            .map_err(|e| Error::failed(e.to_string()))?;
 
-            let now = Utc::now().to_rfc3339();
-            let version = SecretVersion::new(
-                version_id,
-                ciphertext,
-                now.clone(),
-                None,
-                master_key_version,
-            );
-            let value = SecretValue::new(name.clone(), metadata, now, version);
-
-            registry
-                .upsert(value.clone())
-                .await
-                .map_err(|e| Error::failed(e.to_string()))?;
-
-            let spec_builder = results.get().init_secret();
-            write_secret_spec(spec_builder, &value);
-            Ok(())
-        })
+        let spec_builder = results.get().init_secret();
+        write_secret_spec(spec_builder, &value);
+        Ok(())
     }
 
-    fn update(
-        &mut self,
+    async fn update(
+        &self,
         params: secrets::UpdateParams,
         mut results: secrets::UpdateResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let registry = self.registry();
         let keyring = self.keyring();
 
-        Promise::from_future(async move {
-            let request = params.get()?.get_request()?;
-            let name = request.get_name()?.to_str()?.trim().to_string();
-            if name.is_empty() {
-                return Err(Error::failed("secret name cannot be empty".into()));
-            }
+        let request = params.get()?.get_request()?;
+        let name = request.get_name()?.to_str()?.trim().to_string();
+        if name.is_empty() {
+            return Err(Error::failed("secret name cannot be empty".into()));
+        }
 
-            let existing = registry
-                .get_by_name(&name)
+        let existing = registry
+            .get_by_name(&name)
+            .map_err(|e| Error::failed(e.to_string()))?
+            .ok_or_else(|| Error::failed(format!("secret '{name}' not found")))?;
+
+        let plaintext = plaintext_from_reader(request.get_plaintext()?);
+        let description_raw = request.get_description()?.to_str()?.trim().to_string();
+        let description = if description_raw.is_empty() {
+            None
+        } else {
+            Some(description_raw)
+        };
+        let metadata = metadata_from_entries(request.get_metadata()?, description);
+
+        let version_id = Uuid::new_v4();
+        let ciphertext = {
+            let guard = keyring.read().await;
+            guard
+                .encrypt(existing.id, version_id, &plaintext)
                 .map_err(|e| Error::failed(e.to_string()))?
-                .ok_or_else(|| Error::failed(format!("secret '{name}' not found")))?;
+        };
+        let ciphertext = secret_ciphertext_from_encryption(ciphertext);
+        let master_key_version = ciphertext.master_key_version;
 
-            let plaintext = plaintext_from_reader(request.get_plaintext()?);
-            let description_raw = request.get_description()?.to_str()?.trim().to_string();
-            let description = if description_raw.is_empty() {
-                None
-            } else {
-                Some(description_raw)
-            };
-            let metadata = metadata_from_entries(request.get_metadata()?, description);
+        let now = Utc::now().to_rfc3339();
+        let version = SecretVersion::new(
+            version_id,
+            ciphertext,
+            now.clone(),
+            None,
+            master_key_version,
+        );
+        let mut updated = existing.clone();
+        updated.metadata = metadata;
+        updated.set_version(version, now);
 
-            let version_id = Uuid::new_v4();
-            let ciphertext = {
-                let guard = keyring.read().await;
-                guard
-                    .encrypt(existing.id, version_id, &plaintext)
-                    .map_err(|e| Error::failed(e.to_string()))?
-            };
-            let ciphertext = secret_ciphertext_from_encryption(ciphertext);
-            let master_key_version = ciphertext.master_key_version;
+        registry
+            .upsert(updated.clone())
+            .await
+            .map_err(|e| Error::failed(e.to_string()))?;
 
-            let now = Utc::now().to_rfc3339();
-            let version = SecretVersion::new(
-                version_id,
-                ciphertext,
-                now.clone(),
-                None,
-                master_key_version,
-            );
-            let mut updated = existing.clone();
-            updated.metadata = metadata;
-            updated.set_version(version, now);
-
-            registry
-                .upsert(updated.clone())
-                .await
-                .map_err(|e| Error::failed(e.to_string()))?;
-
-            let spec_builder = results.get().init_secret();
-            write_secret_spec(spec_builder, &updated);
-            Ok(())
-        })
+        let spec_builder = results.get().init_secret();
+        write_secret_spec(spec_builder, &updated);
+        Ok(())
     }
 
-    fn delete(
-        &mut self,
+    async fn delete(
+        &self,
         params: secrets::DeleteParams,
         _results: secrets::DeleteResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let registry = self.registry();
 
-        Promise::from_future(async move {
-            let names = params.get()?.get_names()?;
-            for name_reader in names.iter() {
-                let name = name_reader?.to_str()?.trim().to_string();
-                if name.is_empty() {
-                    continue;
-                }
-                let id = compute_secret_id(&name);
-                registry
-                    .remove(id)
-                    .await
-                    .map_err(|e| Error::failed(e.to_string()))?;
+        let names = params.get()?.get_names()?;
+        for name_reader in names.iter() {
+            let name = name_reader?.to_str()?.trim().to_string();
+            if name.is_empty() {
+                continue;
             }
-            Ok(())
-        })
+            let id = compute_secret_id(&name);
+            registry
+                .remove(id)
+                .await
+                .map_err(|e| Error::failed(e.to_string()))?;
+        }
+        Ok(())
     }
 
-    fn get(
-        &mut self,
+    async fn get(
+        &self,
         params: secrets::GetParams,
         mut results: secrets::GetResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let registry = self.registry();
         let keyring = self.keyring();
 
-        Promise::from_future(async move {
-            let request = params.get()?;
-            let name = request.get_name()?.to_str()?.trim().to_string();
-            if name.is_empty() {
-                return Err(Error::failed("secret name cannot be empty".into()));
+        let request = params.get()?;
+        let name = request.get_name()?.to_str()?.trim().to_string();
+        if name.is_empty() {
+            return Err(Error::failed("secret name cannot be empty".into()));
+        }
+
+        let requested_version = {
+            let data = request.get_version_id()?;
+            if data.len() == 16 {
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(data);
+                Some(Uuid::from_bytes(bytes))
+            } else {
+                None
             }
+        };
 
-            let requested_version = {
-                let data = request.get_version_id()?;
-                if data.len() == 16 {
-                    let mut bytes = [0u8; 16];
-                    bytes.copy_from_slice(data);
-                    Some(Uuid::from_bytes(bytes))
-                } else {
-                    None
-                }
-            };
+        let value = registry
+            .get_by_name(&name)
+            .map_err(|e| Error::failed(e.to_string()))?
+            .ok_or_else(|| Error::failed(format!("secret '{name}' not found")))?;
 
-            let value = registry
-                .get_by_name(&name)
+        let version_id = value.current_version.version_id;
+        if let Some(requested) = requested_version {
+            if requested != version_id {
+                return Err(Error::failed(format!(
+                    "secret '{name}' version {requested} not found"
+                )));
+            }
+        }
+
+        let plaintext = {
+            let guard = keyring.read().await;
+            guard
+                .decrypt(value.id, version_id, &value.current_version.ciphertext)
                 .map_err(|e| Error::failed(e.to_string()))?
-                .ok_or_else(|| Error::failed(format!("secret '{name}' not found")))?;
+        };
 
-            let version_id = value.current_version.version_id;
-            if let Some(requested) = requested_version {
-                if requested != version_id {
-                    return Err(Error::failed(format!(
-                        "secret '{name}' version {requested} not found"
-                    )));
-                }
-            }
-
-            let plaintext = {
-                let guard = keyring.read().await;
-                guard
-                    .decrypt(value.id, version_id, &value.current_version.ciphertext)
-                    .map_err(|e| Error::failed(e.to_string()))?
-            };
-
-            let mut data_builder = results.get().init_version();
-            let spec_builder = data_builder.reborrow().init_spec();
-            write_secret_spec(spec_builder, &value);
-            data_builder.set_plaintext(&plaintext);
-            Ok(())
-        })
+        let mut data_builder = results.get().init_version();
+        let spec_builder = data_builder.reborrow().init_spec();
+        write_secret_spec(spec_builder, &value);
+        data_builder.set_plaintext(&plaintext);
+        Ok(())
     }
 
     /// Exposes the currently active master key so authenticated peers can bootstrap.
-    fn get_master_key(
-        &mut self,
+    async fn get_master_key(
+        &self,
         _params: secrets::GetMasterKeyParams,
         mut results: secrets::GetMasterKeyResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let store = self.master_store();
 
-        Promise::from_future(async move {
-            let record = store
-                .current()
-                .map_err(|e| Error::failed(format!("failed to load master key: {e}")))?;
-            let mut envelope = results.get().init_envelope();
-            envelope.set_version(record.version);
-            envelope.set_key(&record.key);
-            Ok(())
-        })
+        let record = store
+            .current()
+            .map_err(|e| Error::failed(format!("failed to load master key: {e}")))?;
+        let mut envelope = results.get().init_envelope();
+        envelope.set_version(record.version);
+        envelope.set_key(&record.key);
+        Ok(())
     }
 
     /// Rotates the cluster master key, re-encrypting all stored secrets with the new version.
-    fn rotate_master_key(
-        &mut self,
+    async fn rotate_master_key(
+        &self,
         _params: secrets::RotateMasterKeyParams,
         mut results: secrets::RotateMasterKeyResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let registry = self.registry();
         let keyring_handle = self.keyring();
         let master_store = self.master_store();
@@ -379,87 +365,83 @@ impl secrets::Server for SecretsService {
         // Note: We keep previous master-key material around after rotation so peers still
         // decrypt pre-rotation ciphertext while convergence happens. We push the new version
         // to every known peer below. Once the cluster settles, the old key can be GC’d later.
-        Promise::from_future(async move {
-            let new_record = master_store
-                .rotate()
-                .map_err(|e| Error::failed(format!("failed to rotate master key: {e}")))?;
+        let new_record = master_store
+            .rotate()
+            .map_err(|e| Error::failed(format!("failed to rotate master key: {e}")))?;
 
-            let keyring_clone = {
-                let guard = keyring_handle.write().await;
-                guard.install_current(new_record);
-                guard.clone()
-            };
+        let keyring_clone = {
+            let guard = keyring_handle.write().await;
+            guard.install_current(new_record);
+            guard.clone()
+        };
 
-            let secrets = registry.list().map_err(|e| Error::failed(e.to_string()))?;
+        let secrets = registry.list().map_err(|e| Error::failed(e.to_string()))?;
 
-            for mut value in secrets {
-                let plaintext = keyring_clone
-                    .decrypt(
-                        value.id,
-                        value.current_version.version_id,
-                        &value.current_version.ciphertext,
-                    )
-                    .map_err(|e| Error::failed(e.to_string()))?;
+        for mut value in secrets {
+            let plaintext = keyring_clone
+                .decrypt(
+                    value.id,
+                    value.current_version.version_id,
+                    &value.current_version.ciphertext,
+                )
+                .map_err(|e| Error::failed(e.to_string()))?;
 
-                let ciphertext = keyring_clone
-                    .encrypt(value.id, value.current_version.version_id, &plaintext)
-                    .map_err(|e| Error::failed(e.to_string()))?;
-                let ciphertext = secret_ciphertext_from_encryption(ciphertext);
+            let ciphertext = keyring_clone
+                .encrypt(value.id, value.current_version.version_id, &plaintext)
+                .map_err(|e| Error::failed(e.to_string()))?;
+            let ciphertext = secret_ciphertext_from_encryption(ciphertext);
 
-                value.current_version.master_key_version = ciphertext.master_key_version;
-                value.current_version.ciphertext = ciphertext;
-                value.touch(Utc::now().to_rfc3339());
+            value.current_version.master_key_version = ciphertext.master_key_version;
+            value.current_version.ciphertext = ciphertext;
+            value.touch(Utc::now().to_rfc3339());
 
-                registry
-                    .upsert(value)
-                    .await
-                    .map_err(|e| Error::failed(e.to_string()))?;
+            registry
+                .upsert(value)
+                .await
+                .map_err(|e| Error::failed(e.to_string()))?;
+        }
+
+        if let Some(topology) = topology {
+            if let Err(e) = distribute_master_key(topology, new_record).await {
+                warn!(target: "secrets", "failed to distribute master key v{}: {e}", new_record.version);
             }
+        }
 
-            if let Some(topology) = topology {
-                if let Err(e) = distribute_master_key(topology, new_record).await {
-                    warn!(target: "secrets", "failed to distribute master key v{}: {e}", new_record.version);
-                }
-            }
-
-            results.get().set_version(new_record.version);
-            Ok(())
-        })
+        results.get().set_version(new_record.version);
+        Ok(())
     }
 
-    fn install_master_key(
-        &mut self,
+    async fn install_master_key(
+        &self,
         params: secrets::InstallMasterKeyParams,
         _results: secrets::InstallMasterKeyResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let store = self.master_store();
         let keyring = self.keyring();
 
-        Promise::from_future(async move {
-            let envelope = params.get()?.get_envelope()?;
-            let key_bytes = envelope.get_key()?;
-            if key_bytes.len() != 32 {
-                return Err(Error::failed(
-                    "master key payload must be exactly 32 bytes".into(),
-                ));
-            }
+        let envelope = params.get()?.get_envelope()?;
+        let key_bytes = envelope.get_key()?;
+        if key_bytes.len() != 32 {
+            return Err(Error::failed(
+                "master key payload must be exactly 32 bytes".into(),
+            ));
+        }
 
-            let mut key = [0u8; 32];
-            key.copy_from_slice(key_bytes);
-            let record = MasterKeyRecord::new(envelope.get_version(), key)
-                .map_err(|e| Error::failed(e.to_string()))?;
+        let mut key = [0u8; 32];
+        key.copy_from_slice(key_bytes);
+        let record = MasterKeyRecord::new(envelope.get_version(), key)
+            .map_err(|e| Error::failed(e.to_string()))?;
 
-            store
-                .import_current(&record)
-                .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
+        store
+            .import_current(&record)
+            .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
 
-            {
-                let guard = keyring.write().await;
-                guard.install_current(record);
-            }
+        {
+            let guard = keyring.write().await;
+            guard.install_current(record);
+        }
 
-            Ok(())
-        })
+        Ok(())
     }
 }
 

@@ -11,7 +11,6 @@ use crate::task::types::TaskValue;
 use crate::topology::peers::PeerValue;
 use async_trait::async_trait;
 use bincode;
-use capnp::capability::Promise;
 use capnp_rpc::new_client;
 use crdt_store::{PageDigestRange, compute_want_from_have, uuid_key::UuidKey};
 use crdts::MVReg;
@@ -67,74 +66,72 @@ impl DeltaSinkImpl {
 }
 
 impl delta_sink::Server for DeltaSinkImpl {
-    fn push_chunk(&mut self, params: delta_sink::PushChunkParams) -> Promise<(), capnp::Error> {
+    async fn push_chunk(&self, params: delta_sink::PushChunkParams) -> Result<(), capnp::Error> {
         let stores = self.stores.clone();
-        Promise::from_future(async move {
-            let chunk = params.get()?.get_chunk()?;
-            let domain = chunk
-                .get_domain()
-                .map_err(|_| capnp::Error::failed("unknown sync domain".into()))?;
+        let chunk = params.get()?.get_chunk()?;
+        let domain = chunk
+            .get_domain()
+            .map_err(|_| capnp::Error::failed("unknown sync domain".into()))?;
 
-            match domain {
-                Domain::Peers => {
-                    apply_chunk(stores.peers.clone(), &chunk, decode_register::<PeerValue>).await?
-                }
-                Domain::Tasks => {
-                    apply_chunk(stores.tasks.clone(), &chunk, decode_register::<TaskValue>).await?
-                }
-                Domain::Services => {
-                    apply_chunk(
-                        stores.services.clone(),
-                        &chunk,
-                        decode_register::<ServiceSpecValue>,
-                    )
-                    .await?
-                }
-                Domain::Secrets => {
-                    apply_chunk(
-                        stores.secrets.clone(),
-                        &chunk,
-                        decode_register::<SecretValue>,
-                    )
-                    .await?
-                }
-                Domain::Networks => {
-                    apply_chunk(
-                        stores.networks.clone(),
-                        &chunk,
-                        decode_register::<NetworkSpecValue>,
-                    )
-                    .await?
-                }
-                Domain::NetworkPeers => {
-                    apply_chunk(
-                        stores.network_peers.clone(),
-                        &chunk,
-                        decode_register::<NetworkPeerStateValue>,
-                    )
-                    .await?
-                }
-                Domain::NetworkAttachments => {
-                    apply_chunk(
-                        stores.network_attachments.clone(),
-                        &chunk,
-                        decode_register::<NetworkAttachmentValue>,
-                    )
-                    .await?
-                }
+        match domain {
+            Domain::Peers => {
+                apply_chunk(stores.peers.clone(), &chunk, decode_register::<PeerValue>).await?
             }
+            Domain::Tasks => {
+                apply_chunk(stores.tasks.clone(), &chunk, decode_register::<TaskValue>).await?
+            }
+            Domain::Services => {
+                apply_chunk(
+                    stores.services.clone(),
+                    &chunk,
+                    decode_register::<ServiceSpecValue>,
+                )
+                .await?
+            }
+            Domain::Secrets => {
+                apply_chunk(
+                    stores.secrets.clone(),
+                    &chunk,
+                    decode_register::<SecretValue>,
+                )
+                .await?
+            }
+            Domain::Networks => {
+                apply_chunk(
+                    stores.networks.clone(),
+                    &chunk,
+                    decode_register::<NetworkSpecValue>,
+                )
+                .await?
+            }
+            Domain::NetworkPeers => {
+                apply_chunk(
+                    stores.network_peers.clone(),
+                    &chunk,
+                    decode_register::<NetworkPeerStateValue>,
+                )
+                .await?
+            }
+            Domain::NetworkAttachments => {
+                apply_chunk(
+                    stores.network_attachments.clone(),
+                    &chunk,
+                    decode_register::<NetworkAttachmentValue>,
+                )
+                .await?
+            }
+        }
 
-            Ok(())
-        })
+        Ok(())
     }
 
-    fn end(
-        &mut self,
+    async fn end(
+        &self,
         _params: delta_sink::EndParams,
         _results: delta_sink::EndResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> Result<(), capnp::Error> {
         debug!(target: "delta", "delta stream end");
-        Promise::ok(())
+        Ok(())
     }
 }
 

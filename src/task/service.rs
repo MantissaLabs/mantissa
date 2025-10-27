@@ -5,7 +5,6 @@ use crate::task::types::{
     TaskSecretReference, TaskSpec, TaskStateFilter, TaskStateKind,
 };
 use capnp::Error;
-use capnp::capability::Promise;
 use capnp::struct_list;
 use protocol::gossip::gossip_message;
 use protocol::task::{
@@ -353,38 +352,117 @@ impl TaskService {
 }
 
 impl task::Server for TaskService {
-    fn start(
-        &mut self,
+    async fn start(
+        &self,
         params: task::StartParams,
         mut results: task::StartResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let manager = self.manager.clone();
 
-        Promise::from_future(async move {
-            let req = params.get()?.get_request()?;
-            let name = req.get_name()?.to_str()?.to_string();
-            let image = req.get_image()?.to_str()?.to_string();
-            let mut command = Vec::new();
-            for arg in req.get_command()?.iter() {
-                command.push(arg?.to_str()?.to_string());
+        let req = params.get()?.get_request()?;
+        let name = req.get_name()?.to_str()?.to_string();
+        let image = req.get_image()?.to_str()?.to_string();
+        let mut command = Vec::new();
+        for arg in req.get_command()?.iter() {
+            command.push(arg?.to_str()?.to_string());
+        }
+        let cpu_millis = req.get_cpu_millis();
+        let memory_bytes = req.get_memory_bytes();
+        let mut slot_ids = Vec::new();
+        for slot_id in req.get_slot_ids()?.iter() {
+            slot_ids.push(slot_id);
+        }
+        let restart_policy = if req.has_restart_policy() {
+            Some(decode_restart_policy(req.get_restart_policy()?)?)
+        } else {
+            None
+        };
+        let env = decode_env_vars(req.get_env()?)?;
+        let secret_files = decode_secret_files(req.get_secret_files()?)?;
+
+        let mut networks = Vec::new();
+        for entry in req.get_networks()?.iter() {
+            let data = entry?;
+            if data.len() != 16 {
+                return Err(Error::failed("invalid network id length".to_string()));
             }
-            let cpu_millis = req.get_cpu_millis();
-            let memory_bytes = req.get_memory_bytes();
-            let mut slot_ids = Vec::new();
-            for slot_id in req.get_slot_ids()?.iter() {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&data);
+            networks.push(Uuid::from_bytes(bytes));
+        }
+
+        let request = TaskStartRequest {
+            name,
+            image,
+            command,
+            cpu_millis,
+            memory_bytes,
+            id: None,
+            slot_ids,
+            restart_policy,
+            env,
+            secret_files,
+            networks,
+        };
+
+        let mut specs = manager
+            .start_tasks_batch(vec![request])
+            .await
+            .map_err(|e| Error::failed(e.to_string()))?;
+
+        let spec = specs
+            .pop()
+            .ok_or_else(|| Error::failed("start batch returned no spec".to_string()))?;
+
+        let mut out = results.get();
+        let spec_builder = out.reborrow().init_spec();
+        write_spec(spec_builder, &spec);
+        Ok(())
+    }
+
+    async fn start_many(
+        &self,
+        params: task::StartManyParams,
+        mut results: task::StartManyResults,
+    ) -> Result<(), Error> {
+        let manager = self.manager.clone();
+
+        let list = params.get()?.get_requests()?;
+        let mut requests = Vec::with_capacity(list.len() as usize);
+
+        for entry in list.iter() {
+            let name = entry.get_name()?.to_str()?.to_string();
+            let image = entry.get_image()?.to_str()?.to_string();
+            let cpu_millis = entry.get_cpu_millis();
+            let memory_bytes = entry.get_memory_bytes();
+            let slots_reader = entry.get_slot_ids()?;
+            let mut slot_ids = Vec::with_capacity(slots_reader.len() as usize);
+            for slot_id in slots_reader.iter() {
                 slot_ids.push(slot_id);
             }
-            let restart_policy = if req.has_restart_policy() {
-                Some(decode_restart_policy(req.get_restart_policy()?)?)
-            } else {
-                None
+
+            let task_id = {
+                let bytes = entry.get_task_id()?;
+                if bytes.len() == 16 {
+                    let mut arr = [0u8; 16];
+                    arr.copy_from_slice(bytes);
+                    Some(Uuid::from_bytes(arr))
+                } else {
+                    None
+                }
             };
-            let env = decode_env_vars(req.get_env()?)?;
-            let secret_files = decode_secret_files(req.get_secret_files()?)?;
+
+            let mut command = Vec::new();
+            for arg in entry.get_command()?.iter() {
+                command.push(arg?.to_str()?.to_string());
+            }
+
+            let env = decode_env_vars(entry.get_env()?)?;
+            let secret_files = decode_secret_files(entry.get_secret_files()?)?;
 
             let mut networks = Vec::new();
-            for entry in req.get_networks()?.iter() {
-                let data = entry?;
+            for net in entry.get_networks()?.iter() {
+                let data = net?;
                 if data.len() != 16 {
                     return Err(Error::failed("invalid network id length".to_string()));
                 }
@@ -393,171 +471,84 @@ impl task::Server for TaskService {
                 networks.push(Uuid::from_bytes(bytes));
             }
 
-            let request = TaskStartRequest {
+            let restart_policy = if entry.has_restart_policy() {
+                Some(decode_restart_policy(entry.get_restart_policy()?)?)
+            } else {
+                None
+            };
+
+            requests.push(TaskStartRequest {
                 name,
                 image,
                 command,
                 cpu_millis,
                 memory_bytes,
-                id: None,
+                id: task_id,
                 slot_ids,
                 restart_policy,
                 env,
                 secret_files,
                 networks,
-            };
+            });
+        }
 
-            let mut specs = manager
-                .start_tasks_batch(vec![request])
-                .await
-                .map_err(|e| Error::failed(e.to_string()))?;
+        let specs = manager
+            .start_tasks_batch(requests)
+            .await
+            .map_err(|e| Error::failed(e.to_string()))?;
 
-            let spec = specs
-                .pop()
-                .ok_or_else(|| Error::failed("start batch returned no spec".to_string()))?;
+        let mut list_builder = results.get().init_specs(specs.len() as u32);
+        for (idx, spec) in specs.iter().enumerate() {
+            let builder = list_builder.reborrow().get(idx as u32);
+            write_spec(builder, spec);
+        }
 
-            let mut out = results.get();
-            let spec_builder = out.reborrow().init_spec();
-            write_spec(spec_builder, &spec);
-            Ok(())
-        })
+        Ok(())
     }
 
-    fn start_many(
-        &mut self,
-        params: task::StartManyParams,
-        mut results: task::StartManyResults,
-    ) -> Promise<(), Error> {
-        let manager = self.manager.clone();
-
-        Promise::from_future(async move {
-            let list = params.get()?.get_requests()?;
-            let mut requests = Vec::with_capacity(list.len() as usize);
-
-            for entry in list.iter() {
-                let name = entry.get_name()?.to_str()?.to_string();
-                let image = entry.get_image()?.to_str()?.to_string();
-                let cpu_millis = entry.get_cpu_millis();
-                let memory_bytes = entry.get_memory_bytes();
-                let slots_reader = entry.get_slot_ids()?;
-                let mut slot_ids = Vec::with_capacity(slots_reader.len() as usize);
-                for slot_id in slots_reader.iter() {
-                    slot_ids.push(slot_id);
-                }
-
-                let task_id = {
-                    let bytes = entry.get_task_id()?;
-                    if bytes.len() == 16 {
-                        let mut arr = [0u8; 16];
-                        arr.copy_from_slice(bytes);
-                        Some(Uuid::from_bytes(arr))
-                    } else {
-                        None
-                    }
-                };
-
-                let mut command = Vec::new();
-                for arg in entry.get_command()?.iter() {
-                    command.push(arg?.to_str()?.to_string());
-                }
-
-                let env = decode_env_vars(entry.get_env()?)?;
-                let secret_files = decode_secret_files(entry.get_secret_files()?)?;
-
-                let mut networks = Vec::new();
-                for net in entry.get_networks()?.iter() {
-                    let data = net?;
-                    if data.len() != 16 {
-                        return Err(Error::failed("invalid network id length".to_string()));
-                    }
-                    let mut bytes = [0u8; 16];
-                    bytes.copy_from_slice(&data);
-                    networks.push(Uuid::from_bytes(bytes));
-                }
-
-                let restart_policy = if entry.has_restart_policy() {
-                    Some(decode_restart_policy(entry.get_restart_policy()?)?)
-                } else {
-                    None
-                };
-
-                requests.push(TaskStartRequest {
-                    name,
-                    image,
-                    command,
-                    cpu_millis,
-                    memory_bytes,
-                    id: task_id,
-                    slot_ids,
-                    restart_policy,
-                    env,
-                    secret_files,
-                    networks,
-                });
-            }
-
-            let specs = manager
-                .start_tasks_batch(requests)
-                .await
-                .map_err(|e| Error::failed(e.to_string()))?;
-
-            let mut list_builder = results.get().init_specs(specs.len() as u32);
-            for (idx, spec) in specs.iter().enumerate() {
-                let builder = list_builder.reborrow().get(idx as u32);
-                write_spec(builder, spec);
-            }
-
-            Ok(())
-        })
-    }
-
-    fn stop(
-        &mut self,
+    async fn stop(
+        &self,
         params: task::StopParams,
         mut results: task::StopResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let manager = self.manager.clone();
 
-        Promise::from_future(async move {
-            let req = params.get()?.get_request()?;
-            let id = read_id_from_data(req.get_id()?)?;
+        let req = params.get()?.get_request()?;
+        let id = read_id_from_data(req.get_id()?)?;
 
-            let spec = manager
-                .stop_task(id)
-                .await
-                .map_err(|e| Error::failed(e.to_string()))?;
+        let spec = manager
+            .stop_task(id)
+            .await
+            .map_err(|e| Error::failed(e.to_string()))?;
 
-            let mut out = results.get();
-            let spec_builder = out.reborrow().init_spec();
-            write_spec(spec_builder, &spec);
-            Ok(())
-        })
+        let mut out = results.get();
+        let spec_builder = out.reborrow().init_spec();
+        write_spec(spec_builder, &spec);
+        Ok(())
     }
 
-    fn list(
-        &mut self,
+    async fn list(
+        &self,
         params: task::ListParams,
         mut results: task::ListResults,
-    ) -> Promise<(), Error> {
+    ) -> Result<(), Error> {
         let manager = self.manager.clone();
 
-        Promise::from_future(async move {
-            let request = params.get()?.get_request()?;
-            let filter = list_filter_from_request(&request)?;
+        let request = params.get()?.get_request()?;
+        let filter = list_filter_from_request(&request)?;
 
-            let specs = manager
-                .list_tasks(&filter)
-                .await
-                .map_err(|e| Error::failed(e.to_string()))?;
+        let specs = manager
+            .list_tasks(&filter)
+            .await
+            .map_err(|e| Error::failed(e.to_string()))?;
 
-            let mut list = results.get().init_tasks(specs.len() as u32);
-            for (idx, spec) in specs.iter().enumerate() {
-                let builder = list.reborrow().get(idx as u32);
-                write_spec(builder, spec);
-            }
+        let mut list = results.get().init_tasks(specs.len() as u32);
+        for (idx, spec) in specs.iter().enumerate() {
+            let builder = list.reborrow().get(idx as u32);
+            write_spec(builder, spec);
+        }
 
-            Ok(())
-        })
+        Ok(())
     }
 }
 

@@ -1,4 +1,3 @@
-use capnp::capability::Promise;
 use protocol::{
     gossip::gossip, health::health, network::networks, node::node, scheduling::scheduler,
     secrets::secrets, server::cluster_session, services::services, sync::sync, task::task,
@@ -62,14 +61,12 @@ impl ClusterSessionImpl {
 
 impl cluster_session::Server for ClusterSessionImpl {
     /// Get all capabilities.
-    fn get_capabilities(
-        &mut self,
+    async fn get_capabilities(
+        &self,
         _params: cluster_session::GetCapabilitiesParams,
         mut results: cluster_session::GetCapabilitiesResults,
-    ) -> Promise<(), capnp::Error> {
-        if let Err(e) = self.ensure_online() {
-            return Promise::err(e);
-        }
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
 
         let mut caps = results.get().init_caps();
 
@@ -83,123 +80,105 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_secrets(self.secrets.clone());
         caps.set_networks(self.networks.clone());
 
-        Promise::ok(())
+        Ok(())
     }
 
-    fn get_topology(
-        &mut self,
+    async fn get_topology(
+        &self,
         _params: cluster_session::GetTopologyParams,
         mut results: cluster_session::GetTopologyResults,
-    ) -> Promise<(), capnp::Error> {
-        if let Err(e) = self.ensure_online() {
-            return Promise::err(e);
-        }
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
 
         results.get().set_topology(self.topology.clone());
-        Promise::ok(())
+        Ok(())
     }
 
-    fn get_sync(
-        &mut self,
+    async fn get_sync(
+        &self,
         _params: cluster_session::GetSyncParams,
         mut results: cluster_session::GetSyncResults,
-    ) -> Promise<(), capnp::Error> {
-        if let Err(e) = self.ensure_online() {
-            return Promise::err(e);
-        }
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
 
         results.get().set_sync(self.sync.clone());
-        Promise::ok(())
+        Ok(())
     }
 
-    fn get_gossip(
-        &mut self,
+    async fn get_gossip(
+        &self,
         _params: cluster_session::GetGossipParams,
         mut results: cluster_session::GetGossipResults,
-    ) -> Promise<(), capnp::Error> {
-        if let Err(e) = self.ensure_online() {
-            return Promise::err(e);
-        }
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
 
         results.get().set_gossip(self.gossip.clone());
-        Promise::ok(())
+        Ok(())
     }
 
-    fn get_node(
-        &mut self,
+    async fn get_node(
+        &self,
         _params: cluster_session::GetNodeParams,
         mut results: cluster_session::GetNodeResults,
-    ) -> Promise<(), capnp::Error> {
-        if let Err(e) = self.ensure_online() {
-            return Promise::err(e);
-        }
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
 
         results.get().set_node(self.node.clone());
-        Promise::ok(())
+        Ok(())
     }
 
-    fn get_task(
-        &mut self,
+    async fn get_task(
+        &self,
         _params: cluster_session::GetTaskParams,
         mut results: cluster_session::GetTaskResults,
-    ) -> Promise<(), capnp::Error> {
-        if let Err(e) = self.ensure_online() {
-            return Promise::err(e);
-        }
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
 
         results.get().set_task(self.task.clone());
-        Promise::ok(())
+        Ok(())
     }
 
-    fn get_scheduler(
-        &mut self,
+    async fn get_scheduler(
+        &self,
         _params: cluster_session::GetSchedulerParams,
         mut results: cluster_session::GetSchedulerResults,
-    ) -> Promise<(), capnp::Error> {
-        if let Err(e) = self.ensure_online() {
-            return Promise::err(e);
-        }
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
 
         results.get().set_scheduler(self.scheduler.clone());
-        Promise::ok(())
+        Ok(())
     }
 
-    fn get_services(
-        &mut self,
+    async fn get_services(
+        &self,
         _params: cluster_session::GetServicesParams,
         mut results: cluster_session::GetServicesResults,
-    ) -> Promise<(), capnp::Error> {
-        if let Err(e) = self.ensure_online() {
-            return Promise::err(e);
-        }
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
 
         results.get().set_services(self.services.clone());
-        Promise::ok(())
+        Ok(())
     }
 
-    fn get_secrets(
-        &mut self,
+    async fn get_secrets(
+        &self,
         _params: cluster_session::GetSecretsParams,
         mut results: cluster_session::GetSecretsResults,
-    ) -> Promise<(), capnp::Error> {
-        if let Err(e) = self.ensure_online() {
-            return Promise::err(e);
-        }
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
 
         results.get().set_secrets(self.secrets.clone());
-        Promise::ok(())
+        Ok(())
     }
 
-    fn get_networks(
-        &mut self,
+    async fn get_networks(
+        &self,
         _params: cluster_session::GetNetworksParams,
         mut results: cluster_session::GetNetworksResults,
-    ) -> Promise<(), capnp::Error> {
-        if let Err(e) = self.ensure_online() {
-            return Promise::err(e);
-        }
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
 
         results.get().set_networks(self.networks.clone());
-        Promise::ok(())
+        Ok(())
     }
 }
