@@ -124,9 +124,9 @@ impl Topology {
     }
 
     async fn persist_join_state(
-        peers: PeersStore,
-        local_sessions: LocalSessionStore,
-        local_creds: LocalCredentialStore,
+        peers: &PeersStore,
+        local_sessions: &LocalSessionStore,
+        local_creds: &LocalCredentialStore,
         peer_id: Uuid,
         peer_value: &PeerValue,
         ticket: &[u8],
@@ -201,11 +201,6 @@ impl topology::Server for Topology {
         let payload = self.build_join_payload()?;
 
         let self_addr = self.networking.configured().to_string();
-        let peers = self.peers.clone();
-        let local_sessions = self.local_sessions.clone();
-        let local_creds = self.local_credential_store.clone();
-        let token_store = self.token_store.clone();
-        let topology = self.clone();
 
         let inputs = JoinInputs::from_params(params)?;
 
@@ -234,9 +229,9 @@ impl topology::Server for Topology {
         } = response;
 
         Topology::persist_join_state(
-            peers.clone(),
-            local_sessions.clone(),
-            local_creds.clone(),
+            &self.peers,
+            &self.local_sessions,
+            &self.local_credential_store,
             peer_id,
             &peer_value,
             &ticket,
@@ -244,20 +239,18 @@ impl topology::Server for Topology {
         )
         .await?;
 
-        token_store
+        self.token_store
             .set_and_persist(&inputs.join_token)
             .await
             .map_err(|e| Error::failed(format!("failed to persist join token: {e}")))?;
 
-        topology
-            .install_master_key_from_anchor(session.clone())
-            .await?;
+        self.install_master_key_from_anchor(session.clone()).await?;
 
         ClusterCredential::from_bytes_verified(&credential).map_err(Error::failed)?;
 
-        topology.mark_seen(peer_id);
+        self.mark_seen(peer_id);
 
-        topology.attach_handle_only(peer_id, anchor_handle).await;
+        self.attach_handle_only(peer_id, anchor_handle).await;
 
         let sync_cap = {
             let req = session.get_sync_request();
@@ -266,13 +259,13 @@ impl topology::Server for Topology {
         };
 
         let sync_stores = SyncStores {
-            peers: peers.clone(),
-            tasks: topology.tasks.clone(),
-            services: topology.services.clone(),
-            secrets: topology.secrets.clone(),
-            networks: topology.networks.clone(),
-            network_peers: topology.network_peers.clone(),
-            network_attachments: topology.network_attachments.clone(),
+            peers: self.peers.clone(),
+            tasks: self.tasks.clone(),
+            services: self.services.clone(),
+            secrets: self.secrets.clone(),
+            networks: self.networks.clone(),
+            network_peers: self.network_peers.clone(),
+            network_attachments: self.network_attachments.clone(),
         };
 
         tokio::task::spawn_local({
@@ -282,8 +275,8 @@ impl topology::Server for Topology {
             }
         });
 
-        topology.ensure_periodic_sync();
-        topology.sync_once_now();
+        self.ensure_periodic_sync();
+        self.sync_once_now();
 
         Ok(())
     }
