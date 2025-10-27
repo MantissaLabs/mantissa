@@ -295,10 +295,6 @@ impl networks::Server for NetworksRpc {
         params: networks::CreateParams,
         mut results: networks::CreateResults,
     ) -> Result<(), Error> {
-        let registry = self.registry.clone();
-        let gossiper = self.gossiper.clone();
-        let controller = self.controller.clone();
-
         let request = params.get()?;
         let spec_reader = request.get_spec()?;
 
@@ -312,7 +308,7 @@ impl networks::Server for NetworksRpc {
         let programs = collect_bpf_programs(&spec_reader)?;
 
         let network_id = compute_network_id(&name);
-        let existing_spec = registry.get_spec(network_id).map_err(to_capnp)?;
+        let existing_spec = self.registry.get_spec(network_id).map_err(to_capnp)?;
 
         let (mut spec_value, is_new) = match existing_spec {
             Some(mut current) if current.is_deleted() => {
@@ -365,17 +361,17 @@ impl networks::Server for NetworksRpc {
             spec_value.set_status(NetworkStatus::Pending);
         }
 
-        registry
+        self.registry
             .upsert_spec(spec_value.clone())
             .await
             .map_err(to_capnp)?;
 
-        gossiper
+        self.gossiper
             .broadcast(NetworkEvent::Upsert(spec_value.clone()))
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 
-        controller.schedule_spec_change(spec_value.id).await;
+        self.controller.schedule_spec_change(spec_value.id).await;
 
         results.get().set_network_id(spec_value.id.as_bytes());
         Ok(())
@@ -386,30 +382,26 @@ impl networks::Server for NetworksRpc {
         params: networks::DeleteParams,
         _results: networks::DeleteResults,
     ) -> Result<(), Error> {
-        let registry = self.registry.clone();
-        let gossiper = self.gossiper.clone();
-        let controller = self.controller.clone();
-
         let ids_reader = params.get()?.get_ids()?;
         for entry in ids_reader.iter() {
             let uuid = read_uuid(entry?)?;
-            if let Some(mut spec) = registry.get_spec(uuid).map_err(to_capnp)? {
+            if let Some(mut spec) = self.registry.get_spec(uuid).map_err(to_capnp)? {
                 spec.mark_deleted();
                 let spec_clone = spec.clone();
-                registry.upsert_spec(spec).await.map_err(to_capnp)?;
-                gossiper
+                self.registry.upsert_spec(spec).await.map_err(to_capnp)?;
+                self.gossiper
                     .broadcast(NetworkEvent::Upsert(spec_clone))
                     .await
                     .map_err(|e| Error::failed(e.to_string()))?;
-                controller.schedule_spec_change(uuid).await;
+                self.controller.schedule_spec_change(uuid).await;
             }
 
-            registry
+            self.registry
                 .remove_peer_states_for_network(uuid)
                 .await
                 .map_err(to_capnp)?;
 
-            registry
+            self.registry
                 .remove_attachments_for_network(uuid)
                 .await
                 .map_err(to_capnp)?;
@@ -422,14 +414,12 @@ impl networks::Server for NetworksRpc {
         _params: networks::ListParams,
         mut results: networks::ListResults,
     ) -> Result<(), Error> {
-        let registry = self.registry.clone();
-
-        let specs = registry.list_specs().map_err(to_capnp)?;
+        let specs = self.registry.list_specs().map_err(to_capnp)?;
         let visible_specs: Vec<_> = specs
             .into_iter()
             .filter(|spec| !spec.is_deleted())
             .collect();
-        let counts = aggregate_peer_counts(&visible_specs, &registry)?;
+        let counts = aggregate_peer_counts(&visible_specs, &self.registry)?;
 
         let mut list = results.get().init_networks(visible_specs.len() as u32);
         for (idx, spec) in visible_specs.iter().enumerate() {
@@ -445,17 +435,16 @@ impl networks::Server for NetworksRpc {
         params: networks::InspectParams,
         mut results: networks::InspectResults,
     ) -> Result<(), Error> {
-        let registry = self.registry.clone();
-
         let id = read_uuid(params.get()?.get_id()?)?;
-        let spec = registry
+        let spec = self
+            .registry
             .get_spec(id)
             .map_err(to_capnp)?
             .ok_or_else(|| Error::failed(format!("network {id} not found")))?;
 
-        let peers = registry.list_peer_states(Some(id)).map_err(to_capnp)?;
+        let peers = self.registry.list_peer_states(Some(id)).map_err(to_capnp)?;
 
-        let attachment_counts = registry.attachment_counts().map_err(to_capnp)?;
+        let attachment_counts = self.registry.attachment_counts().map_err(to_capnp)?;
         let attachment_count = attachment_counts
             .get(&id)
             .copied()
@@ -483,9 +472,8 @@ impl networks::Server for NetworksRpc {
         params: networks::PeerStatusParams,
         mut results: networks::PeerStatusResults,
     ) -> Result<(), Error> {
-        let registry = self.registry.clone();
         let id = read_uuid(params.get()?.get_id()?)?;
-        let peers = registry.list_peer_states(Some(id)).map_err(to_capnp)?;
+        let peers = self.registry.list_peer_states(Some(id)).map_err(to_capnp)?;
 
         let mut list = results.get().init_peers(peers.len() as u32);
         for (idx, peer) in peers.iter().enumerate() {
@@ -500,9 +488,8 @@ impl networks::Server for NetworksRpc {
         params: networks::AttachmentsParams,
         mut results: networks::AttachmentsResults,
     ) -> Result<(), Error> {
-        let registry = self.registry.clone();
         let id = read_uuid(params.get()?.get_id()?)?;
-        let attachments = registry.list_attachments(Some(id)).map_err(to_capnp)?;
+        let attachments = self.registry.list_attachments(Some(id)).map_err(to_capnp)?;
 
         let mut list = results.get().init_attachments(attachments.len() as u32);
         for (idx, attachment) in attachments.iter().enumerate() {

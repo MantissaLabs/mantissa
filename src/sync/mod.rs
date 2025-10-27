@@ -53,13 +53,13 @@ impl sync::Server for SyncService {
         _params: sync::GetRootsParams,
         mut results: sync::GetRootsResults,
     ) -> Result<(), capnp::Error> {
-        let peers = self.peers.clone();
-        let tasks = self.tasks.clone();
-        let services = self.services.clone();
-        let secrets = self.secrets.clone();
-        let networks = self.networks.clone();
-        let network_peers = self.network_peers.clone();
-        let network_attachments = self.network_attachments.clone();
+        let peers = &self.peers;
+        let tasks = &self.tasks;
+        let services = &self.services;
+        let secrets = &self.secrets;
+        let networks = &self.networks;
+        let network_peers = &self.network_peers;
+        let network_attachments = &self.network_attachments;
 
         const DOMAINS: [Domain; 7] = [
             Domain::Peers,
@@ -95,13 +95,13 @@ impl sync::Server for SyncService {
         params: sync::GetRangesParams,
         mut results: sync::GetRangesResults,
     ) -> Result<(), capnp::Error> {
-        let peers = self.peers.clone();
-        let tasks = self.tasks.clone();
-        let services = self.services.clone();
-        let secrets = self.secrets.clone();
-        let networks = self.networks.clone();
-        let network_peers = self.network_peers.clone();
-        let network_attachments = self.network_attachments.clone();
+        let peers = &self.peers;
+        let tasks = &self.tasks;
+        let services = &self.services;
+        let secrets = &self.secrets;
+        let networks = &self.networks;
+        let network_peers = &self.network_peers;
+        let network_attachments = &self.network_attachments;
 
         let requested_domains: Vec<Domain> = {
             let domains_reader = params.get()?.get_domains()?;
@@ -253,13 +253,13 @@ impl sync::Server for SyncService {
         params: sync::OpenDeltaParams,
         _results: sync::OpenDeltaResults,
     ) -> Result<(), capnp::Error> {
-        let peers = self.peers.clone();
-        let tasks = self.tasks.clone();
-        let services = self.services.clone();
-        let secrets = self.secrets.clone();
-        let networks = self.networks.clone();
-        let network_peers = self.network_peers.clone();
-        let network_attachments = self.network_attachments.clone();
+        let peers = &self.peers;
+        let tasks = &self.tasks;
+        let services = &self.services;
+        let secrets = &self.secrets;
+        let networks = &self.networks;
+        let network_peers = &self.network_peers;
+        let network_attachments = &self.network_attachments;
 
         let p = params.get()?;
         let wants_reader = p.get_wants()?;

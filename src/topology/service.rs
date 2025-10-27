@@ -7,7 +7,6 @@ use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::store::secret_master_store::MasterKeyRecord;
 use crate::sync::delta::{SyncStores, sync_all_domains};
-use crate::token::TokenStore;
 use crate::topology::health::status_to_node_status;
 use crate::topology::peers::PeerValue;
 use capnp::Error;
@@ -293,19 +292,16 @@ impl topology::Server for Topology {
         }
 
         let self_id = self.node.id;
-        let peers = self.peers.clone();
-        let registry = self.registry.clone();
-        let topology = self.clone();
 
-        peers
+        self.peers
             .remove(&UuidKey::from(self_id))
             .await
             .map_err(|e| capnp::Error::failed(format!("leave: tombstone failed: {e}")))?;
 
-        registry.clear().await;
+        self.registry.clear().await;
 
         // Stop the loop so this node is quiescent and can rejoin elsewhere
-        topology.stop_periodic_sync();
+        self.stop_periodic_sync();
 
         Ok(())
     }
@@ -359,9 +355,7 @@ impl topology::Server for Topology {
         _params: topology::ShowTokenParams,
         mut results: topology::ShowTokenResults,
     ) -> Result<(), Error> {
-        let store: TokenStore = self.token_store.clone();
-
-        let token = store.current_token().await;
+        let token = self.token_store.current_token().await;
         results.get().set_token(&token);
         Ok(())
     }
@@ -372,9 +366,7 @@ impl topology::Server for Topology {
         _params: topology::RotateTokenParams,
         mut results: topology::RotateTokenResults,
     ) -> Result<(), Error> {
-        let store: TokenStore = self.token_store.clone();
-
-        let new_token = store.rotate_and_persist().await?;
+        let new_token = self.token_store.rotate_and_persist().await?;
         results.get().set_token(&new_token);
         Ok(())
     }

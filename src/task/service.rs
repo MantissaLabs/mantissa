@@ -357,8 +357,6 @@ impl task::Server for TaskService {
         params: task::StartParams,
         mut results: task::StartResults,
     ) -> Result<(), Error> {
-        let manager = self.manager.clone();
-
         let req = params.get()?.get_request()?;
         let name = req.get_name()?.to_str()?.to_string();
         let image = req.get_image()?.to_str()?.to_string();
@@ -405,7 +403,8 @@ impl task::Server for TaskService {
             networks,
         };
 
-        let mut specs = manager
+        let mut specs = self
+            .manager
             .start_tasks_batch(vec![request])
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
@@ -425,8 +424,6 @@ impl task::Server for TaskService {
         params: task::StartManyParams,
         mut results: task::StartManyResults,
     ) -> Result<(), Error> {
-        let manager = self.manager.clone();
-
         let list = params.get()?.get_requests()?;
         let mut requests = Vec::with_capacity(list.len() as usize);
 
@@ -492,7 +489,8 @@ impl task::Server for TaskService {
             });
         }
 
-        let specs = manager
+        let specs = self
+            .manager
             .start_tasks_batch(requests)
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
@@ -511,12 +509,11 @@ impl task::Server for TaskService {
         params: task::StopParams,
         mut results: task::StopResults,
     ) -> Result<(), Error> {
-        let manager = self.manager.clone();
-
         let req = params.get()?.get_request()?;
         let id = read_id_from_data(req.get_id()?)?;
 
-        let spec = manager
+        let spec = self
+            .manager
             .stop_task(id)
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
@@ -532,12 +529,11 @@ impl task::Server for TaskService {
         params: task::ListParams,
         mut results: task::ListResults,
     ) -> Result<(), Error> {
-        let manager = self.manager.clone();
-
         let request = params.get()?.get_request()?;
         let filter = list_filter_from_request(&request)?;
 
-        let specs = manager
+        let specs = self
+            .manager
             .list_tasks(&filter)
             .await
             .map_err(|e| Error::failed(e.to_string()))?;

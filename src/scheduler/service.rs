@@ -38,9 +38,7 @@ impl scheduler::Server for SchedulerService {
         params: scheduler::SummaryParams,
         mut results: scheduler::SummaryResults,
     ) -> Result<(), capnp::Error> {
-        let scheduler = self.scheduler.clone();
         let node_id = self.node_id;
-        let node_name = self.node_name.clone();
 
         let req = params.get()?;
         let inner = req.get_request()?;
@@ -57,12 +55,17 @@ impl scheduler::Server for SchedulerService {
         };
 
         let summary = if let Some(peer_id) = target_peer {
-            scheduler
+            self.scheduler
                 .fetch_remote_summary(peer_id, include_details)
                 .await?
         } else {
-            let snapshot = scheduler.snapshot().await;
-            SchedulerSummary::from_snapshot(node_id, &node_name, snapshot.as_ref(), include_details)
+            let snapshot = self.scheduler.snapshot().await;
+            SchedulerSummary::from_snapshot(
+                node_id,
+                &self.node_name,
+                snapshot.as_ref(),
+                include_details,
+            )
         };
 
         let mut builder = results.get().init_summary();
@@ -75,8 +78,6 @@ impl scheduler::Server for SchedulerService {
         params: scheduler::ReserveSlotsParams,
         mut results: scheduler::ReserveSlotsResults,
     ) -> Result<(), capnp::Error> {
-        let scheduler = self.scheduler.clone();
-
         let request = params.get()?.get_request()?;
         let expected_version = request.get_expected_version();
         let intents = request.get_intents()?;
@@ -104,7 +105,8 @@ impl scheduler::Server for SchedulerService {
             });
         }
 
-        let snapshot = scheduler
+        let snapshot = self
+            .scheduler
             .reserve_slots(expected_version, reservations)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
@@ -122,8 +124,6 @@ impl scheduler::Server for SchedulerService {
         params: scheduler::ReleaseSlotsParams,
         mut results: scheduler::ReleaseSlotsResults,
     ) -> Result<(), capnp::Error> {
-        let scheduler = self.scheduler.clone();
-
         let request = params.get()?.get_request()?;
         let expected_version = request.get_expected_version();
 
@@ -133,7 +133,8 @@ impl scheduler::Server for SchedulerService {
             slot_ids.push(slot_id);
         }
 
-        let snapshot = scheduler
+        let snapshot = self
+            .scheduler
             .free_slots(expected_version, slot_ids)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))?;

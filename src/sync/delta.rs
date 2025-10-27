@@ -67,7 +67,6 @@ impl DeltaSinkImpl {
 
 impl delta_sink::Server for DeltaSinkImpl {
     async fn push_chunk(&self, params: delta_sink::PushChunkParams) -> Result<(), capnp::Error> {
-        let stores = self.stores.clone();
         let chunk = params.get()?.get_chunk()?;
         let domain = chunk
             .get_domain()
@@ -75,14 +74,24 @@ impl delta_sink::Server for DeltaSinkImpl {
 
         match domain {
             Domain::Peers => {
-                apply_chunk(stores.peers.clone(), &chunk, decode_register::<PeerValue>).await?
+                apply_chunk(
+                    self.stores.peers.clone(),
+                    &chunk,
+                    decode_register::<PeerValue>,
+                )
+                .await?
             }
             Domain::Tasks => {
-                apply_chunk(stores.tasks.clone(), &chunk, decode_register::<TaskValue>).await?
+                apply_chunk(
+                    self.stores.tasks.clone(),
+                    &chunk,
+                    decode_register::<TaskValue>,
+                )
+                .await?
             }
             Domain::Services => {
                 apply_chunk(
-                    stores.services.clone(),
+                    self.stores.services.clone(),
                     &chunk,
                     decode_register::<ServiceSpecValue>,
                 )
@@ -90,7 +99,7 @@ impl delta_sink::Server for DeltaSinkImpl {
             }
             Domain::Secrets => {
                 apply_chunk(
-                    stores.secrets.clone(),
+                    self.stores.secrets.clone(),
                     &chunk,
                     decode_register::<SecretValue>,
                 )
@@ -98,7 +107,7 @@ impl delta_sink::Server for DeltaSinkImpl {
             }
             Domain::Networks => {
                 apply_chunk(
-                    stores.networks.clone(),
+                    self.stores.networks.clone(),
                     &chunk,
                     decode_register::<NetworkSpecValue>,
                 )
@@ -106,7 +115,7 @@ impl delta_sink::Server for DeltaSinkImpl {
             }
             Domain::NetworkPeers => {
                 apply_chunk(
-                    stores.network_peers.clone(),
+                    self.stores.network_peers.clone(),
                     &chunk,
                     decode_register::<NetworkPeerStateValue>,
                 )
@@ -114,7 +123,7 @@ impl delta_sink::Server for DeltaSinkImpl {
             }
             Domain::NetworkAttachments => {
                 apply_chunk(
-                    stores.network_attachments.clone(),
+                    self.stores.network_attachments.clone(),
                     &chunk,
                     decode_register::<NetworkAttachmentValue>,
                 )

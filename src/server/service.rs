@@ -13,9 +13,7 @@ impl protocol::server::Server for Server {
         params: protocol::server::RegisterNodeParams,
         mut results: protocol::server::RegisterNodeResults,
     ) -> Result<(), capnp::Error> {
-        let server = self.clone();
-
-        server.ensure_online()?;
+        self.ensure_online()?;
 
         let p = params.get()?;
         let info = p.get_info()?;
@@ -23,17 +21,17 @@ impl protocol::server::Server for Server {
         let handle = info.get_handle()?;
 
         // Join token check.
-        if !server.stores.token_store.matches(&token).await {
+        if !self.stores.token_store.matches(&token).await {
             return Err(capnp::Error::failed("invalid join token".to_string()));
         }
 
         let joiner_id = id::read_node_id(info.get_id()?)?;
-        if joiner_id == server.id {
+        if joiner_id == self.id {
             return Err(capnp::Error::failed("cannot join self".to_string()));
         }
 
         // Already registered?
-        let exists = server
+        let exists = self
             .topology
             .peer_exists(joiner_id)
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -73,14 +71,13 @@ impl protocol::server::Server for Server {
             signing_pub,
         };
 
-        server
-            .topology
+        self.topology
             .register_peer(joiner_id, &peer, Some(handle.clone()))
             .await
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         // Issue session ticket.
-        let ticket = server
+        let ticket = self
             .stores
             .session_store
             .issue_ticket(joiner_id)
@@ -89,14 +86,14 @@ impl protocol::server::Server for Server {
         let nonce = rand::try_nonce16().map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         const TTL_SECS: u64 = 3600; // 1 hour (tune it)
-        let cred = ClusterCredential::sign(&server.signing_key, joiner_id, TTL_SECS, nonce);
+        let cred = ClusterCredential::sign(&self.signing_key, joiner_id, TTL_SECS, nonce);
         let cred_bytes = cred.to_bytes().map_err(capnp::Error::failed)?;
-        let session_client = server.new_session_client();
+        let session_client = self.new_session_client();
 
         // Ensure the periodic sync loop is running on this node as soon as we have a cluster
         // at least two nodes.
         {
-            let topo = server.topology.clone();
+            let topo = self.topology.clone();
             tokio::task::spawn_local(async move {
                 topo.ensure_periodic_sync();
             });
@@ -109,7 +106,7 @@ impl protocol::server::Server for Server {
         // Include our NodeInfo so the joiner can immediately insert to its store.
         // Fast propagation of our info means we can get a session to the joiner fast.
         let ni = out.reborrow().init_node_info();
-        server.topology.populate_self_node_info(ni);
+        self.topology.populate_self_node_info(ni);
         out.set_credential(&cred_bytes);
 
         // Gossip event to other peers.
@@ -123,7 +120,7 @@ impl protocol::server::Server for Server {
             signing_pub: Box::new(signing_vk),
         };
 
-        server.topology.gossip_topology_event(join_event).await?;
+        self.topology.gossip_topology_event(join_event).await?;
 
         Ok(())
     }
@@ -133,12 +130,10 @@ impl protocol::server::Server for Server {
         params: protocol::server::GetSessionParams,
         mut results: protocol::server::GetSessionResults,
     ) -> Result<(), capnp::Error> {
-        let server = self.clone();
-
-        server.ensure_online()?;
+        self.ensure_online()?;
 
         let ticket = params.get()?.get_ticket()?;
-        let Some(peer_id) = server
+        let Some(peer_id) = self
             .stores
             .session_store
             .lookup(ticket)
@@ -147,7 +142,7 @@ impl protocol::server::Server for Server {
             return Err(capnp::Error::failed("unknown session ticket".to_string()));
         };
 
-        if !server
+        if !self
             .topology
             .peer_exists(peer_id)
             .map_err(|e| capnp::Error::failed(e.to_string()))?
@@ -155,7 +150,7 @@ impl protocol::server::Server for Server {
             return Err(capnp::Error::failed("peer not registered".to_string()));
         }
 
-        let session_client = server.new_session_client();
+        let session_client = self.new_session_client();
         results.get().set_session(session_client);
         Ok(())
     }
@@ -165,9 +160,7 @@ impl protocol::server::Server for Server {
         params: protocol::server::GetWithCredentialParams,
         mut results: protocol::server::GetWithCredentialResults,
     ) -> Result<(), capnp::Error> {
-        let server = self.clone();
-
-        server.ensure_online()?;
+        self.ensure_online()?;
 
         // Parse + Verify the signed blob
         let cred_bytes = params.get()?.get_credential()?;
@@ -175,7 +168,7 @@ impl protocol::server::Server for Server {
             ClusterCredential::from_bytes_verified(cred_bytes).map_err(capnp::Error::failed)?;
 
         // We must already know the subject as a registered peer
-        if !server
+        if !self
             .topology
             .peer_exists(cred.subject)
             .map_err(|e| capnp::Error::failed(e.to_string()))?
@@ -185,7 +178,7 @@ impl protocol::server::Server for Server {
             ));
         }
 
-        if let Some(expected_vk) = server.topology.signing_vk_for(cred.subject) {
+        if let Some(expected_vk) = self.topology.signing_vk_for(cred.subject) {
             if expected_vk != cred.issuer {
                 debug!(target: "server", subject=%cred.subject, "issuer mismatch for");
                 return Err(capnp::Error::failed(
@@ -203,14 +196,14 @@ impl protocol::server::Server for Server {
         debug!(target: "server", "Peer {} authenticated", cred.subject);
 
         // Mint a fresh ticket for the subject
-        let ticket = server
+        let ticket = self
             .stores
             .session_store
             .issue_ticket(cred.subject)
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         // Return session + ticket + our peer id (so caller can persist)
-        let session_client = server.new_session_client();
+        let session_client = self.new_session_client();
 
         let mut out = results.get();
         out.set_session(session_client);
@@ -218,7 +211,7 @@ impl protocol::server::Server for Server {
 
         // Include our NodeInfo so the caller can upsert immediately.
         let ni = out.reborrow().init_node_info();
-        server.topology.populate_self_node_info(ni);
+        self.topology.populate_self_node_info(ni);
 
         Ok(())
     }

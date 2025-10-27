@@ -123,8 +123,6 @@ impl services::Server for ServicesRPC {
         params: services::DeployParams,
         mut results: services::DeployResults,
     ) -> Result<(), Error> {
-        let manager = self.manager.clone();
-
         let request = params.get()?;
         let spec = request.get_spec()?;
 
@@ -137,7 +135,8 @@ impl services::Server for ServicesRPC {
             tasks.push(read_task_template(tmpl)?);
         }
 
-        let service_id = manager
+        let service_id = self
+            .manager
             .submit_deployment(manifest_id, manifest_name, service_name, tasks)
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
@@ -151,9 +150,8 @@ impl services::Server for ServicesRPC {
         _params: services::ListParams,
         mut results: services::ListResults,
     ) -> Result<(), Error> {
-        let manager = self.manager.clone();
-
-        let services = manager
+        let services = self
+            .manager
             .list_services()
             .map_err(|e| Error::failed(e.to_string()))?;
 
@@ -171,12 +169,10 @@ impl services::Server for ServicesRPC {
         params: services::DeleteParams,
         _results: services::DeleteResults,
     ) -> Result<(), Error> {
-        let manager = self.manager.clone();
-
         let ids = params.get()?.get_ids()?;
         for entry in ids.iter() {
             let id = read_uuid(entry?)?;
-            let manager = manager.clone();
+            let manager = self.manager.clone();
             tokio::task::spawn_local(async move {
                 if let Err(err) = manager.submit_stop(id).await {
                     warn!(
