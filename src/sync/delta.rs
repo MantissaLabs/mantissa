@@ -16,6 +16,7 @@ use crdt_store::{PageDigestRange, compute_want_from_have, uuid_key::UuidKey};
 use crdts::MVReg;
 use protocol::sync::{self, Domain, delta_chunk, delta_sink};
 use std::io;
+use std::rc::Rc;
 use tracing::{debug, warn};
 
 type RegisterDelta<V> = Vec<(UuidKey, MVReg<V, uuid::Uuid>)>;
@@ -69,7 +70,10 @@ impl DeltaSinkImpl {
 }
 
 impl delta_sink::Server for DeltaSinkImpl {
-    async fn push_chunk(&self, params: delta_sink::PushChunkParams) -> Result<(), capnp::Error> {
+    async fn push_chunk(
+        self: Rc<Self>,
+        params: delta_sink::PushChunkParams,
+    ) -> Result<(), capnp::Error> {
         let chunk = params.get()?.get_chunk()?;
         let domain = chunk
             .get_domain()
@@ -138,7 +142,7 @@ impl delta_sink::Server for DeltaSinkImpl {
     }
 
     async fn end(
-        &self,
+        self: Rc<Self>,
         _params: delta_sink::EndParams,
         _results: delta_sink::EndResults,
     ) -> Result<(), capnp::Error> {

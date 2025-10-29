@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 impl health::Server for Health {
     async fn ping(
-        &self,
+        self: std::rc::Rc<Self>,
         _params: health::PingParams,
         mut results: health::PingResults,
     ) -> Result<(), capnp::Error> {

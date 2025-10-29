@@ -7,6 +7,7 @@ use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use crdt_store::mst_store::{Registers, Tombstones};
 use crdt_store::uuid_key::UuidKey;
 use protocol::sync::{Domain, delta_sink, sync};
+use std::rc::Rc;
 use tracing::debug;
 
 pub mod delta;
@@ -52,7 +53,7 @@ impl SyncService {
 
 impl sync::Server for SyncService {
     async fn get_roots(
-        &self,
+        self: Rc<Self>,
         _params: sync::GetRootsParams,
         mut results: sync::GetRootsResults,
     ) -> Result<(), capnp::Error> {
@@ -94,7 +95,7 @@ impl sync::Server for SyncService {
     }
 
     async fn get_ranges(
-        &self,
+        self: Rc<Self>,
         params: sync::GetRangesParams,
         mut results: sync::GetRangesResults,
     ) -> Result<(), capnp::Error> {
@@ -252,7 +253,7 @@ impl sync::Server for SyncService {
     }
 
     async fn open_delta(
-        &self,
+        self: Rc<Self>,
         params: sync::OpenDeltaParams,
         _results: sync::OpenDeltaResults,
     ) -> Result<(), capnp::Error> {

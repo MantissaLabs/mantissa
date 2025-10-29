@@ -16,6 +16,7 @@ use ed25519_dalek::VerifyingKey;
 use protocol::gossip::gossip_message;
 use protocol::server::{self, cluster_session};
 use protocol::topology::{topology, topology_event};
+use std::rc::Rc;
 use tracing::info;
 use uuid::Uuid;
 
@@ -193,7 +194,7 @@ impl topology::Server for Topology {
     /// Returns an instance of `Membership` to the caller to track its
     /// status.
     async fn join(
-        &self,
+        self: Rc<Self>,
         params: topology::JoinParams,
         mut _results: topology::JoinResults,
     ) -> Result<(), Error> {
@@ -283,7 +284,7 @@ impl topology::Server for Topology {
     /// Leave the cluster: tombstone *this node* in its local Peers store and
     /// trigger an immediate sync so peers learn about the removal quickly.
     async fn leave(
-        &self,
+        self: Rc<Self>,
         _params: topology::LeaveParams,
         _results: topology::LeaveResults,
     ) -> Result<(), capnp::Error> {
@@ -309,7 +310,7 @@ impl topology::Server for Topology {
     /// List members of the network. Returns a list of nodes with their
     /// relevant information.
     async fn list(
-        &self,
+        self: Rc<Self>,
         _params: topology::ListParams,
         mut results: topology::ListResults,
     ) -> Result<(), Error> {
@@ -351,7 +352,7 @@ impl topology::Server for Topology {
     /// Returns the current join token for other nodes to use
     /// to join the cluster from this node.
     async fn show_token(
-        &self,
+        self: Rc<Self>,
         _params: topology::ShowTokenParams,
         mut results: topology::ShowTokenResults,
     ) -> Result<(), Error> {
@@ -362,7 +363,7 @@ impl topology::Server for Topology {
 
     /// Rotates the token used to join the cluster.
     async fn rotate_token(
-        &self,
+        self: Rc<Self>,
         _params: topology::RotateTokenParams,
         mut results: topology::RotateTokenResults,
     ) -> Result<(), Error> {

@@ -3,6 +3,7 @@ use protocol::{
     secrets::secrets, server::cluster_session, services::services, sync::sync, task::task,
     topology::topology,
 };
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,7 +44,7 @@ impl ClusterSessionImpl {
 impl cluster_session::Server for ClusterSessionImpl {
     /// Get all capabilities.
     async fn get_capabilities(
-        &self,
+        self: Rc<Self>,
         _params: cluster_session::GetCapabilitiesParams,
         mut results: cluster_session::GetCapabilitiesResults,
     ) -> Result<(), capnp::Error> {
@@ -65,7 +66,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     }
 
     async fn get_topology(
-        &self,
+        self: Rc<Self>,
         _params: cluster_session::GetTopologyParams,
         mut results: cluster_session::GetTopologyResults,
     ) -> Result<(), capnp::Error> {
@@ -76,7 +77,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     }
 
     async fn get_sync(
-        &self,
+        self: Rc<Self>,
         _params: cluster_session::GetSyncParams,
         mut results: cluster_session::GetSyncResults,
     ) -> Result<(), capnp::Error> {
@@ -87,7 +88,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     }
 
     async fn get_gossip(
-        &self,
+        self: Rc<Self>,
         _params: cluster_session::GetGossipParams,
         mut results: cluster_session::GetGossipResults,
     ) -> Result<(), capnp::Error> {
@@ -98,7 +99,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     }
 
     async fn get_node(
-        &self,
+        self: Rc<Self>,
         _params: cluster_session::GetNodeParams,
         mut results: cluster_session::GetNodeResults,
     ) -> Result<(), capnp::Error> {
@@ -109,7 +110,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     }
 
     async fn get_task(
-        &self,
+        self: Rc<Self>,
         _params: cluster_session::GetTaskParams,
         mut results: cluster_session::GetTaskResults,
     ) -> Result<(), capnp::Error> {
@@ -120,7 +121,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     }
 
     async fn get_scheduler(
-        &self,
+        self: Rc<Self>,
         _params: cluster_session::GetSchedulerParams,
         mut results: cluster_session::GetSchedulerResults,
     ) -> Result<(), capnp::Error> {
@@ -131,7 +132,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     }
 
     async fn get_services(
-        &self,
+        self: Rc<Self>,
         _params: cluster_session::GetServicesParams,
         mut results: cluster_session::GetServicesResults,
     ) -> Result<(), capnp::Error> {
@@ -142,7 +143,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     }
 
     async fn get_secrets(
-        &self,
+        self: Rc<Self>,
         _params: cluster_session::GetSecretsParams,
         mut results: cluster_session::GetSecretsResults,
     ) -> Result<(), capnp::Error> {
@@ -153,7 +154,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     }
 
     async fn get_networks(
-        &self,
+        self: Rc<Self>,
         _params: cluster_session::GetNetworksParams,
         mut results: cluster_session::GetNetworksResults,
     ) -> Result<(), capnp::Error> {

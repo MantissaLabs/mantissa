@@ -11,6 +11,7 @@ use protocol::task::{
     TaskStateFilter as CapnpTaskStateFilter, environment_var, secret_file, secret_ref, task,
     task_event, task_list_request, task_spec,
 };
+use std::rc::Rc;
 use uuid::Uuid;
 
 fn state_to_str(state: &ContainerState) -> String {
@@ -353,7 +354,7 @@ impl TaskService {
 
 impl task::Server for TaskService {
     async fn start(
-        &self,
+        self: Rc<Self>,
         params: task::StartParams,
         mut results: task::StartResults,
     ) -> Result<(), Error> {
@@ -420,7 +421,7 @@ impl task::Server for TaskService {
     }
 
     async fn start_many(
-        &self,
+        self: Rc<Self>,
         params: task::StartManyParams,
         mut results: task::StartManyResults,
     ) -> Result<(), Error> {
@@ -505,7 +506,7 @@ impl task::Server for TaskService {
     }
 
     async fn stop(
-        &self,
+        self: Rc<Self>,
         params: task::StopParams,
         mut results: task::StopResults,
     ) -> Result<(), Error> {
@@ -525,7 +526,7 @@ impl task::Server for TaskService {
     }
 
     async fn list(
-        &self,
+        self: Rc<Self>,
         params: task::ListParams,
         mut results: task::ListResults,
     ) -> Result<(), Error> {

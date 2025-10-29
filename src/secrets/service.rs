@@ -10,6 +10,7 @@ use capnp::struct_list;
 use chrono::Utc;
 use protocol::secrets::{secret_metadata_entry, secret_spec, secrets};
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -121,7 +122,7 @@ fn plaintext_from_reader(reader: capnp::data::Reader<'_>) -> Vec<u8> {
 
 impl secrets::Server for SecretsService {
     async fn list(
-        &self,
+        self: Rc<Self>,
         _params: secrets::ListParams,
         mut results: secrets::ListResults,
     ) -> Result<(), Error> {
@@ -138,7 +139,7 @@ impl secrets::Server for SecretsService {
     }
 
     async fn create(
-        &self,
+        self: Rc<Self>,
         params: secrets::CreateParams,
         mut results: secrets::CreateResults,
     ) -> Result<(), Error> {
@@ -200,7 +201,7 @@ impl secrets::Server for SecretsService {
     }
 
     async fn update(
-        &self,
+        self: Rc<Self>,
         params: secrets::UpdateParams,
         mut results: secrets::UpdateResults,
     ) -> Result<(), Error> {
@@ -260,7 +261,7 @@ impl secrets::Server for SecretsService {
     }
 
     async fn delete(
-        &self,
+        self: Rc<Self>,
         params: secrets::DeleteParams,
         _results: secrets::DeleteResults,
     ) -> Result<(), Error> {
@@ -282,7 +283,7 @@ impl secrets::Server for SecretsService {
     }
 
     async fn get(
-        &self,
+        self: Rc<Self>,
         params: secrets::GetParams,
         mut results: secrets::GetResults,
     ) -> Result<(), Error> {
@@ -336,7 +337,7 @@ impl secrets::Server for SecretsService {
 
     /// Exposes the currently active master key so authenticated peers can bootstrap.
     async fn get_master_key(
-        &self,
+        self: Rc<Self>,
         _params: secrets::GetMasterKeyParams,
         mut results: secrets::GetMasterKeyResults,
     ) -> Result<(), Error> {
@@ -353,7 +354,7 @@ impl secrets::Server for SecretsService {
 
     /// Rotates the cluster master key, re-encrypting all stored secrets with the new version.
     async fn rotate_master_key(
-        &self,
+        self: Rc<Self>,
         _params: secrets::RotateMasterKeyParams,
         mut results: secrets::RotateMasterKeyResults,
     ) -> Result<(), Error> {
@@ -412,7 +413,7 @@ impl secrets::Server for SecretsService {
     }
 
     async fn install_master_key(
-        &self,
+        self: Rc<Self>,
         params: secrets::InstallMasterKeyParams,
         _results: secrets::InstallMasterKeyResults,
     ) -> Result<(), Error> {

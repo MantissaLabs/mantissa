@@ -5,11 +5,12 @@ use crate::node::identity::pubkey_from_slice;
 use crate::server::credential::ClusterCredential;
 use crate::topology::TopologyEvent;
 use crate::topology::peers::PeerValue;
+use std::rc::Rc;
 use tracing::debug;
 
 impl protocol::server::Server for Server {
     async fn register_node(
-        &self,
+        self: Rc<Self>,
         params: protocol::server::RegisterNodeParams,
         mut results: protocol::server::RegisterNodeResults,
     ) -> Result<(), capnp::Error> {
@@ -126,7 +127,7 @@ impl protocol::server::Server for Server {
     }
 
     async fn get_session(
-        &self,
+        self: Rc<Self>,
         params: protocol::server::GetSessionParams,
         mut results: protocol::server::GetSessionResults,
     ) -> Result<(), capnp::Error> {
@@ -156,7 +157,7 @@ impl protocol::server::Server for Server {
     }
 
     async fn get_with_credential(
-        &self,
+        self: Rc<Self>,
         params: protocol::server::GetWithCredentialParams,
         mut results: protocol::server::GetWithCredentialResults,
     ) -> Result<(), capnp::Error> {

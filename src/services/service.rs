@@ -10,6 +10,7 @@ use capnp::struct_list;
 use protocol::services::{service_event, service_spec, services, task_template};
 use protocol::task::{environment_var, secret_file, secret_ref};
 use std::collections::HashSet;
+use std::rc::Rc;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -119,7 +120,7 @@ fn decode_secret_files(
 
 impl services::Server for ServicesRPC {
     async fn deploy(
-        &self,
+        self: Rc<Self>,
         params: services::DeployParams,
         mut results: services::DeployResults,
     ) -> Result<(), Error> {
@@ -146,7 +147,7 @@ impl services::Server for ServicesRPC {
     }
 
     async fn list(
-        &self,
+        self: Rc<Self>,
         _params: services::ListParams,
         mut results: services::ListResults,
     ) -> Result<(), Error> {
@@ -165,7 +166,7 @@ impl services::Server for ServicesRPC {
     }
 
     async fn delete(
-        &self,
+        self: Rc<Self>,
         params: services::DeleteParams,
         _results: services::DeleteResults,
     ) -> Result<(), Error> {

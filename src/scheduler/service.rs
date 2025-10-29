@@ -34,7 +34,7 @@ impl SchedulerService {
 
 impl scheduler::Server for SchedulerService {
     async fn summary(
-        &self,
+        self: Rc<Self>,
         params: scheduler::SummaryParams,
         mut results: scheduler::SummaryResults,
     ) -> Result<(), capnp::Error> {
@@ -74,7 +74,7 @@ impl scheduler::Server for SchedulerService {
     }
 
     async fn reserve_slots(
-        &self,
+        self: Rc<Self>,
         params: scheduler::ReserveSlotsParams,
         mut results: scheduler::ReserveSlotsResults,
     ) -> Result<(), capnp::Error> {
@@ -120,7 +120,7 @@ impl scheduler::Server for SchedulerService {
     }
 
     async fn release_slots(
-        &self,
+        self: Rc<Self>,
         params: scheduler::ReleaseSlotsParams,
         mut results: scheduler::ReleaseSlotsResults,
     ) -> Result<(), capnp::Error> {

@@ -12,6 +12,7 @@ use protocol::network::{
 };
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::rc::Rc;
 use uuid::Uuid;
 
 /// Cap'n Proto RPC surface for creating, listing, and inspecting overlay networks.
@@ -291,7 +292,7 @@ pub(crate) fn read_network_event(reader: network_event::Reader<'_>) -> Result<Ne
 
 impl networks::Server for NetworksRpc {
     async fn create(
-        &self,
+        self: Rc<Self>,
         params: networks::CreateParams,
         mut results: networks::CreateResults,
     ) -> Result<(), Error> {
@@ -372,7 +373,7 @@ impl networks::Server for NetworksRpc {
     }
 
     async fn delete(
-        &self,
+        self: Rc<Self>,
         params: networks::DeleteParams,
         _results: networks::DeleteResults,
     ) -> Result<(), Error> {
@@ -404,7 +405,7 @@ impl networks::Server for NetworksRpc {
     }
 
     async fn list(
-        &self,
+        self: Rc<Self>,
         _params: networks::ListParams,
         mut results: networks::ListResults,
     ) -> Result<(), Error> {
@@ -425,7 +426,7 @@ impl networks::Server for NetworksRpc {
     }
 
     async fn inspect(
-        &self,
+        self: Rc<Self>,
         params: networks::InspectParams,
         mut results: networks::InspectResults,
     ) -> Result<(), Error> {
@@ -462,7 +463,7 @@ impl networks::Server for NetworksRpc {
     }
 
     async fn peer_status(
-        &self,
+        self: Rc<Self>,
         params: networks::PeerStatusParams,
         mut results: networks::PeerStatusResults,
     ) -> Result<(), Error> {
@@ -478,7 +479,7 @@ impl networks::Server for NetworksRpc {
     }
 
     async fn attachments(
-        &self,
+        self: Rc<Self>,
         params: networks::AttachmentsParams,
         mut results: networks::AttachmentsResults,
     ) -> Result<(), Error> {

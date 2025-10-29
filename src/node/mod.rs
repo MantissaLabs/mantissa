@@ -95,7 +95,7 @@ impl node::Server for Node {
     /// This method returns general informations such as load average,
     /// CPU specs, amount of Memory, Disk capacity, etc. to print on cli.
     async fn info(
-        &self,
+        self: std::rc::Rc<Self>,
         _params: node::InfoParams,
         mut results: node::InfoResults,
     ) -> Result<(), Error> {

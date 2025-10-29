@@ -23,6 +23,7 @@ use protocol::gossip::gossip_message::Which::*;
 use rand::rng;
 use rand::seq::IndexedRandom;
 use std::convert::TryFrom;
+use std::rc::Rc;
 use std::time::Duration;
 use topology::PeerHandle;
 use tracing::error;
@@ -81,7 +82,7 @@ pub struct Channels {
 
 impl gossip::Server for Gossip {
     async fn gossip(
-        &self,
+        self: Rc<Self>,
         params: gossip::GossipParams,
         _results: gossip::GossipResults,
     ) -> Result<(), Error> {
