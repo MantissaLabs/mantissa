@@ -115,6 +115,13 @@ impl SecretValue {
     }
 }
 
+/// Gossip event describing how the secret registry should change.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SecretEvent {
+    Upsert(Box<SecretValue>),
+    Remove(Uuid),
+}
+
 /// Computes a deterministic secret identifier from its logical name.
 pub fn compute_secret_id(name: &str) -> Uuid {
     let digest = blake3::hash(name.as_bytes());

@@ -107,6 +107,7 @@ where
     actor: C::Actor,
     mst: SharedInMemoryMerkleSearchTree<C, H>,
     change_clock: AtomicU64,
+    preserve_local_tombs: bool,
     _tables: std::marker::PhantomData<T>,
 }
 
@@ -129,6 +130,7 @@ where
             db,
             actor,
             hasher: None,
+            preserve_local_tombs: false,
             _tables: std::marker::PhantomData,
         }
     }
@@ -442,21 +444,7 @@ where
         tombs: Tombstones<C::Key>,
     ) -> io::Result<()> {
         // Prepare merged registers by reading current values once.
-        let merged_regs: Vec<(C::Key, C::Reg)> = {
-            let r = self.db.begin_read().map_err(into_err)?;
-            let values = r.open_table(T::values()).map_err(into_err)?;
-
-            let mut out = Vec::with_capacity(regs.len());
-            for (k, incoming) in regs {
-                let kb = Self::encode_key(&k);
-                let current = match values.get(kb.as_slice()).map_err(into_err)? {
-                    Some(row) => Some(Self::decode_reg(row.value())?),
-                    None => None,
-                };
-                out.push((k, C::merge_regs(current, incoming)));
-            }
-            out
-        };
+        let merged_regs = self.prepare_merged_registers(regs, &tombs)?;
 
         // Track whether anything was written so we only advance the change clock when needed.
         let had_changes = !merged_regs.is_empty() || !tombs.is_empty();
@@ -505,21 +493,7 @@ where
         tombs: Tombstones<C::Key>,
     ) -> io::Result<()> {
         // Prepare merged registers by reading current values once.
-        let merged_regs: Vec<(C::Key, C::Reg)> = {
-            let r = self.db.begin_read().map_err(into_err)?;
-            let values = r.open_table(T::values()).map_err(into_err)?;
-
-            let mut out = Vec::with_capacity(regs.len());
-            for (k, incoming) in regs {
-                let kb = Self::encode_key(&k);
-                let current = match values.get(kb.as_slice()).map_err(into_err)? {
-                    Some(row) => Some(Self::decode_reg(row.value())?),
-                    None => None,
-                };
-                out.push((k, C::merge_regs(current, incoming)));
-            }
-            out
-        };
+        let merged_regs = self.prepare_merged_registers(regs, &tombs)?;
 
         let had_changes = !merged_regs.is_empty() || !tombs.is_empty();
 
@@ -567,6 +541,87 @@ where
         }
 
         Ok(())
+    }
+
+    /// Prepare merged registers honoring the configured tombstone strategy.
+    fn prepare_merged_registers(
+        &self,
+        regs: Registers<C::Key, C::Reg>,
+        tombs: &Tombstones<C::Key>,
+    ) -> io::Result<Registers<C::Key, C::Reg>> {
+        if !self.preserve_local_tombs {
+            return self.merge_registers_unconditional(regs);
+        }
+
+        let tomb_keys_in_chunk: HashSet<C::Key> = if regs.is_empty() {
+            HashSet::new()
+        } else {
+            tombs.iter().map(|(k, _)| k.clone()).collect()
+        };
+        self.merge_registers_guarding_local_tombs(regs, tomb_keys_in_chunk)
+    }
+
+    /// Merge incoming registers while ensuring local tombstones remain authoritative unless
+    /// the current chunk also carries a tomb for the same key.
+    fn merge_registers_guarding_local_tombs(
+        &self,
+        regs: Registers<C::Key, C::Reg>,
+        tomb_keys_in_chunk: HashSet<C::Key>,
+    ) -> io::Result<Registers<C::Key, C::Reg>> {
+        if regs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let r = self.db.begin_read().map_err(into_err)?;
+        let values = r.open_table(T::values()).map_err(into_err)?;
+        let tomb_table = r.open_table(T::tombs()).map_err(into_err)?;
+
+        let mut out = Vec::with_capacity(regs.len());
+        for (k, incoming) in regs {
+            let kb = Self::encode_key(&k);
+            let skip_due_to_local_tomb = if tomb_keys_in_chunk.contains(&k) {
+                false
+            } else {
+                tomb_table.get(kb.as_slice()).map_err(into_err)?.is_some()
+            };
+
+            if skip_due_to_local_tomb {
+                continue;
+            }
+
+            let current = match values.get(kb.as_slice()).map_err(into_err)? {
+                Some(row) => Some(Self::decode_reg(row.value())?),
+                None => None,
+            };
+            out.push((k, C::merge_regs(current, incoming)));
+        }
+
+        Ok(out)
+    }
+
+    /// Merge incoming registers without inspecting tombstone state.
+    fn merge_registers_unconditional(
+        &self,
+        regs: Registers<C::Key, C::Reg>,
+    ) -> io::Result<Registers<C::Key, C::Reg>> {
+        if regs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let r = self.db.begin_read().map_err(into_err)?;
+        let values = r.open_table(T::values()).map_err(into_err)?;
+
+        let mut out = Vec::with_capacity(regs.len());
+        for (k, incoming) in regs {
+            let kb = Self::encode_key(&k);
+            let current = match values.get(kb.as_slice()).map_err(into_err)? {
+                Some(row) => Some(Self::decode_reg(row.value())?),
+                None => None,
+            };
+            out.push((k, C::merge_regs(current, incoming)));
+        }
+
+        Ok(out)
     }
 
     /// Rebuild MST once after a sequence of `apply_delta_chunk()` calls.
@@ -818,6 +873,7 @@ where
     db: Arc<redb::Database>,
     actor: C::Actor,
     hasher: Option<H>,
+    preserve_local_tombs: bool,
     _tables: std::marker::PhantomData<T>,
 }
 
@@ -840,6 +896,15 @@ where
         self
     }
 
+    /// Configure whether locally authored tombstones remain authoritative unless the incoming delta explicitly includes the same tomb entry.
+    ///
+    /// Enable this only for domains where recreating a value goes through a higher-level path that clears the tombstone first (e.g., secrets with immediate gossip).
+    /// For most stores we expect anti-entropy to repopulate accidentally deleted rows, so this flag should stay `false`.
+    pub fn with_preserve_local_tombs(mut self, enabled: bool) -> Self {
+        self.preserve_local_tombs = enabled;
+        self
+    }
+
     /// Build and open the store.
     pub fn build(self) -> crate::Result<CrdtMstStore<C, H, T>> {
         // Ensure tables exist
@@ -856,6 +921,7 @@ where
             actor: self.actor,
             mst,
             change_clock: AtomicU64::new(1),
+            preserve_local_tombs: self.preserve_local_tombs,
             _tables: std::marker::PhantomData,
         })
     }

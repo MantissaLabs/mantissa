@@ -51,6 +51,18 @@ struct SecretMasterKey {
   key @1 :Data; # 32-byte cluster master key
 }
 
+struct SecretRecord {
+  spec @0 :SecretSpec;
+  ciphertext @1 :SecretCiphertext;
+}
+
+struct SecretEvent {
+  union {
+    upsert @0 :SecretRecord;
+    remove @1 :Data; # 16-byte UUID for the secret identifier
+  }
+}
+
 interface Secrets {
   list @0 () -> (secrets :List(SecretSpec));
 

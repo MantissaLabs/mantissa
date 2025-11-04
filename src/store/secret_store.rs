@@ -22,6 +22,9 @@ pub type SecretStore = Arc<SecretStoreInner>;
 
 /// Opens the replicated secret store backed by Redb.
 pub fn open_secret_store(db: Arc<redb::Database>, actor: Uuid) -> std::io::Result<SecretStore> {
-    let inner = SecretStoreInner::open(db, actor)?;
+    let inner = SecretStoreInner::builder(db, actor)
+        .with_preserve_local_tombs(true)
+        .build()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(Arc::new(inner))
 }

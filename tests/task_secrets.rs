@@ -5,11 +5,13 @@ use async_trait::async_trait;
 use capnp_rpc::new_client as capnp_new_client;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
+use mantissa::gossip::Message;
 use mantissa::network::registry::NetworkRegistry;
 use mantissa::registry::Registry;
 use mantissa::scheduler::Scheduler;
 use mantissa::scheduler::{SlotCapacity, SlotSpec};
 use mantissa::secrets::crypto::SecretKeyring;
+use mantissa::secrets::gossip::SecretReplicator;
 use mantissa::secrets::registry::SecretRegistry;
 use mantissa::secrets::service::SecretsService;
 use mantissa::secrets::types::{SecretMetadata, SecretValue, SecretVersion, compute_secret_id};
@@ -521,11 +523,16 @@ local_test!(rotate_master_key_rewraps_secrets, {
         .await
         .expect("seed secret registry");
 
+    let (gossip_tx, _gossip_rx) = async_channel::unbounded::<Message>();
+    let (_secret_tx, secret_rx) = async_channel::unbounded::<Message>();
+    let secret_replicator = SecretReplicator::new(secret_registry.clone(), gossip_tx, secret_rx);
+
     let service = SecretsService::new(
         secret_registry.clone(),
         secret_keyring_handle.clone(),
         secret_master_store.clone(),
         None,
+        secret_replicator,
     );
     let client: secrets::Client = capnp_new_client(service);
     let response = client

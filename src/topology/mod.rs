@@ -664,7 +664,8 @@ impl Topology {
                 }
                 Ok(Message::Task { .. })
                 | Ok(Message::Service { .. })
-                | Ok(Message::Network { .. }) => {
+                | Ok(Message::Network { .. })
+                | Ok(Message::Secret { .. }) => {
                     // Intentionally ignored: handled by dedicated managers.
                 }
                 Err(async_channel::RecvError) => {

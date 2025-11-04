@@ -1,14 +1,17 @@
 use crate::secrets::crypto::SecretKeyring;
+use crate::secrets::gossip::SecretReplicator;
 use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::{
-    SecretCiphertext, SecretMetadata, SecretValue, SecretVersion, compute_secret_id,
+    SecretCiphertext, SecretEvent, SecretMetadata, SecretValue, SecretVersion, compute_secret_id,
 };
 use crate::store::secret_master_store::{MasterKeyRecord, SecretMasterStore};
 use crate::topology::Topology;
 use capnp::Error;
 use capnp::struct_list;
 use chrono::Utc;
-use protocol::secrets::{secret_metadata_entry, secret_spec, secrets};
+use protocol::secrets::{
+    secret_ciphertext, secret_event, secret_metadata_entry, secret_record, secret_spec, secrets,
+};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,6 +24,7 @@ pub struct SecretsService {
     keyring: Arc<RwLock<SecretKeyring>>,
     master_store: SecretMasterStore,
     topology: Option<Topology>,
+    replicator: SecretReplicator,
 }
 
 impl SecretsService {
@@ -30,12 +34,14 @@ impl SecretsService {
         keyring: Arc<RwLock<SecretKeyring>>,
         master_store: SecretMasterStore,
         topology: Option<Topology>,
+        replicator: SecretReplicator,
     ) -> Self {
         Self {
             registry,
             keyring,
             master_store,
             topology,
+            replicator,
         }
     }
 
@@ -53,6 +59,10 @@ impl SecretsService {
 
     fn topology(&self) -> Option<Topology> {
         self.topology.clone()
+    }
+
+    fn replicator(&self) -> SecretReplicator {
+        self.replicator.clone()
     }
 }
 
@@ -110,6 +120,138 @@ fn write_secret_spec(mut builder: secret_spec::Builder<'_>, value: &SecretValue)
         version_builder.set_created_by(&[]);
     }
     version_builder.set_master_key_version(value.current_version.master_key_version);
+}
+
+fn write_secret_ciphertext(
+    mut builder: secret_ciphertext::Builder<'_>,
+    ciphertext: &SecretCiphertext,
+) {
+    builder.set_master_key_version(ciphertext.master_key_version);
+    builder.set_nonce(&ciphertext.nonce);
+    builder.set_ciphertext(&ciphertext.ciphertext);
+    builder.set_digest(&ciphertext.digest);
+}
+
+/// Serializes a secret registry event into the Cap’n Proto gossip envelope.
+pub(crate) fn write_secret_event(
+    mut builder: secret_event::Builder<'_>,
+    event: &SecretEvent,
+) -> Result<(), Error> {
+    match event {
+        SecretEvent::Upsert(value) => {
+            let secret = value.as_ref();
+            let mut record_builder = builder.reborrow().init_upsert();
+            let spec_builder = record_builder.reborrow().init_spec();
+            write_secret_spec(spec_builder, secret);
+            let ciphertext_builder = record_builder.reborrow().init_ciphertext();
+            write_secret_ciphertext(ciphertext_builder, &secret.current_version.ciphertext);
+        }
+        SecretEvent::Remove(id) => {
+            builder.set_remove(id.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+/// Deserializes a secret gossip event into a domain object.
+pub(crate) fn read_secret_event(reader: secret_event::Reader<'_>) -> Result<SecretEvent, Error> {
+    match reader.which()? {
+        secret_event::Which::Upsert(Ok(record_reader)) => {
+            let value = read_secret_record(record_reader)?;
+            Ok(SecretEvent::Upsert(Box::new(value)))
+        }
+        secret_event::Which::Upsert(Err(e)) => Err(e),
+        secret_event::Which::Remove(Ok(bytes)) => Ok(SecretEvent::Remove(read_uuid(bytes)?)),
+        secret_event::Which::Remove(Err(e)) => Err(e),
+    }
+}
+
+fn read_secret_record(reader: secret_record::Reader<'_>) -> Result<SecretValue, Error> {
+    let ciphertext = read_secret_ciphertext(reader.get_ciphertext()?)?;
+    let spec_reader = reader.get_spec()?;
+    read_secret_spec_value(spec_reader, ciphertext)
+}
+
+fn read_secret_spec_value(
+    reader: secret_spec::Reader<'_>,
+    ciphertext: SecretCiphertext,
+) -> Result<SecretValue, Error> {
+    let id = read_uuid(reader.get_id()?)?;
+    let name = reader.get_name()?.to_str()?.to_string();
+    let created_at = reader.get_created_at()?.to_str()?.to_string();
+    let updated_at = reader.get_updated_at()?.to_str()?.to_string();
+
+    let description_raw = reader.get_description()?.to_str()?.trim().to_string();
+    let description = if description_raw.is_empty() {
+        None
+    } else {
+        Some(description_raw)
+    };
+    let metadata = metadata_from_entries(reader.get_metadata()?, description);
+
+    let version_reader = reader.get_current_version()?;
+    let version_id = read_uuid(version_reader.get_version_id()?)?;
+    let version_created_at = version_reader.get_created_at()?.to_str()?.to_string();
+    let created_by = {
+        let data = version_reader.get_created_by()?;
+        if data.len() == 16 {
+            Some(read_uuid(data)?)
+        } else {
+            None
+        }
+    };
+    let master_key_version = version_reader.get_master_key_version();
+
+    let version = SecretVersion::new(
+        version_id,
+        ciphertext,
+        version_created_at,
+        created_by,
+        master_key_version,
+    );
+
+    Ok(SecretValue {
+        id,
+        name,
+        metadata,
+        created_at,
+        updated_at,
+        current_version: version,
+    })
+}
+
+fn read_secret_ciphertext(
+    reader: secret_ciphertext::Reader<'_>,
+) -> Result<SecretCiphertext, Error> {
+    let nonce_reader = reader.get_nonce()?;
+    if nonce_reader.len() != 12 {
+        return Err(Error::failed("secret nonce must be 12 bytes".into()));
+    }
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(nonce_reader);
+
+    let digest_reader = reader.get_digest()?;
+    if digest_reader.len() != 32 {
+        return Err(Error::failed("secret digest must be 32 bytes".into()));
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(digest_reader);
+
+    Ok(SecretCiphertext {
+        master_key_version: reader.get_master_key_version(),
+        nonce,
+        ciphertext: reader.get_ciphertext()?.to_vec(),
+        digest,
+    })
+}
+
+fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
+    if data.len() != 16 {
+        return Err(Error::failed("uuid must be 16 bytes".into()));
+    }
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(data);
+    Ok(Uuid::from_bytes(bytes))
 }
 
 fn secret_ciphertext_from_encryption(result: SecretCiphertext) -> SecretCiphertext {
@@ -195,6 +337,11 @@ impl secrets::Server for SecretsService {
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 
+        self.replicator()
+            .broadcast(SecretEvent::Upsert(Box::new(value.clone())))
+            .await
+            .map_err(|e| Error::failed(e.to_string()))?;
+
         let spec_builder = results.get().init_secret();
         write_secret_spec(spec_builder, &value);
         Ok(())
@@ -255,6 +402,11 @@ impl secrets::Server for SecretsService {
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 
+        self.replicator()
+            .broadcast(SecretEvent::Upsert(Box::new(updated.clone())))
+            .await
+            .map_err(|e| Error::failed(e.to_string()))?;
+
         let spec_builder = results.get().init_secret();
         write_secret_spec(spec_builder, &updated);
         Ok(())
@@ -276,6 +428,10 @@ impl secrets::Server for SecretsService {
             let id = compute_secret_id(&name);
             registry
                 .remove(id)
+                .await
+                .map_err(|e| Error::failed(e.to_string()))?;
+            self.replicator()
+                .broadcast(SecretEvent::Remove(id))
                 .await
                 .map_err(|e| Error::failed(e.to_string()))?;
         }

@@ -7,6 +7,8 @@
 
 use crate::network::service::{read_network_event, write_network_event};
 use crate::network::types::NetworkEvent;
+use crate::secrets::service::{read_secret_event, write_secret_event};
+use crate::secrets::types::SecretEvent;
 use crate::services::service::{read_service_event, write_service_event};
 use crate::services::types::ServiceEvent;
 use crate::task::service as task_service;
@@ -50,6 +52,7 @@ pub enum Message {
     Task { id: Uuid, event: TaskEvent },
     Service { id: Uuid, event: ServiceEvent },
     Network { id: Uuid, event: NetworkEvent },
+    Secret { id: Uuid, event: SecretEvent },
     // Scheduling(SchedulingEvent),
 }
 
@@ -60,7 +63,8 @@ impl Message {
             | Message::Topology { id, .. }
             | Message::Task { id, .. }
             | Message::Service { id, .. }
-            | Message::Network { id, .. } => *id,
+            | Message::Network { id, .. }
+            | Message::Secret { id, .. } => *id,
         }
     }
 }
@@ -77,6 +81,7 @@ pub struct Channels {
     pub task_events: Sender<Message>,
     pub service_events: Sender<Message>,
     pub network_events: Sender<Message>,
+    pub secret_events: Sender<Message>,
     // scheduling_events: Sender<SchedulingEvent>,
 }
 
@@ -90,6 +95,7 @@ impl gossip::Server for Gossip {
         let task_tx = self.chans.task_events.clone();
         let service_tx = self.chans.service_events.clone();
         let network_tx = self.chans.network_events.clone();
+        let secret_tx = self.chans.secret_events.clone();
 
         let msgs = params.get().unwrap().get_messages();
 
@@ -162,6 +168,18 @@ impl gossip::Server for Gossip {
                 },
                 Network(Err(e)) => {
                     eprintln!("Error reading network: {e}");
+                }
+                Secret(Ok(reader)) => match read_secret_event(reader) {
+                    Ok(event) => {
+                        let message = Message::Secret { id, event };
+                        secret_tx.send(message).await.map_err(|e| {
+                            capnp::Error::failed(format!("Couldn't send event to secrets: {e}"))
+                        })?;
+                    }
+                    Err(e) => eprintln!("Failed to convert secret event: {e}"),
+                },
+                Secret(Err(e)) => {
+                    eprintln!("Error reading secret: {e}");
                 }
             }
         }
@@ -277,6 +295,10 @@ where
                 let network_builder = builder.init_network();
                 write_network_event(network_builder, event)?;
             }
+            Message::Secret { event, .. } => {
+                let secret_builder = builder.init_secret();
+                write_secret_event(secret_builder, event)?;
+            }
         }
     }
 
@@ -302,6 +324,7 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
         Message::Task { .. } => false,
         Message::Service { .. } => false,
         Message::Network { .. } => false,
+        Message::Secret { .. } => false,
     }
 }
 

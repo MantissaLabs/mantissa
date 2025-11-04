@@ -8,6 +8,7 @@ use crate::registry::Registry;
 use crate::scheduler::Scheduler;
 use crate::scheduler::service::SchedulerService;
 use crate::secrets::crypto::SecretKeyring;
+use crate::secrets::gossip::SecretReplicator;
 use crate::secrets::registry::SecretRegistry;
 use crate::secrets::service::SecretsService;
 use crate::server::auth::AuthStore;
@@ -138,6 +139,7 @@ pub(crate) struct Components {
     #[allow(dead_code)]
     pub network_controller: NetworkController,
     pub network_gossiper: NetworkGossiper,
+    pub secret_replicator: SecretReplicator,
 }
 
 impl Bootstrap {
@@ -281,6 +283,8 @@ impl Bootstrap {
             async_channel::bounded(128);
         let (network_tx, network_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(128);
+        let (secret_tx, secret_rx): (Sender<Message>, Receiver<Message>) =
+            async_channel::bounded(128);
 
         // gossip capability
         let gossip = crate::gossip::Gossip {
@@ -289,6 +293,7 @@ impl Bootstrap {
                 task_events: task_tx.clone(),
                 service_events: service_tx.clone(),
                 network_events: network_tx.clone(),
+                secret_events: secret_tx.clone(),
             },
         };
         let gossip_client = capnp_rpc::new_client(gossip);
@@ -376,6 +381,8 @@ impl Bootstrap {
             .unwrap_or_else(|| ctx.listen_addr.clone());
 
         let secret_registry = SecretRegistry::new(stores.secrets.clone());
+        let secret_replicator =
+            SecretReplicator::new(secret_registry.clone(), gossip_tx.clone(), secret_rx);
 
         let container_manager: Arc<dyn ContainerManager + Send + Sync> =
             if let Some(manager) = docker::container_manager_override() {
@@ -450,6 +457,7 @@ impl Bootstrap {
             stores.secret_keyring.clone(),
             stores.secret_master_store.clone(),
             Some(topology.clone()),
+            secret_replicator.clone(),
         );
         let secrets_client_cap: SecretsClient = capnp_rpc::new_client(secrets_service);
 
@@ -476,6 +484,7 @@ impl Bootstrap {
                 network_registry,
                 network_controller,
                 network_gossiper,
+                secret_replicator,
             },
             gossip_rx,
         ))
@@ -578,6 +587,11 @@ impl Bootstrap {
         let mut service_runner = comps.service_controller.clone();
         tokio::task::spawn_local(async move {
             service_runner.run().await;
+        });
+
+        let secret_replicator = comps.secret_replicator.clone();
+        tokio::task::spawn_local(async move {
+            secret_replicator.run().await;
         });
 
         let gossiper = comps.network_gossiper.clone();
