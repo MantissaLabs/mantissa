@@ -1,5 +1,6 @@
 pub mod allocator;
 pub mod attachment;
+pub mod bpf;
 pub mod controller;
 pub mod events;
 pub mod gossip;

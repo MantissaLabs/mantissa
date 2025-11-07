@@ -1,5 +1,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use uuid::Uuid;
 
 /// Supported overlay driver for network provisioning.
@@ -111,6 +112,110 @@ impl NetworkPeerState {
     }
 }
 
+/// Declarative description of an eBPF program that should back a network.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BpfProgramSpec {
+    pub name: String,
+    #[serde(default)]
+    pub attach_point: BpfAttachPoint,
+}
+
+impl BpfProgramSpec {
+    /// Create a new program spec anchored on the provided name so higher layers can reference it.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            attach_point: BpfAttachPoint::default(),
+        }
+    }
+
+    /// Create a program spec with an explicit attach point for finer control over placement.
+    pub fn with_attach_point(name: impl Into<String>, attach_point: BpfAttachPoint) -> Self {
+        Self {
+            name: name.into(),
+            attach_point,
+        }
+    }
+
+    /// Rehydrate a program spec from its wire representation for Cap'n Proto compatibility.
+    pub fn from_wire(name: &str) -> Self {
+        if let Some((program, attach)) = name.rsplit_once('@') {
+            if let Some(point) = BpfAttachPoint::from_token(attach) {
+                return Self::with_attach_point(program, point);
+            }
+        }
+        Self::new(name)
+    }
+
+    /// Return the attach point where the program expects to be loaded within the datapath.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn attach_point(&self) -> BpfAttachPoint {
+        self.attach_point
+    }
+
+    /// Convert the program specification back into the wire representation used by the RPC layer.
+    pub fn to_wire(&self) -> String {
+        if self.attach_point == BpfAttachPoint::default() {
+            self.name.clone()
+        } else {
+            format!("{}@{}", self.name, self.attach_point)
+        }
+    }
+}
+
+impl fmt::Display for BpfProgramSpec {
+    /// Render the program spec as a human-readable identifier to aid debugging and logging.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.to_wire().fmt(f)
+    }
+}
+
+/// Supported attachment points for Mantissa-managed eBPF programs.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BpfAttachPoint {
+    /// Program attaches to the VXLAN device using XDP for early ingress handling.
+    #[default]
+    VxlanXdp,
+    /// Program attaches to the bridge device using XDP to inspect container traffic.
+    BridgeXdp,
+    /// Program attaches to the bridge ingress qdisc via TC.
+    BridgeTcIngress,
+    /// Program attaches to the bridge egress qdisc via TC.
+    BridgeTcEgress,
+}
+
+impl BpfAttachPoint {
+    /// Convert a textual token (e.g. from network specs) into a strongly typed attach point.
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "vxlan_xdp" => Some(BpfAttachPoint::VxlanXdp),
+            "bridge_xdp" => Some(BpfAttachPoint::BridgeXdp),
+            "bridge_tc_ingress" => Some(BpfAttachPoint::BridgeTcIngress),
+            "bridge_tc_egress" => Some(BpfAttachPoint::BridgeTcEgress),
+            _ => None,
+        }
+    }
+
+    /// Return the canonical string token used when serializing this attach point.
+    pub fn as_token(self) -> &'static str {
+        match self {
+            BpfAttachPoint::VxlanXdp => "vxlan_xdp",
+            BpfAttachPoint::BridgeXdp => "bridge_xdp",
+            BpfAttachPoint::BridgeTcIngress => "bridge_tc_ingress",
+            BpfAttachPoint::BridgeTcEgress => "bridge_tc_egress",
+        }
+    }
+}
+
+impl fmt::Display for BpfAttachPoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_token())
+    }
+}
+
 /// Desired state of a network replicated via CRDT/MST.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NetworkSpecValue {
@@ -125,7 +230,7 @@ pub struct NetworkSpecValue {
     pub updated_at: String,
     pub status: NetworkStatus,
     pub sealed: bool,
-    pub bpf_programs: Vec<String>,
+    pub bpf_programs: Vec<BpfProgramSpec>,
 }
 
 /// Parameters required when creating a new network specification.
@@ -138,7 +243,7 @@ pub struct NetworkSpecDraft {
     pub vni: u32,
     pub mtu: u32,
     pub sealed: bool,
-    pub bpf_programs: Vec<String>,
+    pub bpf_programs: Vec<BpfProgramSpec>,
 }
 
 /// Field bundle applied when updating an existing network specification.
@@ -150,7 +255,7 @@ pub struct NetworkSpecUpdate {
     pub vni: u32,
     pub mtu: u32,
     pub sealed: bool,
-    pub bpf_programs: Vec<String>,
+    pub bpf_programs: Vec<BpfProgramSpec>,
 }
 
 impl NetworkSpecValue {

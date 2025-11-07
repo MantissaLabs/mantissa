@@ -1,5 +1,6 @@
 use crate::gossip::Message;
 use crate::network::attachment::PlatformAttachmentProvisioner;
+use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
@@ -33,6 +34,7 @@ struct NetworkControllerInner {
     node_name: String,
     cluster_registry: Registry,
     provisioner: platform::NetworkProvisioner,
+    bpf: NetworkBpfManager,
     active_networks: AsyncMutex<HashSet<Uuid>>,
     remote_fdb: AsyncMutex<HashMap<Uuid, HashMap<String, IpAddr>>>,
     flood_entries: AsyncMutex<HashMap<Uuid, HashSet<IpAddr>>>,
@@ -69,6 +71,10 @@ impl NetworkController {
             warn!(target: "network", "failed to initialize attachment provisioner: {err}");
             PlatformAttachmentProvisioner::unavailable()
         });
+        let bpf = NetworkBpfManager::new().unwrap_or_else(|err| {
+            warn!(target: "network", "failed to initialize bpf manager: {err:#}");
+            NetworkBpfManager::unavailable()
+        });
 
         Ok(Self {
             inner: Arc::new(NetworkControllerInner {
@@ -77,6 +83,7 @@ impl NetworkController {
                 node_name,
                 cluster_registry,
                 provisioner,
+                bpf,
                 active_networks: AsyncMutex::new(HashSet::new()),
                 remote_fdb: AsyncMutex::new(HashMap::new()),
                 flood_entries: AsyncMutex::new(HashMap::new()),
@@ -308,6 +315,7 @@ impl NetworkController {
             mtu = plan.mtu,
             "ensuring network resources"
         );
+        let interface_ctx: NetworkInterfaceContext = (&plan).into();
         self.inner
             .provisioner
             .ensure_network(&plan)
@@ -320,6 +328,11 @@ impl NetworkController {
             bridge = %plan.bridge_name,
             "network resources ensured"
         );
+        self.inner
+            .bpf
+            .ensure_network(&spec, &interface_ctx)
+            .await
+            .with_context(|| format!("ensure bpf programs for network {}", plan.network_id))?;
 
         self.mark_peer_ready(plan.network_id).await?;
 
@@ -351,6 +364,14 @@ impl NetworkController {
 
         for id in stale {
             let plan = NetworkPlan::from_id(id);
+            let interface_ctx: NetworkInterfaceContext = (&plan).into();
+            if let Err(err) = self.inner.bpf.teardown_network(&interface_ctx).await {
+                warn!(
+                    target: "network",
+                    network = %id,
+                    "failed to tear down bpf programs: {err:#}"
+                );
+            }
             if let Err(err) = self.inner.provisioner.teardown_network(&plan).await {
                 warn!(
                     target: "network",
@@ -393,6 +414,14 @@ impl NetworkController {
         }
 
         let plan = NetworkPlan::from_id(spec.id);
+        let interface_ctx: NetworkInterfaceContext = (&plan).into();
+        if let Err(err) = self.inner.bpf.teardown_network(&interface_ctx).await {
+            warn!(
+                target: "network",
+                network = %spec.id,
+                "failed to tear down bpf programs for deleted network: {err:#}"
+            );
+        }
         if let Err(err) = self.inner.provisioner.teardown_network(&plan).await {
             warn!(
                 target: "network",
@@ -692,6 +721,16 @@ impl NetworkPlan {
             vni: compute_deterministic_vni(network_id),
             mtu: DEFAULT_MTU,
         }
+    }
+}
+
+impl From<&NetworkPlan> for NetworkInterfaceContext {
+    fn from(plan: &NetworkPlan) -> Self {
+        NetworkInterfaceContext::new(
+            plan.network_id,
+            plan.bridge_name.clone(),
+            plan.vxlan_name.clone(),
+        )
     }
 }
 

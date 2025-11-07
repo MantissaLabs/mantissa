@@ -17,7 +17,7 @@ use bollard::models::{HostConfig, RestartPolicy, RestartPolicyNameEnum};
 use bollard::service::ContainerInspectResponse;
 
 use async_trait::async_trait;
-use log::{debug, error, info};
+use log::{debug, info};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

@@ -16,6 +16,7 @@ members = [
     "crates/net",
     "crates/client",
     "crates/health",
+    "crates/network-ebpf",
 ]
 
 [build-dependencies]

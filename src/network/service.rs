@@ -2,8 +2,9 @@ use crate::network::controller::NetworkController;
 use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    NetworkAttachmentValue, NetworkDriver, NetworkEvent, NetworkPeerState, NetworkPeerStateValue,
-    NetworkSpecDraft, NetworkSpecUpdate, NetworkSpecValue, NetworkStatus, compute_network_id,
+    BpfProgramSpec, NetworkAttachmentValue, NetworkDriver, NetworkEvent, NetworkPeerState,
+    NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecUpdate, NetworkSpecValue, NetworkStatus,
+    compute_network_id,
 };
 use capnp::Error;
 use protocol::network::{
@@ -83,10 +84,14 @@ fn convert_driver(driver: protocol::network::NetworkDriver) -> NetworkDriver {
     NetworkDriver::from_proto(driver)
 }
 
-fn collect_bpf_programs(spec: &network_create_spec::Reader<'_>) -> Result<Vec<String>, Error> {
+/// Parse the requested BPF program entries into structured specs for reconciliation.
+fn collect_bpf_programs(
+    spec: &network_create_spec::Reader<'_>,
+) -> Result<Vec<BpfProgramSpec>, Error> {
     let mut programs = Vec::new();
     for entry in spec.get_bpf_programs()?.iter() {
-        programs.push(entry?.to_str()?.to_string());
+        let text = entry?.to_str()?.to_string();
+        programs.push(BpfProgramSpec::from_wire(&text));
     }
     Ok(programs)
 }
@@ -108,7 +113,8 @@ fn write_network_spec(mut builder: network_spec::Builder<'_>, spec: &NetworkSpec
         .reborrow()
         .init_bpf_programs(spec.bpf_programs.len() as u32);
     for (idx, program) in spec.bpf_programs.iter().enumerate() {
-        programs.set(idx as u32, program);
+        let encoded = program.to_wire();
+        programs.set(idx as u32, &encoded);
     }
 }
 
@@ -192,7 +198,8 @@ fn read_network_spec(reader: network_spec::Reader<'_>) -> Result<NetworkSpecValu
 
     let mut bpf_programs = Vec::new();
     for entry in reader.get_bpf_programs()?.iter() {
-        bpf_programs.push(entry?.to_str()?.to_string());
+        let text = entry?.to_str()?.to_string();
+        bpf_programs.push(BpfProgramSpec::from_wire(&text));
     }
 
     Ok(NetworkSpecValue {
