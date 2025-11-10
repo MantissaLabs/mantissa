@@ -16,7 +16,9 @@ struct EnvGuard {
 impl EnvGuard {
     fn set(key: &'static str, val: impl Into<std::ffi::OsString>) -> Self {
         let previous = std::env::var_os(key);
-        std::env::set_var(key, val.into());
+        unsafe {
+            std::env::set_var(key, val.into());
+        }
         Self {
             key,
             value: previous,
@@ -27,8 +29,12 @@ impl EnvGuard {
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.value {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
+            Some(v) => unsafe {
+                std::env::set_var(self.key, v);
+            },
+            None => unsafe {
+                std::env::remove_var(self.key);
+            },
         }
     }
 }

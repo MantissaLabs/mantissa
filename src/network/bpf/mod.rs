@@ -105,9 +105,10 @@ mod platform {
     use std::ffi::CString;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
-    use tracing::{debug, info};
+    use tracing::{debug, info, warn};
     use uuid::Uuid;
 
     #[derive(Clone, Copy)]
@@ -164,10 +165,18 @@ mod platform {
             }
             Ok(())
         }
+
+        fn matches(&self, specs: &[BpfProgramSpec]) -> bool {
+            self.canonical_specs() == canonical_specs(specs.iter())
+        }
+
+        fn canonical_specs(&self) -> Vec<(BpfAttachPoint, String)> {
+            canonical_specs(self.programs.iter().map(|program| &program.spec))
+        }
     }
 
     struct LoadedProgram {
-        _spec: BpfProgramSpec,
+        spec: BpfProgramSpec,
         _artifact: PathBuf,
         handle: ProgramHandle,
     }
@@ -200,8 +209,37 @@ mod platform {
 
             self.validate_programs(programs, interfaces)?;
 
+            let network_id = interfaces.network_id();
+            {
+                let guard = self.loaded.lock().await;
+                if let Some(existing) = guard.get(&network_id) {
+                    if existing.matches(programs) {
+                        return Ok(());
+                    }
+                }
+            }
+
+            let mut guard = self.loaded.lock().await;
+            let previous = guard.remove(&network_id);
+            drop(guard);
+
+            if let Some(existing) = previous {
+                if let Err(err) = existing.teardown() {
+                    warn!(
+                        target: "network",
+                        network = %network_id,
+                        "failed to detach existing bpf programs before reattach: {err:#}"
+                    );
+                }
+            }
+
+            self.clear_stale_xdp_targets(programs, interfaces);
+
+            let mut ordered_programs: Vec<&BpfProgramSpec> = programs.iter().collect();
+            ordered_programs.sort_by_key(|spec| attach_priority(spec.attach_point()));
+
             let mut network = LoadedNetwork::new();
-            for spec in programs {
+            for spec in ordered_programs {
                 let artifact = self
                     .resolver
                     .resolve(spec)
@@ -219,26 +257,37 @@ mod platform {
                     "attaching bpf program"
                 );
 
-                let handle = self
-                    .loader
-                    .load_and_attach(spec, attach_target, &artifact)
-                    .with_context(|| {
-                        format!(
-                            "load and attach program '{}' ({})",
-                            spec,
-                            artifact.display()
-                        )
-                    })?;
+                let handle = match load_with_retry(&*self.loader, spec, attach_target, &artifact) {
+                    Ok(handle) => handle,
+                    Err(err) => {
+                        if let Err(teardown_err) = network.teardown() {
+                            warn!(
+                                target: "network",
+                                network = %network_id,
+                                "failed to rollback partially attached bpf programs: {teardown_err:#}"
+                            );
+                        }
+                        return Err(err);
+                    }
+                };
 
                 network.push(LoadedProgram {
-                    _spec: spec.clone(),
+                    spec: spec.clone(),
                     _artifact: artifact,
                     handle,
                 });
             }
 
             let mut guard = self.loaded.lock().await;
-            guard.insert(interfaces.network_id(), network);
+            if let Some(replaced) = guard.insert(network_id, network) {
+                if let Err(err) = replaced.teardown() {
+                    warn!(
+                        target: "network",
+                        network = %network_id,
+                        "failed to detach replaced bpf programs after ensure: {err:#}"
+                    );
+                }
+            }
             Ok(())
         }
 
@@ -289,6 +338,43 @@ mod platform {
                 }
             }
             Ok(())
+        }
+
+        fn clear_stale_xdp_targets(
+            &self,
+            programs: &[BpfProgramSpec],
+            interfaces: &NetworkInterfaceContext,
+        ) {
+            let mut seen = HashSet::new();
+            let mut targets = Vec::new();
+            for spec in programs {
+                let point = spec.attach_point();
+                if !matches!(point, BpfAttachPoint::BridgeXdp | BpfAttachPoint::VxlanXdp) {
+                    continue;
+                }
+                let attach_target = resolve_attach_target(point, interfaces);
+                let interface = interface_name(attach_target).to_string();
+                if seen.insert(interface.clone()) {
+                    targets.push((
+                        detach_priority(point),
+                        attach_target,
+                        interface,
+                        spec.to_string(),
+                    ));
+                }
+            }
+
+            targets.sort_by_key(|(priority, _, _, _)| *priority);
+            for (_, target, interface, program) in targets {
+                if let Err(err) = force_detach_target(target) {
+                    warn!(
+                        target: "network",
+                        program = %program,
+                        interface = %interface,
+                        "failed to clear stale eBPF attachment: {err:#}"
+                    );
+                }
+            }
         }
     }
 
@@ -398,6 +484,341 @@ mod platform {
         match CString::new(name) {
             Ok(cstr) => unsafe { if_nametoindex(cstr.as_ptr()) != 0 },
             Err(_) => false,
+        }
+    }
+
+    fn canonical_specs<'a, I>(specs: I) -> Vec<(BpfAttachPoint, String)>
+    where
+        I: IntoIterator<Item = &'a BpfProgramSpec>,
+    {
+        let mut out: Vec<_> = specs
+            .into_iter()
+            .map(|spec| (spec.attach_point(), spec.name.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        out
+    }
+
+    fn attach_priority(point: BpfAttachPoint) -> u8 {
+        match point {
+            BpfAttachPoint::VxlanXdp => 0,
+            BpfAttachPoint::BridgeXdp => 1,
+            _ => 2,
+        }
+    }
+
+    fn detach_priority(point: BpfAttachPoint) -> u8 {
+        match point {
+            BpfAttachPoint::BridgeXdp => 0,
+            BpfAttachPoint::VxlanXdp => 1,
+            _ => 2,
+        }
+    }
+
+    fn force_detach_target(target: AttachTarget<'_>) -> Result<()> {
+        match target {
+            AttachTarget::Xdp { interface } => detach_xdp(interface),
+            AttachTarget::Tc { .. } => Ok(()),
+        }
+    }
+
+    fn detach_xdp(interface: &str) -> Result<()> {
+        let Some(if_index) = interface_index(interface)? else {
+            debug!(
+                target: "network",
+                interface,
+                "skipping xdp detach; interface missing"
+            );
+            return Ok(());
+        };
+
+        match unsafe { netlink::detach_xdp(if_index) } {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    interface,
+                    "failed to detach XDP program via netlink: {err}, trying iproute2 fallback"
+                );
+                detach_xdp_with_ip(interface)
+            }
+        }
+    }
+
+    fn interface_index(name: &str) -> Result<Option<i32>> {
+        let cstr = CString::new(name).context("interface name contains null byte")?;
+        let index = unsafe { if_nametoindex(cstr.as_ptr()) };
+        if index == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(index as i32))
+        }
+    }
+
+    fn detach_xdp_with_ip(interface: &str) -> Result<()> {
+        let output = Command::new("ip")
+            .args(["link", "set", "dev", interface, "xdp", "off"])
+            .output()
+            .with_context(|| format!("run ip link set xdp off for {interface}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "ip link set dev {interface} xdp off failed: {}",
+                stderr.trim()
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_bpf_link_conflict(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            if let Some(sys) = cause.downcast_ref::<aya::sys::SyscallError>() {
+                return sys.call == "bpf_link_create"
+                    && matches!(sys.io_error.raw_os_error(), Some(code) if code == libc::EEXIST);
+            }
+            if let Some(program_err) = cause.downcast_ref::<aya::programs::ProgramError>() {
+                if let aya::programs::ProgramError::SyscallError(sys) = program_err {
+                    return sys.call == "bpf_link_create"
+                        && matches!(sys.io_error.raw_os_error(), Some(code) if code == libc::EEXIST);
+                }
+            }
+            false
+        })
+    }
+
+    fn load_with_retry(
+        loader: &dyn ProgramLoader,
+        spec: &BpfProgramSpec,
+        target: AttachTarget<'_>,
+        artifact: &Path,
+    ) -> Result<ProgramHandle> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match loader
+                .load_and_attach(spec, target, artifact)
+                .with_context(|| {
+                    format!(
+                        "load and attach program '{}' ({})",
+                        spec,
+                        artifact.display()
+                    )
+                }) {
+                Ok(handle) => return Ok(handle),
+                Err(err) => {
+                    if attempt == 1
+                        && matches!(target, AttachTarget::Xdp { .. })
+                        && is_bpf_link_conflict(&err)
+                    {
+                        if let Err(detach_err) = force_detach_target(target) {
+                            warn!(
+                                target: "network",
+                                program = %spec,
+                                interface = %interface_name(target),
+                                "failed to clear conflicting XDP link before retry: {detach_err:#}"
+                            );
+                            return Err(err);
+                        }
+                        warn!(
+                            target: "network",
+                            program = %spec,
+                            interface = %interface_name(target),
+                            "retrying XDP attachment after clearing stale link"
+                        );
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    mod netlink {
+        use libc::{
+            AF_NETLINK, AF_UNSPEC, IFLA_XDP, NETLINK_CAP_ACK, NETLINK_EXT_ACK, NETLINK_ROUTE,
+            NLA_F_NESTED, NLM_F_ACK, NLM_F_REQUEST, NLMSG_ERROR, RTM_SETLINK, SOCK_RAW,
+            SOL_NETLINK, nlattr, nlmsgerr, nlmsghdr, recv, sa_family_t, send, setsockopt,
+        };
+        use std::io;
+        use std::mem;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::ptr;
+        use std::slice;
+
+        const IFLA_XDP_FD_ATTR: u16 = 1;
+
+        #[repr(C)]
+        struct DetachRequest {
+            header: nlmsghdr,
+            ifinfo: IfInfoMsg,
+            xdp_attr: nlattr,
+            fd_attr: nlattr,
+            fd_value: i32,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SockaddrNl {
+            nl_family: sa_family_t,
+            nl_pad: libc::c_ushort,
+            nl_pid: u32,
+            nl_groups: u32,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct IfInfoMsg {
+            ifi_family: u8,
+            __ifi_pad: u8,
+            ifi_type: u16,
+            ifi_index: i32,
+            ifi_flags: u32,
+            ifi_change: u32,
+        }
+
+        pub(super) unsafe fn detach_xdp(if_index: i32) -> io::Result<()> {
+            let sock = unsafe { NetlinkSocket::open()? };
+
+            let mut req: DetachRequest = unsafe { mem::zeroed() };
+            req.header.nlmsg_len = mem::size_of::<DetachRequest>() as u32;
+            req.header.nlmsg_type = RTM_SETLINK;
+            req.header.nlmsg_flags = (NLM_F_REQUEST | NLM_F_ACK) as u16;
+            req.header.nlmsg_seq = 1;
+            req.ifinfo.ifi_family = AF_UNSPEC as u8;
+            req.ifinfo.ifi_index = if_index;
+            req.xdp_attr.nla_type = (NLA_F_NESTED as u16) | (IFLA_XDP as u16);
+            req.xdp_attr.nla_len = (mem::size_of::<nlattr>() * 2 + mem::size_of::<i32>()) as u16;
+            req.fd_attr.nla_type = IFLA_XDP_FD_ATTR;
+            req.fd_attr.nla_len = (mem::size_of::<nlattr>() + mem::size_of::<i32>()) as u16;
+            req.fd_value = -1;
+
+            sock.send(bytes_of(&req))?;
+            sock.recv_ack()
+        }
+
+        struct NetlinkSocket {
+            fd: OwnedFd,
+        }
+
+        impl NetlinkSocket {
+            unsafe fn open() -> io::Result<Self> {
+                let fd = unsafe { libc::socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+                let enable = 1i32;
+                if unsafe {
+                    setsockopt(
+                        fd.as_raw_fd(),
+                        SOL_NETLINK,
+                        NETLINK_EXT_ACK,
+                        &enable as *const _ as *const _,
+                        mem::size_of::<i32>() as u32,
+                    )
+                } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+
+                if unsafe {
+                    setsockopt(
+                        fd.as_raw_fd(),
+                        SOL_NETLINK,
+                        NETLINK_CAP_ACK,
+                        &enable as *const _ as *const _,
+                        mem::size_of::<i32>() as u32,
+                    )
+                } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+
+                let local = SockaddrNl {
+                    nl_family: AF_NETLINK as sa_family_t,
+                    nl_pad: 0,
+                    nl_pid: 0,
+                    nl_groups: 0,
+                };
+
+                if unsafe {
+                    libc::bind(
+                        fd.as_raw_fd(),
+                        &local as *const _ as *const _,
+                        mem::size_of::<SockaddrNl>() as u32,
+                    )
+                } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+
+                let kernel = SockaddrNl {
+                    nl_family: AF_NETLINK as sa_family_t,
+                    nl_pad: 0,
+                    nl_pid: 0,
+                    nl_groups: 0,
+                };
+
+                if unsafe {
+                    libc::connect(
+                        fd.as_raw_fd(),
+                        &kernel as *const _ as *const _,
+                        mem::size_of::<SockaddrNl>() as u32,
+                    )
+                } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+
+                Ok(Self { fd })
+            }
+
+            fn send(&self, msg: &[u8]) -> io::Result<()> {
+                if unsafe { send(self.fd.as_raw_fd(), msg.as_ptr() as *const _, msg.len(), 0) } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            }
+
+            fn recv_ack(&self) -> io::Result<()> {
+                let mut buf = [0u8; 256];
+                let len = unsafe {
+                    recv(
+                        self.fd.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        0,
+                    )
+                };
+                if len < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if (len as usize) < mem::size_of::<nlmsghdr>() + mem::size_of::<nlmsgerr>() {
+                    return Err(io::Error::other("short netlink reply"));
+                }
+
+                let header = unsafe { ptr::read_unaligned(buf.as_ptr() as *const nlmsghdr) };
+                if header.nlmsg_type as i32 != NLMSG_ERROR {
+                    return Ok(());
+                }
+
+                let err = unsafe {
+                    ptr::read_unaligned(
+                        buf[mem::size_of::<nlmsghdr>()..].as_ptr() as *const nlmsgerr
+                    )
+                };
+                if err.error == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(-err.error))
+                }
+            }
+        }
+
+        fn bytes_of<T>(val: &T) -> &[u8] {
+            unsafe { slice::from_raw_parts((val as *const T).cast::<u8>(), mem::size_of::<T>()) }
         }
     }
 
@@ -559,9 +980,13 @@ mod platform {
 
         fn reset_env(original: Option<std::ffi::OsString>) {
             if let Some(value) = original {
-                env::set_var("MANTISSA_BPF_DIR", value);
+                unsafe {
+                    env::set_var("MANTISSA_BPF_DIR", value);
+                }
             } else {
-                env::remove_var("MANTISSA_BPF_DIR");
+                unsafe {
+                    env::remove_var("MANTISSA_BPF_DIR");
+                }
             }
         }
 
@@ -572,7 +997,9 @@ mod platform {
             fs::write(&artifact_path, b"test").context("write artifact stub")?;
 
             let original = env::var_os("MANTISSA_BPF_DIR");
-            env::set_var("MANTISSA_BPF_DIR", dir.path());
+            unsafe {
+                env::set_var("MANTISSA_BPF_DIR", dir.path());
+            }
 
             let resolver = ArtifactResolver::new();
             let spec = BpfProgramSpec::new("resolver-example");

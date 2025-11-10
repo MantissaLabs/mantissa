@@ -10,6 +10,8 @@ use crate::network::types::{
 use crate::registry::Registry;
 use anyhow::{Context, Result};
 use async_channel::Sender;
+#[cfg(target_os = "linux")]
+use aya::{programs::ProgramError, sys::SyscallError};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -304,35 +306,74 @@ impl NetworkController {
             self.send_event(NetworkEvent::Upsert(spec.clone())).await;
         }
 
-        info!(
-            target: "network",
-            network_id = %plan.network_id,
-            node_id = %self.inner.node_id,
-            node = %self.inner.node_name,
-            vxlan = %plan.vxlan_name,
-            bridge = %plan.bridge_name,
-            vni = plan.vni,
-            mtu = plan.mtu,
-            "ensuring network resources"
-        );
         let interface_ctx: NetworkInterfaceContext = (&plan).into();
-        self.inner
-            .provisioner
-            .ensure_network(&plan)
-            .await
-            .with_context(|| format!("ensure network {}", plan.network_id))?;
-        info!(
-            target: "network",
-            network_id = %plan.network_id,
-            vxlan = %plan.vxlan_name,
-            bridge = %plan.bridge_name,
-            "network resources ensured"
-        );
-        self.inner
-            .bpf
-            .ensure_network(&spec, &interface_ctx)
-            .await
-            .with_context(|| format!("ensure bpf programs for network {}", plan.network_id))?;
+        let mut retried_after_bpf_conflict = false;
+        loop {
+            info!(
+                target: "network",
+                network_id = %plan.network_id,
+                node_id = %self.inner.node_id,
+                node = %self.inner.node_name,
+                vxlan = %plan.vxlan_name,
+                bridge = %plan.bridge_name,
+                vni = plan.vni,
+                mtu = plan.mtu,
+                "ensuring network resources"
+            );
+            self.inner
+                .provisioner
+                .ensure_network(&plan)
+                .await
+                .with_context(|| format!("ensure network {}", plan.network_id))?;
+            info!(
+                target: "network",
+                network_id = %plan.network_id,
+                vxlan = %plan.vxlan_name,
+                bridge = %plan.bridge_name,
+                "network resources ensured"
+            );
+
+            match self.inner.bpf.ensure_network(&spec, &interface_ctx).await {
+                Ok(()) => break,
+                Err(err) => {
+                    if retried_after_bpf_conflict || !Self::is_bpf_link_conflict(&err) {
+                        return Err(err.context(format!(
+                            "ensure bpf programs for network {}",
+                            plan.network_id
+                        )));
+                    }
+
+                    retried_after_bpf_conflict = true;
+                    warn!(
+                        target: "network",
+                        network = %plan.network_id,
+                        bridge = %plan.bridge_name,
+                        vxlan = %plan.vxlan_name,
+                        "stale eBPF attachments detected, rebuilding interfaces"
+                    );
+
+                    if let Err(teardown_err) = self.inner.bpf.teardown_network(&interface_ctx).await
+                    {
+                        warn!(
+                            target: "network",
+                            network = %plan.network_id,
+                            "failed to detach bpf programs after conflict: {teardown_err:#}"
+                        );
+                    }
+
+                    if let Err(teardown_err) = self.inner.provisioner.teardown_network(&plan).await
+                    {
+                        warn!(
+                            target: "network",
+                            network = %plan.network_id,
+                            "failed to teardown network after bpf conflict: {teardown_err:#}"
+                        );
+                    }
+
+                    continue;
+                }
+            }
+        }
 
         self.mark_peer_ready(plan.network_id).await?;
 
@@ -352,6 +393,32 @@ impl NetworkController {
         let mut active = self.inner.active_networks.lock().await;
         active.insert(plan.network_id);
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_bpf_link_conflict(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            if let Some(sys) = cause.downcast_ref::<SyscallError>() {
+                return Self::is_link_create_conflict(sys);
+            }
+            if let Some(program_err) = cause.downcast_ref::<ProgramError>() {
+                if let ProgramError::SyscallError(sys) = program_err {
+                    return Self::is_link_create_conflict(sys);
+                }
+            }
+            false
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_link_create_conflict(sys: &SyscallError) -> bool {
+        sys.call == "bpf_link_create"
+            && matches!(sys.io_error.raw_os_error(), Some(code) if code == libc::EEXIST)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn is_bpf_link_conflict(_err: &anyhow::Error) -> bool {
+        false
     }
 
     async fn teardown_removed_networks(&self, desired: &HashSet<Uuid>) -> Result<()> {
@@ -708,6 +775,41 @@ impl NetworkController {
                 None
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::NetworkController;
+    use anyhow::Context;
+    use aya::{programs::ProgramError, sys::SyscallError};
+
+    fn make_syscall_error() -> SyscallError {
+        SyscallError {
+            call: "bpf_link_create",
+            io_error: std::io::Error::from_raw_os_error(libc::EEXIST),
+        }
+    }
+
+    #[test]
+    fn detects_syscall_conflict_directly() {
+        let err = Err::<(), _>(make_syscall_error())
+            .context("attach xdp")
+            .unwrap_err();
+        assert!(
+            NetworkController::is_bpf_link_conflict(&err),
+            "expected syscall conflict to be detected"
+        );
+    }
+
+    #[test]
+    fn detects_syscall_conflict_wrapped_in_program_error() {
+        let program_err: ProgramError = make_syscall_error().into();
+        let err = Err::<(), _>(program_err).context("attach xdp").unwrap_err();
+        assert!(
+            NetworkController::is_bpf_link_conflict(&err),
+            "expected program error conflict to be detected"
+        );
     }
 }
 
