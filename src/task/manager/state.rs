@@ -41,6 +41,7 @@ impl TaskManager {
             memory_bytes: spec.memory_bytes,
             env: spec.env.clone(),
             secret_files: spec.secret_files.clone(),
+            service_metadata: spec.service_metadata.clone(),
         });
 
         value.restart_policy = spec.restart_policy.clone();
@@ -369,6 +370,29 @@ impl TaskManager {
         error
     }
 
+    fn resolve_dns_servers(&self, network_ids: &[Uuid]) -> Vec<String> {
+        let mut servers = Vec::new();
+        let mut seen = HashSet::new();
+
+        for network_id in network_ids {
+            let Ok(spec_opt) = self.network_registry.get_spec(*network_id) else {
+                continue;
+            };
+            let Some(spec) = spec_opt else {
+                continue;
+            };
+            if let Ok(addr) =
+                crate::network::allocator::resolver_ipv4_address(&spec, self.local_node_id)
+            {
+                if seen.insert(addr) {
+                    servers.push(addr.to_string());
+                }
+            }
+        }
+
+        servers
+    }
+
     /// Maps a task restart policy into the Docker restart policy configuration.
     pub(super) fn restart_policy_to_config(policy: &TaskRestartPolicy) -> RestartPolicyConfig {
         RestartPolicyConfig {
@@ -467,6 +491,13 @@ impl TaskManager {
 
         let container_name = format!("mantissa-{}", working.id);
 
+        let dns_servers = self.resolve_dns_servers(&working.networks);
+        let dns_servers = if dns_servers.is_empty() {
+            None
+        } else {
+            Some(dns_servers)
+        };
+
         let create_request = ContainerCreateRequest {
             name: container_name.clone(),
             image: working.image.clone(),
@@ -480,6 +511,7 @@ impl TaskManager {
             volumes,
             restart_policy,
             resource_limits,
+            dns_servers,
         };
 
         let create_outcome = self
@@ -588,7 +620,12 @@ impl TaskManager {
         }
 
         if let Err(err) = self
-            .ensure_runtime_attachments(working.id, &container_id, &working.networks)
+            .ensure_runtime_attachments(
+                working.id,
+                &container_id,
+                &working.networks,
+                working.service_metadata.as_ref(),
+            )
             .await
         {
             let err = err.context(format!(

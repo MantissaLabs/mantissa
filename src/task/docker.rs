@@ -54,6 +54,7 @@ pub struct ContainerCreateRequest {
     pub volumes: Option<Vec<String>>,
     pub restart_policy: Option<RestartPolicyConfig>,
     pub resource_limits: ResourceLimits,
+    pub dns_servers: Option<Vec<String>>,
 }
 
 /// Interface for container management operations
@@ -272,6 +273,7 @@ impl ContainerManager for DockerContainerManager {
             volumes,
             restart_policy,
             resource_limits,
+            dns_servers,
         } = request;
 
         // Configure host settings
@@ -308,6 +310,10 @@ impl ContainerManager for DockerContainerManager {
         // Set volumes if provided
         if let Some(vols) = volumes {
             host_config.binds = Some(vols);
+        }
+
+        if let Some(servers) = dns_servers {
+            host_config.dns = Some(servers);
         }
 
         // Create container config

@@ -320,6 +320,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         env,
         secret_files,
         networks,
+        service_metadata: None,
     })
 }
 
@@ -402,6 +403,7 @@ impl task::Server for TaskService {
             env,
             secret_files,
             networks,
+            service_metadata: None,
         };
 
         let mut specs = self
@@ -487,6 +489,7 @@ impl task::Server for TaskService {
                 env,
                 secret_files,
                 networks,
+                service_metadata: None,
             });
         }
 

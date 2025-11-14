@@ -406,6 +406,7 @@ impl TaskManager {
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),
                 networks: plan.networks.clone(),
+                service_metadata: plan.service_metadata.clone(),
             };
 
             if let Err(err) = self.persist_spec(&spec).await {

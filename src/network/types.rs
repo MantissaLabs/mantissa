@@ -480,6 +480,10 @@ pub struct NetworkAttachmentValue {
     pub state: NetworkAttachmentState,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub service_name: Option<String>,
+    #[serde(default)]
+    pub template_name: Option<String>,
 }
 
 /// Parameters captured when creating a new network attachment record.
@@ -495,6 +499,8 @@ pub struct NetworkAttachmentDraft {
     pub mac: Option<String>,
     pub state: NetworkAttachmentState,
     pub error: Option<String>,
+    pub service_name: Option<String>,
+    pub template_name: Option<String>,
 }
 
 impl NetworkAttachmentValue {
@@ -513,6 +519,8 @@ impl NetworkAttachmentValue {
             updated_at: created_at,
             state: draft.state,
             error: draft.error,
+            service_name: draft.service_name,
+            template_name: draft.template_name,
         }
     }
 

@@ -15,7 +15,7 @@ use crate::network::types::{
     compute_network_attachment_id,
 };
 use crate::task::container::ContainerState;
-use crate::task::types::TaskEvent;
+use crate::task::types::{TaskEvent, TaskServiceMetadata};
 
 use super::TaskManager;
 
@@ -95,6 +95,7 @@ impl TaskManager {
         task_id: Uuid,
         container_id: &str,
         network_ids: &[Uuid],
+        service_meta: Option<&TaskServiceMetadata>,
     ) -> Result<()> {
         self.cleanup_orphaned_local_attachments()
             .await
@@ -131,6 +132,9 @@ impl TaskManager {
             .list_attachments_for_task(task_id)
             .context("failed to list existing network attachments")?;
 
+        let service_labels =
+            service_meta.map(|meta| (meta.service_name.clone(), meta.template.clone()));
+
         let mut existing: HashMap<Uuid, NetworkAttachmentValue> = HashMap::new();
         for attachment in existing_list {
             existing.entry(attachment.network_id).or_insert(attachment);
@@ -139,33 +143,48 @@ impl TaskManager {
         let mut touched_networks: HashSet<Uuid> = HashSet::new();
 
         for network_id in &desired {
-            let (mut attachment, previous_state, previous_ip, previous_mac) =
-                match existing.remove(network_id) {
-                    Some(mut value) => {
-                        let prev_state = value.state;
-                        let prev_ip = value.assigned_ip.clone();
-                        let prev_mac = value.mac.clone();
-                        value.container_id = container_id.to_string();
-                        (value, Some(prev_state), prev_ip, prev_mac)
+            let (mut attachment, previous_state, previous_ip, previous_mac) = match existing
+                .remove(network_id)
+            {
+                Some(mut value) => {
+                    let prev_state = value.state;
+                    let prev_ip = value.assigned_ip.clone();
+                    let prev_mac = value.mac.clone();
+                    value.container_id = container_id.to_string();
+                    if value.service_name.is_none() {
+                        if let Some((service, _)) = &service_labels {
+                            value.service_name = Some(service.clone());
+                        }
                     }
-                    None => (
-                        NetworkAttachmentValue::new(NetworkAttachmentDraft {
-                            id: compute_network_attachment_id(task_id, *network_id),
-                            task_id,
-                            node_id: self.local_node_id,
-                            container_id: container_id.to_string(),
-                            network_id: *network_id,
-                            requested_ip: None,
-                            assigned_ip: None,
-                            mac: None,
-                            state: NetworkAttachmentState::Pending,
-                            error: None,
-                        }),
-                        None,
-                        None,
-                        None,
-                    ),
-                };
+                    if value.template_name.is_none() {
+                        if let Some((_, template)) = &service_labels {
+                            value.template_name = Some(template.clone());
+                        }
+                    }
+                    (value, Some(prev_state), prev_ip, prev_mac)
+                }
+                None => (
+                    NetworkAttachmentValue::new(NetworkAttachmentDraft {
+                        id: compute_network_attachment_id(task_id, *network_id),
+                        task_id,
+                        node_id: self.local_node_id,
+                        container_id: container_id.to_string(),
+                        network_id: *network_id,
+                        requested_ip: None,
+                        assigned_ip: None,
+                        mac: None,
+                        state: NetworkAttachmentState::Pending,
+                        error: None,
+                        service_name: service_labels.as_ref().map(|(service, _)| service.clone()),
+                        template_name: service_labels
+                            .as_ref()
+                            .map(|(_, template)| template.clone()),
+                    }),
+                    None,
+                    None,
+                    None,
+                ),
+            };
 
             let spec = self
                 .network_registry

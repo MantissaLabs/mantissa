@@ -400,11 +400,14 @@ impl Bootstrap {
             stores.network_attachments.clone(),
         );
 
+        let service_registry = ServiceRegistry::new(stores.services.clone());
+
         let (forwarding_tx, forwarding_rx) = mpsc::unbounded_channel();
 
         let network_controller = NetworkController::new(
             network_registry.clone(),
             registry.clone(),
+            stores.tasks.clone(),
             ctx.self_id,
             local_node_name.clone(),
             gossip_tx.clone(),
@@ -435,7 +438,6 @@ impl Bootstrap {
             attachment_override: None,
         });
 
-        let service_registry = ServiceRegistry::new(stores.services.clone());
         let service_controller = ServiceController::new(
             service_registry.clone(),
             task_manager.clone(),

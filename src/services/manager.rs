@@ -9,7 +9,7 @@ use crate::services::types::{
 };
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
-use crate::task::types::{TaskRestartPolicy, TaskRestartPolicyKind};
+use crate::task::types::{TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata};
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
@@ -1002,6 +1002,7 @@ fn make_replica_request(
         env: template.env.clone(),
         secret_files: template.secret_files.clone(),
         networks: template.required_network_ids(),
+        service_metadata: Some(TaskServiceMetadata::new(service_name, &template.name)),
     }
 }
 

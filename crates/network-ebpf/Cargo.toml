@@ -7,3 +7,27 @@ publish = false
 [dependencies]
 aya-ebpf = { git = "https://github.com/aya-rs/aya", rev = "c65a200e9a6b0349178c0ee2bba280e498b48108", package = "aya-ebpf" }
 aya-ebpf-macros = { git = "https://github.com/aya-rs/aya", rev = "c65a200e9a6b0349178c0ee2bba280e498b48108", package = "aya-ebpf-macros" }
+
+[[bin]]
+name = "bridge_xdp"
+path = "src/bin/bridge_xdp.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "vxlan_xdp"
+path = "src/bin/vxlan_xdp.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "bridge_tc_ingress"
+path = "src/bin/bridge_tc_ingress.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "bridge_tc_egress"
+path = "src/bin/bridge_tc_egress.rs"
+test = false
+bench = false

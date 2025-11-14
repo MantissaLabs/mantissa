@@ -104,6 +104,7 @@ impl TaskManager {
                 volumes,
                 restart_policy,
                 resource_limits,
+                dns_servers: None,
             };
 
             let create_result = self
@@ -142,7 +143,12 @@ impl TaskManager {
                 .with_context(|| format!("docker start failed for task {}", plan.name))?;
 
             if let Err(err) = self
-                .ensure_runtime_attachments(plan.id, &container_id, &plan.networks)
+                .ensure_runtime_attachments(
+                    plan.id,
+                    &container_id,
+                    &plan.networks,
+                    plan.service_metadata.as_ref(),
+                )
                 .await
             {
                 let err = err.context(format!(
@@ -213,6 +219,7 @@ impl TaskManager {
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),
                 networks: plan.networks.clone(),
+                service_metadata: plan.service_metadata.clone(),
             };
 
             if let Err(err) = self.persist_spec(&spec).await {

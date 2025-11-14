@@ -429,6 +429,7 @@ async fn reconcile_rejects_missing_slot_assignments() {
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: Vec::new(),
+        service_metadata: None,
     };
 
     let err = manager
@@ -589,6 +590,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
+                service_metadata: None,
             },
             TaskStartRequest {
                 name: "svc-b".into(),
@@ -602,6 +604,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
+                service_metadata: None,
             },
         ])
         .await
@@ -650,6 +653,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
             env: Vec::new(),
             secret_files: Vec::new(),
             networks: Vec::new(),
+            service_metadata: None,
         }])
         .await
         .expect("start with pre-reserved slot");
@@ -701,6 +705,7 @@ async fn task_owned_locally_detects_remote_entries() {
         memory_bytes: 64 * 1_024 * 1_024,
         env: Vec::new(),
         secret_files: Vec::new(),
+        service_metadata: None,
     });
 
     let store = manager.store.clone();
@@ -750,6 +755,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
+                service_metadata: None,
             },
             TaskStartRequest {
                 name: "svc-d".into(),
@@ -763,6 +769,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
+                service_metadata: None,
             },
         ])
         .await
@@ -836,6 +843,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: vec![spec.id],
+        service_metadata: None,
     };
 
     let mut specs = manager
@@ -926,6 +934,7 @@ async fn stop_task_cleans_up_after_teardown_failure() {
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: vec![spec.id],
+        service_metadata: None,
     };
 
     let mut specs = manager
@@ -1001,6 +1010,7 @@ async fn attachment_ready_triggers_forwarding_event() {
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: vec![spec.id],
+        service_metadata: None,
     };
 
     let _specs = manager
@@ -1094,6 +1104,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: vec![spec_a.id, spec_b.id],
+        service_metadata: None,
     };
 
     let mut specs = manager
@@ -1196,6 +1207,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: vec![spec.id],
+        service_metadata: None,
     };
 
     let mut specs = match manager.start_tasks_batch(vec![request]).await {

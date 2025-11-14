@@ -1,6 +1,8 @@
 use crate::gossip::Message;
+use crate::network::allocator::{parse_ipv4_cidr, resolver_ipv4_address};
 use crate::network::attachment::PlatformAttachmentProvisioner;
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
+use crate::network::discovery::ServiceDiscovery;
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
@@ -8,12 +10,13 @@ use crate::network::types::{
     NetworkSpecValue, NetworkStatus,
 };
 use crate::registry::Registry;
+use crate::store::task_store::TaskStore;
 use anyhow::{Context, Result};
 use async_channel::Sender;
 #[cfg(target_os = "linux")]
 use aya::{programs::ProgramError, sys::SyscallError};
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc::UnboundedReceiver};
 use tokio::time::Duration;
@@ -37,6 +40,7 @@ struct NetworkControllerInner {
     cluster_registry: Registry,
     provisioner: platform::NetworkProvisioner,
     bpf: NetworkBpfManager,
+    discovery: ServiceDiscovery,
     active_networks: AsyncMutex<HashSet<Uuid>>,
     remote_fdb: AsyncMutex<HashMap<Uuid, HashMap<String, IpAddr>>>,
     flood_entries: AsyncMutex<HashMap<Uuid, HashSet<IpAddr>>>,
@@ -56,6 +60,8 @@ struct NetworkPlan {
     bridge_name: String,
     vni: u32,
     mtu: u32,
+    resolver_ipv4: Option<Ipv4Addr>,
+    subnet_prefix: Option<u8>,
 }
 
 impl NetworkController {
@@ -63,6 +69,7 @@ impl NetworkController {
     pub fn new(
         registry: NetworkRegistry,
         cluster_registry: Registry,
+        task_store: TaskStore,
         node_id: Uuid,
         node_name: String,
         gossip_tx: Sender<Message>,
@@ -78,6 +85,8 @@ impl NetworkController {
             NetworkBpfManager::unavailable()
         });
 
+        let discovery = ServiceDiscovery::new(registry.clone(), task_store);
+
         Ok(Self {
             inner: Arc::new(NetworkControllerInner {
                 registry,
@@ -86,6 +95,7 @@ impl NetworkController {
                 cluster_registry,
                 provisioner,
                 bpf,
+                discovery,
                 active_networks: AsyncMutex::new(HashSet::new()),
                 remote_fdb: AsyncMutex::new(HashMap::new()),
                 flood_entries: AsyncMutex::new(HashMap::new()),
@@ -375,6 +385,19 @@ impl NetworkController {
             }
         }
 
+        if let Err(err) = self
+            .inner
+            .discovery
+            .ensure_network(&spec, plan.resolver_ipv4)
+            .await
+        {
+            warn!(
+                target: "network",
+                network = %plan.network_id,
+                "failed to ensure service discovery: {err:#}"
+            );
+        }
+
         self.mark_peer_ready(plan.network_id).await?;
 
         if spec.status != NetworkStatus::Ready {
@@ -446,6 +469,13 @@ impl NetworkController {
                     id
                 );
             }
+            if let Err(err) = self.inner.discovery.teardown_network(id).await {
+                warn!(
+                    target: "network",
+                    network = %id,
+                    "failed to tear down discovery service: {err:#}"
+                );
+            }
 
             self.cleanup_network_state(id)
                 .await
@@ -494,6 +524,13 @@ impl NetworkController {
                 target: "network",
                 "failed to tear down deleted network {}: {err:#}",
                 spec.id
+            );
+        }
+        if let Err(err) = self.inner.discovery.teardown_network(spec.id).await {
+            warn!(
+                target: "network",
+                network = %spec.id,
+                "failed to tear down discovery service for deleted network: {err:#}"
             );
         }
 
@@ -554,6 +591,31 @@ impl NetworkController {
 
         spec.bpf_programs.sort();
 
+        let resolver_ipv4 = match resolver_ipv4_address(spec, self.inner.node_id) {
+            Ok(ip) => Some(ip),
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    network = %spec.id,
+                    "failed to compute resolver address: {err}"
+                );
+                None
+            }
+        };
+
+        let subnet_prefix = match parse_ipv4_cidr(&spec.subnet_cidr) {
+            Ok((_, prefix)) => Some(prefix),
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    network = %spec.id,
+                    subnet = %spec.subnet_cidr,
+                    "failed to parse subnet for resolver configuration: {err}"
+                );
+                None
+            }
+        };
+
         let suffix = short_id(spec.id);
         let plan = NetworkPlan {
             network_id: spec.id,
@@ -561,6 +623,8 @@ impl NetworkController {
             bridge_name: format!("mnt-br-{suffix}"),
             vni: spec.vni,
             mtu: spec.mtu,
+            resolver_ipv4,
+            subnet_prefix,
         };
 
         Ok((plan, changed))
@@ -822,6 +886,8 @@ impl NetworkPlan {
             bridge_name: format!("mnt-br-{suffix}"),
             vni: compute_deterministic_vni(network_id),
             mtu: DEFAULT_MTU,
+            resolver_ipv4: None,
+            subnet_prefix: None,
         }
     }
 }
@@ -868,7 +934,7 @@ mod platform {
         Error as RtnetlinkError, Handle, LinkBridge, LinkMessageBuilder, LinkUnspec, LinkVxlan,
         new_connection,
     };
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::process::Command;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
@@ -1005,6 +1071,17 @@ mod platform {
                     })?;
             }
 
+            if let (Some(ip), Some(prefix)) = (plan.resolver_ipv4, plan.subnet_prefix) {
+                self.ensure_bridge_address(bridge_index, ip, prefix, &plan.bridge_name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "assign resolver address {ip} to bridge {} (idx {})",
+                            plan.bridge_name, bridge_index
+                        )
+                    })?;
+            }
+
             info!(
                 target: "network",
                 vxlan = %plan.vxlan_name,
@@ -1012,6 +1089,25 @@ mod platform {
                 "provisioner: kernel interfaces ensured"
             );
             Ok(())
+        }
+
+        async fn ensure_bridge_address(
+            &self,
+            bridge_index: u32,
+            ip: Ipv4Addr,
+            prefix: u8,
+            bridge_name: &str,
+        ) -> Result<()> {
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+            handle
+                .address()
+                .add(bridge_index, IpAddr::V4(ip), prefix.into())
+                .replace()
+                .execute()
+                .await
+                .with_context(|| format!("assign resolver {ip}/{prefix} on {bridge_name}"))
         }
 
         pub async fn teardown_network(&self, plan: &NetworkPlan) -> Result<()> {

@@ -28,6 +28,8 @@ pub struct TaskSpec {
     pub secret_files: Vec<TaskSecretFile>,
     #[serde(default)]
     pub networks: Vec<Uuid>,
+    #[serde(default)]
+    pub service_metadata: Option<TaskServiceMetadata>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -142,6 +144,8 @@ pub struct TaskValue {
     pub secret_files: Vec<TaskSecretFile>,
     #[serde(default)]
     pub networks: Vec<Uuid>,
+    #[serde(default)]
+    pub service_metadata: Option<TaskServiceMetadata>,
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +164,7 @@ pub struct TaskValueDraft {
     pub memory_bytes: u64,
     pub env: Vec<TaskEnvironmentVariable>,
     pub secret_files: Vec<TaskSecretFile>,
+    pub service_metadata: Option<TaskServiceMetadata>,
 }
 
 impl TaskValue {
@@ -182,6 +187,22 @@ impl TaskValue {
             restart_policy: None,
             env: draft.env,
             secret_files: draft.secret_files,
+            service_metadata: draft.service_metadata,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskServiceMetadata {
+    pub service_name: String,
+    pub template: String,
+}
+
+impl TaskServiceMetadata {
+    pub fn new(service_name: impl Into<String>, template: impl Into<String>) -> Self {
+        Self {
+            service_name: service_name.into(),
+            template: template.into(),
         }
     }
 }

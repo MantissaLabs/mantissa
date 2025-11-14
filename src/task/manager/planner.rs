@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use crate::scheduler::summary::SchedulerSlotState;
 use crate::scheduler::{SchedulerSnapshot, SlotCapacity, SlotId, SlotState};
-use crate::task::types::{TaskEnvironmentVariable, TaskRestartPolicy, TaskSecretFile};
+use crate::task::types::{
+    TaskEnvironmentVariable, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata,
+};
 
 use super::{TaskManager, TaskStartRequest};
 
@@ -31,6 +33,7 @@ pub(super) struct BatchStartPlan {
     pub(super) env: Vec<TaskEnvironmentVariable>,
     pub(super) secret_files: Vec<TaskSecretFile>,
     pub(super) networks: Vec<Uuid>,
+    pub(super) service_metadata: Option<TaskServiceMetadata>,
 }
 
 impl BatchStartPlan {
@@ -56,6 +59,7 @@ pub(super) struct StartIntent {
     pub(super) env: Vec<TaskEnvironmentVariable>,
     pub(super) secret_files: Vec<TaskSecretFile>,
     pub(super) networks: Vec<Uuid>,
+    pub(super) service_metadata: Option<TaskServiceMetadata>,
 }
 
 #[derive(Clone)]
@@ -188,6 +192,7 @@ pub(super) struct RemoteStartPlan {
     pub(super) env: Vec<TaskEnvironmentVariable>,
     pub(super) secret_files: Vec<TaskSecretFile>,
     pub(super) networks: Vec<Uuid>,
+    pub(super) service_metadata: Option<TaskServiceMetadata>,
 }
 
 pub(super) struct Assignment {
@@ -215,6 +220,7 @@ impl TaskManager {
                 env: request.env,
                 secret_files: request.secret_files,
                 networks: request.networks,
+                service_metadata: request.service_metadata,
             })
             .collect()
     }
@@ -380,6 +386,7 @@ impl TaskManager {
                 env: intent.env.clone(),
                 secret_files: intent.secret_files.clone(),
                 networks: intent.networks.clone(),
+                service_metadata: intent.service_metadata.clone(),
             });
         }
 
@@ -542,6 +549,7 @@ impl TaskManager {
                         env: intent.env.clone(),
                         secret_files: intent.secret_files.clone(),
                         networks: intent.networks.clone(),
+                        service_metadata: intent.service_metadata.clone(),
                     });
                 }
                 CandidateLocation::Remote { peer_id, version } => {
@@ -560,6 +568,7 @@ impl TaskManager {
                         env: intent.env.clone(),
                         secret_files: intent.secret_files.clone(),
                         networks: intent.networks.clone(),
+                        service_metadata: intent.service_metadata.clone(),
                     });
                 }
             }

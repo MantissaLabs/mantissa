@@ -11,8 +11,8 @@ use crate::task::container::ContainerState;
 use crate::task::docker::ContainerError;
 use crate::task::docker::ContainerManager;
 use crate::task::types::{
-    TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskSpec,
-    TaskStateFilter, TaskValue,
+    TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata,
+    TaskSpec, TaskStateFilter, TaskValue,
 };
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
@@ -77,6 +77,7 @@ pub struct TaskStartRequest {
     pub env: Vec<TaskEnvironmentVariable>,
     pub secret_files: Vec<TaskSecretFile>,
     pub networks: Vec<Uuid>,
+    pub service_metadata: Option<TaskServiceMetadata>,
 }
 
 #[derive(Clone)]
@@ -172,6 +173,7 @@ impl TaskManager {
             env: Vec::new(),
             secret_files: Vec::new(),
             networks: Vec::new(),
+            service_metadata: None,
         };
 
         let mut specs = self.start_tasks_batch(vec![request]).await?;
@@ -610,5 +612,6 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         env: value.env,
         secret_files: value.secret_files,
         networks: value.networks,
+        service_metadata: value.service_metadata,
     }
 }

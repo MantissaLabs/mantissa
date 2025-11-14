@@ -1,5 +1,5 @@
 pub mod manager;
-mod reconcile;
+pub(crate) mod reconcile;
 pub mod registry;
 pub mod service;
 pub mod types;

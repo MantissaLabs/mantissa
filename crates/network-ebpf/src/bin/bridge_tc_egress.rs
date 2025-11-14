@@ -1,5 +1,5 @@
 #![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_main)]
 
 use core::ptr;
 
@@ -28,6 +28,10 @@ pub fn bridge_tc_egress(ctx: TcContext) -> i32 {
     TC_ACT_OK
 }
 
+#[cfg(test)]
+fn main() {}
+
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
