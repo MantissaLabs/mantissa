@@ -1,0 +1,40 @@
+(
+    name: "discovery-demo",
+    tasks: [
+        (
+            name: "backend",
+            image: "hashicorp/http-echo:1.0.0",
+            command: [
+                "-listen",
+                ":8000",
+                "-text",
+                "hello from backend replica",
+            ],
+            replicas: 2,
+            resources: (
+                cpu_millis: 200,
+                memory_mb: 64,
+            ),
+            networks: ["discovery-demo"],
+            env: [],
+            secret_files: [],
+        ),
+        (
+            name: "frontend",
+            image: "curlimages/curl:8.9.1",
+            command: [
+                "sh",
+                "-c",
+                "while true; do printf '\\n---\\n' && date && curl -s http://backend.discovery-demo.svc.mantissa:8000; sleep 5; done",
+            ],
+            replicas: 1,
+            resources: (
+                cpu_millis: 200,
+                memory_mb: 64,
+            ),
+            networks: ["discovery-demo"],
+            env: [],
+            secret_files: [],
+        ),
+    ],
+)
