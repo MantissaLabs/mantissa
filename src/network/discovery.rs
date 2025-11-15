@@ -1,5 +1,7 @@
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{NetworkAttachmentState, NetworkSpecValue};
+use crate::services::registry::ServiceRegistry;
+use crate::services::types::ServiceSpecValue;
 use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
 use crate::task::types::TaskValue;
@@ -23,6 +25,7 @@ const SERVICE_TTL_SECS: u32 = 5;
 pub struct ServiceDiscovery {
     registry: NetworkRegistry,
     tasks: TaskStore,
+    services: ServiceRegistry,
     servers: Arc<AsyncMutex<HashMap<Uuid, DnsServerHandle>>>,
 }
 
@@ -33,10 +36,11 @@ struct DnsServerHandle {
 }
 
 impl ServiceDiscovery {
-    pub fn new(registry: NetworkRegistry, tasks: TaskStore) -> Self {
+    pub fn new(registry: NetworkRegistry, tasks: TaskStore, services: ServiceRegistry) -> Self {
         Self {
             registry,
             tasks,
+            services,
             servers: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
@@ -65,6 +69,7 @@ impl ServiceDiscovery {
         let server = spawn_dns_server(
             self.registry.clone(),
             self.tasks.clone(),
+            self.services.clone(),
             spec.id,
             spec.name.clone(),
             resolver_ip,
@@ -104,6 +109,7 @@ impl ServiceDiscovery {
 async fn spawn_dns_server(
     registry: NetworkRegistry,
     tasks: TaskStore,
+    services: ServiceRegistry,
     network_id: Uuid,
     network_name: String,
     resolver_ip: Ipv4Addr,
@@ -121,6 +127,7 @@ async fn spawn_dns_server(
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let task_registry = registry.clone();
+    let service_registry = services.clone();
     let server = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         loop {
@@ -138,6 +145,7 @@ async fn spawn_dns_server(
                                 peer,
                                 &task_registry,
                                 &tasks,
+                                &service_registry,
                                 network_id,
                                 &network_name,
                             ).await {
@@ -179,6 +187,7 @@ async fn handle_datagram(
     peer: SocketAddr,
     registry: &NetworkRegistry,
     tasks: &TaskStore,
+    services: &ServiceRegistry,
     network_id: Uuid,
     network_name: &str,
 ) -> Result<()> {
@@ -208,10 +217,33 @@ async fn handle_datagram(
 
     let mut answers_added = false;
     let mut saw_nxdomain = false;
+    let mut saw_nodata = false;
     let mut saw_notimp = false;
 
+    let service_specs = match services.list() {
+        Ok(specs) => specs,
+        Err(err) => {
+            warn!(
+                target: "network",
+                network = %network_id,
+                "failed to load service registry while answering dns query: {err}"
+            );
+            Vec::new()
+        }
+    };
+    let template_index = build_task_template_index(&service_specs);
+
     for query in request.queries() {
-        match answer_query(query, registry, tasks, network_id, network_name).await? {
+        match answer_query(
+            query,
+            registry,
+            tasks,
+            &template_index,
+            network_id,
+            network_name,
+        )
+        .await?
+        {
             LookupOutcome::Records(records) => {
                 for record in records {
                     response.add_answer(record);
@@ -219,11 +251,14 @@ async fn handle_datagram(
                 }
             }
             LookupOutcome::NxDomain => saw_nxdomain = true,
+            LookupOutcome::NoData => saw_nodata = true,
             LookupOutcome::NotImplemented => saw_notimp = true,
         }
     }
 
     if answers_added {
+        response.set_response_code(ResponseCode::NoError);
+    } else if saw_nodata {
         response.set_response_code(ResponseCode::NoError);
     } else if saw_notimp {
         response.set_response_code(ResponseCode::NotImp);
@@ -244,6 +279,7 @@ async fn handle_datagram(
 enum LookupOutcome {
     Records(Vec<Record>),
     NxDomain,
+    NoData,
     NotImplemented,
 }
 
@@ -251,10 +287,14 @@ async fn answer_query(
     query: &Query,
     registry: &NetworkRegistry,
     tasks: &TaskStore,
+    template_index: &HashMap<Uuid, (String, String)>,
     network_id: Uuid,
     network_name: &str,
 ) -> Result<LookupOutcome> {
-    if query.query_type() != RecordType::A && query.query_type() != RecordType::AAAA {
+    if query.query_type() == RecordType::AAAA {
+        return Ok(LookupOutcome::NoData);
+    }
+    if query.query_type() != RecordType::A {
         return Ok(LookupOutcome::NotImplemented);
     }
 
@@ -262,7 +302,8 @@ async fn answer_query(
         return Ok(LookupOutcome::NxDomain);
     };
 
-    let addresses = resolve_service_ips(registry, tasks, network_id, &service_name).await?;
+    let addresses =
+        resolve_service_ips(registry, tasks, template_index, network_id, &service_name).await?;
     if addresses.is_empty() {
         return Ok(LookupOutcome::NxDomain);
     }
@@ -309,6 +350,7 @@ fn extract_service_label(name: &Name, network_name: &str) -> Option<String> {
 async fn resolve_service_ips(
     registry: &NetworkRegistry,
     tasks: &TaskStore,
+    template_index: &HashMap<Uuid, (String, String)>,
     network_id: Uuid,
     service_name: &str,
 ) -> Result<Vec<Ipv4Addr>> {
@@ -343,6 +385,11 @@ async fn resolve_service_ips(
                     .as_ref()
                     .map(|meta| meta.template.eq_ignore_ascii_case(service_name))
             })
+            .or_else(|| {
+                template_index
+                    .get(&attachment.task_id)
+                    .map(|(_, template)| template.eq_ignore_ascii_case(service_name))
+            })
             .unwrap_or_else(|| task.name.eq_ignore_ascii_case(service_name));
         if !template_match {
             continue;
@@ -366,4 +413,18 @@ fn load_task(tasks: &TaskStore, id: Uuid) -> Option<TaskValue> {
     let key = UuidKey::from(id);
     let snapshot = tasks.get_snapshot(&key).ok()??;
     snapshot.as_slice().last().cloned()
+}
+
+fn build_task_template_index(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (String, String)> {
+    let mut index = HashMap::new();
+    for spec in specs {
+        let mut ids = spec.task_ids.iter();
+        for template in &spec.tasks {
+            for _ in 0..template.replicas {
+                let Some(task_id) = ids.next() else { break };
+                index.insert(*task_id, (spec.service_name.clone(), template.name.clone()));
+            }
+        }
+    }
+    index
 }

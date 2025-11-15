@@ -10,6 +10,7 @@ use crate::network::types::{
     NetworkSpecValue, NetworkStatus,
 };
 use crate::registry::Registry;
+use crate::services::registry::ServiceRegistry;
 use crate::store::task_store::TaskStore;
 use anyhow::{Context, Result};
 use async_channel::Sender;
@@ -70,6 +71,7 @@ impl NetworkController {
         registry: NetworkRegistry,
         cluster_registry: Registry,
         task_store: TaskStore,
+        service_registry: ServiceRegistry,
         node_id: Uuid,
         node_name: String,
         gossip_tx: Sender<Message>,
@@ -85,7 +87,7 @@ impl NetworkController {
             NetworkBpfManager::unavailable()
         });
 
-        let discovery = ServiceDiscovery::new(registry.clone(), task_store);
+        let discovery = ServiceDiscovery::new(registry.clone(), task_store, service_registry);
 
         Ok(Self {
             inner: Arc::new(NetworkControllerInner {

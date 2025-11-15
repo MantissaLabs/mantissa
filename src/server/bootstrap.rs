@@ -408,6 +408,7 @@ impl Bootstrap {
             network_registry.clone(),
             registry.clone(),
             stores.tasks.clone(),
+            service_registry.clone(),
             ctx.self_id,
             local_node_name.clone(),
             gossip_tx.clone(),
