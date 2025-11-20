@@ -144,4 +144,75 @@ pub mod net {
     pub fn is_zero(mac: &[u8; 6]) -> bool {
         mac.iter().all(|&b| b == 0)
     }
+
+    #[inline(always)]
+    pub unsafe fn ptr_at<T>(data: usize, data_end: usize, offset: usize) -> Result<*const T, ()> {
+        let size = mem::size_of::<T>();
+        if data + offset + size > data_end {
+            return Err(());
+        }
+        Ok((data + offset) as *const T)
+    }
+
+    #[inline(always)]
+    pub unsafe fn mut_ptr_at<T>(data: usize, data_end: usize, offset: usize) -> Result<*mut T, ()> {
+        let size = mem::size_of::<T>();
+        if data + offset + size > data_end {
+            return Err(());
+        }
+        Ok((data + offset) as *mut T)
+    }
+}
+
+pub mod lb {
+    /// Maximum number of backend targets tracked per VIP entry.
+    pub const MAX_BACKENDS: usize = 8;
+
+    /// Key for VIP-backed routing decisions stored in eBPF maps.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct VipKey {
+        pub vip: u32,
+    }
+
+    /// L2/L3 coordinates for a backend attachment.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Backend {
+        pub ip: u32,
+        pub mac: [u8; 6],
+        pub _pad: u16,
+    }
+
+    /// Backend set and VIP metadata used when selecting a target.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct VipEntry {
+        pub vip_mac: [u8; 6],
+        pub backend_count: u8,
+        pub _pad: [u8; 3],
+        pub backends: [Backend; MAX_BACKENDS],
+    }
+
+    /// Normalized 5-tuple used to maintain DNAT/SNAT state.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Flow4 {
+        pub src: u32,
+        pub dst: u32,
+        pub src_port: u16,
+        pub dst_port: u16,
+        pub proto: u8,
+        pub _pad: u8,
+    }
+
+    /// Cached per-flow translation data shared between ingress/egress hooks.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct NatEntry {
+        pub vip: u32,
+        pub vip_mac: [u8; 6],
+        pub backend_ip: u32,
+        pub backend_mac: [u8; 6],
+    }
 }

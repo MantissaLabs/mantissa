@@ -103,6 +103,7 @@ mod platform {
     use std::collections::{HashMap, HashSet};
     use std::env;
     use std::ffi::CString;
+    use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -134,6 +135,7 @@ mod platform {
             spec: &BpfProgramSpec,
             target: AttachTarget<'_>,
             artifact: &Path,
+            map_pin_path: &Path,
         ) -> Result<ProgramHandle>;
     }
 
@@ -233,6 +235,8 @@ mod platform {
                 }
             }
 
+            let map_pin_path = map_pin_dir(network_id)?;
+
             self.clear_stale_xdp_targets(programs, interfaces);
 
             let mut ordered_programs: Vec<&BpfProgramSpec> = programs.iter().collect();
@@ -257,7 +261,13 @@ mod platform {
                     "attaching bpf program"
                 );
 
-                let handle = match load_with_retry(&*self.loader, spec, attach_target, &artifact) {
+                let handle = match load_with_retry(
+                    &*self.loader,
+                    spec,
+                    attach_target,
+                    &artifact,
+                    &map_pin_path,
+                ) {
                     Ok(handle) => handle,
                     Err(err) => {
                         if let Err(teardown_err) = network.teardown() {
@@ -522,6 +532,13 @@ mod platform {
         }
     }
 
+    fn map_pin_dir(network_id: Uuid) -> Result<PathBuf> {
+        let path = PathBuf::from("/sys/fs/bpf/mantissa").join(network_id.to_string());
+        fs::create_dir_all(&path)
+            .with_context(|| format!("create map pin directory {}", path.display()))?;
+        Ok(path)
+    }
+
     fn detach_xdp(interface: &str) -> Result<()> {
         let Some(if_index) = interface_index(interface)? else {
             debug!(
@@ -591,12 +608,13 @@ mod platform {
         spec: &BpfProgramSpec,
         target: AttachTarget<'_>,
         artifact: &Path,
+        map_pin_path: &Path,
     ) -> Result<ProgramHandle> {
         let mut attempt = 0;
         loop {
             attempt += 1;
             match loader
-                .load_and_attach(spec, target, artifact)
+                .load_and_attach(spec, target, artifact, map_pin_path)
                 .with_context(|| {
                     format!(
                         "load and attach program '{}' ({})",
@@ -831,6 +849,7 @@ mod platform {
             _spec: &BpfProgramSpec,
             _target: AttachTarget<'_>,
             _artifact: &Path,
+            _map_pin_path: &Path,
         ) -> Result<ProgramHandle> {
             Ok(Box::new(NoopHandle))
         }
@@ -852,8 +871,10 @@ mod platform {
             spec: &BpfProgramSpec,
             target: AttachTarget<'_>,
             artifact: &Path,
+            map_pin_path: &Path,
         ) -> Result<ProgramHandle> {
             let mut loader = EbpfLoader::new();
+            loader.map_pin_path(map_pin_path);
             let mut bpf = loader
                 .load_file(artifact)
                 .with_context(|| format!("load bpf object {}", artifact.display()))?;

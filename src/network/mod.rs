@@ -5,6 +5,7 @@ pub mod controller;
 pub mod discovery;
 pub mod events;
 pub mod gossip;
+pub mod lb;
 pub mod registry;
 pub mod service;
 pub mod types;

@@ -1,3 +1,5 @@
+use crate::network::allocator::parse_ipv4_cidr;
+use crate::network::lb::{BackendAddress, BpfLoadBalancer};
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{NetworkAttachmentState, NetworkSpecValue};
 use crate::services::registry::ServiceRegistry;
@@ -6,6 +8,7 @@ use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
 use crate::task::types::TaskValue;
 use anyhow::{Context, Result};
+use blake3::Hasher;
 use crdt_store::uuid_key::UuidKey;
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -27,6 +30,8 @@ pub struct ServiceDiscovery {
     tasks: TaskStore,
     services: ServiceRegistry,
     servers: Arc<AsyncMutex<HashMap<Uuid, DnsServerHandle>>>,
+    load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
+    bpf_lb: BpfLoadBalancer,
 }
 
 struct DnsServerHandle {
@@ -42,6 +47,8 @@ impl ServiceDiscovery {
             tasks,
             services,
             servers: Arc::new(AsyncMutex::new(HashMap::new())),
+            load_balancer: Arc::new(AsyncMutex::new(ServiceLoadBalancer::default())),
+            bpf_lb: BpfLoadBalancer::new(),
         }
     }
 
@@ -73,6 +80,8 @@ impl ServiceDiscovery {
             spec.id,
             spec.name.clone(),
             resolver_ip,
+            self.load_balancer.clone(),
+            self.bpf_lb.clone(),
         )
         .await?;
 
@@ -113,6 +122,8 @@ async fn spawn_dns_server(
     network_id: Uuid,
     network_name: String,
     resolver_ip: Ipv4Addr,
+    load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
+    bpf_lb: BpfLoadBalancer,
 ) -> Result<DnsServerHandle> {
     let bind_addr = SocketAddr::new(IpAddr::V4(resolver_ip), 53);
     let socket = UdpSocket::bind(bind_addr)
@@ -128,6 +139,7 @@ async fn spawn_dns_server(
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let task_registry = registry.clone();
     let service_registry = services.clone();
+    let lb_manager = bpf_lb.clone();
     let server = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         loop {
@@ -148,6 +160,8 @@ async fn spawn_dns_server(
                                 &service_registry,
                                 network_id,
                                 &network_name,
+                                &load_balancer,
+                                &lb_manager,
                             ).await {
                                 warn!(
                                     target: "network",
@@ -190,6 +204,8 @@ async fn handle_datagram(
     services: &ServiceRegistry,
     network_id: Uuid,
     network_name: &str,
+    load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
+    bpf_lb: &BpfLoadBalancer,
 ) -> Result<()> {
     let request = match Message::from_vec(payload) {
         Ok(message) => message,
@@ -241,6 +257,8 @@ async fn handle_datagram(
             &template_index,
             network_id,
             network_name,
+            load_balancer,
+            bpf_lb,
         )
         .await?
         {
@@ -290,6 +308,8 @@ async fn answer_query(
     template_index: &HashMap<Uuid, (String, String)>,
     network_id: Uuid,
     network_name: &str,
+    load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
+    bpf_lb: &BpfLoadBalancer,
 ) -> Result<LookupOutcome> {
     if query.query_type() == RecordType::AAAA {
         return Ok(LookupOutcome::NoData);
@@ -302,11 +322,43 @@ async fn answer_query(
         return Ok(LookupOutcome::NxDomain);
     };
 
-    let addresses =
-        resolve_service_ips(registry, tasks, template_index, network_id, &service_name).await?;
-    if addresses.is_empty() {
+    let backends =
+        resolve_service_backends(registry, tasks, template_index, network_id, &service_name)
+            .await?;
+    if backends.is_empty() {
         return Ok(LookupOutcome::NxDomain);
     }
+    if let Some((vip, mac)) = compute_service_vip(registry, network_id, &service_name, &backends)? {
+        match bpf_lb.sync_vip(network_id, vip, mac, &backends) {
+            Ok(()) => {
+                return Ok(LookupOutcome::Records(vec![Record::from_rdata(
+                    query.name().clone(),
+                    SERVICE_TTL_SECS,
+                    RData::A(vip.into()),
+                )]));
+            }
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    service = %service_name,
+                    "failed to sync bpf vip for service; falling back to dns round robin: {err:#}"
+                );
+            }
+        }
+    }
+
+    let offset = {
+        let mut picker = load_balancer.lock().await;
+        picker.next_offset(network_id, &service_name, backends.len())
+    };
+    let addresses = rotate_addresses(
+        backends
+            .iter()
+            .map(|backend| backend.ip)
+            .collect::<Vec<Ipv4Addr>>(),
+        offset,
+    );
 
     let records = addresses
         .into_iter()
@@ -347,13 +399,13 @@ fn extract_service_label(name: &Name, network_name: &str) -> Option<String> {
     labels.pop()
 }
 
-async fn resolve_service_ips(
+async fn resolve_service_backends(
     registry: &NetworkRegistry,
     tasks: &TaskStore,
     template_index: &HashMap<Uuid, (String, String)>,
     network_id: Uuid,
     service_name: &str,
-) -> Result<Vec<Ipv4Addr>> {
+) -> Result<Vec<BackendAddress>> {
     let attachments = registry
         .list_attachments(Some(network_id))
         .context("list attachments for discovery")?;
@@ -365,6 +417,9 @@ async fn resolve_service_ips(
             continue;
         }
         let Some(ip_text) = &attachment.assigned_ip else {
+            continue;
+        };
+        let Some(mac_text) = &attachment.mac else {
             continue;
         };
         let task_entry = cache
@@ -394,16 +449,33 @@ async fn resolve_service_ips(
         if !template_match {
             continue;
         }
-        match ip_text.parse::<Ipv4Addr>() {
-            Ok(addr) => results.push(addr),
-            Err(err) => warn!(
-                target: "network",
-                network = %network_id,
-                task = %task.id,
-                "invalid attachment ip {}: {err}",
-                ip_text
-            ),
-        }
+        let ip_addr = match ip_text.parse::<Ipv4Addr>() {
+            Ok(addr) => addr,
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    task = %task.id,
+                    "invalid attachment ip {}: {err}",
+                    ip_text
+                );
+                continue;
+            }
+        };
+        let mac = match parse_mac(mac_text) {
+            Ok(mac) => mac,
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    task = %task.id,
+                    "invalid attachment mac {}: {err}",
+                    mac_text
+                );
+                continue;
+            }
+        };
+        results.push(BackendAddress { ip: ip_addr, mac });
     }
 
     Ok(results)
@@ -427,4 +499,109 @@ fn build_task_template_index(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (Strin
         }
     }
     index
+}
+
+fn compute_service_vip(
+    registry: &NetworkRegistry,
+    network_id: Uuid,
+    service_name: &str,
+    backends: &[BackendAddress],
+) -> Result<Option<(Ipv4Addr, [u8; 6])>> {
+    let Some(spec) = registry.get_spec(network_id)? else {
+        return Ok(None);
+    };
+    let Ok((base_ip, prefix)) = parse_ipv4_cidr(&spec.subnet_cidr) else {
+        return Ok(None);
+    };
+
+    let host_bits = 32u8.saturating_sub(prefix);
+    if host_bits < 4 {
+        return Ok(None);
+    }
+
+    let digest = {
+        let mut hasher = Hasher::new();
+        hasher.update(network_id.as_bytes());
+        hasher.update(service_name.as_bytes());
+        hasher.finalize()
+    };
+
+    let mut slot_seed = [0u8; 4];
+    slot_seed.copy_from_slice(&digest.as_bytes()[..4]);
+
+    // Constrain VIPs to the even offsets of the overlay to avoid collisions with per-node resolver
+    // addresses, which always occupy the odd slots (offsets 1, 3, 5, ...).
+    let available_even = (1u64 << host_bits).saturating_sub(16) / 2;
+    if available_even == 0 {
+        return Ok(None);
+    }
+
+    let backend_ips: std::collections::HashSet<u32> = backends
+        .iter()
+        .map(|backend| u32::from(backend.ip))
+        .collect();
+
+    let mut slot = (u32::from_le_bytes(slot_seed) % available_even as u32) * 2 + 8;
+    for _ in 0..available_even.min(16) as usize {
+        let candidate = u32::from(base_ip).saturating_add(slot);
+        if !backend_ips.contains(&candidate) {
+            let vip = Ipv4Addr::from(candidate);
+
+            let mut mac = [0u8; 6];
+            mac[0] = 0x02;
+            mac[1..].copy_from_slice(&digest.as_bytes()[4..9]);
+
+            return Ok(Some((vip, mac)));
+        }
+
+        // Walk forward to the next even slot if we collided with an existing backend.
+        slot = slot.wrapping_add(2) % (available_even as u32 * 2);
+        if slot < 8 {
+            slot = 8;
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_mac(text: &str) -> Result<[u8; 6], String> {
+    let parts: Vec<&str> = text.split(':').collect();
+    if parts.len() != 6 {
+        return Err("wrong number of octets".to_string());
+    }
+    let mut mac = [0u8; 6];
+    for (idx, part) in parts.iter().enumerate() {
+        mac[idx] = u8::from_str_radix(part, 16).map_err(|err| err.to_string())?;
+    }
+    Ok(mac)
+}
+
+#[derive(Default)]
+struct ServiceLoadBalancer {
+    cursors: HashMap<(Uuid, String), usize>,
+}
+
+impl ServiceLoadBalancer {
+    /// Track per-service cursor offsets so DNS answers expose different primaries and downstream
+    /// clients that always pick the first A record can still fan out across replicas.
+    fn next_offset(&mut self, network_id: Uuid, service_name: &str, backend_count: usize) -> usize {
+        if backend_count == 0 {
+            return 0;
+        }
+        let key = (network_id, service_name.to_ascii_lowercase());
+        let cursor = self.cursors.entry(key).or_insert(0);
+        let offset = *cursor % backend_count;
+        *cursor = cursor.wrapping_add(1);
+        offset
+    }
+}
+
+/// Rotate the ordered list of backend addresses so the requested offset becomes the first entry.
+fn rotate_addresses(mut addresses: Vec<Ipv4Addr>, offset: usize) -> Vec<Ipv4Addr> {
+    if addresses.is_empty() {
+        return addresses;
+    }
+    let shift = offset % addresses.len();
+    addresses.rotate_left(shift);
+    addresses
 }
