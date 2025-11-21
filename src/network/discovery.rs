@@ -31,6 +31,7 @@ pub struct ServiceDiscovery {
     services: ServiceRegistry,
     servers: Arc<AsyncMutex<HashMap<Uuid, DnsServerHandle>>>,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
+    health: Arc<AsyncMutex<BackendHealth>>,
     bpf_lb: BpfLoadBalancer,
 }
 
@@ -48,6 +49,7 @@ impl ServiceDiscovery {
             services,
             servers: Arc::new(AsyncMutex::new(HashMap::new())),
             load_balancer: Arc::new(AsyncMutex::new(ServiceLoadBalancer::default())),
+            health: Arc::new(AsyncMutex::new(BackendHealth::default())),
             bpf_lb: BpfLoadBalancer::new(),
         }
     }
@@ -81,6 +83,7 @@ impl ServiceDiscovery {
             spec.name.clone(),
             resolver_ip,
             self.load_balancer.clone(),
+            self.health.clone(),
             self.bpf_lb.clone(),
         )
         .await?;
@@ -123,6 +126,7 @@ async fn spawn_dns_server(
     network_name: String,
     resolver_ip: Ipv4Addr,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
+    health: Arc<AsyncMutex<BackendHealth>>,
     bpf_lb: BpfLoadBalancer,
 ) -> Result<DnsServerHandle> {
     let bind_addr = SocketAddr::new(IpAddr::V4(resolver_ip), 53);
@@ -161,6 +165,7 @@ async fn spawn_dns_server(
                                 network_id,
                                 &network_name,
                                 &load_balancer,
+                                &health,
                                 &lb_manager,
                             ).await {
                                 warn!(
@@ -205,6 +210,7 @@ async fn handle_datagram(
     network_id: Uuid,
     network_name: &str,
     load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
+    health: &Arc<AsyncMutex<BackendHealth>>,
     bpf_lb: &BpfLoadBalancer,
 ) -> Result<()> {
     let request = match Message::from_vec(payload) {
@@ -258,6 +264,7 @@ async fn handle_datagram(
             network_id,
             network_name,
             load_balancer,
+            health,
             bpf_lb,
         )
         .await?
@@ -309,6 +316,7 @@ async fn answer_query(
     network_id: Uuid,
     network_name: &str,
     load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
+    health: &Arc<AsyncMutex<BackendHealth>>,
     bpf_lb: &BpfLoadBalancer,
 ) -> Result<LookupOutcome> {
     if query.query_type() == RecordType::AAAA {
@@ -325,6 +333,10 @@ async fn answer_query(
     let backends =
         resolve_service_backends(registry, tasks, template_index, network_id, &service_name)
             .await?;
+    let backends = {
+        let guard = health.lock().await;
+        guard.filter_healthy(network_id, &service_name, backends)
+    };
     if backends.is_empty() {
         return Ok(LookupOutcome::NxDomain);
     }
@@ -604,4 +616,56 @@ fn rotate_addresses(mut addresses: Vec<Ipv4Addr>, offset: usize) -> Vec<Ipv4Addr
     let shift = offset % addresses.len();
     addresses.rotate_left(shift);
     addresses
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum HealthState {
+    Unknown,
+    Healthy,
+    Unhealthy,
+}
+
+#[derive(Default)]
+struct BackendHealth {
+    statuses: HashMap<(Uuid, String), HashMap<Ipv4Addr, HealthState>>,
+}
+
+impl BackendHealth {
+    /// Select only backends currently marked healthy (or unknown) to prepare for active probing.
+    fn filter_healthy(
+        &self,
+        network_id: Uuid,
+        service_name: &str,
+        backends: Vec<BackendAddress>,
+    ) -> Vec<BackendAddress> {
+        let key = (network_id, service_name.to_ascii_lowercase());
+        let Some(service_status) = self.statuses.get(&key) else {
+            return backends;
+        };
+
+        backends
+            .into_iter()
+            .filter(|backend| {
+                service_status
+                    .get(&backend.ip)
+                    .copied()
+                    .unwrap_or(HealthState::Unknown)
+                    != HealthState::Unhealthy
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    fn set_health(
+        &mut self,
+        network_id: Uuid,
+        service_name: &str,
+        backend: Ipv4Addr,
+        state: HealthState,
+    ) {
+        let key = (network_id, service_name.to_ascii_lowercase());
+        let entry = self.statuses.entry(key).or_default();
+        entry.insert(backend, state);
+    }
 }

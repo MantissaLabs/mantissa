@@ -957,6 +957,13 @@ mod platform {
 
     impl NetworkProvisioner {
         pub fn new() -> Result<Self> {
+            if unsafe { libc::geteuid() } != 0 {
+                debug!(
+                    target: "network",
+                    "running unprivileged; using stub network provisioner"
+                );
+                return Ok(Self::unavailable());
+            }
             Self::ensure_vxlan_module().context("load vxlan kernel module")?;
 
             match new_connection() {
@@ -1862,11 +1869,41 @@ mod platform {
         fn ensure_vxlan_module() -> Result<()> {
             match Command::new("modprobe").arg("vxlan").status() {
                 Ok(status) if status.success() => Ok(()),
-                Ok(status) => Err(anyhow!("modprobe vxlan exited with status {status}")),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
-                    "modprobe binary not found; ensure the vxlan module is available"
-                )),
-                Err(err) => Err(err.into()),
+                Ok(status) => {
+                    if unsafe { libc::geteuid() } != 0 {
+                        warn!(
+                            target: "network",
+                            "modprobe vxlan failed with status {status}; ignoring because process is not root"
+                        );
+                        Ok(())
+                    } else {
+                        Err(anyhow!("modprobe vxlan exited with status {status}"))
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if unsafe { libc::geteuid() } != 0 {
+                        warn!(
+                            target: "network",
+                            "modprobe not available; skipping vxlan load because process is not root"
+                        );
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "modprobe binary not found; ensure the vxlan module is available"
+                        ))
+                    }
+                }
+                Err(err) => {
+                    if unsafe { libc::geteuid() } != 0 {
+                        warn!(
+                            target: "network",
+                            "modprobe vxlan failed ({err}); ignoring because process is not root"
+                        );
+                        Ok(())
+                    } else {
+                        Err(err.into())
+                    }
+                }
             }
         }
     }

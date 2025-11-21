@@ -1129,7 +1129,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
     assert_eq!(initial.len(), 2);
 
     manager
-        .ensure_runtime_attachments(task_spec.id, &container_id, &[spec_a.id])
+        .ensure_runtime_attachments(task_spec.id, &container_id, &[spec_a.id], None)
         .await
         .expect("reconcile attachments");
 

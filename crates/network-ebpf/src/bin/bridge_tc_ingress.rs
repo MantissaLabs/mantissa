@@ -4,7 +4,6 @@
 
 use aya_ebpf::{
     bindings::{TC_ACT_OK, TC_ACT_SHOT},
-    helpers::bpf_get_prandom_u32,
     macros::{classifier, map},
     maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
@@ -197,13 +196,9 @@ fn select_backend(flow: &Flow4, vip: u32) -> Option<NatEntry> {
         return None;
     }
 
-    let hash = hash_flow(flow);
-    let mut idx = (hash as usize) & (MAX_BACKENDS - 1);
-    if idx >= count {
-        idx %= count;
-    }
-
     let vip_slot = (vip_key.vip as usize) & (MAX_VIPS - 1);
+    let flow_hash = hash_flow(flow, vip_slot as u32);
+    let idx = choose_backend_idx(flow_hash, count);
     let backend_index = (vip_slot * MAX_BACKENDS + idx) as u32;
     let backend = unsafe { LB_BACKENDS.get(backend_index)?.clone() };
 
@@ -215,11 +210,44 @@ fn select_backend(flow: &Flow4, vip: u32) -> Option<NatEntry> {
     })
 }
 
-fn hash_flow(flow: &Flow4) -> u32 {
-    let mut acc = flow.src ^ flow.dst ^ ((flow.proto as u32) << 16);
-    acc ^= (flow.src_port as u32) << 16 | (flow.dst_port as u32);
-    acc ^= unsafe { bpf_get_prandom_u32() };
-    acc
+fn hash_flow(flow: &Flow4, vip_slot: u32) -> u64 {
+    let mut acc = (flow.src as u64) ^ ((flow.dst as u64) << 7);
+    acc ^= ((flow.src_port as u64) << 32) ^ ((flow.dst_port as u64) << 19);
+    acc ^= (flow.proto as u64) << 48;
+    acc ^= (vip_slot as u64) << 5;
+    mix64(acc)
+}
+
+/// Apply a lightweight 64-bit mix to spread hash values for rendezvous hashing.
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+    x ^= x >> 33;
+    x
+}
+
+/// Pick the best-scoring backend index using rendezvous hashing to keep selections stable.
+fn choose_backend_idx(flow_hash: u64, backend_count: usize) -> usize {
+    let mut best_score: u64 = 0;
+    let mut best_idx: usize = 0;
+
+    // Rendezvous hashing across the bounded backend set to keep stickiness stable.
+    let mut idx: usize = 0;
+    while idx < MAX_BACKENDS {
+        if idx >= backend_count {
+            break;
+        }
+        let score = mix64(flow_hash ^ (idx as u64));
+        if score > best_score {
+            best_score = score;
+            best_idx = idx;
+        }
+        idx += 1;
+    }
+
+    best_idx
 }
 
 fn parse_ports(
