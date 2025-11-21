@@ -63,6 +63,8 @@ mod platform {
         ) -> Result<()> {
             let base = map_pin_dir(_network_id)?;
             let vip_map = MapData::from_pin(base.join("LB_VIPS")).context("open LB_VIPS map")?;
+            let backend_map =
+                MapData::from_pin(base.join("LB_BACKENDS")).context("open LB_BACKENDS map")?;
 
             let entry = build_vip_entry(vip_mac, backends);
             let key = VipKey {
@@ -72,13 +74,22 @@ mod platform {
             update_elem(vip_map.fd().as_fd().as_raw_fd(), &key, &entry)
                 .context("update VIP metadata")?;
 
+            program_backends(
+                backend_map.fd().as_fd().as_raw_fd(),
+                key.vip,
+                backends,
+                MAX_BACKENDS,
+            )
+            .context("program backends")?;
+
             clear_hash_map(base.join("LB_FWD")).context("clear LB_FWD map")?;
             clear_hash_map(base.join("LB_REV")).context("clear LB_REV map")?;
             Ok(())
         }
     }
 
-    const MAX_BACKENDS: usize = 8;
+    const MAX_BACKENDS: usize = 64;
+    const MAX_VIPS: usize = 64;
     const BPF_MAP_UPDATE_ELEM: libc::c_uint = 2;
     const BPF_MAP_DELETE_ELEM: libc::c_uint = 3;
     const BPF_MAP_GET_NEXT_KEY: libc::c_uint = 4;
@@ -105,7 +116,6 @@ mod platform {
         vip_mac: [u8; 6],
         backend_count: u8,
         _pad: [u8; 3],
-        backends: [Backend; MAX_BACKENDS],
     }
     unsafe impl Pod for VipEntry {}
 
@@ -115,7 +125,6 @@ mod platform {
                 vip_mac: [0; 6],
                 backend_count: 0,
                 _pad: [0; 3],
-                backends: [Backend::default(); MAX_BACKENDS],
             }
         }
     }
@@ -128,11 +137,11 @@ mod platform {
         src_port: u16,
         dst_port: u16,
         proto: u8,
-        _pad: u8,
+        pad: u8,
     }
     unsafe impl Pod for Flow4 {}
 
-    #[repr(C)]
+    #[repr(C, packed)]
     #[derive(Clone, Copy, Default)]
     #[allow(dead_code)]
     struct NatEntry {
@@ -146,16 +155,38 @@ mod platform {
     fn build_vip_entry(vip_mac: [u8; 6], backends: &[BackendAddress]) -> VipEntry {
         let mut entry = VipEntry::default();
         entry.vip_mac = vip_mac;
-        let limit = backends.len().min(MAX_BACKENDS);
-        entry.backend_count = limit as u8;
-        for (idx, backend) in backends.iter().take(limit).enumerate() {
-            entry.backends[idx] = Backend {
+        entry.backend_count = backends.len().min(MAX_BACKENDS) as u8;
+        entry
+    }
+
+    fn program_backends(
+        fd: std::os::fd::RawFd,
+        vip: u32,
+        backends: &[BackendAddress],
+        max: usize,
+    ) -> Result<()> {
+        let vip_slot = (vip as usize) & (MAX_VIPS - 1);
+        let base = vip_slot * MAX_BACKENDS;
+
+        for (idx, backend) in backends.iter().take(max).enumerate() {
+            let key = (base + idx) as u32;
+            let value = Backend {
                 ip: u32::from_be_bytes(backend.ip.octets()),
                 mac: backend.mac,
                 _pad: 0,
             };
+            update_elem(fd, &key, &value)
+                .with_context(|| format!("update backend slot {} for vip {:08x}", idx, vip))?;
         }
-        entry
+
+        // Clear any stale entries beyond the new backend_count for this VIP.
+        for idx in backends.len().min(max)..max {
+            let key = (base + idx) as u32;
+            let value = Backend::default();
+            let _ = update_elem(fd, &key, &value);
+        }
+
+        Ok(())
     }
 
     fn map_pin_dir(network_id: Uuid) -> Result<std::path::PathBuf> {

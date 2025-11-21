@@ -166,7 +166,9 @@ pub mod net {
 
 pub mod lb {
     /// Maximum number of backend targets tracked per VIP entry.
-    pub const MAX_BACKENDS: usize = 8;
+    pub const MAX_BACKENDS: usize = 64;
+    /// Maximum number of VIPs tracked in LB maps.
+    pub const MAX_VIPS: usize = 64;
 
     /// Key for VIP-backed routing decisions stored in eBPF maps.
     #[repr(C)]
@@ -184,14 +186,13 @@ pub mod lb {
         pub _pad: u16,
     }
 
-    /// Backend set and VIP metadata used when selecting a target.
+    /// VIP metadata used when selecting a target; actual backends are stored separately.
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct VipEntry {
         pub vip_mac: [u8; 6],
         pub backend_count: u8,
         pub _pad: [u8; 3],
-        pub backends: [Backend; MAX_BACKENDS],
     }
 
     /// Normalized 5-tuple used to maintain DNAT/SNAT state.
@@ -203,11 +204,11 @@ pub mod lb {
         pub src_port: u16,
         pub dst_port: u16,
         pub proto: u8,
-        pub _pad: u8,
+        pub pad: u8,
     }
 
     /// Cached per-flow translation data shared between ingress/egress hooks.
-    #[repr(C)]
+    #[repr(C, packed)]
     #[derive(Clone, Copy)]
     pub struct NatEntry {
         pub vip: u32,

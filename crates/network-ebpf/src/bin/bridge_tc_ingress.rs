@@ -2,17 +2,15 @@
 #![allow(static_mut_refs)]
 #![cfg_attr(not(test), no_main)]
 
-use core::ptr;
-
 use aya_ebpf::{
     bindings::{TC_ACT_OK, TC_ACT_SHOT},
     helpers::bpf_get_prandom_u32,
     macros::{classifier, map},
-    maps::{HashMap, LruHashMap, PerCpuArray},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use network_ebpf::{
-    lb::{Backend, Flow4, NatEntry, VipEntry, VipKey, MAX_BACKENDS},
+    lb::{Backend, Flow4, NatEntry, VipEntry, VipKey, MAX_BACKENDS, MAX_VIPS},
     net::{self, EthernetHeader, Ipv4Header, UdpHeader},
     stats::{self, PacketStats},
 };
@@ -31,9 +29,6 @@ struct ArpHeader {
     tpa: u32,
 }
 
-const BACKEND_SIZE: usize = core::mem::size_of::<Backend>();
-const BACKEND_BASE_OFFSET: usize = core::mem::size_of::<VipEntry>() - (MAX_BACKENDS * BACKEND_SIZE);
-
 const MAX_FRAME_LEN: usize = 1600;
 const ETH_P_IPV4: u16 = 0x0800;
 const ETH_P_ARP: u16 = 0x0806;
@@ -49,6 +44,10 @@ static mut BRIDGE_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with
 #[map(name = "LB_VIPS", pinning = "Shared")]
 static mut LB_VIPS: HashMap<VipKey, VipEntry> = HashMap::with_max_entries(64, 0);
 
+#[map(name = "LB_BACKENDS", pinning = "Shared")]
+static mut LB_BACKENDS: Array<Backend> =
+    Array::with_max_entries((MAX_BACKENDS * MAX_VIPS) as u32, 0);
+
 #[map(name = "LB_FWD", pinning = "Shared")]
 static mut LB_FWD: LruHashMap<Flow4, NatEntry> = LruHashMap::with_max_entries(1024, 0);
 
@@ -59,21 +58,21 @@ static mut LB_REV: LruHashMap<Flow4, NatEntry> = LruHashMap::with_max_entries(10
 pub fn bridge_tc_ingress(ctx: TcContext) -> i32 {
     let len = ctx.len() as usize;
     if len > MAX_FRAME_LEN {
-        unsafe { stats::record_drop(ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len) };
+        unsafe { stats::record_drop(core::ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len) };
         return TC_ACT_SHOT;
     }
 
     match handle_packet(&ctx) {
         Ok(TC_ACT_OK) => unsafe {
-            stats::record_pass(ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len);
+            stats::record_pass(core::ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len);
             TC_ACT_OK
         },
         Ok(action) => unsafe {
-            stats::record_pass(ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len);
+            stats::record_pass(core::ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len);
             action
         },
         Err(_) => unsafe {
-            stats::record_drop(ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len);
+            stats::record_drop(core::ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len);
             TC_ACT_SHOT
         },
     }
@@ -119,12 +118,13 @@ fn handle_packet(ctx: &TcContext) -> Result<i32, ()> {
         src_port,
         dst_port,
         proto,
-        _pad: 0,
+        pad: 0,
     };
 
-    let chosen = unsafe { LB_FWD.get(&client_flow) }
-        .cloned()
-        .or_else(|| select_backend(&client_flow, ip_hdr.dst));
+    let mut chosen = unsafe { LB_FWD.get(&client_flow).copied() };
+    if chosen.is_none() {
+        chosen = select_backend(&client_flow, ip_hdr.dst);
+    }
 
     let Some(choice) = chosen else {
         return Ok(TC_ACT_OK);
@@ -140,7 +140,7 @@ fn handle_packet(ctx: &TcContext) -> Result<i32, ()> {
         src_port: dst_port,
         dst_port: src_port,
         proto,
-        _pad: 0,
+        pad: 0,
     };
 
     unsafe {
@@ -191,7 +191,7 @@ fn handle_arp(data: usize, data_end: usize, eth: &mut EthernetHeader) -> Result<
 /// with bounded pointer arithmetic over the pre-sized backend array.
 fn select_backend(flow: &Flow4, vip: u32) -> Option<NatEntry> {
     let vip_key = VipKey { vip };
-    let config = unsafe { LB_VIPS.get(&vip_key)? };
+    let config = unsafe { LB_VIPS.get(&vip_key)?.clone() };
     let count = config.backend_count as usize;
     if count == 0 || count > MAX_BACKENDS {
         return None;
@@ -203,42 +203,16 @@ fn select_backend(flow: &Flow4, vip: u32) -> Option<NatEntry> {
         idx %= count;
     }
 
-    let (backend_ip, backend_mac) = unsafe { load_backend(config, idx)? };
+    let vip_slot = (vip_key.vip as usize) & (MAX_VIPS - 1);
+    let backend_index = (vip_slot * MAX_BACKENDS + idx) as u32;
+    let backend = unsafe { LB_BACKENDS.get(backend_index)?.clone() };
 
     Some(NatEntry {
         vip,
         vip_mac: config.vip_mac,
-        backend_ip,
-        backend_mac,
+        backend_ip: backend.ip,
+        backend_mac: backend.mac,
     })
-}
-
-/// Read backend coordinates directly from the map value without copying the full entry to the
-/// stack, keeping verifier stack pressure low.
-unsafe fn load_backend(entry: &VipEntry, idx: usize) -> Option<(u32, [u8; 6])> {
-    let base = (entry as *const VipEntry).cast::<u8>();
-    let offset = match idx {
-        0 => BACKEND_BASE_OFFSET,
-        1 => BACKEND_BASE_OFFSET + (1 * BACKEND_SIZE),
-        2 => BACKEND_BASE_OFFSET + (2 * BACKEND_SIZE),
-        3 => BACKEND_BASE_OFFSET + (3 * BACKEND_SIZE),
-        4 => BACKEND_BASE_OFFSET + (4 * BACKEND_SIZE),
-        5 => BACKEND_BASE_OFFSET + (5 * BACKEND_SIZE),
-        6 => BACKEND_BASE_OFFSET + (6 * BACKEND_SIZE),
-        7 => BACKEND_BASE_OFFSET + (7 * BACKEND_SIZE),
-        _ => return None,
-    };
-
-    // Layout: ip (4 bytes) + mac (6 bytes) + pad (2 bytes); read only the useful fields.
-    let ip = core::ptr::read_unaligned(base.add(offset).cast::<u32>());
-    let mut mac = [0u8; 6];
-    mac[0] = core::ptr::read_unaligned(base.add(offset + 4).cast::<u8>());
-    mac[1] = core::ptr::read_unaligned(base.add(offset + 5).cast::<u8>());
-    mac[2] = core::ptr::read_unaligned(base.add(offset + 6).cast::<u8>());
-    mac[3] = core::ptr::read_unaligned(base.add(offset + 7).cast::<u8>());
-    mac[4] = core::ptr::read_unaligned(base.add(offset + 8).cast::<u8>());
-    mac[5] = core::ptr::read_unaligned(base.add(offset + 9).cast::<u8>());
-    Some((ip, mac))
 }
 
 fn hash_flow(flow: &Flow4) -> u32 {

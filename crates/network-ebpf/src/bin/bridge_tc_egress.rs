@@ -81,7 +81,7 @@ fn handle_packet(ctx: &TcContext) -> Result<i32, ()> {
         src_port,
         dst_port,
         proto,
-        _pad: 0,
+        pad: 0,
     };
 
     let Some(entry) = (unsafe { LB_REV.get(&reverse_key) }) else {
