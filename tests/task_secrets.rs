@@ -458,11 +458,11 @@ local_test!(task_manager_rejects_missing_secret_reference, {
         env: vec![TaskEnvironmentVariable {
             name: "API_KEY".into(),
             value: None,
-        secret: Some(TaskSecretReference {
+            secret: Some(TaskSecretReference {
                 name: "api-key".into(),
                 version_id: None,
-        }),
-    }],
+            }),
+        }],
         secret_files: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,

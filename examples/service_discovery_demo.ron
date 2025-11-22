@@ -18,6 +18,10 @@
             networks: ["discovery-demo"],
             env: [],
             secret_files: [],
+            health_port: Some(8000),
+            health_command: Some([
+                "/",
+            ]),
         ),
         (
             name: "frontend",

@@ -99,6 +99,8 @@ local_test!(services_gossip_propagates_across_peers, {
                     mode: Some(0o440),
                 }],
                 networks: Vec::new(),
+                health_port: None,
+                health_command: None,
             }],
         )
         .await
@@ -191,6 +193,8 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
             mode: Some(0o440),
         }],
         networks: Vec::new(),
+        health_port: None,
+        health_command: None,
     }];
 
     let service_id = node
@@ -273,6 +277,8 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                     mode: Some(0o440),
                 }],
                 networks: Vec::new(),
+                health_port: None,
+                health_command: None,
             }],
         )
         .await
@@ -538,6 +544,8 @@ local_test!(services_redeploy_scales_replicas, {
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: Vec::new(),
+        health_port: None,
+        health_command: None,
     }];
 
     let service_id = node
@@ -643,6 +651,8 @@ local_test!(services_redeploy_updates_resources, {
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: Vec::new(),
+        health_port: None,
+        health_command: None,
     }];
 
     let service_id = node
@@ -881,6 +891,8 @@ fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskS
                     })
                     .collect(),
                 networks,
+                health_port: None,
+                health_command: None,
             }
         })
         .collect()

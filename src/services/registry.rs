@@ -109,6 +109,8 @@ mod tests {
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
+                health_port: None,
+                health_command: None,
             }],
             vec![Uuid::new_v4()],
         );
@@ -141,6 +143,8 @@ mod tests {
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
+                health_port: None,
+                health_command: None,
             }],
             vec![Uuid::new_v4(), Uuid::new_v4()],
         );

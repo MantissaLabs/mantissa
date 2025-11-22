@@ -72,6 +72,10 @@ pub struct ServiceTaskSpecValue {
     pub secret_files: Vec<TaskSecretFile>,
     #[serde(default)]
     pub networks: Vec<ServiceTaskNetworkRequirement>,
+    #[serde(default)]
+    pub health_port: Option<u16>,
+    #[serde(default)]
+    pub health_command: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -95,6 +99,14 @@ impl ServiceTaskSpecValue {
             .iter()
             .map(|network| network.network_id)
             .collect()
+    }
+
+    pub fn health_port(&self) -> Option<u16> {
+        self.health_port
+    }
+
+    pub fn health_command(&self) -> Option<&[String]> {
+        self.health_command.as_deref()
     }
 }
 

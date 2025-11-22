@@ -200,22 +200,22 @@ mod platform {
             }
         }
 
-    pub async fn ensure_programs(
-        &self,
-        programs: &[BpfProgramSpec],
-        interfaces: &NetworkInterfaceContext,
-    ) -> Result<()> {
-        if std::env::var_os("MANTISSA_BPF_NO_ATTACH").is_some() {
-            tracing::debug!(
-                target: "network",
-                network = %interfaces.network_id(),
-                "skipping bpf ensure_programs because MANTISSA_BPF_NO_ATTACH is set"
-            );
-            return Ok(());
-        }
-        if programs.is_empty() {
-            return Ok(());
-        }
+        pub async fn ensure_programs(
+            &self,
+            programs: &[BpfProgramSpec],
+            interfaces: &NetworkInterfaceContext,
+        ) -> Result<()> {
+            if std::env::var_os("MANTISSA_BPF_NO_ATTACH").is_some() {
+                tracing::debug!(
+                    target: "network",
+                    network = %interfaces.network_id(),
+                    "skipping bpf ensure_programs because MANTISSA_BPF_NO_ATTACH is set"
+                );
+                return Ok(());
+            }
+            if programs.is_empty() {
+                return Ok(());
+            }
 
             self.validate_programs(programs, interfaces)?;
 

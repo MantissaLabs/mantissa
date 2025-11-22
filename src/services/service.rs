@@ -325,6 +325,26 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
     }
     networks.sort_by(|a, b| a.network_id.cmp(&b.network_id));
 
+    let raw_health = reader.get_health_port();
+    let health_port = if raw_health == 0 {
+        None
+    } else {
+        Some(raw_health)
+    };
+
+    let mut health_cmds = Vec::new();
+    for arg in reader.get_health_command()?.iter() {
+        let text = arg?.to_str()?.to_string();
+        if !text.is_empty() {
+            health_cmds.push(text);
+        }
+    }
+    let health_command = if health_cmds.is_empty() {
+        None
+    } else {
+        Some(health_cmds)
+    };
+
     Ok(ServiceTaskSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
         image: reader.get_image()?.to_str()?.to_string(),
@@ -336,6 +356,8 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         env,
         secret_files,
         networks,
+        health_port,
+        health_command,
     })
 }
 
@@ -402,6 +424,19 @@ fn write_task_template(
         .reborrow()
         .init_secret_files(task.secret_files.len() as u32);
     encode_secret_files(&mut files_builder, &task.secret_files);
+
+    builder.set_health_port(task.health_port.unwrap_or(0));
+    let mut health_builder = builder.reborrow().init_health_command(
+        task.health_command
+            .as_ref()
+            .map(|cmd| cmd.len() as u32)
+            .unwrap_or(0),
+    );
+    if let Some(cmd) = &task.health_command {
+        for (idx, arg) in cmd.iter().enumerate() {
+            health_builder.set(idx as u32, arg);
+        }
+    }
 
     Ok(())
 }

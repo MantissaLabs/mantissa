@@ -15,6 +15,8 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
@@ -32,6 +34,8 @@ pub struct ServiceDiscovery {
     servers: Arc<AsyncMutex<HashMap<Uuid, DnsServerHandle>>>,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
+    health_port: Option<u16>,
+    health_timeout: Duration,
     bpf_lb: BpfLoadBalancer,
 }
 
@@ -43,6 +47,9 @@ struct DnsServerHandle {
 
 impl ServiceDiscovery {
     pub fn new(registry: NetworkRegistry, tasks: TaskStore, services: ServiceRegistry) -> Self {
+        let health_port = std::env::var("MANTISSA_LB_HEALTH_PORT")
+            .ok()
+            .and_then(|text| text.parse::<u16>().ok());
         Self {
             registry,
             tasks,
@@ -50,6 +57,8 @@ impl ServiceDiscovery {
             servers: Arc::new(AsyncMutex::new(HashMap::new())),
             load_balancer: Arc::new(AsyncMutex::new(ServiceLoadBalancer::default())),
             health: Arc::new(AsyncMutex::new(BackendHealth::default())),
+            health_port,
+            health_timeout: Duration::from_millis(300),
             bpf_lb: BpfLoadBalancer::new(),
         }
     }
@@ -84,6 +93,8 @@ impl ServiceDiscovery {
             resolver_ip,
             self.load_balancer.clone(),
             self.health.clone(),
+            self.health_port,
+            self.health_timeout,
             self.bpf_lb.clone(),
         )
         .await?;
@@ -127,6 +138,8 @@ async fn spawn_dns_server(
     resolver_ip: Ipv4Addr,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
+    health_port: Option<u16>,
+    health_timeout: Duration,
     bpf_lb: BpfLoadBalancer,
 ) -> Result<DnsServerHandle> {
     let bind_addr = SocketAddr::new(IpAddr::V4(resolver_ip), 53);
@@ -166,6 +179,8 @@ async fn spawn_dns_server(
                                 &network_name,
                                 &load_balancer,
                                 &health,
+                                health_port,
+                                health_timeout,
                                 &lb_manager,
                             ).await {
                                 warn!(
@@ -211,6 +226,8 @@ async fn handle_datagram(
     network_name: &str,
     load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: &Arc<AsyncMutex<BackendHealth>>,
+    health_port: Option<u16>,
+    health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
 ) -> Result<()> {
     let request = match Message::from_vec(payload) {
@@ -260,11 +277,14 @@ async fn handle_datagram(
             query,
             registry,
             tasks,
+            &service_specs,
             &template_index,
             network_id,
             network_name,
             load_balancer,
             health,
+            health_port,
+            health_timeout,
             bpf_lb,
         )
         .await?
@@ -312,11 +332,14 @@ async fn answer_query(
     query: &Query,
     registry: &NetworkRegistry,
     tasks: &TaskStore,
+    service_specs: &[ServiceSpecValue],
     template_index: &HashMap<Uuid, (String, String)>,
     network_id: Uuid,
     network_name: &str,
     load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: &Arc<AsyncMutex<BackendHealth>>,
+    health_port: Option<u16>,
+    health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
 ) -> Result<LookupOutcome> {
     if query.query_type() == RecordType::AAAA {
@@ -333,10 +356,20 @@ async fn answer_query(
     let backends =
         resolve_service_backends(registry, tasks, template_index, network_id, &service_name)
             .await?;
-    let backends = {
-        let guard = health.lock().await;
-        guard.filter_healthy(network_id, &service_name, backends)
-    };
+    let service_port = health_port
+        .or_else(|| service_health_port(service_specs, &service_name))
+        .and_then(|port| if port == 0 { None } else { Some(port) });
+    let http_path = service_health_path(service_specs, &service_name);
+    let backends = evaluate_backend_health(
+        health,
+        network_id,
+        &service_name,
+        backends,
+        service_port,
+        http_path,
+        health_timeout,
+    )
+    .await;
     if backends.is_empty() {
         return Ok(LookupOutcome::NxDomain);
     }
@@ -632,31 +665,15 @@ struct BackendHealth {
 }
 
 impl BackendHealth {
-    /// Select only backends currently marked healthy (or unknown) to prepare for active probing.
-    fn filter_healthy(
-        &self,
-        network_id: Uuid,
-        service_name: &str,
-        backends: Vec<BackendAddress>,
-    ) -> Vec<BackendAddress> {
+    fn get_state(&self, network_id: Uuid, service_name: &str, backend: Ipv4Addr) -> HealthState {
         let key = (network_id, service_name.to_ascii_lowercase());
-        let Some(service_status) = self.statuses.get(&key) else {
-            return backends;
-        };
-
-        backends
-            .into_iter()
-            .filter(|backend| {
-                service_status
-                    .get(&backend.ip)
-                    .copied()
-                    .unwrap_or(HealthState::Unknown)
-                    != HealthState::Unhealthy
-            })
-            .collect()
+        self.statuses
+            .get(&key)
+            .and_then(|svc| svc.get(&backend).copied())
+            .unwrap_or(HealthState::Unknown)
     }
 
-    #[allow(dead_code)]
+    /// Select only backends currently marked healthy (or unknown) to prepare for active probing.
     fn set_health(
         &mut self,
         network_id: Uuid,
@@ -667,5 +684,136 @@ impl BackendHealth {
         let key = (network_id, service_name.to_ascii_lowercase());
         let entry = self.statuses.entry(key).or_default();
         entry.insert(backend, state);
+    }
+}
+
+async fn evaluate_backend_health(
+    health: &Arc<AsyncMutex<BackendHealth>>,
+    network_id: Uuid,
+    service_name: &str,
+    backends: Vec<BackendAddress>,
+    port: Option<u16>,
+    http_path: Option<String>,
+    timeout: Duration,
+) -> Vec<BackendAddress> {
+    // Health probing is opt-in. When no port is provided we keep current behavior and return all backends.
+    let Some(port) = port else { return backends };
+
+    let mut healthy = Vec::with_capacity(backends.len());
+    let mut guard = health.lock().await;
+    for backend in backends {
+        let current_state = guard.get_state(network_id, service_name, backend.ip);
+
+        let last_seen_ok = matches!(current_state, HealthState::Healthy);
+
+        let mut newly_healthy = false;
+        if !last_seen_ok {
+            if probe_backend(&backend.ip, port, http_path.as_deref(), timeout).await {
+                guard.set_health(network_id, service_name, backend.ip, HealthState::Healthy);
+                newly_healthy = true;
+            } else {
+                guard.set_health(network_id, service_name, backend.ip, HealthState::Unhealthy);
+            }
+        }
+
+        if newly_healthy || last_seen_ok {
+            healthy.push(backend);
+        }
+    }
+
+    healthy
+}
+
+async fn probe_backend(
+    ip: &Ipv4Addr,
+    port: u16,
+    http_path: Option<&str>,
+    timeout: Duration,
+) -> bool {
+    if let Some(path) = http_path {
+        if probe_backend_http(ip, port, path, timeout).await {
+            return true;
+        }
+    }
+    probe_backend_tcp(ip, port, timeout).await
+}
+
+fn service_health_port(service_specs: &[ServiceSpecValue], service_name: &str) -> Option<u16> {
+    for spec in service_specs {
+        for task in &spec.tasks {
+            if task.name.eq_ignore_ascii_case(service_name) {
+                if let Some(port) = task.health_port {
+                    return Some(port);
+                }
+                for env in &task.env {
+                    if env.name.eq_ignore_ascii_case("MANTISSA_HEALTH_PORT") {
+                        if let Some(val) = env.value.as_deref() {
+                            if let Ok(port) = val.parse::<u16>() {
+                                return Some(port);
+                            }
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+fn service_health_path(service_specs: &[ServiceSpecValue], service_name: &str) -> Option<String> {
+    for spec in service_specs {
+        for task in &spec.tasks {
+            if task.name.eq_ignore_ascii_case(service_name) {
+                if let Some(cmd) = &task.health_command {
+                    if let Some(first) = cmd.first() {
+                        return Some(first.clone());
+                    }
+                }
+                for env in &task.env {
+                    if env.name.eq_ignore_ascii_case("MANTISSA_HEALTH_PATH") {
+                        if let Some(val) = env.value.clone() {
+                            return Some(val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn probe_backend_tcp(ip: &Ipv4Addr, port: u16, timeout: Duration) -> bool {
+    let addr = SocketAddr::new(IpAddr::V4(*ip), port);
+    tokio::time::timeout(timeout, TcpStream::connect(addr))
+        .await
+        .is_ok()
+}
+
+async fn probe_backend_http(ip: &Ipv4Addr, port: u16, path: &str, timeout: Duration) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let addr = SocketAddr::new(IpAddr::V4(*ip), port);
+    let path = if path.is_empty() { "/" } else { path };
+    let mut stream = match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => s,
+        _ => return false,
+    };
+
+    let request = format!("GET {path} HTTP/1.0\r\nHost: {ip}\r\n\r\n");
+    if tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut buf = [0u8; 128];
+    match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => {
+            let prefix = &buf[..n];
+            prefix.starts_with(b"HTTP/1.1 2") || prefix.starts_with(b"HTTP/1.0 2")
+        }
+        _ => false,
     }
 }

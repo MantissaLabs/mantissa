@@ -13,6 +13,8 @@ struct TaskTemplate {
   env @7 :List(TaskSchema.EnvironmentVar); # Environment variables (literal or secret-backed)
   secretFiles @8 :List(TaskSchema.SecretFile); # Secret-backed file projections
   networks @9 :List(Text); # Required overlay network names
+  healthPort @10 :UInt16;   # Optional health probe port (0 disables probing)
+  healthCommand @11 :List(Text); # Optional health command (first element may be HTTP path); empty disables
 }
 
 enum RestartPolicyName {
