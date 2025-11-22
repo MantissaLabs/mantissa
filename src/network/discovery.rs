@@ -15,7 +15,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
@@ -661,16 +661,20 @@ enum HealthState {
 
 #[derive(Default)]
 struct BackendHealth {
-    statuses: HashMap<(Uuid, String), HashMap<Ipv4Addr, HealthState>>,
+    statuses: HashMap<(Uuid, String), HashMap<Ipv4Addr, HealthEntry>>,
 }
 
 impl BackendHealth {
-    fn get_state(&self, network_id: Uuid, service_name: &str, backend: Ipv4Addr) -> HealthState {
+    fn get_entry(
+        &self,
+        network_id: Uuid,
+        service_name: &str,
+        backend: Ipv4Addr,
+    ) -> Option<HealthEntry> {
         let key = (network_id, service_name.to_ascii_lowercase());
         self.statuses
             .get(&key)
             .and_then(|svc| svc.get(&backend).copied())
-            .unwrap_or(HealthState::Unknown)
     }
 
     /// Select only backends currently marked healthy (or unknown) to prepare for active probing.
@@ -683,8 +687,20 @@ impl BackendHealth {
     ) {
         let key = (network_id, service_name.to_ascii_lowercase());
         let entry = self.statuses.entry(key).or_default();
-        entry.insert(backend, state);
+        entry.insert(
+            backend,
+            HealthEntry {
+                state,
+                checked_at: Instant::now(),
+            },
+        );
     }
+}
+
+#[derive(Clone, Copy)]
+struct HealthEntry {
+    state: HealthState,
+    checked_at: Instant,
 }
 
 async fn evaluate_backend_health(
@@ -702,21 +718,27 @@ async fn evaluate_backend_health(
     let mut healthy = Vec::with_capacity(backends.len());
     let mut guard = health.lock().await;
     for backend in backends {
-        let current_state = guard.get_state(network_id, service_name, backend.ip);
+        let entry = guard.get_entry(network_id, service_name, backend.ip);
+        let now = Instant::now();
+        let state = entry.map(|e| e.state).unwrap_or(HealthState::Unknown);
+        let checked_at = entry
+            .map(|e| e.checked_at)
+            .unwrap_or(Instant::now() - timeout);
+        let recheck_after = timeout.max(Duration::from_secs(1));
+        let is_stale = now.saturating_duration_since(checked_at) >= recheck_after;
 
-        let last_seen_ok = matches!(current_state, HealthState::Healthy);
+        let mut state_ok = matches!(state, HealthState::Healthy) && !is_stale;
 
-        let mut newly_healthy = false;
-        if !last_seen_ok {
+        if !state_ok {
             if probe_backend(&backend.ip, port, http_path.as_deref(), timeout).await {
                 guard.set_health(network_id, service_name, backend.ip, HealthState::Healthy);
-                newly_healthy = true;
+                state_ok = true;
             } else {
                 guard.set_health(network_id, service_name, backend.ip, HealthState::Unhealthy);
             }
         }
 
-        if newly_healthy || last_seen_ok {
+        if state_ok {
             healthy.push(backend);
         }
     }
