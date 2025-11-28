@@ -1,18 +1,22 @@
 use crate::network::allocator::parse_ipv4_cidr;
+use crate::network::attachment::{bridge_name, vxlan_name};
+use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::lb::{BackendAddress, BpfLoadBalancer};
 use crate::network::registry::NetworkRegistry;
-use crate::network::types::{NetworkAttachmentState, NetworkSpecValue};
+use crate::network::types::{
+    BpfAttachPoint, BpfProgramSpec, NetworkAttachmentState, NetworkSpecValue,
+};
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::ServiceSpecValue;
 use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
 use crate::task::types::TaskValue;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use crdt_store::uuid_key::UuidKey;
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,23 +24,27 @@ use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const SERVICE_ZONE_SUFFIX: &str = "svc.mantissa";
 const SERVICE_TTL_SECS: u32 = 5;
+const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct ServiceDiscovery {
     registry: NetworkRegistry,
     tasks: TaskStore,
     services: ServiceRegistry,
+    bpf: NetworkBpfManager,
     servers: Arc<AsyncMutex<HashMap<Uuid, DnsServerHandle>>>,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
     health_port: Option<u16>,
     health_timeout: Duration,
     bpf_lb: BpfLoadBalancer,
+    missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
 }
 
 struct DnsServerHandle {
@@ -46,7 +54,12 @@ struct DnsServerHandle {
 }
 
 impl ServiceDiscovery {
-    pub fn new(registry: NetworkRegistry, tasks: TaskStore, services: ServiceRegistry) -> Self {
+    pub fn new(
+        registry: NetworkRegistry,
+        tasks: TaskStore,
+        services: ServiceRegistry,
+        bpf: NetworkBpfManager,
+    ) -> Self {
         let health_port = std::env::var("MANTISSA_LB_HEALTH_PORT")
             .ok()
             .and_then(|text| text.parse::<u16>().ok());
@@ -54,12 +67,14 @@ impl ServiceDiscovery {
             registry,
             tasks,
             services,
+            bpf,
             servers: Arc::new(AsyncMutex::new(HashMap::new())),
             load_balancer: Arc::new(AsyncMutex::new(ServiceLoadBalancer::default())),
             health: Arc::new(AsyncMutex::new(BackendHealth::default())),
             health_port,
             health_timeout: Duration::from_millis(300),
             bpf_lb: BpfLoadBalancer::new(),
+            missing_lb_maps: Arc::new(AsyncMutex::new(HashSet::new())),
         }
     }
 
@@ -88,6 +103,7 @@ impl ServiceDiscovery {
             self.registry.clone(),
             self.tasks.clone(),
             self.services.clone(),
+            self.bpf.clone(),
             spec.id,
             spec.name.clone(),
             resolver_ip,
@@ -96,6 +112,7 @@ impl ServiceDiscovery {
             self.health_port,
             self.health_timeout,
             self.bpf_lb.clone(),
+            self.missing_lb_maps.clone(),
         )
         .await?;
 
@@ -133,6 +150,7 @@ async fn spawn_dns_server(
     registry: NetworkRegistry,
     tasks: TaskStore,
     services: ServiceRegistry,
+    bpf: NetworkBpfManager,
     network_id: Uuid,
     network_name: String,
     resolver_ip: Ipv4Addr,
@@ -141,6 +159,7 @@ async fn spawn_dns_server(
     health_port: Option<u16>,
     health_timeout: Duration,
     bpf_lb: BpfLoadBalancer,
+    missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
 ) -> Result<DnsServerHandle> {
     let bind_addr = SocketAddr::new(IpAddr::V4(resolver_ip), 53);
     let socket = UdpSocket::bind(bind_addr)
@@ -157,13 +176,56 @@ async fn spawn_dns_server(
     let task_registry = registry.clone();
     let service_registry = services.clone();
     let lb_manager = bpf_lb.clone();
+    let bpf_manager = bpf.clone();
+    let lb_missing = missing_lb_maps.clone();
+    if let Err(err) = refresh_network_services(
+        &task_registry,
+        &tasks,
+        &service_registry,
+        &bpf_manager,
+        network_id,
+        &health,
+        health_port,
+        health_timeout,
+        &lb_manager,
+        &lb_missing,
+    )
+    .await
+    {
+        warn!(
+            target: "network",
+            network = %network_id,
+            "initial service discovery refresh failed: {err:#}"
+        );
+    }
     let server = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
+        let mut refresh = time::interval(REFRESH_INTERVAL);
         loop {
             tokio::select! {
                 biased;
                 _ = &mut shutdown_rx => {
                     break;
+                }
+                _ = refresh.tick() => {
+                    if let Err(err) = refresh_network_services(
+                        &task_registry,
+                        &tasks,
+                        &service_registry,
+                        &bpf_manager,
+                        network_id,
+                        &health,
+                        health_port,
+                        health_timeout,
+                        &lb_manager,
+                        &lb_missing,
+                    ).await {
+                        warn!(
+                            target: "network",
+                            network = %network_id,
+                            "service discovery refresh failed: {err:#}"
+                        );
+                    }
                 }
                 result = socket.recv_from(&mut buf) => {
                     match result {
@@ -175,6 +237,7 @@ async fn spawn_dns_server(
                                 &task_registry,
                                 &tasks,
                                 &service_registry,
+                                &bpf_manager,
                                 network_id,
                                 &network_name,
                                 &load_balancer,
@@ -182,6 +245,7 @@ async fn spawn_dns_server(
                                 health_port,
                                 health_timeout,
                                 &lb_manager,
+                                &lb_missing,
                             ).await {
                                 warn!(
                                     target: "network",
@@ -222,6 +286,7 @@ async fn handle_datagram(
     registry: &NetworkRegistry,
     tasks: &TaskStore,
     services: &ServiceRegistry,
+    bpf: &NetworkBpfManager,
     network_id: Uuid,
     network_name: &str,
     load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
@@ -229,6 +294,7 @@ async fn handle_datagram(
     health_port: Option<u16>,
     health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
+    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
 ) -> Result<()> {
     let request = match Message::from_vec(payload) {
         Ok(message) => message,
@@ -241,6 +307,19 @@ async fn handle_datagram(
             return Ok(());
         }
     };
+
+    let query_names: Vec<String> = request
+        .queries()
+        .iter()
+        .map(|q| q.name().to_string())
+        .collect();
+    debug!(
+        target: "network",
+        network = %network_id,
+        peer = %peer,
+        ?query_names,
+        "received dns query"
+    );
 
     let mut response = Message::new();
     response.set_id(request.id());
@@ -255,6 +334,7 @@ async fn handle_datagram(
     }
 
     let mut answers_added = false;
+    let mut total_answer_records = 0usize;
     let mut saw_nxdomain = false;
     let mut saw_nodata = false;
     let mut saw_notimp = false;
@@ -276,6 +356,7 @@ async fn handle_datagram(
         match answer_query(
             query,
             registry,
+            bpf,
             tasks,
             &service_specs,
             &template_index,
@@ -286,6 +367,7 @@ async fn handle_datagram(
             health_port,
             health_timeout,
             bpf_lb,
+            lb_missing,
         )
         .await?
         {
@@ -293,7 +375,16 @@ async fn handle_datagram(
                 for record in records {
                     response.add_answer(record);
                     answers_added = true;
+                    total_answer_records += 1;
                 }
+                debug!(
+                    target: "network",
+                    network = %network_id,
+                    peer = %peer,
+                    name = %query.name(),
+                    answers = total_answer_records,
+                    "dns answered with records"
+                );
             }
             LookupOutcome::NxDomain => saw_nxdomain = true,
             LookupOutcome::NoData => saw_nodata = true,
@@ -331,6 +422,7 @@ enum LookupOutcome {
 async fn answer_query(
     query: &Query,
     registry: &NetworkRegistry,
+    bpf: &NetworkBpfManager,
     tasks: &TaskStore,
     service_specs: &[ServiceSpecValue],
     template_index: &HashMap<Uuid, (String, String)>,
@@ -341,6 +433,7 @@ async fn answer_query(
     health_port: Option<u16>,
     health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
+    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
 ) -> Result<LookupOutcome> {
     if query.query_type() == RecordType::AAAA {
         return Ok(LookupOutcome::NoData);
@@ -353,46 +446,46 @@ async fn answer_query(
         return Ok(LookupOutcome::NxDomain);
     };
 
-    let backends =
+    let candidates =
         resolve_service_backends(registry, tasks, template_index, network_id, &service_name)
             .await?;
     let service_port = health_port
         .or_else(|| service_health_port(service_specs, &service_name))
         .and_then(|port| if port == 0 { None } else { Some(port) });
     let http_path = service_health_path(service_specs, &service_name);
-    let backends = evaluate_backend_health(
+    let mut backends = evaluate_backend_health(
         health,
+        registry,
         network_id,
         &service_name,
-        backends,
+        candidates.clone(),
         service_port,
         http_path,
         health_timeout,
     )
     .await;
+    tracing::trace!(
+        target: "network",
+        network = %network_id,
+        service = %service_name,
+        candidate_backends = candidates.len(),
+        healthy_backends = backends.len(),
+        "post-health backends"
+    );
+    if backends.is_empty() && !candidates.is_empty() {
+        warn!(
+            target: "network",
+            network = %network_id,
+            service = %service_name,
+            candidates = candidates.len(),
+            "no healthy backends; falling back to candidate attachments"
+        );
+        backends = candidates;
+    }
     if backends.is_empty() {
         return Ok(LookupOutcome::NxDomain);
     }
-    if let Some((vip, mac)) = compute_service_vip(registry, network_id, &service_name, &backends)? {
-        match bpf_lb.sync_vip(network_id, vip, mac, &backends) {
-            Ok(()) => {
-                return Ok(LookupOutcome::Records(vec![Record::from_rdata(
-                    query.name().clone(),
-                    SERVICE_TTL_SECS,
-                    RData::A(vip.into()),
-                )]));
-            }
-            Err(err) => {
-                warn!(
-                    target: "network",
-                    network = %network_id,
-                    service = %service_name,
-                    "failed to sync bpf vip for service; falling back to dns round robin: {err:#}"
-                );
-            }
-        }
-    }
-
+    let mut records = Vec::new();
     let offset = {
         let mut picker = load_balancer.lock().await;
         picker.next_offset(network_id, &service_name, backends.len())
@@ -405,16 +498,36 @@ async fn answer_query(
         offset,
     );
 
-    let records = addresses
-        .into_iter()
-        .map(|addr| {
-            Record::from_rdata(
+    records.extend(addresses.into_iter().map(|addr| {
+        Record::from_rdata(
+            query.name().clone(),
+            SERVICE_TTL_SECS,
+            RData::A(addr.into()),
+        )
+    }));
+
+    if let Some((vip, mac)) = compute_service_vip(registry, network_id, &service_name, &backends)? {
+        if program_service_vip(
+            bpf_lb,
+            bpf,
+            lb_missing,
+            registry,
+            network_id,
+            &service_name,
+            vip,
+            mac,
+            &backends,
+        )
+        .await
+        {
+            records.push(Record::from_rdata(
                 query.name().clone(),
                 SERVICE_TTL_SECS,
-                RData::A(addr.into()),
-            )
-        })
-        .collect();
+                RData::A(vip.into()),
+            ));
+        }
+    }
+
     Ok(LookupOutcome::Records(records))
 }
 
@@ -457,42 +570,90 @@ async fn resolve_service_backends(
     let mut cache: HashMap<Uuid, Option<TaskValue>> = HashMap::new();
     let mut results = Vec::new();
 
+    tracing::trace!(
+        target: "network",
+        network = %network_id,
+        service = %service_name,
+        attachments = attachments.len(),
+        "resolving service backends"
+    );
+
     for attachment in attachments {
         if attachment.state != NetworkAttachmentState::Ready {
+            tracing::trace!(
+                target: "network",
+                network = %network_id,
+                attachment = %attachment.id,
+                state = ?attachment.state,
+                "skipping attachment not ready"
+            );
             continue;
         }
         let Some(ip_text) = &attachment.assigned_ip else {
+            tracing::debug!(
+                target: "network",
+                network = %network_id,
+                attachment = %attachment.id,
+                "skipping attachment without ip"
+            );
             continue;
         };
         let Some(mac_text) = &attachment.mac else {
+            tracing::debug!(
+                target: "network",
+                network = %network_id,
+                attachment = %attachment.id,
+                "skipping attachment without mac"
+            );
             continue;
         };
         let task_entry = cache
             .entry(attachment.task_id)
             .or_insert_with(|| load_task(tasks, attachment.task_id));
-        let Some(task) = task_entry else {
-            continue;
-        };
-        if task.state != ContainerState::Running {
+        let task = task_entry.as_ref();
+
+        let mut template_match = false;
+        if let Some(template) = attachment.template_name.as_deref() {
+            template_match |= template.eq_ignore_ascii_case(service_name);
+        }
+        if let Some(service) = attachment.service_name.as_deref() {
+            template_match |= service.eq_ignore_ascii_case(service_name);
+        }
+        if let Some(task) = task {
+            if let Some(meta) = task.service_metadata.as_ref() {
+                template_match |= meta.template.eq_ignore_ascii_case(service_name);
+            }
+            template_match |= task.name.eq_ignore_ascii_case(service_name);
+        }
+        if let Some((_, template)) = template_index.get(&attachment.task_id) {
+            template_match |= template.eq_ignore_ascii_case(service_name);
+        }
+
+        if !template_match {
+            tracing::trace!(
+                target: "network",
+                network = %network_id,
+                attachment = %attachment.id,
+                task = %attachment.task_id,
+                template = %attachment.template_name.clone().unwrap_or_default(),
+                service = %service_name,
+                "skipping attachment; template mismatch"
+            );
             continue;
         }
-        let template_match = attachment
-            .template_name
-            .as_deref()
-            .map(|template| template.eq_ignore_ascii_case(service_name))
-            .or_else(|| {
-                task.service_metadata
-                    .as_ref()
-                    .map(|meta| meta.template.eq_ignore_ascii_case(service_name))
-            })
-            .or_else(|| {
-                template_index
-                    .get(&attachment.task_id)
-                    .map(|(_, template)| template.eq_ignore_ascii_case(service_name))
-            })
-            .unwrap_or_else(|| task.name.eq_ignore_ascii_case(service_name));
-        if !template_match {
-            continue;
+
+        if let Some(task) = task {
+            if task.state != ContainerState::Running {
+                tracing::debug!(
+                    target: "network",
+                    network = %network_id,
+                    attachment = %attachment.id,
+                    task = %task.id,
+                    state = ?task.state,
+                    "skipping attachment; task not running"
+                );
+                continue;
+            }
         }
         let ip_addr = match ip_text.parse::<Ipv4Addr>() {
             Ok(addr) => addr,
@@ -500,7 +661,7 @@ async fn resolve_service_backends(
                 warn!(
                     target: "network",
                     network = %network_id,
-                    task = %task.id,
+                    task = %attachment.task_id,
                     "invalid attachment ip {}: {err}",
                     ip_text
                 );
@@ -513,7 +674,7 @@ async fn resolve_service_backends(
                 warn!(
                     target: "network",
                     network = %network_id,
-                    task = %task.id,
+                    task = %attachment.task_id,
                     "invalid attachment mac {}: {err}",
                     mac_text
                 );
@@ -522,6 +683,14 @@ async fn resolve_service_backends(
         };
         results.push(BackendAddress { ip: ip_addr, mac });
     }
+
+    tracing::trace!(
+        target: "network",
+        network = %network_id,
+        service = %service_name,
+        backends = results.len(),
+        "resolved service backends"
+    );
 
     Ok(results)
 }
@@ -703,8 +872,11 @@ struct HealthEntry {
     checked_at: Instant,
 }
 
+/// Actively probe candidate backends so only healthy endpoints are returned to DNS callers and the
+/// eBPF dataplane is programmed with live MAC addresses.
 async fn evaluate_backend_health(
     health: &Arc<AsyncMutex<BackendHealth>>,
+    registry: &NetworkRegistry,
     network_id: Uuid,
     service_name: &str,
     backends: Vec<BackendAddress>,
@@ -728,9 +900,13 @@ async fn evaluate_backend_health(
         let is_stale = now.saturating_duration_since(checked_at) >= recheck_after;
 
         let mut state_ok = matches!(state, HealthState::Healthy) && !is_stale;
+        let mut backend = backend;
 
         if !state_ok {
             if probe_backend(&backend.ip, port, http_path.as_deref(), timeout).await {
+                if let Some(mac) = refresh_backend_mac(registry, network_id, backend.ip).await {
+                    backend.mac = mac;
+                }
                 guard.set_health(network_id, service_name, backend.ip, HealthState::Healthy);
                 state_ok = true;
             } else {
@@ -740,10 +916,131 @@ async fn evaluate_backend_health(
 
         if state_ok {
             healthy.push(backend);
+        } else {
+            tracing::debug!(
+                target: "network",
+                network = %network_id,
+                service = %service_name,
+                backend = %backend.ip,
+                state = ?state,
+                stale = is_stale,
+                "backend failed health check"
+            );
         }
     }
 
     healthy
+}
+
+/// Refresh the MAC address stored for a backend by querying kernel neighbour tables and persisting
+/// the new value into the attachment registry so downstream dataplane programming uses the right
+/// L2 destination.
+async fn refresh_backend_mac(
+    registry: &NetworkRegistry,
+    network_id: Uuid,
+    ip: Ipv4Addr,
+) -> Option<[u8; 6]> {
+    let mac = resolve_neighbor_mac(network_id, ip).await?;
+
+    if let Ok(attachments) = registry.list_attachments(Some(network_id)) {
+        for mut attachment in attachments {
+            if attachment.assigned_ip.as_deref() == Some(&ip.to_string()) {
+                attachment.mac = Some(format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                ));
+                let _ = registry.upsert_attachment(attachment).await;
+                break;
+            }
+        }
+    }
+
+    Some(mac)
+}
+
+/// Look up the current MAC associated with a backend IP by scanning neighbour entries on the
+/// overlay bridge and VXLAN devices so we can recover when containers are restarted out of band.
+#[cfg(target_os = "linux")]
+async fn resolve_neighbor_mac(network_id: Uuid, ip: Ipv4Addr) -> Option<[u8; 6]> {
+    use futures::TryStreamExt;
+
+    let (conn, handle, _) = match rtnetlink::new_connection() {
+        Ok(parts) => parts,
+        Err(_) => return None,
+    };
+    tokio::spawn(conn);
+
+    let bridge = bridge_name(network_id);
+    let bridge_index = match handle
+        .link()
+        .get()
+        .match_name(bridge.clone())
+        .execute()
+        .try_next()
+        .await
+    {
+        Ok(Some(msg)) => Some(msg.header.index),
+        _ => None,
+    };
+
+    let vxlan = vxlan_name(network_id);
+    let vxlan_index = match handle
+        .link()
+        .get()
+        .match_name(vxlan.clone())
+        .execute()
+        .try_next()
+        .await
+    {
+        Ok(Some(msg)) => Some(msg.header.index),
+        _ => None,
+    };
+
+    if bridge_index.is_none() && vxlan_index.is_none() {
+        return None;
+    }
+
+    let mut neighs = handle.neighbours().get().execute();
+    while let Ok(Some(msg)) = neighs.try_next().await {
+        let on_bridge = bridge_index
+            .map(|idx| idx == msg.header.ifindex)
+            .unwrap_or(false);
+        let on_vxlan = vxlan_index
+            .map(|idx| idx == msg.header.ifindex)
+            .unwrap_or(false);
+        if !on_bridge && !on_vxlan {
+            continue;
+        }
+
+        let mut found_ip = false;
+        let mut found_mac: Option<[u8; 6]> = None;
+        for nla in &msg.attributes {
+            use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
+            match nla {
+                NeighbourAttribute::Destination(NeighbourAddress::Inet(addr)) if *addr == ip => {
+                    found_ip = true;
+                }
+                NeighbourAttribute::LinkLocalAddress(ll) if ll.len() == 6 => {
+                    let mut mac = [0u8; 6];
+                    mac.copy_from_slice(ll);
+                    found_mac = Some(mac);
+                }
+                _ => {}
+            }
+        }
+
+        if found_ip {
+            if let Some(mac) = found_mac {
+                return Some(mac);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn resolve_neighbor_mac(_network_id: Uuid, _ip: Ipv4Addr) -> Option<[u8; 6]> {
+    None
 }
 
 async fn probe_backend(
@@ -764,7 +1061,7 @@ fn service_health_port(service_specs: &[ServiceSpecValue], service_name: &str) -
     for spec in service_specs {
         for task in &spec.tasks {
             if task.name.eq_ignore_ascii_case(service_name) {
-                if let Some(port) = task.health_port {
+                if let Some(port) = task.health_port() {
                     return Some(port);
                 }
                 for env in &task.env {
@@ -787,7 +1084,7 @@ fn service_health_path(service_specs: &[ServiceSpecValue], service_name: &str) -
     for spec in service_specs {
         for task in &spec.tasks {
             if task.name.eq_ignore_ascii_case(service_name) {
-                if let Some(cmd) = &task.health_command {
+                if let Some(cmd) = task.health_command() {
                     if let Some(first) = cmd.first() {
                         return Some(first.clone());
                     }
@@ -807,9 +1104,10 @@ fn service_health_path(service_specs: &[ServiceSpecValue], service_name: &str) -
 
 async fn probe_backend_tcp(ip: &Ipv4Addr, port: u16, timeout: Duration) -> bool {
     let addr = SocketAddr::new(IpAddr::V4(*ip), port);
-    tokio::time::timeout(timeout, TcpStream::connect(addr))
-        .await
-        .is_ok()
+    matches!(
+        tokio::time::timeout(timeout, TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
 }
 
 async fn probe_backend_http(ip: &Ipv4Addr, port: u16, path: &str, timeout: Duration) -> bool {
@@ -838,4 +1136,194 @@ async fn probe_backend_http(ip: &Ipv4Addr, port: u16, path: &str, timeout: Durat
         }
         _ => false,
     }
+}
+
+/// Periodically refresh health and BPF state for all services attached to a specific network so
+/// dataplane programming keeps up with container restarts even when no DNS queries arrive.
+async fn refresh_network_services(
+    registry: &NetworkRegistry,
+    tasks: &TaskStore,
+    services: &ServiceRegistry,
+    bpf: &NetworkBpfManager,
+    network_id: Uuid,
+    health: &Arc<AsyncMutex<BackendHealth>>,
+    health_port: Option<u16>,
+    health_timeout: Duration,
+    bpf_lb: &BpfLoadBalancer,
+    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
+) -> Result<()> {
+    let service_specs = services.list().context("load service specs for refresh")?;
+    let template_index = build_task_template_index(&service_specs);
+    let names = services_for_network(&service_specs, network_id);
+
+    for service_name in names {
+        refresh_single_service(
+            registry,
+            tasks,
+            &service_specs,
+            &template_index,
+            bpf,
+            network_id,
+            &service_name,
+            health,
+            health_port,
+            health_timeout,
+            bpf_lb,
+            lb_missing,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Determine all service labels that attach to the provided network based on declared task network
+/// requirements so we can refresh health and load balancer state without waiting on DNS requests.
+fn services_for_network(service_specs: &[ServiceSpecValue], network_id: Uuid) -> HashSet<String> {
+    let mut services = HashSet::new();
+    for spec in service_specs {
+        for task in &spec.tasks {
+            if task.networks.iter().any(|net| net.network_id == network_id) {
+                services.insert(task.name.clone());
+            }
+        }
+    }
+    services
+}
+
+/// Refresh healthy backend list and VIP programming for a single service so clients connected via
+/// the VIP can fail over even if they do not issue new DNS lookups.
+async fn refresh_single_service(
+    registry: &NetworkRegistry,
+    tasks: &TaskStore,
+    service_specs: &[ServiceSpecValue],
+    template_index: &HashMap<Uuid, (String, String)>,
+    bpf: &NetworkBpfManager,
+    network_id: Uuid,
+    service_name: &str,
+    health: &Arc<AsyncMutex<BackendHealth>>,
+    health_port: Option<u16>,
+    health_timeout: Duration,
+    bpf_lb: &BpfLoadBalancer,
+    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
+) -> Result<()> {
+    let candidates =
+        resolve_service_backends(registry, tasks, template_index, network_id, service_name).await?;
+    let service_port = health_port
+        .or_else(|| service_health_port(service_specs, service_name))
+        .and_then(|port| if port == 0 { None } else { Some(port) });
+    let http_path = service_health_path(service_specs, service_name);
+    let mut backends = evaluate_backend_health(
+        health,
+        registry,
+        network_id,
+        service_name,
+        candidates.clone(),
+        service_port,
+        http_path,
+        health_timeout,
+    )
+    .await;
+
+    if backends.is_empty() && !candidates.is_empty() {
+        warn!(
+            target: "network",
+            network = %network_id,
+            service = %service_name,
+            candidates = candidates.len(),
+            "no healthy backends during refresh; keeping candidate attachments"
+        );
+        backends = candidates;
+    }
+
+    if backends.is_empty() {
+        return Ok(());
+    }
+
+    if let Some((vip, mac)) = compute_service_vip(registry, network_id, service_name, &backends)? {
+        let _ = program_service_vip(
+            bpf_lb,
+            bpf,
+            lb_missing,
+            registry,
+            network_id,
+            service_name,
+            vip,
+            mac,
+            &backends,
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+/// Attempt to synchronize VIP metadata into the eBPF maps if they are available, returning whether
+/// the dataplane was programmed successfully. Missing maps are warned once per network.
+async fn program_service_vip(
+    bpf_lb: &BpfLoadBalancer,
+    bpf: &NetworkBpfManager,
+    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
+    registry: &NetworkRegistry,
+    network_id: Uuid,
+    service_name: &str,
+    vip: Ipv4Addr,
+    vip_mac: [u8; 6],
+    backends: &[BackendAddress],
+) -> bool {
+    match bpf_lb.sync_vip(network_id, vip, vip_mac, backends) {
+        Ok(()) => {
+            let mut guard = lb_missing.lock().await;
+            guard.remove(&network_id);
+            true
+        }
+        Err(err) => {
+            // Attempt to heal the maps by re-ensuring BPF programs, then retry once.
+            let healed = heal_lb_maps(bpf, registry, network_id).await;
+            if healed.is_ok() && bpf_lb.sync_vip(network_id, vip, vip_mac, backends).is_ok() {
+                let mut guard = lb_missing.lock().await;
+                guard.remove(&network_id);
+                return true;
+            }
+
+            let mut guard = lb_missing.lock().await;
+            if guard.insert(network_id) {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    service = %service_name,
+                    "failed to sync bpf vip for service; falling back to dns round robin: {err:#}"
+                );
+            }
+            false
+        }
+    }
+}
+
+/// Reconcile BPF programs for a network when VIP map access fails so pinned maps can be recreated.
+async fn heal_lb_maps(
+    bpf: &NetworkBpfManager,
+    registry: &NetworkRegistry,
+    network_id: Uuid,
+) -> Result<()> {
+    let Some(spec) = registry.get_spec(network_id)? else {
+        bail!("network spec {network_id} missing while healing LB maps");
+    };
+    let mut attach_spec = spec.clone();
+    if attach_spec.bpf_programs.is_empty() {
+        attach_spec.bpf_programs = default_bpf_programs();
+    }
+
+    let interfaces =
+        NetworkInterfaceContext::new(network_id, bridge_name(network_id), vxlan_name(network_id));
+    bpf.ensure_network(&attach_spec, &interfaces).await
+}
+
+fn default_bpf_programs() -> Vec<BpfProgramSpec> {
+    vec![
+        BpfProgramSpec::with_attach_point("vxlan_xdp", BpfAttachPoint::VxlanXdp),
+        BpfProgramSpec::with_attach_point("bridge_xdp", BpfAttachPoint::BridgeXdp),
+        BpfProgramSpec::with_attach_point("bridge_tc_ingress", BpfAttachPoint::BridgeTcIngress),
+        BpfProgramSpec::with_attach_point("bridge_tc_egress", BpfAttachPoint::BridgeTcEgress),
+    ]
 }

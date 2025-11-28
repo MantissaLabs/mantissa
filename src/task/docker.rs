@@ -17,7 +17,7 @@ use bollard::models::{HostConfig, RestartPolicy, RestartPolicyNameEnum};
 use bollard::service::ContainerInspectResponse;
 
 use async_trait::async_trait;
-use log::{debug, info};
+use log::{debug, info, warn};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -313,7 +313,13 @@ impl ContainerManager for DockerContainerManager {
         }
 
         if let Some(servers) = dns_servers {
-            host_config.dns = Some(servers);
+            host_config.dns = Some(servers.clone());
+            info!(target: "task", "configured container dns for {name}: {servers:?}");
+        } else {
+            warn!(
+                target: "task",
+                "no custom dns configured for {name}; falling back to docker defaults"
+            );
         }
 
         // Create container config

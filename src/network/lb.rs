@@ -41,9 +41,13 @@ mod platform {
     use anyhow::{Context, Result};
     use aya::Pod;
     use aya::maps::MapData;
+    use nix::mount::{MsFlags, mount};
+    use nix::sys::statfs::{BPF_FS_MAGIC, statfs};
+    use std::fs;
     use std::mem;
     use std::net::Ipv4Addr;
     use std::os::fd::{AsFd, AsRawFd};
+    use std::path::Path;
     use uuid::Uuid;
 
     #[derive(Clone, Default)]
@@ -62,9 +66,8 @@ mod platform {
             backends: &[BackendAddress],
         ) -> Result<()> {
             let base = map_pin_dir(_network_id)?;
-            let vip_map = MapData::from_pin(base.join("LB_VIPS")).context("open LB_VIPS map")?;
-            let backend_map =
-                MapData::from_pin(base.join("LB_BACKENDS")).context("open LB_BACKENDS map")?;
+            let vip_map = open_map(&base, "LB_VIPS").context("open LB_VIPS map")?;
+            let backend_map = open_map(&base, "LB_BACKENDS").context("open LB_BACKENDS map")?;
 
             let entry = build_vip_entry(vip_mac, backends);
             let key = VipKey {
@@ -82,8 +85,8 @@ mod platform {
             )
             .context("program backends")?;
 
-            clear_hash_map(base.join("LB_FWD")).context("clear LB_FWD map")?;
-            clear_hash_map(base.join("LB_REV")).context("clear LB_REV map")?;
+            clear_hash_map(&base, "LB_FWD").context("clear LB_FWD map")?;
+            clear_hash_map(&base, "LB_REV").context("clear LB_REV map")?;
             Ok(())
         }
     }
@@ -190,8 +193,9 @@ mod platform {
     }
 
     fn map_pin_dir(network_id: Uuid) -> Result<std::path::PathBuf> {
+        ensure_bpffs().context("prepare bpffs mount")?;
         let path = std::path::PathBuf::from("/sys/fs/bpf/mantissa").join(network_id.to_string());
-        std::fs::create_dir_all(&path)
+        fs::create_dir_all(&path)
             .with_context(|| format!("create map pin directory {}", path.display()))?;
         Ok(path)
     }
@@ -228,8 +232,8 @@ mod platform {
         Ok(())
     }
 
-    fn clear_hash_map(path: std::path::PathBuf) -> Result<()> {
-        let map = MapData::from_pin(&path)?;
+    fn clear_hash_map(base: &Path, name: &str) -> Result<()> {
+        let map = open_map(base, name)?;
         let fd = map.fd().as_fd().as_raw_fd();
 
         #[repr(C)]
@@ -285,6 +289,53 @@ mod platform {
             prev = Some(next);
         }
         Ok(())
+    }
+
+    /// Try to open a pinned map from the expected mantissa directory, falling back to the tc/globals
+    /// location Aya may use for TC programs on some kernels.
+    fn open_map(base: &Path, name: &str) -> Result<MapData> {
+        let candidates = [
+            base.join(name),
+            base.join("tc").join("globals").join(name),
+            Path::new("/sys/fs/bpf/tc/globals").join(name),
+        ];
+
+        for candidate in candidates {
+            if let Ok(map) = MapData::from_pin(&candidate) {
+                return Ok(map);
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "map {name} not found in expected pin locations"
+        ))
+    }
+
+    /// Ensure bpffs is mounted at /sys/fs/bpf so TC maps can be pinned predictably.
+    fn ensure_bpffs() -> Result<()> {
+        let mountpoint = Path::new("/sys/fs/bpf");
+        if !mountpoint.exists() {
+            fs::create_dir_all(mountpoint).context("create /sys/fs/bpf")?;
+        }
+
+        if is_bpffs(mountpoint) {
+            return Ok(());
+        }
+
+        mount::<Path, Path, str, str>(
+            None::<&Path>,
+            mountpoint,
+            Some("bpf"),
+            MsFlags::empty(),
+            None::<&str>,
+        )
+        .context("mount bpffs")?;
+        Ok(())
+    }
+
+    /// Lightweight check to see if a path is a bpffs mount.
+    fn is_bpffs(path: &Path) -> bool {
+        matches!(statfs(path), Ok(stat) if stat.filesystem_type() == BPF_FS_MAGIC)
     }
 }
 

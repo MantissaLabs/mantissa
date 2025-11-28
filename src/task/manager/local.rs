@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use chrono::Utc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::task::container::ContainerState;
 use crate::task::docker::{
@@ -77,6 +77,21 @@ impl TaskManager {
                 plan.requested_memory_bytes,
             );
 
+            let dns_servers: Vec<String> = self.resolve_dns_servers(&plan.networks).await?;
+            let dns_servers = if dns_servers.is_empty() {
+                None
+            } else {
+                Some(dns_servers)
+            };
+
+            debug!(
+                target: "task",
+                task = %plan.id,
+                container = %plan.container_name,
+                networks = ?plan.networks,
+                "launching container with networks"
+            );
+
             let mut resolved = self
                 .resolve_runtime_secrets(plan.id, &plan.env, &plan.secret_files)
                 .await?;
@@ -104,7 +119,7 @@ impl TaskManager {
                 volumes,
                 restart_policy,
                 resource_limits,
-                dns_servers: None,
+                dns_servers,
             };
 
             let create_result = self

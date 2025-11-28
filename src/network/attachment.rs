@@ -157,6 +157,12 @@ pub(crate) fn bridge_name(network_id: Uuid) -> String {
     format!("mnt-br-{}", short_id(network_id))
 }
 
+/// Compute the deterministic VXLAN device name for an overlay network so dataplane helpers can
+/// target the correct interface.
+pub(crate) fn vxlan_name(network_id: Uuid) -> String {
+    format!("mvx-{}", short_id(network_id))
+}
+
 fn short_id(id: Uuid) -> String {
     let hex = id.simple().to_string();
     hex.chars().take(8).collect()

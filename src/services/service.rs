@@ -425,15 +425,13 @@ fn write_task_template(
         .init_secret_files(task.secret_files.len() as u32);
     encode_secret_files(&mut files_builder, &task.secret_files);
 
-    builder.set_health_port(task.health_port.unwrap_or(0));
-    let mut health_builder = builder.reborrow().init_health_command(
-        task.health_command
-            .as_ref()
-            .map(|cmd| cmd.len() as u32)
-            .unwrap_or(0),
-    );
-    if let Some(cmd) = &task.health_command {
-        for (idx, arg) in cmd.iter().enumerate() {
+    builder.set_health_port(task.health_port().unwrap_or(0));
+    let cmd = task.health_command();
+    let mut health_builder = builder
+        .reborrow()
+        .init_health_command(cmd.map(|args| args.len() as u32).unwrap_or(0));
+    if let Some(args) = cmd {
+        for (idx, arg) in args.iter().enumerate() {
             health_builder.set(idx as u32, arg);
         }
     }

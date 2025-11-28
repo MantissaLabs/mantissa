@@ -22,6 +22,7 @@ members = [
 [build-dependencies]
 aya-build = { git = "https://github.com/aya-rs/aya" }
 anyhow = "1"
+cargo_metadata = "0.23"
 
 [dependencies]
 crdt_store = { path = "crates/crdt_store" }
@@ -118,7 +119,7 @@ rtnetlink = { version = "0.18.1", default-features = false, features = ["tokio_s
 netlink-packet-route = "0.19"
 netlink-packet-utils = "0.5"
 netlink-packet-core = "0.8"
-nix = { version = "0.29", default-features = false, features = ["sched"] }
+nix = { version = "0.29", default-features = false, features = ["sched", "mount", "fs"] }
 
 [features]
 default = []

@@ -370,27 +370,60 @@ impl TaskManager {
         error
     }
 
-    fn resolve_dns_servers(&self, network_ids: &[Uuid]) -> Vec<String> {
+    pub(super) async fn resolve_dns_servers(
+        &self,
+        network_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<String>> {
+        if network_ids.is_empty() {
+            anyhow::bail!("cannot compute DNS resolvers: task has no networks");
+        }
+
         let mut servers = Vec::new();
         let mut seen = HashSet::new();
 
         for network_id in network_ids {
-            let Ok(spec_opt) = self.network_registry.get_spec(*network_id) else {
-                continue;
-            };
-            let Some(spec) = spec_opt else {
-                continue;
-            };
-            if let Ok(addr) =
-                crate::network::allocator::resolver_ipv4_address(&spec, self.local_node_id)
-            {
-                if seen.insert(addr) {
-                    servers.push(addr.to_string());
+            match self.network_registry.get_spec(*network_id) {
+                Ok(Some(spec)) => {
+                    match crate::network::allocator::resolver_ipv4_address(
+                        &spec,
+                        self.local_node_id,
+                    ) {
+                        Ok(addr) => {
+                            if seen.insert(addr) {
+                                servers.push(addr.to_string());
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                target: "task",
+                                network = %network_id,
+                                "failed to compute resolver address: {err}"
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    warn!(
+                        target: "task",
+                        network = %network_id,
+                        "missing network spec while computing resolver"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        network = %network_id,
+                        "failed to load network spec while computing resolver: {err:#}"
+                    );
                 }
             }
         }
 
-        servers
+        if servers.is_empty() && !network_ids.is_empty() {
+            anyhow::bail!("no DNS resolvers available for task networks: {network_ids:?}");
+        }
+
+        Ok(servers)
     }
 
     /// Maps a task restart policy into the Docker restart policy configuration.
@@ -491,7 +524,14 @@ impl TaskManager {
 
         let container_name = format!("mantissa-{}", working.id);
 
-        let dns_servers = self.resolve_dns_servers(&working.networks);
+        debug!(
+            target: "task",
+            task = %working.id,
+            container = %container_name,
+            networks = ?working.networks,
+            "resolving dns servers for task"
+        );
+        let dns_servers = self.resolve_dns_servers(&working.networks).await?;
         let dns_servers = if dns_servers.is_empty() {
             None
         } else {

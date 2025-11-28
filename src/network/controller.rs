@@ -6,8 +6,8 @@ use crate::network::discovery::ServiceDiscovery;
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    NetworkAttachmentState, NetworkEvent, NetworkPeerState, NetworkPeerStateValue,
-    NetworkSpecValue, NetworkStatus,
+    BpfAttachPoint, BpfProgramSpec, NetworkAttachmentState, NetworkEvent, NetworkPeerState,
+    NetworkPeerStateValue, NetworkSpecValue, NetworkStatus,
 };
 use crate::registry::Registry;
 use crate::services::registry::ServiceRegistry;
@@ -65,6 +65,27 @@ struct NetworkPlan {
     subnet_prefix: Option<u8>,
 }
 
+#[cfg(target_os = "linux")]
+fn default_bpf_programs() -> Vec<BpfProgramSpec> {
+    if std::env::var_os("MANTISSA_BPF_NO_ATTACH").is_some()
+        || std::env::var_os("MANTISSA_SKIP_BPF").is_some()
+    {
+        return Vec::new();
+    }
+
+    vec![
+        BpfProgramSpec::with_attach_point("vxlan_xdp", BpfAttachPoint::VxlanXdp),
+        BpfProgramSpec::with_attach_point("bridge_xdp", BpfAttachPoint::BridgeXdp),
+        BpfProgramSpec::with_attach_point("bridge_tc_ingress", BpfAttachPoint::BridgeTcIngress),
+        BpfProgramSpec::with_attach_point("bridge_tc_egress", BpfAttachPoint::BridgeTcEgress),
+    ]
+}
+
+#[cfg(not(target_os = "linux"))]
+fn default_bpf_programs() -> Vec<BpfProgramSpec> {
+    Vec::new()
+}
+
 impl NetworkController {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(
@@ -87,7 +108,8 @@ impl NetworkController {
             NetworkBpfManager::unavailable()
         });
 
-        let discovery = ServiceDiscovery::new(registry.clone(), task_store, service_registry);
+        let discovery =
+            ServiceDiscovery::new(registry.clone(), task_store, service_registry, bpf.clone());
 
         Ok(Self {
             inner: Arc::new(NetworkControllerInner {
@@ -591,6 +613,7 @@ impl NetworkController {
             changed = true;
         }
 
+        changed |= Self::ensure_default_bpf_programs(&mut spec.bpf_programs);
         spec.bpf_programs.sort();
 
         let resolver_ipv4 = match resolver_ipv4_address(spec, self.inner.node_id) {
@@ -630,6 +653,35 @@ impl NetworkController {
         };
 
         Ok((plan, changed))
+    }
+
+    /// Guarantee the dataplane programs required for VIP load-balancing are present with the
+    /// correct attach points so LB maps are always created and pinned.
+    fn ensure_default_bpf_programs(programs: &mut Vec<BpfProgramSpec>) -> bool {
+        let mut changed = false;
+        let defaults = default_bpf_programs();
+        if defaults.is_empty() {
+            return false;
+        }
+
+        for default in defaults {
+            match programs.iter_mut().find(|p| p.name == default.name) {
+                Some(existing) => {
+                    if existing.attach_point != default.attach_point {
+                        existing.attach_point = default.attach_point;
+                        changed = true;
+                    }
+                }
+                None => {
+                    programs.push(default);
+                    changed = true;
+                }
+            }
+        }
+
+        programs.sort();
+        programs.dedup();
+        changed
     }
 
     async fn mark_peer_ready(&self, network_id: Uuid) -> Result<()> {

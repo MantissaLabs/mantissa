@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use crdt_store::uuid_key::UuidKey;
+use tokio::time::{Duration, interval};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -26,20 +27,157 @@ impl TaskManager {
         guard.insert(id)
     }
 
-    /// Main gossip processing loop for the task manager.
-    pub async fn run(&mut self) {
-        while let Ok(message) = self.rx.recv().await {
-            match message {
-                Message::Task { id, event } => {
-                    if !self.record_gossip_id(id).await {
+    /// Periodically re-attach networks to running containers whose attachment interfaces vanished
+    /// (for example after a container restart) so backends rejoin service discovery and load
+    /// balancing without manual intervention.
+    async fn repair_runtime_attachments(&self) -> Result<()> {
+        let attachments = self
+            .network_registry
+            .list_attachments(None)
+            .context("list attachments for repair")?;
+
+        for attachment in attachments {
+            if attachment.node_id != self.local_node_id {
+                continue;
+            }
+            if !matches!(
+                attachment.state,
+                NetworkAttachmentState::Ready | NetworkAttachmentState::Error
+            ) {
+                continue;
+            }
+
+            if self
+                .attachment_provisioner
+                .attachment_exists(attachment.id)
+                .await
+                .context("check attachment presence during repair")?
+            {
+                continue;
+            }
+
+            let spec = match self.load_spec(attachment.task_id).await {
+                Ok(spec) => spec,
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        task = %attachment.task_id,
+                        attachment = %attachment.id,
+                        "skipping repair; failed to load task spec: {err:#}"
+                    );
+                    continue;
+                }
+            };
+
+            let desired_name = format!("mantissa-{}", spec.id);
+            let mut container_id = {
+                let guard = self.local_containers.lock().await;
+                guard
+                    .get(&spec.id)
+                    .cloned()
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| attachment.container_id.clone())
+            };
+            if container_id.is_empty() {
+                container_id = desired_name.clone();
+            }
+
+            let inspect = match self
+                .container_manager
+                .inspect_container(&container_id)
+                .await
+            {
+                Ok(info) => info,
+                Err(first_err) => {
+                    if container_id != desired_name {
+                        match self
+                            .container_manager
+                            .inspect_container(&desired_name)
+                            .await
+                        {
+                            Ok(info) => info,
+                            Err(err) => {
+                                warn!(
+                                    target: "task",
+                                    task = %attachment.task_id,
+                                    attachment = %attachment.id,
+                                    container = %container_id,
+                                    name = %desired_name,
+                                    "skipping repair; inspect failed (by id and name): {first_err:#}; {err:#}"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        warn!(
+                            target: "task",
+                            task = %attachment.task_id,
+                            attachment = %attachment.id,
+                            container = %container_id,
+                            "skipping repair; inspect failed: {first_err:#}"
+                        );
                         continue;
                     }
-                    if let Err(e) = self.handle_event(event).await {
-                        tracing::error!(target: "task", "failed to handle task event: {e}");
+                }
+            };
+
+            if let Some(id) = inspect.id.clone() {
+                container_id = id;
+            }
+
+            {
+                let mut guard = self.local_containers.lock().await;
+                guard.insert(spec.id, container_id.clone());
+            }
+
+            if let Err(err) = self
+                .ensure_runtime_attachments(
+                    spec.id,
+                    &container_id,
+                    &spec.networks,
+                    spec.service_metadata.as_ref(),
+                )
+                .await
+            {
+                warn!(
+                    target: "task",
+                    task = %attachment.task_id,
+                    attachment = %attachment.id,
+                    container = %container_id,
+                    "failed to repair runtime attachment: {err:#}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Main gossip processing loop for the task manager.
+    pub async fn run(&mut self) {
+        let mut repair_tick = interval(Duration::from_secs(5));
+
+        loop {
+            tokio::select! {
+                _ = repair_tick.tick() => {
+                    if let Err(err) = self.repair_runtime_attachments().await {
+                        warn!(target: "task", "failed to repair runtime attachments: {err:#}");
                     }
                 }
-                Message::Void { .. } => {}
-                _ => {}
+                message = self.rx.recv() => {
+                    let Ok(message) = message else { break; };
+                    match message {
+                        Message::Task { id, event } => {
+                            if !self.record_gossip_id(id).await {
+                                continue;
+                            }
+                            if let Err(e) = self.handle_event(event).await {
+                                tracing::error!(target: "task", "failed to handle task event: {e}");
+                            }
+                        }
+                        Message::Void { .. } => {}
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -97,11 +235,27 @@ impl TaskManager {
         network_ids: &[Uuid],
         service_meta: Option<&TaskServiceMetadata>,
     ) -> Result<()> {
-        self.cleanup_orphaned_local_attachments()
-            .await
-            .context("cleanup orphaned network attachments")?;
+        // Only clean up orphaned attachments when the task already exists in the store. During
+        // initial creation (before we persist the TaskSpec) this would incorrectly delete
+        // attachments we just created for earlier tasks in the same batch.
+        let has_snapshot = self
+            .store
+            .get_snapshot(&UuidKey::from(task_id))
+            .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?
+            .is_some();
+        if has_snapshot {
+            self.cleanup_orphaned_local_attachments()
+                .await
+                .context("cleanup orphaned network attachments")?;
+        }
 
         if network_ids.is_empty() {
+            warn!(
+                target: "task",
+                task = %task_id,
+                container = %container_id,
+                "skipping network attachment because no networks were provided"
+            );
             return Ok(());
         }
 
@@ -113,15 +267,21 @@ impl TaskManager {
                 format!("inspect container {container_id} for network attachment provisioning")
             })?;
 
-        let pid = inspect
-            .state
-            .as_ref()
-            .and_then(|state| state.pid)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "container {container_id} missing pid while configuring attachments"
-                )
-            })?;
+        let state = inspect.state.as_ref();
+        let pid = state.and_then(|s| s.pid).unwrap_or(0);
+
+        let running = state.and_then(|s| s.running).unwrap_or(false);
+        if pid == 0 || !running {
+            tracing::trace!(
+                target: "task",
+                task = %task_id,
+                container = %container_id,
+                pid,
+                running,
+                "skipping attachment provisioning; container not running yet"
+            );
+            return Ok(());
+        }
 
         let container_pid = i32::try_from(pid)
             .context("container pid exceeds 32-bit range for attachment provisioning")?;

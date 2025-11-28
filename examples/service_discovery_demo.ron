@@ -29,7 +29,7 @@
             command: [
                 "sh",
                 "-c",
-                "while true; do printf '\\n---\\n' && date && curl -s http://backend.discovery-demo.svc.mantissa:8000; sleep 5; done",
+                "while true; do printf '\\n---\\n' && date && curl --connect-timeout 2 --max-time 4 --no-keepalive --retry 0 -s http://backend.discovery-demo.svc.mantissa:8000; sleep 5; done",
             ],
             replicas: 1,
             resources: (

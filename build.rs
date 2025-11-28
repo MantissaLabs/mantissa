@@ -1,10 +1,14 @@
 #[cfg(target_os = "linux")]
+use cargo_metadata::MetadataCommand;
+#[cfg(target_os = "linux")]
 use std::{env, error::Error, fs, io, path::PathBuf, process::Command};
 
 #[cfg(not(target_os = "linux"))]
 use std::error::Error;
 
 #[cfg(target_os = "linux")]
+/// Build the eBPF programs when compiling on Linux, ensuring artifacts are
+/// available for runtime networking features.
 fn build_bpf() -> Result<(), Box<dyn Error>> {
     if env::var_os("MANTISSA_SKIP_BPF").is_some() {
         println!("cargo:warning=skipping eBPF compilation (MANTISSA_SKIP_BPF set)");
@@ -13,15 +17,34 @@ fn build_bpf() -> Result<(), Box<dyn Error>> {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
 
-    let mut metadata_cmd = aya_build::cargo_metadata::MetadataCommand::new();
+    let mut metadata_cmd = MetadataCommand::new();
     metadata_cmd.manifest_path(manifest_dir.join("Cargo.toml"));
     let metadata = metadata_cmd.exec()?;
 
     let packages: Vec<_> = metadata
         .packages
-        .into_iter()
+        .iter()
         .filter(|pkg| pkg.name == "network-ebpf")
-        .collect();
+        .map(|pkg| {
+            let root_dir = pkg
+                .manifest_path
+                .parent()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        "network-ebpf manifest path does not have a parent directory",
+                    )
+                })?
+                .as_str();
+
+            Ok(aya_build::Package {
+                name: pkg.name.as_str(),
+                root_dir,
+                no_default_features: false,
+                features: &[],
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
 
     if packages.is_empty() {
         return Ok(());
@@ -71,19 +94,25 @@ fn build_bpf() -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(not(target_os = "linux"))]
+/// No-op build hook on non-Linux hosts; eBPF programs are not compiled here.
 fn build_bpf() -> Result<(), Box<dyn Error>> {
     println!("cargo:warning=skipping eBPF compilation on non-Linux host");
     Ok(())
 }
 
+/// Build script entry point that attempts eBPF compilation while degrading
+/// gracefully to runtime fallbacks when unavailable.
 fn main() {
     if let Err(err) = build_bpf() {
-        eprintln!("Failed to compile eBPF programs: {err:#}");
-        std::process::exit(1);
+        println!(
+            "cargo:warning=skipping eBPF build (will fall back to DNS-only VIP behavior): {err:#}"
+        );
     }
 }
 
 #[cfg(target_os = "linux")]
+/// Ensure `bpf-linker` is available before triggering compilation so we can
+/// surface a clear error early in the build process.
 fn ensure_bpf_linker() -> Result<(), Box<dyn Error>> {
     let status = Command::new("bpf-linker").arg("--version").status();
     match status {

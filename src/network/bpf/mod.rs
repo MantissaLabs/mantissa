@@ -95,11 +95,15 @@ mod platform {
     use super::{BpfProgramSpec, NetworkInterfaceContext};
     use crate::network::types::BpfAttachPoint;
     use anyhow::{Context, Result, anyhow};
+    use aya::maps::MapData;
+    use aya::pin::PinError;
     use aya::programs::tc::{SchedClassifierLinkId, TcAttachType, qdisc_add_clsact};
     use aya::programs::xdp::XdpLinkId;
     use aya::programs::{SchedClassifier, Xdp, XdpFlags};
     use aya::{Ebpf, EbpfLoader};
     use libc::if_nametoindex;
+    use nix::mount::{MsFlags, mount};
+    use nix::sys::statfs::{BPF_FS_MAGIC, statfs};
     use std::collections::{HashMap, HashSet};
     use std::env;
     use std::ffi::CString;
@@ -220,11 +224,20 @@ mod platform {
             self.validate_programs(programs, interfaces)?;
 
             let network_id = interfaces.network_id();
+            let map_pin_path = map_pin_dir(network_id)?;
             {
                 let guard = self.loaded.lock().await;
                 if let Some(existing) = guard.get(&network_id) {
                     if existing.matches(programs) {
-                        return Ok(());
+                        if lb_maps_required(programs) && !lb_maps_present(&map_pin_path) {
+                            warn!(
+                                target: "network",
+                                network = %network_id,
+                                "load balancer maps missing despite matching programs; forcing reload"
+                            );
+                        } else {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -242,8 +255,6 @@ mod platform {
                     );
                 }
             }
-
-            let map_pin_path = map_pin_dir(network_id)?;
 
             self.clear_stale_xdp_targets(programs, interfaces);
 
@@ -533,6 +544,35 @@ mod platform {
         }
     }
 
+    /// Return whether the configured programs expect the load balancer maps to be present.
+    fn lb_maps_required(programs: &[BpfProgramSpec]) -> bool {
+        programs.iter().any(|spec| {
+            matches!(
+                spec.attach_point(),
+                BpfAttachPoint::BridgeTcIngress | BpfAttachPoint::BridgeTcEgress
+            )
+        })
+    }
+
+    /// Check whether the pinned load balancer maps are reachable from userspace.
+    fn lb_maps_present(base: &Path) -> bool {
+        const MAPS: &[&str] = &["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"];
+        MAPS.iter().all(|name| map_is_pinned(base, name))
+    }
+
+    /// Attempt to locate a pinned map across the expected bpffs locations Aya may use.
+    fn map_is_pinned(base: &Path, name: &str) -> bool {
+        let candidates = [
+            base.join(name),
+            base.join("tc").join("globals").join(name),
+            Path::new("/sys/fs/bpf/tc/globals").join(name),
+        ];
+
+        candidates
+            .into_iter()
+            .any(|candidate| MapData::from_pin(&candidate).is_ok())
+    }
+
     fn force_detach_target(target: AttachTarget<'_>) -> Result<()> {
         match target {
             AttachTarget::Xdp { interface } => detach_xdp(interface),
@@ -540,7 +580,49 @@ mod platform {
         }
     }
 
+    /// Ensure LB-related maps are pinned so subsequent program loads reuse the same instances and
+    /// userspace can program them via predictable paths.
+    fn ensure_lb_maps_pinned(bpf: &mut Ebpf, base: &Path) -> Result<()> {
+        const MAPS: &[&str] = &["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"];
+        if let Err(err) = fs::create_dir_all(base) {
+            warn!(
+                target: "network",
+                path = %base.display(),
+                "failed to prepare lb map pin directory: {err:#}"
+            );
+            return Ok(());
+        }
+
+        for name in MAPS {
+            let Some(map) = bpf.map_mut(name) else {
+                continue;
+            };
+            let path = base.join(name);
+            if let Err(err) = map.pin(&path) {
+                if !is_already_pinned(&err) {
+                    warn!(
+                        target: "network",
+                        map = %name,
+                        path = %path.display(),
+                        "failed to pin lb map (continuing with in-kernel handle): {err:#}"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn is_already_pinned(err: &PinError) -> bool {
+        matches!(
+            err,
+            PinError::SyscallError(sys)
+                if matches!(sys.io_error.raw_os_error(), Some(code) if code == libc::EEXIST)
+        )
+    }
+
     fn map_pin_dir(network_id: Uuid) -> Result<PathBuf> {
+        ensure_bpffs().context("prepare bpffs mount")?;
         let path = PathBuf::from("/sys/fs/bpf/mantissa").join(network_id.to_string());
         fs::create_dir_all(&path)
             .with_context(|| format!("create map pin directory {}", path.display()))?;
@@ -593,6 +675,32 @@ mod platform {
             ));
         }
         Ok(())
+    }
+
+    /// Ensure bpffs is mounted at /sys/fs/bpf so we have a stable pin location.
+    fn ensure_bpffs() -> Result<()> {
+        let mountpoint = Path::new("/sys/fs/bpf");
+        if !mountpoint.exists() {
+            fs::create_dir_all(mountpoint).context("create /sys/fs/bpf")?;
+        }
+        if is_bpffs(mountpoint) {
+            return Ok(());
+        }
+
+        mount::<Path, Path, str, str>(
+            None::<&Path>,
+            mountpoint,
+            Some("bpf"),
+            MsFlags::empty(),
+            None::<&str>,
+        )
+        .context("mount bpffs")?;
+        Ok(())
+    }
+
+    /// Lightweight check to see if a path is a bpffs mount.
+    fn is_bpffs(path: &Path) -> bool {
+        matches!(statfs(path), Ok(stat) if stat.filesystem_type() == BPF_FS_MAGIC)
     }
 
     fn is_bpf_link_conflict(err: &anyhow::Error) -> bool {
@@ -886,6 +994,7 @@ mod platform {
             let mut bpf = loader
                 .load_file(artifact)
                 .with_context(|| format!("load bpf object {}", artifact.display()))?;
+            ensure_lb_maps_pinned(&mut bpf, map_pin_path).context("pin load balancer maps")?;
 
             let program_name = spec.name.clone();
 
