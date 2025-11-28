@@ -375,7 +375,7 @@ impl TaskManager {
         network_ids: &[Uuid],
     ) -> anyhow::Result<Vec<String>> {
         if network_ids.is_empty() {
-            anyhow::bail!("cannot compute DNS resolvers: task has no networks");
+            return Ok(Vec::new());
         }
 
         let mut servers = Vec::new();

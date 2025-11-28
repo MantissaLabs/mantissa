@@ -270,7 +270,9 @@ impl TaskManager {
         let state = inspect.state.as_ref();
         let pid = state.and_then(|s| s.pid).unwrap_or(0);
 
-        let running = state.and_then(|s| s.running).unwrap_or(false);
+        // Treat unknown running state as true for compatibility with older Docker/mocks, but
+        // require a non-zero PID.
+        let running = state.and_then(|s| s.running).unwrap_or(true);
         if pid == 0 || !running {
             tracing::trace!(
                 target: "task",
