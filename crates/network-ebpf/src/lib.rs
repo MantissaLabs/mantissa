@@ -166,9 +166,9 @@ pub mod net {
 
 pub mod lb {
     /// Maximum number of backend targets tracked per VIP entry.
-    pub const MAX_BACKENDS: usize = 64;
+    pub const MAX_BACKENDS: usize = 255;
     /// Maximum number of VIPs tracked in LB maps.
-    pub const MAX_VIPS: usize = 64;
+    pub const MAX_VIPS: usize = 4096;
 
     /// Key for VIP-backed routing decisions stored in eBPF maps.
     #[repr(C)]
@@ -193,6 +193,15 @@ pub mod lb {
         pub vip_mac: [u8; 6],
         pub backend_count: u8,
         pub _pad: [u8; 3],
+    }
+
+    /// Composite key used to isolate backend slots per VIP inside a flat hash map so the backend
+    /// table can grow without a small fixed slot limit.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct VipBackendKey {
+        pub vip: u32,
+        pub slot: u32,
     }
 
     /// Normalized 5-tuple used to maintain DNAT/SNAT state.

@@ -91,8 +91,7 @@ mod platform {
         }
     }
 
-    const MAX_BACKENDS: usize = 64;
-    const MAX_VIPS: usize = 64;
+    const MAX_BACKENDS: usize = 255;
     const BPF_MAP_UPDATE_ELEM: libc::c_uint = 2;
     const BPF_MAP_DELETE_ELEM: libc::c_uint = 3;
     const BPF_MAP_GET_NEXT_KEY: libc::c_uint = 4;
@@ -103,6 +102,14 @@ mod platform {
         vip: u32,
     }
     unsafe impl Pod for VipKey {}
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct VipBackendKey {
+        vip: u32,
+        slot: u32,
+    }
+    unsafe impl Pod for VipBackendKey {}
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -168,11 +175,13 @@ mod platform {
         backends: &[BackendAddress],
         max: usize,
     ) -> Result<()> {
-        let vip_slot = (vip as usize) & (MAX_VIPS - 1);
-        let base = vip_slot * MAX_BACKENDS;
+        clear_vip_backends(fd, vip)?;
 
         for (idx, backend) in backends.iter().take(max).enumerate() {
-            let key = (base + idx) as u32;
+            let key = VipBackendKey {
+                vip,
+                slot: idx as u32,
+            };
             let value = Backend {
                 ip: u32::from_be_bytes(backend.ip.octets()),
                 mac: backend.mac,
@@ -182,11 +191,66 @@ mod platform {
                 .with_context(|| format!("update backend slot {} for vip {:08x}", idx, vip))?;
         }
 
-        // Clear any stale entries beyond the new backend_count for this VIP.
-        for idx in backends.len().min(max)..max {
-            let key = (base + idx) as u32;
-            let value = Backend::default();
-            let _ = update_elem(fd, &key, &value);
+        Ok(())
+    }
+
+    fn clear_vip_backends(fd: std::os::fd::RawFd, vip: u32) -> Result<()> {
+        #[repr(C)]
+        struct BpfAttrKeyIter {
+            map_fd: u32,
+            _pad: u32,
+            key: u64,
+            next_key: u64,
+        }
+
+        #[repr(C)]
+        struct BpfAttrDelete {
+            map_fd: u32,
+            _pad: u32,
+            key: u64,
+        }
+
+        let mut cursor: Option<VipBackendKey> = None;
+        loop {
+            let mut next: VipBackendKey = VipBackendKey::default();
+            let mut iter = BpfAttrKeyIter {
+                map_fd: fd as u32,
+                _pad: 0,
+                key: cursor.as_ref().map(|k| k as *const _ as u64).unwrap_or(0),
+                next_key: &mut next as *mut _ as u64,
+            };
+
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    BPF_MAP_GET_NEXT_KEY,
+                    &mut iter as *mut _,
+                    mem::size_of::<BpfAttrKeyIter>(),
+                )
+            };
+
+            if ret < 0 {
+                break;
+            }
+
+            if next.vip == vip {
+                let mut del = BpfAttrDelete {
+                    map_fd: fd as u32,
+                    _pad: 0,
+                    key: &next as *const _ as u64,
+                };
+                let _ = unsafe {
+                    libc::syscall(
+                        libc::SYS_bpf,
+                        BPF_MAP_DELETE_ELEM,
+                        &mut del as *mut _,
+                        mem::size_of::<BpfAttrDelete>(),
+                    )
+                };
+                cursor = None;
+            } else {
+                cursor = Some(next);
+            }
         }
 
         Ok(())

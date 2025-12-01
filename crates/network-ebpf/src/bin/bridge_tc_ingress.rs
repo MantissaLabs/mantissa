@@ -5,11 +5,11 @@
 use aya_ebpf::{
     bindings::{TC_ACT_OK, TC_ACT_SHOT},
     macros::{classifier, map},
-    maps::{Array, HashMap, LruHashMap, PerCpuArray},
+    maps::{HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use network_ebpf::{
-    lb::{Backend, Flow4, NatEntry, VipEntry, VipKey, MAX_BACKENDS, MAX_VIPS},
+    lb::{Backend, Flow4, NatEntry, VipBackendKey, VipEntry, VipKey, MAX_BACKENDS, MAX_VIPS},
     net::{self, EthernetHeader, Ipv4Header, UdpHeader},
     stats::{self, PacketStats},
 };
@@ -41,11 +41,11 @@ const IPPROTO_UDP: u8 = 17;
 static mut BRIDGE_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
 
 #[map(name = "LB_VIPS", pinning = "Shared")]
-static mut LB_VIPS: HashMap<VipKey, VipEntry> = HashMap::with_max_entries(64, 0);
+static mut LB_VIPS: HashMap<VipKey, VipEntry> = HashMap::with_max_entries(MAX_VIPS as u32, 0);
 
 #[map(name = "LB_BACKENDS", pinning = "Shared")]
-static mut LB_BACKENDS: Array<Backend> =
-    Array::with_max_entries((MAX_BACKENDS * MAX_VIPS) as u32, 0);
+static mut LB_BACKENDS: HashMap<VipBackendKey, Backend> =
+    HashMap::with_max_entries((MAX_BACKENDS * MAX_VIPS) as u32, 0);
 
 #[map(name = "LB_FWD", pinning = "Shared")]
 static mut LB_FWD: LruHashMap<Flow4, NatEntry> = LruHashMap::with_max_entries(1024, 0);
@@ -186,8 +186,8 @@ fn handle_arp(data: usize, data_end: usize, eth: &mut EthernetHeader) -> Result<
     Ok(TC_ACT_OK)
 }
 
-/// Select a backend for the provided VIP using a stable hash while keeping the verifier happy
-/// with bounded pointer arithmetic over the pre-sized backend array.
+/// Select a backend for the provided VIP using a stable hash while allowing an unbounded number of
+/// VIPs and a larger per-VIP backend set by storing entries in a flat hash map keyed by VIP.
 fn select_backend(flow: &Flow4, vip: u32) -> Option<NatEntry> {
     let vip_key = VipKey { vip };
     let config = unsafe { LB_VIPS.get(&vip_key)?.clone() };
@@ -196,11 +196,29 @@ fn select_backend(flow: &Flow4, vip: u32) -> Option<NatEntry> {
         return None;
     }
 
-    let vip_slot = (vip_key.vip as usize) & (MAX_VIPS - 1);
-    let flow_hash = hash_flow(flow, vip_slot as u32);
-    let idx = choose_backend_idx(flow_hash, count);
-    let backend_index = (vip_slot * MAX_BACKENDS + idx) as u32;
-    let backend = unsafe { LB_BACKENDS.get(backend_index)?.clone() };
+    let flow_hash = hash_flow(flow, vip);
+    let mut best_score: u64 = 0;
+    let mut chosen: Option<Backend> = None;
+
+    let mut idx: usize = 0;
+    while idx < count && idx < MAX_BACKENDS {
+        let key = VipBackendKey {
+            vip,
+            slot: idx as u32,
+        };
+
+        if let Some(backend) = unsafe { LB_BACKENDS.get(&key) } {
+            let score = mix64(flow_hash ^ (idx as u64));
+            if chosen.is_none() || score > best_score {
+                best_score = score;
+                chosen = Some(backend.clone());
+            }
+        }
+
+        idx += 1;
+    }
+
+    let backend = chosen?;
 
     Some(NatEntry {
         vip,
@@ -210,11 +228,11 @@ fn select_backend(flow: &Flow4, vip: u32) -> Option<NatEntry> {
     })
 }
 
-fn hash_flow(flow: &Flow4, vip_slot: u32) -> u64 {
+fn hash_flow(flow: &Flow4, vip: u32) -> u64 {
     let mut acc = (flow.src as u64) ^ ((flow.dst as u64) << 7);
     acc ^= ((flow.src_port as u64) << 32) ^ ((flow.dst_port as u64) << 19);
     acc ^= (flow.proto as u64) << 48;
-    acc ^= (vip_slot as u64) << 5;
+    acc ^= (vip as u64) << 5;
     mix64(acc)
 }
 
@@ -226,28 +244,6 @@ fn mix64(mut x: u64) -> u64 {
     x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
     x ^= x >> 33;
     x
-}
-
-/// Pick the best-scoring backend index using rendezvous hashing to keep selections stable.
-fn choose_backend_idx(flow_hash: u64, backend_count: usize) -> usize {
-    let mut best_score: u64 = 0;
-    let mut best_idx: usize = 0;
-
-    // Rendezvous hashing across the bounded backend set to keep stickiness stable.
-    let mut idx: usize = 0;
-    while idx < MAX_BACKENDS {
-        if idx >= backend_count {
-            break;
-        }
-        let score = mix64(flow_hash ^ (idx as u64));
-        if score > best_score {
-            best_score = score;
-            best_idx = idx;
-        }
-        idx += 1;
-    }
-
-    best_idx
 }
 
 fn parse_ports(
