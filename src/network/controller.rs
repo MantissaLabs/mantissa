@@ -343,7 +343,7 @@ impl NetworkController {
         let interface_ctx: NetworkInterfaceContext = (&plan).into();
         let mut retried_after_bpf_conflict = false;
         loop {
-            info!(
+            debug!(
                 target: "network",
                 network_id = %plan.network_id,
                 node_id = %self.inner.node_id,
@@ -359,7 +359,7 @@ impl NetworkController {
                 .ensure_network(&plan)
                 .await
                 .with_context(|| format!("ensure network {}", plan.network_id))?;
-            info!(
+            debug!(
                 target: "network",
                 network_id = %plan.network_id,
                 vxlan = %plan.vxlan_name,
@@ -1082,7 +1082,7 @@ mod platform {
                 return Ok(());
             }
 
-            info!(
+            debug!(
                 target: "network",
                 vxlan = %plan.vxlan_name,
                 bridge = %plan.bridge_name,
@@ -1094,7 +1094,7 @@ mod platform {
                 .ensure_vxlan(plan)
                 .await
                 .with_context(|| format!("ensure vxlan interface {}", plan.vxlan_name))?;
-            info!(
+            debug!(
                 target: "network",
                 vxlan = %plan.vxlan_name,
                 vxlan_index,
@@ -1105,7 +1105,7 @@ mod platform {
                 .ensure_bridge(plan)
                 .await
                 .with_context(|| format!("ensure bridge {}", plan.bridge_name))?;
-            info!(
+            debug!(
                 target: "network",
                 bridge = %plan.bridge_name,
                 bridge_index,
@@ -1165,7 +1165,7 @@ mod platform {
                     })?;
             }
 
-            info!(
+            debug!(
                 target: "network",
                 vxlan = %plan.vxlan_name,
                 bridge = %plan.bridge_name,
@@ -1233,7 +1233,7 @@ mod platform {
                         "failed to update vxlan configuration while reusing interface"
                     );
                 }
-                info!(
+                debug!(
                     target: "network",
                     vxlan = %plan.vxlan_name,
                     vxlan_index = index,
@@ -1564,7 +1564,7 @@ mod platform {
 
         async fn ensure_bridge(&self, plan: &NetworkPlan) -> Result<u32> {
             if let Some(index) = self.find_link(&plan.bridge_name).await? {
-                info!(
+                debug!(
                     target: "network",
                     bridge = %plan.bridge_name,
                     bridge_index = index,
@@ -1573,7 +1573,7 @@ mod platform {
                 return Ok(index);
             }
 
-            info!(
+            debug!(
                 target: "network",
                 bridge = %plan.bridge_name,
                 "provisioner: creating bridge"
@@ -1607,7 +1607,7 @@ mod platform {
                 .await
                 .context("resolve link name before bringing link up")?
                 .unwrap_or_else(|| format!("ifindex{index}"));
-            info!(
+            debug!(
                 target: "network",
                 link = %name,
                 link_index = index,
@@ -1619,7 +1619,7 @@ mod platform {
                 .execute()
                 .await
                 .with_context(|| format!("bring link {name} (index {index}) up"))?;
-            info!(
+            debug!(
                 target: "network",
                 link = %name,
                 link_index = index,
@@ -1642,7 +1642,7 @@ mod platform {
                 .await
                 .context("resolve link name before setting mtu")?
                 .unwrap_or_else(|| format!("ifindex{index}"));
-            info!(
+            debug!(
                 target: "network",
                 link = %name,
                 link_index = index,
@@ -1655,7 +1655,7 @@ mod platform {
                 .execute()
                 .await
                 .with_context(|| format!("set mtu {mtu} on link {name} (index {index})"))?;
-            info!(
+            debug!(
                 target: "network",
                 link = %name,
                 link_index = index,
@@ -1681,7 +1681,7 @@ mod platform {
                 .context("resolve bridge name before attaching interface")?
                 .unwrap_or_else(|| format!("ifindex{master_index}"));
 
-            info!(
+            debug!(
                 target: "network",
                 link = %link_name,
                 link_index,
@@ -1703,7 +1703,7 @@ mod platform {
                         "attach link {link_name} (index {link_index}) to bridge {master_name} (index {master_index})"
                     )
                 })?;
-            info!(
+            debug!(
                 target: "network",
                 link = %link_name,
                 link_index,
