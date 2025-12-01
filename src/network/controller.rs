@@ -685,6 +685,16 @@ impl NetworkController {
     }
 
     async fn mark_peer_ready(&self, network_id: Uuid) -> Result<()> {
+        if let Some(existing) = self
+            .inner
+            .registry
+            .get_peer_state(network_id, self.inner.node_id)?
+        {
+            if existing.state == NetworkPeerState::Ready && existing.error.is_none() {
+                return Ok(());
+            }
+        }
+
         let mut state = NetworkPeerStateValue::new(
             network_id,
             self.inner.node_id,
@@ -705,6 +715,18 @@ impl NetworkController {
     }
 
     async fn update_peer_state_error(&self, network_id: Uuid, message: String) -> Result<()> {
+        if let Some(existing) = self
+            .inner
+            .registry
+            .get_peer_state(network_id, self.inner.node_id)?
+        {
+            if existing.state == NetworkPeerState::Error
+                && existing.error.as_deref() == Some(message.as_str())
+            {
+                return Ok(());
+            }
+        }
+
         let mut state = NetworkPeerStateValue::new(
             network_id,
             self.inner.node_id,
