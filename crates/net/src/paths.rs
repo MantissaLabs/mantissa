@@ -44,10 +44,10 @@ pub fn ensure_state_dir() -> io::Result<PathBuf> {
         let desired_mode = if running_as_root() { 0o750 } else { 0o700 };
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(desired_mode));
 
-        if running_as_root() {
-            if let Some(gid) = lookup_group_gid(MANTISSA_GROUP) {
-                let _ = chown_group(&path, gid);
-            }
+        if running_as_root()
+            && let Some(gid) = lookup_group_gid(MANTISSA_GROUP)
+        {
+            let _ = chown_group(&path, gid);
         }
     }
 
@@ -57,10 +57,10 @@ pub fn ensure_state_dir() -> io::Result<PathBuf> {
 /// Helper to change a filesystem object's group to `mantissa`.
 #[cfg(unix)]
 pub fn ensure_mantissa_group(path: &Path) {
-    if running_as_root() {
-        if let Some(gid) = lookup_group_gid(MANTISSA_GROUP) {
-            let _ = chown_group(path, gid);
-        }
+    if running_as_root()
+        && let Some(gid) = lookup_group_gid(MANTISSA_GROUP)
+    {
+        let _ = chown_group(path, gid);
     }
 }
 

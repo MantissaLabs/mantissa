@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::too_many_arguments)]
+
 extern crate clap;
 extern crate log;
 extern crate sysinfo;

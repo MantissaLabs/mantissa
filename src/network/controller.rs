@@ -21,7 +21,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc::UnboundedReceiver};
 use tokio::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -87,7 +87,7 @@ fn default_bpf_programs() -> Vec<BpfProgramSpec> {
 }
 
 impl NetworkController {
-    #[allow(clippy::arc_with_non_send_sync)]
+    #[allow(clippy::arc_with_non_send_sync, clippy::too_many_arguments)]
     pub fn new(
         registry: NetworkRegistry,
         cluster_registry: Registry,
@@ -448,10 +448,8 @@ impl NetworkController {
             if let Some(sys) = cause.downcast_ref::<SyscallError>() {
                 return Self::is_link_create_conflict(sys);
             }
-            if let Some(program_err) = cause.downcast_ref::<ProgramError>() {
-                if let ProgramError::SyscallError(sys) = program_err {
-                    return Self::is_link_create_conflict(sys);
-                }
+            if let Some(ProgramError::SyscallError(sys)) = cause.downcast_ref::<ProgramError>() {
+                return Self::is_link_create_conflict(sys);
             }
             false
         })
@@ -689,10 +687,10 @@ impl NetworkController {
             .inner
             .registry
             .get_peer_state(network_id, self.inner.node_id)?
+            && existing.state == NetworkPeerState::Ready
+            && existing.error.is_none()
         {
-            if existing.state == NetworkPeerState::Ready && existing.error.is_none() {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         let mut state = NetworkPeerStateValue::new(
@@ -719,12 +717,10 @@ impl NetworkController {
             .inner
             .registry
             .get_peer_state(network_id, self.inner.node_id)?
+            && existing.state == NetworkPeerState::Error
+            && existing.error.as_deref() == Some(message.as_str())
         {
-            if existing.state == NetworkPeerState::Error
-                && existing.error.as_deref() == Some(message.as_str())
-            {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         let mut state = NetworkPeerStateValue::new(
@@ -1186,7 +1182,7 @@ mod platform {
             };
             handle
                 .address()
-                .add(bridge_index, IpAddr::V4(ip), prefix.into())
+                .add(bridge_index, IpAddr::V4(ip), prefix)
                 .replace()
                 .execute()
                 .await
@@ -1455,8 +1451,8 @@ mod platform {
                 for attr in &proto_attrs {
                     let value_len = attr.value_len();
                     let attr_len = (NLA_HEADER_SIZE + value_len) as u16;
-                    let aligned_len = ((attr_len as usize) + (NLA_ALIGNTO as usize) - 1)
-                        & !(NLA_ALIGNTO as usize - 1);
+                    let align = NLA_ALIGNTO;
+                    let aligned_len = ((attr_len as usize) + align - 1) & !(align - 1);
                     let start = buf.len();
                     buf.resize(start + aligned_len, 0);
                     {
@@ -1607,18 +1603,21 @@ mod platform {
                 .await
                 .context("resolve link name before bringing link up")?
                 .unwrap_or_else(|| format!("ifindex{index}"));
+
             debug!(
                 target: "network",
                 link = %name,
                 link_index = index,
                 "provisioner: bringing link up"
             );
+
             handle
                 .link()
                 .set(LinkUnspec::new_with_index(index).up().build())
                 .execute()
                 .await
                 .with_context(|| format!("bring link {name} (index {index}) up"))?;
+
             debug!(
                 target: "network",
                 link = %name,
@@ -1721,30 +1720,27 @@ mod platform {
 
             let mut stream = handle.link().get().match_name(name.to_string()).execute();
 
-            loop {
-                match stream.try_next().await {
-                    Ok(Some(link)) => return Ok(Some(link.header.index)),
-                    Ok(None) => break,
-                    Err(RtnetlinkError::NetlinkError(msg)) => {
-                        let raw = msg.raw_code();
-                        let errno = raw.abs();
-                        if errno == libc::ENODEV || errno == libc::ENOENT {
-                            debug!(
-                                target: "network",
-                                link = name,
-                                errno,
-                                raw_code = raw,
-                                "link lookup returned ENODEV/ENOENT; treating as absent"
-                            );
-                            return Ok(None);
-                        }
-                        return Err(RtnetlinkError::NetlinkError(msg).into());
+            match stream.try_next().await {
+                Ok(Some(link)) => Ok(Some(link.header.index)),
+                Ok(None) => Ok(None),
+                Err(RtnetlinkError::NetlinkError(msg)) => {
+                    let raw = msg.raw_code();
+                    let errno = raw.abs();
+                    if errno == libc::ENODEV || errno == libc::ENOENT {
+                        debug!(
+                            target: "network",
+                            link = name,
+                            errno,
+                            raw_code = raw,
+                            "link lookup returned ENODEV/ENOENT; treating as absent"
+                        );
+                        Ok(None)
+                    } else {
+                        Err(RtnetlinkError::NetlinkError(msg).into())
                     }
-                    Err(err) => return Err(err.into()),
                 }
+                Err(err) => Err(err.into()),
             }
-
-            Ok(None)
         }
 
         async fn underlay_info(&self) -> Result<(u32, IpAddr)> {
@@ -1853,7 +1849,7 @@ mod platform {
                         if let AddressAttribute::Address(addr) | AddressAttribute::Local(addr) =
                             attr
                         {
-                            let ip = addr.clone();
+                            let ip = *addr;
                             if ip.is_loopback() {
                                 continue;
                             }

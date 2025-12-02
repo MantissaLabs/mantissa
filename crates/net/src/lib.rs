@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if)]
+
 pub mod inproc;
 pub mod noise;
 pub mod paths;

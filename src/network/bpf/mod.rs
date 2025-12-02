@@ -227,17 +227,17 @@ mod platform {
             let map_pin_path = map_pin_dir(network_id)?;
             {
                 let guard = self.loaded.lock().await;
-                if let Some(existing) = guard.get(&network_id) {
-                    if existing.matches(programs) {
-                        if lb_maps_required(programs) && !lb_maps_present(&map_pin_path) {
-                            warn!(
-                                target: "network",
-                                network = %network_id,
-                                "load balancer maps missing despite matching programs; forcing reload"
-                            );
-                        } else {
-                            return Ok(());
-                        }
+                if let Some(existing) = guard.get(&network_id)
+                    && existing.matches(programs)
+                {
+                    if lb_maps_required(programs) && !lb_maps_present(&map_pin_path) {
+                        warn!(
+                            target: "network",
+                            network = %network_id,
+                            "load balancer maps missing despite matching programs; forcing reload"
+                        );
+                    } else {
+                        return Ok(());
                     }
                 }
             }
@@ -246,14 +246,14 @@ mod platform {
             let previous = guard.remove(&network_id);
             drop(guard);
 
-            if let Some(existing) = previous {
-                if let Err(err) = existing.teardown() {
-                    warn!(
-                        target: "network",
-                        network = %network_id,
-                        "failed to detach existing bpf programs before reattach: {err:#}"
-                    );
-                }
+            if let Some(existing) = previous
+                && let Err(err) = existing.teardown()
+            {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    "failed to detach existing bpf programs before reattach: {err:#}"
+                );
             }
 
             self.clear_stale_xdp_targets(programs, interfaces);
@@ -308,14 +308,14 @@ mod platform {
             }
 
             let mut guard = self.loaded.lock().await;
-            if let Some(replaced) = guard.insert(network_id, network) {
-                if let Err(err) = replaced.teardown() {
-                    warn!(
-                        target: "network",
-                        network = %network_id,
-                        "failed to detach replaced bpf programs after ensure: {err:#}"
-                    );
-                }
+            if let Some(replaced) = guard.insert(network_id, network)
+                && let Err(err) = replaced.teardown()
+            {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    "failed to detach replaced bpf programs after ensure: {err:#}"
+                );
             }
             Ok(())
         }
@@ -598,15 +598,15 @@ mod platform {
                 continue;
             };
             let path = base.join(name);
-            if let Err(err) = map.pin(&path) {
-                if !is_already_pinned(&err) {
-                    warn!(
-                        target: "network",
-                        map = %name,
-                        path = %path.display(),
-                        "failed to pin lb map (continuing with in-kernel handle): {err:#}"
-                    );
-                }
+            if let Err(err) = map.pin(&path)
+                && !is_already_pinned(&err)
+            {
+                warn!(
+                    target: "network",
+                    map = %name,
+                    path = %path.display(),
+                    "failed to pin lb map (continuing with in-kernel handle): {err:#}"
+                );
             }
         }
 
@@ -709,11 +709,11 @@ mod platform {
                 return sys.call == "bpf_link_create"
                     && matches!(sys.io_error.raw_os_error(), Some(code) if code == libc::EEXIST);
             }
-            if let Some(program_err) = cause.downcast_ref::<aya::programs::ProgramError>() {
-                if let aya::programs::ProgramError::SyscallError(sys) = program_err {
-                    return sys.call == "bpf_link_create"
-                        && matches!(sys.io_error.raw_os_error(), Some(code) if code == libc::EEXIST);
-                }
+            if let Some(aya::programs::ProgramError::SyscallError(sys)) =
+                cause.downcast_ref::<aya::programs::ProgramError>()
+            {
+                return sys.call == "bpf_link_create"
+                    && matches!(sys.io_error.raw_os_error(), Some(code) if code == libc::EEXIST);
             }
             false
         })
@@ -820,7 +820,10 @@ mod platform {
             req.header.nlmsg_seq = 1;
             req.ifinfo.ifi_family = AF_UNSPEC as u8;
             req.ifinfo.ifi_index = if_index;
-            req.xdp_attr.nla_type = (NLA_F_NESTED as u16) | (IFLA_XDP as u16);
+            #[allow(clippy::unnecessary_cast)]
+            {
+                req.xdp_attr.nla_type = (NLA_F_NESTED as u16) | (IFLA_XDP as u16);
+            }
             req.xdp_attr.nla_len = (mem::size_of::<nlattr>() * 2 + mem::size_of::<i32>()) as u16;
             req.fd_attr.nla_type = IFLA_XDP_FD_ATTR;
             req.fd_attr.nla_len = (mem::size_of::<nlattr>() + mem::size_of::<i32>()) as u16;

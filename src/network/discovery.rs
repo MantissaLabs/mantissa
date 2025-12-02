@@ -90,10 +90,10 @@ impl ServiceDiscovery {
 
         {
             let guard = self.servers.lock().await;
-            if let Some(existing) = guard.get(&spec.id) {
-                if existing.resolver_ip == resolver_ip {
-                    return Ok(());
-                }
+            if let Some(existing) = guard.get(&spec.id)
+                && existing.resolver_ip == resolver_ip
+            {
+                return Ok(());
             }
         }
 
@@ -146,6 +146,7 @@ impl ServiceDiscovery {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_dns_server(
     registry: NetworkRegistry,
     tasks: TaskStore,
@@ -279,6 +280,7 @@ async fn spawn_dns_server(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_datagram(
     socket: &UdpSocket,
     payload: &[u8],
@@ -392,17 +394,16 @@ async fn handle_datagram(
         }
     }
 
-    if answers_added {
-        response.set_response_code(ResponseCode::NoError);
-    } else if saw_nodata {
-        response.set_response_code(ResponseCode::NoError);
+    let code = if answers_added || saw_nodata {
+        ResponseCode::NoError
     } else if saw_notimp {
-        response.set_response_code(ResponseCode::NotImp);
+        ResponseCode::NotImp
     } else if saw_nxdomain {
-        response.set_response_code(ResponseCode::NXDomain);
+        ResponseCode::NXDomain
     } else {
-        response.set_response_code(ResponseCode::ServFail);
-    }
+        ResponseCode::ServFail
+    };
+    response.set_response_code(code);
 
     let bytes = response.to_vec().context("encode dns response")?;
     socket
@@ -419,6 +420,7 @@ enum LookupOutcome {
     NotImplemented,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn answer_query(
     query: &Query,
     registry: &NetworkRegistry,
@@ -506,8 +508,8 @@ async fn answer_query(
         )
     }));
 
-    if let Some((vip, mac)) = compute_service_vip(registry, network_id, &service_name, &backends)? {
-        if program_service_vip(
+    if let Some((vip, mac)) = compute_service_vip(registry, network_id, &service_name, &backends)?
+        && program_service_vip(
             bpf_lb,
             bpf,
             lb_missing,
@@ -519,13 +521,12 @@ async fn answer_query(
             &backends,
         )
         .await
-        {
-            records.push(Record::from_rdata(
-                query.name().clone(),
-                SERVICE_TTL_SECS,
-                RData::A(vip.into()),
-            ));
-        }
+    {
+        records.push(Record::from_rdata(
+            query.name().clone(),
+            SERVICE_TTL_SECS,
+            RData::A(vip.into()),
+        ));
     }
 
     Ok(LookupOutcome::Records(records))

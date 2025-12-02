@@ -40,7 +40,7 @@ pub fn vxlan_xdp(ctx: XdpContext) -> u32 {
 fn validate_vxlan(ctx: &XdpContext) -> Result<(), ()> {
     let data = ctx.data();
     let data_end = ctx.data_end();
-    let eth: EthernetHeader = unsafe { net::read_at(data, data_end, 0)? };
+    let eth: EthernetHeader = unsafe { net::read_at(data, data_end, 0).map_err(|_| ())? };
     let proto = eth.protocol();
     if proto != ETH_P_IPV4 && proto != ETH_P_IPV6 && proto != ETH_P_ARP {
         return Err(());

@@ -144,14 +144,14 @@ impl ServiceManifest {
                     ));
                 }
 
-                if let Some(count) = policy.max_retry_count {
-                    if count > i32::MAX as u32 {
-                        return Err(anyhow!(
-                            "task '{}' must set max_retry_count <= {}",
-                            task.name,
-                            i32::MAX
-                        ));
-                    }
+                if let Some(count) = policy.max_retry_count
+                    && count > i32::MAX as u32
+                {
+                    return Err(anyhow!(
+                        "task '{}' must set max_retry_count <= {}",
+                        task.name,
+                        i32::MAX
+                    ));
                 }
             }
 
@@ -227,14 +227,14 @@ impl ServiceManifest {
                     })?;
                 }
 
-                if let Some(mode) = file.mode {
-                    if mode > 0o7777 {
-                        return Err(anyhow!(
-                            "task '{}' secret file '{}' must set a POSIX mode <= 0o7777",
-                            task.name,
-                            file.path
-                        ));
-                    }
+                if let Some(mode) = file.mode
+                    && mode > 0o7777
+                {
+                    return Err(anyhow!(
+                        "task '{}' secret file '{}' must set a POSIX mode <= 0o7777",
+                        task.name,
+                        file.path
+                    ));
                 }
             }
 

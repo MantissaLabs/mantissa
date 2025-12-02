@@ -109,16 +109,15 @@ impl node::Server for Node {
             let builder = &mut builder;
             let mut system = builder.init_root::<SystemInfo::Builder>();
 
-            if info.hostname.is_some() {
-                system.set_hostname(info.hostname.unwrap());
+            if let Some(hostname) = info.hostname {
+                system.set_hostname(hostname);
             }
 
             // Operating system
             {
                 let mut os = system.reborrow().init_os();
 
-                if info.os_info.is_some() {
-                    let os_info = info.os_info.unwrap();
+                if let Some(os_info) = info.os_info {
                     os.set_name(&os_info.os_name);
                     os.set_version(&os_info.os_version);
                     os.set_kernel_version(&os_info.kernel_version)
@@ -129,8 +128,7 @@ impl node::Server for Node {
             {
                 let mut load = system.reborrow().init_load();
 
-                if info.load_info.is_some() {
-                    let load_info = info.load_info.unwrap();
+                if let Some(load_info) = info.load_info {
                     load.set_one(load_info.one);
                     load.set_five(load_info.five);
                     load.set_fifteen(load_info.fifteen);
@@ -141,8 +139,7 @@ impl node::Server for Node {
             {
                 let mut cpu = system.reborrow().init_cpu();
 
-                if info.cpu_info.is_some() {
-                    let cpu_info = info.cpu_info.unwrap();
+                if let Some(cpu_info) = info.cpu_info {
                     cpu.set_vendor(cpu_info.vendor.unwrap_or(String::from("Unknown")));
                     cpu.set_brand(cpu_info.brand.unwrap_or(String::from("Unknown")));
                     cpu.set_codename(cpu_info.codename.unwrap_or(String::from("Unknown")));
@@ -161,8 +158,7 @@ impl node::Server for Node {
             {
                 let mut mem = system.reborrow().init_memory();
 
-                if info.mem_info.is_some() {
-                    let mem_info = info.mem_info.unwrap();
+                if let Some(mem_info) = info.mem_info {
                     mem.set_total(mem_info.total);
                     mem.set_free(mem_info.free);
                     mem.set_avail(mem_info.available);
@@ -175,8 +171,7 @@ impl node::Server for Node {
             {
                 let mut disk = system.reborrow().init_disk();
 
-                if info.disk_info.is_some() {
-                    let disk_info = info.disk_info.unwrap();
+                if let Some(disk_info) = info.disk_info {
                     disk.set_total(disk_info.total);
                     disk.set_free(disk_info.free);
                 }

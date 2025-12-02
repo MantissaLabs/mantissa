@@ -121,23 +121,13 @@ mod platform {
     unsafe impl Pod for Backend {}
 
     #[repr(C)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Default)]
     struct VipEntry {
         vip_mac: [u8; 6],
         backend_count: u8,
         _pad: [u8; 3],
     }
     unsafe impl Pod for VipEntry {}
-
-    impl Default for VipEntry {
-        fn default() -> Self {
-            Self {
-                vip_mac: [0; 6],
-                backend_count: 0,
-                _pad: [0; 3],
-            }
-        }
-    }
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -163,10 +153,11 @@ mod platform {
     unsafe impl Pod for NatEntry {}
 
     fn build_vip_entry(vip_mac: [u8; 6], backends: &[BackendAddress]) -> VipEntry {
-        let mut entry = VipEntry::default();
-        entry.vip_mac = vip_mac;
-        entry.backend_count = backends.len().min(MAX_BACKENDS) as u8;
-        entry
+        VipEntry {
+            vip_mac,
+            backend_count: backends.len().min(MAX_BACKENDS) as u8,
+            ..VipEntry::default()
+        }
     }
 
     fn program_backends(

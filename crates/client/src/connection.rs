@@ -89,12 +89,12 @@ async fn client_from_unix_stream(
 }
 
 fn classify_path_not_socket(path: &Path) -> Option<ClientSocketError> {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if !meta.file_type().is_socket() {
-            return Some(ClientSocketError::NotASocket {
-                path: path.to_path_buf(),
-            });
-        }
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && !meta.file_type().is_socket()
+    {
+        return Some(ClientSocketError::NotASocket {
+            path: path.to_path_buf(),
+        });
     }
     None
 }

@@ -24,16 +24,30 @@ pub mod stats {
     }
 
     #[inline(always)]
+    /// Record a passed packet into the per-CPU stats map.
+    ///
+    /// # Safety
+    /// Caller must pass a valid pointer to a `PerCpuArray<PacketStats>` with at least one slot and
+    /// obey eBPF verifier rules for concurrent access.
     pub unsafe fn record_pass(map: *mut PerCpuArray<PacketStats>, len: usize) {
         update(map, len, false);
     }
 
     #[inline(always)]
+    /// Record a dropped packet into the per-CPU stats map.
+    ///
+    /// # Safety
+    /// Caller must pass a valid pointer to a `PerCpuArray<PacketStats>` with at least one slot and
+    /// obey eBPF verifier rules for concurrent access.
     pub unsafe fn record_drop(map: *mut PerCpuArray<PacketStats>, len: usize) {
         update(map, len, true);
     }
 
     #[inline(always)]
+    /// Shared counter update helper.
+    ///
+    /// # Safety
+    /// `map` must be a valid pointer to a per-CPU stats array.
     unsafe fn update(map: *mut PerCpuArray<PacketStats>, len: usize, dropped: bool) {
         let map_ref = &*map;
         if let Some(ptr) = map_ref.get_ptr_mut(0) {
@@ -125,11 +139,25 @@ pub mod net {
         data_end.saturating_sub(data)
     }
 
-    #[inline(always)]
-    pub unsafe fn read_at<T: Copy>(data: usize, data_end: usize, offset: usize) -> Result<T, ()> {
+    /// Errors that can occur when reading from packet memory.
+    #[derive(Clone, Copy, Debug)]
+    pub enum PacketReadError {
+        OutOfBounds,
+    }
+
+    /// Read a value of type `T` from the packet buffer at the provided offset.
+    ///
+    /// # Safety
+    /// Caller must ensure `data` and `data_end` bound a valid packet region and that `offset`
+    /// plus `size_of::<T>()` does not exceed `data_end`.
+    pub unsafe fn read_at<T: Copy>(
+        data: usize,
+        data_end: usize,
+        offset: usize,
+    ) -> Result<T, PacketReadError> {
         let size = mem::size_of::<T>();
         if data + offset + size > data_end {
-            return Err(());
+            return Err(PacketReadError::OutOfBounds);
         }
         let ptr = (data + offset) as *const T;
         Ok(ptr::read_unaligned(ptr))
@@ -146,19 +174,35 @@ pub mod net {
     }
 
     #[inline(always)]
-    pub unsafe fn ptr_at<T>(data: usize, data_end: usize, offset: usize) -> Result<*const T, ()> {
+    /// Return a const pointer to `T` within the packet buffer.
+    ///
+    /// # Safety
+    /// Caller must ensure the pointer stays within the bounds of the packet slice.
+    pub unsafe fn ptr_at<T>(
+        data: usize,
+        data_end: usize,
+        offset: usize,
+    ) -> Result<*const T, PacketReadError> {
         let size = mem::size_of::<T>();
         if data + offset + size > data_end {
-            return Err(());
+            return Err(PacketReadError::OutOfBounds);
         }
         Ok((data + offset) as *const T)
     }
 
     #[inline(always)]
-    pub unsafe fn mut_ptr_at<T>(data: usize, data_end: usize, offset: usize) -> Result<*mut T, ()> {
+    /// Return a mutable pointer to `T` within the packet buffer.
+    ///
+    /// # Safety
+    /// Caller must ensure exclusive access and that the returned pointer is in-bounds.
+    pub unsafe fn mut_ptr_at<T>(
+        data: usize,
+        data_end: usize,
+        offset: usize,
+    ) -> Result<*mut T, PacketReadError> {
         let size = mem::size_of::<T>();
         if data + offset + size > data_end {
-            return Err(());
+            return Err(PacketReadError::OutOfBounds);
         }
         Ok((data + offset) as *mut T)
     }

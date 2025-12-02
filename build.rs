@@ -10,8 +10,9 @@ use std::error::Error;
 /// Build the eBPF programs when compiling on Linux, ensuring artifacts are
 /// available for runtime networking features.
 fn build_bpf() -> Result<(), Box<dyn Error>> {
+    println!("cargo:rerun-if-env-changed=MANTISSA_SKIP_BPF");
+
     if env::var_os("MANTISSA_SKIP_BPF").is_some() {
-        println!("cargo:warning=skipping eBPF compilation (MANTISSA_SKIP_BPF set)");
         return Ok(());
     }
 
@@ -30,10 +31,7 @@ fn build_bpf() -> Result<(), Box<dyn Error>> {
                 .manifest_path
                 .parent()
                 .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        "network-ebpf manifest path does not have a parent directory",
-                    )
+                    io::Error::other("network-ebpf manifest path does not have a parent directory")
                 })?
                 .as_str();
 
@@ -63,10 +61,7 @@ fn build_bpf() -> Result<(), Box<dyn Error>> {
     aya_build::build_ebpf(packages.into_iter(), toolchain)?;
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "OUT_DIR missing while copying compiled eBPF artifacts",
-        )
+        io::Error::other("OUT_DIR missing while copying compiled eBPF artifacts")
     })?);
     let dest_dir = manifest_dir.join("target/bpf");
     fs::create_dir_all(&dest_dir)?;

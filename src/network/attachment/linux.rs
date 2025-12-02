@@ -198,29 +198,29 @@ impl AttachmentProvisioner {
             return Ok(());
         };
         let host_if = host_iface_name(attachment_id);
-        if let Some(index) = self.link_index(handle, &host_if).await? {
-            if let Err(err) = handle.link().del(index).execute().await {
-                match err {
-                    rtnetlink::Error::NetlinkError(message) => {
-                        let raw = message.raw_code();
-                        let errno = raw.abs();
-                        if errno == libc::ENODEV || errno == libc::ENOENT || errno == libc::ENXIO {
-                            debug!(
-                                target: "task",
-                                link = host_if,
-                                errno,
-                                raw_code = raw,
-                                "interface already removed while deleting; ignoring"
-                            );
-                        } else {
-                            return Err(rtnetlink::Error::NetlinkError(message))
-                                .with_context(|| format!("failed to delete interface {host_if}"));
-                        }
-                    }
-                    other => {
-                        return Err(other)
+        if let Some(index) = self.link_index(handle, &host_if).await?
+            && let Err(err) = handle.link().del(index).execute().await
+        {
+            match err {
+                rtnetlink::Error::NetlinkError(message) => {
+                    let raw = message.raw_code();
+                    let errno = raw.abs();
+                    if errno == libc::ENODEV || errno == libc::ENOENT || errno == libc::ENXIO {
+                        debug!(
+                            target: "task",
+                            link = host_if,
+                            errno,
+                            raw_code = raw,
+                            "interface already removed while deleting; ignoring"
+                        );
+                    } else {
+                        return Err(rtnetlink::Error::NetlinkError(message))
                             .with_context(|| format!("failed to delete interface {host_if}"));
                     }
+                }
+                other => {
+                    return Err(other)
+                        .with_context(|| format!("failed to delete interface {host_if}"));
                 }
             }
         }
@@ -254,7 +254,7 @@ impl AttachmentProvisioner {
                     dst = %dst,
                     "programmed static vxlan fdb entry"
                 );
-                return Ok(true);
+                Ok(true)
             }
             Err(rtnetlink::Error::NetlinkError(message))
                 if message.raw_code().abs() == libc::EOPNOTSUPP =>
@@ -266,11 +266,10 @@ impl AttachmentProvisioner {
                     dst = %dst,
                     "kernel rejected static fdb entry (unsupported); continuing"
                 );
-                return Ok(false);
+                Ok(false)
             }
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to program fdb entry {mac} -> {dst}"));
+                Err(err).with_context(|| format!("failed to program fdb entry {mac} -> {dst}"))
             }
         }
     }
@@ -328,31 +327,27 @@ impl AttachmentProvisioner {
     async fn link_index(&self, handle: &Handle, name: &str) -> Result<Option<u32>> {
         let mut stream = handle.link().get().match_name(name.to_string()).execute();
 
-        loop {
-            match stream.try_next().await {
-                Ok(Some(msg)) => return Ok(Some(msg.header.index)),
-                Ok(None) => break,
-                Err(rtnetlink::Error::NetlinkError(message)) => {
-                    let raw = message.raw_code();
-                    let errno = raw.abs();
-                    if errno == libc::ENODEV || errno == libc::ENOENT {
-                        debug!(
-                            target: "task",
-                            link = name,
-                            errno,
-                            raw_code = raw,
-                            "link lookup returned ENODEV/ENOENT; treating as absent"
-                        );
-                        return Ok(None);
-                    }
-                    return Err(rtnetlink::Error::NetlinkError(message))
-                        .context("query link state");
+        match stream.try_next().await {
+            Ok(Some(msg)) => Ok(Some(msg.header.index)),
+            Ok(None) => Ok(None),
+            Err(rtnetlink::Error::NetlinkError(message)) => {
+                let raw = message.raw_code();
+                let errno = raw.abs();
+                if errno == libc::ENODEV || errno == libc::ENOENT {
+                    debug!(
+                        target: "task",
+                        link = name,
+                        errno,
+                        raw_code = raw,
+                        "link lookup returned ENODEV/ENOENT; treating as absent"
+                    );
+                    Ok(None)
+                } else {
+                    Err(rtnetlink::Error::NetlinkError(message)).context("query link state")
                 }
-                Err(err) => return Err(err).context("query link state"),
             }
+            Err(err) => Err(err).context("query link state"),
         }
-
-        Ok(None)
     }
 
     async fn program_fdb_entry(
@@ -488,14 +483,13 @@ fn parse_mac(mac: &str) -> Result<Vec<u8>> {
 
 fn warn_unless_not_found(err: rtnetlink::Error, context: impl FnOnce() -> String) {
     use tracing::warn;
-    if let rtnetlink::Error::NetlinkError(ref message) = err {
-        if message
+    if let rtnetlink::Error::NetlinkError(ref message) = err
+        && message
             .code
             .map(|code| code.get() == -libc::ENOENT)
             .unwrap_or(false)
-        {
-            return;
-        }
+    {
+        return;
     }
     warn!(target: "network", "{}: {err}", context());
 }
@@ -577,7 +571,7 @@ fn configure_interface_in_current_ns(
 
         handle
             .address()
-            .add(index, IpAddr::V4(assigned_ip), prefix.into())
+            .add(index, IpAddr::V4(assigned_ip), prefix)
             .replace()
             .execute()
             .await

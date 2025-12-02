@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::too_many_arguments)]
+
 pub mod config;
 pub mod connection;
 mod errors;

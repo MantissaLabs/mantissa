@@ -784,10 +784,10 @@ async fn wait_for_service_status(
 ) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if let Ok(Some(spec)) = manager.registry().get(service_id) {
-            if spec.status() == expected {
-                return true;
-            }
+        if let Ok(Some(spec)) = manager.registry().get(service_id)
+            && spec.status() == expected
+        {
+            return true;
         }
         sleep(Duration::from_millis(50)).await;
     }

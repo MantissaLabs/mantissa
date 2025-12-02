@@ -534,10 +534,10 @@ impl TestNode {
     ) -> Result<(), capnp::Error> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(s) = self.list_status_of(target).await? {
-                if s == expect {
-                    return Ok(());
-                }
+            if let Some(s) = self.list_status_of(target).await?
+                && s == expect
+            {
+                return Ok(());
             }
             if Instant::now() > deadline {
                 return Err(capnp::Error::failed(format!(

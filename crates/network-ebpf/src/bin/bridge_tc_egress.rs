@@ -50,14 +50,15 @@ fn handle_packet(ctx: &TcContext) -> Result<i32, ()> {
     let data = ctx.data();
     let data_end = ctx.data_end();
 
-    let eth: *mut EthernetHeader = unsafe { net::mut_ptr_at(data, data_end, 0)? };
+    let eth: *mut EthernetHeader = unsafe { net::mut_ptr_at(data, data_end, 0).map_err(|_| ())? };
     let eth_hdr = unsafe { &mut *eth };
     if eth_hdr.protocol() != ETH_P_IPV4 {
         return Ok(TC_ACT_OK);
     }
 
     let ip_offset = net::ETH_HDR_LEN;
-    let ip: *mut Ipv4Header = unsafe { net::mut_ptr_at(data, data_end, ip_offset)? };
+    let ip: *mut Ipv4Header =
+        unsafe { net::mut_ptr_at(data, data_end, ip_offset).map_err(|_| ())? };
     let ip_hdr = unsafe { &mut *ip };
     if ip_hdr.version() != 4 || ip_hdr.is_fragmented() {
         return Ok(TC_ACT_OK);
@@ -100,7 +101,7 @@ fn parse_ports(
     proto: u8,
 ) -> Result<(u16, u16), ()> {
     if proto == IPPROTO_TCP || proto == IPPROTO_UDP {
-        let udp: UdpHeader = unsafe { net::read_at(data, data_end, l4_offset)? };
+        let udp: UdpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
         return Ok((udp.source, udp.dest));
     }
     Err(())
@@ -124,7 +125,7 @@ fn apply_snat(
     if proto == IPPROTO_TCP || proto == IPPROTO_UDP {
         let csum_offset = l4_offset + 16;
         let checksum_ptr: *mut u16 =
-            unsafe { net::mut_ptr_at(data, data_end, csum_offset)? } as *mut u16;
+            unsafe { net::mut_ptr_at(data, data_end, csum_offset).map_err(|_| ())? } as *mut u16;
         let csum = unsafe { *checksum_ptr };
         let updated = update_checksum(csum, old_src, ip.src);
         unsafe { *checksum_ptr = updated };

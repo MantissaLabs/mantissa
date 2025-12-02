@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+
 [dependencies]
 aya-ebpf = { git = "https://github.com/aya-rs/aya", rev = "c65a200e9a6b0349178c0ee2bba280e498b48108", package = "aya-ebpf" }
 aya-ebpf-macros = { git = "https://github.com/aya-rs/aya", rev = "c65a200e9a6b0349178c0ee2bba280e498b48108", package = "aya-ebpf-macros" }
