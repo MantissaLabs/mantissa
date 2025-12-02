@@ -1,7 +1,10 @@
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +41,16 @@ pub struct HealthMonitor {
     status: Mutex<HashMap<Uuid, Status>>,
 }
 
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            warn!("{name} mutex poisoned: {err}");
+            err.into_inner()
+        }
+    }
+}
+
 impl HealthMonitor {
     pub fn new(cfg: Config) -> Arc<Self> {
         Arc::new(Self {
@@ -60,31 +73,34 @@ impl HealthMonitor {
 
     pub fn observe_seen(&self, id: Uuid) {
         let now = Instant::now();
-        self.last_seen.lock().unwrap().insert(id, now);
-        self.status.lock().unwrap().insert(id, Status::Alive);
+        lock_or_recover(&self.last_seen, "health.last_seen").insert(id, now);
+        lock_or_recover(&self.status, "health.status").insert(id, Status::Alive);
     }
 
     pub fn set_status(&self, id: Uuid, s: Status) {
-        self.status.lock().unwrap().insert(id, s);
+        lock_or_recover(&self.status, "health.status").insert(id, s);
     }
 
     pub fn status(&self, id: Uuid) -> Status {
         self.status
             .lock()
-            .unwrap()
+            .unwrap_or_else(|err| {
+                warn!("health.status mutex poisoned: {err}");
+                err.into_inner()
+            })
             .get(&id)
             .cloned()
             .unwrap_or(Status::Unknown)
     }
 
     pub fn snapshot(&self) -> HashMap<Uuid, Status> {
-        self.status.lock().unwrap().clone()
+        lock_or_recover(&self.status, "health.status").clone()
     }
 
     fn recompute(&self) {
         let now = Instant::now();
-        let mut status = self.status.lock().unwrap();
-        let seen = self.last_seen.lock().unwrap();
+        let mut status = lock_or_recover(&self.status, "health.status");
+        let seen = lock_or_recover(&self.last_seen, "health.last_seen");
 
         for (id, last) in seen.iter() {
             let elapsed = now.saturating_duration_since(*last);

@@ -3,6 +3,9 @@ name = "health"
 version = "0.1.0"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 tokio = { version = "1", features = ["time", "sync", "rt"] }
 uuid = { version = "1", features = ["v4"] }

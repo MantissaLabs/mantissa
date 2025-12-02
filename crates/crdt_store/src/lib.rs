@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 //! Generic Redb-backed CRDT store with Merkle Search Tree ranges.
 //!
 //! - Parameterised by a `RegAdapter` that maps a CRDT register type to

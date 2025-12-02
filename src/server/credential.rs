@@ -79,10 +79,13 @@ impl ClusterCredential {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(dur) => dur.as_secs(),
+        Err(err) => {
+            tracing::warn!("system clock error for credential verification: {err}");
+            0
+        }
+    }
 }
 
 /// Minimal serde helpers to encode/decode ed25519 types as raw bytes.

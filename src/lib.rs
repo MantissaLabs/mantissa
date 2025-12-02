@@ -1,4 +1,4 @@
-#![allow(clippy::collapsible_if, clippy::too_many_arguments)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub use protocol::{
     gossip_capnp, health_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,

@@ -39,6 +39,16 @@ use x25519_dalek::PublicKey;
 
 use self::peer_snapshot::{PeerSnapshot, PeerSnapshotCache};
 
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(err) => {
+            error!("{name} mutex poisoned: {err}");
+            err.into_inner()
+        }
+    }
+}
+
 pub mod health;
 pub mod peer_provider;
 mod peer_snapshot;
@@ -99,19 +109,20 @@ impl Networking {
     }
 
     fn set_bound(&self, addr: SocketAddr) {
-        *self.bound_addr.lock().unwrap() = Some(addr);
+        *lock_or_recover(&self.bound_addr, "topology.bound_addr") = Some(addr);
     }
 
     fn set_override<S: Into<String>>(&self, addr: Option<S>) {
-        *self.advertise_override.lock().unwrap() = addr.map(Into::into);
+        *lock_or_recover(&self.advertise_override, "topology.advertise_override") =
+            addr.map(Into::into);
     }
 
     fn override_addr(&self) -> Option<String> {
-        self.advertise_override.lock().unwrap().clone()
+        lock_or_recover(&self.advertise_override, "topology.advertise_override").clone()
     }
 
     fn bound(&self) -> Option<SocketAddr> {
-        *self.bound_addr.lock().unwrap()
+        *lock_or_recover(&self.bound_addr, "topology.bound_addr")
     }
 }
 
@@ -154,11 +165,11 @@ impl GossipState {
     }
 
     fn set_interval(&self, d: Duration) {
-        *self.interval.lock().unwrap() = d;
+        *lock_or_recover(&self.interval, "topology.gossip_interval") = d;
     }
 
     fn interval(&self) -> Duration {
-        *self.interval.lock().unwrap()
+        *lock_or_recover(&self.interval, "topology.gossip_interval")
     }
 }
 
@@ -184,11 +195,11 @@ impl SyncState {
     }
 
     fn set_interval(&self, d: Duration) {
-        *self.interval.lock().unwrap() = d;
+        *lock_or_recover(&self.interval, "topology.sync_interval") = d;
     }
 
     fn interval(&self) -> Duration {
-        *self.interval.lock().unwrap()
+        *lock_or_recover(&self.interval, "topology.sync_interval")
     }
 
     fn start_if_idle(&self) -> bool {

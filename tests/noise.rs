@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use net::noise::{client_handshake, server_handshake};
 use net::noise::{read_framed_len, write_framed};
 use std::io::ErrorKind;

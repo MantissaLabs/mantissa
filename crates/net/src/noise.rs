@@ -38,6 +38,12 @@ impl NoiseKeys {
 const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const MAX_FRAME: usize = 64 * 1024;
 
+fn parsed_noise_params() -> io::Result<snow::params::NoiseParams> {
+    NOISE_PARAMS
+        .parse()
+        .map_err(|e| io::Error::other(format!("invalid noise params: {e}")))
+}
+
 // prologue no longer contains the token — just a static tag
 fn prologue() -> &'static [u8] {
     b"MANTISSA|v1"
@@ -52,7 +58,7 @@ pub async fn client_handshake(
 ) -> io::Result<tokio::io::DuplexStream> {
     let pk_bytes = keys.private.to_bytes();
 
-    let builder = snow::Builder::new(NOISE_PARAMS.parse().unwrap())
+    let builder = snow::Builder::new(parsed_noise_params()?)
         .prologue(prologue())
         .local_private_key(&pk_bytes);
 
@@ -102,7 +108,7 @@ pub async fn server_handshake(
 ) -> io::Result<tokio::io::DuplexStream> {
     let pk_bytes = keys.private.to_bytes();
 
-    let builder = snow::Builder::new(NOISE_PARAMS.parse().unwrap())
+    let builder = snow::Builder::new(parsed_noise_params()?)
         .prologue(prologue())
         .local_private_key(&pk_bytes);
 

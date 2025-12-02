@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use mantissa::store::local_session_store::LocalSessionStore;
 use uuid::Uuid;
 

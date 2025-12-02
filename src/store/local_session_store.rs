@@ -24,10 +24,13 @@ fn ioerr<E: std::error::Error>(e: E) -> io::Error {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(dur) => dur.as_secs(),
+        Err(err) => {
+            tracing::warn!("system clock error for session store: {err}");
+            0
+        }
+    }
 }
 
 /// What we store (plaintext) before sealing.

@@ -97,9 +97,17 @@ impl gossip::Server for Gossip {
         let network_tx = self.chans.network_events.clone();
         let secret_tx = self.chans.secret_events.clone();
 
-        let msgs = params.get().unwrap().get_messages();
+        let params_reader = params
+            .get()
+            .map_err(|e| Error::failed(format!("failed to read gossip params: {e}")))?;
+        let messages = params_reader
+            .get_messages()
+            .map_err(|e| Error::failed(format!("failed to read gossip messages: {e}")))?;
+        let message_list = messages
+            .get_messages()
+            .map_err(|e| Error::failed(format!("failed to read gossip message list: {e}")))?;
 
-        for msg in msgs.unwrap().get_messages().unwrap().iter() {
+        for msg in message_list.iter() {
             let id = match msg.get_id() {
                 Ok(data) => {
                     let bytes = data.to_owned();

@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 capnp::generated_code!(pub mod server_capnp);
 capnp::generated_code!(pub mod node_capnp);
 capnp::generated_code!(pub mod gossip_capnp);

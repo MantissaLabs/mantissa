@@ -1,4 +1,4 @@
-#![allow(clippy::collapsible_if)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub mod inproc;
 pub mod noise;

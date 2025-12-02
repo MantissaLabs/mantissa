@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use mantissa::server::auth::AuthStore;
 use uuid::Uuid;
 

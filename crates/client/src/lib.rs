@@ -1,4 +1,4 @@
-#![allow(clippy::collapsible_if, clippy::too_many_arguments)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub mod config;
 pub mod connection;

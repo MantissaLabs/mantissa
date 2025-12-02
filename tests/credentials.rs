@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use ed25519_dalek::SigningKey;
 use mantissa::server::credential::ClusterCredential;
 use uuid::Uuid;

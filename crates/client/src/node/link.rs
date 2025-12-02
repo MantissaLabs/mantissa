@@ -13,10 +13,19 @@ pub async fn link(cfg: &ClientConfig) -> Result<()> {
 
     let mut builder = Builder::new_default();
 
+    let anchor = cfg
+        .anchor
+        .as_deref()
+        .ok_or_else(|| anyhow!("anchor is required to link"))?;
+    let join_token = cfg
+        .join_token
+        .as_deref()
+        .ok_or_else(|| anyhow!("join token is required to link"))?;
+
     // Build link message.
     let mut link = builder.init_root::<JoinRequest::Builder>();
-    link.set_anchor(cfg.anchor.as_ref().unwrap());
-    link.set_join_token(cfg.join_token.as_ref().unwrap());
+    link.set_anchor(anchor);
+    link.set_join_token(join_token);
 
     let _ = request
         .get()
@@ -32,7 +41,7 @@ pub async fn link(cfg: &ClientConfig) -> Result<()> {
 
     println!(
         "join succeeded via {}",
-        cfg.anchor.as_deref().unwrap_or("<unknown anchor>")
+        anchor
     );
 
     Ok(())

@@ -18,7 +18,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
 
     let reader = response.get()?.get_nodes()?;
     let mut tw = TabWriter::new(Vec::new());
-    writeln!(&mut tw, "ID\tHOSTNAME\tENDPOINT\tSTATUS").unwrap();
+    writeln!(&mut tw, "ID\tHOSTNAME\tENDPOINT\tSTATUS")?;
 
     let mut list: Vec<NodeInfo> = reader.get_nodes()?.iter().collect();
     list.sort_by_key(id_sort_key_uuid_bytes);
@@ -34,8 +34,8 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
         )?;
     }
 
-    tw.flush().unwrap();
-    let output = String::from_utf8(tw.into_inner().unwrap()).unwrap();
+    tw.flush()?;
+    let output = String::from_utf8(tw.into_inner()?)?;
     output::emit_block(output);
 
     Ok(())

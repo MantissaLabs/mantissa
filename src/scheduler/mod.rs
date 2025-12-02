@@ -220,10 +220,11 @@ impl Scheduler {
             .state
             .compare_and_swap(&None::<Arc<SchedulerState>>, Some(state_arc.clone()));
 
-        if prev.is_some() {
+        if let Some(existing) = prev.as_ref() {
             // Another thread won the race to initialise the scheduler; reuse its snapshot.
-            let snapshot = prev.as_ref().map(|state| state.snapshot.clone()).unwrap();
-            return Err(SchedulerError::AlreadyInitialized { snapshot });
+            return Err(SchedulerError::AlreadyInitialized {
+                snapshot: existing.snapshot.clone(),
+            });
         }
 
         if let Err(e) = self.store.upsert(&self.store_key, snapshot.clone()).await {
