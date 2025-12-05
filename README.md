@@ -87,6 +87,7 @@ With that symlink in place, run privileged commands explicitly (`sudo mantissa i
      --subnet 10.240.0.0/16
    mantissa networks list
    ```
+   Subnet defaults to 10.42.0.0/16 and the standard eBPF programs attach automatically, so you can omit those flags when you just want a quick overlay for demos.
    The `networks create` command prints a UUID; Mantissa resolves the `demo-overlay` label in the manifest to that network specification when scheduling tasks.
 6. (Optional) Seed the demo secrets used by the sample manifest (see [Using Secrets in Service Manifests](#using-secrets-in-service-manifests)).
 7. Deploy the sample service manifest:

@@ -39,10 +39,7 @@ pub async fn link(cfg: &ClientConfig) -> Result<()> {
         return Err(anyhow!(err.to_string()));
     }
 
-    println!(
-        "join succeeded via {}",
-        anchor
-    );
+    println!("join succeeded via {}", anchor);
 
     Ok(())
 }

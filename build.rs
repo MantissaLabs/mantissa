@@ -1,5 +1,5 @@
 #[cfg(target_os = "linux")]
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 #[cfg(target_os = "linux")]
 use cargo_metadata::{Artifact, CompilerMessage, Message, MetadataCommand, Target};
 #[cfg(target_os = "linux")]
@@ -39,16 +39,14 @@ fn build_ebpf_without_warnings<'a>(
         .map(PathBuf::from)
         .context("OUT_DIR not set while preparing eBPF build output")?;
 
-    let endian = env::var("CARGO_CFG_TARGET_ENDIAN")
-        .context("CARGO_CFG_TARGET_ENDIAN not set")?;
+    let endian = env::var("CARGO_CFG_TARGET_ENDIAN").context("CARGO_CFG_TARGET_ENDIAN not set")?;
     let target = match endian.as_str() {
         "big" => "bpfeb",
         "little" => "bpfel",
         _ => bail!("unsupported endian value {endian} for eBPF build"),
     };
 
-    let raw_arch = env::var("CARGO_CFG_TARGET_ARCH")
-        .context("CARGO_CFG_TARGET_ARCH not set")?;
+    let raw_arch = env::var("CARGO_CFG_TARGET_ARCH").context("CARGO_CFG_TARGET_ARCH not set")?;
     let bpf_target_arch = target_arch_fixup(raw_arch.into()).into_owned();
     let target = format!("{target}-unknown-none");
 

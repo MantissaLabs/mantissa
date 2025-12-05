@@ -241,10 +241,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     name: args.name.clone(),
                     description: args.description.clone(),
                     driver,
-                    subnet_cidr: args.subnet.clone(),
+                    subnet_cidr: args.resolved_subnet(),
                     vni: args.vni,
                     mtu: args.mtu,
-                    bpf_programs: args.bpf_programs.clone(),
+                    bpf_programs: args.resolved_bpf_programs(),
                     sealed: args.sealed,
                 };
 

@@ -390,6 +390,19 @@ pub enum NetworkDriverOpt {
     Vxlan,
 }
 
+const DEFAULT_NETWORK_SUBNET: &str = "10.42.0.0/16";
+
+/// Return the baseline dataplane programs Mantissa needs for VXLAN overlays so VIP maps and
+/// forwarding stay functional even when callers omit explicit BPF flags.
+fn default_network_bpf_programs() -> Vec<String> {
+    vec![
+        "vxlan_xdp".to_string(),
+        "bridge_xdp@bridge_xdp".to_string(),
+        "bridge_tc_ingress@bridge_tc_ingress".to_string(),
+        "bridge_tc_egress@bridge_tc_egress".to_string(),
+    ]
+}
+
 #[derive(Subcommand, Debug)]
 pub enum NetworksCommand {
     /// Create a new overlay network in the cluster
@@ -426,9 +439,10 @@ pub struct NetworksCreateArgs {
     #[arg(long = "driver", value_enum, default_value = "vxlan")]
     pub driver: NetworkDriverOpt,
 
-    /// CIDR range allocated to the overlay (e.g. 10.24.0.0/16)
+    /// CIDR range allocated to the overlay (e.g. 10.24.0.0/16).
+    /// Defaults to 10.42.0.0/16 when omitted.
     #[arg(long = "subnet", value_name = "CIDR")]
-    pub subnet: String,
+    pub subnet: Option<String>,
 
     /// Explicit VXLAN identifier (auto-assigned when omitted)
     #[arg(long = "vni", value_name = "VNI")]
@@ -438,13 +452,34 @@ pub struct NetworksCreateArgs {
     #[arg(long = "mtu", value_name = "BYTES")]
     pub mtu: Option<u32>,
 
-    /// Optional BPF program identifiers to attach (repeat flag)
+    /// Optional BPF program identifiers to attach (repeat flag).
+    /// Defaults to the standard VXLAN and bridge programs; provided entries are appended.
     #[arg(long = "bpf-program", value_name = "PROGRAM", action = ArgAction::Append)]
     pub bpf_programs: Vec<String>,
 
     /// Mark the network spec read-only after creation
     #[arg(long = "sealed", action = ArgAction::SetTrue)]
     pub sealed: bool,
+}
+
+impl NetworksCreateArgs {
+    /// Resolve the subnet CIDR for network creation, falling back to the shared VXLAN range when
+    /// the caller does not provide an explicit value.
+    pub fn resolved_subnet(&self) -> String {
+        self.subnet
+            .clone()
+            .unwrap_or_else(|| DEFAULT_NETWORK_SUBNET.to_string())
+    }
+
+    /// Merge user-provided programs with the defaults so dataplane maps and load-balancing remain
+    /// available even when no BPF flags are specified on the CLI.
+    pub fn resolved_bpf_programs(&self) -> Vec<String> {
+        let mut programs = default_network_bpf_programs();
+        programs.extend(self.bpf_programs.iter().cloned());
+        programs.sort();
+        programs.dedup();
+        programs
+    }
 }
 
 #[derive(Args, Debug)]
