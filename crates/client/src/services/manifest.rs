@@ -85,6 +85,12 @@ pub struct TaskSpec {
     pub secret_files: Vec<SecretFileProjection>,
     #[serde(default)]
     pub networks: Vec<String>,
+    #[serde(default)]
+    pub health_port: Option<u16>,
+    #[serde(default)]
+    pub health_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub public_port: Option<u16>,
 }
 
 impl ServiceManifest {
@@ -112,6 +118,27 @@ impl ServiceManifest {
             if task.replicas == 0 {
                 return Err(anyhow!(
                     "task '{}' must request at least one replica",
+                    task.name
+                ));
+            }
+
+            if matches!(task.health_port, Some(0)) {
+                return Err(anyhow!(
+                    "task '{}' must set health_port to a non-zero value when provided",
+                    task.name
+                ));
+            }
+
+            if matches!(task.public_port, Some(0)) {
+                return Err(anyhow!(
+                    "task '{}' must set public_port to a non-zero value when provided",
+                    task.name
+                ));
+            }
+
+            if task.public_port.is_some() && task.networks.len() != 1 {
+                return Err(anyhow!(
+                    "task '{}' must attach to exactly one network when public_port is set",
                     task.name
                 ));
             }

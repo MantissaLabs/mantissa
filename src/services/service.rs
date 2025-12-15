@@ -345,6 +345,13 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         Some(health_cmds)
     };
 
+    let raw_public = reader.get_public_port();
+    let public_port = if raw_public == 0 {
+        None
+    } else {
+        Some(raw_public)
+    };
+
     Ok(ServiceTaskSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
         image: reader.get_image()?.to_str()?.to_string(),
@@ -358,6 +365,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         networks,
         health_port,
         health_command,
+        public_port,
     })
 }
 
@@ -435,6 +443,8 @@ fn write_task_template(
             health_builder.set(idx as u32, arg);
         }
     }
+
+    builder.set_public_port(task.public_port().unwrap_or(0));
 
     Ok(())
 }

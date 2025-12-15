@@ -22,6 +22,7 @@
             health_command: Some([
                 "/",
             ]),
+            public_port: Some(8000),
         ),
         (
             name: "frontend",

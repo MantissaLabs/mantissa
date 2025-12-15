@@ -167,6 +167,21 @@ fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) -> Resul
         networks_builder.set(idx as u32, network.trim());
     }
 
+    builder.set_health_port(task.health_port.unwrap_or(0));
+    let mut health_builder = builder.reborrow().init_health_command(
+        task.health_command
+            .as_ref()
+            .map(|cmd| cmd.len() as u32)
+            .unwrap_or(0),
+    );
+    if let Some(cmd) = &task.health_command {
+        for (idx, arg) in cmd.iter().enumerate() {
+            health_builder.set(idx as u32, arg);
+        }
+    }
+
+    builder.set_public_port(task.public_port.unwrap_or(0));
+
     let mut files_builder = builder
         .reborrow()
         .init_secret_files(task.secret_files.len() as u32);

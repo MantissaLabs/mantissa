@@ -50,20 +50,20 @@ fn build_ebpf_without_warnings<'a>(
     let bpf_target_arch = target_arch_fixup(raw_arch.into()).into_owned();
     let target = format!("{target}-unknown-none");
 
-    if !rustup_target_installed(&target)? {
+    let toolchain_str = match &toolchain {
+        aya_build::Toolchain::Nightly => "nightly",
+        aya_build::Toolchain::Custom(spec) => spec,
+    };
+
+    if !rustc_supports_target(toolchain_str, &target)? {
         eprintln!(
-            "Skipping eBPF build: rustup target `{target}` not installed (install with `rustup target add {target}` or set MANTISSA_SKIP_BPF=1)."
+            "Skipping eBPF build: rustc toolchain `{toolchain_str}` does not list `{target}` (set MANTISSA_SKIP_BPF=1 to bypass eBPF compilation)."
         );
         return Ok(());
     }
 
     for package in packages {
         println!("cargo:rerun-if-changed={}", package.root_dir);
-
-        let toolchain_str = match &toolchain {
-            aya_build::Toolchain::Nightly => "nightly",
-            aya_build::Toolchain::Custom(spec) => spec,
-        };
 
         let mut cmd = Command::new("rustup");
         cmd.args([
@@ -298,23 +298,19 @@ fn ensure_bpf_linker() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-/// Check whether the BPF target triple is installed for the selected rustup toolchain.
-fn rustup_target_installed(target: &str) -> Result<bool> {
+/// Check whether the selected rust toolchain advertises the BPF target triple.
+fn rustc_supports_target(toolchain: &str, target: &str) -> Result<bool> {
     let output = Command::new("rustup")
-        .args(["target", "list", "--installed"])
+        .args(["run", toolchain, "rustc", "--print=target-list"])
         .output()
-        .context("failed to query rustup for installed targets")?;
+        .context("failed to query rustc for supported targets")?;
 
     if !output.status.success() {
-        eprintln!(
-            "Skipping eBPF build: rustup target list failed with status {}",
-            output.status
-        );
-        return Ok(false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("rustc target list failed: {}", stderr.trim());
     }
 
-    let installed = String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .any(|line| line.trim() == target);
-    Ok(installed)
+        .any(|line| line.trim() == target))
 }

@@ -3,7 +3,7 @@
 #![cfg_attr(not(test), no_main)]
 
 use aya_ebpf::{
-    bindings::{TC_ACT_OK, TC_ACT_SHOT},
+    bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
     macros::{classifier, map},
     maps::{HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
@@ -40,18 +40,18 @@ const IPPROTO_UDP: u8 = 17;
 #[map(name = "BRIDGE_TC_INGRESS_STATS")]
 static mut BRIDGE_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
 
-#[map(name = "LB_VIPS", pinning = "Shared")]
-static mut LB_VIPS: HashMap<VipKey, VipEntry> = HashMap::with_max_entries(MAX_VIPS as u32, 0);
+#[map(name = "LB_VIPS")]
+static mut LB_VIPS: HashMap<VipKey, VipEntry> = HashMap::pinned(MAX_VIPS as u32, 0);
 
-#[map(name = "LB_BACKENDS", pinning = "Shared")]
+#[map(name = "LB_BACKENDS")]
 static mut LB_BACKENDS: HashMap<VipBackendKey, Backend> =
-    HashMap::with_max_entries((MAX_BACKENDS * MAX_VIPS) as u32, 0);
+    HashMap::pinned((MAX_BACKENDS * MAX_VIPS) as u32, 0);
 
-#[map(name = "LB_FWD", pinning = "Shared")]
-static mut LB_FWD: LruHashMap<Flow4, NatEntry> = LruHashMap::with_max_entries(1024, 0);
+#[map(name = "LB_FWD")]
+static mut LB_FWD: LruHashMap<Flow4, NatEntry> = LruHashMap::pinned(1024, 0);
 
-#[map(name = "LB_REV", pinning = "Shared")]
-static mut LB_REV: LruHashMap<Flow4, NatEntry> = LruHashMap::with_max_entries(1024, 0);
+#[map(name = "LB_REV")]
+static mut LB_REV: LruHashMap<Flow4, NatEntry> = LruHashMap::pinned(1024, 0);
 
 #[classifier]
 pub fn bridge_tc_ingress(ctx: TcContext) -> i32 {
@@ -85,7 +85,7 @@ fn handle_packet(ctx: &TcContext) -> Result<i32, ()> {
     match eth_hdr.protocol() {
         ETH_P_IPV4 => {}
         ETH_P_ARP => {
-            return handle_arp(data, data_end, eth_hdr);
+            return handle_arp(ctx, data, data_end, eth_hdr);
         }
         _ => {
             return Ok(TC_ACT_OK);
@@ -119,6 +119,7 @@ fn handle_packet(ctx: &TcContext) -> Result<i32, ()> {
         dst_port,
         proto,
         pad: 0,
+        padding: [0u8; 2],
     };
 
     let mut chosen = unsafe { LB_FWD.get(&client_flow).copied() };
@@ -130,9 +131,7 @@ fn handle_packet(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK);
     };
 
-    apply_dnat(
-        data, data_end, eth_hdr, ip_hdr, l4_offset, proto, src_port, dst_port, &choice,
-    )?;
+    apply_dnat(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, &choice)?;
 
     let reverse_key = Flow4 {
         src: choice.backend_ip,
@@ -141,6 +140,7 @@ fn handle_packet(ctx: &TcContext) -> Result<i32, ()> {
         dst_port: src_port,
         proto,
         pad: 0,
+        padding: [0u8; 2],
     };
 
     unsafe {
@@ -151,7 +151,18 @@ fn handle_packet(ctx: &TcContext) -> Result<i32, ()> {
     Ok(TC_ACT_OK)
 }
 
-fn handle_arp(data: usize, data_end: usize, eth: &mut EthernetHeader) -> Result<i32, ()> {
+/// Reply to ARP requests targeting a configured VIP.
+///
+/// Mantissa assigns VIPs per service and publishes them through DNS. Clients must resolve the VIP
+/// into a stable MAC address before they can send IP traffic. This handler synthesizes an ARP
+/// reply in-place and uses `clone_redirect` so the reply is delivered back to the ingress port
+/// (veth, vxlan, or host access) without relying on bridge hairpin forwarding.
+fn handle_arp(
+    ctx: &TcContext,
+    data: usize,
+    data_end: usize,
+    eth: &mut EthernetHeader,
+) -> Result<i32, ()> {
     let hdr: *mut ArpHeader =
         unsafe { net::mut_ptr_at(data, data_end, net::ETH_HDR_LEN).map_err(|_| ())? };
     let arp = unsafe { &mut *hdr };
@@ -184,6 +195,16 @@ fn handle_arp(data: usize, data_end: usize, eth: &mut EthernetHeader) -> Result<
 
     eth.dst = sender_mac;
     eth.src = config.vip_mac;
+
+    // Redirect the synthesized reply back out of the ingress interface so hosts (and remote
+    // peers via VXLAN) can learn the VIP MAC even when the bridge would otherwise drop same-port
+    // egress frames.
+    let ingress = unsafe { (*ctx.skb.skb).ingress_ifindex };
+    if ingress != 0 {
+        if ctx.clone_redirect(ingress, 0).is_ok() {
+            return Ok(TC_ACT_SHOT);
+        }
+    }
 
     Ok(TC_ACT_OK)
 }
@@ -262,57 +283,33 @@ fn parse_ports(
 }
 
 fn apply_dnat(
-    data: usize,
-    data_end: usize,
+    ctx: &TcContext,
     eth: &mut EthernetHeader,
     ip: &mut Ipv4Header,
+    ip_offset: usize,
     l4_offset: usize,
     proto: u8,
-    src_port: u16,
-    dst_port: u16,
     choice: &NatEntry,
 ) -> Result<(), ()> {
     // Update L2 destination towards the chosen backend.
     eth.dst = choice.backend_mac;
 
-    // Update destination IP and adjust IP checksum.
     let old_dst = ip.dst;
     ip.dst = choice.backend_ip;
-    ip.checksum = update_checksum(ip.checksum, old_dst, ip.dst);
+    ctx.l3_csum_replace(ip_offset + 10, old_dst as u64, ip.dst as u64, 4)
+        .map_err(|_| ())?;
 
-    // Adjust L4 checksum to account for the IP change.
     if proto == IPPROTO_TCP || proto == IPPROTO_UDP {
-        let csum_offset = l4_offset + 16;
-        let checksum_ptr: *mut u16 =
-            unsafe { net::mut_ptr_at(data, data_end, csum_offset).map_err(|_| ())? } as *mut u16;
-        let csum = unsafe { *checksum_ptr };
-        let updated = update_checksum(csum, old_dst, ip.dst);
-        unsafe { *checksum_ptr = updated };
+        ctx.l4_csum_replace(
+            l4_offset + 16,
+            old_dst as u64,
+            ip.dst as u64,
+            (BPF_F_PSEUDO_HDR as u64) | 4,
+        )
+        .map_err(|_| ())?;
     }
 
-    // Ensure the compiler keeps ports in use for the verifier (used by reverse key construction).
-    let _ = (src_port, dst_port);
     Ok(())
-}
-
-/// Fold a running checksum into a 16-bit one's complement value.
-fn csum_fold(mut sum: u32) -> u16 {
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-/// Update a 16-bit checksum with a 32-bit field replacement.
-///
-/// The checksum provided should already be one's complement (e.g., from the packet).
-fn update_checksum(csum: u16, old: u32, new: u32) -> u16 {
-    let mut sum = (!csum as u32) & 0xffff;
-    sum = sum.wrapping_sub((old >> 16) & 0xffff);
-    sum = sum.wrapping_sub(old & 0xffff);
-    sum = sum.wrapping_add((new >> 16) & 0xffff);
-    sum = sum.wrapping_add(new & 0xffff);
-    csum_fold(sum)
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 use core::ptr;
 
 use aya_ebpf::{
-    bindings::{TC_ACT_OK, TC_ACT_SHOT},
+    bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
     macros::{classifier, map},
     maps::{LruHashMap, PerCpuArray},
     programs::TcContext,
@@ -23,8 +23,8 @@ const IPPROTO_UDP: u8 = 17;
 #[map(name = "BRIDGE_TC_EGRESS_STATS")]
 static mut BRIDGE_TC_EGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
 
-#[map(name = "LB_REV", pinning = "Shared")]
-static mut LB_REV: LruHashMap<Flow4, NatEntry> = LruHashMap::with_max_entries(1024, 0);
+#[map(name = "LB_REV")]
+static mut LB_REV: LruHashMap<Flow4, NatEntry> = LruHashMap::pinned(1024, 0);
 
 #[classifier]
 pub fn bridge_tc_egress(ctx: TcContext) -> i32 {
@@ -83,13 +83,14 @@ fn handle_packet(ctx: &TcContext) -> Result<i32, ()> {
         dst_port,
         proto,
         pad: 0,
+        padding: [0u8; 2],
     };
 
     let Some(entry) = (unsafe { LB_REV.get(&reverse_key) }) else {
         return Ok(TC_ACT_OK);
     };
 
-    apply_snat(data, data_end, eth_hdr, ip_hdr, l4_offset, proto, *entry)?;
+    apply_snat(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, *entry)?;
 
     Ok(TC_ACT_OK)
 }
@@ -108,10 +109,10 @@ fn parse_ports(
 }
 
 fn apply_snat(
-    data: usize,
-    data_end: usize,
+    ctx: &TcContext,
     eth: &mut EthernetHeader,
     ip: &mut Ipv4Header,
+    ip_offset: usize,
     l4_offset: usize,
     proto: u8,
     entry: NatEntry,
@@ -119,35 +120,21 @@ fn apply_snat(
     // Rewrite to present VIP identity on return traffic.
     let old_src = ip.src;
     ip.src = entry.vip;
-    ip.checksum = update_checksum(ip.checksum, old_src, ip.src);
     eth.src = entry.vip_mac;
+    ctx.l3_csum_replace(ip_offset + 10, old_src as u64, ip.src as u64, 4)
+        .map_err(|_| ())?;
 
     if proto == IPPROTO_TCP || proto == IPPROTO_UDP {
-        let csum_offset = l4_offset + 16;
-        let checksum_ptr: *mut u16 =
-            unsafe { net::mut_ptr_at(data, data_end, csum_offset).map_err(|_| ())? } as *mut u16;
-        let csum = unsafe { *checksum_ptr };
-        let updated = update_checksum(csum, old_src, ip.src);
-        unsafe { *checksum_ptr = updated };
+        ctx.l4_csum_replace(
+            l4_offset + 16,
+            old_src as u64,
+            ip.src as u64,
+            (BPF_F_PSEUDO_HDR as u64) | 4,
+        )
+        .map_err(|_| ())?;
     }
 
     Ok(())
-}
-
-fn csum_fold(mut sum: u32) -> u16 {
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-fn update_checksum(csum: u16, old: u32, new: u32) -> u16 {
-    let mut sum = (!csum as u32) & 0xffff;
-    sum = sum.wrapping_sub((old >> 16) & 0xffff);
-    sum = sum.wrapping_sub(old & 0xffff);
-    sum = sum.wrapping_add((new >> 16) & 0xffff);
-    sum = sum.wrapping_add(new & 0xffff);
-    csum_fold(sum)
 }
 
 #[cfg(test)]

@@ -71,7 +71,11 @@ mod platform {
 
             let entry = build_vip_entry(vip_mac, backends);
             let key = VipKey {
-                vip: u32::from_be_bytes(vip.octets()),
+                // The eBPF programs read IPv4 fields directly from packet memory without endian
+                // conversion, meaning the stored `u32` value must match the host-native
+                // interpretation of the network bytes. Using `from_ne_bytes` keeps the in-memory
+                // representation consistent for lookups and for rewriting packet headers.
+                vip: u32::from_ne_bytes(vip.octets()),
             };
 
             update_elem(vip_map.fd().as_fd().as_raw_fd(), &key, &entry)
@@ -84,9 +88,6 @@ mod platform {
                 MAX_BACKENDS,
             )
             .context("program backends")?;
-
-            clear_hash_map(&base, "LB_FWD").context("clear LB_FWD map")?;
-            clear_hash_map(&base, "LB_REV").context("clear LB_REV map")?;
             Ok(())
         }
     }
@@ -129,29 +130,6 @@ mod platform {
     }
     unsafe impl Pod for VipEntry {}
 
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct Flow4 {
-        src: u32,
-        dst: u32,
-        src_port: u16,
-        dst_port: u16,
-        proto: u8,
-        pad: u8,
-    }
-    unsafe impl Pod for Flow4 {}
-
-    #[repr(C, packed)]
-    #[derive(Clone, Copy, Default)]
-    #[allow(dead_code)]
-    struct NatEntry {
-        vip: u32,
-        vip_mac: [u8; 6],
-        backend_ip: u32,
-        backend_mac: [u8; 6],
-    }
-    unsafe impl Pod for NatEntry {}
-
     fn build_vip_entry(vip_mac: [u8; 6], backends: &[BackendAddress]) -> VipEntry {
         VipEntry {
             vip_mac,
@@ -174,7 +152,9 @@ mod platform {
                 slot: idx as u32,
             };
             let value = Backend {
-                ip: u32::from_be_bytes(backend.ip.octets()),
+                // Keep the backend IP representation consistent with how the eBPF programs read
+                // and write IPv4 header fields (native-endian `u32` matching network bytes).
+                ip: u32::from_ne_bytes(backend.ip.octets()),
                 mac: backend.mac,
                 _pad: 0,
             };
@@ -283,65 +263,6 @@ mod platform {
         };
         if ret < 0 {
             return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
-    }
-
-    fn clear_hash_map(base: &Path, name: &str) -> Result<()> {
-        let map = open_map(base, name)?;
-        let fd = map.fd().as_fd().as_raw_fd();
-
-        #[repr(C)]
-        struct BpfAttrKeyIter {
-            map_fd: u32,
-            _pad: u32,
-            key: u64,
-            next_key: u64,
-        }
-
-        #[repr(C)]
-        struct BpfAttrDelete {
-            map_fd: u32,
-            _pad: u32,
-            key: u64,
-        }
-
-        let mut prev: Option<Flow4> = None;
-        loop {
-            let mut next: Flow4 = Flow4::default();
-            let mut iter = BpfAttrKeyIter {
-                map_fd: fd as u32,
-                _pad: 0,
-                key: prev.as_ref().map(|k| k as *const _ as u64).unwrap_or(0),
-                next_key: &mut next as *mut _ as u64,
-            };
-
-            let ret = unsafe {
-                libc::syscall(
-                    libc::SYS_bpf,
-                    BPF_MAP_GET_NEXT_KEY,
-                    &mut iter as *mut _,
-                    mem::size_of::<BpfAttrKeyIter>(),
-                )
-            };
-            if ret < 0 {
-                break;
-            }
-
-            let mut del = BpfAttrDelete {
-                map_fd: fd as u32,
-                _pad: 0,
-                key: &next as *const _ as u64,
-            };
-            let _ = unsafe {
-                libc::syscall(
-                    libc::SYS_bpf,
-                    BPF_MAP_DELETE_ELEM,
-                    &mut del as *mut _,
-                    mem::size_of::<BpfAttrDelete>(),
-                )
-            };
-            prev = Some(next);
         }
         Ok(())
     }

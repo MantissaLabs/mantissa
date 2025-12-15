@@ -991,6 +991,7 @@ fn compute_deterministic_vni(network_id: Uuid) -> u32 {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{NetworkPlan, VXLAN_PORT};
+    use crate::network::attachment::{host_access_host_iface_name, host_access_peer_iface_name};
     use anyhow::{Context, Result, anyhow};
     use futures::TryStreamExt;
     use libc;
@@ -1003,8 +1004,8 @@ mod platform {
         LinkProtoInfoBridge,
     };
     use rtnetlink::{
-        Error as RtnetlinkError, Handle, LinkBridge, LinkMessageBuilder, LinkUnspec, LinkVxlan,
-        new_connection,
+        AddressMessageBuilder, Error as RtnetlinkError, Handle, LinkBridge, LinkMessageBuilder,
+        LinkUnspec, LinkVeth, LinkVxlan, new_connection,
     };
     use std::net::{IpAddr, Ipv4Addr};
     use std::process::Command;
@@ -1019,6 +1020,7 @@ mod platform {
     }
 
     const IFLA_PROTINFO: u16 = 12;
+    const BRPORT_ATTR_HAIRPIN_MODE: u16 = 4;
     const BRPORT_ATTR_LEARNING: u16 = 8;
     const BRPORT_ATTR_UNICAST_FLOOD: u16 = 9;
     const BRPORT_ATTR_NEIGH_SUPPRESS: u16 = 32;
@@ -1064,6 +1066,145 @@ mod platform {
 
         fn handle(&self) -> Option<&Handle> {
             self.handle.as_ref()
+        }
+
+        /// Compute stable interface names for the per-network host access veth pair.
+        ///
+        /// This veth is used to inject host-originated traffic into the overlay bridge as a
+        /// *bridge port ingress*, so the tc-ingress eBPF programs (ARP responder + DNAT) see the
+        /// packets just like container traffic.
+        fn host_access_ifnames(network_id: uuid::Uuid) -> (String, String) {
+            (
+                host_access_host_iface_name(network_id),
+                host_access_peer_iface_name(network_id),
+            )
+        }
+
+        /// Ensure the host has a dedicated veth pair wired into the overlay bridge.
+        ///
+        /// The host side remains L3 (keeps IP addresses/routes), while the peer is enslaved to the
+        /// bridge so packets traverse the same dataplane as workload veth devices.
+        async fn ensure_host_access_veth(
+            &self,
+            network_id: uuid::Uuid,
+            bridge_index: u32,
+        ) -> Result<(u32, u32)> {
+            let Some(handle) = self.handle() else {
+                return Ok((0, 0));
+            };
+
+            let (host_ifname, peer_ifname) = Self::host_access_ifnames(network_id);
+            let host_existing = self.find_link(&host_ifname).await?;
+            let peer_existing = self.find_link(&peer_ifname).await?;
+
+            let (host_index, peer_index) = match (host_existing, peer_existing) {
+                (Some(host_index), Some(peer_index)) => (host_index, peer_index),
+                (Some(host_index), None) => {
+                    warn!(
+                        target: "network",
+                        network = %network_id,
+                        host_if = %host_ifname,
+                        "host access veth peer missing; recreating veth pair"
+                    );
+                    handle
+                        .link()
+                        .del(host_index)
+                        .execute()
+                        .await
+                        .with_context(|| {
+                            format!("delete orphaned host access interface {host_ifname}")
+                        })?;
+                    self.create_host_access_veth(handle, &host_ifname, &peer_ifname)
+                        .await?;
+                    let host_index = self
+                        .find_link(&host_ifname)
+                        .await?
+                        .context("host access interface missing after recreation")?;
+                    let peer_index = self
+                        .find_link(&peer_ifname)
+                        .await?
+                        .context("host access peer missing after recreation")?;
+                    (host_index, peer_index)
+                }
+                (None, Some(peer_index)) => {
+                    warn!(
+                        target: "network",
+                        network = %network_id,
+                        peer_if = %peer_ifname,
+                        "host access veth host missing; recreating veth pair"
+                    );
+                    handle
+                        .link()
+                        .del(peer_index)
+                        .execute()
+                        .await
+                        .with_context(|| {
+                            format!("delete orphaned host access peer interface {peer_ifname}")
+                        })?;
+                    self.create_host_access_veth(handle, &host_ifname, &peer_ifname)
+                        .await?;
+                    let host_index = self
+                        .find_link(&host_ifname)
+                        .await?
+                        .context("host access interface missing after recreation")?;
+                    let peer_index = self
+                        .find_link(&peer_ifname)
+                        .await?
+                        .context("host access peer missing after recreation")?;
+                    (host_index, peer_index)
+                }
+                (None, None) => {
+                    self.create_host_access_veth(handle, &host_ifname, &peer_ifname)
+                        .await?;
+                    let host_index = self
+                        .find_link(&host_ifname)
+                        .await?
+                        .context("host access interface missing after creation")?;
+                    let peer_index = self
+                        .find_link(&peer_ifname)
+                        .await?
+                        .context("host access peer missing after creation")?;
+                    (host_index, peer_index)
+                }
+            };
+
+            self.attach_master(peer_index, bridge_index)
+                .await
+                .with_context(|| {
+                    format!(
+                        "attach host access peer {} (idx {}) to bridge (idx {})",
+                        peer_ifname, peer_index, bridge_index
+                    )
+                })?;
+
+            self.configure_bridge_hairpin(peer_index, &peer_ifname)
+                .await
+                .with_context(|| {
+                    format!(
+                        "enable hairpin mode on host access peer {} (idx {})",
+                        peer_ifname, peer_index
+                    )
+                })?;
+
+            Ok((host_index, peer_index))
+        }
+
+        /// Create the host access veth pair that connects the host namespace to the overlay bridge.
+        async fn create_host_access_veth(
+            &self,
+            handle: &Handle,
+            host_ifname: &str,
+            peer_ifname: &str,
+        ) -> Result<()> {
+            handle
+                .link()
+                .add(LinkVeth::new(host_ifname, peer_ifname).build())
+                .execute()
+                .await
+                .with_context(|| {
+                    format!("create host access veth {host_ifname}<->{peer_ifname}")
+                })?;
+            Ok(())
         }
 
         pub async fn ensure_network(&self, plan: &NetworkPlan) -> Result<()> {
@@ -1126,12 +1267,36 @@ mod platform {
                     )
                 })?;
 
+            let host_access = if plan.resolver_ipv4.is_some() && plan.subnet_prefix.is_some() {
+                Some(
+                    self.ensure_host_access_veth(plan.network_id, bridge_index)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "ensure host access veth for network {} on bridge {} (idx {})",
+                                plan.network_id, plan.bridge_name, bridge_index
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+
             self.set_up(vxlan_index).await.with_context(|| {
                 format!("bring link {} (idx {}) up", plan.vxlan_name, vxlan_index)
             })?;
             self.set_up(bridge_index).await.with_context(|| {
                 format!("bring link {} (idx {}) up", plan.bridge_name, bridge_index)
             })?;
+            if let Some((host_index, peer_index)) = host_access {
+                let (host_ifname, peer_ifname) = Self::host_access_ifnames(plan.network_id);
+                self.set_up(peer_index).await.with_context(|| {
+                    format!("bring link {} (idx {}) up", peer_ifname, peer_index)
+                })?;
+                self.set_up(host_index).await.with_context(|| {
+                    format!("bring link {} (idx {}) up", host_ifname, host_index)
+                })?;
+            }
 
             if plan.mtu > 0 {
                 self.set_mtu(vxlan_index, plan.mtu).await.with_context(|| {
@@ -1148,15 +1313,49 @@ mod platform {
                             plan.mtu, plan.bridge_name, bridge_index
                         )
                     })?;
+                if let Some((host_index, peer_index)) = host_access {
+                    let (host_ifname, peer_ifname) = Self::host_access_ifnames(plan.network_id);
+                    self.set_mtu(peer_index, plan.mtu).await.with_context(|| {
+                        format!(
+                            "set mtu {} on host access peer {} (idx {})",
+                            plan.mtu, peer_ifname, peer_index
+                        )
+                    })?;
+                    self.set_mtu(host_index, plan.mtu).await.with_context(|| {
+                        format!(
+                            "set mtu {} on host access link {} (idx {})",
+                            plan.mtu, host_ifname, host_index
+                        )
+                    })?;
+                }
             }
 
             if let (Some(ip), Some(prefix)) = (plan.resolver_ipv4, plan.subnet_prefix) {
-                self.ensure_bridge_address(bridge_index, ip, prefix, &plan.bridge_name)
+                let Some((host_index, _peer_index)) = host_access else {
+                    return Err(anyhow!(
+                        "host access veth missing despite resolver address being configured"
+                    ));
+                };
+                let (host_ifname, _peer_ifname) = Self::host_access_ifnames(plan.network_id);
+
+                // Older deployments assigned the resolver address to the bridge device. That makes
+                // host-originated overlay traffic (including VIP flows) bypass tc-ingress and
+                // therefore miss ARP + DNAT handling. Move the IP to the host-access veth.
+                self.remove_interface_address(bridge_index, ip, prefix, &plan.bridge_name)
                     .await
                     .with_context(|| {
                         format!(
-                            "assign resolver address {ip} to bridge {} (idx {})",
+                            "remove resolver address {ip}/{prefix} from bridge {} (idx {})",
                             plan.bridge_name, bridge_index
+                        )
+                    })?;
+
+                self.ensure_interface_address(host_index, ip, prefix, &host_ifname)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "assign resolver address {ip}/{prefix} to host access {} (idx {})",
+                            host_ifname, host_index
                         )
                     })?;
             }
@@ -1170,29 +1369,89 @@ mod platform {
             Ok(())
         }
 
-        async fn ensure_bridge_address(
+        /// Ensure an IPv4 address exists on the provided link using a replace operation.
+        ///
+        /// Mantissa uses this to place the per-network resolver address on the interface that
+        /// should own the connected route for the overlay subnet.
+        async fn ensure_interface_address(
             &self,
-            bridge_index: u32,
+            link_index: u32,
             ip: Ipv4Addr,
             prefix: u8,
-            bridge_name: &str,
+            link_name: &str,
         ) -> Result<()> {
             let Some(handle) = self.handle() else {
                 return Ok(());
             };
             handle
                 .address()
-                .add(bridge_index, IpAddr::V4(ip), prefix)
+                .add(link_index, IpAddr::V4(ip), prefix)
                 .replace()
                 .execute()
                 .await
-                .with_context(|| format!("assign resolver {ip}/{prefix} on {bridge_name}"))
+                .with_context(|| format!("assign resolver {ip}/{prefix} on {link_name}"))
+        }
+
+        /// Remove the specified IPv4 address from the provided link if present.
+        ///
+        /// This enables safe migrations where the resolver IP used to live on the bridge device
+        /// but now should move onto the host-access veth so host traffic hits tc-ingress programs.
+        async fn remove_interface_address(
+            &self,
+            link_index: u32,
+            ip: Ipv4Addr,
+            prefix: u8,
+            link_name: &str,
+        ) -> Result<()> {
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
+            let msg = AddressMessageBuilder::<Ipv4Addr>::new()
+                .index(link_index)
+                .address(ip, prefix)
+                .build();
+            match handle.address().del(msg).execute().await {
+                Ok(()) => Ok(()),
+                Err(RtnetlinkError::NetlinkError(msg)) => {
+                    let raw = msg.raw_code();
+                    let errno = raw.abs();
+                    if errno == libc::ENOENT || errno == libc::EADDRNOTAVAIL {
+                        debug!(
+                            target: "network",
+                            link = link_name,
+                            ip = %ip,
+                            prefix,
+                            errno,
+                            raw_code = raw,
+                            "address already absent while removing; ignoring"
+                        );
+                        Ok(())
+                    } else {
+                        Err(RtnetlinkError::NetlinkError(msg)).with_context(|| {
+                            format!("remove resolver {ip}/{prefix} from {link_name}")
+                        })
+                    }
+                }
+                Err(err) => Err(err)
+                    .with_context(|| format!("remove resolver {ip}/{prefix} from {link_name}")),
+            }
         }
 
         pub async fn teardown_network(&self, plan: &NetworkPlan) -> Result<()> {
             let Some(handle) = self.handle() else {
                 return Ok(());
             };
+
+            let (host_ifname, _peer_ifname) = Self::host_access_ifnames(plan.network_id);
+            if let Some(index) = self.find_link(&host_ifname).await? {
+                handle
+                    .link()
+                    .del(index)
+                    .execute()
+                    .await
+                    .with_context(|| format!("delete host access {}", host_ifname))?;
+            }
 
             if let Some(index) = self.find_link(&plan.vxlan_name).await? {
                 handle
@@ -1431,6 +1690,7 @@ mod platform {
             // if the payload is not marked nested.
             let payload = {
                 let proto_attrs = [
+                    LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_HAIRPIN_MODE, vec![1])),
                     LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_LEARNING, vec![0])),
                     LinkProtoInfoBridge::Other(DefaultNla::new(
                         BRPORT_ATTR_NEIGH_SUPPRESS,
@@ -1503,6 +1763,58 @@ mod platform {
             Ok(())
         }
 
+        /// Enable hairpin mode on a bridge port so frames may egress back out the ingress port.
+        ///
+        /// Mantissa's VIP ARP responder synthesizes replies by rewriting inbound ARP requests on
+        /// tc-ingress. Hairpin mode is required so those replies can be sent back to the original
+        /// ingress port (containers, vxlan, or the host access veth peer).
+        async fn configure_bridge_hairpin(&self, port_index: u32, name: &str) -> Result<()> {
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
+            let payload = {
+                let proto_attrs = [LinkProtoInfoBridge::Other(DefaultNla::new(
+                    BRPORT_ATTR_HAIRPIN_MODE,
+                    vec![1],
+                ))];
+
+                let mut buf: Vec<u8> = Vec::with_capacity(32);
+                for attr in &proto_attrs {
+                    let value_len = attr.value_len();
+                    let attr_len = (NLA_HEADER_SIZE + value_len) as u16;
+                    let align = NLA_ALIGNTO;
+                    let aligned_len = ((attr_len as usize) + align - 1) & !(align - 1);
+                    let start = buf.len();
+                    buf.resize(start + aligned_len, 0);
+                    {
+                        let mut nla_buf = NlaBuffer::new(&mut buf[start..start + aligned_len]);
+                        nla_buf.set_kind(attr.kind());
+                        nla_buf.set_length(attr_len);
+                        attr.emit_value(nla_buf.value_mut());
+                    }
+                }
+                buf
+            };
+
+            let request = LinkMessageBuilder::<LinkUnspec>::default()
+                .set_header(LinkHeader {
+                    interface_family: AddressFamily::Bridge,
+                    index: port_index,
+                    ..Default::default()
+                })
+                .name(name.to_string())
+                .append_extra_attribute(LinkAttribute::Other(DefaultNla::new(
+                    IFLA_PROTINFO | NLA_F_NESTED,
+                    payload,
+                )))
+                .build();
+
+            handle.link().set(request).execute().await.with_context(|| {
+                format!("enable hairpin mode on bridge port {name} (idx {port_index})")
+            })
+        }
+
         async fn log_bridge_port_state(&self, index: u32, name: &str) -> Result<()> {
             let Some(handle) = self.handle() else {
                 return Ok(());
@@ -1510,6 +1822,7 @@ mod platform {
 
             let mut stream = handle.link().get().match_index(index).execute();
             while let Some(msg) = stream.try_next().await? {
+                let mut hairpin = None;
                 let mut learning = None;
                 let mut neigh_suppress = None;
                 let mut unicast_flood = None;
@@ -1522,6 +1835,9 @@ mod platform {
                             if let LinkInfo::PortData(InfoPortData::BridgePort(entries)) = info {
                                 for entry in entries {
                                     match entry {
+                                        InfoBridgePort::HairpinMode(value) => {
+                                            hairpin = Some(*value)
+                                        }
                                         InfoBridgePort::Learning(value) => learning = Some(*value),
                                         InfoBridgePort::NeighSupress(value) => {
                                             neigh_suppress = Some(*value)
@@ -1546,6 +1862,7 @@ mod platform {
                 debug!(
                     target: "network",
                     vxlan = %name,
+                    hairpin = ?hairpin,
                     learning = ?learning,
                     neigh_suppress = ?neigh_suppress,
                     unicast_flood = ?unicast_flood,

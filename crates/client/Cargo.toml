@@ -20,6 +20,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 ron = "0.10.1"
+blake3 = "1"
 
 [features]
 default = []

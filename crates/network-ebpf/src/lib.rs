@@ -259,6 +259,9 @@ pub mod lb {
         pub dst_port: u16,
         pub proto: u8,
         pub pad: u8,
+        /// Explicit tail padding so the key has deterministic bytes (Rust would otherwise leave
+        /// implicit struct padding uninitialized, causing map lookups to miss across programs).
+        pub padding: [u8; 2],
     }
 
     /// Cached per-flow translation data shared between ingress/egress hooks.

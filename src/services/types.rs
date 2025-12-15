@@ -76,6 +76,8 @@ pub struct ServiceTaskSpecValue {
     pub health_port: Option<u16>,
     #[serde(default)]
     pub health_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub public_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -107,6 +109,12 @@ impl ServiceTaskSpecValue {
 
     pub fn health_command(&self) -> Option<&[String]> {
         self.health_command.as_deref()
+    }
+
+    /// Return the port that should be reachable from the host via the network VIP, if one was
+    /// declared in the service manifest.
+    pub fn public_port(&self) -> Option<u16> {
+        self.public_port
     }
 }
 

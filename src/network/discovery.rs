@@ -1,5 +1,5 @@
 use crate::network::allocator::parse_ipv4_cidr;
-use crate::network::attachment::{bridge_name, vxlan_name};
+use crate::network::attachment::{bridge_name, host_access_host_iface_name, vxlan_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::lb::{BackendAddress, BpfLoadBalancer};
 use crate::network::registry::NetworkRegistry;
@@ -508,6 +508,8 @@ async fn answer_query(
         )
     }));
 
+    let expose_to_host = service_is_public(service_specs, network_id, &service_name);
+
     if let Some((vip, mac)) = compute_service_vip(registry, network_id, &service_name, &backends)?
         && program_service_vip(
             bpf_lb,
@@ -519,6 +521,7 @@ async fn answer_query(
             vip,
             mac,
             &backends,
+            expose_to_host,
         )
         .await
     {
@@ -1252,6 +1255,7 @@ async fn refresh_single_service(
             vip,
             mac,
             &backends,
+            service_is_public(service_specs, network_id, service_name),
         )
         .await;
     }
@@ -1271,9 +1275,21 @@ async fn program_service_vip(
     vip: Ipv4Addr,
     vip_mac: [u8; 6],
     backends: &[BackendAddress],
+    expose_to_host: bool,
 ) -> bool {
     match bpf_lb.sync_vip(network_id, vip, vip_mac, backends) {
         Ok(()) => {
+            if expose_to_host {
+                if let Err(err) = ensure_host_vip_neighbor(network_id, vip, vip_mac).await {
+                    debug!(
+                        target: "network",
+                        network = %network_id,
+                        service = %service_name,
+                        vip = %vip,
+                        "failed to program host neighbour for vip (continuing): {err:#}"
+                    );
+                }
+            }
             let mut guard = lb_missing.lock().await;
             guard.remove(&network_id);
             true
@@ -1282,6 +1298,17 @@ async fn program_service_vip(
             // Attempt to heal the maps by re-ensuring BPF programs, then retry once.
             let healed = heal_lb_maps(bpf, registry, network_id).await;
             if healed.is_ok() && bpf_lb.sync_vip(network_id, vip, vip_mac, backends).is_ok() {
+                if expose_to_host {
+                    if let Err(err) = ensure_host_vip_neighbor(network_id, vip, vip_mac).await {
+                        debug!(
+                            target: "network",
+                            network = %network_id,
+                            service = %service_name,
+                            vip = %vip,
+                            "failed to program host neighbour for vip after healing (continuing): {err:#}"
+                        );
+                    }
+                }
                 let mut guard = lb_missing.lock().await;
                 guard.remove(&network_id);
                 return true;
@@ -1298,6 +1325,86 @@ async fn program_service_vip(
             }
             false
         }
+    }
+}
+
+/// Return true if a service template declares a public port for the given network.
+///
+/// This is used to decide whether Mantissa should proactively program host neighbour entries for
+/// VIPs, enabling `curl http://<vip>:<port>` from the node without relying on ARP synthesis.
+fn service_is_public(
+    service_specs: &[ServiceSpecValue],
+    network_id: Uuid,
+    service_name: &str,
+) -> bool {
+    service_specs.iter().any(|spec| {
+        spec.tasks.iter().any(|task| {
+            task.name.eq_ignore_ascii_case(service_name)
+                && task.public_port().is_some()
+                && task.networks.iter().any(|net| net.network_id == network_id)
+        })
+    })
+}
+
+/// Ensure the local host has a stable neighbour entry for a service VIP.
+///
+/// Host-originated traffic enters the overlay via a dedicated `mnhost-*` interface. Without an
+/// ARP reply, the host neighbour table can remain in `FAILED` and prevent `curl` from reaching
+/// the VIP. Programming a permanent neighbour entry ties the VIP to the deterministic VIP MAC so
+/// packets reach the bridge tc-ingress load balancer immediately.
+async fn ensure_host_vip_neighbor(network_id: Uuid, vip: Ipv4Addr, vip_mac: [u8; 6]) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (network_id, vip, vip_mac);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use futures::TryStreamExt;
+        use rtnetlink::packet_route::neighbour::NeighbourState;
+
+        let (conn, handle, _) =
+            rtnetlink::new_connection().context("open rtnetlink connection for vip neighbour")?;
+        tokio::spawn(conn);
+
+        let host_ifname = host_access_host_iface_name(network_id);
+        let host_index = match handle
+            .link()
+            .get()
+            .match_name(host_ifname.clone())
+            .execute()
+            .try_next()
+            .await
+        {
+            Ok(Some(msg)) => msg.header.index,
+            Ok(None) => {
+                debug!(
+                    target: "network",
+                    network = %network_id,
+                    iface = %host_ifname,
+                    "host access interface missing while programming vip neighbour"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("lookup host access interface {host_ifname} for vip neighbour")
+                });
+            }
+        };
+
+        handle
+            .neighbours()
+            .add(host_index, IpAddr::V4(vip))
+            .link_local_address(&vip_mac)
+            .state(NeighbourState::Permanent)
+            .replace()
+            .execute()
+            .await
+            .with_context(|| format!("program vip neighbour entry for {vip} on {host_ifname}"))?;
+
+        Ok(())
     }
 }
 

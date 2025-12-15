@@ -1,3 +1,4 @@
+use crate::network::attachment::host_access_peer_iface_name;
 use crate::network::types::{BpfProgramSpec, NetworkSpecValue};
 use anyhow::Result;
 use uuid::Uuid;
@@ -9,6 +10,7 @@ pub struct NetworkInterfaceContext {
     network_id: Uuid,
     bridge_ifname: String,
     vxlan_ifname: String,
+    host_peer_ifname: String,
 }
 
 impl NetworkInterfaceContext {
@@ -24,6 +26,7 @@ impl NetworkInterfaceContext {
             network_id,
             bridge_ifname: bridge_ifname.into(),
             vxlan_ifname: vxlan_ifname.into(),
+            host_peer_ifname: host_access_peer_iface_name(network_id),
         }
     }
 
@@ -43,6 +46,12 @@ impl NetworkInterfaceContext {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn vxlan_ifname(&self) -> &str {
         self.vxlan_ifname.as_str()
+    }
+
+    /// Provide the bridge-port interface name that connects host traffic into the overlay bridge.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn host_peer_ifname(&self) -> &str {
+        self.host_peer_ifname.as_str()
     }
 }
 
@@ -97,7 +106,9 @@ mod platform {
     use anyhow::{Context, Result, anyhow};
     use aya::maps::MapData;
     use aya::pin::PinError;
-    use aya::programs::tc::{SchedClassifierLinkId, TcAttachType, qdisc_add_clsact};
+    use aya::programs::tc::{
+        SchedClassifierLinkId, TcAttachType, qdisc_add_clsact, qdisc_detach_program,
+    };
     use aya::programs::xdp::XdpLinkId;
     use aya::programs::{SchedClassifier, Xdp, XdpFlags};
     use aya::{Ebpf, EbpfLoader};
@@ -492,11 +503,19 @@ mod platform {
                 interface: interfaces.bridge_ifname(),
             },
             BpfAttachPoint::BridgeTcIngress => AttachTarget::Tc {
-                interface: interfaces.bridge_ifname(),
+                interface: if interface_exists(interfaces.host_peer_ifname()) {
+                    interfaces.host_peer_ifname()
+                } else {
+                    interfaces.bridge_ifname()
+                },
                 attach_type: TcAttachType::Ingress,
             },
             BpfAttachPoint::BridgeTcEgress => AttachTarget::Tc {
-                interface: interfaces.bridge_ifname(),
+                interface: if interface_exists(interfaces.host_peer_ifname()) {
+                    interfaces.host_peer_ifname()
+                } else {
+                    interfaces.bridge_ifname()
+                },
                 attach_type: TcAttachType::Egress,
             },
         }
@@ -576,8 +595,41 @@ mod platform {
     fn force_detach_target(target: AttachTarget<'_>) -> Result<()> {
         match target {
             AttachTarget::Xdp { interface } => detach_xdp(interface),
-            AttachTarget::Tc { .. } => Ok(()),
+            AttachTarget::Tc {
+                interface,
+                attach_type,
+            } => detach_tc_filters(interface, attach_type, None),
         }
+    }
+
+    /// Detach stale `tc` filters so repeated daemon restarts do not stack multiple classifiers on
+    /// the same hook (which can produce surprising behavior and wastes CPU cycles).
+    fn detach_tc_filters(
+        interface: &str,
+        attach_type: TcAttachType,
+        program_name: Option<&str>,
+    ) -> Result<()> {
+        let mut candidates = Vec::new();
+        if let Some(name) = program_name {
+            candidates.push(name.to_string());
+            let truncated: String = name.chars().take(15).collect();
+            if truncated != name {
+                candidates.push(truncated);
+            }
+        } else {
+            candidates.push("bridge_tc_ingress".chars().take(15).collect());
+            candidates.push("bridge_tc_egress".chars().take(15).collect());
+        }
+
+        for name in candidates {
+            match qdisc_detach_program(interface, attach_type, &name) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(())
     }
 
     /// Ensure LB-related maps are pinned so subsequent program loads reuse the same instances and
@@ -1035,6 +1087,17 @@ mod platform {
                                 interface
                             ));
                         }
+                    }
+
+                    if let Err(err) = detach_tc_filters(interface, attach_type, Some(&program_name))
+                    {
+                        warn!(
+                            target: "network",
+                            program = %program_name,
+                            interface,
+                            attach = ?attach_type,
+                            "failed to detach stale tc filter before attaching: {err:#}"
+                        );
                     }
 
                     let program = bpf.program_mut(program_name.as_str()).with_context(|| {

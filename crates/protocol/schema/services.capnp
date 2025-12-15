@@ -15,6 +15,7 @@ struct TaskTemplate {
   networks @9 :List(Text); # Required overlay network names
   healthPort @10 :UInt16;   # Optional health probe port (0 disables probing)
   healthCommand @11 :List(Text); # Optional health command (first element may be HTTP path); empty disables
+  publicPort @12 :UInt16;   # Optional host-facing service port (0 disables public exposure)
 }
 
 enum RestartPolicyName {

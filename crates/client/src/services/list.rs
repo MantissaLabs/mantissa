@@ -1,11 +1,16 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::networks;
+use crate::networks::{NetworkAttachment, NetworkAttachmentState, NetworkSummary};
 use crate::output;
 use crate::tasks::uuid_to_string;
 use anyhow::Result;
+use blake3::Hasher;
 use capnp::Error as CapnpError;
 use protocol::services::{ServiceStatus as ProtoServiceStatus, service_spec, task_template};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::net::Ipv4Addr;
 use tabwriter::TabWriter;
 use uuid::Uuid;
 
@@ -25,7 +30,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
 
     rows.sort_by(|a, b| a.service_name.cmp(&b.service_name));
 
-    let display_rows: Vec<ServiceRow> = rows
+    let mut display_rows: Vec<ServiceRow> = rows
         .into_iter()
         .filter(|row| row.status != ServiceStatusRow::Stopped)
         .collect();
@@ -35,8 +40,13 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
         return Ok(());
     }
 
+    hydrate_public_endpoints(cfg, &mut display_rows).await;
+
     let mut tw = TabWriter::new(Vec::new());
-    writeln!(&mut tw, "SERVICE\tSTATUS\tTASKS\tTASK IDS\tUPDATED\tID")?;
+    writeln!(
+        &mut tw,
+        "SERVICE\tSTATUS\tTASKS\tPUBLIC\tTASK IDS\tUPDATED\tID"
+    )?;
 
     for row in display_rows {
         let tasks_summary = if row.tasks.is_empty() {
@@ -49,12 +59,19 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
                 .join(", ")
         };
 
+        let public_summary = if row.public_endpoints.is_empty() {
+            "-".to_string()
+        } else {
+            row.public_endpoints.join(", ")
+        };
+
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.service_name,
             row.status,
             tasks_summary,
+            public_summary,
             row.task_ids.len(),
             row.updated_at,
             row.id,
@@ -76,6 +93,7 @@ pub struct ServiceRow {
     pub updated_at: String,
     pub task_ids: Vec<Uuid>,
     pub status: ServiceStatusRow,
+    pub public_endpoints: Vec<String>,
 }
 
 impl ServiceRow {
@@ -106,6 +124,7 @@ impl ServiceRow {
             updated_at: spec.get_updated_at()?.to_str()?.to_string(),
             task_ids,
             status: ServiceStatusRow::from_proto(spec.get_status()?),
+            public_endpoints: Vec::new(),
         })
     }
 }
@@ -116,6 +135,8 @@ pub struct ServiceTaskRow {
     pub image: String,
     pub command: Vec<String>,
     pub replicas: u16,
+    pub networks: Vec<String>,
+    pub public_port: Option<u16>,
 }
 
 impl ServiceTaskRow {
@@ -125,11 +146,25 @@ impl ServiceTaskRow {
             command.push(arg?.to_str()?.to_string());
         }
 
+        let mut networks = Vec::new();
+        for entry in reader.get_networks()?.iter() {
+            networks.push(entry?.to_str()?.to_string());
+        }
+
+        let raw_public = reader.get_public_port();
+        let public_port = if raw_public == 0 {
+            None
+        } else {
+            Some(raw_public)
+        };
+
         Ok(Self {
             name: reader.get_name()?.to_str()?.to_string(),
             image: reader.get_image()?.to_str()?.to_string(),
             command,
             replicas: reader.get_replicas(),
+            networks,
+            public_port,
         })
     }
 }
@@ -166,4 +201,194 @@ impl std::fmt::Display for ServiceStatusRow {
         };
         write!(f, "{label}")
     }
+}
+
+/// Best-effort enrichment that computes per-service public VIP endpoints so operators can
+/// `curl` services from the host without issuing manual DNS lookups.
+async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
+    if !rows.iter().any(|row| {
+        row.tasks
+            .iter()
+            .any(|task| task.public_port.is_some() && !task.networks.is_empty())
+    }) {
+        return;
+    }
+
+    let network_list = match networks::list(cfg).await {
+        Ok(list) => list,
+        Err(err) => {
+            eprintln!("warning: failed to list networks for public endpoints: {err}");
+            return;
+        }
+    };
+
+    let mut by_name: HashMap<String, NetworkSummary> = HashMap::new();
+    for net in network_list {
+        by_name.insert(net.name.to_ascii_lowercase(), net);
+    }
+
+    let mut attachments_cache: HashMap<Uuid, Vec<NetworkAttachment>> = HashMap::new();
+
+    for row in rows.iter_mut() {
+        let template_task_ids = build_template_task_ids(&row.tasks, &row.task_ids);
+        let mut endpoints = Vec::new();
+
+        for task in &row.tasks {
+            let Some(port) = task.public_port else {
+                continue;
+            };
+
+            let network_name = match task.networks.as_slice() {
+                [single] => single,
+                _ => continue,
+            };
+
+            let Some(network) = by_name.get(&network_name.to_ascii_lowercase()) else {
+                continue;
+            };
+
+            let template_ids = match template_task_ids.get(&task.name.to_ascii_lowercase()) {
+                Some(ids) => ids,
+                None => continue,
+            };
+
+            let attachments = match attachments_cache.get(&network.id) {
+                Some(existing) => existing,
+                None => {
+                    let fetched = match networks::attachments(cfg, &network.id.to_string()).await {
+                        Ok(list) => list,
+                        Err(err) => {
+                            eprintln!(
+                                "warning: failed to list attachments for network {} ({}): {err}",
+                                network.name, network.id
+                            );
+                            continue;
+                        }
+                    };
+                    attachments_cache.insert(network.id, fetched);
+                    attachments_cache
+                        .get(&network.id)
+                        .expect("inserted network attachments")
+                }
+            };
+
+            let mut backend_ips = HashSet::new();
+            for attachment in attachments {
+                if attachment.state != NetworkAttachmentState::Ready {
+                    continue;
+                }
+                if !template_ids.contains(&attachment.task_id) {
+                    continue;
+                }
+                let Some(ip_text) = attachment.assigned_ip.as_deref() else {
+                    continue;
+                };
+                let Ok(ip) = ip_text.parse::<Ipv4Addr>() else {
+                    continue;
+                };
+                backend_ips.insert(u32::from(ip));
+            }
+
+            if backend_ips.is_empty() {
+                continue;
+            }
+
+            let Some(vip) =
+                compute_service_vip(&network.subnet_cidr, network.id, &task.name, &backend_ips)
+            else {
+                continue;
+            };
+
+            endpoints.push(format!("{}={vip}:{port}", task.name));
+        }
+
+        endpoints.sort();
+        endpoints.dedup();
+        row.public_endpoints = endpoints;
+    }
+}
+
+/// Map template names to their task identifiers based on the ordered `taskIds` list returned by the
+/// service registry so we can select the correct backend attachments for VIP collision avoidance.
+fn build_template_task_ids(
+    templates: &[ServiceTaskRow],
+    task_ids: &[Uuid],
+) -> HashMap<String, HashSet<Uuid>> {
+    let mut out: HashMap<String, HashSet<Uuid>> = HashMap::new();
+    let mut cursor = 0usize;
+
+    for template in templates {
+        let key = template.name.to_ascii_lowercase();
+        let entry = out.entry(key).or_default();
+        let count = template.replicas as usize;
+
+        for _ in 0..count {
+            if let Some(task_id) = task_ids.get(cursor) {
+                entry.insert(*task_id);
+            }
+            cursor = cursor.saturating_add(1);
+        }
+    }
+
+    out
+}
+
+/// Compute the deterministic per-service VIP used by the Mantissa dataplane, matching the server
+/// implementation so the CLI can surface a stable endpoint for host access.
+fn compute_service_vip(
+    subnet_cidr: &str,
+    network_id: Uuid,
+    service_name: &str,
+    backend_ips: &HashSet<u32>,
+) -> Option<Ipv4Addr> {
+    let (base_ip, prefix) = parse_ipv4_cidr(subnet_cidr)?;
+
+    let host_bits = 32u8.saturating_sub(prefix);
+    if host_bits < 4 {
+        return None;
+    }
+
+    let digest = {
+        let mut hasher = Hasher::new();
+        hasher.update(network_id.as_bytes());
+        hasher.update(service_name.as_bytes());
+        hasher.finalize()
+    };
+
+    let mut slot_seed = [0u8; 4];
+    slot_seed.copy_from_slice(&digest.as_bytes()[..4]);
+
+    // Constrain VIPs to the even offsets of the overlay to avoid collisions with per-node resolver
+    // addresses, which always occupy the odd slots (offsets 1, 3, 5, ...).
+    let available_even = (1u64 << host_bits).saturating_sub(16) / 2;
+    if available_even == 0 {
+        return None;
+    }
+
+    let mut slot = (u32::from_le_bytes(slot_seed) % available_even as u32) * 2 + 8;
+    for _ in 0..available_even.min(16) as usize {
+        let candidate = u32::from(base_ip).saturating_add(slot);
+        if !backend_ips.contains(&candidate) {
+            return Some(Ipv4Addr::from(candidate));
+        }
+
+        // Walk forward to the next even slot if we collided with an existing backend.
+        slot = slot.wrapping_add(2) % (available_even as u32 * 2);
+        if slot < 8 {
+            slot = 8;
+        }
+    }
+
+    None
+}
+
+/// Parse an IPv4 CIDR string (e.g. "10.240.0.0/16") into its base address and prefix length.
+fn parse_ipv4_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
+    let (base_text, prefix_text) = cidr.split_once('/')?;
+    let prefix: u8 = prefix_text.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let base_ip: Ipv4Addr = base_text.parse().ok()?;
+    Some((base_ip, prefix))
 }
