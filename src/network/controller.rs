@@ -9,6 +9,7 @@ use crate::network::types::{
     BpfAttachPoint, BpfProgramSpec, NetworkAttachmentState, NetworkEvent, NetworkPeerState,
     NetworkPeerStateValue, NetworkSpecValue, NetworkStatus,
 };
+use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
 use crate::services::registry::ServiceRegistry;
 use crate::store::task_store::TaskStore;
@@ -28,6 +29,7 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const DEFAULT_MTU: u32 = 1450;
 #[cfg(target_os = "linux")]
 const VXLAN_PORT: u16 = 4789;
+const WIREGUARD_RECONCILE_DEBOUNCE: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct NetworkController {
@@ -43,12 +45,15 @@ struct NetworkControllerInner {
     bpf: NetworkBpfManager,
     discovery: ServiceDiscovery,
     active_networks: AsyncMutex<HashSet<Uuid>>,
+    vxlan_ifindex: AsyncMutex<HashMap<Uuid, u32>>,
     remote_fdb: AsyncMutex<HashMap<Uuid, HashMap<String, IpAddr>>>,
     flood_entries: AsyncMutex<HashMap<Uuid, HashSet<IpAddr>>>,
     attachment: PlatformAttachmentProvisioner,
     pending_forwarding: AsyncMutex<HashSet<Uuid>>,
     forwarding_events: AsyncMutex<Option<UnboundedReceiver<ForwardingEvent>>>,
     pending_specs: AsyncMutex<HashSet<Uuid>>,
+    wireguard: AsyncMutex<WireGuardUnderlayState>,
+    wireguard_last_reconcile: AsyncMutex<Option<std::time::Instant>>,
     wake: Notify,
     gossip_tx: Sender<Message>,
 }
@@ -63,6 +68,8 @@ struct NetworkPlan {
     mtu: u32,
     resolver_ipv4: Option<Ipv4Addr>,
     subnet_prefix: Option<u8>,
+    underlay_iface: Option<String>,
+    underlay_ip: Option<IpAddr>,
 }
 
 #[cfg(target_os = "linux")]
@@ -121,12 +128,15 @@ impl NetworkController {
                 bpf,
                 discovery,
                 active_networks: AsyncMutex::new(HashSet::new()),
+                vxlan_ifindex: AsyncMutex::new(HashMap::new()),
                 remote_fdb: AsyncMutex::new(HashMap::new()),
                 flood_entries: AsyncMutex::new(HashMap::new()),
                 attachment,
                 pending_forwarding: AsyncMutex::new(HashSet::new()),
                 forwarding_events: AsyncMutex::new(forwarding_events),
                 pending_specs: AsyncMutex::new(HashSet::new()),
+                wireguard: AsyncMutex::new(WireGuardUnderlayState::default()),
+                wireguard_last_reconcile: AsyncMutex::new(None),
                 wake: Notify::new(),
                 gossip_tx,
             }),
@@ -165,6 +175,57 @@ impl NetworkController {
         }
     }
 
+    /// Reconcile the optional WireGuard underlay used to encrypt VXLAN traffic.
+    ///
+    /// This is a best-effort step that never blocks overlay provisioning: if WireGuard cannot be
+    /// configured on a node, Mantissa falls back to the existing plaintext underlay.
+    async fn reconcile_wireguard_underlay(&self) {
+        // WireGuard provisioning is expensive (it rewrites interface + routes). The main network
+        // reconciliation loop can invoke this helper multiple times per tick (pending specs,
+        // pending forwarding, periodic sweep). Debounce here so we only touch kernel WireGuard once
+        // per short window.
+        let now = std::time::Instant::now();
+        {
+            let mut guard = self.inner.wireguard_last_reconcile.lock().await;
+            if let Some(last) = *guard
+                && now.saturating_duration_since(last) < WIREGUARD_RECONCILE_DEBOUNCE
+            {
+                return;
+            }
+            *guard = Some(now);
+        }
+
+        let previous = { self.inner.wireguard.lock().await.clone() };
+        match wireguard::ensure_wireguard_underlay(&self.inner.cluster_registry, self.inner.node_id)
+            .await
+        {
+            Ok(state) => {
+                let mut guard = self.inner.wireguard.lock().await;
+                if guard.underlay_active != state.underlay_active
+                    || guard.tunnel_ip != state.tunnel_ip
+                    || guard.ifname != state.ifname
+                {
+                    debug!(
+                        target: "network",
+                        underlay_active = state.underlay_active,
+                        ifname = %state.ifname,
+                        tunnel_ip = ?state.tunnel_ip,
+                        "wireguard underlay state updated"
+                    );
+                }
+                *guard = state;
+            }
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    "wireguard underlay reconcile failed; continuing without encryption: {err:#}"
+                );
+                let mut guard = self.inner.wireguard.lock().await;
+                *guard = previous;
+            }
+        }
+    }
+
     fn spawn_forwarding_listener(&self) {
         let controller = self.clone();
         tokio::task::spawn_local(async move {
@@ -199,6 +260,8 @@ impl NetworkController {
     }
 
     async fn reconcile_pending_forwarding(&self) -> Result<()> {
+        self.reconcile_wireguard_underlay().await;
+
         let pending: Vec<Uuid> = {
             let mut guard = self.inner.pending_forwarding.lock().await;
             guard.drain().collect()
@@ -225,6 +288,8 @@ impl NetworkController {
     }
 
     async fn reconcile_pending_specs(&self) -> Result<()> {
+        self.reconcile_wireguard_underlay().await;
+
         let queued: Vec<Uuid> = {
             let mut guard = self.inner.pending_specs.lock().await;
             guard.drain().collect()
@@ -292,6 +357,8 @@ impl NetworkController {
     }
 
     async fn reconcile_once(&self) -> Result<()> {
+        self.reconcile_wireguard_underlay().await;
+
         let specs = self
             .inner
             .registry
@@ -330,7 +397,8 @@ impl NetworkController {
     }
 
     async fn reconcile_network(&self, mut spec: NetworkSpecValue) -> Result<()> {
-        let (plan, spec_changed) = self.prepare_plan(&mut spec)?;
+        let (mut plan, spec_changed) = self.prepare_plan(&mut spec)?;
+        self.apply_wireguard_overrides(&mut plan).await;
         if spec_changed {
             self.inner
                 .registry
@@ -359,6 +427,7 @@ impl NetworkController {
                 .ensure_network(&plan)
                 .await
                 .with_context(|| format!("ensure network {}", plan.network_id))?;
+            self.observe_vxlan_ifindex(&plan).await;
             debug!(
                 target: "network",
                 network_id = %plan.network_id,
@@ -593,6 +662,11 @@ impl NetworkController {
             guard.remove(&network_id);
         }
 
+        {
+            let mut guard = self.inner.vxlan_ifindex.lock().await;
+            guard.remove(&network_id);
+        }
+
         Ok(())
     }
 
@@ -648,9 +722,88 @@ impl NetworkController {
             mtu: spec.mtu,
             resolver_ipv4,
             subnet_prefix,
+            underlay_iface: None,
+            underlay_ip: None,
         };
 
         Ok((plan, changed))
+    }
+
+    /// Apply runtime wireguard decisions to the network plan.
+    ///
+    /// This adjusts MTU and VXLAN underlay selection without mutating the replicated network spec.
+    async fn apply_wireguard_overrides(&self, plan: &mut NetworkPlan) {
+        let state = { self.inner.wireguard.lock().await.clone() };
+        if !state.underlay_active {
+            return;
+        }
+
+        if let Some(underlay_ip) = state.tunnel_ip {
+            plan.underlay_iface = Some(state.ifname);
+            plan.underlay_ip = Some(underlay_ip);
+            plan.mtu = plan.mtu.min(wireguard::MANTISSA_WIREGUARD_VXLAN_MTU);
+        }
+    }
+
+    /// Track the current VXLAN interface index for the network and clear forwarding caches when
+    /// the interface is recreated.
+    ///
+    /// Mantissa keeps in-memory maps of remote FDB and flood targets to avoid repeating netlink
+    /// work. When the VXLAN device is deleted/recreated (e.g. underlay switch, bpf conflict
+    /// recovery), the kernel state is lost and these caches must be invalidated.
+    async fn observe_vxlan_ifindex(&self, plan: &NetworkPlan) {
+        let current = match self.inner.provisioner.link_index(&plan.vxlan_name).await {
+            Ok(index) => index,
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    network = %plan.network_id,
+                    vxlan = %plan.vxlan_name,
+                    "failed to resolve vxlan ifindex; clearing forwarding caches defensively: {err:#}"
+                );
+                self.clear_forwarding_caches(plan.network_id).await;
+                let mut guard = self.inner.vxlan_ifindex.lock().await;
+                guard.remove(&plan.network_id);
+                return;
+            }
+        };
+
+        let mut changed = false;
+        {
+            let mut guard = self.inner.vxlan_ifindex.lock().await;
+            let prev = match current {
+                Some(index) => guard.insert(plan.network_id, index),
+                None => guard.remove(&plan.network_id),
+            };
+
+            if let (Some(prev), Some(now)) = (prev, current) {
+                changed = prev != now;
+            } else if prev.is_some() && current.is_none() {
+                changed = true;
+            }
+        }
+
+        if changed {
+            debug!(
+                target: "network",
+                network = %plan.network_id,
+                vxlan = %plan.vxlan_name,
+                "vxlan interface changed; clearing forwarding caches"
+            );
+            self.clear_forwarding_caches(plan.network_id).await;
+        }
+    }
+
+    /// Remove in-memory remote forwarding caches for the provided network.
+    async fn clear_forwarding_caches(&self, network_id: Uuid) {
+        {
+            let mut guard = self.inner.remote_fdb.lock().await;
+            guard.remove(&network_id);
+        }
+        {
+            let mut guard = self.inner.flood_entries.lock().await;
+            guard.remove(&network_id);
+        }
     }
 
     /// Guarantee the dataplane programs required for VIP load-balancing are present with the
@@ -765,7 +918,7 @@ impl NetworkController {
                 _ => continue,
             };
 
-            let peer_ip = match self.peer_ip_for_node(attachment.node_id) {
+            let peer_ip = match self.peer_ip_for_node(attachment.node_id).await {
                 Some(ip) => ip,
                 None => continue,
             };
@@ -895,9 +1048,30 @@ impl NetworkController {
         Ok(())
     }
 
-    fn peer_ip_for_node(&self, peer_id: Uuid) -> Option<IpAddr> {
+    /// Resolve the VXLAN underlay destination address to reach `peer_id`.
+    ///
+    /// When WireGuard underlay is active, we route VXLAN to the peer's deterministic tunnel IPv6.
+    /// Otherwise we fall back to the peer's advertised RPC address IP (current behavior).
+    async fn peer_ip_for_node(&self, peer_id: Uuid) -> Option<IpAddr> {
         if peer_id == self.inner.node_id {
             return None;
+        }
+
+        if self.inner.wireguard.lock().await.underlay_active {
+            if self
+                .inner
+                .cluster_registry
+                .peer_wireguard(peer_id)
+                .is_none()
+            {
+                warn!(
+                    target: "network",
+                    peer = %peer_id,
+                    "wireguard underlay active but peer is missing wireguard metadata; skipping forwarding entry"
+                );
+                return None;
+            }
+            return Some(IpAddr::V6(net::wireguard::wireguard_tunnel_ipv6(peer_id)));
         }
 
         let address = self.inner.cluster_registry.peer_address(peer_id)?;
@@ -960,6 +1134,8 @@ impl NetworkPlan {
             mtu: DEFAULT_MTU,
             resolver_ipv4: None,
             subnet_prefix: None,
+            underlay_iface: None,
+            underlay_ip: None,
         }
     }
 }
@@ -992,17 +1168,18 @@ fn compute_deterministic_vni(network_id: Uuid) -> u32 {
 mod platform {
     use super::{NetworkPlan, VXLAN_PORT};
     use crate::network::attachment::{host_access_host_iface_name, host_access_peer_iface_name};
+    use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
     use anyhow::{Context, Result, anyhow};
     use futures::TryStreamExt;
     use libc;
     use netlink_packet_core::{DefaultNla, Nla};
     use netlink_packet_utils::nla::{NLA_ALIGNTO, NLA_F_NESTED, NLA_HEADER_SIZE, NlaBuffer};
-    use rtnetlink::packet_route::AddressFamily;
-    use rtnetlink::packet_route::address::AddressAttribute;
-    use rtnetlink::packet_route::link::{
-        InfoBridgePort, InfoKind, InfoPortData, LinkAttribute, LinkFlags, LinkHeader, LinkInfo,
-        LinkProtoInfoBridge,
-    };
+	    use rtnetlink::packet_route::AddressFamily;
+	    use rtnetlink::packet_route::address::AddressAttribute;
+	    use rtnetlink::packet_route::link::{
+	        InfoBridgePort, InfoData, InfoKind, InfoPortData, InfoVxlan, LinkAttribute, LinkFlags,
+	        LinkHeader, LinkInfo, LinkProtoInfoBridge,
+	    };
     use rtnetlink::{
         AddressMessageBuilder, Error as RtnetlinkError, Handle, LinkBridge, LinkMessageBuilder,
         LinkUnspec, LinkVeth, LinkVxlan, new_connection,
@@ -1480,52 +1657,124 @@ mod platform {
                 .ok_or_else(|| anyhow!("rtnetlink handle unavailable"))?;
 
             if let Some(index) = self.find_link(&plan.vxlan_name).await? {
-                if let Err(err) = self.configure_existing_vxlan(index, &plan.vxlan_name).await {
-                    warn!(
+                let mut recreate = false;
+
+                if let Some(forced_underlay) = plan.underlay_iface.as_deref() {
+                    match self.find_link(forced_underlay).await? {
+                        Some(forced_index) => {
+                            let current = self.link_lower_index(index).await?;
+                            if current != Some(forced_index) {
+                                warn!(
+                                    target: "network",
+                                    vxlan = %plan.vxlan_name,
+                                    vxlan_index = index,
+                                    current_underlay = ?current,
+                                    desired_underlay = forced_underlay,
+                                    desired_underlay_index = forced_index,
+                                    "vxlan underlay changed; recreating interface"
+                                );
+                                recreate = true;
+                            }
+                        }
+                        None => {
+                            warn!(
+                                target: "network",
+                                vxlan = %plan.vxlan_name,
+                                vxlan_index = index,
+                                desired_underlay = forced_underlay,
+                                "requested vxlan underlay interface missing; reusing existing vxlan"
+                            );
+                        }
+                    }
+                } else if let Some(wg_index) = self.find_link(MANTISSA_WIREGUARD_IFNAME).await? {
+                    let current = self.link_lower_index(index).await?;
+                    if current == Some(wg_index) {
+                        warn!(
+                            target: "network",
+                            vxlan = %plan.vxlan_name,
+                            vxlan_index = index,
+                            "wireguard underlay no longer requested; recreating vxlan on detected underlay"
+                        );
+                        recreate = true;
+                    }
+                }
+
+                if recreate {
+                    handle.link().del(index).execute().await.with_context(|| {
+                        format!("delete vxlan {} (idx {})", plan.vxlan_name, index)
+                    })?;
+                } else {
+                    if let Err(err) = self.configure_existing_vxlan(index, &plan.vxlan_name).await {
+                        warn!(
+                            target: "network",
+                            vxlan = %plan.vxlan_name,
+                            error = %err,
+                            "failed to update vxlan configuration while reusing interface"
+                        );
+                    }
+                    debug!(
                         target: "network",
                         vxlan = %plan.vxlan_name,
-                        error = %err,
-                        "failed to update vxlan configuration while reusing interface"
+                        vxlan_index = index,
+                        "provisioner: reusing existing vxlan interface"
                     );
+                    return Ok(index);
                 }
-                debug!(
-                    target: "network",
-                    vxlan = %plan.vxlan_name,
-                    vxlan_index = index,
-                    "provisioner: reusing existing vxlan interface"
-                );
-                return Ok(index);
             }
 
             let mut last_error: Option<anyhow::Error> = None;
 
             for attempt in 0..=1 {
-                let (underlay_index, underlay_ip) = self
-                    .underlay_info()
-                    .await
-                    .context("resolve underlay interface for vxlan")?;
+                let mut forced_underlay_name: Option<String> = None;
+                let (underlay_index, underlay_ip) = if let (Some(ifname), Some(ip)) =
+                    (plan.underlay_iface.as_deref(), plan.underlay_ip)
+                {
+                    forced_underlay_name = Some(ifname.to_string());
+                    match self.find_link(ifname).await? {
+                        Some(index) => (index, ip),
+                        None => {
+                            warn!(
+                                target: "network",
+                                attempt,
+                                underlay = ifname,
+                                "requested wireguard underlay interface missing; falling back to detected underlay"
+                            );
+                            forced_underlay_name = None;
+                            self.underlay_info()
+                                .await
+                                .context("resolve underlay interface for vxlan")?
+                        }
+                    }
+                } else {
+                    self.underlay_info()
+                        .await
+                        .context("resolve underlay interface for vxlan")?
+                };
 
-                let underlay_name = match self.link_name(underlay_index).await {
-                    Ok(Some(name)) => name,
-                    Ok(None) => {
-                        warn!(
-                            target: "network",
-                            underlay_index,
-                            attempt,
-                            "underlay index missing while preparing vxlan; will fall back to numeric name"
-                        );
-                        format!("ifindex{underlay_index}")
-                    }
-                    Err(err) => {
-                        warn!(
-                            target: "network",
-                            underlay_index,
-                            attempt,
-                            error = %err,
-                            "failed to resolve underlay name before vxlan creation; falling back to numeric name"
-                        );
-                        format!("ifindex{underlay_index}")
-                    }
+                let underlay_name = match forced_underlay_name {
+                    Some(name) => name,
+                    None => match self.link_name(underlay_index).await {
+                        Ok(Some(name)) => name,
+                        Ok(None) => {
+                            warn!(
+                                target: "network",
+                                underlay_index,
+                                attempt,
+                                "underlay index missing while preparing vxlan; will fall back to numeric name"
+                            );
+                            format!("ifindex{underlay_index}")
+                        }
+                        Err(err) => {
+                            warn!(
+                                target: "network",
+                                underlay_index,
+                                attempt,
+                                error = %err,
+                                "failed to resolve underlay name before vxlan creation; falling back to numeric name"
+                            );
+                            format!("ifindex{underlay_index}")
+                        }
+                    },
                 };
 
                 info!(
@@ -2030,6 +2279,14 @@ mod platform {
             Ok(())
         }
 
+        /// Resolve the kernel interface index for the provided link name.
+        ///
+        /// This is used by higher-level controllers to detect when interfaces have been recreated
+        /// (e.g. underlay changes) so they can invalidate any cached forwarding state.
+        pub async fn link_index(&self, name: &str) -> Result<Option<u32>> {
+            self.find_link(name).await
+        }
+
         async fn find_link(&self, name: &str) -> Result<Option<u32>> {
             let Some(handle) = self.handle() else {
                 return Ok(None);
@@ -2148,6 +2405,13 @@ mod platform {
                     );
                     continue;
                 }
+                if name == MANTISSA_WIREGUARD_IFNAME {
+                    debug!(
+                        target: "network",
+                        "skipping underlay candidate {name} (index {index}) because it is managed by wireguard"
+                    );
+                    continue;
+                }
 
                 let mut addr_stream = handle
                     .address()
@@ -2218,6 +2482,45 @@ mod platform {
                 for nla in link.attributes.into_iter() {
                     if let LinkAttribute::IfName(name) = nla {
                         return Ok(Some(name));
+                    }
+                }
+            }
+            Ok(None)
+        }
+
+        /// Return the "lower" (underlay) link index for the provided interface, when available.
+        ///
+        /// Mantissa needs to detect the underlay device used by an existing VXLAN interface so
+        /// we can decide whether it must be recreated (for example when switching the overlay
+        /// underlay from plaintext to WireGuard).
+        ///
+        /// Important: the VXLAN underlay link is stored in `IFLA_INFO_DATA` as
+        /// `IFLA_VXLAN_LINK` (parsed here as `InfoData::Vxlan(..)/InfoVxlan::Link(..)`).
+        /// `LinkMessageBuilder::link()` / `IFLA_LINK` is *not* reliable for VXLAN devices.
+        async fn link_lower_index(&self, index: u32) -> Result<Option<u32>> {
+            let Some(handle) = self.handle() else {
+                return Ok(None);
+            };
+
+            let mut links = handle.link().get().match_index(index).execute();
+            while let Some(link) = links.try_next().await? {
+                for nla in link.attributes.into_iter() {
+                    match nla {
+                        LinkAttribute::LinkInfo(infos) => {
+                            for info in infos {
+                                if let LinkInfo::Data(InfoData::Vxlan(entries)) = info {
+                                    for entry in entries {
+                                        if let InfoVxlan::Link(lower) = entry {
+                                            return Ok(Some(lower));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        LinkAttribute::Link(lower) => {
+                            return Ok(Some(lower));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -2308,6 +2611,11 @@ mod platform {
     impl NetworkProvisioner {
         pub fn new() -> Result<Self> {
             Ok(Self)
+        }
+
+        /// Return `None` on unsupported platforms, since no kernel interfaces are created.
+        pub async fn link_index(&self, _name: &str) -> Result<Option<u32>> {
+            Ok(None)
         }
 
         pub async fn ensure_network(&self, plan: &NetworkPlan) -> Result<()> {

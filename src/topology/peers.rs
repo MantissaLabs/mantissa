@@ -6,6 +6,28 @@ use x25519_dalek::PublicKey;
 
 use serde::{Deserialize, Serialize};
 
+/// WireGuard configuration advertised by a peer for encrypting the VXLAN underlay.
+///
+/// This struct is stored in the Peers CRDT so every node can deterministically build
+/// a full mesh WireGuard underlay without any extra out-of-band configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub struct WireGuardPeerValue {
+    /// Curve25519 public key used by WireGuard for this peer.
+    pub public_key: [u8; 32],
+
+    /// UDP port the peer listens on for WireGuard. A value of 0 means "reuse the port
+    /// from `PeerValue.address`".
+    #[serde(default)]
+    pub port: u16,
+
+    /// Indicates whether the peer has successfully configured its local WireGuard interface.
+    ///
+    /// We keep this explicit to support safe, opportunistic enablement: nodes only switch the
+    /// VXLAN underlay to WireGuard once every participating peer has `enabled = true`.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct PeerValue {
     pub address: String,
@@ -14,6 +36,10 @@ pub struct PeerValue {
 
     /// Verifying key for cluster credentials signing.
     pub signing_pub: [u8; 32],
+
+    /// Optional WireGuard configuration used to encrypt the VXLAN underlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireguard: Option<WireGuardPeerValue>,
 }
 
 #[async_trait(?Send)]
@@ -67,11 +93,31 @@ impl PeerValue {
         let mut signing_pub = [0u8; 32];
         signing_pub.copy_from_slice(sk_bytes);
 
+        let wg_key_bytes = ni.get_wireguard_public_key()?;
+        let wireguard = if wg_key_bytes.is_empty() {
+            None
+        } else {
+            if wg_key_bytes.len() != 32 {
+                return Err(CapnpError::failed(
+                    "wireguardPublicKey must be exactly 32 bytes".into(),
+                ));
+            }
+            let mut public_key = [0u8; 32];
+            public_key.copy_from_slice(wg_key_bytes);
+
+            Some(WireGuardPeerValue {
+                public_key,
+                port: ni.get_wireguard_port(),
+                enabled: ni.get_wireguard_enabled(),
+            })
+        };
+
         Ok(PeerValue {
             address,
             hostname,
             noise_static_pub,
             signing_pub,
+            wireguard,
         })
     }
 }

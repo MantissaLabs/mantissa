@@ -15,6 +15,7 @@ use crate::network::types::{
     NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue,
     compute_network_attachment_id,
 };
+use crate::network::wireguard;
 use crate::task::container::ContainerState;
 use crate::task::types::{TaskEvent, TaskServiceMetadata};
 
@@ -359,7 +360,10 @@ impl TaskManager {
 
             let (_, prefix) = parse_ipv4_cidr(&spec.subnet_cidr)
                 .context("failed to parse network subnet for attachment")?;
-            let mtu = if spec.mtu == 0 { DEFAULT_MTU } else { spec.mtu };
+            let mut mtu = if spec.mtu == 0 { DEFAULT_MTU } else { spec.mtu };
+            if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_none() {
+                mtu = mtu.min(wireguard::MANTISSA_WIREGUARD_VXLAN_MTU);
+            }
             let bridge = bridge_name(spec.id);
 
             attachment.set_assignment(

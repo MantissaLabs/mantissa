@@ -4,7 +4,7 @@ use crate::node::id;
 use crate::node::identity::pubkey_from_slice;
 use crate::server::credential::ClusterCredential;
 use crate::topology::TopologyEvent;
-use crate::topology::peers::PeerValue;
+use crate::topology::peers::{PeerValue, WireGuardPeerValue};
 use std::rc::Rc;
 use tracing::debug;
 
@@ -65,11 +65,30 @@ impl protocol::server::Server for Server {
 
         let signing_pub = signing_vk.to_bytes();
 
+        let wg_pk_bytes = info.get_wireguard_public_key()?;
+        let wireguard = if wg_pk_bytes.is_empty() {
+            None
+        } else {
+            if wg_pk_bytes.len() != 32 {
+                return Err(capnp::Error::failed(
+                    "wireguardPublicKey must be exactly 32 bytes".to_string(),
+                ));
+            }
+            let mut public_key = [0u8; 32];
+            public_key.copy_from_slice(wg_pk_bytes);
+            Some(WireGuardPeerValue {
+                public_key,
+                port: info.get_wireguard_port(),
+                enabled: info.get_wireguard_enabled(),
+            })
+        };
+
         let peer = PeerValue {
             address,
             hostname,
             noise_static_pub: pubkey.to_bytes(),
             signing_pub,
+            wireguard,
         };
 
         self.topology
@@ -119,6 +138,7 @@ impl protocol::server::Server for Server {
             client: Some(handle.clone()),
             noise_static_pub: pubkey,
             signing_pub: Box::new(signing_vk),
+            wireguard: peer.wireguard.clone(),
         };
 
         self.topology.gossip_topology_event(join_event).await?;

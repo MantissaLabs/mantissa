@@ -1,8 +1,9 @@
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
-use crate::topology::peers::PeerValue;
+use crate::topology::peers::{PeerValue, WireGuardPeerValue};
 use ::health::HealthMonitor;
 use anyhow::{Result as AnyResult, anyhow};
+use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::SigningKey;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::health;
@@ -175,6 +176,50 @@ impl Registry {
     pub fn peer_address(&self, peer_id: Uuid) -> Option<String> {
         self.peer_latest_value(peer_id)
             .map(|value| value.address.clone())
+    }
+
+    /// Returns the last recorded WireGuard underlay configuration for the provided `peer_id`, if
+    /// available.
+    pub fn peer_wireguard(&self, peer_id: Uuid) -> Option<WireGuardPeerValue> {
+        self.peer_latest_value(peer_id)
+            .and_then(|value| value.wireguard)
+    }
+
+    /// Returns a best-effort snapshot of the latest `PeerValue` for every active peer.
+    ///
+    /// This is used by subsystems (like networking) that need to reconcile state based on peer
+    /// metadata without repeatedly scanning the store for each individual peer.
+    pub fn peer_values_snapshot(&self) -> AnyResult<Vec<(Uuid, PeerValue)>> {
+        let (actives, _) = self
+            .peers
+            .load_all()
+            .map_err(|e| anyhow!("failed to load peer store: {e}"))?;
+
+        let mut out = Vec::with_capacity(actives.len());
+        for (key, snapshot) in actives {
+            if let Some(value) = Self::select_peer_value(snapshot.as_slice()) {
+                out.push((key.to_uuid(), value));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Updates the local node's advertised WireGuard state in the peers store.
+    ///
+    /// This allows the data plane (network controller) to mark WireGuard as ready once the kernel
+    /// interface has been provisioned, enabling other nodes to safely switch the VXLAN underlay
+    /// to the encrypted tunnel.
+    pub async fn upsert_self_wireguard(&self, wireguard: WireGuardPeerValue) -> AnyResult<()> {
+        let Some(mut current) = self.peer_latest_value(self.node_id) else {
+            return Err(anyhow!("self peer value not yet available"));
+        };
+
+        current.wireguard = Some(wireguard);
+        self.peers
+            .upsert(&UuidKey::from(self.node_id), current)
+            .await
+            .map_err(|e| anyhow!("failed to upsert self peer wireguard state: {e}"))?;
+        Ok(())
     }
 
     pub async fn session_for_peer(&self, peer_id: Uuid) -> Option<cluster_session::Client> {
@@ -648,12 +693,91 @@ impl Registry {
         }
     }
 
+    /// Select the "best" peer value from an MVReg snapshot.
+    ///
+    /// Peers are stored as a multi-value register to tolerate concurrent writes during cluster
+    /// joins/sync. For the networking stack we want a single, stable view of a peer that prefers
+    /// values with more complete metadata (e.g. WireGuard configuration and enabled state) instead
+    /// of relying on the arbitrary ordering of concurrent register entries.
+    fn select_peer_value(values: &[PeerValue]) -> Option<PeerValue> {
+        fn is_nonzero_key(key: &[u8; 32]) -> bool {
+            key.iter().any(|b| *b != 0)
+        }
+
+        fn rank_wireguard(wg: &WireGuardPeerValue) -> (bool, bool, bool, u16, [u8; 32]) {
+            (
+                wg.enabled,
+                is_nonzero_key(&wg.public_key),
+                wg.port != 0,
+                wg.port,
+                wg.public_key,
+            )
+        }
+
+        if values.is_empty() {
+            return None;
+        }
+
+        let mut address: Option<&str> = None;
+        let mut hostname: Option<&str> = None;
+        let mut noise_static_pub: Option<[u8; 32]> = None;
+        let mut signing_pub: Option<[u8; 32]> = None;
+        let mut wireguard: Option<WireGuardPeerValue> = None;
+
+        for value in values {
+            if !value.address.is_empty() {
+                address = match address {
+                    None => Some(value.address.as_str()),
+                    Some(current) => Some(std::cmp::max(current, value.address.as_str())),
+                };
+            }
+
+            if !value.hostname.is_empty() {
+                hostname = match hostname {
+                    None => Some(value.hostname.as_str()),
+                    Some(current) => Some(std::cmp::max(current, value.hostname.as_str())),
+                };
+            }
+
+            noise_static_pub = match noise_static_pub {
+                None => Some(value.noise_static_pub),
+                Some(current) => Some(std::cmp::max(current, value.noise_static_pub)),
+            };
+
+            signing_pub = match signing_pub {
+                None => Some(value.signing_pub),
+                Some(current) => Some(std::cmp::max(current, value.signing_pub)),
+            };
+
+            if let Some(candidate) = value.wireguard.as_ref() {
+                wireguard = match wireguard.as_ref() {
+                    None => Some(candidate.clone()),
+                    Some(current) => {
+                        if rank_wireguard(candidate) > rank_wireguard(current) {
+                            Some(candidate.clone())
+                        } else {
+                            Some(current.clone())
+                        }
+                    }
+                };
+            }
+        }
+
+        Some(PeerValue {
+            address: address.unwrap_or_default().to_string(),
+            hostname: hostname.unwrap_or_default().to_string(),
+            noise_static_pub: noise_static_pub.unwrap_or_default(),
+            signing_pub: signing_pub.unwrap_or_default(),
+            wireguard,
+        })
+    }
+
     fn peer_latest_value(&self, peer_id: Uuid) -> Option<PeerValue> {
         let (actives, _) = self.peers.load_all().ok()?;
         actives
             .into_iter()
             .find(|(k, _)| k.to_uuid() == peer_id)
-            .and_then(|(_, snap)| snap.as_slice().last().cloned())
+            .and_then(|(_, snap)| Self::select_peer_value(snap.as_slice()))
     }
 
     async fn connect_to_peer(addr: &str) -> Result<server::Client, String> {

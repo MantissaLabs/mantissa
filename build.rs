@@ -193,7 +193,23 @@ fn build_bpf() -> Result<()> {
 
     let mut metadata_cmd = MetadataCommand::new();
     metadata_cmd.manifest_path(manifest_dir.join("Cargo.toml"));
-    let metadata = metadata_cmd.exec()?;
+    // The eBPF build only needs to locate workspace members. Using `--no-deps` keeps cargo from
+    // resolving and downloading the full dependency graph (which may be blocked in restricted
+    // environments even when the host build succeeds from cache).
+    metadata_cmd.no_deps();
+    // Prefer an offline metadata query so the build remains deterministic when internet access is
+    // unavailable (e.g. CI or air-gapped nodes). If the workspace has never been built before and
+    // the cargo index is missing, this will fail and we'll fall back to an online query.
+    metadata_cmd.other_options(vec!["--offline".into()]);
+    let metadata = match metadata_cmd.exec() {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            let mut retry = MetadataCommand::new();
+            retry.manifest_path(manifest_dir.join("Cargo.toml"));
+            retry.no_deps();
+            retry.exec().with_context(|| format!("cargo metadata failed in offline mode: {err}"))?
+        }
+    };
 
     let packages: Vec<_> = metadata
         .packages

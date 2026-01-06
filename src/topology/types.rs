@@ -4,6 +4,8 @@ use std::fmt;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
+use crate::topology::peers::WireGuardPeerValue;
+
 #[derive(Clone)]
 pub struct PeerHandle {
     pub id: Uuid,
@@ -46,6 +48,7 @@ pub enum TopologyEvent {
         client: Option<server::Client>,
         noise_static_pub: PublicKey,
         signing_pub: Box<VerifyingKey>,
+        wireguard: Option<WireGuardPeerValue>,
     },
     Leave {
         id: Uuid,

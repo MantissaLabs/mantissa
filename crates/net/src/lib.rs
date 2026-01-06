@@ -5,3 +5,4 @@ pub mod noise;
 pub mod paths;
 pub mod tcp_secure;
 pub mod unix_socket;
+pub mod wireguard;

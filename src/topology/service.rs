@@ -1,4 +1,5 @@
 use super::{Topology, types::TopologyEvent};
+use crate::node::address::extract_port;
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::pubkey_from_slice;
 use crate::server::credential::ClusterCredential;
@@ -8,7 +9,7 @@ use crate::store::peer_store::PeersStore;
 use crate::store::secret_master_store::MasterKeyRecord;
 use crate::sync::delta::{SyncStores, sync_all_domains};
 use crate::topology::health::status_to_node_status;
-use crate::topology::peers::PeerValue;
+use crate::topology::peers::{PeerValue, WireGuardPeerValue};
 use capnp::Error;
 use capnp::data;
 use crdt_store::uuid_key::UuidKey;
@@ -28,6 +29,7 @@ struct JoinPayload {
     server_handle: server::Client,
     public_key: [u8; 32],
     signing_key: [u8; 32],
+    wireguard: Option<WireGuardPeerValue>,
 }
 
 struct JoinInputs {
@@ -65,9 +67,10 @@ impl Topology {
             .get_server_handle()
             .ok_or_else(|| Error::failed("server handle not set".into()))?;
 
-        let advertise_addr = self
-            .compute_advertise_addr()
-            .map_err(|e| Error::failed(format!("failed to compute advertise addr: {e}")))?;
+	        let advertise_addr = self
+	            .compute_advertise_addr()
+	            .map_err(|e| Error::failed(format!("failed to compute advertise addr: {e}")))?;
+	        let preferred_wireguard_port = extract_port(&advertise_addr).ok();
 
         let hostname = self
             .node
@@ -77,6 +80,35 @@ impl Topology {
             .clone()
             .ok_or_else(|| Error::failed("hostname not set".into()))?;
 
+	        let wireguard = if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_some()
+	            || !net::paths::running_as_root()
+	        {
+	            None
+	        } else {
+	            match net::wireguard::resolve_wireguard_key_path()
+	                .and_then(net::wireguard::load_or_generate_wireguard_keys)
+	            {
+	                Ok(keys) => match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(preferred_wireguard_port) {
+	                    Ok(port) => Some(WireGuardPeerValue {
+	                        public_key: keys.public_bytes(),
+	                        port,
+                        enabled: false,
+                    }),
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "topology",
+                            "failed to resolve WireGuard listen port: {err}"
+                        );
+                        None
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(target: "topology", "failed to load WireGuard keys: {err}");
+                    None
+                }
+            }
+        };
+
         Ok(JoinPayload {
             id: self.node.id,
             hostname,
@@ -84,6 +116,7 @@ impl Topology {
             server_handle,
             public_key: self.public_key.to_bytes(),
             signing_key: self.signing_key.verifying_key().to_bytes(),
+            wireguard,
         })
     }
 
@@ -101,6 +134,11 @@ impl Topology {
         info.set_handle(payload.server_handle.clone());
         info.set_public_key(&payload.public_key);
         info.set_signing_key(&payload.signing_key);
+        if let Some(wg) = payload.wireguard.as_ref() {
+            info.set_wireguard_public_key(&wg.public_key);
+            info.set_wireguard_port(wg.port);
+            info.set_wireguard_enabled(wg.enabled);
+        }
 
         request.get().set_token(join_token);
 
@@ -335,6 +373,12 @@ impl topology::Server for Topology {
                 node.set_addr(&val.address);
                 node.set_hostname(&val.hostname);
                 node.set_public_key(&val.noise_static_pub);
+                node.set_signing_key(&val.signing_pub);
+                if let Some(wg) = val.wireguard.as_ref() {
+                    node.set_wireguard_public_key(&wg.public_key);
+                    node.set_wireguard_port(wg.port);
+                    node.set_wireguard_enabled(wg.enabled);
+                }
             }
 
             // Map health snapshot to NodeStatus.
@@ -388,6 +432,24 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
     let id = read_node_id(node.get_id()?)?;
     let pubkey = pubkey_from_slice(node.get_public_key()?).expect("Failed to parse public key");
     let signing_pub = verifying_key_from_data(node.get_signing_key()?)?;
+    let wg_pk_bytes = node.get_wireguard_public_key()?;
+    let wireguard = if wg_pk_bytes.is_empty() {
+        None
+    } else {
+        if wg_pk_bytes.len() != 32 {
+            return Err(capnp::Error::failed(
+                "wireguardPublicKey must be exactly 32 bytes".into(),
+            ));
+        }
+        let mut public_key = [0u8; 32];
+        public_key.copy_from_slice(wg_pk_bytes);
+
+        Some(WireGuardPeerValue {
+            public_key,
+            port: node.get_wireguard_port(),
+            enabled: node.get_wireguard_enabled(),
+        })
+    };
 
     let event = match reader.get_event()? {
         EventType::Add => {
@@ -405,6 +467,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 client,
                 noise_static_pub: pubkey,
                 signing_pub: Box::new(signing_pub),
+                wireguard,
             }
         }
         EventType::Remove => TopologyEvent::Leave { id },
@@ -430,6 +493,7 @@ pub fn add_event(
             client,
             noise_static_pub,
             signing_pub,
+            wireguard,
         } => {
             let mut topo = msg.init_topology();
 
@@ -442,6 +506,11 @@ pub fn add_event(
             node.set_root_hash(root_hash);
             node.set_public_key(&noise_static_pub.to_bytes());
             node.set_signing_key(&signing_pub.to_bytes());
+            if let Some(wg) = wireguard.as_ref() {
+                node.set_wireguard_public_key(&wg.public_key);
+                node.set_wireguard_port(wg.port);
+                node.set_wireguard_enabled(wg.enabled);
+            }
 
             if let Some(client) = client {
                 // Only embed our own handle; forwarding a capability learned from another peer

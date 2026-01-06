@@ -2,7 +2,8 @@ use anyhow::{Context, Result, anyhow};
 use futures::{StreamExt, TryStreamExt};
 use libc;
 use rtnetlink::packet_core::{
-    NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
+    NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkMessage,
+    NetlinkPayload,
 };
 use rtnetlink::packet_route::neighbour::{
     NeighbourAddress, NeighbourAttribute, NeighbourFlags, NeighbourMessage, NeighbourState,
@@ -378,6 +379,29 @@ impl AttachmentProvisioner {
 
             let mut request = NetlinkMessage::from(RouteNetlinkMessage::NewNeighbour(message));
             request.header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_APPEND;
+            return self.submit_request(request).await;
+        }
+
+        if let IpAddr::V6(v6) = dst {
+            // The rtnetlink neighbour builder is historically brittle for bridge FDB entries that
+            // carry IPv6 destinations. Build the netlink message directly so VXLAN forwarding works
+            // reliably when the underlay is IPv6 (e.g. VXLAN-over-WireGuard).
+            let mut message = NeighbourMessage::default();
+            message.header.family = AddressFamily::Bridge;
+            message.header.ifindex = vxlan_index;
+            message.header.state = NeighbourState::Permanent;
+            message.header.flags = NeighbourFlags::Own;
+            message.header.kind = RouteType::Unspec;
+
+            message
+                .attributes
+                .push(NeighbourAttribute::LinkLocalAddress(mac.to_vec()));
+            message
+                .attributes
+                .push(NeighbourAttribute::Destination(NeighbourAddress::from(v6)));
+
+            let mut request = NetlinkMessage::from(RouteNetlinkMessage::NewNeighbour(message));
+            request.header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
             return self.submit_request(request).await;
         }
 

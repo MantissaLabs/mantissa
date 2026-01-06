@@ -1,6 +1,7 @@
 use crate::gossip::{GossipContext, Message};
 use crate::node::Node;
 use crate::node::address::compute_advertise_ip;
+use crate::node::address::extract_port;
 use crate::node::id::set_node_id;
 use crate::registry::Registry;
 use crate::secrets::crypto::SecretKeyring;
@@ -387,15 +388,16 @@ impl Topology {
 
         // Compute advertise address before registering. If this fails we abort so the node
         // does not appear joined without a reachable address.
-        let advertise = match self.compute_advertise_addr() {
-            Ok(addr) => addr,
-            Err(e) => {
+	        let advertise = match self.compute_advertise_addr() {
+	            Ok(addr) => addr,
+	            Err(e) => {
                 log::error!(
                     "topology: failed to compute advertise address during server handle setup: {e}"
                 );
                 return Err(handle);
-            }
-        };
+	            }
+	        };
+	        let preferred_wireguard_port = extract_port(&advertise).ok();
 
         // Also ensure our own peer-entry exists in the store
         let peers = self.peers.clone();
@@ -416,22 +418,46 @@ impl Topology {
             registry.register_peer_handle(local_id, handle).await;
 
             let key = UuidKey::from(local_id);
-
-            match peers.exists(&key) {
-                Ok(false) => {
-                    let v = PeerValue {
-                        address: advertise,
-                        hostname: host,
-                        noise_static_pub: public_key.to_bytes(),
-                        signing_pub: verifying_key.to_bytes(),
-                    };
-
-                    if let Err(e) = peers.upsert(&key, v).await {
-                        log::warn!("failed to upsert self peer: {e}");
+	            let wireguard = if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_some()
+	                || !net::paths::running_as_root()
+	            {
+	                None
+	            } else {
+	                match net::wireguard::resolve_wireguard_key_path()
+	                    .and_then(net::wireguard::load_or_generate_wireguard_keys)
+	                {
+	                    Ok(keys) => match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(preferred_wireguard_port) {
+	                        Ok(port) => Some(crate::topology::peers::WireGuardPeerValue {
+	                            public_key: keys.public_bytes(),
+	                            port,
+                            enabled: false,
+                        }),
+                        Err(err) => {
+                            log::warn!(
+                                "failed to resolve WireGuard listen port; continuing without underlay encryption: {err}"
+                            );
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        log::warn!(
+                            "failed to load WireGuard keys; continuing without underlay encryption: {err}"
+                        );
+                        None
                     }
                 }
-                Ok(true) => {} // Nothing to do.
-                Err(e) => log::warn!("exists(self) failed: {e}"),
+            };
+
+            let v = PeerValue {
+                address: advertise,
+                hostname: host,
+                noise_static_pub: public_key.to_bytes(),
+                signing_pub: verifying_key.to_bytes(),
+                wireguard,
+            };
+
+            if let Err(e) = peers.upsert(&key, v).await {
+                log::warn!("failed to upsert self peer: {e}");
             }
 
             // mark self as alive in health (passive observation)
@@ -542,11 +568,51 @@ impl Topology {
         let addr = self
             .compute_advertise_addr()
             .unwrap_or_else(|_| String::new());
+        let preferred_wireguard_port = extract_port(&addr).ok();
         info.set_addr(&addr);
 
         // Keys
         info.set_public_key(&self.public_key.to_bytes());
         info.set_signing_key(&self.signing_key.verifying_key().to_bytes());
+
+        // WireGuard underlay advertisement (best-effort).
+        //
+        // We intentionally keep this non-fatal: nodes without kernel networking privileges
+        // should still be able to participate in the control plane, even if they cannot
+        // encrypt the data-plane underlay.
+        if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_none() && net::paths::running_as_root()
+        {
+            match net::wireguard::resolve_wireguard_key_path()
+                .and_then(net::wireguard::load_or_generate_wireguard_keys)
+            {
+                Ok(keys) => match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(
+                    preferred_wireguard_port,
+                ) {
+                    Ok(port) => {
+                        let enabled = self
+                            .registry
+                            .peer_wireguard(self.node.id)
+                            .map(|wg| wg.enabled)
+                            .unwrap_or(false);
+                        info.set_wireguard_public_key(&keys.public_bytes());
+                        info.set_wireguard_port(port);
+                        info.set_wireguard_enabled(enabled);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "topology",
+                            "failed to resolve WireGuard listen port for NodeInfo: {err}"
+                        );
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        target: "topology",
+                        "failed to load WireGuard keys for NodeInfo: {err}"
+                    );
+                }
+            }
+        }
     }
 
     /// True if we already have at least one peer (not ourselves) or any stored ticket.
@@ -604,6 +670,7 @@ impl Topology {
                             ref client,
                             ref noise_static_pub,
                             ref signing_pub,
+                            ref wireguard,
                         } => {
                             info!(target: "topology", "Node joined: {id} at {address}");
 
@@ -612,6 +679,7 @@ impl Topology {
                                 hostname: hostname.clone(),
                                 noise_static_pub: noise_static_pub.to_bytes(),
                                 signing_pub: signing_pub.to_bytes(),
+                                wireguard: wireguard.clone(),
                             };
 
                             if let Err(e) = self.register_peer(id, &v, client.clone()).await {
@@ -644,6 +712,7 @@ impl Topology {
                             client,
                             noise_static_pub,
                             signing_pub,
+                            wireguard,
                         } => {
                             // Never re-gossip a capability we only know as an import. Cap’n Proto
                             // will panic if we hand a borrowed client handle back to the peer that
@@ -657,6 +726,7 @@ impl Topology {
                                 client,
                                 noise_static_pub,
                                 signing_pub,
+                                wireguard,
                             }
                         }
                         evt => evt,

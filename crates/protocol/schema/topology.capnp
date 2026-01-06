@@ -102,6 +102,16 @@ struct NodeInfo {
 
   health @9 :NodeStatus;
   # Health status of the node.
+
+  wireguardPublicKey @10 :Data;
+  # Optional WireGuard public key used to encrypt the VXLAN underlay.
+  # Empty means the node is not advertising WireGuard capability yet.
+
+  wireguardPort @11 :UInt16;
+  # UDP listen port for WireGuard. 0 means "reuse the port from `addr`".
+
+  wireguardEnabled @12 :Bool;
+  # True once the node has created and configured its WireGuard interface.
 }
 
 struct NodeList {
