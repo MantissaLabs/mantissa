@@ -196,8 +196,12 @@ impl NetworkController {
         }
 
         let previous = { self.inner.wireguard.lock().await.clone() };
-        match wireguard::ensure_wireguard_underlay(&self.inner.cluster_registry, self.inner.node_id)
-            .await
+        match wireguard::ensure_wireguard_underlay(
+            &self.inner.cluster_registry,
+            self.inner.node_id,
+            Some(previous.clone()),
+        )
+        .await
         {
             Ok(state) => {
                 let mut guard = self.inner.wireguard.lock().await;

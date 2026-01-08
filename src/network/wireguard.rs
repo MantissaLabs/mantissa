@@ -2,8 +2,11 @@ use crate::registry::Registry;
 use crate::topology::peers::WireGuardPeerValue;
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use std::net::{IpAddr, SocketAddr};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Name of the kernel WireGuard interface managed by Mantissa.
@@ -26,6 +29,9 @@ pub const MANTISSA_WIREGUARD_MTU: u32 = 1420;
 /// - `WireGuard MTU (1420) - VXLAN/UDP/IPv6 overhead (70) = 1350`
 pub const MANTISSA_WIREGUARD_VXLAN_MTU: u32 = MANTISSA_WIREGUARD_MTU - 70;
 
+/// Periodic forced reconfiguration interval to correct external drift.
+const WIREGUARD_FORCE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+
 /// UDP destination port used by Mantissa VXLAN devices.
 ///
 /// We keep this local to the WireGuard module so we can punch firewall holes without depending
@@ -43,6 +49,58 @@ pub struct WireGuardUnderlayState {
 
     /// The local tunnel IP address used as the VXLAN underlay source/destination.
     pub tunnel_ip: Option<IpAddr>,
+
+    /// Hash of the last WireGuard interface configuration applied by Mantissa.
+    pub config_hash: Option<u64>,
+
+    /// Timestamp of the last successful WireGuard configuration apply.
+    pub last_configured_at: Option<Instant>,
+}
+
+/// Snapshot the per-peer configuration fields that affect the kernel WireGuard interface.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct PeerConfigFingerprint {
+    peer_id: Uuid,
+    public_key: [u8; 32],
+    endpoint: String,
+    allowed_ip: Ipv6Addr,
+    keepalive: u16,
+}
+
+/// Compute a stable hash for the WireGuard interface configuration so we only reconfigure when needed.
+fn compute_wireguard_config_hash(
+    listen_port: u16,
+    tunnel_ip: IpAddr,
+    peers: &[PeerConfigFingerprint],
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    MANTISSA_WIREGUARD_IFNAME.hash(&mut hasher);
+    MANTISSA_WIREGUARD_MTU.hash(&mut hasher);
+    listen_port.hash(&mut hasher);
+    tunnel_ip.hash(&mut hasher);
+    peers.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Decide whether the WireGuard interface should be reconfigured to reduce churn while correcting drift.
+fn should_reconfigure_wireguard(
+    previous: Option<&WireGuardUnderlayState>,
+    config_hash: u64,
+    now: Instant,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+
+    if previous.config_hash != Some(config_hash) {
+        return true;
+    }
+
+    let Some(last) = previous.last_configured_at else {
+        return true;
+    };
+
+    now.saturating_duration_since(last) >= WIREGUARD_FORCE_REFRESH_INTERVAL
 }
 
 /// Ensure the Mantissa-managed WireGuard underlay is configured on this node and return the
@@ -58,12 +116,15 @@ pub struct WireGuardUnderlayState {
 pub async fn ensure_wireguard_underlay(
     registry: &Registry,
     self_id: Uuid,
+    previous: Option<WireGuardUnderlayState>,
 ) -> Result<WireGuardUnderlayState> {
     if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_some() {
         return Ok(WireGuardUnderlayState {
             underlay_active: false,
             ifname: MANTISSA_WIREGUARD_IFNAME.to_string(),
             tunnel_ip: None,
+            config_hash: None,
+            last_configured_at: None,
         });
     }
 
@@ -72,9 +133,12 @@ pub async fn ensure_wireguard_underlay(
             underlay_active: false,
             ifname: MANTISSA_WIREGUARD_IFNAME.to_string(),
             tunnel_ip: None,
+            config_hash: None,
+            last_configured_at: None,
         });
     }
 
+    let now = Instant::now();
     let prefer_underlay = match net::wireguard::load_wireguard_underlay_preference() {
         Ok(value) => value,
         Err(err) => {
@@ -94,13 +158,14 @@ pub async fn ensure_wireguard_underlay(
     let listen_port = net::wireguard::load_or_choose_wireguard_listen_port()
         .context("load wireguard listen port")?;
 
-    let tunnel_ip = IpAddr::V6(net::wireguard::wireguard_tunnel_ipv6(self_id));
+    let tunnel_v6 = net::wireguard::wireguard_tunnel_ipv6(self_id);
+    let tunnel_ip = IpAddr::V6(tunnel_v6);
 
     let peers_snapshot = registry
         .peer_values_snapshot()
         .context("load peers snapshot for wireguard")?;
 
-    let mut peers = Vec::new();
+    let mut peer_configs = Vec::new();
     let mut peer_count = 0usize;
     let mut all_peers_advertised = true;
     let mut all_peers_enabled = true;
@@ -130,49 +195,72 @@ pub async fn ensure_wireguard_underlay(
             }
         };
 
-        let mut peer = defguard_wireguard_rs::host::Peer::new(
-            defguard_wireguard_rs::key::Key::new(wg.public_key),
-        );
-        peer.set_allowed_ips(vec![defguard_wireguard_rs::net::IpAddrMask::host(
-            IpAddr::V6(net::wireguard::wireguard_tunnel_ipv6(peer_id)),
-        )]);
-        peer.persistent_keepalive_interval = Some(25);
-        peer.set_endpoint(&endpoint)
-            .with_context(|| format!("set wireguard endpoint for peer {peer_id}"))?;
-        peers.push(peer);
+        peer_configs.push(PeerConfigFingerprint {
+            peer_id,
+            public_key: wg.public_key,
+            endpoint,
+            allowed_ip: net::wireguard::wireguard_tunnel_ipv6(peer_id),
+            keepalive: 25,
+        });
     }
 
+    peer_configs.sort_by_key(|peer| peer.peer_id);
+
+    let config_hash = compute_wireguard_config_hash(listen_port, tunnel_ip, &peer_configs);
+    let should_configure =
+        should_reconfigure_wireguard(previous.as_ref(), config_hash, now);
+
     let ifname = MANTISSA_WIREGUARD_IFNAME.to_string();
-    let prvkey_b64 = BASE64_STANDARD.encode(keys.to_private_bytes());
-    let interface_config = defguard_wireguard_rs::InterfaceConfiguration {
-        name: ifname.clone(),
-        prvkey: prvkey_b64,
-        addresses: vec![defguard_wireguard_rs::net::IpAddrMask::host(tunnel_ip)],
-        port: listen_port,
-        peers: peers.clone(),
-        mtu: Some(MANTISSA_WIREGUARD_MTU),
+
+    let last_configured_at = if should_configure {
+        let mut peers = Vec::with_capacity(peer_configs.len());
+        for peer_config in &peer_configs {
+            let mut peer = defguard_wireguard_rs::host::Peer::new(
+                defguard_wireguard_rs::key::Key::new(peer_config.public_key),
+            );
+            peer.set_allowed_ips(vec![defguard_wireguard_rs::net::IpAddrMask::host(
+                IpAddr::V6(peer_config.allowed_ip),
+            )]);
+            peer.persistent_keepalive_interval = Some(peer_config.keepalive);
+            peer.set_endpoint(&peer_config.endpoint)
+                .with_context(|| format!("set wireguard endpoint for peer {}", peer_config.peer_id))?;
+            peers.push(peer);
+        }
+
+        let prvkey_b64 = BASE64_STANDARD.encode(keys.to_private_bytes());
+        let interface_config = defguard_wireguard_rs::InterfaceConfiguration {
+            name: ifname.clone(),
+            prvkey: prvkey_b64,
+            addresses: vec![defguard_wireguard_rs::net::IpAddrMask::host(tunnel_ip)],
+            port: listen_port,
+            peers: peers.clone(),
+            mtu: Some(MANTISSA_WIREGUARD_MTU),
+        };
+
+        let ifname_for_blocking = ifname.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            use defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi};
+
+            let mut wgapi =
+                WGApi::<Kernel>::new(ifname_for_blocking).context("create WGApi<Kernel>")?;
+            wgapi
+                .create_interface()
+                .context("create wireguard interface")?;
+            wgapi
+                .configure_interface(&interface_config)
+                .context("configure wireguard interface")?;
+            wgapi
+                .configure_peer_routing(&peers)
+                .context("configure wireguard peer routing")?;
+            ensure_vxlan_firewall_accept(&interface_config.name);
+            Ok(())
+        })
+        .await
+        .context("wireguard configuration task panicked")??;
+        Some(now)
+    } else {
+        previous.as_ref().and_then(|state| state.last_configured_at)
     };
-
-    let ifname_for_blocking = ifname.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        use defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi};
-
-        let mut wgapi =
-            WGApi::<Kernel>::new(ifname_for_blocking).context("create WGApi<Kernel>")?;
-        wgapi
-            .create_interface()
-            .context("create wireguard interface")?;
-        wgapi
-            .configure_interface(&interface_config)
-            .context("configure wireguard interface")?;
-        wgapi
-            .configure_peer_routing(&peers)
-            .context("configure wireguard peer routing")?;
-        ensure_vxlan_firewall_accept(&interface_config.name);
-        Ok(())
-    })
-    .await
-    .context("wireguard configuration task panicked")??;
 
     let published = match registry
         .upsert_self_wireguard(WireGuardPeerValue {
@@ -217,6 +305,8 @@ pub async fn ensure_wireguard_underlay(
         underlay_active: published && cluster_ready_for_encryption,
         ifname,
         tunnel_ip: Some(tunnel_ip),
+        config_hash: Some(config_hash),
+        last_configured_at,
     })
 }
 
@@ -225,6 +315,7 @@ pub async fn ensure_wireguard_underlay(
 pub async fn ensure_wireguard_underlay(
     _registry: &Registry,
     _self_id: Uuid,
+    _previous: Option<WireGuardUnderlayState>,
 ) -> Result<WireGuardUnderlayState> {
     Ok(WireGuardUnderlayState::default())
 }
