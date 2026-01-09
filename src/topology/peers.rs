@@ -38,7 +38,8 @@ pub struct PeerValue {
     pub signing_pub: [u8; 32],
 
     /// Optional WireGuard configuration used to encrypt the VXLAN underlay.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Always serialize the option tag to keep bincode framing stable across reads.
+    #[serde(default)]
     pub wireguard: Option<WireGuardPeerValue>,
 }
 
