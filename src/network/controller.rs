@@ -15,6 +15,7 @@ use crate::services::registry::ServiceRegistry;
 use crate::store::task_store::TaskStore;
 use anyhow::{Context, Result};
 use async_channel::Sender;
+use blake3::Hasher;
 #[cfg(target_os = "linux")]
 use aya::{programs::ProgramError, sys::SyscallError};
 use std::collections::{HashMap, HashSet};
@@ -70,6 +71,8 @@ struct NetworkPlan {
     subnet_prefix: Option<u8>,
     underlay_iface: Option<String>,
     underlay_ip: Option<IpAddr>,
+    /// Deterministic host-access MAC used for static FDB programming when resolver networking is enabled.
+    host_access_mac: Option<[u8; 6]>,
 }
 
 #[cfg(target_os = "linux")]
@@ -717,6 +720,12 @@ impl NetworkController {
             }
         };
 
+        let host_access_mac = if resolver_ipv4.is_some() && subnet_prefix.is_some() {
+            Some(host_access_mac(spec.id, self.inner.node_id))
+        } else {
+            None
+        };
+
         let suffix = short_id(spec.id);
         let plan = NetworkPlan {
             network_id: spec.id,
@@ -728,6 +737,7 @@ impl NetworkController {
             subnet_prefix,
             underlay_iface: None,
             underlay_ip: None,
+            host_access_mac,
         };
 
         Ok((plan, changed))
@@ -929,6 +939,50 @@ impl NetworkController {
 
             desired.insert(mac, peer_ip);
             *flood_targets.entry(peer_ip).or_insert(0) += 1;
+        }
+
+        if plan.host_access_mac.is_some() {
+            let peer_states = self
+                .inner
+                .registry
+                .list_peer_states(Some(plan.network_id))
+                .context("list peer states for host access forwarding")?;
+
+            for state in peer_states {
+                if state.peer_id == self.inner.node_id {
+                    continue;
+                }
+
+                if state.state != NetworkPeerState::Ready {
+                    continue;
+                }
+
+                let peer_ip = match self.peer_ip_for_node(state.peer_id).await {
+                    Some(ip) => ip,
+                    None => continue,
+                };
+
+                // Add deterministic host-access MACs so return traffic to resolver-originated
+                // flows stays unicast instead of flooding across every VXLAN peer.
+                let mac = format_mac(host_access_mac(plan.network_id, state.peer_id));
+                match desired.get(&mac) {
+                    Some(existing) if existing == &peer_ip => continue,
+                    Some(existing) => {
+                        warn!(
+                            target: "network",
+                            network = %plan.network_id,
+                            mac,
+                            existing = %existing,
+                            candidate = %peer_ip,
+                            "host access mac collides with existing forwarding entry"
+                        );
+                        continue;
+                    }
+                    None => {}
+                }
+
+                desired.insert(mac, peer_ip);
+            }
         }
 
         {
@@ -1140,6 +1194,7 @@ impl NetworkPlan {
             subnet_prefix: None,
             underlay_iface: None,
             underlay_ip: None,
+            host_access_mac: None,
         }
     }
 }
@@ -1168,9 +1223,36 @@ fn compute_deterministic_vni(network_id: Uuid) -> u32 {
     vni & 0x00FF_FFFF
 }
 
+/// Derive a stable host-access MAC for a node/network pair so peers can program static FDB entries.
+///
+/// The MAC is locally administered and unicast, avoiding conflicts with hardware addresses while
+/// providing a deterministic value for control-plane reconciliation.
+fn host_access_mac(network_id: Uuid, node_id: Uuid) -> [u8; 6] {
+    let digest = {
+        let mut hasher = Hasher::new();
+        hasher.update(network_id.as_bytes());
+        hasher.update(node_id.as_bytes());
+        hasher.update(b"host-access-mac");
+        hasher.finalize()
+    };
+
+    let mut mac = [0u8; 6];
+    mac[0] = 0x02;
+    mac[1..].copy_from_slice(&digest.as_bytes()[0..5]);
+    mac
+}
+
+/// Format a MAC address as a lowercase, colon-delimited string for netlink programming.
+fn format_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{NetworkPlan, VXLAN_PORT};
+    use super::{NetworkPlan, VXLAN_PORT, format_mac};
     use crate::network::attachment::{host_access_host_iface_name, host_access_peer_iface_name};
     use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
     use anyhow::{Context, Result, anyhow};
@@ -1269,6 +1351,7 @@ mod platform {
             &self,
             network_id: uuid::Uuid,
             bridge_index: u32,
+            host_mac: Option<[u8; 6]>,
         ) -> Result<(u32, u32)> {
             let Some(handle) = self.handle() else {
                 return Ok((0, 0));
@@ -1348,6 +1431,19 @@ mod platform {
                     (host_index, peer_index)
                 }
             };
+
+            if let Some(mac) = host_mac {
+                self.ensure_link_mac(host_index, mac, &host_ifname)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "ensure host access mac {} on {} (idx {})",
+                            format_mac(mac),
+                            host_ifname,
+                            host_index
+                        )
+                    })?;
+            }
 
             self.attach_master(peer_index, bridge_index)
                 .await
@@ -1450,14 +1546,18 @@ mod platform {
 
             let host_access = if plan.resolver_ipv4.is_some() && plan.subnet_prefix.is_some() {
                 Some(
-                    self.ensure_host_access_veth(plan.network_id, bridge_index)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "ensure host access veth for network {} on bridge {} (idx {})",
-                                plan.network_id, plan.bridge_name, bridge_index
-                            )
-                        })?,
+                    self.ensure_host_access_veth(
+                        plan.network_id,
+                        bridge_index,
+                        plan.host_access_mac,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "ensure host access veth for network {} on bridge {} (idx {})",
+                            plan.network_id, plan.bridge_name, bridge_index
+                        )
+                    })?,
                 )
             } else {
                 None
@@ -1943,7 +2043,9 @@ mod platform {
             // if the payload is not marked nested.
             let payload = {
                 let proto_attrs = [
-                    LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_HAIRPIN_MODE, vec![1])),
+                    // Disable hairpin on the VXLAN port to avoid BUM traffic looping back into
+                    // the overlay; we enable hairpin selectively on host-access veths instead.
+                    LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_HAIRPIN_MODE, vec![0])),
                     LinkProtoInfoBridge::Other(DefaultNla::new(BRPORT_ATTR_LEARNING, vec![0])),
                     LinkProtoInfoBridge::Other(DefaultNla::new(
                         BRPORT_ATTR_NEIGH_SUPPRESS,
@@ -2234,6 +2336,42 @@ mod platform {
             Ok(())
         }
 
+        /// Ensure a link advertises the requested MAC address for deterministic forwarding.
+        ///
+        /// This keeps the host-access interface stable across reconciles so peer FDB entries can
+        /// target a consistent MAC and avoid unknown-unicast flooding.
+        async fn ensure_link_mac(&self, index: u32, mac: [u8; 6], name: &str) -> Result<()> {
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
+            let current = self.link_address(index).await?;
+            if current.as_deref() == Some(&mac[..]) {
+                return Ok(());
+            }
+
+            debug!(
+                target: "network",
+                link = %name,
+                link_index = index,
+                desired = %format_mac(mac),
+                "provisioner: updating link mac"
+            );
+
+            handle
+                .link()
+                .set(
+                    LinkUnspec::new_with_index(index)
+                        .address(mac.to_vec())
+                        .build(),
+                )
+                .execute()
+                .await
+                .with_context(|| format!("set mac {} on link {name} (index {index})", format_mac(mac)))?;
+
+            Ok(())
+        }
+
         async fn attach_master(&self, link_index: u32, master_index: u32) -> Result<()> {
             let Some(handle) = self.handle() else {
                 return Ok(());
@@ -2486,6 +2624,26 @@ mod platform {
                 for nla in link.attributes.into_iter() {
                     if let LinkAttribute::IfName(name) = nla {
                         return Ok(Some(name));
+                    }
+                }
+            }
+            Ok(None)
+        }
+
+        /// Resolve the current MAC address for a link so MAC updates remain idempotent.
+        ///
+        /// The provisioning loop uses this to skip redundant `ip link set address` operations
+        /// once the host-access veth has the desired deterministic address.
+        async fn link_address(&self, index: u32) -> Result<Option<Vec<u8>>> {
+            let Some(handle) = self.handle() else {
+                return Ok(None);
+            };
+
+            let mut links = handle.link().get().match_index(index).execute();
+            while let Some(link) = links.try_next().await? {
+                for nla in link.attributes.into_iter() {
+                    if let LinkAttribute::Address(addr) = nla {
+                        return Ok(Some(addr));
                     }
                 }
             }
