@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, info, warn};
@@ -31,6 +31,12 @@ use uuid::Uuid;
 const SERVICE_ZONE_SUFFIX: &str = "svc.mantissa";
 const SERVICE_TTL_SECS: u32 = 5;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+// Keep cached health around for roughly one DNS TTL to avoid stale blackholes.
+const HEALTH_CACHE_STALE_AFTER: Duration = Duration::from_secs(SERVICE_TTL_SECS as u64);
+// Recheck healthy backends periodically so we refresh MACs without probing on every tick.
+const HEALTH_HEALTHY_RECHECK: Duration = Duration::from_secs(2);
+// Back off unhealthy probes to reduce repeated timeouts while an endpoint is down.
+const HEALTH_UNHEALTHY_RECHECK: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct ServiceDiscovery {
@@ -49,7 +55,7 @@ pub struct ServiceDiscovery {
 
 struct DnsServerHandle {
     resolver_ip: Ipv4Addr,
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: Option<watch::Sender<bool>>,
     task: JoinHandle<()>,
 }
 
@@ -129,7 +135,7 @@ impl ServiceDiscovery {
 
         if let Some(mut handle) = handle {
             if let Some(tx) = handle.shutdown.take() {
-                let _ = tx.send(());
+                let _ = tx.send(true);
             }
             tokio::spawn(async move {
                 if let Err(err) = handle.task.await {
@@ -173,7 +179,7 @@ async fn spawn_dns_server(
         "started service discovery listener"
     );
 
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let task_registry = registry.clone();
     let service_registry = services.clone();
     let lb_manager = bpf_lb.clone();
@@ -199,33 +205,63 @@ async fn spawn_dns_server(
             "initial service discovery refresh failed: {err:#}"
         );
     }
-    let server = tokio::spawn(async move {
-        let mut buf = vec![0u8; 2048];
+    let mut refresh_shutdown = shutdown_rx.clone();
+    let refresh_task_registry = task_registry.clone();
+    let refresh_tasks = tasks.clone();
+    let refresh_service_registry = service_registry.clone();
+    let refresh_bpf_manager = bpf_manager.clone();
+    let refresh_health = health.clone();
+    let refresh_lb_manager = lb_manager.clone();
+    let refresh_lb_missing = lb_missing.clone();
+    let refresh_task = tokio::spawn(async move {
         let mut refresh = time::interval(REFRESH_INTERVAL);
         loop {
             tokio::select! {
-                biased;
-                _ = &mut shutdown_rx => {
-                    break;
+                _ = refresh_shutdown.changed() => {
+                    if *refresh_shutdown.borrow() {
+                        break;
+                    }
                 }
                 _ = refresh.tick() => {
                     if let Err(err) = refresh_network_services(
-                        &task_registry,
-                        &tasks,
-                        &service_registry,
-                        &bpf_manager,
+                        &refresh_task_registry,
+                        &refresh_tasks,
+                        &refresh_service_registry,
+                        &refresh_bpf_manager,
                         network_id,
-                        &health,
+                        &refresh_health,
                         health_port,
                         health_timeout,
-                        &lb_manager,
-                        &lb_missing,
+                        &refresh_lb_manager,
+                        &refresh_lb_missing,
                     ).await {
                         warn!(
                             target: "network",
                             network = %network_id,
                             "service discovery refresh failed: {err:#}"
                         );
+                    }
+                }
+            }
+        }
+    });
+
+    let mut dns_shutdown = shutdown_rx.clone();
+    let dns_task_registry = task_registry.clone();
+    let dns_tasks = tasks.clone();
+    let dns_service_registry = service_registry.clone();
+    let dns_bpf_manager = bpf_manager.clone();
+    let dns_load_balancer = load_balancer.clone();
+    let dns_health = health.clone();
+    let dns_lb_manager = lb_manager.clone();
+    let dns_lb_missing = lb_missing.clone();
+    let dns_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            tokio::select! {
+                _ = dns_shutdown.changed() => {
+                    if *dns_shutdown.borrow() {
+                        break;
                     }
                 }
                 result = socket.recv_from(&mut buf) => {
@@ -235,18 +271,18 @@ async fn spawn_dns_server(
                                 &socket,
                                 &buf[..len],
                                 peer,
-                                &task_registry,
-                                &tasks,
-                                &service_registry,
-                                &bpf_manager,
+                                &dns_task_registry,
+                                &dns_tasks,
+                                &dns_service_registry,
+                                &dns_bpf_manager,
                                 network_id,
                                 &network_name,
-                                &load_balancer,
-                                &health,
+                                &dns_load_balancer,
+                                &dns_health,
                                 health_port,
                                 health_timeout,
-                                &lb_manager,
-                                &lb_missing,
+                                &dns_lb_manager,
+                                &dns_lb_missing,
                             ).await {
                                 warn!(
                                     target: "network",
@@ -271,6 +307,11 @@ async fn spawn_dns_server(
             network = %network_id,
             "service discovery listener stopped"
         );
+    });
+
+    let server = tokio::spawn(async move {
+        let _ = refresh_task.await;
+        let _ = dns_task.await;
     });
 
     Ok(DnsServerHandle {
@@ -437,6 +478,8 @@ async fn answer_query(
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
 ) -> Result<LookupOutcome> {
+    // DNS path is cache-only; probes happen in the refresh loop.
+    let _ = health_timeout;
     if query.query_type() == RecordType::AAAA {
         return Ok(LookupOutcome::NoData);
     }
@@ -454,18 +497,12 @@ async fn answer_query(
     let service_port = health_port
         .or_else(|| service_health_port(service_specs, &service_name))
         .and_then(|port| if port == 0 { None } else { Some(port) });
-    let http_path = service_health_path(service_specs, &service_name);
-    let mut backends = evaluate_backend_health(
-        health,
-        registry,
-        network_id,
-        &service_name,
-        candidates.clone(),
-        service_port,
-        http_path,
-        health_timeout,
-    )
-    .await;
+    let mut backends = if service_port.is_some() {
+        let guard = health.lock().await;
+        filter_cached_backends(&guard, network_id, &service_name, candidates.clone())
+    } else {
+        candidates.clone()
+    };
     tracing::trace!(
         target: "network",
         network = %network_id,
@@ -876,8 +913,40 @@ struct HealthEntry {
     checked_at: Instant,
 }
 
-/// Actively probe candidate backends so only healthy endpoints are returned to DNS callers and the
-/// eBPF dataplane is programmed with live MAC addresses.
+/// Filter candidate backends using cached health without performing probes.
+///
+/// This keeps DNS responses fast and avoids blocking on synchronous checks.
+fn filter_cached_backends(
+    health: &BackendHealth,
+    network_id: Uuid,
+    service_name: &str,
+    backends: Vec<BackendAddress>,
+) -> Vec<BackendAddress> {
+    let now = Instant::now();
+    let mut filtered = Vec::with_capacity(backends.len());
+    for backend in backends {
+        let entry = health.get_entry(network_id, service_name, backend.ip);
+        let include = match entry {
+            None => true,
+            Some(entry) => {
+                let is_stale = now.saturating_duration_since(entry.checked_at)
+                    >= HEALTH_CACHE_STALE_AFTER;
+                match entry.state {
+                    HealthState::Healthy | HealthState::Unknown => true,
+                    // If refresh stalls, treat stale unhealthy entries as unknown so we do not
+                    // permanently exclude an endpoint without fresh data.
+                    HealthState::Unhealthy => is_stale,
+                }
+            }
+        };
+        if include {
+            filtered.push(backend);
+        }
+    }
+    filtered
+}
+
+/// Actively probe candidate backends so the cached health state and dataplane MACs stay fresh.
 async fn evaluate_backend_health(
     health: &Arc<AsyncMutex<BackendHealth>>,
     registry: &NetworkRegistry,
@@ -892,35 +961,46 @@ async fn evaluate_backend_health(
     let Some(port) = port else { return backends };
 
     let mut healthy = Vec::with_capacity(backends.len());
-    let mut guard = health.lock().await;
     for backend in backends {
-        let entry = guard.get_entry(network_id, service_name, backend.ip);
+        let entry = {
+            let guard = health.lock().await;
+            guard.get_entry(network_id, service_name, backend.ip)
+        };
         let now = Instant::now();
         let state = entry.map(|e| e.state).unwrap_or(HealthState::Unknown);
-        let checked_at = entry
-            .map(|e| e.checked_at)
-            .unwrap_or(Instant::now() - timeout);
-        let recheck_after = timeout.max(Duration::from_secs(1));
+        let checked_at = entry.map(|e| e.checked_at).unwrap_or(now);
+        let recheck_after = match state {
+            HealthState::Healthy => HEALTH_HEALTHY_RECHECK,
+            HealthState::Unknown => Duration::from_secs(0),
+            HealthState::Unhealthy => HEALTH_UNHEALTHY_RECHECK,
+        };
         let is_stale = now.saturating_duration_since(checked_at) >= recheck_after;
 
-        let mut state_ok = matches!(state, HealthState::Healthy) && !is_stale;
-        let mut backend = backend;
-
-        if !state_ok {
-            if probe_backend(&backend.ip, port, http_path.as_deref(), timeout).await {
-                if let Some(mac) = refresh_backend_mac(registry, network_id, backend.ip).await {
-                    backend.mac = mac;
-                }
-                guard.set_health(network_id, service_name, backend.ip, HealthState::Healthy);
-                state_ok = true;
-            } else {
-                guard.set_health(network_id, service_name, backend.ip, HealthState::Unhealthy);
-            }
+        // Respect cached health until the recheck interval expires.
+        if matches!(state, HealthState::Healthy) && !is_stale {
+            healthy.push(backend);
+            continue;
+        }
+        if matches!(state, HealthState::Unhealthy) && !is_stale {
+            continue;
         }
 
-        if state_ok {
+        let mut backend = backend;
+        let probe_ok = probe_backend(&backend.ip, port, http_path.as_deref(), timeout).await;
+        let refreshed_mac = if probe_ok {
+            refresh_backend_mac(registry, network_id, backend.ip).await
+        } else {
+            None
+        };
+        let mut guard = health.lock().await;
+        if probe_ok {
+            if let Some(mac) = refreshed_mac {
+                backend.mac = mac;
+            }
+            guard.set_health(network_id, service_name, backend.ip, HealthState::Healthy);
             healthy.push(backend);
         } else {
+            guard.set_health(network_id, service_name, backend.ip, HealthState::Unhealthy);
             tracing::debug!(
                 target: "network",
                 network = %network_id,
