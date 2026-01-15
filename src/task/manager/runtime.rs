@@ -32,6 +32,10 @@ impl TaskManager {
     /// (for example after a container restart) so backends rejoin service discovery and load
     /// balancing without manual intervention.
     async fn repair_runtime_attachments(&self) -> Result<()> {
+        self.cleanup_orphaned_local_attachments()
+            .await
+            .context("cleanup orphaned network attachments")?;
+
         let attachments = self
             .network_registry
             .list_attachments(None)
@@ -472,14 +476,23 @@ impl TaskManager {
             .context("list attachments for orphan cleanup")?;
 
         for attachment in attachments {
-            let task_exists = self
+            let task_state = self
                 .store
                 .get_snapshot(&UuidKey::from(attachment.task_id))
                 .with_context(|| format!("lookup task {}", attachment.task_id))?
                 .and_then(|snap| snap.as_slice().last().cloned())
-                .is_some();
+                .map(|value| value.state);
 
-            if task_exists {
+            let should_remove = match task_state {
+                None => true,
+                Some(ContainerState::Stopped)
+                | Some(ContainerState::Failed)
+                | Some(ContainerState::Exited(_))
+                | Some(ContainerState::Unknown) => true,
+                _ => false,
+            };
+
+            if !should_remove {
                 continue;
             }
 
