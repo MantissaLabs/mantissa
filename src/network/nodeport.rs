@@ -5,6 +5,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 const NODEPORT_PROTO_TCP: u8 = 6;
+const NODEPORT_PROTO_UDP: u8 = 17;
 
 /// Declarative nodeport mapping that connects an external port to an overlay VIP.
 #[derive(Clone, Debug)]
@@ -12,6 +13,34 @@ pub struct NodePortMapping {
     pub port: u16,
     pub vip: Ipv4Addr,
     pub vip_port: u16,
+    pub protocol: NodePortProtocol,
+}
+
+/// Supported nodeport transport protocols for VIP exposure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum NodePortProtocol {
+    Tcp,
+    Udp,
+}
+
+impl NodePortProtocol {
+    /// Convert the nodeport protocol to the IP protocol number used in L4 headers.
+    pub fn number(self) -> u8 {
+        match self {
+            NodePortProtocol::Tcp => NODEPORT_PROTO_TCP,
+            NodePortProtocol::Udp => NODEPORT_PROTO_UDP,
+        }
+    }
+}
+
+impl std::fmt::Display for NodePortProtocol {
+    /// Render a stable, human-readable protocol label for logs and diagnostics.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodePortProtocol::Tcp => f.write_str("tcp"),
+            NodePortProtocol::Udp => f.write_str("udp"),
+        }
+    }
 }
 
 /// Maintain host-NIC nodeport programs and their associated dataplane maps.
@@ -57,7 +86,7 @@ impl PlatformNodePortManager {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{NODEPORT_PROTO_TCP, NodePortMapping};
+    use super::{NodePortMapping, NodePortProtocol};
     use crate::network::attachment::host_access_host_iface_name;
     use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
     use crate::node::address::compute_advertise_ip;
@@ -115,6 +144,20 @@ mod platform {
     }
     unsafe impl Pod for NodePortHost {}
 
+    /// Uniquely identify a nodeport binding by port and transport protocol.
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    struct NodePortSelector {
+        port: u16,
+        protocol: NodePortProtocol,
+    }
+
+    impl NodePortSelector {
+        /// Build a selector for nodeport ownership and deduplication.
+        fn new(port: u16, protocol: NodePortProtocol) -> Self {
+            Self { port, protocol }
+        }
+    }
+
     struct NodePortAttachment {
         _ingress: Ebpf,
         egress: Ebpf,
@@ -126,8 +169,8 @@ mod platform {
         iface: Option<String>,
         node_ip: Option<Ipv4Addr>,
         attachment: Option<NodePortAttachment>,
-        ports_by_network: HashMap<Uuid, HashSet<u16>>,
-        port_owner: HashMap<u16, Uuid>,
+        ports_by_network: HashMap<Uuid, HashSet<NodePortSelector>>,
+        port_owner: HashMap<NodePortSelector, Uuid>,
         host_ingress_attached: HashSet<Uuid>,
     }
 
@@ -208,38 +251,52 @@ mod platform {
             let node_ip = self
                 .node_ip
                 .ok_or_else(|| anyhow!("nodeport node_ip missing"))?;
-            let overlay_ifindex = if entries.is_empty() {
-                0
+            let overlay_ifindex_opt = if entries.is_empty() {
+                None
             } else {
-                overlay_ifindex(network_id)?
+                Some(overlay_ifindex(network_id)?)
             };
             let mut desired_ports = HashSet::new();
             let base = map_pin_dir()?;
             let vip_map = open_map(&base, "NODEPORT_VIPS").context("open NODEPORT_VIPS map")?;
             let vip_fd = vip_map.fd().as_fd().as_raw_fd();
-            if !entries.is_empty() {
+            if let Some(overlay_ifindex) = overlay_ifindex_opt {
                 let host_mac = host_access_mac(network_id).await?;
                 let host_ip = host_access_ip(network_id).await?;
                 let host_map =
                     open_map(&base, "NODEPORT_HOST").context("open NODEPORT_HOST map")?;
                 let host_fd = host_map.fd().as_fd().as_raw_fd();
-                let key: u32 = 0;
                 let value = NodePortHost {
                     mac: host_mac,
                     _pad: 0,
                     host_ip: u32::from_ne_bytes(host_ip.octets()),
                 };
-                update_elem(host_fd, &key, &value)
-                    .context("program nodeport host mac")?;
+                update_elem(host_fd, &overlay_ifindex, &value)
+                    .context("program nodeport host attachment")?;
+            } else if had_ports {
+                if let Ok(overlay_ifindex) = overlay_ifindex(network_id) {
+                    if let Ok(host_map) = open_map(&base, "NODEPORT_HOST") {
+                        let host_fd = host_map.fd().as_fd().as_raw_fd();
+                        let _ = delete_elem(host_fd, &overlay_ifindex);
+                    }
+                }
             }
+            let overlay_index = if entries.is_empty() {
+                0
+            } else {
+                overlay_ifindex_opt.ok_or_else(|| anyhow!("nodeport overlay ifindex missing"))?
+            };
+
             for entry in entries {
-                desired_ports.insert(entry.port);
-                if let Some(owner) = self.port_owner.get(&entry.port)
+                let selector = NodePortSelector::new(entry.port, entry.protocol);
+                desired_ports.insert(selector);
+                if let Some(owner) = self.port_owner.get(&selector)
                     && *owner != network_id
                 {
                     warn!(
                         target: "network",
                         port = entry.port,
+                        protocol = %entry.protocol,
                         existing = %owner,
                         requested = %network_id,
                         "nodeport conflict; keeping existing owner"
@@ -249,19 +306,19 @@ mod platform {
 
                 let key = NodePortKey {
                     port: entry.port.to_be(),
-                    proto: NODEPORT_PROTO_TCP,
+                    proto: entry.protocol.number(),
                     _pad: 0,
                 };
                 let value = NodePortEntry {
                     vip: u32::from_ne_bytes(entry.vip.octets()),
                     vip_port: entry.vip_port.to_be(),
                     _pad: 0,
-                    overlay_ifindex,
+                    overlay_ifindex: overlay_index,
                     node_ip: u32::from_ne_bytes(node_ip.octets()),
                 };
                 update_elem(vip_fd, &key, &value)
                     .with_context(|| format!("program nodeport {}", entry.port))?;
-                self.port_owner.insert(entry.port, network_id);
+                self.port_owner.insert(selector, network_id);
             }
 
             let known = self
@@ -269,15 +326,15 @@ mod platform {
                 .entry(network_id)
                 .or_default()
                 .clone();
-            for port in known.difference(&desired_ports) {
+            for selector in known.difference(&desired_ports) {
                 let key = NodePortKey {
-                    port: port.to_be(),
-                    proto: NODEPORT_PROTO_TCP,
+                    port: selector.port.to_be(),
+                    proto: selector.protocol.number(),
                     _pad: 0,
                 };
                 delete_elem(vip_fd, &key)
-                    .with_context(|| format!("remove nodeport {}", port))?;
-                self.port_owner.remove(port);
+                    .with_context(|| format!("remove nodeport {}", selector.port))?;
+                self.port_owner.remove(selector);
             }
             self.ports_by_network.insert(network_id, desired_ports);
             Ok(())
@@ -417,6 +474,30 @@ mod platform {
                 return Ok(());
             }
 
+            if let Some(iface) = self.iface.clone() {
+                if self.node_ip.is_none() {
+                    match detect_iface_ip(&iface).await? {
+                        Some(ip) => {
+                            info!(
+                                target: "network",
+                                iface = %iface,
+                                node_ip = %ip,
+                                "nodeport selected IP on configured interface"
+                            );
+                            self.node_ip = Some(ip);
+                        }
+                        None => {
+                            warn!(
+                                target: "network",
+                                iface = %iface,
+                                "nodeport could not find IPv4 address for configured interface"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+
             if let Some(node_ip) = self.node_ip {
                 if let Some(iface) = detect_iface_for_ip(node_ip).await? {
                     info!(
@@ -499,6 +580,47 @@ mod platform {
                                 return Ok(Some(name.clone()));
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve an IPv4 address assigned to a specific interface name.
+    async fn detect_iface_ip(iface: &str) -> Result<Option<Ipv4Addr>> {
+        let (conn, handle, _) =
+            new_connection().context("open rtnetlink connection for nodeport iface ip lookup")?;
+        tokio::spawn(conn);
+
+        let Some(link) = handle
+            .link()
+            .get()
+            .match_name(iface.to_string())
+            .execute()
+            .try_next()
+            .await
+            .context("fetch nodeport interface link")?
+        else {
+            return Ok(None);
+        };
+
+        let mut addr_stream = handle
+            .address()
+            .get()
+            .set_link_index_filter(link.header.index)
+            .execute();
+
+        while let Some(msg) = addr_stream
+            .try_next()
+            .await
+            .context("enumerate nodeport interface addresses")?
+        {
+            for attr in msg.attributes.iter() {
+                if let AddressAttribute::Address(addr) | AddressAttribute::Local(addr) = attr {
+                    if let IpAddr::V4(ip) = *addr {
+                        return Ok(Some(ip));
                     }
                 }
             }

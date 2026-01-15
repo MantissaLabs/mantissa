@@ -78,6 +78,23 @@ pub struct ServiceTaskSpecValue {
     pub health_command: Option<Vec<String>>,
     #[serde(default)]
     pub public_port: Option<u16>,
+    #[serde(default)]
+    pub public_protocol: Option<ServicePortProtocol>,
+}
+
+/// Supported transport protocols for publicly exposed service ports.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ServicePortProtocol {
+    Tcp,
+    Udp,
+    TcpUdp,
+}
+
+impl Default for ServicePortProtocol {
+    fn default() -> Self {
+        ServicePortProtocol::Tcp
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,6 +132,18 @@ impl ServiceTaskSpecValue {
     /// declared in the service manifest.
     pub fn public_port(&self) -> Option<u16> {
         self.public_port
+    }
+
+    /// Return the public protocols to expose for the declared nodeport.
+    ///
+    /// The default remains TCP-only to match historical behavior unless the manifest opts in
+    /// to UDP or both protocols.
+    pub fn public_protocols(&self) -> Vec<ServicePortProtocol> {
+        match self.public_protocol.unwrap_or_default() {
+            ServicePortProtocol::Tcp => vec![ServicePortProtocol::Tcp],
+            ServicePortProtocol::Udp => vec![ServicePortProtocol::Udp],
+            ServicePortProtocol::TcpUdp => vec![ServicePortProtocol::Tcp, ServicePortProtocol::Udp],
+        }
     }
 }
 

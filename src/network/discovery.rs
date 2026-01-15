@@ -2,13 +2,13 @@ use crate::network::allocator::parse_ipv4_cidr;
 use crate::network::attachment::{bridge_name, host_access_host_iface_name, vxlan_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::lb::{BackendAddress, BpfLoadBalancer};
-use crate::network::nodeport::{NodePortManager, NodePortMapping};
+use crate::network::nodeport::{NodePortManager, NodePortMapping, NodePortProtocol};
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     BpfAttachPoint, BpfProgramSpec, NetworkAttachmentState, NetworkSpecValue,
 };
 use crate::services::registry::ServiceRegistry;
-use crate::services::types::ServiceSpecValue;
+use crate::services::types::{ServicePortProtocol, ServiceSpecValue};
 use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
 use crate::task::types::TaskValue;
@@ -1192,6 +1192,35 @@ fn service_public_port(service_specs: &[ServiceSpecValue], service_name: &str) -
     None
 }
 
+/// Resolve the transport protocols to expose when a service declares a public port.
+fn service_public_protocols(
+    service_specs: &[ServiceSpecValue],
+    service_name: &str,
+) -> Vec<NodePortProtocol> {
+    for spec in service_specs {
+        for task in &spec.tasks {
+            if task.name.eq_ignore_ascii_case(service_name) {
+                return task
+                    .public_protocols()
+                    .into_iter()
+                    .map(nodeport_protocol)
+                    .collect();
+            }
+        }
+    }
+    vec![NodePortProtocol::Tcp]
+}
+
+/// Convert a service protocol descriptor into a nodeport transport selector.
+fn nodeport_protocol(protocol: ServicePortProtocol) -> NodePortProtocol {
+    match protocol {
+        ServicePortProtocol::Tcp => NodePortProtocol::Tcp,
+        ServicePortProtocol::Udp => NodePortProtocol::Udp,
+        // TcpUdp is expanded into both entries by ServiceTaskSpecValue::public_protocols.
+        ServicePortProtocol::TcpUdp => NodePortProtocol::Tcp,
+    }
+}
+
 fn service_health_path(service_specs: &[ServiceSpecValue], service_name: &str) -> Option<String> {
     for spec in service_specs {
         for task in &spec.tasks {
@@ -1271,7 +1300,7 @@ async fn refresh_network_services(
     let mut nodeport_entries = Vec::new();
 
     for service_name in names {
-        if let Some(mapping) = refresh_single_service(
+        let mappings = refresh_single_service(
             registry,
             tasks,
             &service_specs,
@@ -1285,10 +1314,8 @@ async fn refresh_network_services(
             bpf_lb,
             lb_missing,
         )
-        .await?
-        {
-            nodeport_entries.push(mapping);
-        }
+        .await?;
+        nodeport_entries.extend(mappings);
     }
 
     nodeport
@@ -1316,7 +1343,7 @@ fn services_for_network(service_specs: &[ServiceSpecValue], network_id: Uuid) ->
 /// Refresh healthy backend list and VIP programming for a single service so clients connected via
 /// the VIP can fail over even if they do not issue new DNS lookups.
 ///
-/// Returns a nodeport mapping when the service is marked public so external listeners can be
+/// Returns nodeport mappings when the service is marked public so external listeners can be
 /// reconciled by the caller.
 async fn refresh_single_service(
     registry: &NetworkRegistry,
@@ -1331,7 +1358,7 @@ async fn refresh_single_service(
     health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
-) -> Result<Option<NodePortMapping>> {
+) -> Result<Vec<NodePortMapping>> {
     let candidates =
         resolve_service_backends(registry, tasks, template_index, network_id, service_name).await?;
     let service_port = health_port
@@ -1362,7 +1389,7 @@ async fn refresh_single_service(
     }
 
     if backends.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     if let Some((vip, mac)) = compute_service_vip(registry, network_id, service_name, &backends)? {
@@ -1381,15 +1408,20 @@ async fn refresh_single_service(
         .await;
 
         if let Some(port) = service_public_port(service_specs, service_name) {
-            return Ok(Some(NodePortMapping {
-                port,
-                vip,
-                vip_port: port,
-            }));
+            let mut mappings = Vec::new();
+            for protocol in service_public_protocols(service_specs, service_name) {
+                mappings.push(NodePortMapping {
+                    port,
+                    vip,
+                    vip_port: port,
+                    protocol,
+                });
+            }
+            return Ok(mappings);
         }
     }
 
-    Ok(None)
+    Ok(Vec::new())
 }
 
 /// Attempt to synchronize VIP metadata into the eBPF maps if they are available, returning whether

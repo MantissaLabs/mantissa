@@ -1,8 +1,9 @@
 use crate::network::types::compute_network_id;
 use crate::services::manager::ServiceController;
 use crate::services::types::{
-    ServiceEvent, ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement,
-    ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
+    ServiceEvent, ServicePortProtocol, ServiceSpecValue, ServiceStatus,
+    ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
+    ServiceTaskSpecValue,
 };
 use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use capnp::Error;
@@ -351,6 +352,22 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
     } else {
         Some(raw_public)
     };
+    let public_protocol = if public_port.is_some() {
+        let proto = match reader.get_public_protocol() {
+            Ok(proto) => proto,
+            Err(_) => {
+                warn!("service public protocol missing or invalid; defaulting to tcp");
+                protocol::services::PublicProtocol::Tcp
+            }
+        };
+        Some(match proto {
+            protocol::services::PublicProtocol::Tcp => ServicePortProtocol::Tcp,
+            protocol::services::PublicProtocol::Udp => ServicePortProtocol::Udp,
+            protocol::services::PublicProtocol::TcpUdp => ServicePortProtocol::TcpUdp,
+        })
+    } else {
+        None
+    };
 
     Ok(ServiceTaskSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
@@ -366,6 +383,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         health_port,
         health_command,
         public_port,
+        public_protocol,
     })
 }
 
@@ -445,6 +463,13 @@ fn write_task_template(
     }
 
     builder.set_public_port(task.public_port().unwrap_or(0));
+    let public_protocol = task.public_protocol.unwrap_or_default();
+    let proto = match public_protocol {
+        ServicePortProtocol::Tcp => protocol::services::PublicProtocol::Tcp,
+        ServicePortProtocol::Udp => protocol::services::PublicProtocol::Udp,
+        ServicePortProtocol::TcpUdp => protocol::services::PublicProtocol::TcpUdp,
+    };
+    builder.set_public_protocol(proto);
 
     Ok(())
 }

@@ -102,6 +102,7 @@ local_test!(services_gossip_propagates_across_peers, {
                 health_port: None,
                 health_command: None,
                 public_port: None,
+                public_protocol: None,
             }],
         )
         .await
@@ -197,6 +198,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
         health_port: None,
         health_command: None,
         public_port: None,
+        public_protocol: None,
     }];
 
     let service_id = node
@@ -282,6 +284,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                 health_port: None,
                 health_command: None,
                 public_port: None,
+                public_protocol: None,
             }],
         )
         .await
@@ -550,6 +553,7 @@ local_test!(services_redeploy_scales_replicas, {
         health_port: None,
         health_command: None,
         public_port: None,
+        public_protocol: None,
     }];
 
     let service_id = node
@@ -658,6 +662,7 @@ local_test!(services_redeploy_updates_resources, {
         health_port: None,
         health_command: None,
         public_port: None,
+        public_protocol: None,
     }];
 
     let service_id = node
@@ -899,6 +904,7 @@ fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskS
                 health_port: None,
                 health_command: None,
                 public_port: None,
+                public_protocol: None,
             }
         })
         .collect()

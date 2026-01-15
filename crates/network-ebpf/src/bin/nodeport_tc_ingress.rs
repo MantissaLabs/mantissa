@@ -9,7 +9,7 @@ use aya_ebpf::{
     },
     bindings::bpf_adj_room_mode::BPF_ADJ_ROOM_MAC,
     macros::{classifier, map},
-    maps::{Array, HashMap, LruHashMap, PerCpuArray},
+    maps::{HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use network_ebpf::{
@@ -72,7 +72,7 @@ static mut NODEPORT_FWD: LruHashMap<Flow4, NodePortNat> = LruHashMap::pinned(204
 static mut NODEPORT_REV: LruHashMap<Flow4, NodePortNat> = LruHashMap::pinned(2048, 0);
 
 #[map(name = "NODEPORT_HOST")]
-static mut NODEPORT_HOST: Array<NodePortHost> = Array::pinned(1, 0);
+static mut NODEPORT_HOST: HashMap<u32, NodePortHost> = HashMap::pinned(256, 0);
 
 /// Intercept external nodeport traffic and redirect it into the overlay dataplane.
 #[classifier]
@@ -136,7 +136,7 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK);
     }
 
-    let host = unsafe { NODEPORT_HOST.get(0).ok_or(())? };
+    let host = unsafe { NODEPORT_HOST.get(&entry.overlay_ifindex).ok_or(())? };
     let original_src = ip_hdr.src;
     let snat_src = host.host_ip;
     if snat_src != 0 && original_src != snat_src {
@@ -180,7 +180,7 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
     }
 
     rewrite_destination(ctx, ip_offset, l4_offset, proto, entry)?;
-    if ensure_ethernet(ctx, ip_offset).is_err() {
+    if ensure_ethernet(ctx, ip_offset, host).is_err() {
         return Ok(TC_ACT_OK);
     }
     if ctx.clone_redirect(entry.overlay_ifindex, 0).is_ok()
@@ -320,9 +320,11 @@ fn rewrite_source(
 
 /// Ensure the packet carries a valid Ethernet header when originating from loopback.
 /// Ensure nodeport packets have a valid Ethernet header before redirecting to the overlay.
-fn ensure_ethernet(ctx: &mut TcContext, ip_offset: usize) -> Result<(), ()> {
-    let host = unsafe { NODEPORT_HOST.get(0).ok_or(())? };
-
+fn ensure_ethernet(
+    ctx: &mut TcContext,
+    ip_offset: usize,
+    host: &NodePortHost,
+) -> Result<(), ()> {
     if ip_offset == net::ETH_HDR_LEN {
         if !eth_header_is_zero(ctx)? {
             return Ok(());

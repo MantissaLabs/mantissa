@@ -112,6 +112,7 @@ mod tests {
                 health_port: None,
                 health_command: None,
                 public_port: None,
+                public_protocol: None,
             }],
             vec![Uuid::new_v4()],
         );
@@ -147,6 +148,7 @@ mod tests {
                 health_port: None,
                 health_command: None,
                 public_port: None,
+                public_protocol: None,
             }],
             vec![Uuid::new_v4(), Uuid::new_v4()],
         );

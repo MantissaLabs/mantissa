@@ -16,6 +16,13 @@ struct TaskTemplate {
   healthPort @10 :UInt16;   # Optional health probe port (0 disables probing)
   healthCommand @11 :List(Text); # Optional health command (first element may be HTTP path); empty disables
   publicPort @12 :UInt16;   # Optional host-facing service port (0 disables public exposure)
+  publicProtocol @13 :PublicProtocol; # Transport protocol(s) for public port (defaults to tcp)
+}
+
+enum PublicProtocol {
+  tcp @0;
+  udp @1;
+  tcpUdp @2;
 }
 
 enum RestartPolicyName {
