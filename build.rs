@@ -265,6 +265,8 @@ fn build_bpf() -> Result<()> {
         "bridge_xdp",
         "bridge_tc_ingress",
         "bridge_tc_egress",
+        "nodeport_tc_ingress",
+        "nodeport_tc_egress",
     ] {
         let source = out_dir.join(program);
         if source.exists() {

@@ -2,6 +2,7 @@ use crate::network::allocator::parse_ipv4_cidr;
 use crate::network::attachment::{bridge_name, host_access_host_iface_name, vxlan_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::lb::{BackendAddress, BpfLoadBalancer};
+use crate::network::nodeport::{NodePortManager, NodePortMapping};
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     BpfAttachPoint, BpfProgramSpec, NetworkAttachmentState, NetworkSpecValue,
@@ -50,6 +51,7 @@ pub struct ServiceDiscovery {
     health_port: Option<u16>,
     health_timeout: Duration,
     bpf_lb: BpfLoadBalancer,
+    nodeport: NodePortManager,
     missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
 }
 
@@ -80,6 +82,7 @@ impl ServiceDiscovery {
             health_port,
             health_timeout: Duration::from_millis(300),
             bpf_lb: BpfLoadBalancer::new(),
+            nodeport: NodePortManager::new(),
             missing_lb_maps: Arc::new(AsyncMutex::new(HashSet::new())),
         }
     }
@@ -118,6 +121,7 @@ impl ServiceDiscovery {
             self.health_port,
             self.health_timeout,
             self.bpf_lb.clone(),
+            self.nodeport.clone(),
             self.missing_lb_maps.clone(),
         )
         .await?;
@@ -132,6 +136,14 @@ impl ServiceDiscovery {
             let mut guard = self.servers.lock().await;
             guard.remove(&network_id)
         };
+
+        if let Err(err) = self.nodeport.sync_ports(network_id, &[]).await {
+            warn!(
+                target: "network",
+                network = %network_id,
+                "failed to clear nodeport mappings during teardown: {err:#}"
+            );
+        }
 
         if let Some(mut handle) = handle {
             if let Some(tx) = handle.shutdown.take() {
@@ -166,6 +178,7 @@ async fn spawn_dns_server(
     health_port: Option<u16>,
     health_timeout: Duration,
     bpf_lb: BpfLoadBalancer,
+    nodeport: NodePortManager,
     missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
 ) -> Result<DnsServerHandle> {
     let bind_addr = SocketAddr::new(IpAddr::V4(resolver_ip), 53);
@@ -195,6 +208,7 @@ async fn spawn_dns_server(
         health_port,
         health_timeout,
         &lb_manager,
+        &nodeport,
         &lb_missing,
     )
     .await
@@ -212,6 +226,7 @@ async fn spawn_dns_server(
     let refresh_bpf_manager = bpf_manager.clone();
     let refresh_health = health.clone();
     let refresh_lb_manager = lb_manager.clone();
+    let refresh_nodeport = nodeport.clone();
     let refresh_lb_missing = lb_missing.clone();
     let refresh_task = tokio::spawn(async move {
         let mut refresh = time::interval(REFRESH_INTERVAL);
@@ -233,6 +248,7 @@ async fn spawn_dns_server(
                         health_port,
                         health_timeout,
                         &refresh_lb_manager,
+                        &refresh_nodeport,
                         &refresh_lb_missing,
                     ).await {
                         warn!(
@@ -1164,6 +1180,18 @@ fn service_health_port(service_specs: &[ServiceSpecValue], service_name: &str) -
     None
 }
 
+/// Resolve the public nodeport requested by a service template, if any.
+fn service_public_port(service_specs: &[ServiceSpecValue], service_name: &str) -> Option<u16> {
+    for spec in service_specs {
+        for task in &spec.tasks {
+            if task.name.eq_ignore_ascii_case(service_name) {
+                return task.public_port();
+            }
+        }
+    }
+    None
+}
+
 fn service_health_path(service_specs: &[ServiceSpecValue], service_name: &str) -> Option<String> {
     for spec in service_specs {
         for task in &spec.tasks {
@@ -1234,14 +1262,16 @@ async fn refresh_network_services(
     health_port: Option<u16>,
     health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
+    nodeport: &NodePortManager,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
 ) -> Result<()> {
     let service_specs = services.list().context("load service specs for refresh")?;
     let template_index = build_task_template_index(&service_specs);
     let names = services_for_network(&service_specs, network_id);
+    let mut nodeport_entries = Vec::new();
 
     for service_name in names {
-        refresh_single_service(
+        if let Some(mapping) = refresh_single_service(
             registry,
             tasks,
             &service_specs,
@@ -1255,8 +1285,16 @@ async fn refresh_network_services(
             bpf_lb,
             lb_missing,
         )
-        .await?;
+        .await?
+        {
+            nodeport_entries.push(mapping);
+        }
     }
+
+    nodeport
+        .sync_ports(network_id, &nodeport_entries)
+        .await
+        .context("sync nodeport mappings")?;
 
     Ok(())
 }
@@ -1277,6 +1315,9 @@ fn services_for_network(service_specs: &[ServiceSpecValue], network_id: Uuid) ->
 
 /// Refresh healthy backend list and VIP programming for a single service so clients connected via
 /// the VIP can fail over even if they do not issue new DNS lookups.
+///
+/// Returns a nodeport mapping when the service is marked public so external listeners can be
+/// reconciled by the caller.
 async fn refresh_single_service(
     registry: &NetworkRegistry,
     tasks: &TaskStore,
@@ -1290,7 +1331,7 @@ async fn refresh_single_service(
     health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
-) -> Result<()> {
+) -> Result<Option<NodePortMapping>> {
     let candidates =
         resolve_service_backends(registry, tasks, template_index, network_id, service_name).await?;
     let service_port = health_port
@@ -1321,7 +1362,7 @@ async fn refresh_single_service(
     }
 
     if backends.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     if let Some((vip, mac)) = compute_service_vip(registry, network_id, service_name, &backends)? {
@@ -1338,9 +1379,17 @@ async fn refresh_single_service(
             service_is_public(service_specs, network_id, service_name),
         )
         .await;
+
+        if let Some(port) = service_public_port(service_specs, service_name) {
+            return Ok(Some(NodePortMapping {
+                port,
+                vip,
+                vip_port: port,
+            }));
+        }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 /// Attempt to synchronize VIP metadata into the eBPF maps if they are available, returning whether

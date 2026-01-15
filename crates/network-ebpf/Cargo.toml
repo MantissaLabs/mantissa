@@ -35,3 +35,15 @@ name = "bridge_tc_egress"
 path = "src/bin/bridge_tc_egress.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "nodeport_tc_ingress"
+path = "src/bin/nodeport_tc_ingress.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "nodeport_tc_egress"
+path = "src/bin/nodeport_tc_egress.rs"
+test = false
+bench = false
