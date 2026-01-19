@@ -26,7 +26,10 @@ use tokio::time::Duration;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Periodic reconciliation interval for drift detection when no events are pending.
+const RECONCILE_DRIFT_INTERVAL: Duration = Duration::from_secs(60);
+/// Frequency to check for attachment updates that require forwarding refresh.
+const ATTACHMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const DEFAULT_MTU: u32 = 1450;
 #[cfg(target_os = "linux")]
 const VXLAN_PORT: u16 = 4789;
@@ -55,6 +58,7 @@ struct NetworkControllerInner {
     pending_specs: AsyncMutex<HashSet<Uuid>>,
     wireguard: AsyncMutex<WireGuardUnderlayState>,
     wireguard_last_reconcile: AsyncMutex<Option<std::time::Instant>>,
+    attachments_root: AsyncMutex<Option<String>>,
     wake: Notify,
     gossip_tx: Sender<Message>,
 }
@@ -140,6 +144,7 @@ impl NetworkController {
                 pending_specs: AsyncMutex::new(HashSet::new()),
                 wireguard: AsyncMutex::new(WireGuardUnderlayState::default()),
                 wireguard_last_reconcile: AsyncMutex::new(None),
+                attachments_root: AsyncMutex::new(None),
                 wake: Notify::new(),
                 gossip_tx,
             }),
@@ -240,39 +245,63 @@ impl NetworkController {
         });
     }
 
+    /// Run the event-driven reconciliation loop with a slow drift sweep for external changes.
     async fn run(&self) {
-        let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
-        loop {
-            if let Err(err) = self.reconcile_pending_forwarding().await {
-                warn!(
-                    target: "network",
-                    "pending forwarding reconcile failed: {err:#}"
-                );
-            }
-            if let Err(err) = self.reconcile_pending_specs().await {
-                warn!(target: "network", "pending spec reconcile failed: {err:#}");
-            }
+        if let Err(err) = self.reconcile_pending_forwarding().await {
+            warn!(
+                target: "network",
+                "pending forwarding reconcile failed on startup: {err:#}"
+            );
+        }
+        if let Err(err) = self.reconcile_pending_specs().await {
+            warn!(
+                target: "network",
+                "pending spec reconcile failed on startup: {err:#}"
+            );
+        }
 
+        let mut interval = tokio::time::interval(RECONCILE_DRIFT_INTERVAL);
+        let mut attachment_refresh = tokio::time::interval(ATTACHMENT_REFRESH_INTERVAL);
+        loop {
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(err) = self.reconcile_once().await {
                         warn!(target: "network", "network reconciliation failed: {err:#}");
                     }
                 }
+                _ = attachment_refresh.tick() => {
+                    if let Err(err) = self.refresh_forwarding_from_attachments().await {
+                        warn!(
+                            target: "network",
+                            "attachment forwarding refresh failed: {err:#}"
+                        );
+                    }
+                }
                 _ = self.inner.wake.notified() => {
-                    // loop again immediately to process pending work
+                    if let Err(err) = self.reconcile_pending_forwarding().await {
+                        warn!(
+                            target: "network",
+                            "pending forwarding reconcile failed: {err:#}"
+                        );
+                    }
+                    if let Err(err) = self.reconcile_pending_specs().await {
+                        warn!(target: "network", "pending spec reconcile failed: {err:#}");
+                    }
                 }
             }
         }
     }
 
     async fn reconcile_pending_forwarding(&self) -> Result<()> {
-        self.reconcile_wireguard_underlay().await;
-
         let pending: Vec<Uuid> = {
             let mut guard = self.inner.pending_forwarding.lock().await;
             guard.drain().collect()
         };
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        self.reconcile_wireguard_underlay().await;
 
         for network_id in pending {
             let spec_opt = self.inner.registry.get_spec(network_id)?;
@@ -295,12 +324,15 @@ impl NetworkController {
     }
 
     async fn reconcile_pending_specs(&self) -> Result<()> {
-        self.reconcile_wireguard_underlay().await;
-
         let queued: Vec<Uuid> = {
             let mut guard = self.inner.pending_specs.lock().await;
             guard.drain().collect()
         };
+        if queued.is_empty() {
+            return Ok(());
+        }
+
+        self.reconcile_wireguard_underlay().await;
 
         for network_id in queued {
             match self.inner.registry.get_spec(network_id) {
@@ -331,6 +363,47 @@ impl NetworkController {
                         "failed to load spec for immediate reconcile: {err:#}"
                     );
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn refresh_forwarding_from_attachments(&self) -> Result<()> {
+        let root = self
+            .inner
+            .registry
+            .attachments_root_hex()
+            .await
+            .context("load attachment root hash")?;
+
+        let mut guard = self.inner.attachments_root.lock().await;
+        if guard.as_deref() == Some(root.as_str()) {
+            return Ok(());
+        }
+        *guard = Some(root);
+        drop(guard);
+
+        self.reconcile_wireguard_underlay().await;
+
+        let specs = self
+            .inner
+            .registry
+            .list_specs()
+            .context("list network specs for attachment forwarding refresh")?;
+
+        for mut spec in specs {
+            if spec.is_deleted() {
+                continue;
+            }
+            let (mut plan, _) = self.prepare_plan(&mut spec)?;
+            self.apply_wireguard_overrides(&mut plan).await;
+            if let Err(err) = self.reconcile_remote_forwarding(&plan).await {
+                warn!(
+                    target: "network",
+                    network = %plan.network_id,
+                    "attachment-triggered forwarding reconcile failed: {err:#}"
+                );
             }
         }
 

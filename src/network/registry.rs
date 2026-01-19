@@ -177,6 +177,11 @@ impl NetworkRegistry {
         Ok(())
     }
 
+    /// Return the attachment store root hash used to detect forwarding drift.
+    pub async fn attachments_root_hex(&self) -> Result<String> {
+        Ok(self.attachments.root_hex().await)
+    }
+
     /// Remove every attachment associated with a network.
     pub async fn remove_attachments_for_network(&self, network_id: Uuid) -> Result<()> {
         let attachments = self.list_attachments(Some(network_id))?;

@@ -781,36 +781,32 @@ impl TaskManager {
 
     /// Ensures that a locally tracked task has completely stopped and released resources.
     pub(super) async fn ensure_task_stopped(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
-        if matches!(spec.state, ContainerState::Stopped) {
-            self.local_containers.lock().await.remove(&spec.id);
-            self.cleanup_secret_artifacts(spec.id).await;
-            if let Err(err) = self
-                .teardown_runtime_attachments(spec.id, HashSet::new())
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to cleanup attachments for stopped task {}: {err}",
-                    spec.id
-                );
-            }
-            self.remove_spec(spec.id).await?;
-            self.enqueue_gossip(TaskEvent::Remove { id: spec.id })
-                .await?;
-            if let Err(err) = self.cleanup_orphaned_local_attachments().await {
-                warn!(
-                    target: "task",
-                    task = %spec.id,
-                    "failed to run orphaned attachment cleanup for stopped task: {err}"
-                );
-            }
-            return Ok(());
-        }
-
-        let has_container = {
+        let mut has_container = {
             let guard = self.local_containers.lock().await;
             guard.contains_key(&spec.id)
         };
+
+        if !has_container {
+            // After a daemon restart the in-memory cache is empty, so inspect by name
+            // before declaring the task containerless.
+            let container_name = format!("mantissa-{}", spec.id);
+            match self.container_manager.inspect_container(&container_name).await {
+                Ok(info) => {
+                    let resolved = info.id.unwrap_or(container_name);
+                    let mut guard = self.local_containers.lock().await;
+                    guard.insert(spec.id, resolved);
+                    has_container = true;
+                }
+                Err(ContainerError::NotFound(_)) => {}
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        task = %spec.id,
+                        "failed to inspect container while stopping task: {err}"
+                    );
+                }
+            }
+        }
 
         if !has_container {
             self.cleanup_secret_artifacts(spec.id).await;
@@ -837,7 +833,12 @@ impl TaskManager {
             return Ok(());
         }
 
-        let _ = self.perform_local_stop(spec).await?;
+        let mut working = spec.clone();
+        if matches!(working.state, ContainerState::Stopped) {
+            // Force a stop pass even if the persisted state already says "stopped".
+            working.state = ContainerState::Stopping;
+        }
+        let _ = self.perform_local_stop(working).await?;
         Ok(())
     }
 
