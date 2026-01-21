@@ -63,8 +63,6 @@ fn build_ebpf_without_warnings<'a>(
     }
 
     for package in packages {
-        println!("cargo:rerun-if-changed={}", package.root_dir);
-
         let mut cmd = Command::new("rustup");
         cmd.args([
             "run",
@@ -180,6 +178,50 @@ fn build_ebpf_without_warnings<'a>(
 }
 
 #[cfg(target_os = "linux")]
+/// Register the eBPF source inputs so Cargo only reruns this build script when they change.
+fn track_ebpf_inputs(root_dir: &PathBuf) -> Result<()> {
+    let paths = [
+        root_dir.join("Cargo.toml"),
+        root_dir.join("src"),
+        root_dir.join(".cargo"),
+    ];
+
+    for path in paths {
+        track_ebpf_path(&path)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+/// Recursively emit rerun directives for files under an input path, skipping target artifacts.
+fn track_ebpf_path(path: &PathBuf) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::metadata(path)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "target")
+            {
+                continue;
+            }
+            track_ebpf_path(&entry_path)?;
+        }
+    } else {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 /// Build the eBPF programs when compiling on Linux, ensuring artifacts are
 /// available for runtime networking features.
 fn build_bpf() -> Result<()> {
@@ -237,6 +279,10 @@ fn build_bpf() -> Result<()> {
         return Ok(());
     }
 
+    for package in &packages {
+        track_ebpf_inputs(&PathBuf::from(package.root_dir))?;
+    }
+
     if let Err(err) = ensure_bpf_linker() {
         eprintln!("Skipping eBPF build: {err}");
         return Ok(());
@@ -272,7 +318,6 @@ fn build_bpf() -> Result<()> {
         if source.exists() {
             let destination = dest_dir.join(format!("{program}.bpf.o"));
             fs::copy(&source, &destination)?;
-            println!("cargo:rerun-if-changed={}", destination.display());
         } else {
             println!(
                 "cargo:warning=compiled eBPF artifact for {program} not found at {}",
