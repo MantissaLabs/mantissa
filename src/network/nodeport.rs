@@ -172,6 +172,7 @@ mod platform {
         ports_by_network: HashMap<Uuid, HashSet<NodePortSelector>>,
         port_owner: HashMap<NodePortSelector, Uuid>,
         host_ingress_attached: HashSet<Uuid>,
+        host_ingress_ifindex: HashMap<Uuid, u32>,
     }
 
     impl PlatformNodePortManager {
@@ -220,6 +221,7 @@ mod platform {
                 ports_by_network: HashMap::new(),
                 port_owner: HashMap::new(),
                 host_ingress_attached: HashSet::new(),
+                host_ingress_ifindex: HashMap::new(),
             }
         }
 
@@ -337,6 +339,10 @@ mod platform {
                 self.port_owner.remove(selector);
             }
             self.ports_by_network.insert(network_id, desired_ports);
+            if entries.is_empty() {
+                self.host_ingress_attached.remove(&network_id);
+                self.host_ingress_ifindex.remove(&network_id);
+            }
             Ok(())
         }
 
@@ -422,9 +428,6 @@ mod platform {
 
         /// Attach nodeport SNAT handling to the host-access interface for a network.
         async fn ensure_host_ingress(&mut self, network_id: Uuid) -> Result<()> {
-            if self.host_ingress_attached.contains(&network_id) {
-                return Ok(());
-            }
             let Some(attachment) = self.attachment.as_mut() else {
                 return Ok(());
             };
@@ -438,9 +441,17 @@ mod platform {
                         iface = %iface,
                         "nodeport host-access interface not ready: {err:#}"
                     );
+                    self.host_ingress_attached.remove(&network_id);
+                    self.host_ingress_ifindex.remove(&network_id);
                     return Ok(());
                 }
             };
+
+            if self.host_ingress_attached.contains(&network_id)
+                && self.host_ingress_ifindex.get(&network_id) == Some(&ifindex)
+            {
+                return Ok(());
+            }
 
             ensure_clsact(&iface)?;
             if let Err(err) = configure_host_access_sysctls(&iface) {
@@ -465,6 +476,7 @@ mod platform {
                 "nodeport host-access tc program attached"
             );
             self.host_ingress_attached.insert(network_id);
+            self.host_ingress_ifindex.insert(network_id, ifindex);
             Ok(())
         }
 
