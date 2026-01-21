@@ -4,10 +4,12 @@ use super::manifest::{
 };
 use crate::config::ClientConfig;
 use crate::connection;
-use anyhow::{Context, Result, anyhow};
+use crate::networks;
+use anyhow::{anyhow, Context, Result};
 use capnp::struct_list;
 use protocol::services::task_template;
 use protocol::task::{environment_var, secret_file, secret_ref};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 /// Identifies the asynchronous deployment issued against the cluster so callers can poll status.
@@ -15,6 +17,56 @@ use uuid::Uuid;
 pub struct ServiceDeploymentHandle {
     pub service_id: Uuid,
     pub manifest_id: Uuid,
+}
+
+/// Ensure every network referenced by the manifest exists so scheduling can attach tasks reliably.
+async fn ensure_manifest_networks(cfg: &ClientConfig, manifest: &ServiceManifest) -> Result<()> {
+    let mut required = Vec::new();
+    let mut seen = HashSet::new();
+    for task in &manifest.tasks {
+        for network in &task.networks {
+            let trimmed = network.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                required.push(trimmed.to_string());
+            }
+        }
+    }
+
+    if required.is_empty() {
+        return Ok(());
+    }
+
+    let existing = networks::list(cfg).await?;
+    let existing_names: HashSet<String> = existing.into_iter().map(|net| net.name).collect();
+
+    for name in required {
+        if existing_names.contains(&name) {
+            continue;
+        }
+
+        let request = networks::default_network_create_request(name.clone());
+        match networks::create(cfg, &request).await {
+            Ok(network_id) => {
+                println!("network '{name}' created with id {network_id} (auto-provisioned)");
+            }
+            Err(err) => {
+                // Re-list to handle races where another actor created the network concurrently.
+                let fallback = networks::list(cfg).await?;
+                if fallback.iter().any(|net| net.name == name) {
+                    eprintln!(
+                        "warning: auto-provision for network '{name}' failed but it already exists: {err}"
+                    );
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn write_secret_reference(
@@ -75,6 +127,7 @@ pub async fn deploy_manifest(
     manifest: &ServiceManifest,
 ) -> Result<ServiceDeploymentHandle> {
     let manifest_id = Uuid::new_v4();
+    ensure_manifest_networks(cfg, manifest).await?;
 
     let client = connection::get_local_session(cfg).await?;
     let request = client.get_services_request();

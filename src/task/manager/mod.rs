@@ -14,7 +14,7 @@ use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata,
     TaskSpec, TaskStateFilter, TaskValue,
 };
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use async_channel::{Receiver, Sender};
 use bollard::errors::Error as BollardError;
 use crdt_store::uuid_key::UuidKey;
@@ -24,8 +24,8 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc::UnboundedSender};
-use tokio::time::{Duration, sleep};
+use tokio::sync::{mpsc::UnboundedSender, Mutex as AsyncMutex, RwLock};
+use tokio::time::{sleep, Duration};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -39,7 +39,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-use self::planner::RemoteStartPlan;
+use self::planner::{RemoteStartPlan, SchedulingError};
 use self::reservation::{ExecutionError, RemoteReservation};
 use self::secrets::TaskSecretArtifacts;
 
@@ -195,15 +195,35 @@ impl TaskManager {
         let intents = Self::build_start_intents(requests);
 
         const MAX_ATTEMPTS: usize = 5;
+        const NETWORK_READINESS_MAX_ATTEMPTS: usize = 30;
         let mut attempt = 0usize;
+        let mut network_attempts = 0usize;
 
         while attempt < MAX_ATTEMPTS {
-            attempt += 1;
-
             let assignment = match self.compute_assignment(&intents).await {
-                Ok(plan) => plan,
-                Err(err) => return Err(err.context("failed to compute scheduling plan")),
+                Ok(plan) => {
+                    network_attempts = 0;
+                    plan
+                }
+                Err(err) => {
+                    if is_network_readiness_error(&err) {
+                        network_attempts += 1;
+                        if network_attempts >= NETWORK_READINESS_MAX_ATTEMPTS {
+                            return Err(err.context("failed to compute scheduling plan"));
+                        }
+                        let backoff = network_readiness_backoff(network_attempts);
+                        debug!(
+                            target: "task",
+                            "network readiness blocked scheduling attempt {network_attempts}; retrying in {backoff:?}: {err}"
+                        );
+                        sleep(backoff).await;
+                        continue;
+                    }
+                    return Err(err.context("failed to compute scheduling plan"));
+                }
             };
+
+            attempt += 1;
 
             let local_version = assignment.local_version;
             let mut local_plans = assignment.local;
@@ -494,6 +514,21 @@ impl TaskManager {
 
         Ok(readiness)
     }
+}
+
+/// Identify scheduling errors that indicate network readiness is delaying placement decisions.
+fn is_network_readiness_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<SchedulingError>())
+}
+
+/// Compute the retry backoff used when networks are still converging before scheduling tasks.
+fn network_readiness_backoff(attempt: usize) -> Duration {
+    const BASE_MS: u64 = 200;
+    const MAX_MS: u64 = 2_000;
+
+    let exp = attempt.min(5) as u32;
+    let backoff = BASE_MS.saturating_mul(1u64 << exp);
+    Duration::from_millis(backoff.min(MAX_MS))
 }
 
 fn resolve_secret_runtime_root(local_node_id: Uuid) -> PathBuf {

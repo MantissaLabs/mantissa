@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use chrono::{DateTime, Utc};
 use rand::rng;
 use rand::seq::SliceRandom;
+use thiserror::Error;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -13,6 +14,15 @@ use crate::task::types::{
 };
 
 use super::{TaskManager, TaskStartRequest};
+
+/// Scheduling failures that indicate network readiness is blocking placement decisions.
+#[derive(Error, Debug)]
+pub(super) enum SchedulingError {
+    #[error("scheduler reservation failed: networks {networks:?} unavailable on any candidate")]
+    NetworksUnavailable { networks: Vec<Uuid> },
+    #[error("local node lacks required networks for task '{task}'")]
+    LocalNetworksUnavailable { task: String },
+}
 
 /// Execution plan for a single local task launch, holding the target slots and container metadata.
 #[derive(Clone)]
@@ -302,10 +312,10 @@ impl TaskManager {
             }
 
             if !intent.networks.iter().all(|net| local_ready.contains(net)) {
-                return Err(anyhow::anyhow!(
-                    "local node lacks required networks for task '{}'",
-                    intent.name
-                ));
+                return Err(SchedulingError::LocalNetworksUnavailable {
+                    task: intent.name.clone(),
+                }
+                .into());
             }
 
             let mut seen = HashSet::new();
@@ -517,12 +527,10 @@ impl TaskManager {
 
             let Some((location, slots)) = allocated else {
                 if skipped_for_networks {
-                    let networks: Vec<String> =
-                        intent.networks.iter().map(|id| id.to_string()).collect();
-                    return Err(anyhow::anyhow!(
-                        "scheduler reservation failed: networks {:?} unavailable on any candidate",
-                        networks
-                    ));
+                    return Err(SchedulingError::NetworksUnavailable {
+                        networks: intent.networks.clone(),
+                    }
+                    .into());
                 } else {
                     return Err(anyhow::anyhow!(
                         "scheduler reservation failed: insufficient capacity for batch"

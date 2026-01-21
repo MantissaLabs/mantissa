@@ -390,19 +390,6 @@ pub enum NetworkDriverOpt {
     Vxlan,
 }
 
-const DEFAULT_NETWORK_SUBNET: &str = "10.42.0.0/16";
-
-/// Return the baseline dataplane programs Mantissa needs for VXLAN overlays so VIP maps and
-/// forwarding stay functional even when callers omit explicit BPF flags.
-fn default_network_bpf_programs() -> Vec<String> {
-    vec![
-        "vxlan_xdp".to_string(),
-        "bridge_xdp@bridge_xdp".to_string(),
-        "bridge_tc_ingress@bridge_tc_ingress".to_string(),
-        "bridge_tc_egress@bridge_tc_egress".to_string(),
-    ]
-}
-
 #[derive(Subcommand, Debug)]
 pub enum NetworksCommand {
     /// Create a new overlay network in the cluster
@@ -468,13 +455,13 @@ impl NetworksCreateArgs {
     pub fn resolved_subnet(&self) -> String {
         self.subnet
             .clone()
-            .unwrap_or_else(|| DEFAULT_NETWORK_SUBNET.to_string())
+            .unwrap_or_else(|| client::networks::DEFAULT_NETWORK_SUBNET.to_string())
     }
 
     /// Merge user-provided programs with the defaults so dataplane maps and load-balancing remain
     /// available even when no BPF flags are specified on the CLI.
     pub fn resolved_bpf_programs(&self) -> Vec<String> {
-        let mut programs = default_network_bpf_programs();
+        let mut programs = client::networks::default_network_bpf_programs();
         programs.extend(self.bpf_programs.iter().cloned());
         programs.sort();
         programs.dedup();
