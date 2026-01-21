@@ -94,7 +94,9 @@ mod platform {
     use aya::Pod;
     use aya::maps::MapData;
     use aya::programs::ProgramError;
-    use aya::programs::tc::{SchedClassifier, TcAttachType, qdisc_add_clsact};
+    use aya::programs::tc::{
+        SchedClassifier, TcAttachType, qdisc_add_clsact, qdisc_detach_program,
+    };
     use aya::{Ebpf, EbpfLoader};
     use futures::TryStreamExt;
     use libc::if_nametoindex;
@@ -343,6 +345,9 @@ mod platform {
                 self.host_ingress_attached.remove(&network_id);
                 self.host_ingress_ifindex.remove(&network_id);
             }
+            if self.port_owner.is_empty() {
+                self.detach_if_idle().await?;
+            }
             Ok(())
         }
 
@@ -423,6 +428,24 @@ mod platform {
                 _ingress: ingress,
                 egress,
             });
+            Ok(())
+        }
+
+        /// Detach nodeport programs when no mappings remain to avoid side effects on loopback.
+        async fn detach_if_idle(&mut self) -> Result<()> {
+            let Some(iface) = self.iface.clone() else {
+                return Ok(());
+            };
+            let Some(_attachment) = self.attachment.take() else {
+                return Ok(());
+            };
+
+            detach_tc(&iface, TcAttachType::Ingress, "nodeport_tc_ingress")?;
+            detach_tc(&iface, TcAttachType::Egress, "nodeport_tc_egress")?;
+            let _ = detach_tc("lo", TcAttachType::Ingress, "nodeport_tc_ingress");
+
+            self.host_ingress_attached.clear();
+            self.host_ingress_ifindex.clear();
             Ok(())
         }
 
@@ -859,6 +882,29 @@ mod platform {
             Err(ProgramError::AlreadyAttached) => {}
             Err(err) => return Err(err.into()),
         }
+        Ok(())
+    }
+
+    /// Detach a tc program from the provided interface, tolerating missing attachments.
+    fn detach_tc(
+        iface: &str,
+        attach_type: TcAttachType,
+        program_name: &str,
+    ) -> Result<()> {
+        let mut candidates = vec![program_name.to_string()];
+        let truncated: String = program_name.chars().take(15).collect();
+        if truncated != program_name {
+            candidates.push(truncated);
+        }
+
+        for name in candidates {
+            match qdisc_detach_program(iface, attach_type, &name) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
         Ok(())
     }
 
