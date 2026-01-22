@@ -45,6 +45,19 @@ impl ServiceRegistry {
         Ok(snapshot.and_then(|snap| snap.as_slice().last().cloned()))
     }
 
+    /// Returns every concurrent service spec value stored for the provided id.
+    pub fn get_versions(&self, id: Uuid) -> Result<Vec<ServiceSpecValue>> {
+        let key = UuidKey::from(id);
+        let snapshot = self
+            .store
+            .get_snapshot(&key)
+            .map_err(|e| anyhow!("service lookup failed: {e}"))?;
+
+        Ok(snapshot
+            .map(|snap| snap.as_slice().to_vec())
+            .unwrap_or_default())
+    }
+
     pub fn list(&self) -> Result<Vec<ServiceSpecValue>> {
         let (entries, _) = self
             .store

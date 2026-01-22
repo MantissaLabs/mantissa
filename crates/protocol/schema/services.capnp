@@ -45,6 +45,21 @@ enum ServiceStatus {
   failed @4;
 }
 
+enum RescheduleReason {
+  missingReplicas @0;
+  excessReplicas @1;
+  drift @2;
+}
+
+struct RescheduleLock {
+  holderId @0 :Data;
+  holderName @1 :Text;
+  token @2 :Data;
+  issuedAt @3 :Text;
+  expiresAt @4 :Text;
+  reason @5 :RescheduleReason;
+}
+
 struct ServiceSpec {
   id @0 :Data;                  # Deterministic service UUID (16 bytes)
   manifestId @1 :Data;          # Manifest revision UUID (16 bytes)
@@ -54,6 +69,7 @@ struct ServiceSpec {
   taskIds @5 :List(Data);       # Current task UUIDs (16 bytes each)
   updatedAt @6 :Text;           # RFC3339 timestamp when this spec was last updated
   status @7 :ServiceStatus;
+  rescheduleLock @8 :RescheduleLock;
 }
 
 struct ServiceEvent {

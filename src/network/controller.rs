@@ -15,9 +15,9 @@ use crate::services::registry::ServiceRegistry;
 use crate::store::task_store::TaskStore;
 use anyhow::{Context, Result};
 use async_channel::Sender;
-use blake3::Hasher;
 #[cfg(target_os = "linux")]
 use aya::{programs::ProgramError, sys::SyscallError};
+use blake3::Hasher;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -1333,12 +1333,12 @@ mod platform {
     use libc;
     use netlink_packet_core::{DefaultNla, Nla};
     use netlink_packet_utils::nla::{NLA_ALIGNTO, NLA_F_NESTED, NLA_HEADER_SIZE, NlaBuffer};
-	    use rtnetlink::packet_route::AddressFamily;
-	    use rtnetlink::packet_route::address::AddressAttribute;
-	    use rtnetlink::packet_route::link::{
-	        InfoBridgePort, InfoData, InfoKind, InfoPortData, InfoVxlan, LinkAttribute, LinkFlags,
-	        LinkHeader, LinkInfo, LinkProtoInfoBridge,
-	    };
+    use rtnetlink::packet_route::AddressFamily;
+    use rtnetlink::packet_route::address::AddressAttribute;
+    use rtnetlink::packet_route::link::{
+        InfoBridgePort, InfoData, InfoKind, InfoPortData, InfoVxlan, LinkAttribute, LinkFlags,
+        LinkHeader, LinkInfo, LinkProtoInfoBridge,
+    };
     use rtnetlink::{
         AddressMessageBuilder, Error as RtnetlinkError, Handle, LinkBridge, LinkMessageBuilder,
         LinkUnspec, LinkVeth, LinkVxlan, new_connection,
@@ -2440,7 +2440,9 @@ mod platform {
                 )
                 .execute()
                 .await
-                .with_context(|| format!("set mac {} on link {name} (index {index})", format_mac(mac)))?;
+                .with_context(|| {
+                    format!("set mac {} on link {name} (index {index})", format_mac(mac))
+                })?;
 
             Ok(())
         }

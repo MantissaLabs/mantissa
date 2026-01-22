@@ -4,21 +4,25 @@ use crate::services::reconcile::{
 };
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServiceEvent, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
-    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, compute_service_id,
+    ServiceEvent, ServiceRescheduleLock, ServiceRescheduleReason, ServiceSpecValue, ServiceStatus,
+    ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
+    compute_service_id,
 };
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
-use crate::task::types::{TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata};
+use crate::task::types::{
+    TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec, TaskStateFilter,
+};
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use health::{HealthMonitor, Status as HealthStatus};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::time::sleep;
+use tokio::time::{interval, sleep};
 use uuid::Uuid;
 
 /// Interval between readiness polls when waiting for service tasks to acknowledge their state.
@@ -30,6 +34,12 @@ const SERVICE_READY_TIMEOUT_SECS: u64 = 60;
 const SERVICE_READY_BACKOFF_BASE_MS: u64 = 500;
 /// Maximum number of deployment attempts (initial + retries) before marking the service failed.
 const SERVICE_DEPLOYMENT_MAX_ATTEMPTS: u32 = 3;
+/// Interval used by the rescheduler loop to evaluate service replica health.
+const SERVICE_RESCHEDULE_TICK_SECS: u64 = 2;
+/// Lease duration (in seconds) used for reschedule locks before another node may take over.
+const SERVICE_RESCHEDULE_LOCK_TTL_SECS: i64 = 20;
+/// Delay after claiming a reschedule lock to allow gossip/MST propagation.
+const SERVICE_RESCHEDULE_LOCK_SETTLE_MS: u64 = 250;
 
 #[derive(Clone)]
 pub struct ServiceController {
@@ -38,14 +48,22 @@ pub struct ServiceController {
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
     seen_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
+    local_node_id: Uuid,
+    local_node_name: String,
+    health_monitor: Arc<HealthMonitor>,
+    inflight_reschedules: Arc<AsyncMutex<HashSet<Uuid>>>,
 }
 
 impl ServiceController {
+    /// Creates a service controller bound to the local node and shared cluster state.
     pub fn new(
         registry: ServiceRegistry,
         task_manager: TaskManager,
         gossip_tx: Sender<Message>,
         gossip_rx: Receiver<Message>,
+        local_node_id: Uuid,
+        local_node_name: String,
+        health_monitor: Arc<HealthMonitor>,
     ) -> Self {
         Self {
             registry,
@@ -53,18 +71,38 @@ impl ServiceController {
             gossip_tx,
             gossip_rx,
             seen_ids: Arc::new(AsyncMutex::new(HashSet::new())),
+            local_node_id,
+            local_node_name,
+            health_monitor,
+            inflight_reschedules: Arc::new(AsyncMutex::new(HashSet::new())),
         }
     }
 
+    /// Runs the service controller loop, handling gossip events and periodic rescheduling.
     pub async fn run(&mut self) {
-        while let Ok(message) = self.gossip_rx.recv().await {
-            if let Message::Service { id, event } = message {
-                if self.record_gossip_id(id).await {
-                    if let Err(err) = self.handle_event(event).await {
+        let mut reschedule_tick = interval(Duration::from_secs(SERVICE_RESCHEDULE_TICK_SECS));
+
+        loop {
+            tokio::select! {
+                _ = reschedule_tick.tick() => {
+                    if let Err(err) = self.reconcile_services().await {
                         tracing::warn!(
                             target: "services",
-                            "failed to apply service gossip event: {err}"
+                            "failed to reconcile service replicas: {err}"
                         );
+                    }
+                }
+                message = self.gossip_rx.recv() => {
+                    let Ok(message) = message else { break; };
+                    if let Message::Service { id, event } = message {
+                        if self.record_gossip_id(id).await {
+                            if let Err(err) = self.handle_event(event).await {
+                                tracing::warn!(
+                                    target: "services",
+                                    "failed to apply service gossip event: {err}"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -252,6 +290,255 @@ impl ServiceController {
     async fn record_gossip_id(&self, id: Uuid) -> bool {
         let mut guard = self.seen_ids.lock().await;
         guard.insert(id)
+    }
+
+    /// Periodically checks services against task health to reschedule missing replicas.
+    async fn reconcile_services(&self) -> anyhow::Result<()> {
+        let specs = self.registry.list()?;
+        if specs.is_empty() {
+            return Ok(());
+        }
+
+        let inventory = Arc::new(self.collect_task_inventory().await?);
+        let health_snapshot = Arc::new(self.health_monitor.snapshot());
+
+        for spec in specs {
+            if spec.status() != ServiceStatus::Running {
+                continue;
+            }
+
+            let Some(reschedule_guard) = self.try_begin_reschedule(spec.id).await else {
+                continue;
+            };
+
+            let controller = self.clone();
+            let inventory = inventory.clone();
+            let health_snapshot = health_snapshot.clone();
+            tokio::task::spawn_local(async move {
+                let _guard = reschedule_guard;
+                if let Err(err) = controller
+                    .reconcile_service(spec, inventory.as_ref(), health_snapshot.as_ref())
+                    .await
+                {
+                    tracing::warn!(
+                        target: "services",
+                        "service reconciliation failed: {err}"
+                    );
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Drives a single service through reschedule planning and execution while holding a lock.
+    async fn reconcile_service(
+        &self,
+        spec: ServiceSpecValue,
+        inventory: &TaskInventory,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
+    ) -> anyhow::Result<()> {
+        let plan = build_reschedule_plan(&spec, inventory, health_snapshot);
+        if plan.is_noop() {
+            return Ok(());
+        }
+
+        let Some(lock) = self.ensure_reschedule_lock(&spec, plan.reason()).await? else {
+            return Ok(());
+        };
+
+        let Some(mut locked_spec) = self.load_spec_for_lock(spec.id, &lock)? else {
+            return Ok(());
+        };
+
+        if locked_spec.status() != ServiceStatus::Running {
+            self.release_reschedule_lock(locked_spec.id, &lock).await?;
+            return Ok(());
+        }
+
+        let refreshed_inventory = self.collect_task_inventory().await?;
+        let refreshed_plan =
+            build_reschedule_plan(&locked_spec, &refreshed_inventory, health_snapshot);
+        if refreshed_plan.is_noop() {
+            self.release_reschedule_lock(locked_spec.id, &lock).await?;
+            return Ok(());
+        }
+
+        let mut replacements: HashMap<usize, Uuid> = HashMap::new();
+        let mut start_requests = Vec::new();
+        for slot in &refreshed_plan.missing_slots {
+            let desired_id = Uuid::new_v4();
+            replacements.insert(slot.index, desired_id);
+            start_requests.push(make_replica_request(
+                &locked_spec.service_name,
+                &slot.template,
+                slot.replica,
+                desired_id,
+            ));
+        }
+
+        if !start_requests.is_empty() {
+            match self.task_manager.start_tasks_batch(start_requests).await {
+                Ok(specs) => {
+                    if specs.len() != replacements.len() {
+                        tracing::warn!(
+                            target: "services",
+                            "replacement count mismatch for '{}' during reschedule: expected {}, got {}",
+                            locked_spec.service_name,
+                            replacements.len(),
+                            specs.len()
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to reschedule replicas for '{}': {err}",
+                        locked_spec.service_name
+                    );
+                    self.release_reschedule_lock(locked_spec.id, &lock).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        if !replacements.is_empty() {
+            locked_spec.task_ids = apply_replacements(&refreshed_plan.slots, &replacements);
+            locked_spec.set_reschedule_lock(Some(lock.clone()));
+            self.apply_upsert(locked_spec.clone()).await?;
+            self.broadcast(ServiceEvent::Upsert(locked_spec.clone()))
+                .await?;
+        }
+
+        if !refreshed_plan.extra_task_ids.is_empty() {
+            for task_id in refreshed_plan.extra_task_ids {
+                if let Err(err) = self.task_manager.stop_task(task_id).await {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to stop excess task {task_id} for '{}': {err}",
+                        locked_spec.service_name
+                    );
+                }
+            }
+        }
+
+        self.release_reschedule_lock(locked_spec.id, &lock).await?;
+        Ok(())
+    }
+
+    /// Collects a cluster-wide task inventory snapshot to support reconciliation decisions.
+    async fn collect_task_inventory(&self) -> anyhow::Result<TaskInventory> {
+        let specs = self
+            .task_manager
+            .list_tasks(&TaskStateFilter::all())
+            .await?;
+        Ok(TaskInventory::from_specs(specs))
+    }
+
+    /// Claims a local in-flight marker so we avoid overlapping reconciliations per service.
+    async fn try_begin_reschedule(&self, service_id: Uuid) -> Option<RescheduleGuard> {
+        let mut guard = self.inflight_reschedules.lock().await;
+        if guard.contains(&service_id) {
+            return None;
+        }
+        guard.insert(service_id);
+        Some(RescheduleGuard {
+            service_id,
+            inflight: self.inflight_reschedules.clone(),
+        })
+    }
+
+    /// Attempts to claim the reschedule lock for the provided service, returning it on success.
+    async fn ensure_reschedule_lock(
+        &self,
+        spec: &ServiceSpecValue,
+        reason: ServiceRescheduleReason,
+    ) -> anyhow::Result<Option<ServiceRescheduleLock>> {
+        let now = Utc::now();
+        let versions = self.registry.get_versions(spec.id)?;
+        if let Some(lock) = select_reschedule_lock(&versions, now) {
+            if lock.holder_id == self.local_node_id {
+                return Ok(Some(lock));
+            }
+            return Ok(None);
+        }
+
+        let Some(current) = self.registry.get(spec.id)? else {
+            return Ok(None);
+        };
+        if current.status() != ServiceStatus::Running {
+            return Ok(None);
+        }
+
+        let issued_at = now.to_rfc3339();
+        let expires_at =
+            (now + ChronoDuration::seconds(SERVICE_RESCHEDULE_LOCK_TTL_SECS)).to_rfc3339();
+        let lock = ServiceRescheduleLock::new(
+            self.local_node_id,
+            self.local_node_name.clone(),
+            Uuid::new_v4(),
+            issued_at,
+            expires_at,
+            reason,
+        );
+
+        let mut next = current;
+        next.set_reschedule_lock(Some(lock.clone()));
+        self.apply_upsert(next.clone()).await?;
+        self.broadcast(ServiceEvent::Upsert(next)).await?;
+
+        sleep(Duration::from_millis(SERVICE_RESCHEDULE_LOCK_SETTLE_MS)).await;
+
+        let versions = self.registry.get_versions(spec.id)?;
+        let now = Utc::now();
+        match select_reschedule_lock(&versions, now) {
+            Some(winner)
+                if winner.holder_id == self.local_node_id && winner.token == lock.token =>
+            {
+                Ok(Some(winner))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Releases a reschedule lock when this node still holds the winning lease.
+    async fn release_reschedule_lock(
+        &self,
+        service_id: Uuid,
+        lock: &ServiceRescheduleLock,
+    ) -> anyhow::Result<()> {
+        let versions = self.registry.get_versions(service_id)?;
+        let now = Utc::now();
+        let Some(winner) = select_reschedule_lock(&versions, now) else {
+            return Ok(());
+        };
+
+        if winner.token != lock.token || winner.holder_id != self.local_node_id {
+            return Ok(());
+        }
+
+        let Some(mut spec) = self.load_spec_for_lock(service_id, &winner)? else {
+            return Ok(());
+        };
+
+        spec.set_reschedule_lock(None);
+        self.apply_upsert(spec.clone()).await?;
+        self.broadcast(ServiceEvent::Upsert(spec)).await?;
+        Ok(())
+    }
+
+    /// Loads the latest service spec that carries the provided lock token.
+    fn load_spec_for_lock(
+        &self,
+        service_id: Uuid,
+        lock: &ServiceRescheduleLock,
+    ) -> anyhow::Result<Option<ServiceSpecValue>> {
+        let versions = self.registry.get_versions(service_id)?;
+        if let Some(spec) = select_spec_for_lock(&versions, lock) {
+            return Ok(Some(spec));
+        }
+
+        Ok(self.registry.get(service_id)?)
     }
 
     /// Executes the deployment workflow in the background by starting tasks via the task manager
@@ -685,6 +972,220 @@ impl ServiceController {
     pub fn registry(&self) -> &ServiceRegistry {
         &self.registry
     }
+}
+
+#[derive(Clone, Debug)]
+struct TaskInventory {
+    by_id: HashMap<Uuid, TaskSpec>,
+    by_service: HashMap<String, Vec<TaskSpec>>,
+}
+
+impl TaskInventory {
+    /// Builds a task inventory snapshot for service-level reconciliation checks.
+    fn from_specs(specs: Vec<TaskSpec>) -> Self {
+        let mut by_id = HashMap::with_capacity(specs.len());
+        let mut by_service: HashMap<String, Vec<TaskSpec>> = HashMap::new();
+
+        for spec in specs {
+            by_id.insert(spec.id, spec.clone());
+            if let Some(meta) = spec.service_metadata.as_ref() {
+                by_service
+                    .entry(meta.service_name.clone())
+                    .or_default()
+                    .push(spec);
+            }
+        }
+
+        Self { by_id, by_service }
+    }
+}
+
+/// Local guard that clears the in-flight reschedule marker on drop.
+struct RescheduleGuard {
+    service_id: Uuid,
+    inflight: Arc<AsyncMutex<HashSet<Uuid>>>,
+}
+
+impl Drop for RescheduleGuard {
+    /// Clears the in-flight marker when the guard is dropped.
+    fn drop(&mut self) {
+        let inflight = self.inflight.clone();
+        let service_id = self.service_id;
+        tokio::task::spawn_local(async move {
+            inflight.lock().await.remove(&service_id);
+        });
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReplicaSlot {
+    index: usize,
+    template: ServiceTaskSpecValue,
+    replica: u16,
+    task_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug)]
+struct ServiceReschedulePlan {
+    slots: Vec<ReplicaSlot>,
+    missing_slots: Vec<ReplicaSlot>,
+    extra_task_ids: Vec<Uuid>,
+}
+
+impl ServiceReschedulePlan {
+    /// Returns true when the plan indicates no reschedule actions are required.
+    fn is_noop(&self) -> bool {
+        self.missing_slots.is_empty() && self.extra_task_ids.is_empty()
+    }
+
+    /// Summarizes the reason for rescheduling to annotate lock claims.
+    fn reason(&self) -> ServiceRescheduleReason {
+        if !self.missing_slots.is_empty() {
+            ServiceRescheduleReason::MissingReplicas
+        } else if !self.extra_task_ids.is_empty() {
+            ServiceRescheduleReason::ExcessReplicas
+        } else {
+            ServiceRescheduleReason::Drift
+        }
+    }
+}
+
+/// Expands the service spec into an ordered list of desired replica slots.
+fn build_replica_slots(spec: &ServiceSpecValue) -> Vec<ReplicaSlot> {
+    let mut slots = Vec::new();
+    let mut cursor = 0usize;
+
+    for template in &spec.tasks {
+        for replica in 1..=template.replicas {
+            let task_id = spec.task_ids.get(cursor).copied();
+            slots.push(ReplicaSlot {
+                index: cursor,
+                template: template.clone(),
+                replica,
+                task_id,
+            });
+            cursor += 1;
+        }
+    }
+
+    slots
+}
+
+/// Builds a reconciliation plan for the provided service using task health signals.
+fn build_reschedule_plan(
+    spec: &ServiceSpecValue,
+    inventory: &TaskInventory,
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
+) -> ServiceReschedulePlan {
+    let slots = build_replica_slots(spec);
+    let desired_ids: HashSet<Uuid> = slots.iter().filter_map(|slot| slot.task_id).collect();
+
+    let mut missing_slots = Vec::new();
+    for slot in &slots {
+        let Some(task_id) = slot.task_id else {
+            missing_slots.push(slot.clone());
+            continue;
+        };
+
+        let Some(task) = inventory.by_id.get(&task_id) else {
+            missing_slots.push(slot.clone());
+            continue;
+        };
+
+        // Treat replicas on down nodes (or unhealthy containers) as missing so replacements spawn.
+        if node_is_down(task.node_id, health_snapshot) || !task_state_healthy(&task.state) {
+            missing_slots.push(slot.clone());
+        }
+    }
+
+    let mut extra_task_ids = Vec::new();
+    if let Some(tasks) = inventory.by_service.get(&spec.service_name) {
+        for task in tasks {
+            if desired_ids.contains(&task.id) {
+                continue;
+            }
+            if node_is_down(task.node_id, health_snapshot) {
+                continue;
+            }
+            if !task_state_healthy(&task.state) {
+                continue;
+            }
+            extra_task_ids.push(task.id);
+        }
+    }
+
+    ServiceReschedulePlan {
+        slots,
+        missing_slots,
+        extra_task_ids,
+    }
+}
+
+/// Returns true if a task state should be treated as a healthy, in-flight replica.
+fn task_state_healthy(state: &ContainerState) -> bool {
+    // Pending/creating are still converging, so we avoid spawning duplicates.
+    matches!(
+        state,
+        ContainerState::Pending | ContainerState::Creating | ContainerState::Running
+    )
+}
+
+/// Returns true if the node health snapshot marks the node as down (suspect remains eligible).
+fn node_is_down(node_id: Uuid, health_snapshot: &HashMap<Uuid, HealthStatus>) -> bool {
+    matches!(health_snapshot.get(&node_id), Some(HealthStatus::Down))
+}
+
+/// Applies replacement task ids to the slot list, preserving deterministic order.
+fn apply_replacements(slots: &[ReplicaSlot], replacements: &HashMap<usize, Uuid>) -> Vec<Uuid> {
+    let mut ids = Vec::with_capacity(slots.len());
+    for slot in slots {
+        if let Some(replacement) = replacements.get(&slot.index) {
+            ids.push(*replacement);
+        } else if let Some(task_id) = slot.task_id {
+            ids.push(task_id);
+        }
+    }
+    ids
+}
+
+/// Picks the winning reschedule lock across concurrent spec versions.
+fn select_reschedule_lock(
+    specs: &[ServiceSpecValue],
+    now: DateTime<Utc>,
+) -> Option<ServiceRescheduleLock> {
+    let mut locks: Vec<ServiceRescheduleLock> = specs
+        .iter()
+        .filter_map(|spec| spec.reschedule_lock.clone())
+        .filter(|lock| !lock_expired(lock, now))
+        .collect();
+
+    // Deterministic tie-breaker keeps all nodes aligned even with concurrent claims.
+    locks.sort_by(|a, b| a.token.cmp(&b.token).then(a.holder_id.cmp(&b.holder_id)));
+    locks.into_iter().next()
+}
+
+/// Returns true when the reschedule lock is expired or has invalid timestamps.
+fn lock_expired(lock: &ServiceRescheduleLock, now: DateTime<Utc>) -> bool {
+    match parse_timestamp(&lock.expires_at) {
+        Some(expiry) => expiry <= now,
+        None => true,
+    }
+}
+
+/// Chooses the service spec value that carries the provided reschedule lock token.
+fn select_spec_for_lock(
+    specs: &[ServiceSpecValue],
+    lock: &ServiceRescheduleLock,
+) -> Option<ServiceSpecValue> {
+    specs
+        .iter()
+        .find(|spec| {
+            spec.reschedule_lock
+                .as_ref()
+                .map(|candidate| candidate.token == lock.token)
+                .unwrap_or(false)
+        })
+        .cloned()
 }
 
 struct ServiceDeploymentJob {
@@ -1140,4 +1641,205 @@ fn format_task_state_summary(states: &[(Uuid, Option<ContainerState>)]) -> Strin
     }
 
     parts.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::types::TaskServiceMetadata;
+
+    /// Builds a minimal task spec for reschedule planning tests.
+    fn make_task(
+        id: Uuid,
+        node_id: Uuid,
+        service_name: &str,
+        template: &str,
+        state: ContainerState,
+    ) -> TaskSpec {
+        TaskSpec {
+            id,
+            name: format!("{service_name}-{template}-1-test"),
+            image: "ghcr.io/demo/app:latest".to_string(),
+            state,
+            created_at: Utc::now().to_rfc3339(),
+            command: Vec::new(),
+            node_id,
+            node_name: format!("node-{node_id}"),
+            slot_ids: Vec::new(),
+            slot_id: None,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            restart_policy: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            networks: Vec::new(),
+            service_metadata: Some(TaskServiceMetadata::new(service_name, template)),
+        }
+    }
+
+    /// Ensures replica slots map task ids in template/replica order.
+    #[test]
+    fn replica_slots_follow_template_order() {
+        let task_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let spec = ServiceSpecValue::new(
+            Uuid::new_v4(),
+            "manifest",
+            "demo-service",
+            vec![
+                ServiceTaskSpecValue {
+                    name: "api".into(),
+                    image: "ghcr.io/demo/api:latest".into(),
+                    command: Vec::new(),
+                    replicas: 2,
+                    cpu_millis: 0,
+                    memory_bytes: 0,
+                    restart_policy: None,
+                    env: Vec::new(),
+                    secret_files: Vec::new(),
+                    networks: Vec::new(),
+                    health_port: None,
+                    health_command: None,
+                    public_port: None,
+                    public_protocol: None,
+                },
+                ServiceTaskSpecValue {
+                    name: "web".into(),
+                    image: "ghcr.io/demo/web:latest".into(),
+                    command: Vec::new(),
+                    replicas: 1,
+                    cpu_millis: 0,
+                    memory_bytes: 0,
+                    restart_policy: None,
+                    env: Vec::new(),
+                    secret_files: Vec::new(),
+                    networks: Vec::new(),
+                    health_port: None,
+                    health_command: None,
+                    public_port: None,
+                    public_protocol: None,
+                },
+            ],
+            task_ids.clone(),
+        );
+
+        let slots = build_replica_slots(&spec);
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots[0].task_id, Some(task_ids[0]));
+        assert_eq!(slots[1].task_id, Some(task_ids[1]));
+        assert_eq!(slots[2].task_id, Some(task_ids[2]));
+        assert_eq!(slots[0].template.name, "api");
+        assert_eq!(slots[1].template.name, "api");
+        assert_eq!(slots[2].template.name, "web");
+    }
+
+    /// Verifies down nodes produce missing replicas in the reschedule plan.
+    #[test]
+    fn plan_marks_down_node_missing() {
+        let service_name = "demo-service";
+        let node_alive = Uuid::new_v4();
+        let node_down = Uuid::new_v4();
+        let task_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let spec = ServiceSpecValue::new(
+            Uuid::new_v4(),
+            "manifest",
+            service_name,
+            vec![ServiceTaskSpecValue {
+                name: "api".into(),
+                image: "ghcr.io/demo/api:latest".into(),
+                command: Vec::new(),
+                replicas: 2,
+                cpu_millis: 0,
+                memory_bytes: 0,
+                restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                networks: Vec::new(),
+                health_port: None,
+                health_command: None,
+                public_port: None,
+                public_protocol: None,
+            }],
+            task_ids.clone(),
+        );
+
+        let tasks = vec![
+            make_task(
+                task_ids[0],
+                node_alive,
+                service_name,
+                "api",
+                ContainerState::Running,
+            ),
+            make_task(
+                task_ids[1],
+                node_down,
+                service_name,
+                "api",
+                ContainerState::Running,
+            ),
+        ];
+        let inventory = TaskInventory::from_specs(tasks);
+        let mut health_snapshot = HashMap::new();
+        health_snapshot.insert(node_alive, HealthStatus::Alive);
+        health_snapshot.insert(node_down, HealthStatus::Down);
+
+        let plan = build_reschedule_plan(&spec, &inventory, &health_snapshot);
+        assert_eq!(plan.missing_slots.len(), 1);
+        assert_eq!(plan.extra_task_ids.len(), 0);
+    }
+
+    /// Ensures extra replicas that are not in the desired task id set are detected.
+    #[test]
+    fn plan_marks_extra_tasks() {
+        let service_name = "demo-service";
+        let node_alive = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let extra_id = Uuid::new_v4();
+        let spec = ServiceSpecValue::new(
+            Uuid::new_v4(),
+            "manifest",
+            service_name,
+            vec![ServiceTaskSpecValue {
+                name: "api".into(),
+                image: "ghcr.io/demo/api:latest".into(),
+                command: Vec::new(),
+                replicas: 1,
+                cpu_millis: 0,
+                memory_bytes: 0,
+                restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                networks: Vec::new(),
+                health_port: None,
+                health_command: None,
+                public_port: None,
+                public_protocol: None,
+            }],
+            vec![task_id],
+        );
+
+        let tasks = vec![
+            make_task(
+                task_id,
+                node_alive,
+                service_name,
+                "api",
+                ContainerState::Running,
+            ),
+            make_task(
+                extra_id,
+                node_alive,
+                service_name,
+                "api",
+                ContainerState::Running,
+            ),
+        ];
+        let inventory = TaskInventory::from_specs(tasks);
+        let mut health_snapshot = HashMap::new();
+        health_snapshot.insert(node_alive, HealthStatus::Alive);
+
+        let plan = build_reschedule_plan(&spec, &inventory, &health_snapshot);
+        assert_eq!(plan.missing_slots.len(), 0);
+        assert_eq!(plan.extra_task_ids, vec![extra_id]);
+    }
 }

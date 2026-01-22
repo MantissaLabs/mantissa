@@ -7,7 +7,7 @@ mod status;
 mod types;
 
 pub use attachments::attachments;
-pub use create::{create, NetworkCreateRequest};
+pub use create::{NetworkCreateRequest, create};
 pub use delete::delete;
 pub use inspect::inspect;
 pub use list::list;

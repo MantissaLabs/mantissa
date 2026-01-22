@@ -790,7 +790,11 @@ impl TaskManager {
             // After a daemon restart the in-memory cache is empty, so inspect by name
             // before declaring the task containerless.
             let container_name = format!("mantissa-{}", spec.id);
-            match self.container_manager.inspect_container(&container_name).await {
+            match self
+                .container_manager
+                .inspect_container(&container_name)
+                .await
+            {
                 Ok(info) => {
                     let resolved = info.id.unwrap_or(container_name);
                     let mut guard = self.local_containers.lock().await;

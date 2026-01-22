@@ -249,7 +249,9 @@ fn build_bpf() -> Result<()> {
             let mut retry = MetadataCommand::new();
             retry.manifest_path(manifest_dir.join("Cargo.toml"));
             retry.no_deps();
-            retry.exec().with_context(|| format!("cargo metadata failed in offline mode: {err}"))?
+            retry
+                .exec()
+                .with_context(|| format!("cargo metadata failed in offline mode: {err}"))?
         }
     };
 

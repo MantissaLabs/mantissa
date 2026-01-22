@@ -388,16 +388,16 @@ impl Topology {
 
         // Compute advertise address before registering. If this fails we abort so the node
         // does not appear joined without a reachable address.
-	        let advertise = match self.compute_advertise_addr() {
-	            Ok(addr) => addr,
-	            Err(e) => {
+        let advertise = match self.compute_advertise_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
                 log::error!(
                     "topology: failed to compute advertise address during server handle setup: {e}"
                 );
                 return Err(handle);
-	            }
-	        };
-	        let preferred_wireguard_port = extract_port(&advertise).ok();
+            }
+        };
+        let preferred_wireguard_port = extract_port(&advertise).ok();
 
         // Also ensure our own peer-entry exists in the store
         let peers = self.peers.clone();
@@ -418,27 +418,31 @@ impl Topology {
             registry.register_peer_handle(local_id, handle).await;
 
             let key = UuidKey::from(local_id);
-	            let wireguard = if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_some()
-	                || !net::paths::running_as_root()
-	            {
-	                None
-	            } else {
-	                match net::wireguard::resolve_wireguard_key_path()
-	                    .and_then(net::wireguard::load_or_generate_wireguard_keys)
-	                {
-	                    Ok(keys) => match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(preferred_wireguard_port) {
-	                        Ok(port) => Some(crate::topology::peers::WireGuardPeerValue {
-	                            public_key: keys.public_bytes(),
-	                            port,
-                            enabled: false,
-                        }),
-                        Err(err) => {
-                            log::warn!(
-                                "failed to resolve WireGuard listen port; continuing without underlay encryption: {err}"
-                            );
-                            None
+            let wireguard = if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_some()
+                || !net::paths::running_as_root()
+            {
+                None
+            } else {
+                match net::wireguard::resolve_wireguard_key_path()
+                    .and_then(net::wireguard::load_or_generate_wireguard_keys)
+                {
+                    Ok(keys) => {
+                        match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(
+                            preferred_wireguard_port,
+                        ) {
+                            Ok(port) => Some(crate::topology::peers::WireGuardPeerValue {
+                                public_key: keys.public_bytes(),
+                                port,
+                                enabled: false,
+                            }),
+                            Err(err) => {
+                                log::warn!(
+                                    "failed to resolve WireGuard listen port; continuing without underlay encryption: {err}"
+                                );
+                                None
+                            }
                         }
-                    },
+                    }
                     Err(err) => {
                         log::warn!(
                             "failed to load WireGuard keys; continuing without underlay encryption: {err}"
@@ -585,26 +589,28 @@ impl Topology {
             match net::wireguard::resolve_wireguard_key_path()
                 .and_then(net::wireguard::load_or_generate_wireguard_keys)
             {
-                Ok(keys) => match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(
-                    preferred_wireguard_port,
-                ) {
-                    Ok(port) => {
-                        let enabled = self
-                            .registry
-                            .peer_wireguard(self.node.id)
-                            .map(|wg| wg.enabled)
-                            .unwrap_or(false);
-                        info.set_wireguard_public_key(&keys.public_bytes());
-                        info.set_wireguard_port(port);
-                        info.set_wireguard_enabled(enabled);
+                Ok(keys) => {
+                    match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(
+                        preferred_wireguard_port,
+                    ) {
+                        Ok(port) => {
+                            let enabled = self
+                                .registry
+                                .peer_wireguard(self.node.id)
+                                .map(|wg| wg.enabled)
+                                .unwrap_or(false);
+                            info.set_wireguard_public_key(&keys.public_bytes());
+                            info.set_wireguard_port(port);
+                            info.set_wireguard_enabled(enabled);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "topology",
+                                "failed to resolve WireGuard listen port for NodeInfo: {err}"
+                            );
+                        }
                     }
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "topology",
-                            "failed to resolve WireGuard listen port for NodeInfo: {err}"
-                        );
-                    }
-                },
+                }
                 Err(err) => {
                     tracing::warn!(
                         target: "topology",

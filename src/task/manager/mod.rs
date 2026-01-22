@@ -14,7 +14,7 @@ use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata,
     TaskSpec, TaskStateFilter, TaskValue,
 };
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use bollard::errors::Error as BollardError;
 use crdt_store::uuid_key::UuidKey;
@@ -24,8 +24,8 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::{mpsc::UnboundedSender, Mutex as AsyncMutex, RwLock};
-use tokio::time::{sleep, Duration};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc::UnboundedSender};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, warn};
 use uuid::Uuid;
 

@@ -945,8 +945,8 @@ fn filter_cached_backends(
         let include = match entry {
             None => true,
             Some(entry) => {
-                let is_stale = now.saturating_duration_since(entry.checked_at)
-                    >= HEALTH_CACHE_STALE_AFTER;
+                let is_stale =
+                    now.saturating_duration_since(entry.checked_at) >= HEALTH_CACHE_STALE_AFTER;
                 match entry.state {
                     HealthState::Healthy | HealthState::Unknown => true,
                     // If refresh stalls, treat stale unhealthy entries as unknown so we do not

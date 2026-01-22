@@ -444,6 +444,9 @@ impl Bootstrap {
             task_manager.clone(),
             gossip_tx.clone(),
             service_rx,
+            ctx.self_id,
+            local_node_name.clone(),
+            health_monitor.clone(),
         );
         let services_service = ServicesRPC::new(service_controller.clone());
         let services_client_cap = capnp_rpc::new_client(services_service);

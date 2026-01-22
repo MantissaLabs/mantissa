@@ -5,7 +5,7 @@ use super::manifest::{
 use crate::config::ClientConfig;
 use crate::connection;
 use crate::networks;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use capnp::struct_list;
 use protocol::services::task_template;
 use protocol::task::{environment_var, secret_file, secret_ref};

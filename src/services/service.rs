@@ -1,9 +1,9 @@
 use crate::network::types::compute_network_id;
 use crate::services::manager::ServiceController;
 use crate::services::types::{
-    ServiceEvent, ServicePortProtocol, ServiceSpecValue, ServiceStatus,
-    ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
-    ServiceTaskSpecValue,
+    ServiceEvent, ServicePortProtocol, ServiceRescheduleLock, ServiceRescheduleReason,
+    ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
+    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
 };
 use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use capnp::Error;
@@ -211,6 +211,11 @@ pub(crate) fn write_service_spec(
         tasks_builder.set(idx as u32, wid.as_bytes());
     }
 
+    if let Some(lock) = value.reschedule_lock.as_ref() {
+        let lock_builder = builder.reborrow().init_reschedule_lock();
+        write_reschedule_lock(lock_builder, lock)?;
+    }
+
     Ok(())
 }
 
@@ -269,6 +274,11 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
     value.id = id;
     value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
     value.status = proto_to_service_status(reader.get_status()?);
+    value.reschedule_lock = if reader.has_reschedule_lock() {
+        Some(read_reschedule_lock(reader.get_reschedule_lock()?)?)
+    } else {
+        None
+    };
     Ok(value)
 }
 
@@ -405,6 +415,71 @@ fn proto_to_service_status(status: protocol::services::ServiceStatus) -> Service
         protocol::services::ServiceStatus::Stopped => ServiceStatus::Stopped,
         protocol::services::ServiceStatus::Failed => ServiceStatus::Failed,
     }
+}
+
+/// Maps an internal reschedule reason into the protocol wire enum.
+fn reschedule_reason_to_proto(
+    reason: ServiceRescheduleReason,
+) -> protocol::services::RescheduleReason {
+    match reason {
+        ServiceRescheduleReason::MissingReplicas => {
+            protocol::services::RescheduleReason::MissingReplicas
+        }
+        ServiceRescheduleReason::ExcessReplicas => {
+            protocol::services::RescheduleReason::ExcessReplicas
+        }
+        ServiceRescheduleReason::Drift => protocol::services::RescheduleReason::Drift,
+    }
+}
+
+/// Decodes the protocol reschedule reason into the internal representation.
+fn proto_to_reschedule_reason(
+    reason: protocol::services::RescheduleReason,
+) -> ServiceRescheduleReason {
+    match reason {
+        protocol::services::RescheduleReason::MissingReplicas => {
+            ServiceRescheduleReason::MissingReplicas
+        }
+        protocol::services::RescheduleReason::ExcessReplicas => {
+            ServiceRescheduleReason::ExcessReplicas
+        }
+        protocol::services::RescheduleReason::Drift => ServiceRescheduleReason::Drift,
+    }
+}
+
+/// Encodes the service reschedule lock into the wire schema so it can be gossiped.
+fn write_reschedule_lock(
+    mut builder: protocol::services::reschedule_lock::Builder<'_>,
+    lock: &ServiceRescheduleLock,
+) -> Result<(), Error> {
+    builder.set_holder_id(lock.holder_id.as_bytes());
+    builder.set_holder_name(&lock.holder_name);
+    builder.set_token(lock.token.as_bytes());
+    builder.set_issued_at(&lock.issued_at);
+    builder.set_expires_at(&lock.expires_at);
+    builder.set_reason(reschedule_reason_to_proto(lock.reason));
+    Ok(())
+}
+
+/// Decodes the reschedule lock metadata that coordinates service reconciler ownership.
+fn read_reschedule_lock(
+    reader: protocol::services::reschedule_lock::Reader<'_>,
+) -> Result<ServiceRescheduleLock, Error> {
+    let holder_id = read_uuid(reader.get_holder_id()?)?;
+    let holder_name = reader.get_holder_name()?.to_str()?.to_string();
+    let token = read_uuid(reader.get_token()?)?;
+    let issued_at = reader.get_issued_at()?.to_str()?.to_string();
+    let expires_at = reader.get_expires_at()?.to_str()?.to_string();
+    let reason = proto_to_reschedule_reason(reader.get_reason()?);
+
+    Ok(ServiceRescheduleLock::new(
+        holder_id,
+        holder_name,
+        token,
+        issued_at,
+        expires_at,
+        reason,
+    ))
 }
 
 fn write_task_template(

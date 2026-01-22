@@ -58,11 +58,7 @@ impl NodePortManager {
     }
 
     /// Synchronize nodeport mappings for a specific network so external traffic can reach VIPs.
-    pub async fn sync_ports(
-        &self,
-        network_id: Uuid,
-        entries: &[NodePortMapping],
-    ) -> Result<()> {
+    pub async fn sync_ports(&self, network_id: Uuid, entries: &[NodePortMapping]) -> Result<()> {
         let mut guard = self.inner.lock().await;
         guard.sync_ports(network_id, entries).await
     }
@@ -102,9 +98,9 @@ mod platform {
     use libc::if_nametoindex;
     use nix::mount::{MsFlags, mount};
     use nix::sys::statfs::{BPF_FS_MAGIC, statfs};
+    use rtnetlink::new_connection;
     use rtnetlink::packet_route::address::AddressAttribute;
     use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags};
-    use rtnetlink::new_connection;
     use std::collections::{HashMap, HashSet};
     use std::env;
     use std::ffi::CString;
@@ -184,10 +180,14 @@ mod platform {
             let node_ip = env::var("MANTISSA_NODEPORT_IP")
                 .ok()
                 .and_then(|val| val.parse::<Ipv4Addr>().ok())
-                .or_else(|| compute_advertise_ip(None, None).ok().and_then(|ip| match ip {
-                    IpAddr::V4(v4) => Some(v4),
-                    _ => None,
-                }));
+                .or_else(|| {
+                    compute_advertise_ip(None, None)
+                        .ok()
+                        .and_then(|ip| match ip {
+                            IpAddr::V4(v4) => Some(v4),
+                            _ => None,
+                        })
+                });
             let enabled = env::var_os("MANTISSA_BPF_NO_ATTACH").is_none()
                 && env::var_os("MANTISSA_SKIP_BPF").is_none();
 
@@ -325,11 +325,7 @@ mod platform {
                 self.port_owner.insert(selector, network_id);
             }
 
-            let known = self
-                .ports_by_network
-                .entry(network_id)
-                .or_default()
-                .clone();
+            let known = self.ports_by_network.entry(network_id).or_default().clone();
             for selector in known.difference(&desired_ports) {
                 let key = NodePortKey {
                     port: selector.port.to_be(),
@@ -395,21 +391,33 @@ mod platform {
 
             let mut ingress =
                 load_program("nodeport_tc_ingress").context("load nodeport ingress")?;
-            let mut egress =
-                load_program("nodeport_tc_egress").context("load nodeport egress")?;
+            let mut egress = load_program("nodeport_tc_egress").context("load nodeport egress")?;
 
-            attach_tc(&mut ingress, &iface, TcAttachType::Ingress, "nodeport_tc_ingress")
-                .context("attach nodeport ingress tc")?;
-            attach_tc(&mut egress, &iface, TcAttachType::Egress, "nodeport_tc_egress")
-                .context("attach nodeport egress tc")?;
+            attach_tc(
+                &mut ingress,
+                &iface,
+                TcAttachType::Ingress,
+                "nodeport_tc_ingress",
+            )
+            .context("attach nodeport ingress tc")?;
+            attach_tc(
+                &mut egress,
+                &iface,
+                TcAttachType::Egress,
+                "nodeport_tc_egress",
+            )
+            .context("attach nodeport egress tc")?;
             if let Err(err) = ensure_clsact("lo") {
                 warn!(
                     target: "network",
                     "unable to enable nodeport on loopback: {err:#}"
                 );
-            } else if let Err(err) =
-                attach_tc(&mut ingress, "lo", TcAttachType::Ingress, "nodeport_tc_ingress")
-            {
+            } else if let Err(err) = attach_tc(
+                &mut ingress,
+                "lo",
+                TcAttachType::Ingress,
+                "nodeport_tc_ingress",
+            ) {
                 warn!(
                     target: "network",
                     "unable to attach nodeport ingress on loopback: {err:#}"
@@ -813,7 +821,9 @@ mod platform {
             }
         }
 
-        Err(anyhow!("host access interface {ifname} missing IPv4 address"))
+        Err(anyhow!(
+            "host access interface {ifname} missing IPv4 address"
+        ))
     }
 
     /// Load a tc program from the local BPF artifact directory.
@@ -843,18 +853,14 @@ mod platform {
     fn configure_host_access_sysctls(iface: &str) -> Result<()> {
         // Hairpin replies arrive on the host-access veth with a local source, so we must
         // explicitly accept local sources and disable strict reverse-path filtering there.
-        write_ipv4_sysctl(iface, "accept_local", "1")
-            .context("set nodeport accept_local")?;
-        write_ipv4_sysctl(iface, "rp_filter", "0")
-            .context("disable nodeport rp_filter")?;
+        write_ipv4_sysctl(iface, "accept_local", "1").context("set nodeport accept_local")?;
+        write_ipv4_sysctl(iface, "rp_filter", "0").context("disable nodeport rp_filter")?;
         Ok(())
     }
 
     /// Write a per-interface IPv4 sysctl to allow nodeport hairpin responses.
     fn write_ipv4_sysctl(iface: &str, key: &str, value: &str) -> Result<()> {
-        let path = Path::new("/proc/sys/net/ipv4/conf")
-            .join(iface)
-            .join(key);
+        let path = Path::new("/proc/sys/net/ipv4/conf").join(iface).join(key);
         // The sysctl path expects newline-terminated values.
         fs::write(&path, format!("{value}\n"))
             .with_context(|| format!("write sysctl {}", path.display()))?;
@@ -886,11 +892,7 @@ mod platform {
     }
 
     /// Detach a tc program from the provided interface, tolerating missing attachments.
-    fn detach_tc(
-        iface: &str,
-        attach_type: TcAttachType,
-        program_name: &str,
-    ) -> Result<()> {
+    fn detach_tc(iface: &str, attach_type: TcAttachType, program_name: &str) -> Result<()> {
         let mut candidates = vec![program_name.to_string()];
         let truncated: String = program_name.chars().take(15).collect();
         if truncated != program_name {
@@ -923,7 +925,9 @@ mod platform {
                 roots.push(pwd.join("target/bpf"));
                 roots.push(pwd.join("assets/bpf"));
             }
-            Self { search_roots: roots }
+            Self {
+                search_roots: roots,
+            }
         }
 
         /// Find a compiled BPF object for the requested program name.

@@ -207,8 +207,7 @@ pub async fn ensure_wireguard_underlay(
     peer_configs.sort_by_key(|peer| peer.peer_id);
 
     let config_hash = compute_wireguard_config_hash(listen_port, tunnel_ip, &peer_configs);
-    let should_configure =
-        should_reconfigure_wireguard(previous.as_ref(), config_hash, now);
+    let should_configure = should_reconfigure_wireguard(previous.as_ref(), config_hash, now);
 
     let ifname = MANTISSA_WIREGUARD_IFNAME.to_string();
 
@@ -222,8 +221,9 @@ pub async fn ensure_wireguard_underlay(
                 IpAddr::V6(peer_config.allowed_ip),
             )]);
             peer.persistent_keepalive_interval = Some(peer_config.keepalive);
-            peer.set_endpoint(&peer_config.endpoint)
-                .with_context(|| format!("set wireguard endpoint for peer {}", peer_config.peer_id))?;
+            peer.set_endpoint(&peer_config.endpoint).with_context(|| {
+                format!("set wireguard endpoint for peer {}", peer_config.peer_id)
+            })?;
             peers.push(peer);
         }
 
@@ -283,7 +283,8 @@ pub async fn ensure_wireguard_underlay(
     // Only switch the VXLAN underlay once every peer has successfully configured its own
     // WireGuard interface (enabled = true). This avoids one node switching early and breaking
     // cross-node overlay traffic during cluster bootstrap or rolling restarts.
-    let cluster_ready_for_encryption = peer_count == 0 || (all_peers_advertised && all_peers_enabled);
+    let cluster_ready_for_encryption =
+        peer_count == 0 || (all_peers_advertised && all_peers_enabled);
 
     if prefer_underlay && peer_count > 0 && !cluster_ready_for_encryption {
         tracing::debug!(

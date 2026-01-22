@@ -3,11 +3,11 @@
 #![cfg_attr(not(test), no_main)]
 
 use aya_ebpf::{
+    bindings::bpf_adj_room_mode::BPF_ADJ_ROOM_MAC,
     bindings::{
         BPF_F_ADJ_ROOM_ENCAP_L2_ETH, BPF_F_ADJ_ROOM_NO_CSUM_RESET, BPF_F_PSEUDO_HDR, TC_ACT_OK,
         TC_ACT_SHOT,
     },
-    bindings::bpf_adj_room_mode::BPF_ADJ_ROOM_MAC,
     macros::{classifier, map},
     maps::{HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
@@ -60,7 +60,8 @@ struct NodePortNat {
 }
 
 #[map(name = "NODEPORT_TC_INGRESS_STATS")]
-static mut NODEPORT_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
+static mut NODEPORT_TC_INGRESS_STATS: PerCpuArray<PacketStats> =
+    PerCpuArray::with_max_entries(1, 0);
 
 #[map(name = "NODEPORT_VIPS")]
 static mut NODEPORT_VIPS: HashMap<NodePortKey, NodePortEntry> = HashMap::pinned(1024, 0);
@@ -143,7 +144,11 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
         // Rewrite external traffic into the overlay's host-access source so replies are routable.
         rewrite_source(ctx, ip_offset, l4_offset, proto, original_src, snat_src)?;
     }
-    let flow_src = if snat_src != 0 { snat_src } else { original_src };
+    let flow_src = if snat_src != 0 {
+        snat_src
+    } else {
+        original_src
+    };
 
     let client_flow = Flow4 {
         src: flow_src,
@@ -183,8 +188,7 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
     if ensure_ethernet(ctx, ip_offset, host).is_err() {
         return Ok(TC_ACT_OK);
     }
-    if ctx.clone_redirect(entry.overlay_ifindex, 0).is_ok()
-    {
+    if ctx.clone_redirect(entry.overlay_ifindex, 0).is_ok() {
         return Ok(TC_ACT_SHOT);
     }
 
@@ -253,12 +257,9 @@ fn rewrite_destination(
     proto: u8,
     entry: &NodePortEntry,
 ) -> Result<(), ()> {
-    let old_dst: u32 = ctx
-        .load(ip_offset + 16)
-        .map_err(|_| ())?;
+    let old_dst: u32 = ctx.load(ip_offset + 16).map_err(|_| ())?;
     if old_dst != entry.vip {
-        ctx.store(ip_offset + 16, &entry.vip, 0)
-            .map_err(|_| ())?;
+        ctx.store(ip_offset + 16, &entry.vip, 0).map_err(|_| ())?;
     }
     ctx.l3_csum_replace(ip_offset + 10, old_dst as u64, entry.vip as u64, 4)
         .map_err(|_| ())?;
@@ -275,8 +276,7 @@ fn rewrite_destination(
     let dest_offset = l4_offset + 2;
     let old_port: u16 = ctx.load(dest_offset).map_err(|_| ())?;
     if old_port != entry.vip_port {
-        ctx.store(dest_offset, &entry.vip_port, 0)
-            .map_err(|_| ())?;
+        ctx.store(dest_offset, &entry.vip_port, 0).map_err(|_| ())?;
         ctx.l4_csum_replace(
             l4_offset + checksum_offset,
             old_port as u64,
@@ -300,8 +300,7 @@ fn rewrite_source(
     new_src: u32,
 ) -> Result<(), ()> {
     if old_src != new_src {
-        ctx.store(ip_offset + 12, &new_src, 0)
-            .map_err(|_| ())?;
+        ctx.store(ip_offset + 12, &new_src, 0).map_err(|_| ())?;
     }
     ctx.l3_csum_replace(ip_offset + 10, old_src as u64, new_src as u64, 4)
         .map_err(|_| ())?;
@@ -320,11 +319,7 @@ fn rewrite_source(
 
 /// Ensure the packet carries a valid Ethernet header when originating from loopback.
 /// Ensure nodeport packets have a valid Ethernet header before redirecting to the overlay.
-fn ensure_ethernet(
-    ctx: &mut TcContext,
-    ip_offset: usize,
-    host: &NodePortHost,
-) -> Result<(), ()> {
+fn ensure_ethernet(ctx: &mut TcContext, ip_offset: usize, host: &NodePortHost) -> Result<(), ()> {
     if ip_offset == net::ETH_HDR_LEN {
         if !eth_header_is_zero(ctx)? {
             return Ok(());

@@ -132,13 +132,8 @@ fn rewrite_destination(
         ctx.store(ip_offset + 16, &entry.client_ip, 0)
             .map_err(|_| ())?;
     }
-    ctx.l3_csum_replace(
-        ip_offset + 10,
-        old_dst as u64,
-        entry.client_ip as u64,
-        4,
-    )
-    .map_err(|_| ())?;
+    ctx.l3_csum_replace(ip_offset + 10, old_dst as u64, entry.client_ip as u64, 4)
+        .map_err(|_| ())?;
 
     let checksum_offset = if proto == IPPROTO_TCP { 16 } else { 6 };
     ctx.l4_csum_replace(
@@ -160,9 +155,7 @@ fn rewrite_source(
     proto: u8,
     entry: &NodePortNat,
 ) -> Result<(), ()> {
-    let old_src: u32 = ctx
-        .load(ip_offset + 12)
-        .map_err(|_| ())?;
+    let old_src: u32 = ctx.load(ip_offset + 12).map_err(|_| ())?;
     if old_src != entry.node_ip {
         ctx.store(ip_offset + 12, &entry.node_ip, 0)
             .map_err(|_| ())?;

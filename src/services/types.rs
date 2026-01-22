@@ -16,6 +16,8 @@ pub struct ServiceSpecValue {
     pub updated_at: String,
     #[serde(default)]
     pub status: ServiceStatus,
+    #[serde(default)]
+    pub reschedule_lock: Option<ServiceRescheduleLock>,
 }
 
 impl ServiceSpecValue {
@@ -39,6 +41,7 @@ impl ServiceSpecValue {
             task_ids,
             updated_at: current_timestamp(),
             status: ServiceStatus::Running,
+            reschedule_lock: None,
         }
     }
 
@@ -52,6 +55,12 @@ impl ServiceSpecValue {
 
     pub fn set_status(&mut self, status: ServiceStatus) {
         self.status = status;
+        self.touch();
+    }
+
+    /// Overwrites the reschedule lock metadata for the service so reconciler ownership can be shared.
+    pub fn set_reschedule_lock(&mut self, lock: Option<ServiceRescheduleLock>) {
+        self.reschedule_lock = lock;
         self.touch();
     }
 }
@@ -180,6 +189,45 @@ pub enum ServiceStatus {
     Stopping,
     Stopped,
     Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceRescheduleLock {
+    pub holder_id: Uuid,
+    pub holder_name: String,
+    pub token: Uuid,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub reason: ServiceRescheduleReason,
+}
+
+impl ServiceRescheduleLock {
+    /// Creates a new reschedule lock with the provided metadata to coordinate service reconciliation.
+    pub fn new(
+        holder_id: Uuid,
+        holder_name: impl Into<String>,
+        token: Uuid,
+        issued_at: String,
+        expires_at: String,
+        reason: ServiceRescheduleReason,
+    ) -> Self {
+        Self {
+            holder_id,
+            holder_name: holder_name.into(),
+            token,
+            issued_at,
+            expires_at,
+            reason,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceRescheduleReason {
+    MissingReplicas,
+    ExcessReplicas,
+    Drift,
 }
 
 fn current_timestamp() -> String {

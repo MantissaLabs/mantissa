@@ -67,10 +67,10 @@ impl Topology {
             .get_server_handle()
             .ok_or_else(|| Error::failed("server handle not set".into()))?;
 
-	        let advertise_addr = self
-	            .compute_advertise_addr()
-	            .map_err(|e| Error::failed(format!("failed to compute advertise addr: {e}")))?;
-	        let preferred_wireguard_port = extract_port(&advertise_addr).ok();
+        let advertise_addr = self
+            .compute_advertise_addr()
+            .map_err(|e| Error::failed(format!("failed to compute advertise addr: {e}")))?;
+        let preferred_wireguard_port = extract_port(&advertise_addr).ok();
 
         let hostname = self
             .node
@@ -80,28 +80,32 @@ impl Topology {
             .clone()
             .ok_or_else(|| Error::failed("hostname not set".into()))?;
 
-	        let wireguard = if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_some()
-	            || !net::paths::running_as_root()
-	        {
-	            None
-	        } else {
-	            match net::wireguard::resolve_wireguard_key_path()
-	                .and_then(net::wireguard::load_or_generate_wireguard_keys)
-	            {
-	                Ok(keys) => match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(preferred_wireguard_port) {
-	                    Ok(port) => Some(WireGuardPeerValue {
-	                        public_key: keys.public_bytes(),
-	                        port,
-                        enabled: false,
-                    }),
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "topology",
-                            "failed to resolve WireGuard listen port: {err}"
-                        );
-                        None
+        let wireguard = if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_some()
+            || !net::paths::running_as_root()
+        {
+            None
+        } else {
+            match net::wireguard::resolve_wireguard_key_path()
+                .and_then(net::wireguard::load_or_generate_wireguard_keys)
+            {
+                Ok(keys) => {
+                    match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(
+                        preferred_wireguard_port,
+                    ) {
+                        Ok(port) => Some(WireGuardPeerValue {
+                            public_key: keys.public_bytes(),
+                            port,
+                            enabled: false,
+                        }),
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "topology",
+                                "failed to resolve WireGuard listen port: {err}"
+                            );
+                            None
+                        }
                     }
-                },
+                }
                 Err(err) => {
                     tracing::warn!(target: "topology", "failed to load WireGuard keys: {err}");
                     None
