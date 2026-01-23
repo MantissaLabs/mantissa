@@ -1,7 +1,9 @@
 use crate::services::types::{ServiceSpecValue, compute_service_id};
 use crate::store::service_store::ServiceStore;
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
 use crdt_store::uuid_key::UuidKey;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -42,7 +44,7 @@ impl ServiceRegistry {
             .get_snapshot(&key)
             .map_err(|e| anyhow!("service lookup failed: {e}"))?;
 
-        Ok(snapshot.and_then(|snap| snap.as_slice().last().cloned()))
+        Ok(snapshot.and_then(|snap| select_best_service_spec(snap.as_slice())))
     }
 
     /// Returns every concurrent service spec value stored for the provided id.
@@ -68,7 +70,7 @@ impl ServiceRegistry {
         let mut values = Vec::with_capacity(entries.len());
         for (key, snapshot) in entries {
             let id = key.to_uuid();
-            if let Some(value) = snapshot.as_slice().last().cloned() {
+            if let Some(value) = select_best_service_spec(snapshot.as_slice()) {
                 if seen.insert(id) {
                     values.push(value);
                 }
@@ -83,6 +85,72 @@ impl ServiceRegistry {
     #[allow(dead_code)]
     pub fn compute_id(&self, service_name: &str) -> Uuid {
         compute_service_id(service_name)
+    }
+}
+
+/// Picks the canonical service spec from concurrent MVReg versions based on status and timestamp.
+fn select_best_service_spec(values: &[ServiceSpecValue]) -> Option<ServiceSpecValue> {
+    let mut best: Option<&ServiceSpecValue> = None;
+    for value in values {
+        match best {
+            None => best = Some(value),
+            Some(current) => {
+                if should_prefer_candidate(current, value) {
+                    best = Some(value);
+                }
+            }
+        }
+    }
+    best.cloned()
+}
+
+/// Decides whether the candidate spec should replace the current selection.
+fn should_prefer_candidate(current: &ServiceSpecValue, candidate: &ServiceSpecValue) -> bool {
+    if current.manifest_id == candidate.manifest_id {
+        let current_rank = status_rank(current.status);
+        let candidate_rank = status_rank(candidate.status);
+
+        match candidate_rank.cmp(&current_rank) {
+            Ordering::Less => return false,
+            Ordering::Equal => {
+                if let (Some(current_ts), Some(candidate_ts)) = (
+                    parse_timestamp(&current.updated_at),
+                    parse_timestamp(&candidate.updated_at),
+                ) {
+                    return candidate_ts > current_ts;
+                }
+                return false;
+            }
+            Ordering::Greater => return true,
+        }
+    } else if current.status != crate::services::types::ServiceStatus::Stopped {
+        if let (Some(current_ts), Some(candidate_ts)) = (
+            parse_timestamp(&current.updated_at),
+            parse_timestamp(&candidate.updated_at),
+        ) {
+            return candidate_ts > current_ts;
+        }
+        return false;
+    }
+
+    true
+}
+
+/// Parses RFC3339 timestamps for service state comparisons.
+fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+}
+
+/// Ranks service status values for deterministic selection ordering.
+fn status_rank(status: crate::services::types::ServiceStatus) -> u8 {
+    use crate::services::types::ServiceStatus::{Deploying, Failed, Running, Stopped, Stopping};
+    match status {
+        Deploying | Failed => 0,
+        Running => 1,
+        Stopping => 2,
+        Stopped => 3,
     }
 }
 

@@ -886,4 +886,39 @@ impl TaskManager {
 
         Ok(value_to_spec(id, value))
     }
+
+    /// Periodically reconciles all locally owned tasks so missed gossip updates still apply.
+    pub(super) async fn reconcile_local_tasks(&self) -> Result<(), anyhow::Error> {
+        let (actives, _) = self
+            .store
+            .load_all()
+            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
+
+        for (key, snapshot) in actives {
+            let Some(value) = snapshot.as_slice().last().cloned() else {
+                continue;
+            };
+            if value.node_id != self.local_node_id {
+                continue;
+            }
+
+            let spec = value_to_spec(key.to_uuid(), value);
+            let manager = self.clone();
+            let spec_for_reconcile = spec.clone();
+            tokio::task::spawn_local(async move {
+                if let Err(err) = manager
+                    .reconcile_local_task(spec_for_reconcile.clone())
+                    .await
+                {
+                    warn!(
+                        target: "task",
+                        "periodic reconcile failed for task {}: {err}",
+                        spec_for_reconcile.id
+                    );
+                }
+            });
+        }
+
+        Ok(())
+    }
 }

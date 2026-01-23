@@ -38,6 +38,8 @@ const SERVICE_DEPLOYMENT_MAX_ATTEMPTS: u32 = 3;
 const SERVICE_RESCHEDULE_TICK_SECS: u64 = 2;
 /// Lease duration (in seconds) used for reschedule locks before another node may take over.
 const SERVICE_RESCHEDULE_LOCK_TTL_SECS: i64 = 20;
+/// Refresh window (in seconds) before lock expiry so the holder can extend exclusivity.
+const SERVICE_RESCHEDULE_LOCK_REFRESH_SECS: i64 = 5;
 /// Delay after claiming a reschedule lock to allow gossip/MST propagation.
 const SERVICE_RESCHEDULE_LOCK_SETTLE_MS: u64 = 250;
 
@@ -352,7 +354,6 @@ impl ServiceController {
         };
 
         if locked_spec.status() != ServiceStatus::Running {
-            self.release_reschedule_lock(locked_spec.id, &lock).await?;
             return Ok(());
         }
 
@@ -360,7 +361,6 @@ impl ServiceController {
         let refreshed_plan =
             build_reschedule_plan(&locked_spec, &refreshed_inventory, health_snapshot);
         if refreshed_plan.is_noop() {
-            self.release_reschedule_lock(locked_spec.id, &lock).await?;
             return Ok(());
         }
 
@@ -396,7 +396,6 @@ impl ServiceController {
                         "failed to reschedule replicas for '{}': {err}",
                         locked_spec.service_name
                     );
-                    self.release_reschedule_lock(locked_spec.id, &lock).await?;
                     return Ok(());
                 }
             }
@@ -422,7 +421,6 @@ impl ServiceController {
             }
         }
 
-        self.release_reschedule_lock(locked_spec.id, &lock).await?;
         Ok(())
     }
 
@@ -458,6 +456,14 @@ impl ServiceController {
         let versions = self.registry.get_versions(spec.id)?;
         if let Some(lock) = select_reschedule_lock(&versions, now) {
             if lock.holder_id == self.local_node_id {
+                if should_refresh_lock(&lock, now) {
+                    let refreshed = refresh_lock(&lock, now)?;
+                    let mut current = spec.clone();
+                    current.set_reschedule_lock(Some(refreshed.clone()));
+                    self.apply_upsert(current.clone()).await?;
+                    self.broadcast(ServiceEvent::Upsert(current)).await?;
+                    return Ok(Some(refreshed));
+                }
                 return Ok(Some(lock));
             }
             return Ok(None);
@@ -499,32 +505,6 @@ impl ServiceController {
             }
             _ => Ok(None),
         }
-    }
-
-    /// Releases a reschedule lock when this node still holds the winning lease.
-    async fn release_reschedule_lock(
-        &self,
-        service_id: Uuid,
-        lock: &ServiceRescheduleLock,
-    ) -> anyhow::Result<()> {
-        let versions = self.registry.get_versions(service_id)?;
-        let now = Utc::now();
-        let Some(winner) = select_reschedule_lock(&versions, now) else {
-            return Ok(());
-        };
-
-        if winner.token != lock.token || winner.holder_id != self.local_node_id {
-            return Ok(());
-        }
-
-        let Some(mut spec) = self.load_spec_for_lock(service_id, &winner)? else {
-            return Ok(());
-        };
-
-        spec.set_reschedule_lock(None);
-        self.apply_upsert(spec.clone()).await?;
-        self.broadcast(ServiceEvent::Upsert(spec)).await?;
-        Ok(())
     }
 
     /// Loads the latest service spec that carries the provided lock token.
@@ -1104,9 +1084,6 @@ fn build_reschedule_plan(
             if desired_ids.contains(&task.id) {
                 continue;
             }
-            if node_is_down(task.node_id, health_snapshot) {
-                continue;
-            }
             if !task_state_healthy(&task.state) {
                 continue;
             }
@@ -1170,6 +1147,33 @@ fn lock_expired(lock: &ServiceRescheduleLock, now: DateTime<Utc>) -> bool {
         Some(expiry) => expiry <= now,
         None => true,
     }
+}
+
+/// Returns true if the lock should be refreshed to keep exclusivity while work remains.
+fn should_refresh_lock(lock: &ServiceRescheduleLock, now: DateTime<Utc>) -> bool {
+    match parse_timestamp(&lock.expires_at) {
+        Some(expiry) => {
+            expiry <= now + ChronoDuration::seconds(SERVICE_RESCHEDULE_LOCK_REFRESH_SECS)
+        }
+        None => true,
+    }
+}
+
+/// Extends a lock lease while preserving its identity and holder.
+fn refresh_lock(
+    lock: &ServiceRescheduleLock,
+    now: DateTime<Utc>,
+) -> anyhow::Result<ServiceRescheduleLock> {
+    let issued_at = now.to_rfc3339();
+    let expires_at = (now + ChronoDuration::seconds(SERVICE_RESCHEDULE_LOCK_TTL_SECS)).to_rfc3339();
+    Ok(ServiceRescheduleLock::new(
+        lock.holder_id,
+        lock.holder_name.clone(),
+        lock.token,
+        issued_at,
+        expires_at,
+        lock.reason,
+    ))
 }
 
 /// Chooses the service spec value that carries the provided reschedule lock token.

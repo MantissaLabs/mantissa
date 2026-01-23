@@ -33,6 +33,12 @@ struct TaskSpec {
   env @12 :List(EnvironmentVar);
   secretFiles @13 :List(SecretFile);
   networks @14 :List(Data); # Each entry is a 16-byte network UUID
+  serviceMetadata @15 :ServiceMetadata;
+}
+
+struct ServiceMetadata {
+  serviceName @0 :Text;
+  templateName @1 :Text;
 }
 
 struct TaskStartRequest {

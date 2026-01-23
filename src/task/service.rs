@@ -2,7 +2,7 @@ use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSecretFile,
-    TaskSecretReference, TaskSpec, TaskStateFilter, TaskStateKind,
+    TaskSecretReference, TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStateKind,
 };
 use capnp::Error;
 use capnp::struct_list;
@@ -252,6 +252,12 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
         encode_secret_ref(secret_builder, &file.secret);
         entry.set_mode(file.mode.unwrap_or(0));
     }
+
+    if let Some(meta) = spec.service_metadata.as_ref() {
+        let mut meta_builder = builder.reborrow().init_service_metadata();
+        meta_builder.set_service_name(&meta.service_name);
+        meta_builder.set_template_name(&meta.template);
+    }
 }
 
 pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
@@ -303,6 +309,19 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         networks.push(Uuid::from_bytes(bytes));
     }
 
+    let service_metadata = if reader.has_service_metadata() {
+        let meta = reader.get_service_metadata()?;
+        let service_name = meta.get_service_name()?.to_str()?.to_string();
+        let template = meta.get_template_name()?.to_str()?.to_string();
+        if service_name.is_empty() || template.is_empty() {
+            None
+        } else {
+            Some(TaskServiceMetadata::new(service_name, template))
+        }
+    } else {
+        None
+    };
+
     Ok(TaskSpec {
         id,
         name,
@@ -320,7 +339,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         env,
         secret_files,
         networks,
-        service_metadata: None,
+        service_metadata,
     })
 }
 

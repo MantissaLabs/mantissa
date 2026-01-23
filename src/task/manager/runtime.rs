@@ -160,12 +160,18 @@ impl TaskManager {
     /// Main gossip processing loop for the task manager.
     pub async fn run(&mut self) {
         let mut repair_tick = interval(Duration::from_secs(5));
+        let mut reconcile_tick = interval(Duration::from_secs(5));
 
         loop {
             tokio::select! {
                 _ = repair_tick.tick() => {
                     if let Err(err) = self.repair_runtime_attachments().await {
                         warn!(target: "task", "failed to repair runtime attachments: {err:#}");
+                    }
+                }
+                _ = reconcile_tick.tick() => {
+                    if let Err(err) = self.reconcile_local_tasks().await {
+                        warn!(target: "task", "failed to reconcile local tasks: {err:#}");
                     }
                 }
                 message = self.rx.recv() => {
