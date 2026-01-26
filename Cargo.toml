@@ -70,7 +70,6 @@ redb = "2.5.0"
 
 # crdt based structures useful for state replication and conflict resolution.
 merkle-search-tree = "0.8.0"
-crdt_tree = "0.0.16"
 # melda = "0.2.3"
 crdts = "7.3.2"
 

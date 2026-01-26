@@ -17,10 +17,7 @@ impl ServiceRegistry {
         Self { store }
     }
 
-    pub async fn upsert(&self, mut value: ServiceSpecValue) -> Result<()> {
-        // ensure timestamp reflects last update
-        value.touch();
-
+    pub async fn upsert(&self, value: ServiceSpecValue) -> Result<()> {
         self.store
             .upsert(&UuidKey::from(value.id), value)
             .await
@@ -45,19 +42,6 @@ impl ServiceRegistry {
             .map_err(|e| anyhow!("service lookup failed: {e}"))?;
 
         Ok(snapshot.and_then(|snap| select_best_service_spec(snap.as_slice())))
-    }
-
-    /// Returns every concurrent service spec value stored for the provided id.
-    pub fn get_versions(&self, id: Uuid) -> Result<Vec<ServiceSpecValue>> {
-        let key = UuidKey::from(id);
-        let snapshot = self
-            .store
-            .get_snapshot(&key)
-            .map_err(|e| anyhow!("service lookup failed: {e}"))?;
-
-        Ok(snapshot
-            .map(|snap| snap.as_slice().to_vec())
-            .unwrap_or_default())
     }
 
     pub fn list(&self) -> Result<Vec<ServiceSpecValue>> {

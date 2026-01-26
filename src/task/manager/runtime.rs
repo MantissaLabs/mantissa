@@ -20,6 +20,7 @@ use crate::task::container::ContainerState;
 use crate::task::types::{TaskEvent, TaskServiceMetadata};
 
 use super::TaskManager;
+use super::select_best_task_value;
 
 impl TaskManager {
     /// Records gossip identifiers to avoid processing duplicates.
@@ -316,25 +317,52 @@ impl TaskManager {
         let mut touched_networks: HashSet<Uuid> = HashSet::new();
 
         for network_id in &desired {
-            let (mut attachment, previous_state, previous_ip, previous_mac) = match existing
-                .remove(network_id)
-            {
+            let (
+                mut attachment,
+                previous_state,
+                previous_ip,
+                previous_mac,
+                location_changed,
+                label_changed,
+            ) = match existing.remove(network_id) {
                 Some(mut value) => {
                     let prev_state = value.state;
                     let prev_ip = value.assigned_ip.clone();
                     let prev_mac = value.mac.clone();
-                    value.container_id = container_id.to_string();
+                    let mut location_changed = false;
+                    let mut label_changed = false;
+
+                    if value.node_id != self.local_node_id {
+                        value.node_id = self.local_node_id;
+                        location_changed = true;
+                    }
+
+                    if value.container_id != container_id {
+                        value.container_id = container_id.to_string();
+                        location_changed = true;
+                    }
+
                     if value.service_name.is_none() {
                         if let Some((service, _)) = &service_labels {
                             value.service_name = Some(service.clone());
+                            label_changed = true;
                         }
                     }
                     if value.template_name.is_none() {
                         if let Some((_, template)) = &service_labels {
                             value.template_name = Some(template.clone());
+                            label_changed = true;
                         }
                     }
-                    (value, Some(prev_state), prev_ip, prev_mac)
+
+                    (
+                        value,
+                        Some(prev_state),
+                        prev_ip,
+                        prev_mac,
+                        location_changed,
+                        label_changed,
+                    )
                 }
                 None => (
                     NetworkAttachmentValue::new(NetworkAttachmentDraft {
@@ -356,6 +384,8 @@ impl TaskManager {
                     None,
                     None,
                     None,
+                    true,
+                    service_labels.is_some(),
                 ),
             };
 
@@ -383,6 +413,7 @@ impl TaskManager {
 
             let assignment_changed =
                 previous_ip != attachment.assigned_ip || previous_mac != attachment.mac;
+            let metadata_changed = location_changed || label_changed;
 
             let provisioned = self
                 .attachment_provisioner
@@ -448,12 +479,17 @@ impl TaskManager {
 
             attachment.set_state(NetworkAttachmentState::Ready, None);
             let was_ready = matches!(previous_state, Some(NetworkAttachmentState::Ready));
-            let notify_forwarding = !was_ready || assignment_changed;
+            let should_persist =
+                assignment_changed || metadata_changed || !was_ready || !provisioned;
+            let notify_forwarding =
+                assignment_changed || location_changed || !was_ready || !provisioned;
 
-            self.network_registry
-                .upsert_attachment(attachment)
-                .await
-                .context("failed to persist runtime attachment state")?;
+            if should_persist {
+                self.network_registry
+                    .upsert_attachment(attachment)
+                    .await
+                    .context("failed to persist runtime attachment state")?;
+            }
 
             if notify_forwarding {
                 touched_networks.insert(spec.id);
@@ -486,7 +522,7 @@ impl TaskManager {
                 .store
                 .get_snapshot(&UuidKey::from(attachment.task_id))
                 .with_context(|| format!("lookup task {}", attachment.task_id))?
-                .and_then(|snap| snap.as_slice().last().cloned())
+                .and_then(|snap| select_best_task_value(snap.as_slice()))
                 .map(|value| value.state);
 
             let should_remove = match task_state {

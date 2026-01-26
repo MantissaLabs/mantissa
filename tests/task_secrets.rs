@@ -355,6 +355,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
         }],
         networks: Vec::new(),
         service_metadata: None,
+        target_node: None,
     };
 
     let mut specs = manager
@@ -466,6 +467,7 @@ local_test!(task_manager_rejects_missing_secret_reference, {
         secret_files: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
+        target_node: None,
     };
 
     let err = manager

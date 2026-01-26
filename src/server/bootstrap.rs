@@ -442,10 +442,10 @@ impl Bootstrap {
         let service_controller = ServiceController::new(
             service_registry.clone(),
             task_manager.clone(),
+            registry.clone(),
             gossip_tx.clone(),
             service_rx,
             ctx.self_id,
-            local_node_name.clone(),
             health_monitor.clone(),
         );
         let services_service = ServicesRPC::new(service_controller.clone());

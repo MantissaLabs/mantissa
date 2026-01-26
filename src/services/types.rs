@@ -57,12 +57,6 @@ impl ServiceSpecValue {
         self.status = status;
         self.touch();
     }
-
-    /// Overwrites the reschedule lock metadata for the service so reconciler ownership can be shared.
-    pub fn set_reschedule_lock(&mut self, lock: Option<ServiceRescheduleLock>) {
-        self.reschedule_lock = lock;
-        self.touch();
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]

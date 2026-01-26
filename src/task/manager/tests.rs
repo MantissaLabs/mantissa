@@ -418,6 +418,7 @@ async fn reconcile_rejects_missing_slot_assignments() {
         image: "img".into(),
         state: ContainerState::Pending,
         created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
         command: Vec::new(),
         node_id: manager.local_node_id,
         node_name: "local-node".into(),
@@ -591,6 +592,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 secret_files: Vec::new(),
                 networks: Vec::new(),
                 service_metadata: None,
+                target_node: None,
             },
             TaskStartRequest {
                 name: "svc-b".into(),
@@ -605,6 +607,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 secret_files: Vec::new(),
                 networks: Vec::new(),
                 service_metadata: None,
+                target_node: None,
             },
         ])
         .await
@@ -654,6 +657,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
             secret_files: Vec::new(),
             networks: Vec::new(),
             service_metadata: None,
+            target_node: None,
         }])
         .await
         .expect("start with pre-reserved slot");
@@ -696,6 +700,7 @@ async fn task_owned_locally_detects_remote_entries() {
         image: "img".to_string(),
         state: ContainerState::Running,
         created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
         command: vec![],
         node_id: Uuid::new_v4(),
         node_name: "remote-node".to_string(),
@@ -756,6 +761,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 secret_files: Vec::new(),
                 networks: Vec::new(),
                 service_metadata: None,
+                target_node: None,
             },
             TaskStartRequest {
                 name: "svc-d".into(),
@@ -770,6 +776,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 secret_files: Vec::new(),
                 networks: Vec::new(),
                 service_metadata: None,
+                target_node: None,
             },
         ])
         .await
@@ -844,6 +851,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         secret_files: Vec::new(),
         networks: vec![spec.id],
         service_metadata: None,
+        target_node: None,
     };
 
     let mut specs = manager
@@ -935,6 +943,7 @@ async fn stop_task_cleans_up_after_teardown_failure() {
         secret_files: Vec::new(),
         networks: vec![spec.id],
         service_metadata: None,
+        target_node: None,
     };
 
     let mut specs = manager
@@ -1011,6 +1020,7 @@ async fn attachment_ready_triggers_forwarding_event() {
         secret_files: Vec::new(),
         networks: vec![spec.id],
         service_metadata: None,
+        target_node: None,
     };
 
     let _specs = manager
@@ -1105,6 +1115,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         secret_files: Vec::new(),
         networks: vec![spec_a.id, spec_b.id],
         service_metadata: None,
+        target_node: None,
     };
 
     let mut specs = manager
@@ -1208,6 +1219,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         secret_files: Vec::new(),
         networks: vec![spec.id],
         service_metadata: None,
+        target_node: None,
     };
 
     let mut specs = match manager.start_tasks_batch(vec![request]).await {

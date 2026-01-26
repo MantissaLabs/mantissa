@@ -11,9 +11,10 @@ use crate::task::container::ContainerState;
 use crate::task::docker::ContainerError;
 use crate::task::docker::ContainerManager;
 use crate::task::types::{
-    TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata,
-    TaskSpec, TaskStateFilter, TaskValue,
+    TaskEnvironmentVariable, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata, TaskSpec,
+    TaskStateFilter, TaskValue,
 };
+use chrono::{DateTime, Utc};
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use bollard::errors::Error as BollardError;
@@ -78,6 +79,8 @@ pub struct TaskStartRequest {
     pub secret_files: Vec<TaskSecretFile>,
     pub networks: Vec<Uuid>,
     pub service_metadata: Option<TaskServiceMetadata>,
+    /// Placement hint used by the scheduler when a task must land on a specific node.
+    pub target_node: Option<Uuid>,
 }
 
 #[derive(Clone)]
@@ -174,6 +177,7 @@ impl TaskManager {
             secret_files: Vec::new(),
             networks: Vec::new(),
             service_metadata: None,
+            target_node: None,
         };
 
         let mut specs = self.start_tasks_batch(vec![request]).await?;
@@ -357,8 +361,8 @@ impl TaskManager {
         let mut specs = Vec::with_capacity(actives.len());
         for (k, snap) in actives {
             let id = k.to_uuid();
-            if let Some(value) = snap.as_slice().last() {
-                let spec = value_to_spec(id, value.clone());
+            if let Some(value) = select_best_task_value(snap.as_slice()) {
+                let spec = value_to_spec(id, value);
                 if filter.accepts(&spec.state) {
                     specs.push(spec);
                 }
@@ -382,7 +386,7 @@ impl TaskManager {
                 .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?;
 
             let state = snapshot
-                .and_then(|snap| snap.as_slice().last().cloned())
+                .and_then(|snap| select_best_task_value(snap.as_slice()))
                 .map(|value| value.state);
             states.push((*id, state));
         }
@@ -401,23 +405,16 @@ impl TaskManager {
         Ok(spec.node_id == self.local_node_id)
     }
 
+    /// Stops a task by identifier, delegating to the owning node when it is remote.
     pub async fn stop_task(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
         let spec = self.load_spec(id).await?;
 
         if spec.node_id != self.local_node_id {
-            if matches!(
-                spec.state,
-                ContainerState::Stopping | ContainerState::Stopped
-            ) {
+            if matches!(spec.state, ContainerState::Stopped) {
                 return Ok(spec);
             }
 
-            let mut updated = spec.clone();
-            updated.state = ContainerState::Stopping;
-            self.persist_spec(&updated).await?;
-            self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
-                .await?;
-            return Ok(updated);
+            return self.stop_remote_task(&spec).await;
         }
 
         self.perform_local_stop(spec).await
@@ -621,6 +618,69 @@ fn container_already_running(err: &ContainerError) -> bool {
     )
 }
 
+fn select_best_task_value(values: &[TaskValue]) -> Option<TaskValue> {
+    let mut best: Option<&TaskValue> = None;
+    for value in values {
+        match best {
+            None => best = Some(value),
+            Some(current) => {
+                if should_prefer_task_value(current, value) {
+                    best = Some(value);
+                }
+            }
+        }
+    }
+    best.cloned()
+}
+
+fn should_prefer_task_value(current: &TaskValue, candidate: &TaskValue) -> bool {
+    match (
+        parse_task_timestamp(&current.updated_at, &current.created_at),
+        parse_task_timestamp(&candidate.updated_at, &candidate.created_at),
+    ) {
+        (Some(current_ts), Some(candidate_ts)) => {
+            if candidate_ts > current_ts {
+                return true;
+            } else if candidate_ts < current_ts {
+                return false;
+            }
+        }
+        (None, Some(_)) => return true,
+        (Some(_), None) => return false,
+        (None, None) => {}
+    }
+
+    let current_rank = task_state_rank(&current.state);
+    let candidate_rank = task_state_rank(&candidate.state);
+    match candidate_rank.cmp(&current_rank) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => candidate.node_id > current.node_id,
+    }
+}
+
+fn parse_task_timestamp(updated_at: &str, created_at: &str) -> Option<DateTime<Utc>> {
+    parse_timestamp(updated_at).or_else(|| parse_timestamp(created_at))
+}
+
+fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+}
+
+fn task_state_rank(state: &ContainerState) -> u8 {
+    match state {
+        ContainerState::Running => 6,
+        ContainerState::Creating => 5,
+        ContainerState::Pending => 4,
+        ContainerState::Stopping => 3,
+        ContainerState::Stopped => 2,
+        ContainerState::Paused => 1,
+        ContainerState::Failed | ContainerState::Exited(_) | ContainerState::Unknown => 0,
+    }
+}
+
 fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
     let mut slot_ids = value.slot_ids;
     if slot_ids.is_empty() {
@@ -636,6 +696,7 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         image: value.image,
         state: value.state,
         created_at: value.created_at,
+        updated_at: value.updated_at,
         command: value.command,
         node_id: value.node_id,
         node_name: value.node_name,

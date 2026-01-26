@@ -1045,10 +1045,14 @@ async fn refresh_backend_mac(
     if let Ok(attachments) = registry.list_attachments(Some(network_id)) {
         for mut attachment in attachments {
             if attachment.assigned_ip.as_deref() == Some(&ip.to_string()) {
-                attachment.mac = Some(format!(
+                let formatted = format!(
                     "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-                ));
+                );
+                if attachment.mac.as_deref() == Some(formatted.as_str()) {
+                    break;
+                }
+                attachment.mac = Some(formatted);
                 let _ = registry.upsert_attachment(attachment).await;
                 break;
             }

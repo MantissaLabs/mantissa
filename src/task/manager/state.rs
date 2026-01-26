@@ -19,8 +19,8 @@ use crate::task::types::{
 };
 
 use super::{
-    TaskManager, container_already_running, is_name_conflict, value_to_spec, wrap_create_error,
-    wrap_existing_inspect_error, wrap_start_error,
+    TaskManager, container_already_running, is_name_conflict, select_best_task_value,
+    value_to_spec, wrap_create_error, wrap_existing_inspect_error, wrap_start_error,
 };
 
 impl TaskManager {
@@ -32,6 +32,7 @@ impl TaskManager {
             image: spec.image.clone(),
             state: spec.state.clone(),
             created_at: spec.created_at.clone(),
+            updated_at: spec.updated_at.clone(),
             command: spec.command.clone(),
             node_id: spec.node_id,
             node_name: spec.node_name.clone(),
@@ -161,7 +162,7 @@ impl TaskManager {
         let mut slots = HashSet::new();
         for (key, snapshot) in actives {
             let id = key.to_uuid();
-            if let Some(value) = snapshot.as_slice().last() {
+            if let Some(value) = select_best_task_value(snapshot.as_slice()) {
                 if value.node_id == self.local_node_id {
                     if value.slot_ids.is_empty() {
                         if let Some(slot_id) = value.slot_id {
@@ -214,6 +215,7 @@ impl TaskManager {
         let mut updated = spec.clone();
         if !matches!(spec.state, ContainerState::Stopping) {
             updated.state = ContainerState::Stopping;
+            updated.updated_at = Utc::now().to_rfc3339();
             self.persist_spec(&updated).await?;
             self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
                 .await?;
@@ -234,6 +236,7 @@ impl TaskManager {
             Err(e) => {
                 updated.state = spec.state;
                 if updated.state != ContainerState::Stopping {
+                    updated.updated_at = Utc::now().to_rfc3339();
                     self.persist_spec(&updated).await?;
                     self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
                         .await?;
@@ -270,6 +273,7 @@ impl TaskManager {
         }
 
         updated.state = ContainerState::Stopped;
+        updated.updated_at = Utc::now().to_rfc3339();
         if !spec.slot_ids.is_empty() {
             for slot_id in &spec.slot_ids {
                 self.release_slot(*slot_id)
@@ -348,6 +352,7 @@ impl TaskManager {
         }
 
         spec.state = ContainerState::Failed;
+        spec.updated_at = Utc::now().to_rfc3339();
 
         if let Err(err) = self.persist_spec(&spec).await {
             warn!(
@@ -477,6 +482,7 @@ impl TaskManager {
         // Drive a single state transition to `Creating` so peers observe progress exactly once.
         if !matches!(working.state, ContainerState::Creating) {
             working.state = ContainerState::Creating;
+            working.updated_at = Utc::now().to_rfc3339();
             self.persist_spec(&working).await?;
             if let Err(err) = self
                 .enqueue_gossip(TaskEvent::Upsert(Box::new(working.clone())))
@@ -710,6 +716,7 @@ impl TaskManager {
 
         working.state = ContainerState::Running;
         working.created_at = Utc::now().to_rfc3339();
+        working.updated_at = Utc::now().to_rfc3339();
         working.node_id = self.local_node_id;
         working.node_name = self.local_node_name.clone();
 
@@ -878,13 +885,144 @@ impl TaskManager {
             .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("unknown task {id}"))?;
 
-        let value = snapshot
-            .as_slice()
-            .last()
-            .cloned()
+        let value = select_best_task_value(snapshot.as_slice())
             .ok_or_else(|| anyhow::anyhow!("task {id} has no value"))?;
 
         Ok(value_to_spec(id, value))
+    }
+
+    /// Stops locally running containers that are no longer assigned to this node.
+    pub(super) async fn cleanup_unowned_local_containers(&self) -> Result<(), anyhow::Error> {
+        const UNOWNED_TASK_GRACE_SECS: i64 = 5;
+
+        let local = self.local_containers.lock().await.clone();
+        for (task_id, container_name) in local {
+            let snapshot = self
+                .store
+                .get_snapshot(&UuidKey::from(task_id))
+                .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?;
+
+            let Some(snapshot) = snapshot else {
+                self.stop_unowned_container(task_id, &container_name, true).await;
+                continue;
+            };
+
+            let Some(value) = select_best_task_value(snapshot.as_slice()) else {
+                continue;
+            };
+
+            if value.node_id == self.local_node_id {
+                continue;
+            }
+
+            if task_value_recent(&value, UNOWNED_TASK_GRACE_SECS) {
+                continue;
+            }
+
+            self.stop_unowned_container(task_id, &container_name, false).await;
+        }
+
+        Ok(())
+    }
+
+    /// Tears down a locally running container without mutating replicated task state.
+    /// Tears down a local container and optionally removes shared attachments for missing tasks.
+    async fn stop_unowned_container(
+        &self,
+        task_id: Uuid,
+        container_name: &str,
+        remove_attachments: bool,
+    ) {
+        let identifier = if container_name.is_empty() {
+            format!("mantissa-{task_id}")
+        } else {
+            container_name.to_string()
+        };
+
+        {
+            let mut guard = self.local_containers.lock().await;
+            guard.remove(&task_id);
+        }
+
+        match self
+            .container_manager
+            .stop_container(&identifier, Some(Duration::from_secs(10)))
+            .await
+        {
+            Ok(_) => {}
+            Err(ContainerError::NotFound(_)) => {}
+            Err(err) => {
+                warn!(
+                    target: "task",
+                    "failed to stop unowned container {identifier} for task {task_id}: {err}"
+                );
+            }
+        }
+
+        if let Err(err) = self
+            .container_manager
+            .remove_container(&identifier, false, true)
+            .await
+        {
+            match err {
+                ContainerError::NotFound(_) => {}
+                other => warn!(
+                    target: "task",
+                    "failed to remove unowned container {identifier} for task {task_id}: {other}"
+                ),
+            }
+        }
+
+        self.cleanup_secret_artifacts(task_id).await;
+        if remove_attachments {
+            if let Err(err) = self
+                .teardown_runtime_attachments(task_id, HashSet::new())
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to teardown attachments for unowned task {task_id}: {err}"
+                );
+            }
+
+            if let Err(err) = self.cleanup_orphaned_local_attachments().await {
+                warn!(
+                    target: "task",
+                    task = %task_id,
+                    "failed to run orphaned attachment cleanup after unowned stop: {err}"
+                );
+            }
+        } else if let Err(err) = self.teardown_local_attachments(task_id).await {
+            warn!(
+                target: "task",
+                task = %task_id,
+                "failed to teardown local attachments for unowned task: {err}"
+            );
+        }
+    }
+
+    /// Removes local attachment interfaces without mutating replicated attachment records.
+    async fn teardown_local_attachments(&self, task_id: Uuid) -> Result<(), anyhow::Error> {
+        let attachments = self
+            .network_registry
+            .list_attachments_for_task(task_id)
+            .context("failed to list task attachments for local teardown")?;
+
+        for attachment in attachments {
+            if let Err(err) = self
+                .attachment_provisioner
+                .teardown_attachment(attachment.id)
+                .await
+            {
+                warn!(
+                    target: "task",
+                    attachment = %attachment.id,
+                    "failed to teardown local attachment interface: {err}"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Periodically reconciles all locally owned tasks so missed gossip updates still apply.
@@ -895,7 +1033,7 @@ impl TaskManager {
             .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
 
         for (key, snapshot) in actives {
-            let Some(value) = snapshot.as_slice().last().cloned() else {
+            let Some(value) = select_best_task_value(snapshot.as_slice()) else {
                 continue;
             };
             if value.node_id != self.local_node_id {
@@ -919,6 +1057,27 @@ impl TaskManager {
             });
         }
 
+        if let Err(err) = self.cleanup_unowned_local_containers().await {
+            warn!(
+                target: "task",
+                "failed to cleanup unowned local containers: {err}"
+            );
+        }
+
         Ok(())
+    }
+}
+
+/// Returns true when a task value has been updated within the provided grace window.
+fn task_value_recent(value: &TaskValue, grace_secs: i64) -> bool {
+    let anchor = chrono::DateTime::parse_from_rfc3339(&value.updated_at)
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(&value.created_at));
+
+    match anchor {
+        Ok(anchor) => {
+            let anchor = anchor.with_timezone(&Utc);
+            Utc::now().signed_duration_since(anchor) < chrono::Duration::seconds(grace_secs)
+        }
+        Err(_) => false,
     }
 }

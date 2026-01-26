@@ -4,10 +4,10 @@ use crate::services::reconcile::{
 };
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServiceEvent, ServiceRescheduleLock, ServiceRescheduleReason, ServiceSpecValue, ServiceStatus,
-    ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
-    compute_service_id,
+    ServiceEvent, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
+    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, compute_service_id,
 };
+use crate::registry::Registry;
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
@@ -18,7 +18,7 @@ use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use health::{HealthMonitor, Status as HealthStatus};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -36,24 +36,26 @@ const SERVICE_READY_BACKOFF_BASE_MS: u64 = 500;
 const SERVICE_DEPLOYMENT_MAX_ATTEMPTS: u32 = 3;
 /// Interval used by the rescheduler loop to evaluate service replica health.
 const SERVICE_RESCHEDULE_TICK_SECS: u64 = 2;
-/// Lease duration (in seconds) used for reschedule locks before another node may take over.
-const SERVICE_RESCHEDULE_LOCK_TTL_SECS: i64 = 20;
-/// Refresh window (in seconds) before lock expiry so the holder can extend exclusivity.
-const SERVICE_RESCHEDULE_LOCK_REFRESH_SECS: i64 = 5;
-/// Delay after claiming a reschedule lock to allow gossip/MST propagation.
-const SERVICE_RESCHEDULE_LOCK_SETTLE_MS: u64 = 250;
+/// Minimum delay before a missing replica is rescheduled to avoid transient gossip gaps.
+const SERVICE_SLOT_MISSING_GRACE_SECS: u64 = 6;
+/// Minimum age (in seconds) before a running task is eligible for rebalancing.
+const SERVICE_REBALANCE_MIN_AGE_SECS: i64 = 20;
+/// Cooldown window between rebalance attempts for the same slot.
+const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
 
 #[derive(Clone)]
 pub struct ServiceController {
     registry: ServiceRegistry,
     task_manager: TaskManager,
+    cluster_registry: Registry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
     seen_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
     local_node_id: Uuid,
-    local_node_name: String,
     health_monitor: Arc<HealthMonitor>,
-    inflight_reschedules: Arc<AsyncMutex<HashSet<Uuid>>>,
+    inflight_slots: Arc<AsyncMutex<HashSet<SlotKey>>>,
+    slot_missing_since: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
+    slot_rebalance_after: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
 }
 
 impl ServiceController {
@@ -61,22 +63,24 @@ impl ServiceController {
     pub fn new(
         registry: ServiceRegistry,
         task_manager: TaskManager,
+        cluster_registry: Registry,
         gossip_tx: Sender<Message>,
         gossip_rx: Receiver<Message>,
         local_node_id: Uuid,
-        local_node_name: String,
         health_monitor: Arc<HealthMonitor>,
     ) -> Self {
         Self {
             registry,
             task_manager,
+            cluster_registry,
             gossip_tx,
             gossip_rx,
             seen_ids: Arc::new(AsyncMutex::new(HashSet::new())),
             local_node_id,
-            local_node_name,
             health_monitor,
-            inflight_reschedules: Arc::new(AsyncMutex::new(HashSet::new())),
+            inflight_slots: Arc::new(AsyncMutex::new(HashSet::new())),
+            slot_missing_since: Arc::new(AsyncMutex::new(HashMap::new())),
+            slot_rebalance_after: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
@@ -303,23 +307,25 @@ impl ServiceController {
 
         let inventory = Arc::new(self.collect_task_inventory().await?);
         let health_snapshot = Arc::new(self.health_monitor.snapshot());
+        let eligible_nodes = Arc::new(self.collect_eligible_nodes(health_snapshot.as_ref()));
 
         for spec in specs {
             if spec.status() != ServiceStatus::Running {
                 continue;
             }
 
-            let Some(reschedule_guard) = self.try_begin_reschedule(spec.id).await else {
-                continue;
-            };
-
             let controller = self.clone();
             let inventory = inventory.clone();
             let health_snapshot = health_snapshot.clone();
+            let eligible_nodes = eligible_nodes.clone();
             tokio::task::spawn_local(async move {
-                let _guard = reschedule_guard;
                 if let Err(err) = controller
-                    .reconcile_service(spec, inventory.as_ref(), health_snapshot.as_ref())
+                    .reconcile_service(
+                        spec,
+                        inventory.as_ref(),
+                        health_snapshot.as_ref(),
+                        eligible_nodes.as_ref(),
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -333,91 +339,70 @@ impl ServiceController {
         Ok(())
     }
 
-    /// Drives a single service through reschedule planning and execution while holding a lock.
+    /// Reconciles each replica slot owned by this node so rescheduling is distributed per-slot.
     async fn reconcile_service(
         &self,
         spec: ServiceSpecValue,
         inventory: &TaskInventory,
         health_snapshot: &HashMap<Uuid, HealthStatus>,
+        eligible_nodes: &[Uuid],
     ) -> anyhow::Result<()> {
-        let plan = build_reschedule_plan(&spec, inventory, health_snapshot);
-        if plan.is_noop() {
+        if eligible_nodes.is_empty() {
             return Ok(());
         }
 
-        let Some(lock) = self.ensure_reschedule_lock(&spec, plan.reason()).await? else {
-            return Ok(());
-        };
+        let slots = build_replica_slots(&spec);
+        let slot_targets = compute_slot_targets(spec.id, &spec.tasks, eligible_nodes);
+        let desired_ids: HashSet<Uuid> = slots.iter().filter_map(|slot| slot.task_id).collect();
 
-        let Some(mut locked_spec) = self.load_spec_for_lock(spec.id, &lock)? else {
-            return Ok(());
-        };
+        self.reconcile_extra_tasks(&spec, inventory, eligible_nodes, &desired_ids)
+            .await;
 
-        if locked_spec.status() != ServiceStatus::Running {
-            return Ok(());
-        }
+        for slot in slots {
+            let Some(task_id) = slot.task_id else {
+                tracing::warn!(
+                    target: "services",
+                    "service '{}' missing task id for template '{}' replica {}; skipping slot",
+                    spec.service_name,
+                    slot.template.name,
+                    slot.replica
+                );
+                continue;
+            };
 
-        let refreshed_inventory = self.collect_task_inventory().await?;
-        let refreshed_plan =
-            build_reschedule_plan(&locked_spec, &refreshed_inventory, health_snapshot);
-        if refreshed_plan.is_noop() {
-            return Ok(());
-        }
+            let Some(owner) =
+                select_slot_owner(spec.id, &slot.template.name, slot.replica, eligible_nodes)
+            else {
+                continue;
+            };
 
-        let mut replacements: HashMap<usize, Uuid> = HashMap::new();
-        let mut start_requests = Vec::new();
-        for slot in &refreshed_plan.missing_slots {
-            let desired_id = Uuid::new_v4();
-            replacements.insert(slot.index, desired_id);
-            start_requests.push(make_replica_request(
-                &locked_spec.service_name,
-                &slot.template,
-                slot.replica,
-                desired_id,
-            ));
-        }
-
-        if !start_requests.is_empty() {
-            match self.task_manager.start_tasks_batch(start_requests).await {
-                Ok(specs) => {
-                    if specs.len() != replacements.len() {
-                        tracing::warn!(
-                            target: "services",
-                            "replacement count mismatch for '{}' during reschedule: expected {}, got {}",
-                            locked_spec.service_name,
-                            replacements.len(),
-                            specs.len()
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        target: "services",
-                        "failed to reschedule replicas for '{}': {err}",
-                        locked_spec.service_name
-                    );
-                    return Ok(());
-                }
+            if owner != self.local_node_id {
+                continue;
             }
-        }
 
-        if !replacements.is_empty() {
-            locked_spec.task_ids = apply_replacements(&refreshed_plan.slots, &replacements);
-            locked_spec.set_reschedule_lock(Some(lock.clone()));
-            self.apply_upsert(locked_spec.clone()).await?;
-            self.broadcast(ServiceEvent::Upsert(locked_spec.clone()))
-                .await?;
-        }
+            let key = SlotKey::new(spec.id, &slot.template.name, slot.replica);
+            let Some(_guard) = self.try_begin_slot(&key).await else {
+                continue;
+            };
 
-        if !refreshed_plan.extra_task_ids.is_empty() {
-            for task_id in refreshed_plan.extra_task_ids {
-                if let Err(err) = self.task_manager.stop_task(task_id).await {
-                    tracing::warn!(
-                        target: "services",
-                        "failed to stop excess task {task_id} for '{}': {err}",
-                        locked_spec.service_name
-                    );
-                }
+            if let Err(err) = self
+                    .reconcile_slot(
+                        &spec,
+                        &slot,
+                        task_id,
+                        inventory,
+                        health_snapshot,
+                        &slot_targets,
+                        &key,
+                    )
+                .await
+            {
+                tracing::warn!(
+                    target: "services",
+                    "slot reconciliation failed for '{}' replica {}: {err}",
+                    slot.template.name,
+                    slot.replica
+                );
             }
         }
 
@@ -433,92 +418,303 @@ impl ServiceController {
         Ok(TaskInventory::from_specs(specs))
     }
 
-    /// Claims a local in-flight marker so we avoid overlapping reconciliations per service.
-    async fn try_begin_reschedule(&self, service_id: Uuid) -> Option<RescheduleGuard> {
-        let mut guard = self.inflight_reschedules.lock().await;
-        if guard.contains(&service_id) {
+    /// Builds the deterministic set of nodes eligible to host service replicas from peer metadata.
+    fn collect_eligible_nodes(&self, health_snapshot: &HashMap<Uuid, HealthStatus>) -> Vec<Uuid> {
+        let mut nodes: BTreeSet<Uuid> = BTreeSet::new();
+        nodes.insert(self.local_node_id);
+
+        if let Ok(peers) = self.cluster_registry.known_peers() {
+            for peer_id in peers {
+                nodes.insert(peer_id);
+            }
+        }
+
+        let mut eligible = Vec::with_capacity(nodes.len());
+        for node_id in nodes {
+            if !matches!(health_snapshot.get(&node_id), Some(HealthStatus::Down)) {
+                eligible.push(node_id);
+            }
+        }
+
+        eligible
+    }
+
+    /// Stops tasks that are no longer referenced by the service spec using deterministic cleanup ownership.
+    async fn reconcile_extra_tasks(
+        &self,
+        spec: &ServiceSpecValue,
+        inventory: &TaskInventory,
+        eligible_nodes: &[Uuid],
+        desired_ids: &HashSet<Uuid>,
+    ) {
+        let Some(tasks) = inventory.by_service.get(&spec.service_name) else {
+            return;
+        };
+
+        for task in tasks {
+            if desired_ids.contains(&task.id) {
+                continue;
+            }
+            if !task_state_healthy(&task.state) {
+                continue;
+            }
+            if !task_age_allows_cleanup(task) {
+                continue;
+            }
+            let Some(owner) = select_task_owner(task.id, eligible_nodes) else {
+                continue;
+            };
+            if owner != self.local_node_id {
+                continue;
+            }
+
+            if let Err(err) = self.task_manager.stop_task(task.id).await {
+                tracing::warn!(
+                    target: "services",
+                    "failed to stop excess task {} for '{}': {err}",
+                    task.id,
+                    spec.service_name
+                );
+            }
+        }
+    }
+
+    /// Reconciles a single slot owned by this node, restarting or rebalancing as needed.
+    async fn reconcile_slot(
+        &self,
+        spec: &ServiceSpecValue,
+        slot: &ReplicaSlot,
+        task_id: Uuid,
+        inventory: &TaskInventory,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
+        slot_targets: &HashMap<SlotKey, Uuid>,
+        key: &SlotKey,
+    ) -> anyhow::Result<()> {
+        let Some(desired_node) = slot_targets.get(key).copied() else {
+            return Ok(());
+        };
+
+        let task = inventory.by_id.get(&task_id);
+        let missing = match task {
+            None => true,
+            Some(task) => {
+                node_is_down(task.node_id, health_snapshot) || !task_state_healthy(&task.state)
+            }
+        };
+
+        if missing {
+            if self.slot_missing_elapsed(key).await {
+                self.start_slot_task(spec, slot, task_id, desired_node, key)
+                    .await?;
+            }
+            return Ok(());
+        }
+
+        self.clear_slot_missing(key).await;
+
+        let Some(task) = task else {
+            return Ok(());
+        };
+
+        if !task_state_rebalanceable(&task.state) {
+            return Ok(());
+        }
+        if !task_age_allows_rebalance(task) {
+            return Ok(());
+        }
+        if !self.rebalance_allowed(key).await {
+            return Ok(());
+        }
+
+        if desired_node == task.node_id {
+            return Ok(());
+        }
+
+        self.move_slot_task(spec, slot, task, desired_node, key)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Starts or restarts a replica slot on the preferred node, falling back if placement fails.
+    async fn start_slot_task(
+        &self,
+        spec: &ServiceSpecValue,
+        slot: &ReplicaSlot,
+        task_id: Uuid,
+        preferred_node: Uuid,
+        key: &SlotKey,
+    ) -> anyhow::Result<()> {
+        let request = make_replica_request(
+            &spec.service_name,
+            &slot.template,
+            slot.replica,
+            task_id,
+            Some(preferred_node),
+        );
+
+        match self.task_manager.start_tasks_batch(vec![request]).await {
+            Ok(specs) => {
+                if specs.len() != 1 {
+                    tracing::warn!(
+                        target: "services",
+                        "unexpected start response for '{}' replica {}: expected 1, got {}",
+                        slot.template.name,
+                        slot.replica,
+                        specs.len()
+                    );
+                }
+                self.clear_slot_missing(key).await;
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::debug!(
+                    target: "services",
+                    "preferred placement failed for '{}' replica {} on {}: {err}",
+                    slot.template.name,
+                    slot.replica,
+                    preferred_node
+                );
+            }
+        }
+
+        let fallback = make_replica_request(
+            &spec.service_name,
+            &slot.template,
+            slot.replica,
+            task_id,
+            None,
+        );
+
+        self.task_manager
+            .start_tasks_batch(vec![fallback])
+            .await
+            .map(|specs| {
+                if specs.len() != 1 {
+                    tracing::warn!(
+                        target: "services",
+                        "fallback placement mismatch for '{}' replica {}: expected 1, got {}",
+                        slot.template.name,
+                        slot.replica,
+                        specs.len()
+                    );
+                }
+            })
+            .map_err(|err| anyhow::anyhow!("fallback placement failed: {err}"))?;
+
+        self.clear_slot_missing(key).await;
+        Ok(())
+    }
+
+    /// Moves a replica to the preferred node by stopping the current task and restarting it there.
+    async fn move_slot_task(
+        &self,
+        spec: &ServiceSpecValue,
+        slot: &ReplicaSlot,
+        task: &TaskSpec,
+        preferred_node: Uuid,
+        key: &SlotKey,
+    ) -> anyhow::Result<()> {
+        self.set_rebalance_cooldown(key).await;
+
+        self.task_manager.stop_task(task.id).await.map_err(|err| {
+            anyhow::anyhow!(
+                "failed to stop task {} before rebalance of '{}' replica {}: {err}",
+                task.id,
+                slot.template.name,
+                slot.replica
+            )
+        })?;
+
+        let request = make_replica_request(
+            &spec.service_name,
+            &slot.template,
+            slot.replica,
+            task.id,
+            Some(preferred_node),
+        );
+
+        if let Err(err) = self.task_manager.start_tasks_batch(vec![request]).await {
+            tracing::warn!(
+                target: "services",
+                "rebalance placement failed for '{}' replica {} on {}: {err}",
+                slot.template.name,
+                slot.replica,
+                preferred_node
+            );
+
+            let fallback = make_replica_request(
+                &spec.service_name,
+                &slot.template,
+                slot.replica,
+                task.id,
+                Some(task.node_id),
+            );
+
+            self.task_manager
+                .start_tasks_batch(vec![fallback])
+                .await
+                .map_err(|fallback_err| {
+                    anyhow::anyhow!(
+                        "rebalance fallback failed for '{}' replica {}: {fallback_err}",
+                        slot.template.name,
+                        slot.replica
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
+    /// Claims a local in-flight marker so a slot is not reconciled concurrently.
+    async fn try_begin_slot(&self, key: &SlotKey) -> Option<SlotGuard> {
+        let mut guard = self.inflight_slots.lock().await;
+        if guard.contains(key) {
             return None;
         }
-        guard.insert(service_id);
-        Some(RescheduleGuard {
-            service_id,
-            inflight: self.inflight_reschedules.clone(),
+        guard.insert(key.clone());
+        Some(SlotGuard {
+            key: key.clone(),
+            inflight: self.inflight_slots.clone(),
         })
     }
 
-    /// Attempts to claim the reschedule lock for the provided service, returning it on success.
-    async fn ensure_reschedule_lock(
-        &self,
-        spec: &ServiceSpecValue,
-        reason: ServiceRescheduleReason,
-    ) -> anyhow::Result<Option<ServiceRescheduleLock>> {
-        let now = Utc::now();
-        let versions = self.registry.get_versions(spec.id)?;
-        if let Some(lock) = select_reschedule_lock(&versions, now) {
-            if lock.holder_id == self.local_node_id {
-                if should_refresh_lock(&lock, now) {
-                    let refreshed = refresh_lock(&lock, now)?;
-                    let mut current = spec.clone();
-                    current.set_reschedule_lock(Some(refreshed.clone()));
-                    self.apply_upsert(current.clone()).await?;
-                    self.broadcast(ServiceEvent::Upsert(current)).await?;
-                    return Ok(Some(refreshed));
-                }
-                return Ok(Some(lock));
+    /// Records that a slot appears missing and returns true once the grace period elapses.
+    async fn slot_missing_elapsed(&self, key: &SlotKey) -> bool {
+        let now = Instant::now();
+        let mut guard = self.slot_missing_since.lock().await;
+        match guard.get(key) {
+            Some(started) => now.duration_since(*started) >= Duration::from_secs(SERVICE_SLOT_MISSING_GRACE_SECS),
+            None => {
+                guard.insert(key.clone(), now);
+                false
             }
-            return Ok(None);
-        }
-
-        let Some(current) = self.registry.get(spec.id)? else {
-            return Ok(None);
-        };
-        if current.status() != ServiceStatus::Running {
-            return Ok(None);
-        }
-
-        let issued_at = now.to_rfc3339();
-        let expires_at =
-            (now + ChronoDuration::seconds(SERVICE_RESCHEDULE_LOCK_TTL_SECS)).to_rfc3339();
-        let lock = ServiceRescheduleLock::new(
-            self.local_node_id,
-            self.local_node_name.clone(),
-            Uuid::new_v4(),
-            issued_at,
-            expires_at,
-            reason,
-        );
-
-        let mut next = current;
-        next.set_reschedule_lock(Some(lock.clone()));
-        self.apply_upsert(next.clone()).await?;
-        self.broadcast(ServiceEvent::Upsert(next)).await?;
-
-        sleep(Duration::from_millis(SERVICE_RESCHEDULE_LOCK_SETTLE_MS)).await;
-
-        let versions = self.registry.get_versions(spec.id)?;
-        let now = Utc::now();
-        match select_reschedule_lock(&versions, now) {
-            Some(winner)
-                if winner.holder_id == self.local_node_id && winner.token == lock.token =>
-            {
-                Ok(Some(winner))
-            }
-            _ => Ok(None),
         }
     }
 
-    /// Loads the latest service spec that carries the provided lock token.
-    fn load_spec_for_lock(
-        &self,
-        service_id: Uuid,
-        lock: &ServiceRescheduleLock,
-    ) -> anyhow::Result<Option<ServiceSpecValue>> {
-        let versions = self.registry.get_versions(service_id)?;
-        if let Some(spec) = select_spec_for_lock(&versions, lock) {
-            return Ok(Some(spec));
-        }
+    /// Clears any missing marker for a slot once its task is confirmed healthy.
+    async fn clear_slot_missing(&self, key: &SlotKey) {
+        let mut guard = self.slot_missing_since.lock().await;
+        guard.remove(key);
+    }
 
-        Ok(self.registry.get(service_id)?)
+    /// Returns true when the slot is eligible for another rebalance attempt.
+    async fn rebalance_allowed(&self, key: &SlotKey) -> bool {
+        let now = Instant::now();
+        let guard = self.slot_rebalance_after.lock().await;
+        guard
+            .get(key)
+            .map(|deadline| now >= *deadline)
+            .unwrap_or(true)
+    }
+
+    /// Sets a cooldown window to prevent repeated rebalance attempts for the same slot.
+    async fn set_rebalance_cooldown(&self, key: &SlotKey) {
+        let mut guard = self.slot_rebalance_after.lock().await;
+        guard.insert(
+            key.clone(),
+            Instant::now() + Duration::from_secs(SERVICE_REBALANCE_COOLDOWN_SECS),
+        );
     }
 
     /// Executes the deployment workflow in the background by starting tasks via the task manager
@@ -531,7 +727,10 @@ impl ServiceController {
             templates,
         } = job;
 
-        let requests = build_start_requests(&service_name, &templates);
+        let service_id = compute_service_id(&service_name);
+        let health_snapshot = self.health_monitor.snapshot();
+        let eligible_nodes = self.collect_eligible_nodes(&health_snapshot);
+        let requests = build_start_requests(&service_name, service_id, &templates, &eligible_nodes);
 
         if requests.is_empty() {
             let spec = ServiceSpecValue::new(
@@ -558,7 +757,13 @@ impl ServiceController {
             requests.len()
         );
 
-        let task_specs = match self.task_manager.start_tasks_batch(requests).await {
+        let task_specs = match self
+            .start_tasks_with_fallback(
+                requests,
+                &format!("service '{}' deployment", service_name),
+            )
+            .await
+        {
             Ok(specs) => specs,
             Err(err) => {
                 tracing::warn!(
@@ -668,10 +873,24 @@ impl ServiceController {
             retain.len()
         );
 
-        let start_requests = build_replacement_requests(&service_name, &replace);
+        let health_snapshot = self.health_monitor.snapshot();
+        let eligible_nodes = self.collect_eligible_nodes(&health_snapshot);
+        let start_requests = build_replacement_requests(
+            &service_name,
+            current_spec.id,
+            &templates,
+            &replace,
+            &eligible_nodes,
+        );
         let mut started_specs = Vec::new();
         if !start_requests.is_empty() {
-            match self.task_manager.start_tasks_batch(start_requests).await {
+            match self
+                .start_tasks_with_fallback(
+                    start_requests,
+                    &format!("service '{}' redeployment", service_name),
+                )
+                .await
+            {
                 Ok(specs) => {
                     if specs.len() != replace.len() {
                         tracing::warn!(
@@ -948,6 +1167,36 @@ impl ServiceController {
         }
     }
 
+    /// Starts a batch of tasks, retrying without node targets to keep deployments progressing.
+    async fn start_tasks_with_fallback(
+        &self,
+        mut requests: Vec<TaskStartRequest>,
+        context: &str,
+    ) -> anyhow::Result<Vec<TaskSpec>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let has_targets = requests.iter().any(|request| request.target_node.is_some());
+        match self.task_manager.start_tasks_batch(requests.clone()).await {
+            Ok(specs) => Ok(specs),
+            Err(err) if has_targets => {
+                tracing::warn!(
+                    target: "services",
+                    "pinned placement failed for {context}; retrying without targets: {err}"
+                );
+                for request in &mut requests {
+                    request.target_node = None;
+                }
+                self.task_manager
+                    .start_tasks_batch(requests)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("fallback placement failed: {err}"))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn registry(&self) -> &ServiceRegistry {
         &self.registry
@@ -980,54 +1229,47 @@ impl TaskInventory {
     }
 }
 
-/// Local guard that clears the in-flight reschedule marker on drop.
-struct RescheduleGuard {
+/// Unique identifier for a service replica slot used to coordinate per-slot reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct SlotKey {
     service_id: Uuid,
-    inflight: Arc<AsyncMutex<HashSet<Uuid>>>,
+    template: String,
+    replica: u16,
 }
 
-impl Drop for RescheduleGuard {
+impl SlotKey {
+    /// Builds a slot key from a service and replica identity for local tracking.
+    fn new(service_id: Uuid, template: &str, replica: u16) -> Self {
+        Self {
+            service_id,
+            template: template.to_string(),
+            replica,
+        }
+    }
+}
+
+/// Local guard that clears the in-flight marker for a slot on drop.
+struct SlotGuard {
+    key: SlotKey,
+    inflight: Arc<AsyncMutex<HashSet<SlotKey>>>,
+}
+
+impl Drop for SlotGuard {
     /// Clears the in-flight marker when the guard is dropped.
     fn drop(&mut self) {
         let inflight = self.inflight.clone();
-        let service_id = self.service_id;
+        let key = self.key.clone();
         tokio::task::spawn_local(async move {
-            inflight.lock().await.remove(&service_id);
+            inflight.lock().await.remove(&key);
         });
     }
 }
 
 #[derive(Clone, Debug)]
 struct ReplicaSlot {
-    index: usize,
     template: ServiceTaskSpecValue,
     replica: u16,
     task_id: Option<Uuid>,
-}
-
-#[derive(Clone, Debug)]
-struct ServiceReschedulePlan {
-    slots: Vec<ReplicaSlot>,
-    missing_slots: Vec<ReplicaSlot>,
-    extra_task_ids: Vec<Uuid>,
-}
-
-impl ServiceReschedulePlan {
-    /// Returns true when the plan indicates no reschedule actions are required.
-    fn is_noop(&self) -> bool {
-        self.missing_slots.is_empty() && self.extra_task_ids.is_empty()
-    }
-
-    /// Summarizes the reason for rescheduling to annotate lock claims.
-    fn reason(&self) -> ServiceRescheduleReason {
-        if !self.missing_slots.is_empty() {
-            ServiceRescheduleReason::MissingReplicas
-        } else if !self.extra_task_ids.is_empty() {
-            ServiceRescheduleReason::ExcessReplicas
-        } else {
-            ServiceRescheduleReason::Drift
-        }
-    }
 }
 
 /// Expands the service spec into an ordered list of desired replica slots.
@@ -1039,7 +1281,6 @@ fn build_replica_slots(spec: &ServiceSpecValue) -> Vec<ReplicaSlot> {
         for replica in 1..=template.replicas {
             let task_id = spec.task_ids.get(cursor).copied();
             slots.push(ReplicaSlot {
-                index: cursor,
                 template: template.clone(),
                 replica,
                 task_id,
@@ -1051,51 +1292,135 @@ fn build_replica_slots(spec: &ServiceSpecValue) -> Vec<ReplicaSlot> {
     slots
 }
 
-/// Builds a reconciliation plan for the provided service using task health signals.
-fn build_reschedule_plan(
-    spec: &ServiceSpecValue,
-    inventory: &TaskInventory,
-    health_snapshot: &HashMap<Uuid, HealthStatus>,
-) -> ServiceReschedulePlan {
-    let slots = build_replica_slots(spec);
-    let desired_ids: HashSet<Uuid> = slots.iter().filter_map(|slot| slot.task_id).collect();
+/// Computes the deterministic target node for every replica slot to keep service placement balanced.
+fn compute_slot_targets(
+    service_id: Uuid,
+    templates: &[ServiceTaskSpecValue],
+    eligible_nodes: &[Uuid],
+) -> HashMap<SlotKey, Uuid> {
+    let mut targets = HashMap::new();
+    if eligible_nodes.is_empty() {
+        return targets;
+    }
 
-    let mut missing_slots = Vec::new();
-    for slot in &slots {
-        let Some(task_id) = slot.task_id else {
-            missing_slots.push(slot.clone());
+    let total_replicas: usize = templates
+        .iter()
+        .map(|template| template.replicas as usize)
+        .sum();
+    let service_max = max_replicas_per_node(total_replicas, eligible_nodes.len());
+    let mut template_caps: HashMap<String, usize> = HashMap::new();
+    for template in templates {
+        template_caps.insert(
+            template.name.clone(),
+            max_replicas_per_node(template.replicas as usize, eligible_nodes.len()),
+        );
+    }
+
+    let mut slots: Vec<(ServiceTaskSpecValue, u16)> = Vec::new();
+    for template in templates {
+        for replica in 1..=template.replicas {
+            slots.push((template.clone(), replica));
+        }
+    }
+    slots.sort_by(|(left, left_replica), (right, right_replica)| {
+        left.name
+            .cmp(&right.name)
+            .then(left_replica.cmp(right_replica))
+    });
+
+    let mut total_counts: HashMap<Uuid, usize> = HashMap::new();
+    let mut template_counts: HashMap<(Uuid, String), usize> = HashMap::new();
+
+    for (template, replica) in slots {
+        let key = SlotKey::new(service_id, &template.name, replica);
+        let ranked = rank_nodes_for_slot(service_id, &template.name, replica, eligible_nodes);
+        let template_cap = template_caps
+            .get(&template.name)
+            .copied()
+            .unwrap_or(service_max);
+
+        // Prefer nodes that satisfy both template and service caps; relax template caps if needed.
+        let mut chosen: Option<Uuid> = None;
+        for node_id in &ranked {
+            let total = total_counts.get(node_id).copied().unwrap_or(0);
+            if total >= service_max {
+                continue;
+            }
+            let template_key = (*node_id, template.name.clone());
+            let template_total = template_counts.get(&template_key).copied().unwrap_or(0);
+            if template_total >= template_cap {
+                continue;
+            }
+            chosen = Some(*node_id);
+            break;
+        }
+
+        if chosen.is_none() {
+            for node_id in &ranked {
+                let total = total_counts.get(node_id).copied().unwrap_or(0);
+                if total < service_max {
+                    chosen = Some(*node_id);
+                    break;
+                }
+            }
+        }
+
+        let Some(node_id) = chosen.or_else(|| ranked.first().copied()) else {
             continue;
         };
 
-        let Some(task) = inventory.by_id.get(&task_id) else {
-            missing_slots.push(slot.clone());
-            continue;
-        };
-
-        // Treat replicas on down nodes (or unhealthy containers) as missing so replacements spawn.
-        if node_is_down(task.node_id, health_snapshot) || !task_state_healthy(&task.state) {
-            missing_slots.push(slot.clone());
-        }
+        *total_counts.entry(node_id).or_insert(0) += 1;
+        let template_key = (node_id, template.name.clone());
+        *template_counts.entry(template_key).or_insert(0) += 1;
+        targets.insert(key, node_id);
     }
 
-    let mut extra_task_ids = Vec::new();
-    if let Some(tasks) = inventory.by_service.get(&spec.service_name) {
-        for task in tasks {
-            if desired_ids.contains(&task.id) {
-                continue;
-            }
-            if !task_state_healthy(&task.state) {
-                continue;
-            }
-            extra_task_ids.push(task.id);
-        }
-    }
+    targets
+}
 
-    ServiceReschedulePlan {
-        slots,
-        missing_slots,
-        extra_task_ids,
+/// Produces a stable ordering of candidate nodes for a replica slot using rendezvous hashing.
+fn rank_nodes_for_slot(
+    service_id: Uuid,
+    template: &str,
+    replica: u16,
+    candidates: &[Uuid],
+) -> Vec<Uuid> {
+    let mut scored: Vec<(Uuid, u128)> = candidates
+        .iter()
+        .map(|node_id| (*node_id, rendezvous_score(service_id, template, replica, *node_id)))
+        .collect();
+    scored.sort_by(|(left_id, left_score), (right_id, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    scored.into_iter().map(|(node_id, _)| node_id).collect()
+}
+
+/// Computes the maximum number of replicas a node should hold for even distribution.
+fn max_replicas_per_node(replicas: usize, node_count: usize) -> usize {
+    if node_count == 0 {
+        return 0;
     }
+    (replicas + node_count - 1) / node_count
+}
+
+/// Computes the rendezvous hash score for a node given a replica identity.
+fn rendezvous_score(
+    service_id: Uuid,
+    template: &str,
+    replica: u16,
+    node_id: Uuid,
+) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(service_id.as_bytes());
+    hasher.update(template.as_bytes());
+    hasher.update(&replica.to_le_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
 }
 
 /// Returns true if a task state should be treated as a healthy, in-flight replica.
@@ -1107,89 +1432,95 @@ fn task_state_healthy(state: &ContainerState) -> bool {
     )
 }
 
+/// Returns true if a task is stable enough to migrate during rebalancing.
+fn task_state_rebalanceable(state: &ContainerState) -> bool {
+    matches!(state, ContainerState::Running)
+}
+
+/// Returns true when a task has been running long enough to permit rebalancing.
+fn task_age_allows_rebalance(task: &TaskSpec) -> bool {
+    let Some(anchor) = parse_timestamp(&task.updated_at).or_else(|| parse_timestamp(&task.created_at)) else {
+        return false;
+    };
+    let min_age = ChronoDuration::seconds(SERVICE_REBALANCE_MIN_AGE_SECS);
+    Utc::now().signed_duration_since(anchor) >= min_age
+}
+
+/// Returns true when a task is old enough to be considered for cleanup.
+fn task_age_allows_cleanup(task: &TaskSpec) -> bool {
+    let Some(anchor) = parse_timestamp(&task.updated_at).or_else(|| parse_timestamp(&task.created_at)) else {
+        return false;
+    };
+    let min_age = ChronoDuration::seconds(SERVICE_REBALANCE_MIN_AGE_SECS);
+    Utc::now().signed_duration_since(anchor) >= min_age
+}
+
 /// Returns true if the node health snapshot marks the node as down (suspect remains eligible).
 fn node_is_down(node_id: Uuid, health_snapshot: &HashMap<Uuid, HealthStatus>) -> bool {
     matches!(health_snapshot.get(&node_id), Some(HealthStatus::Down))
 }
 
-/// Applies replacement task ids to the slot list, preserving deterministic order.
-fn apply_replacements(slots: &[ReplicaSlot], replacements: &HashMap<usize, Uuid>) -> Vec<Uuid> {
-    let mut ids = Vec::with_capacity(slots.len());
-    for slot in slots {
-        if let Some(replacement) = replacements.get(&slot.index) {
-            ids.push(*replacement);
-        } else if let Some(task_id) = slot.task_id {
-            ids.push(task_id);
+/// Selects the deterministic owner node for a replica slot so rescheduling is distributed.
+fn select_slot_owner(
+    service_id: Uuid,
+    template: &str,
+    replica: u16,
+    candidates: &[Uuid],
+) -> Option<Uuid> {
+    let mut best: Option<(Uuid, u128)> = None;
+    for node_id in candidates {
+        let score = slot_owner_score(service_id, template, replica, *node_id);
+        match best {
+            None => best = Some((*node_id, score)),
+            Some((_, best_score)) if score > best_score => {
+                best = Some((*node_id, score));
+            }
+            _ => {}
         }
     }
-    ids
+    best.map(|(node_id, _)| node_id)
 }
 
-/// Picks the winning reschedule lock across concurrent spec versions.
-fn select_reschedule_lock(
-    specs: &[ServiceSpecValue],
-    now: DateTime<Utc>,
-) -> Option<ServiceRescheduleLock> {
-    let mut locks: Vec<ServiceRescheduleLock> = specs
-        .iter()
-        .filter_map(|spec| spec.reschedule_lock.clone())
-        .filter(|lock| !lock_expired(lock, now))
-        .collect();
-
-    // Deterministic tie-breaker keeps all nodes aligned even with concurrent claims.
-    locks.sort_by(|a, b| a.token.cmp(&b.token).then(a.holder_id.cmp(&b.holder_id)));
-    locks.into_iter().next()
-}
-
-/// Returns true when the reschedule lock is expired or has invalid timestamps.
-fn lock_expired(lock: &ServiceRescheduleLock, now: DateTime<Utc>) -> bool {
-    match parse_timestamp(&lock.expires_at) {
-        Some(expiry) => expiry <= now,
-        None => true,
-    }
-}
-
-/// Returns true if the lock should be refreshed to keep exclusivity while work remains.
-fn should_refresh_lock(lock: &ServiceRescheduleLock, now: DateTime<Utc>) -> bool {
-    match parse_timestamp(&lock.expires_at) {
-        Some(expiry) => {
-            expiry <= now + ChronoDuration::seconds(SERVICE_RESCHEDULE_LOCK_REFRESH_SECS)
+/// Picks the cleanup owner for an extra task so only one node prunes it.
+fn select_task_owner(task_id: Uuid, candidates: &[Uuid]) -> Option<Uuid> {
+    let mut best: Option<(Uuid, u128)> = None;
+    for node_id in candidates {
+        let score = task_owner_score(task_id, *node_id);
+        match best {
+            None => best = Some((*node_id, score)),
+            Some((_, best_score)) if score > best_score => {
+                best = Some((*node_id, score));
+            }
+            _ => {}
         }
-        None => true,
     }
+    best.map(|(node_id, _)| node_id)
 }
 
-/// Extends a lock lease while preserving its identity and holder.
-fn refresh_lock(
-    lock: &ServiceRescheduleLock,
-    now: DateTime<Utc>,
-) -> anyhow::Result<ServiceRescheduleLock> {
-    let issued_at = now.to_rfc3339();
-    let expires_at = (now + ChronoDuration::seconds(SERVICE_RESCHEDULE_LOCK_TTL_SECS)).to_rfc3339();
-    Ok(ServiceRescheduleLock::new(
-        lock.holder_id,
-        lock.holder_name.clone(),
-        lock.token,
-        issued_at,
-        expires_at,
-        lock.reason,
-    ))
+/// Computes the rendezvous score for slot ownership selection.
+fn slot_owner_score(service_id: Uuid, template: &str, replica: u16, node_id: Uuid) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"owner");
+    hasher.update(service_id.as_bytes());
+    hasher.update(template.as_bytes());
+    hasher.update(&replica.to_le_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
 }
 
-/// Chooses the service spec value that carries the provided reschedule lock token.
-fn select_spec_for_lock(
-    specs: &[ServiceSpecValue],
-    lock: &ServiceRescheduleLock,
-) -> Option<ServiceSpecValue> {
-    specs
-        .iter()
-        .find(|spec| {
-            spec.reschedule_lock
-                .as_ref()
-                .map(|candidate| candidate.token == lock.token)
-                .unwrap_or(false)
-        })
-        .cloned()
+/// Computes the rendezvous score used to choose the cleanup owner for extra tasks.
+fn task_owner_score(task_id: Uuid, node_id: Uuid) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cleanup");
+    hasher.update(task_id.as_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
 }
 
 struct ServiceDeploymentJob {
@@ -1347,7 +1678,14 @@ async fn redeploy_service_tasks(
 
     controller.stop_tasks(&spec).await;
 
-    let requests = build_start_requests(&spec.service_name, &spec.tasks);
+    let health_snapshot = controller.health_monitor.snapshot();
+    let eligible_nodes = controller.collect_eligible_nodes(&health_snapshot);
+    let requests = build_start_requests(
+        &spec.service_name,
+        spec.id,
+        &spec.tasks,
+        &eligible_nodes,
+    );
     if requests.is_empty() {
         let mut updated = spec.clone();
         updated.set_status(ServiceStatus::Running);
@@ -1358,7 +1696,12 @@ async fn redeploy_service_tasks(
         return Ok(updated);
     }
 
-    let task_specs = controller.task_manager.start_tasks_batch(requests).await?;
+    let task_specs = controller
+        .start_tasks_with_fallback(
+            requests,
+            &format!("service '{}' redeploy attempt", spec.service_name),
+        )
+        .await?;
     let task_ids: Vec<Uuid> = task_specs.iter().map(|spec| spec.id).collect();
 
     let mut redeployed = ServiceSpecValue::new(
@@ -1424,18 +1767,24 @@ fn readiness_backoff(attempt: u32) -> Duration {
 /// Builds the individual task start requests for every replica defined in the service manifest.
 fn build_start_requests(
     service_name: &str,
+    service_id: Uuid,
     tasks: &[ServiceTaskSpecValue],
+    eligible_nodes: &[Uuid],
 ) -> Vec<TaskStartRequest> {
+    let slot_targets = compute_slot_targets(service_id, tasks, eligible_nodes);
     let mut requests = Vec::new();
     for task in tasks {
         for replica_idx in 0..task.replicas {
             let replica_number = replica_idx + 1;
             let desired_id = Uuid::new_v4();
+            let key = SlotKey::new(service_id, &task.name, replica_number);
+            let target_node = slot_targets.get(&key).copied();
             requests.push(make_replica_request(
                 service_name,
                 task,
                 replica_number,
                 desired_id,
+                target_node,
             ));
         }
     }
@@ -1445,16 +1794,23 @@ fn build_start_requests(
 /// Builds start requests for replacements so we can map spawn order to replica targets.
 fn build_replacement_requests(
     service_name: &str,
+    service_id: Uuid,
+    templates: &[ServiceTaskSpecValue],
     replacements: &[ReplicaReplacement],
+    eligible_nodes: &[Uuid],
 ) -> Vec<TaskStartRequest> {
+    let slot_targets = compute_slot_targets(service_id, templates, eligible_nodes);
     replacements
         .iter()
         .map(|replacement| {
+            let key = SlotKey::new(service_id, &replacement.template.name, replacement.replica);
+            let target_node = slot_targets.get(&key).copied();
             make_replica_request(
                 service_name,
                 &replacement.template,
                 replacement.replica,
                 replacement.desired_id,
+                target_node,
             )
         })
         .collect()
@@ -1493,6 +1849,7 @@ fn make_replica_request(
     template: &ServiceTaskSpecValue,
     replica: u16,
     desired_id: Uuid,
+    target_node: Option<Uuid>,
 ) -> TaskStartRequest {
     let name = format_replica_name(service_name, &template.name, replica, desired_id);
     TaskStartRequest {
@@ -1508,6 +1865,7 @@ fn make_replica_request(
         secret_files: template.secret_files.clone(),
         networks: template.required_network_ids(),
         service_metadata: Some(TaskServiceMetadata::new(service_name, &template.name)),
+        target_node,
     }
 }
 
@@ -1651,6 +2009,7 @@ fn format_task_state_summary(states: &[(Uuid, Option<ContainerState>)]) -> Strin
 mod tests {
     use super::*;
     use crate::task::types::TaskServiceMetadata;
+    use std::collections::HashMap;
 
     /// Builds a minimal task spec for reschedule planning tests.
     fn make_task(
@@ -1666,6 +2025,7 @@ mod tests {
             image: "ghcr.io/demo/app:latest".to_string(),
             state,
             created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
             command: Vec::new(),
             node_id,
             node_name: format!("node-{node_id}"),
@@ -1736,20 +2096,52 @@ mod tests {
         assert_eq!(slots[2].template.name, "web");
     }
 
-    /// Verifies down nodes produce missing replicas in the reschedule plan.
+    /// Ensures slot ownership selection is deterministic across candidate orderings.
     #[test]
-    fn plan_marks_down_node_missing() {
-        let service_name = "demo-service";
-        let node_alive = Uuid::new_v4();
-        let node_down = Uuid::new_v4();
-        let task_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
-        let spec = ServiceSpecValue::new(
-            Uuid::new_v4(),
-            "manifest",
-            service_name,
-            vec![ServiceTaskSpecValue {
-                name: "api".into(),
-                image: "ghcr.io/demo/api:latest".into(),
+    fn slot_owner_is_deterministic() {
+        let service_id = Uuid::new_v4();
+        let node_a = Uuid::from_bytes([1u8; 16]);
+        let node_b = Uuid::from_bytes([2u8; 16]);
+        let node_c = Uuid::from_bytes([3u8; 16]);
+        let candidates = vec![node_a, node_b, node_c];
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+
+        let owner = select_slot_owner(service_id, "api", 1, &candidates).expect("owner");
+        let owner_reversed = select_slot_owner(service_id, "api", 1, &reversed).expect("owner");
+        assert_eq!(owner, owner_reversed);
+    }
+
+    /// Ensures cleanup ownership selection is deterministic across candidate orderings.
+    #[test]
+    fn cleanup_owner_is_deterministic() {
+        let task_id = Uuid::new_v4();
+        let node_a = Uuid::from_bytes([1u8; 16]);
+        let node_b = Uuid::from_bytes([2u8; 16]);
+        let candidates = vec![node_a, node_b];
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+
+        let owner = select_task_owner(task_id, &candidates).expect("owner");
+        let owner_reversed = select_task_owner(task_id, &reversed).expect("owner");
+        assert_eq!(owner, owner_reversed);
+    }
+
+    /// Ensures slot targets are deterministic regardless of candidate ordering.
+    #[test]
+    fn slot_targets_are_deterministic() {
+        let service_id = Uuid::new_v4();
+        let node_a = Uuid::from_bytes([1u8; 16]);
+        let node_b = Uuid::from_bytes([2u8; 16]);
+        let node_c = Uuid::from_bytes([3u8; 16]);
+        let candidates = vec![node_a, node_b, node_c];
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+
+        let templates = vec![
+            ServiceTaskSpecValue {
+                name: "backend".into(),
+                image: "ghcr.io/demo/backend:latest".into(),
                 command: Vec::new(),
                 replicas: 2,
                 cpu_millis: 0,
@@ -1762,50 +2154,10 @@ mod tests {
                 health_command: None,
                 public_port: None,
                 public_protocol: None,
-            }],
-            task_ids.clone(),
-        );
-
-        let tasks = vec![
-            make_task(
-                task_ids[0],
-                node_alive,
-                service_name,
-                "api",
-                ContainerState::Running,
-            ),
-            make_task(
-                task_ids[1],
-                node_down,
-                service_name,
-                "api",
-                ContainerState::Running,
-            ),
-        ];
-        let inventory = TaskInventory::from_specs(tasks);
-        let mut health_snapshot = HashMap::new();
-        health_snapshot.insert(node_alive, HealthStatus::Alive);
-        health_snapshot.insert(node_down, HealthStatus::Down);
-
-        let plan = build_reschedule_plan(&spec, &inventory, &health_snapshot);
-        assert_eq!(plan.missing_slots.len(), 1);
-        assert_eq!(plan.extra_task_ids.len(), 0);
-    }
-
-    /// Ensures extra replicas that are not in the desired task id set are detected.
-    #[test]
-    fn plan_marks_extra_tasks() {
-        let service_name = "demo-service";
-        let node_alive = Uuid::new_v4();
-        let task_id = Uuid::new_v4();
-        let extra_id = Uuid::new_v4();
-        let spec = ServiceSpecValue::new(
-            Uuid::new_v4(),
-            "manifest",
-            service_name,
-            vec![ServiceTaskSpecValue {
-                name: "api".into(),
-                image: "ghcr.io/demo/api:latest".into(),
+            },
+            ServiceTaskSpecValue {
+                name: "curl".into(),
+                image: "curlimages/curl:latest".into(),
                 command: Vec::new(),
                 replicas: 1,
                 cpu_millis: 0,
@@ -1818,32 +2170,68 @@ mod tests {
                 health_command: None,
                 public_port: None,
                 public_protocol: None,
-            }],
-            vec![task_id],
-        );
-
-        let tasks = vec![
-            make_task(
-                task_id,
-                node_alive,
-                service_name,
-                "api",
-                ContainerState::Running,
-            ),
-            make_task(
-                extra_id,
-                node_alive,
-                service_name,
-                "api",
-                ContainerState::Running,
-            ),
+            },
         ];
-        let inventory = TaskInventory::from_specs(tasks);
-        let mut health_snapshot = HashMap::new();
-        health_snapshot.insert(node_alive, HealthStatus::Alive);
 
-        let plan = build_reschedule_plan(&spec, &inventory, &health_snapshot);
-        assert_eq!(plan.missing_slots.len(), 0);
-        assert_eq!(plan.extra_task_ids, vec![extra_id]);
+        let targets = compute_slot_targets(service_id, &templates, &candidates);
+        let targets_reversed = compute_slot_targets(service_id, &templates, &reversed);
+
+        assert_eq!(targets, targets_reversed);
+    }
+
+    /// Ensures slot targets spread replicas evenly when nodes are available.
+    #[test]
+    fn slot_targets_balance_total_replicas() {
+        let service_id = Uuid::new_v4();
+        let node_a = Uuid::from_bytes([1u8; 16]);
+        let node_b = Uuid::from_bytes([2u8; 16]);
+        let node_c = Uuid::from_bytes([3u8; 16]);
+        let candidates = vec![node_a, node_b, node_c];
+
+        let templates = vec![
+            ServiceTaskSpecValue {
+                name: "backend".into(),
+                image: "ghcr.io/demo/backend:latest".into(),
+                command: Vec::new(),
+                replicas: 2,
+                cpu_millis: 0,
+                memory_bytes: 0,
+                restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                networks: Vec::new(),
+                health_port: None,
+                health_command: None,
+                public_port: None,
+                public_protocol: None,
+            },
+            ServiceTaskSpecValue {
+                name: "curl".into(),
+                image: "curlimages/curl:latest".into(),
+                command: Vec::new(),
+                replicas: 1,
+                cpu_millis: 0,
+                memory_bytes: 0,
+                restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                networks: Vec::new(),
+                health_port: None,
+                health_command: None,
+                public_port: None,
+                public_protocol: None,
+            },
+        ];
+
+        let targets = compute_slot_targets(service_id, &templates, &candidates);
+        let mut counts: HashMap<Uuid, usize> = HashMap::new();
+        for node_id in targets.values() {
+            *counts.entry(*node_id).or_insert(0) += 1;
+        }
+
+        assert_eq!(targets.len(), 3);
+        assert_eq!(counts.get(&node_a).copied().unwrap_or(0), 1);
+        assert_eq!(counts.get(&node_b).copied().unwrap_or(0), 1);
+        assert_eq!(counts.get(&node_c).copied().unwrap_or(0), 1);
     }
 }

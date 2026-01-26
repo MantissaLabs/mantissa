@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use anyhow::Context;
 use chrono::Utc;
 use protocol::server::cluster_session;
 use tracing::warn;
@@ -8,6 +9,7 @@ use uuid::Uuid;
 
 use crate::scheduler::{SchedulerError, SlotId, SlotReservationRequest};
 use crate::task::container::ContainerState;
+use crate::task::service::read_spec;
 use crate::task::types::{TaskEvent, TaskSpec};
 
 use super::TaskManager;
@@ -311,7 +313,7 @@ impl TaskManager {
         }
     }
 
-    async fn remote_session(
+    pub(super) async fn remote_session(
         &self,
         peer_id: Uuid,
     ) -> Result<cluster_session::Client, anyhow::Error> {
@@ -321,7 +323,54 @@ impl TaskManager {
             .ok_or_else(|| anyhow::anyhow!("no active session for peer {peer_id}"))
     }
 
-    /// Marks remote specs as stopping so peers roll them back when the local plan fails.
+    /// Requests a remote peer to stop a task so the owner updates state and broadcasts it.
+    pub(super) async fn stop_remote_task(
+        &self,
+        spec: &TaskSpec,
+    ) -> Result<TaskSpec, anyhow::Error> {
+        if spec.node_id == self.local_node_id {
+            return Err(anyhow::anyhow!(
+                "remote stop invoked for local task {}",
+                spec.id
+            ));
+        }
+
+        let peer_id = spec.node_id;
+        let session = self
+            .remote_session(peer_id)
+            .await
+            .context(format!("no active session for peer {peer_id}"))?;
+        let task_client = session
+            .get_task_request()
+            .send()
+            .promise
+            .await
+            .context(format!("failed to open task service with peer {peer_id}"))?
+            .get()
+            .context(format!("invalid task response from peer {peer_id}"))?
+            .get_task()
+            .context(format!("missing task service for peer {peer_id}"))?;
+
+        let mut stop_req = task_client.stop_request();
+        {
+            let mut request = stop_req.get().init_request();
+            request.set_id(spec.id.as_bytes());
+        }
+        let response = stop_req
+            .send()
+            .promise
+            .await
+            .context(format!("stop request failed on peer {peer_id}"))?;
+        let reader = response
+            .get()
+            .context(format!("invalid stop response from peer {peer_id}"))?
+            .get_spec()
+            .context(format!("missing task spec in stop response from peer {peer_id}"))?;
+
+        read_spec(reader).map_err(|err| anyhow::anyhow!("failed to decode stop response: {err}"))
+    }
+
+    /// Requests remote peers to stop tasks so rollbacks do not leak running containers.
     pub(super) async fn signal_remote_stop(&self, specs: &[(usize, TaskSpec)]) {
         if specs.is_empty() {
             return;
@@ -332,33 +381,16 @@ impl TaskManager {
                 continue;
             }
 
-            if matches!(
-                spec.state,
-                ContainerState::Stopping | ContainerState::Stopped
-            ) {
+            if matches!(spec.state, ContainerState::Stopped) {
                 continue;
             }
 
-            let mut updated = spec.clone();
-            updated.state = ContainerState::Stopping;
-
-            if let Err(err) = self.persist_spec(&updated).await {
+            if let Err(err) = self.stop_remote_task(spec).await {
                 warn!(
                     target: "task",
-                    "failed to persist stopping state for remote task {}: {err}",
-                    spec.id
-                );
-                continue;
-            }
-
-            if let Err(err) = self
-                .enqueue_gossip(TaskEvent::Upsert(Box::new(updated)))
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to broadcast stopping state for remote task {}: {err}",
-                    spec.id
+                    "failed to request remote stop for task {} on peer {}: {err}",
+                    spec.id,
+                    spec.node_id
                 );
             }
         }
@@ -395,6 +427,7 @@ impl TaskManager {
                 image: plan.image.clone(),
                 state: ContainerState::Pending,
                 created_at: Utc::now().to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
                 command: plan.command.clone(),
                 node_id: plan.peer_id,
                 node_name,

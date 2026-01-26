@@ -28,8 +28,17 @@ impl TaskManager {
             plan.container_name = format!("mantissa-{}", plan.id);
         }
 
+        let pending_specs = match self.persist_pending_batch(plans).await {
+            Ok(specs) => specs,
+            Err(err) => {
+                self.cleanup_batch(plans).await;
+                return Err(err);
+            }
+        };
+
         if let Err(err) = self.launch_batch_containers(plans).await {
             self.cleanup_batch(plans).await;
+            self.rollback_pending_specs(&pending_specs).await;
             return Err(err);
         }
 
@@ -44,7 +53,90 @@ impl TaskManager {
             }
             Err(err) => {
                 self.cleanup_batch(plans).await;
+                self.rollback_pending_specs(&pending_specs).await;
                 Err(err)
+            }
+        }
+    }
+
+    /// Persists pending task specs before container launch so other nodes see in-flight placement.
+    async fn persist_pending_batch(
+        &self,
+        plans: &[BatchStartPlan],
+    ) -> Result<Vec<TaskSpec>, anyhow::Error> {
+        let mut specs = Vec::with_capacity(plans.len());
+        let mut persisted: Vec<TaskSpec> = Vec::new();
+
+        for plan in plans {
+            if plan.slots.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "task {} has no slots assigned during pending persist",
+                    plan.name
+                ));
+            }
+
+            let slot_ids = plan.slot_ids();
+            let slot_id = slot_ids.first().copied();
+            let spec = TaskSpec {
+                id: plan.id,
+                name: plan.name.clone(),
+                image: plan.image.clone(),
+                state: ContainerState::Pending,
+                created_at: Utc::now().to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
+                command: plan.command.clone(),
+                node_id: self.local_node_id,
+                node_name: self.local_node_name.clone(),
+                slot_ids,
+                slot_id,
+                cpu_millis: plan.requested_cpu_millis,
+                memory_bytes: plan.requested_memory_bytes,
+                restart_policy: plan.restart_policy.clone(),
+                env: plan.env.clone(),
+                secret_files: plan.secret_files.clone(),
+                networks: plan.networks.clone(),
+                service_metadata: plan.service_metadata.clone(),
+            };
+
+            if let Err(err) = self.persist_spec(&spec).await {
+                for rollback in &persisted {
+                    let _ = self.remove_spec(rollback.id).await;
+                }
+                return Err(err.context(format!(
+                    "failed to persist pending task spec {}",
+                    spec.name
+                )));
+            }
+
+            persisted.push(spec.clone());
+            specs.push(spec);
+        }
+
+        for spec in &specs {
+            if let Err(err) = self
+                .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to enqueue pending task gossip for {}: {err}",
+                    spec.name
+                );
+            }
+        }
+
+        Ok(specs)
+    }
+
+    /// Cleans up pending specs when a local launch fails to keep the store consistent.
+    async fn rollback_pending_specs(&self, specs: &[TaskSpec]) {
+        for spec in specs {
+            if let Err(err) = self.remove_spec(spec.id).await {
+                warn!(
+                    target: "task",
+                    "failed to rollback pending task {}: {err}",
+                    spec.id
+                );
             }
         }
     }
@@ -223,6 +315,7 @@ impl TaskManager {
                 image: plan.image.clone(),
                 state: ContainerState::Running,
                 created_at: plan.created_at.to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
                 command: plan.command.clone(),
                 node_id: self.local_node_id,
                 node_name: self.local_node_name.clone(),

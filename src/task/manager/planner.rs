@@ -70,6 +70,7 @@ pub(super) struct StartIntent {
     pub(super) secret_files: Vec<TaskSecretFile>,
     pub(super) networks: Vec<Uuid>,
     pub(super) service_metadata: Option<TaskServiceMetadata>,
+    pub(super) target_node: Option<Uuid>,
 }
 
 #[derive(Clone)]
@@ -231,6 +232,7 @@ impl TaskManager {
                 secret_files: request.secret_files,
                 networks: request.networks,
                 service_metadata: request.service_metadata,
+                target_node: request.target_node,
             })
             .collect()
     }
@@ -483,6 +485,67 @@ impl TaskManager {
         Ok(queue)
     }
 
+    /// Allocates slots for an intent pinned to a specific node while keeping the
+    /// shared candidate ring usable for later intents.
+    fn allocate_targeted_intent(
+        &self,
+        candidates: &mut VecDeque<Candidate>,
+        intent: &StartIntent,
+        target_node: Uuid,
+    ) -> Result<(CandidateLocation, Vec<SlotChoice>), anyhow::Error> {
+        let candidate_count = candidates.len();
+        if candidate_count == 0 {
+            return Err(anyhow::anyhow!(
+                "scheduler reservation failed: insufficient capacity for batch"
+            ));
+        }
+
+        let mut matched: Option<Candidate> = None;
+        for _ in 0..candidate_count {
+            let candidate = candidates
+                .pop_front()
+                .expect("candidate deque should not be empty");
+            let candidate_node = match candidate.location {
+                CandidateLocation::Local => self.local_node_id,
+                CandidateLocation::Remote { peer_id, .. } => peer_id,
+            };
+
+            if candidate_node == target_node {
+                matched = Some(candidate);
+                break;
+            }
+
+            candidates.push_back(candidate);
+        }
+
+        let Some(mut candidate) = matched else {
+            return Err(anyhow::anyhow!(
+                "scheduler reservation failed: target node {target_node} unavailable"
+            ));
+        };
+
+        if !candidate.can_host(&intent.networks) {
+            candidates.push_back(candidate);
+            return Err(SchedulingError::NetworksUnavailable {
+                networks: intent.networks.clone(),
+            }
+            .into());
+        }
+
+        if let Some(slots) = candidate.allocate(intent.cpu_millis, intent.memory_bytes) {
+            let location = candidate.location.clone();
+            if !candidate.is_empty() {
+                candidates.push_back(candidate);
+            }
+            return Ok((location, slots));
+        }
+
+        candidates.push_back(candidate);
+        Err(anyhow::anyhow!(
+            "scheduler reservation failed: insufficient capacity on target node {target_node}"
+        ))
+    }
+
     /// Allocate the remaining intents across the candidate queue. The queue is
     /// treated as a ring: after examining a candidate we move it to the back so
     /// subsequent intents see a rotated view, which naturally spreads replicas.
@@ -493,6 +556,55 @@ impl TaskManager {
         intents: Vec<&StartIntent>,
     ) -> Result<(), anyhow::Error> {
         for intent in intents {
+            if let Some(target_node) = intent.target_node {
+                let (location, slots) =
+                    self.allocate_targeted_intent(candidates, intent, target_node)?;
+
+                match location {
+                    CandidateLocation::Local => {
+                        assignment.local.push(BatchStartPlan {
+                            id: intent.id,
+                            name: intent.name.clone(),
+                            image: intent.image.clone(),
+                            command: intent.command.clone(),
+                            slots,
+                            requested_cpu_millis: intent.cpu_millis,
+                            requested_memory_bytes: intent.memory_bytes,
+                            container_name: String::new(),
+                            container_id: None,
+                            created_at: Utc::now(),
+                            index: intent.index,
+                            preassigned: false,
+                            restart_policy: intent.restart_policy.clone(),
+                            env: intent.env.clone(),
+                            secret_files: intent.secret_files.clone(),
+                            networks: intent.networks.clone(),
+                            service_metadata: intent.service_metadata.clone(),
+                        });
+                    }
+                    CandidateLocation::Remote { peer_id, version } => {
+                        assignment.remote.push(RemoteStartPlan {
+                            index: intent.index,
+                            id: intent.id,
+                            name: intent.name.clone(),
+                            image: intent.image.clone(),
+                            command: intent.command.clone(),
+                            cpu_millis: intent.cpu_millis,
+                            memory_bytes: intent.memory_bytes,
+                            slots,
+                            peer_id,
+                            scheduler_version: version,
+                            restart_policy: intent.restart_policy.clone(),
+                            env: intent.env.clone(),
+                            secret_files: intent.secret_files.clone(),
+                            networks: intent.networks.clone(),
+                            service_metadata: intent.service_metadata.clone(),
+                        });
+                    }
+                }
+                continue;
+            }
+
             let candidate_count = candidates.len();
             if candidate_count == 0 {
                 return Err(anyhow::anyhow!(

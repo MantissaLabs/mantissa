@@ -34,6 +34,7 @@ struct TaskSpec {
   secretFiles @13 :List(SecretFile);
   networks @14 :List(Data); # Each entry is a 16-byte network UUID
   serviceMetadata @15 :ServiceMetadata;
+  updatedAt @16 :Text;
 }
 
 struct ServiceMetadata {
