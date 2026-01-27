@@ -764,6 +764,22 @@ impl TaskManager {
             );
         }
 
+        if let Err(err) = self
+            .ensure_runtime_attachments(
+                working.id,
+                &container_id,
+                &working.networks,
+                working.service_metadata.as_ref(),
+            )
+            .await
+        {
+            warn!(
+                target: "task",
+                task = %working.id,
+                "failed to refresh attachments after running commit: {err:#}"
+            );
+        }
+
         Ok(())
     }
 

@@ -122,8 +122,13 @@ impl NetworkController {
             NetworkBpfManager::unavailable()
         });
 
-        let discovery =
-            ServiceDiscovery::new(registry.clone(), task_store, service_registry, bpf.clone());
+        let discovery = ServiceDiscovery::new(
+            registry.clone(),
+            task_store,
+            service_registry,
+            bpf.clone(),
+            cluster_registry.health_monitor(),
+        );
 
         Ok(Self {
             inner: Arc::new(NetworkControllerInner {
@@ -1343,6 +1348,8 @@ mod platform {
         AddressMessageBuilder, Error as RtnetlinkError, Handle, LinkBridge, LinkMessageBuilder,
         LinkUnspec, LinkVeth, LinkVxlan, new_connection,
     };
+    use std::fs;
+    use std::mem;
     use std::net::{IpAddr, Ipv4Addr};
     use std::process::Command;
     use std::sync::Arc;
@@ -1650,6 +1657,27 @@ mod platform {
                 self.set_up(host_index).await.with_context(|| {
                     format!("bring link {} (idx {}) up", host_ifname, host_index)
                 })?;
+                if let Err(err) = self.configure_arp_tuning(&plan.bridge_name) {
+                    debug!(
+                        target: "network",
+                        iface = %plan.bridge_name,
+                        "failed to apply bridge arp tuning (continuing): {err:#}"
+                    );
+                }
+                if let Err(err) = self.configure_arp_tuning(&peer_ifname) {
+                    debug!(
+                        target: "network",
+                        iface = %peer_ifname,
+                        "failed to apply host-access peer arp tuning (continuing): {err:#}"
+                    );
+                }
+                if let Err(err) = self.configure_arp_tuning(&host_ifname) {
+                    debug!(
+                        target: "network",
+                        iface = %host_ifname,
+                        "failed to apply host-access arp tuning (continuing): {err:#}"
+                    );
+                }
             }
 
             if plan.mtu > 0 {
@@ -1712,6 +1740,19 @@ mod platform {
                             host_ifname, host_index
                         )
                     })?;
+                if let Some(mac) = plan.host_access_mac {
+                    if let Err(err) =
+                        self.announce_host_access_ip(host_index, ip, mac, &host_ifname).await
+                    {
+                        debug!(
+                            target: "network",
+                            network = %plan.network_id,
+                            iface = %host_ifname,
+                            ip = %ip,
+                            "failed to announce host access ip (continuing): {err:#}"
+                        );
+                    }
+                }
             }
 
             debug!(
@@ -1744,6 +1785,91 @@ mod platform {
                 .execute()
                 .await
                 .with_context(|| format!("assign resolver {ip}/{prefix} on {link_name}"))
+        }
+
+        /// Apply ARP flux mitigation to an interface so it does not answer for foreign IPs.
+        ///
+        /// We use this on the overlay bridge and host-access veth to ensure ARP replies come from
+        /// the interface that actually owns the address, preventing peers from caching the bridge
+        /// MAC for host-access IPs.
+        fn configure_arp_tuning(&self, iface: &str) -> Result<()> {
+            Self::write_sysctl_value(&format!("/proc/sys/net/ipv4/conf/{iface}/arp_ignore"), "1")?;
+            Self::write_sysctl_value(&format!(
+                "/proc/sys/net/ipv4/conf/{iface}/arp_announce"
+            ), "2")?;
+            Ok(())
+        }
+
+        /// Write a sysctl value via /proc so interface-specific network tuning can be set.
+        fn write_sysctl_value(path: &str, value: &str) -> Result<()> {
+            fs::write(path, value).with_context(|| format!("write sysctl {path}"))
+        }
+
+        /// Broadcast a gratuitous ARP for the host-access IP so peers refresh stale neighbor
+        /// entries after the resolver address moves off the bridge and onto the host veth.
+        async fn announce_host_access_ip(
+            &self,
+            host_index: u32,
+            ip: Ipv4Addr,
+            mac: [u8; 6],
+            link_name: &str,
+        ) -> Result<()> {
+            let fd = unsafe {
+                libc::socket(
+                    libc::AF_PACKET,
+                    libc::SOCK_RAW,
+                    (libc::ETH_P_ARP as u16).to_be() as i32,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("open raw socket for {link_name}"));
+            }
+
+            let mut frame = [0u8; 42];
+            frame[..6].copy_from_slice(&[0xff; 6]);
+            frame[6..12].copy_from_slice(&mac);
+            frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+            frame[14..16].copy_from_slice(&1u16.to_be_bytes());
+            frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
+            frame[18] = 6;
+            frame[19] = 4;
+            frame[20..22].copy_from_slice(&1u16.to_be_bytes());
+            frame[22..28].copy_from_slice(&mac);
+            frame[28..32].copy_from_slice(&ip.octets());
+            frame[32..38].copy_from_slice(&[0u8; 6]);
+            frame[38..42].copy_from_slice(&ip.octets());
+
+            let mut addr: libc::sockaddr_ll = unsafe { mem::zeroed() };
+            addr.sll_family = libc::AF_PACKET as u16;
+            addr.sll_protocol = (libc::ETH_P_ARP as u16).to_be();
+            addr.sll_ifindex = host_index as i32;
+            addr.sll_halen = 6;
+            addr.sll_addr[..6].copy_from_slice(&[0xff; 6]);
+
+            let sent = unsafe {
+                libc::sendto(
+                    fd,
+                    frame.as_ptr().cast::<libc::c_void>(),
+                    frame.len(),
+                    0,
+                    &addr as *const _ as *const libc::sockaddr,
+                    mem::size_of::<libc::sockaddr_ll>() as u32,
+                )
+            };
+
+            let close_result = unsafe { libc::close(fd) };
+
+            if sent < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("send gratuitous arp on {link_name}"));
+            }
+            if close_result < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("close raw socket for {link_name}"));
+            }
+
+            Ok(())
         }
 
         /// Remove the specified IPv4 address from the provided link if present.

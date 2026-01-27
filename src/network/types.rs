@@ -470,6 +470,8 @@ pub struct NetworkAttachmentValue {
     pub container_id: String,
     pub network_id: Uuid,
     #[serde(default)]
+    pub task_updated_at: Option<String>,
+    #[serde(default)]
     pub requested_ip: Option<String>,
     #[serde(default)]
     pub assigned_ip: Option<String>,
@@ -494,6 +496,7 @@ pub struct NetworkAttachmentDraft {
     pub node_id: Uuid,
     pub container_id: String,
     pub network_id: Uuid,
+    pub task_updated_at: Option<String>,
     pub requested_ip: Option<String>,
     pub assigned_ip: Option<String>,
     pub mac: Option<String>,
@@ -512,6 +515,7 @@ impl NetworkAttachmentValue {
             node_id: draft.node_id,
             container_id: draft.container_id,
             network_id: draft.network_id,
+            task_updated_at: draft.task_updated_at,
             requested_ip: draft.requested_ip,
             assigned_ip: draft.assigned_ip,
             mac: draft.mac,

@@ -11,10 +11,12 @@ use crate::services::registry::ServiceRegistry;
 use crate::services::types::{ServicePortProtocol, ServiceSpecValue};
 use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
+use crate::task::manager::select_best_task_value;
 use crate::task::types::TaskValue;
 use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use crdt_store::uuid_key::UuidKey;
+use health::{HealthMonitor, Status as HealthStatus};
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::collections::{HashMap, HashSet};
@@ -45,6 +47,7 @@ pub struct ServiceDiscovery {
     tasks: TaskStore,
     services: ServiceRegistry,
     bpf: NetworkBpfManager,
+    health_monitor: Arc<HealthMonitor>,
     servers: Arc<AsyncMutex<HashMap<Uuid, DnsServerHandle>>>,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
@@ -67,6 +70,7 @@ impl ServiceDiscovery {
         tasks: TaskStore,
         services: ServiceRegistry,
         bpf: NetworkBpfManager,
+        health_monitor: Arc<HealthMonitor>,
     ) -> Self {
         let health_port = std::env::var("MANTISSA_LB_HEALTH_PORT")
             .ok()
@@ -76,6 +80,7 @@ impl ServiceDiscovery {
             tasks,
             services,
             bpf,
+            health_monitor,
             servers: Arc::new(AsyncMutex::new(HashMap::new())),
             load_balancer: Arc::new(AsyncMutex::new(ServiceLoadBalancer::default())),
             health: Arc::new(AsyncMutex::new(BackendHealth::default())),
@@ -123,6 +128,7 @@ impl ServiceDiscovery {
             self.bpf_lb.clone(),
             self.nodeport.clone(),
             self.missing_lb_maps.clone(),
+            self.health_monitor.clone(),
         )
         .await?;
 
@@ -180,6 +186,7 @@ async fn spawn_dns_server(
     bpf_lb: BpfLoadBalancer,
     nodeport: NodePortManager,
     missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
+    health_monitor: Arc<HealthMonitor>,
 ) -> Result<DnsServerHandle> {
     let bind_addr = SocketAddr::new(IpAddr::V4(resolver_ip), 53);
     let socket = UdpSocket::bind(bind_addr)
@@ -198,6 +205,7 @@ async fn spawn_dns_server(
     let lb_manager = bpf_lb.clone();
     let bpf_manager = bpf.clone();
     let lb_missing = missing_lb_maps.clone();
+    let refresh_health_monitor = health_monitor.clone();
     if let Err(err) = refresh_network_services(
         &task_registry,
         &tasks,
@@ -210,6 +218,7 @@ async fn spawn_dns_server(
         &lb_manager,
         &nodeport,
         &lb_missing,
+        &refresh_health_monitor,
     )
     .await
     {
@@ -228,6 +237,7 @@ async fn spawn_dns_server(
     let refresh_lb_manager = lb_manager.clone();
     let refresh_nodeport = nodeport.clone();
     let refresh_lb_missing = lb_missing.clone();
+    let refresh_health_monitor = health_monitor.clone();
     let refresh_task = tokio::spawn(async move {
         let mut refresh = time::interval(REFRESH_INTERVAL);
         loop {
@@ -250,6 +260,7 @@ async fn spawn_dns_server(
                         &refresh_lb_manager,
                         &refresh_nodeport,
                         &refresh_lb_missing,
+                        &refresh_health_monitor,
                     ).await {
                         warn!(
                             target: "network",
@@ -271,6 +282,7 @@ async fn spawn_dns_server(
     let dns_health = health.clone();
     let dns_lb_manager = lb_manager.clone();
     let dns_lb_missing = lb_missing.clone();
+    let dns_health_monitor = health_monitor.clone();
     let dns_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         loop {
@@ -299,6 +311,7 @@ async fn spawn_dns_server(
                                 health_timeout,
                                 &dns_lb_manager,
                                 &dns_lb_missing,
+                                &dns_health_monitor,
                             ).await {
                                 warn!(
                                     target: "network",
@@ -354,6 +367,7 @@ async fn handle_datagram(
     health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
+    health_monitor: &Arc<HealthMonitor>,
 ) -> Result<()> {
     let request = match Message::from_vec(payload) {
         Ok(message) => message,
@@ -410,6 +424,7 @@ async fn handle_datagram(
         }
     };
     let template_index = build_task_template_index(&service_specs);
+    let health_snapshot = health_monitor.snapshot();
 
     for query in request.queries() {
         match answer_query(
@@ -427,6 +442,7 @@ async fn handle_datagram(
             health_timeout,
             bpf_lb,
             lb_missing,
+            &health_snapshot,
         )
         .await?
         {
@@ -493,6 +509,7 @@ async fn answer_query(
     health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
 ) -> Result<LookupOutcome> {
     // DNS path is cache-only; probes happen in the refresh loop.
     let _ = health_timeout;
@@ -508,7 +525,14 @@ async fn answer_query(
     };
 
     let candidates =
-        resolve_service_backends(registry, tasks, template_index, network_id, &service_name)
+        resolve_service_backends(
+            registry,
+            tasks,
+            template_index,
+            network_id,
+            &service_name,
+            health_snapshot,
+        )
             .await?;
     let service_port = health_port
         .or_else(|| service_health_port(service_specs, &service_name))
@@ -527,7 +551,7 @@ async fn answer_query(
         healthy_backends = backends.len(),
         "post-health backends"
     );
-    if backends.is_empty() && !candidates.is_empty() {
+    if backends.is_empty() && !candidates.is_empty() && service_port.is_none() {
         warn!(
             target: "network",
             network = %network_id,
@@ -537,7 +561,25 @@ async fn answer_query(
         );
         backends = candidates;
     }
+    sort_backends(&mut backends);
+    let expose_to_host = service_is_public(service_specs, network_id, &service_name);
+
     if backends.is_empty() {
+        if let Some((vip, mac)) = compute_service_vip(registry, network_id, &service_name, &[])? {
+            let _ = program_service_vip(
+                bpf_lb,
+                bpf,
+                lb_missing,
+                registry,
+                network_id,
+                &service_name,
+                vip,
+                mac,
+                &[],
+                expose_to_host,
+            )
+            .await;
+        }
         return Ok(LookupOutcome::NxDomain);
     }
     let mut records = Vec::new();
@@ -560,8 +602,6 @@ async fn answer_query(
             RData::A(addr.into()),
         )
     }));
-
-    let expose_to_host = service_is_public(service_specs, network_id, &service_name);
 
     if let Some((vip, mac)) = compute_service_vip(registry, network_id, &service_name, &backends)?
         && program_service_vip(
@@ -620,6 +660,7 @@ async fn resolve_service_backends(
     template_index: &HashMap<Uuid, (String, String)>,
     network_id: Uuid,
     service_name: &str,
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
 ) -> Result<Vec<BackendAddress>> {
     let attachments = registry
         .list_attachments(Some(network_id))
@@ -636,6 +677,19 @@ async fn resolve_service_backends(
     );
 
     for attachment in attachments {
+        if matches!(
+            health_snapshot.get(&attachment.node_id),
+            Some(HealthStatus::Down)
+        ) {
+            tracing::trace!(
+                target: "network",
+                network = %network_id,
+                attachment = %attachment.id,
+                node = %attachment.node_id,
+                "skipping attachment on down node"
+            );
+            continue;
+        }
         if attachment.state != NetworkAttachmentState::Ready {
             tracing::trace!(
                 target: "network",
@@ -667,7 +721,19 @@ async fn resolve_service_backends(
         let task_entry = cache
             .entry(attachment.task_id)
             .or_insert_with(|| load_task(tasks, attachment.task_id));
-        let task = task_entry.as_ref();
+        let task = match task_entry.as_ref() {
+            Some(task) => task,
+            None => {
+                tracing::debug!(
+                    target: "network",
+                    network = %network_id,
+                    attachment = %attachment.id,
+                    task = %attachment.task_id,
+                    "skipping attachment; task record missing"
+                );
+                continue;
+            }
+        };
 
         let mut template_match = false;
         if let Some(template) = attachment.template_name.as_deref() {
@@ -676,12 +742,10 @@ async fn resolve_service_backends(
         if let Some(service) = attachment.service_name.as_deref() {
             template_match |= service.eq_ignore_ascii_case(service_name);
         }
-        if let Some(task) = task {
-            if let Some(meta) = task.service_metadata.as_ref() {
-                template_match |= meta.template.eq_ignore_ascii_case(service_name);
-            }
-            template_match |= task.name.eq_ignore_ascii_case(service_name);
+        if let Some(meta) = task.service_metadata.as_ref() {
+            template_match |= meta.template.eq_ignore_ascii_case(service_name);
         }
+        template_match |= task.name.eq_ignore_ascii_case(service_name);
         if let Some((_, template)) = template_index.get(&attachment.task_id) {
             template_match |= template.eq_ignore_ascii_case(service_name);
         }
@@ -699,18 +763,40 @@ async fn resolve_service_backends(
             continue;
         }
 
-        if let Some(task) = task {
-            if task.state != ContainerState::Running {
-                tracing::debug!(
-                    target: "network",
-                    network = %network_id,
-                    attachment = %attachment.id,
-                    task = %task.id,
-                    state = ?task.state,
-                    "skipping attachment; task not running"
-                );
-                continue;
+        if task.node_id != attachment.node_id {
+                if attachment_is_newer_than_task(&attachment, task) {
+                    tracing::debug!(
+                        target: "network",
+                        network = %network_id,
+                        attachment = %attachment.id,
+                        task = %task.id,
+                        expected_node = %task.node_id,
+                        actual_node = %attachment.node_id,
+                        "keeping attachment; task record appears stale"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "network",
+                        network = %network_id,
+                        attachment = %attachment.id,
+                        task = %task.id,
+                        expected_node = %task.node_id,
+                        actual_node = %attachment.node_id,
+                        "skipping attachment; task moved to another node"
+                    );
+                    continue;
+                }
             }
+        if task.state != ContainerState::Running {
+            tracing::debug!(
+                target: "network",
+                network = %network_id,
+                attachment = %attachment.id,
+                task = %task.id,
+                state = ?task.state,
+                "skipping attachment; task not running"
+            );
+            continue;
         }
         let ip_addr = match ip_text.parse::<Ipv4Addr>() {
             Ok(addr) => addr,
@@ -752,10 +838,58 @@ async fn resolve_service_backends(
     Ok(results)
 }
 
+/// Load the most relevant task value so discovery follows the current scheduling decision.
 fn load_task(tasks: &TaskStore, id: Uuid) -> Option<TaskValue> {
     let key = UuidKey::from(id);
     let snapshot = tasks.get_snapshot(&key).ok()??;
-    snapshot.as_slice().last().cloned()
+    select_best_task_value(snapshot.as_slice())
+}
+
+/// Decide whether an attachment should be trusted over a stale task record during convergence.
+fn attachment_is_newer_than_task(
+    attachment: &crate::network::types::NetworkAttachmentValue,
+    task: &TaskValue,
+) -> bool {
+    let attachment_ts = attachment_revision_timestamp(attachment);
+    let task_ts = task_revision_timestamp(task);
+
+    match (attachment_ts, task_ts) {
+        (Some(attachment_ts), Some(task_ts)) => attachment_ts >= task_ts,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => false,
+    }
+}
+
+/// Extract a comparable revision timestamp from an attachment to resolve reschedule races.
+fn attachment_revision_timestamp(
+    attachment: &crate::network::types::NetworkAttachmentValue,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    parse_rfc3339(attachment.task_updated_at.as_deref())
+        .or_else(|| parse_rfc3339(Some(&attachment.updated_at)))
+        .or_else(|| parse_rfc3339(Some(&attachment.created_at)))
+}
+
+/// Extract a comparable revision timestamp from a task to detect stale task records.
+fn task_revision_timestamp(task: &TaskValue) -> Option<chrono::DateTime<chrono::Utc>> {
+    parse_rfc3339(Some(&task.updated_at)).or_else(|| parse_rfc3339(Some(&task.created_at)))
+}
+
+/// Parse RFC3339 timestamps from optional string inputs for revision comparisons.
+fn parse_rfc3339(raw: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = raw?;
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .ok()
+}
+
+/// Sort backend endpoints deterministically so LB programming is stable across refreshes.
+fn sort_backends(backends: &mut Vec<BackendAddress>) {
+    backends.sort_by(|a, b| {
+        let a_ip = u32::from(a.ip);
+        let b_ip = u32::from(b.ip);
+        a_ip.cmp(&b_ip).then_with(|| a.mac.cmp(&b.mac))
+    });
 }
 
 fn build_task_template_index(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (String, String)> {
@@ -1297,11 +1431,13 @@ async fn refresh_network_services(
     bpf_lb: &BpfLoadBalancer,
     nodeport: &NodePortManager,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
+    health_monitor: &Arc<HealthMonitor>,
 ) -> Result<()> {
     let service_specs = services.list().context("load service specs for refresh")?;
     let template_index = build_task_template_index(&service_specs);
     let names = services_for_network(&service_specs, network_id);
     let mut nodeport_entries = Vec::new();
+    let health_snapshot = health_monitor.snapshot();
 
     for service_name in names {
         let mappings = refresh_single_service(
@@ -1317,6 +1453,7 @@ async fn refresh_network_services(
             health_timeout,
             bpf_lb,
             lb_missing,
+            &health_snapshot,
         )
         .await?;
         nodeport_entries.extend(mappings);
@@ -1362,9 +1499,17 @@ async fn refresh_single_service(
     health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
 ) -> Result<Vec<NodePortMapping>> {
-    let candidates =
-        resolve_service_backends(registry, tasks, template_index, network_id, service_name).await?;
+    let candidates = resolve_service_backends(
+        registry,
+        tasks,
+        template_index,
+        network_id,
+        service_name,
+        health_snapshot,
+    )
+    .await?;
     let service_port = health_port
         .or_else(|| service_health_port(service_specs, service_name))
         .and_then(|port| if port == 0 { None } else { Some(port) });
@@ -1381,7 +1526,8 @@ async fn refresh_single_service(
     )
     .await;
 
-    if backends.is_empty() && !candidates.is_empty() {
+    let health_checks_enabled = service_port.is_some();
+    if backends.is_empty() && !candidates.is_empty() && !health_checks_enabled {
         warn!(
             target: "network",
             network = %network_id,
@@ -1391,8 +1537,24 @@ async fn refresh_single_service(
         );
         backends = candidates;
     }
+    sort_backends(&mut backends);
 
     if backends.is_empty() {
+        if let Some((vip, mac)) = compute_service_vip(registry, network_id, service_name, &[])? {
+            let _ = program_service_vip(
+                bpf_lb,
+                bpf,
+                lb_missing,
+                registry,
+                network_id,
+                service_name,
+                vip,
+                mac,
+                &[],
+                service_is_public(service_specs, network_id, service_name),
+            )
+            .await;
+        }
         return Ok(Vec::new());
     }
 

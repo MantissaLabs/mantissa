@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use crdt_store::uuid_key::UuidKey;
 use tokio::time::{Duration, interval};
 use tracing::warn;
@@ -41,6 +42,20 @@ impl TaskManager {
             .network_registry
             .list_attachments(None)
             .context("list attachments for repair")?;
+        let mut attachment_index: HashMap<
+            Uuid,
+            HashMap<Uuid, (NetworkAttachmentState, Option<String>)>,
+        > =
+            HashMap::new();
+        for attachment in &attachments {
+            attachment_index
+                .entry(attachment.task_id)
+                .or_default()
+                .insert(
+                    attachment.network_id,
+                    (attachment.state, attachment.task_updated_at.clone()),
+                );
+        }
 
         for attachment in attachments {
             if attachment.node_id != self.local_node_id {
@@ -155,6 +170,80 @@ impl TaskManager {
             }
         }
 
+        let (entries, _) = self
+            .store
+            .load_all()
+            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
+
+        for (_key, snapshot) in entries {
+            let Some(value) = select_best_task_value(snapshot.as_slice()) else {
+                continue;
+            };
+            if value.node_id != self.local_node_id {
+                continue;
+            }
+            if value.networks.is_empty() {
+                continue;
+            }
+            if !matches!(value.state, ContainerState::Running) {
+                continue;
+            }
+
+            let known = attachment_index.get(&value.id);
+            let missing = value.networks.iter().any(|network_id| {
+                let state = known.and_then(|map| map.get(network_id)).map(|entry| entry.0);
+                !matches!(
+                    state,
+                    Some(NetworkAttachmentState::Ready | NetworkAttachmentState::Configuring)
+                )
+            });
+
+            let mut needs_refresh = missing;
+            if !needs_refresh {
+                if let Some(revision) = task_revision_timestamp(&value) {
+                    for network_id in &value.networks {
+                        let observed = known
+                            .and_then(|map| map.get(network_id))
+                            .and_then(|entry| entry.1.as_deref());
+                        if observed != Some(revision.as_str()) {
+                            needs_refresh = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !needs_refresh {
+                continue;
+            }
+
+            let container_id = {
+                let guard = self.local_containers.lock().await;
+                guard
+                    .get(&value.id)
+                    .cloned()
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| format!("mantissa-{}", value.id))
+            };
+
+            if let Err(err) = self
+                .ensure_runtime_attachments(
+                    value.id,
+                    &container_id,
+                    &value.networks,
+                    value.service_metadata.as_ref(),
+                )
+                .await
+            {
+                warn!(
+                    target: "task",
+                    task = %value.id,
+                    container = %container_id,
+                    "failed to restore missing attachments for running task: {err:#}"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -250,11 +339,19 @@ impl TaskManager {
         // Only clean up orphaned attachments when the task already exists in the store. During
         // initial creation (before we persist the TaskSpec) this would incorrectly delete
         // attachments we just created for earlier tasks in the same batch.
-        let has_snapshot = self
+        let snapshot = self
             .store
             .get_snapshot(&UuidKey::from(task_id))
-            .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?
-            .is_some();
+            .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?;
+        let (has_snapshot, task_revision) = match snapshot {
+            Some(values) => (
+                true,
+                select_best_task_value(values.as_slice())
+                    .as_ref()
+                    .and_then(task_revision_timestamp),
+            ),
+            None => (false, None),
+        };
         if has_snapshot {
             self.cleanup_orphaned_local_attachments()
                 .await
@@ -354,6 +451,12 @@ impl TaskManager {
                             label_changed = true;
                         }
                     }
+                    if let Some(revision) = task_revision.as_deref() {
+                        if value.task_updated_at.as_deref() != Some(revision) {
+                            value.task_updated_at = Some(revision.to_string());
+                            label_changed = true;
+                        }
+                    }
 
                     (
                         value,
@@ -371,6 +474,7 @@ impl TaskManager {
                         node_id: self.local_node_id,
                         container_id: container_id.to_string(),
                         network_id: *network_id,
+                        task_updated_at: task_revision.clone(),
                         requested_ip: None,
                         assigned_ip: None,
                         mac: None,
@@ -512,18 +616,26 @@ impl TaskManager {
     }
 
     pub(super) async fn cleanup_orphaned_local_attachments(&self) -> Result<()> {
+        const ORPHAN_ATTACHMENT_GRACE_SECS: i64 = 30;
+
         let attachments = self
             .network_registry
             .list_attachments(None)
             .context("list attachments for orphan cleanup")?;
 
         for attachment in attachments {
-            let task_state = self
+            let task_value = self
                 .store
                 .get_snapshot(&UuidKey::from(attachment.task_id))
                 .with_context(|| format!("lookup task {}", attachment.task_id))?
-                .and_then(|snap| select_best_task_value(snap.as_slice()))
-                .map(|value| value.state);
+                .and_then(|snap| select_best_task_value(snap.as_slice()));
+            let task_state = task_value
+                .as_ref()
+                .map(|value| value.state.clone());
+            let task_owner = task_value.as_ref().map(|value| value.node_id);
+            let task_revision = task_value
+                .as_ref()
+                .and_then(task_revision_timestamp);
 
             let should_remove = match task_state {
                 None => true,
@@ -538,27 +650,41 @@ impl TaskManager {
                 continue;
             }
 
-            if attachment.node_id == self.local_node_id {
-                if let Err(err) = self
-                    .attachment_provisioner
-                    .teardown_attachment(attachment.id)
-                    .await
-                {
-                    warn!(
-                        target: "task",
-                        attachment = %attachment.id,
-                        error = %err,
-                        "failed to teardown orphaned attachment interface"
-                    );
-                }
+            if !attachment_age_exceeds(&attachment, ORPHAN_ATTACHMENT_GRACE_SECS) {
+                continue;
             }
 
-            if let Err(err) = self.network_registry.remove_attachment(attachment.id).await {
+            if attachment.node_id != self.local_node_id {
+                continue;
+            }
+
+            if matches!(task_owner, Some(owner) if owner != self.local_node_id) {
+                let _ = self
+                    .attachment_provisioner
+                    .teardown_attachment(attachment.id)
+                    .await;
+                continue;
+            }
+
+            let mut removing = attachment.clone();
+            if let Some(revision) = task_revision.as_deref() {
+                if removing.task_updated_at.as_deref() != Some(revision) {
+                    removing.task_updated_at = Some(revision.to_string());
+                }
+            }
+            removing.set_state(NetworkAttachmentState::Removing, None);
+            let _ = self.network_registry.upsert_attachment(removing).await;
+
+            if let Err(err) = self
+                .attachment_provisioner
+                .teardown_attachment(attachment.id)
+                .await
+            {
                 warn!(
                     target: "task",
                     attachment = %attachment.id,
                     error = %err,
-                    "failed to remove orphaned attachment record"
+                    "failed to teardown orphaned attachment interface"
                 );
             }
         }
@@ -572,6 +698,12 @@ impl TaskManager {
         task_id: Uuid,
         keep: HashSet<Uuid>,
     ) -> Result<()> {
+        let (allow_registry_updates, task_revision) = match self.load_spec(task_id).await {
+            Ok(spec) if spec.node_id == self.local_node_id => {
+                (true, task_revision_from_spec(&spec))
+            }
+            _ => (false, None),
+        };
         let attachments = self
             .network_registry
             .list_attachments_for_task(task_id)
@@ -582,6 +714,19 @@ impl TaskManager {
                 continue;
             }
 
+            if !allow_registry_updates {
+                let _ = self
+                    .attachment_provisioner
+                    .teardown_attachment(attachment.id)
+                    .await;
+                continue;
+            }
+
+            if let Some(revision) = task_revision.as_deref() {
+                if attachment.task_updated_at.as_deref() != Some(revision) {
+                    attachment.task_updated_at = Some(revision.to_string());
+                }
+            }
             attachment.set_state(NetworkAttachmentState::Removing, None);
             if let Err(err) = self
                 .network_registry
@@ -600,12 +745,7 @@ impl TaskManager {
                 .teardown_attachment(attachment.id)
                 .await
             {
-                Ok(_) => {
-                    self.network_registry
-                        .remove_attachment(attachment.id)
-                        .await
-                        .context("failed to remove runtime attachment entry")?;
-                }
+                Ok(_) => {}
                 Err(err) => {
                     warn!(
                         target: "task",
@@ -620,5 +760,45 @@ impl TaskManager {
         }
 
         Ok(())
+    }
+}
+
+/// Returns true when an attachment has not been updated within the provided grace window.
+fn attachment_age_exceeds(attachment: &NetworkAttachmentValue, grace_secs: i64) -> bool {
+    let anchor = chrono::DateTime::parse_from_rfc3339(&attachment.updated_at)
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(&attachment.created_at));
+
+    match anchor {
+        Ok(anchor) => {
+            let anchor = anchor.with_timezone(&Utc);
+            Utc::now().signed_duration_since(anchor) >= chrono::Duration::seconds(grace_secs)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Extract a stable revision timestamp from a task value so attachment updates track reschedules.
+fn task_revision_timestamp(
+    value: &crate::task::types::TaskValue,
+) -> Option<String> {
+    if !value.updated_at.is_empty() {
+        Some(value.updated_at.clone())
+    } else if !value.created_at.is_empty() {
+        Some(value.created_at.clone())
+    } else {
+        None
+    }
+}
+
+/// Extract a stable revision timestamp from a task spec to label attachment teardown updates.
+fn task_revision_from_spec(
+    spec: &crate::task::types::TaskSpec,
+) -> Option<String> {
+    if !spec.updated_at.is_empty() {
+        Some(spec.updated_at.clone())
+    } else if !spec.created_at.is_empty() {
+        Some(spec.created_at.clone())
+    } else {
+        None
     }
 }

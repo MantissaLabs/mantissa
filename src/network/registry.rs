@@ -4,6 +4,7 @@ use crate::network::types::{
 };
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
 use crdt_store::uuid_key::UuidKey;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -186,10 +187,7 @@ impl NetworkRegistry {
     pub async fn remove_attachments_for_network(&self, network_id: Uuid) -> Result<()> {
         let attachments = self.list_attachments(Some(network_id))?;
         for attachment in attachments {
-            self.attachments
-                .remove(&UuidKey::from(attachment.id))
-                .await
-                .map_err(|e| anyhow!("network attachment remove failed: {e}"))?;
+            self.remove_attachment(attachment.id).await?;
         }
         Ok(())
     }
@@ -206,7 +204,7 @@ impl NetworkRegistry {
 
         let mut list = Vec::with_capacity(entries.len());
         for (_key, snapshot) in entries {
-            if let Some(value) = snapshot.as_slice().last().cloned() {
+            if let Some(value) = select_best_attachment_value(snapshot.as_slice()) {
                 if let Some(network_id) = network_filter {
                     if value.network_id != network_id {
                         continue;
@@ -290,6 +288,99 @@ impl NetworkRegistry {
             NetworkPeerState::Error => 2,
             NetworkPeerState::Removing => 1,
         }
+    }
+}
+
+/// Picks the canonical attachment value from concurrent MVReg versions.
+fn select_best_attachment_value(
+    values: &[NetworkAttachmentValue],
+) -> Option<NetworkAttachmentValue> {
+    let mut best: Option<&NetworkAttachmentValue> = None;
+    for value in values {
+        match best {
+            None => best = Some(value),
+            Some(current) => {
+                if should_prefer_attachment(current, value) {
+                    best = Some(value);
+                }
+            }
+        }
+    }
+    best.cloned()
+}
+
+/// Decide which attachment value should win when multiple updates exist.
+fn should_prefer_attachment(
+    current: &NetworkAttachmentValue,
+    candidate: &NetworkAttachmentValue,
+) -> bool {
+    match (
+        attachment_revision_timestamp(current),
+        attachment_revision_timestamp(candidate),
+    ) {
+        (Some(current_rev), Some(candidate_rev)) => {
+            if candidate_rev > current_rev {
+                return true;
+            } else if candidate_rev < current_rev {
+                return false;
+            }
+        }
+        (None, Some(_)) => return true,
+        (Some(_), None) => return false,
+        (None, None) => {}
+    }
+
+    match (
+        parse_timestamp(&current.updated_at, &current.created_at),
+        parse_timestamp(&candidate.updated_at, &candidate.created_at),
+    ) {
+        (Some(current_ts), Some(candidate_ts)) => {
+            if candidate_ts > current_ts {
+                return true;
+            } else if candidate_ts < current_ts {
+                return false;
+            }
+        }
+        (None, Some(_)) => return true,
+        (Some(_), None) => return false,
+        (None, None) => {}
+    }
+
+    let current_rank = attachment_state_rank(current.state);
+    let candidate_rank = attachment_state_rank(candidate.state);
+    match candidate_rank.cmp(&current_rank) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => candidate.node_id > current.node_id,
+    }
+}
+
+/// Extract a task revision timestamp from an attachment so reschedules win over stale removals.
+fn attachment_revision_timestamp(attachment: &NetworkAttachmentValue) -> Option<DateTime<Utc>> {
+    attachment
+        .task_updated_at
+        .as_deref()
+        .and_then(parse_rfc3339)
+}
+
+fn parse_timestamp(updated_at: &str, created_at: &str) -> Option<DateTime<Utc>> {
+    parse_rfc3339(updated_at).or_else(|| parse_rfc3339(created_at))
+}
+
+fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+}
+
+fn attachment_state_rank(state: crate::network::types::NetworkAttachmentState) -> u8 {
+    use crate::network::types::NetworkAttachmentState::*;
+    match state {
+        Removing => 5,
+        Error => 4,
+        Ready => 3,
+        Configuring => 2,
+        Pending => 1,
     }
 }
 

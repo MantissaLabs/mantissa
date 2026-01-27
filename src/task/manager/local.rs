@@ -354,6 +354,27 @@ impl TaskManager {
             }
         }
 
+        for plan in plans {
+            let Some(container_id) = plan.container_id.as_ref() else {
+                continue;
+            };
+            if let Err(err) = self
+                .ensure_runtime_attachments(
+                    plan.id,
+                    container_id,
+                    &plan.networks,
+                    plan.service_metadata.as_ref(),
+                )
+                .await
+            {
+                warn!(
+                    target: "task",
+                    task = %plan.id,
+                    "failed to refresh attachments after commit: {err:#}"
+                );
+            }
+        }
+
         {
             let mut guard = self.local_containers.lock().await;
             for plan in plans {

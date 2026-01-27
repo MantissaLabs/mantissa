@@ -354,6 +354,15 @@ impl ServiceController {
         let slots = build_replica_slots(&spec);
         let slot_targets = compute_slot_targets(spec.id, &spec.tasks, eligible_nodes);
         let desired_ids: HashSet<Uuid> = slots.iter().filter_map(|slot| slot.task_id).collect();
+        let service_degraded = slots.iter().any(|slot| {
+            let Some(task_id) = slot.task_id else {
+                return true;
+            };
+            let Some(task) = inventory.by_id.get(&task_id) else {
+                return true;
+            };
+            node_is_down(task.node_id, health_snapshot) || !task_state_healthy(&task.state)
+        });
 
         self.reconcile_extra_tasks(&spec, inventory, eligible_nodes, &desired_ids)
             .await;
@@ -394,6 +403,7 @@ impl ServiceController {
                         health_snapshot,
                         &slot_targets,
                         &key,
+                        service_degraded,
                     )
                 .await
             {
@@ -489,6 +499,7 @@ impl ServiceController {
         health_snapshot: &HashMap<Uuid, HealthStatus>,
         slot_targets: &HashMap<SlotKey, Uuid>,
         key: &SlotKey,
+        service_degraded: bool,
     ) -> anyhow::Result<()> {
         let Some(desired_node) = slot_targets.get(key).copied() else {
             return Ok(());
@@ -515,6 +526,14 @@ impl ServiceController {
         let Some(task) = task else {
             return Ok(());
         };
+
+        if slot.template.replicas <= 1 {
+            return Ok(());
+        }
+
+        if service_degraded {
+            return Ok(());
+        }
 
         if !task_state_rebalanceable(&task.state) {
             return Ok(());

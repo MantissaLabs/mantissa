@@ -185,6 +185,11 @@ impl Registry {
             .and_then(|value| value.wireguard)
     }
 
+    /// Returns a shared handle to the cluster health monitor.
+    pub fn health_monitor(&self) -> Arc<HealthMonitor> {
+        self.health_monitor.clone()
+    }
+
     /// Returns a best-effort snapshot of the latest `PeerValue` for every active peer.
     ///
     /// This is used by subsystems (like networking) that need to reconcile state based on peer

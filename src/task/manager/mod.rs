@@ -618,7 +618,8 @@ fn container_already_running(err: &ContainerError) -> bool {
     )
 }
 
-fn select_best_task_value(values: &[TaskValue]) -> Option<TaskValue> {
+/// Select the most relevant task value from concurrent CRDT versions for scheduling decisions.
+pub(crate) fn select_best_task_value(values: &[TaskValue]) -> Option<TaskValue> {
     let mut best: Option<&TaskValue> = None;
     for value in values {
         match best {
