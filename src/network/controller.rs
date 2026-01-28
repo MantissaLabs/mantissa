@@ -1334,6 +1334,7 @@ mod platform {
     use crate::network::attachment::{host_access_host_iface_name, host_access_peer_iface_name};
     use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
     use anyhow::{Context, Result, anyhow};
+    use etherparse::{ArpHardwareId, ArpOperation, ArpPacket, EtherType, PacketBuilder};
     use futures::TryStreamExt;
     use libc;
     use netlink_packet_core::{DefaultNla, Nla};
@@ -1814,6 +1815,24 @@ mod platform {
             mac: [u8; 6],
             link_name: &str,
         ) -> Result<()> {
+            let broadcast = [0xffu8; 6];
+            let arp = ArpPacket::new(
+                ArpHardwareId::ETHERNET,
+                EtherType::IPV4,
+                ArpOperation::REQUEST,
+                &mac,
+                &ip.octets(),
+                &[0u8; 6],
+                &ip.octets(),
+            )
+            .with_context(|| format!("build gratuitous arp payload for {link_name}"))?;
+
+            let builder = PacketBuilder::ethernet2(mac, broadcast).arp(arp);
+            let mut frame = Vec::with_capacity(builder.size());
+            builder
+                .write(&mut frame)
+                .with_context(|| format!("encode gratuitous arp for {link_name}"))?;
+
             let fd = unsafe {
                 libc::socket(
                     libc::AF_PACKET,
@@ -1826,26 +1845,12 @@ mod platform {
                     .with_context(|| format!("open raw socket for {link_name}"));
             }
 
-            let mut frame = [0u8; 42];
-            frame[..6].copy_from_slice(&[0xff; 6]);
-            frame[6..12].copy_from_slice(&mac);
-            frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
-            frame[14..16].copy_from_slice(&1u16.to_be_bytes());
-            frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
-            frame[18] = 6;
-            frame[19] = 4;
-            frame[20..22].copy_from_slice(&1u16.to_be_bytes());
-            frame[22..28].copy_from_slice(&mac);
-            frame[28..32].copy_from_slice(&ip.octets());
-            frame[32..38].copy_from_slice(&[0u8; 6]);
-            frame[38..42].copy_from_slice(&ip.octets());
-
             let mut addr: libc::sockaddr_ll = unsafe { mem::zeroed() };
             addr.sll_family = libc::AF_PACKET as u16;
             addr.sll_protocol = (libc::ETH_P_ARP as u16).to_be();
             addr.sll_ifindex = host_index as i32;
             addr.sll_halen = 6;
-            addr.sll_addr[..6].copy_from_slice(&[0xff; 6]);
+            addr.sll_addr[..6].copy_from_slice(&broadcast);
 
             let sent = unsafe {
                 libc::sendto(

@@ -111,6 +111,7 @@ hkdf = "0.12.4"
 sha2 = "0.10.9"
 tempfile = "3"
 libc = "0.2"
+etherparse = "0.18"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "time"] }

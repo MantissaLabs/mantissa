@@ -1002,6 +1002,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "etherparse"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54a48e7bdc36cdf86876a6890c0840957029374ea07f6697c96fa15898730375"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
 name = "event-listener"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1721,6 +1730,7 @@ dependencies = [
  "defguard_wireguard_rs",
  "dirs",
  "ed25519-dalek",
+ "etherparse",
  "futures",
  "getrandom 0.2.16",
  "health",
