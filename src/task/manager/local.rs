@@ -219,21 +219,57 @@ impl TaskManager {
                 .create_container(create_request)
                 .await;
 
-            let container_id = match create_result {
-                Ok(id) => id,
+            let (container_id, created_fresh) = match create_result {
+                Ok(id) => (id, true),
                 Err(err) => {
-                    if let Some(artifacts) = resolved.artifacts.take() {
-                        if let Err(clean_err) = artifacts.cleanup().await {
-                            warn!(
-                                target: "task",
-                                "failed to cleanup staged secrets after create error for task {}: {clean_err}",
-                                plan.id
-                            );
+                    if super::is_name_conflict(&err) {
+                        match self.resolve_existing_container_id(&plan.container_name).await {
+                            Ok(Some(existing_id)) => (existing_id, false),
+                            Ok(None) => {
+                                if let Some(artifacts) = resolved.artifacts.take() {
+                                    if let Err(clean_err) = artifacts.cleanup().await {
+                                        warn!(
+                                            target: "task",
+                                            "failed to cleanup staged secrets after missing container {}: {clean_err}",
+                                            plan.id
+                                        );
+                                    }
+                                }
+                                let err = anyhow::Error::from(err)
+                                    .context(format!("docker create failed for task {}", plan.name));
+                                return Err(err);
+                            }
+                            Err(inspect_err) => {
+                                if let Some(artifacts) = resolved.artifacts.take() {
+                                    if let Err(clean_err) = artifacts.cleanup().await {
+                                        warn!(
+                                            target: "task",
+                                            "failed to cleanup staged secrets after inspect error for task {}: {clean_err}",
+                                            plan.id
+                                        );
+                                    }
+                                }
+                                let err = anyhow::Error::from(inspect_err).context(format!(
+                                    "failed to inspect existing container after name conflict for task {}",
+                                    plan.name
+                                ));
+                                return Err(err);
+                            }
                         }
+                    } else {
+                        if let Some(artifacts) = resolved.artifacts.take() {
+                            if let Err(clean_err) = artifacts.cleanup().await {
+                                warn!(
+                                    target: "task",
+                                    "failed to cleanup staged secrets after create error for task {}: {clean_err}",
+                                    plan.id
+                                );
+                            }
+                        }
+                        let err = anyhow::Error::from(err)
+                            .context(format!("docker create failed for task {}", plan.name));
+                        return Err(err);
                     }
-                    let err = anyhow::Error::from(err)
-                        .context(format!("docker create failed for task {}", plan.name));
-                    return Err(err);
                 }
             };
 
@@ -244,10 +280,36 @@ impl TaskManager {
 
             plan.container_id = Some(container_id.clone());
 
-            self.container_manager
-                .start_container(&container_id)
-                .await
-                .with_context(|| format!("docker start failed for task {}", plan.name))?;
+            match self.container_manager.start_container(&container_id).await {
+                Ok(_) => {}
+                Err(err) => {
+                    if super::container_already_running(&err) {
+                        debug!(
+                            target: "task",
+                            "container {} already running while starting task {}",
+                            container_id,
+                            plan.id
+                        );
+                    } else {
+                        if created_fresh {
+                            if let Err(remove_err) = self
+                                .container_manager
+                                .remove_container(&container_id, true, true)
+                                .await
+                            {
+                                warn!(
+                                    target: "task",
+                                    "failed to remove container {} after start failure: {remove_err}",
+                                    container_id
+                                );
+                            }
+                        }
+                        let err = anyhow::Error::from(err)
+                            .context(format!("docker start failed for task {}", plan.name));
+                        return Err(err);
+                    }
+                }
+            }
 
             if let Err(err) = self
                 .ensure_runtime_attachments(

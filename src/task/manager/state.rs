@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -907,35 +907,77 @@ impl TaskManager {
         Ok(value_to_spec(id, value))
     }
 
-    /// Stops locally running containers that are no longer assigned to this node.
-    pub(super) async fn cleanup_unowned_local_containers(&self) -> Result<(), anyhow::Error> {
+    /// Reconciles the Docker inventory with the task store so stale containers are adopted or removed.
+    ///
+    /// This is the primary defense against daemon restarts that leave containers running without
+    /// corresponding in-memory tracking. By comparing the local container list against the latest
+    /// task assignments, we either adopt the container (if still owned locally) or stop it.
+    pub(super) async fn reconcile_local_container_inventory(&self) -> Result<(), anyhow::Error> {
         const UNOWNED_TASK_GRACE_SECS: i64 = 5;
 
-        let local = self.local_containers.lock().await.clone();
-        for (task_id, container_name) in local {
-            let snapshot = self
-                .store
-                .get_snapshot(&UuidKey::from(task_id))
-                .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?;
+        let containers = self.container_manager.list_containers(None).await?;
+        let (entries, _) = self
+            .store
+            .load_all()
+            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
 
-            let Some(snapshot) = snapshot else {
-                self.stop_unowned_container(task_id, &container_name, true).await;
+        let mut task_index: HashMap<Uuid, TaskValue> = HashMap::new();
+        for (key, snapshot) in entries {
+            if let Some(value) = select_best_task_value(snapshot.as_slice()) {
+                task_index.insert(key.to_uuid(), value);
+            }
+        }
+
+        for container in containers {
+            let Some(task_id) = container
+                .name
+                .strip_prefix("mantissa-")
+                .and_then(|suffix| Uuid::parse_str(suffix).ok())
+            else {
                 continue;
             };
 
-            let Some(value) = select_best_task_value(snapshot.as_slice()) else {
+            let Some(value) = task_index.get(&task_id) else {
+                self.stop_unowned_container(task_id, &container.name, true).await;
                 continue;
             };
 
-            if value.node_id == self.local_node_id {
+            if value.node_id != self.local_node_id {
+                if task_value_recent(value, UNOWNED_TASK_GRACE_SECS) {
+                    continue;
+                }
+                self.stop_unowned_container(task_id, &container.name, false).await;
                 continue;
             }
 
-            if task_value_recent(&value, UNOWNED_TASK_GRACE_SECS) {
-                continue;
+            let container_id = if container.id.is_empty() {
+                container.name.clone()
+            } else {
+                container.id.clone()
+            };
+            {
+                let mut guard = self.local_containers.lock().await;
+                guard.insert(task_id, container_id.clone());
             }
 
-            self.stop_unowned_container(task_id, &container_name, false).await;
+            if matches!(value.state, ContainerState::Running) && !value.networks.is_empty() {
+                if let Err(err) = self
+                    .ensure_runtime_attachments(
+                        task_id,
+                        &container_id,
+                        &value.networks,
+                        value.service_metadata.as_ref(),
+                    )
+                    .await
+                {
+                    warn!(
+                        target: "task",
+                        task = %task_id,
+                        container = %container_id,
+                        "failed to refresh attachments while adopting container: {err:#}"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -1073,10 +1115,10 @@ impl TaskManager {
             });
         }
 
-        if let Err(err) = self.cleanup_unowned_local_containers().await {
+        if let Err(err) = self.reconcile_local_container_inventory().await {
             warn!(
                 target: "task",
-                "failed to cleanup unowned local containers: {err}"
+                "failed to reconcile local container inventory: {err}"
             );
         }
 

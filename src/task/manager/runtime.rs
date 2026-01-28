@@ -252,6 +252,13 @@ impl TaskManager {
         let mut repair_tick = interval(Duration::from_secs(5));
         let mut reconcile_tick = interval(Duration::from_secs(5));
 
+        if let Err(err) = self.reconcile_local_container_inventory().await {
+            warn!(
+                target: "task",
+                "failed to reconcile local containers at startup: {err:#}"
+            );
+        }
+
         loop {
             tokio::select! {
                 _ = repair_tick.tick() => {
