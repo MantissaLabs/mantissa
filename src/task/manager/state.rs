@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::gossip::Message;
+use crate::network::types::{NetworkAttachmentState, NetworkAttachmentValue};
 use crate::scheduler::{SchedulerError, SlotId, SlotState};
 use crate::task::container::ContainerState;
 use crate::task::docker::{
@@ -788,6 +789,10 @@ impl TaskManager {
         &self,
         container_name: &str,
     ) -> Result<Option<String>, ContainerError> {
+        if let Some(id) = self.find_container_id_by_name(container_name).await? {
+            return Ok(Some(id));
+        }
+
         match self
             .container_manager
             .inspect_container(container_name)
@@ -800,6 +805,25 @@ impl TaskManager {
             Err(ContainerError::NotFound(_)) => Ok(None),
             Err(err) => Err(err),
         }
+    }
+
+    /// Locate a container id by name using the lightweight list API.
+    async fn find_container_id_by_name(
+        &self,
+        container_name: &str,
+    ) -> Result<Option<String>, ContainerError> {
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert("name".to_string(), vec![container_name.to_string()]);
+        let candidates = self.container_manager.list_containers(Some(filters)).await?;
+        for candidate in candidates {
+            if candidate.name == container_name {
+                if !candidate.id.is_empty() {
+                    return Ok(Some(candidate.id));
+                }
+                return Ok(Some(candidate.name));
+            }
+        }
+        Ok(None)
     }
 
     /// Ensures that a locally tracked task has completely stopped and released resources.
@@ -961,26 +985,70 @@ impl TaskManager {
             }
 
             if matches!(value.state, ContainerState::Running) && !value.networks.is_empty() {
-                if let Err(err) = self
-                    .ensure_runtime_attachments(
-                        task_id,
-                        &container_id,
-                        &value.networks,
-                        value.service_metadata.as_ref(),
-                    )
-                    .await
+                if self
+                    .attachments_need_refresh(task_id, &value.networks, task_revision(value))
+                    .await?
                 {
-                    warn!(
-                        target: "task",
-                        task = %task_id,
-                        container = %container_id,
-                        "failed to refresh attachments while adopting container: {err:#}"
-                    );
+                    if let Err(err) = self
+                        .ensure_runtime_attachments(
+                            task_id,
+                            &container_id,
+                            &value.networks,
+                            value.service_metadata.as_ref(),
+                        )
+                        .await
+                    {
+                        warn!(
+                            target: "task",
+                            task = %task_id,
+                            container = %container_id,
+                            "failed to refresh attachments while adopting container: {err:#}"
+                        );
+                    }
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Decide whether local attachments should be refreshed for the given task.
+    async fn attachments_need_refresh(
+        &self,
+        task_id: Uuid,
+        networks: &[Uuid],
+        revision: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        let existing = self
+            .network_registry
+            .list_attachments_for_task(task_id)
+            .context("list attachments for inventory refresh")?;
+        let mut index: HashMap<Uuid, NetworkAttachmentValue> = HashMap::new();
+        for attachment in existing {
+            index.entry(attachment.network_id).or_insert(attachment);
+        }
+
+        for network_id in networks {
+            let Some(attachment) = index.get(network_id) else {
+                return Ok(true);
+            };
+            if attachment.node_id != self.local_node_id {
+                return Ok(true);
+            }
+            if !matches!(
+                attachment.state,
+                NetworkAttachmentState::Ready | NetworkAttachmentState::Configuring
+            ) {
+                return Ok(true);
+            }
+            if let Some(revision) = revision {
+                if attachment.task_updated_at.as_deref() != Some(revision) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     /// Tears down a locally running container without mutating replicated task state.
@@ -1137,5 +1205,16 @@ fn task_value_recent(value: &TaskValue, grace_secs: i64) -> bool {
             Utc::now().signed_duration_since(anchor) < chrono::Duration::seconds(grace_secs)
         }
         Err(_) => false,
+    }
+}
+
+/// Extract a stable revision timestamp to compare attachment freshness.
+fn task_revision(value: &TaskValue) -> Option<&str> {
+    if !value.updated_at.is_empty() {
+        Some(value.updated_at.as_str())
+    } else if !value.created_at.is_empty() {
+        Some(value.created_at.as_str())
+    } else {
+        None
     }
 }

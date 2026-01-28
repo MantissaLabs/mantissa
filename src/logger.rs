@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use once_cell::sync::OnceCell;
+use std::env;
 use std::io;
 use std::io::IsTerminal;
 use time::{UtcOffset, format_description::FormatItem, macros::format_description};
@@ -31,7 +32,10 @@ pub fn init() -> io::Result<()> {
     // Route `log` crate records into `tracing` (idempotent: ignore error).
     let _ = LogTracer::init();
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if !rust_log_mentions("bollard") {
+        filter = filter.add_directive("bollard::docker=warn".parse().unwrap());
+    }
     let ansi = std::io::stderr().is_terminal();
     let timer = local_timer();
     let layer = fmt::layer()
@@ -74,7 +78,11 @@ pub fn init_for_tests() {
     let _ = LogTracer::init(); // idempotent
 
     // Default to debug in tests unless overridden.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    let mut filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    if !rust_log_mentions("bollard") {
+        filter = filter.add_directive("bollard::docker=warn".parse().unwrap());
+    }
 
     let timer = local_timer();
     let layer = fmt::layer()
@@ -91,4 +99,11 @@ pub fn init_for_tests() {
         .try_init();
 
     let _ = INIT.set(());
+}
+
+/// Return true when `RUST_LOG` explicitly references the provided target substring.
+fn rust_log_mentions(target: &str) -> bool {
+    env::var("RUST_LOG")
+        .map(|raw| raw.contains(target))
+        .unwrap_or(false)
 }

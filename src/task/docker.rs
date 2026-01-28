@@ -461,7 +461,7 @@ impl ContainerManager for DockerContainerManager {
         &self,
         filters: Option<HashMap<String, Vec<String>>>,
     ) -> ContainerResult<Vec<ContainerInfo>> {
-        debug!("Listing containers with filters: {:?}", filters);
+        tracing::trace!(target: "task::docker", ?filters, "listing containers");
 
         let options = ListContainersOptions {
             all: true,
