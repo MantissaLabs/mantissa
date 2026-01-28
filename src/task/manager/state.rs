@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::gossip::Message;
 use crate::network::types::{NetworkAttachmentState, NetworkAttachmentValue};
-use crate::scheduler::{SchedulerError, SlotId, SlotState};
+use crate::scheduler::{SchedulerError, SlotId, SlotReservationRequest, SlotState};
 use crate::task::container::ContainerState;
 use crate::task::docker::{
     ContainerCreateRequest, ContainerError, ResourceLimits, RestartPolicyConfig, RestartPolicyType,
@@ -1190,7 +1190,125 @@ impl TaskManager {
             );
         }
 
+        if let Err(err) = self.reconcile_local_slot_reservations().await {
+            warn!(
+                target: "task",
+                "failed to reconcile local scheduler reservations: {err}"
+            );
+        }
+
         Ok(())
+    }
+
+    /// Ensures the scheduler snapshot reserves slots for locally running tasks so rollbacks or
+    /// restarts cannot leave active containers unaccounted for in the slot table.
+    pub(super) async fn reconcile_local_slot_reservations(&self) -> Result<(), anyhow::Error> {
+        const MAX_ATTEMPTS: usize = 5;
+
+        let mut attempt = 0usize;
+        loop {
+            let snapshot = match self.scheduler.snapshot().await {
+                Some(snapshot) => snapshot,
+                None => return Ok(()),
+            };
+
+            let (actives, _) = self
+                .store
+                .load_all()
+                .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
+
+            let mut desired: HashMap<SlotId, Uuid> = HashMap::new();
+            let mut conflicts: HashSet<SlotId> = HashSet::new();
+
+            for (key, values) in actives {
+                let Some(value) = select_best_task_value(values.as_slice()) else {
+                    continue;
+                };
+                if value.node_id != self.local_node_id {
+                    continue;
+                }
+                if !task_requires_slots(&value.state) {
+                    continue;
+                }
+                if value.slot_ids.is_empty() {
+                    continue;
+                }
+
+                let task_id = key.to_uuid();
+                for slot_id in &value.slot_ids {
+                    if conflicts.contains(slot_id) {
+                        continue;
+                    }
+                    if let Some(existing) = desired.insert(*slot_id, task_id) {
+                        conflicts.insert(*slot_id);
+                        desired.remove(slot_id);
+                        warn!(
+                            target: "task",
+                            slot_id = *slot_id,
+                            task_a = %existing,
+                            task_b = %task_id,
+                            "slot conflict detected while reconciling reservations"
+                        );
+                    }
+                }
+            }
+
+            if desired.is_empty() {
+                return Ok(());
+            }
+
+            let mut requests = Vec::new();
+            for slot in &snapshot.slots {
+                let Some(task_id) = desired.get(&slot.slot_id).copied() else {
+                    continue;
+                };
+                match &slot.state {
+                    SlotState::Free => {
+                        requests.push(SlotReservationRequest {
+                            slot_id: slot.slot_id,
+                            owner: self.local_node_id,
+                            task_id: Some(task_id),
+                        });
+                    }
+                    SlotState::Reserved(reservation) => {
+                        if reservation.owner != self.local_node_id {
+                            warn!(
+                                target: "task",
+                                slot_id = slot.slot_id,
+                                owner = %reservation.owner,
+                                "slot needed by local task is already reserved by another node"
+                            );
+                        }
+                    }
+                }
+            }
+
+            if requests.is_empty() {
+                return Ok(());
+            }
+
+            match self
+                .scheduler
+                .reserve_slots(snapshot.version, requests)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(SchedulerError::SnapshotMismatch { .. })
+                | Err(SchedulerError::SlotsUnavailable { .. })
+                | Err(SchedulerError::UnknownSlots { .. }) => {
+                    attempt += 1;
+                    if attempt >= MAX_ATTEMPTS {
+                        warn!(
+                            target: "task",
+                            "slot reservation reconciliation exhausted retries"
+                        );
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(err) => return Err(anyhow::anyhow!(err)),
+            }
+        }
     }
 }
 
@@ -1206,6 +1324,18 @@ fn task_value_recent(value: &TaskValue, grace_secs: i64) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Returns true when a task state should retain scheduler slot reservations.
+fn task_requires_slots(state: &ContainerState) -> bool {
+    matches!(
+        state,
+        ContainerState::Pending
+            | ContainerState::Creating
+            | ContainerState::Running
+            | ContainerState::Paused
+            | ContainerState::Stopping
+    )
 }
 
 /// Extract a stable revision timestamp to compare attachment freshness.

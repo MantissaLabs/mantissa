@@ -661,6 +661,27 @@ impl TaskManager {
                 continue;
             }
 
+            if matches!(attachment.state, NetworkAttachmentState::Removing) {
+                if attachment.node_id == self.local_node_id {
+                    let _ = self
+                        .attachment_provisioner
+                        .teardown_attachment(attachment.id)
+                        .await;
+                }
+                if let Err(err) = self
+                    .network_registry
+                    .remove_attachment(attachment.id)
+                    .await
+                {
+                    warn!(
+                        target: "task",
+                        attachment = %attachment.id,
+                        "failed to remove orphaned attachment record: {err}"
+                    );
+                }
+                continue;
+            }
+
             if attachment.node_id != self.local_node_id {
                 continue;
             }
