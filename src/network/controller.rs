@@ -1806,8 +1806,9 @@ mod platform {
             fs::write(path, value).with_context(|| format!("write sysctl {path}"))
         }
 
-        /// Broadcast a gratuitous ARP for the host-access IP so peers refresh stale neighbor
-        /// entries after the resolver address moves off the bridge and onto the host veth.
+        /// Broadcast an ARP announcement for the host-access IP so peers refresh stale
+        /// neighbor entries after the resolver address moves off the bridge and onto the
+        /// host veth.
         async fn announce_host_access_ip(
             &self,
             host_index: u32,
@@ -1815,23 +1816,8 @@ mod platform {
             mac: [u8; 6],
             link_name: &str,
         ) -> Result<()> {
-            let broadcast = [0xffu8; 6];
-            let arp = ArpPacket::new(
-                ArpHardwareId::ETHERNET,
-                EtherType::IPV4,
-                ArpOperation::REQUEST,
-                &mac,
-                &ip.octets(),
-                &[0u8; 6],
-                &ip.octets(),
-            )
-            .with_context(|| format!("build gratuitous arp payload for {link_name}"))?;
-
-            let builder = PacketBuilder::ethernet2(mac, broadcast).arp(arp);
-            let mut frame = Vec::with_capacity(builder.size());
-            builder
-                .write(&mut frame)
-                .with_context(|| format!("encode gratuitous arp for {link_name}"))?;
+            let frame = Self::build_arp_announcement_frame(mac, ip)
+                .with_context(|| format!("build arp announcement for {link_name}"))?;
 
             let fd = unsafe {
                 libc::socket(
@@ -1850,7 +1836,7 @@ mod platform {
             addr.sll_protocol = (libc::ETH_P_ARP as u16).to_be();
             addr.sll_ifindex = host_index as i32;
             addr.sll_halen = 6;
-            addr.sll_addr[..6].copy_from_slice(&broadcast);
+            addr.sll_addr[..6].copy_from_slice(&[0xff; 6]);
 
             let sent = unsafe {
                 libc::sendto(
@@ -1867,7 +1853,7 @@ mod platform {
 
             if sent < 0 {
                 return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("send gratuitous arp on {link_name}"));
+                    .with_context(|| format!("send arp announcement on {link_name}"));
             }
             if close_result < 0 {
                 return Err(std::io::Error::last_os_error())
@@ -1875,6 +1861,28 @@ mod platform {
             }
 
             Ok(())
+        }
+
+        /// Builds a broadcast ARP announcement frame for the provided IPv4 address.
+        ///
+        /// This packet advertises the host-access IP with the correct MAC so peers update
+        /// their neighbor caches immediately after a reschedule.
+        fn build_arp_announcement_frame(mac: [u8; 6], ip: Ipv4Addr) -> Result<Vec<u8>> {
+            let broadcast = [0xffu8; 6];
+            let arp = ArpPacket::new(
+                ArpHardwareId::ETHERNET,
+                EtherType::IPV4,
+                ArpOperation::REQUEST,
+                &mac,
+                &ip.octets(),
+                &[0u8; 6],
+                &ip.octets(),
+            )?;
+
+            let builder = PacketBuilder::ethernet2(mac, broadcast).arp(arp);
+            let mut frame = Vec::with_capacity(builder.size());
+            builder.write(&mut frame)?;
+            Ok(frame)
         }
 
         /// Remove the specified IPv4 address from the provided link if present.
