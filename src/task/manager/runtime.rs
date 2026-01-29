@@ -726,18 +726,18 @@ impl TaskManager {
         task_id: Uuid,
         keep: HashSet<Uuid>,
     ) -> Result<()> {
-        let (allow_registry_updates, task_revision) = match self.load_spec(task_id).await {
+        let allow_registry_updates = match self.load_spec(task_id).await {
             Ok(spec) if spec.node_id == self.local_node_id => {
-                (true, task_revision_from_spec(&spec))
+                true
             }
-            _ => (false, None),
+            _ => false,
         };
         let attachments = self
             .network_registry
             .list_attachments_for_task(task_id)
             .context("failed to list task attachments for teardown")?;
 
-        for mut attachment in attachments {
+        for attachment in attachments {
             if !keep.is_empty() && keep.contains(&attachment.network_id) {
                 continue;
             }
@@ -748,24 +748,6 @@ impl TaskManager {
                     .teardown_attachment(attachment.id)
                     .await;
                 continue;
-            }
-
-            if let Some(revision) = task_revision.as_deref() {
-                if attachment.task_updated_at.as_deref() != Some(revision) {
-                    attachment.task_updated_at = Some(revision.to_string());
-                }
-            }
-            attachment.set_state(NetworkAttachmentState::Removing, None);
-            if let Err(err) = self
-                .network_registry
-                .upsert_attachment(attachment.clone())
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to mark attachment {} as removing: {err}",
-                    attachment.id
-                );
             }
 
             match self
@@ -780,10 +762,17 @@ impl TaskManager {
                         "failed to teardown attachment {}: {err}",
                         attachment.id
                     );
-                    let mut errored = attachment.clone();
-                    errored.set_state(NetworkAttachmentState::Error, Some(err.to_string()));
-                    let _ = self.network_registry.upsert_attachment(errored).await;
                 }
+            }
+
+            // Explicit teardown requests should remove the attachment record immediately so
+            // callers (and tests) observe prompt cleanup without waiting for the orphan GC loop.
+            if let Err(err) = self.network_registry.remove_attachment(attachment.id).await {
+                warn!(
+                    target: "task",
+                    attachment = %attachment.id,
+                    "failed to remove attachment record after teardown: {err}"
+                );
             }
         }
 
@@ -813,19 +802,6 @@ fn task_revision_timestamp(
         Some(value.updated_at.clone())
     } else if !value.created_at.is_empty() {
         Some(value.created_at.clone())
-    } else {
-        None
-    }
-}
-
-/// Extract a stable revision timestamp from a task spec to label attachment teardown updates.
-fn task_revision_from_spec(
-    spec: &crate::task::types::TaskSpec,
-) -> Option<String> {
-    if !spec.updated_at.is_empty() {
-        Some(spec.updated_at.clone())
-    } else if !spec.created_at.is_empty() {
-        Some(spec.created_at.clone())
     } else {
         None
     }
