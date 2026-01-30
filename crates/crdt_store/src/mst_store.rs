@@ -370,6 +370,31 @@ where
         Ok(ts)
     }
 
+    /// Purge a key locally without writing a tombstone so remote replicas can repopulate it.
+    ///
+    /// This is intended for recovery/testing scenarios where a local store is missing entries
+    /// and should accept the next sync payload, not for user-facing delete operations.
+    pub async fn purge_local(&self, k: &C::Key) -> crate::Result<()> {
+        let w = self.db.begin_write().map_err(into_err)?;
+        {
+            let mut values = w.open_table(T::values()).map_err(into_err)?;
+            let _ = values
+                .remove(Self::encode_key(k).as_slice())
+                .map_err(into_err)?;
+        }
+        {
+            let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
+            let _ = tombs
+                .remove(Self::encode_key(k).as_slice())
+                .map_err(into_err)?;
+        }
+        w.commit().map_err(into_err)?;
+
+        self.rebuild_mst_from_disk().await?;
+        self.bump_change_clock();
+        Ok(())
+    }
+
     /// Merge a remote register for key `k` into durable state and MST, clearing any local tombstone.
     pub async fn merge_register(&self, k: &C::Key, incoming: &C::Reg) -> crate::Result<()> {
         // Read current reg (if any)

@@ -484,15 +484,15 @@ local_test!(services_sync_recovers_missing_entries, {
 
     peer.node
         .services
-        .remove(&UuidKey::from(service_id))
+        .purge_local(&UuidKey::from(service_id))
         .await
-        .expect("remove service from peer store");
+        .expect("purge service from peer store");
     for task_id in &expected_task_ids {
         peer.node
             .tasks
-            .remove(&UuidKey::from(*task_id))
+            .purge_local(&UuidKey::from(*task_id))
             .await
-            .expect("remove task from peer store");
+            .expect("purge task from peer store");
     }
 
     let services_after_remove = peer
