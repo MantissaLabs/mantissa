@@ -41,6 +41,7 @@ impl TaskManager {
             networks: spec.networks.clone(),
             cpu_millis: spec.cpu_millis,
             memory_bytes: spec.memory_bytes,
+            gpu_count: spec.gpu_count,
             env: spec.env.clone(),
             secret_files: spec.secret_files.clone(),
             service_metadata: spec.service_metadata.clone(),
@@ -65,6 +66,37 @@ impl TaskManager {
 
     fn tx(&self) -> Sender<Message> {
         self.tx.clone()
+    }
+
+    /// Resolves GPU device identifiers from reserved slot ids by consulting the
+    /// scheduler snapshot, enabling container runtimes to bind GPUs correctly.
+    async fn gpu_device_ids_for_slots(
+        &self,
+        slot_ids: &[SlotId],
+    ) -> Result<Vec<String>, anyhow::Error> {
+        if slot_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(snapshot) = self.scheduler.snapshot().await else {
+            return Ok(Vec::new());
+        };
+
+        let mut gpu_slots = HashMap::new();
+        for slot in &snapshot.slots {
+            if slot.capacity.gpu_count > 0 {
+                gpu_slots.insert(slot.slot_id, slot.capacity.gpu_count);
+            }
+        }
+
+        let mut ids = Vec::new();
+        for slot_id in slot_ids {
+            if gpu_slots.contains_key(slot_id) {
+                ids.push(slot_id.to_string());
+            }
+        }
+
+        Ok(ids)
     }
 
     /// Broadcasts specs originating from remote peers to the local gossip loop.
@@ -518,7 +550,7 @@ impl TaskManager {
         let mut resolved = self
             .resolve_runtime_secrets(working.id, &working.env, &working.secret_files)
             .await?;
-        let env_vars = if resolved.env.is_empty() {
+        let mut env_vars = if resolved.env.is_empty() {
             None
         } else {
             Some(resolved.env.clone())
@@ -545,6 +577,30 @@ impl TaskManager {
             Some(dns_servers)
         };
 
+        let gpu_device_ids = if working.gpu_count > 0 {
+            let mut ids = self.gpu_device_ids_for_slots(&working.slot_ids).await?;
+            if ids.len() < working.gpu_count as usize {
+                let err = anyhow!(
+                    "task {} requested {} GPU(s) but only {} GPU slot(s) were reserved",
+                    working.name,
+                    working.gpu_count,
+                    ids.len()
+                );
+                let err = self.mark_task_failed(working, err).await;
+                return Err(err);
+            }
+            if ids.len() > working.gpu_count as usize {
+                ids.truncate(working.gpu_count as usize);
+            }
+            Some(ids)
+        } else {
+            None
+        };
+
+        if let Some(device_ids) = gpu_device_ids.as_ref() {
+            super::append_nvidia_visible_devices(&mut env_vars, device_ids);
+        }
+
         let create_request = ContainerCreateRequest {
             name: container_name.clone(),
             image: working.image.clone(),
@@ -559,6 +615,7 @@ impl TaskManager {
             restart_policy,
             resource_limits,
             dns_servers,
+            gpu_device_ids,
         };
 
         let create_outcome = self

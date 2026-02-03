@@ -1877,6 +1877,7 @@ fn make_replica_request(
         command: template.command.clone(),
         cpu_millis: template.cpu_millis,
         memory_bytes: template.memory_bytes,
+        gpu_count: template.gpu_count,
         id: Some(desired_id),
         slot_ids: Vec::new(),
         restart_policy: template.restart_policy.as_ref().map(map_restart_policy),
@@ -2031,6 +2032,7 @@ mod tests {
     use std::collections::HashMap;
 
     /// Builds a minimal task spec for reschedule planning tests.
+    #[allow(dead_code)]
     fn make_task(
         id: Uuid,
         node_id: Uuid,
@@ -2052,6 +2054,7 @@ mod tests {
             slot_id: None,
             cpu_millis: 0,
             memory_bytes: 0,
+            gpu_count: 0,
             restart_policy: None,
             env: Vec::new(),
             secret_files: Vec::new(),
@@ -2076,6 +2079,7 @@ mod tests {
                     replicas: 2,
                     cpu_millis: 0,
                     memory_bytes: 0,
+                    gpu_count: 0,
                     restart_policy: None,
                     env: Vec::new(),
                     secret_files: Vec::new(),
@@ -2092,6 +2096,7 @@ mod tests {
                     replicas: 1,
                     cpu_millis: 0,
                     memory_bytes: 0,
+                    gpu_count: 0,
                     restart_policy: None,
                     env: Vec::new(),
                     secret_files: Vec::new(),
@@ -2165,6 +2170,7 @@ mod tests {
                 replicas: 2,
                 cpu_millis: 0,
                 memory_bytes: 0,
+                gpu_count: 0,
                 restart_policy: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
@@ -2181,6 +2187,7 @@ mod tests {
                 replicas: 1,
                 cpu_millis: 0,
                 memory_bytes: 0,
+                gpu_count: 0,
                 restart_policy: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
@@ -2215,6 +2222,7 @@ mod tests {
                 replicas: 2,
                 cpu_millis: 0,
                 memory_bytes: 0,
+                gpu_count: 0,
                 restart_policy: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
@@ -2231,6 +2239,7 @@ mod tests {
                 replicas: 1,
                 cpu_millis: 0,
                 memory_bytes: 0,
+                gpu_count: 0,
                 restart_policy: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),

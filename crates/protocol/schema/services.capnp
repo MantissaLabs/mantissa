@@ -44,6 +44,9 @@ struct TaskTemplate {
 
   publicProtocol @13 :PublicProtocol;
   # Transport protocol(s) for public port (defaults to tcp)
+
+  gpuCount @14 :UInt32;
+  # Requested GPU count per replica.
 }
 
 enum PublicProtocol {

@@ -125,6 +125,7 @@ fn template_attributes_changed(
         || current.command != desired.command
         || current.cpu_millis != desired.cpu_millis
         || current.memory_bytes != desired.memory_bytes
+        || current.gpu_count != desired.gpu_count
         || current.restart_policy != desired.restart_policy
         || current.networks != desired.networks
 }

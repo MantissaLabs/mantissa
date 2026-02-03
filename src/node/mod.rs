@@ -176,6 +176,31 @@ impl node::Server for Node {
                     disk.set_free(disk_info.free);
                 }
             }
+
+            // GPU
+            {
+                let mut gpu = system.reborrow().init_gpu();
+                if let Some(gpu_info) = info.gpu_info {
+                    gpu.set_vendor(&gpu_info.vendor);
+                    let mut devices = gpu
+                        .reborrow()
+                        .init_devices(gpu_info.devices.len() as u32);
+                    for (idx, device) in gpu_info.devices.iter().enumerate() {
+                        let mut entry = devices.reborrow().get(idx as u32);
+                        entry.set_index(device.index);
+                        entry.set_uuid(device.uuid.as_deref().unwrap_or(""));
+                        entry.set_name(&device.name);
+                        entry.set_memory_total_bytes(device.memory_total_bytes);
+                        entry.set_memory_free_bytes(device.memory_free_bytes);
+                        entry.set_compute_capability(
+                            device.compute_capability.as_deref().unwrap_or(""),
+                        );
+                    }
+                } else {
+                    gpu.set_vendor("");
+                    gpu.reborrow().init_devices(0);
+                }
+            }
         }
 
         match builder.get_root::<SystemInfo::Builder>() {

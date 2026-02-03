@@ -42,19 +42,20 @@ pub async fn list(cfg: &ClientConfig, states: &[TasksListState]) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tIMAGE\tSLOT\tCPU(m)\tMEM(MiB)\tCOMMAND\tNODE\tSTATUS\tCREATED"
+        "ID\tNAME\tIMAGE\tSLOT\tCPU(m)\tMEM(MiB)\tGPU\tCOMMAND\tNODE\tSTATUS\tCREATED"
     )?;
 
     for spec in specs {
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             spec.id,
             spec.name,
             spec.image,
             spec.slot,
             spec.cpu_millis,
             spec.memory_mib,
+            spec.gpu_count,
             spec.command,
             spec.node,
             spec.state,
@@ -76,6 +77,7 @@ struct TaskRow {
     slot: String,
     cpu_millis: u64,
     memory_mib: u64,
+    gpu_count: u32,
     command: String,
     node: String,
     state: String,
@@ -105,6 +107,7 @@ impl TaskRow {
 
         let cpu_millis = spec.get_cpu_millis();
         let memory_mib = spec.get_memory_bytes() / (1024 * 1024);
+        let gpu_count = spec.get_gpu_count();
 
         let mut command = Vec::new();
         for arg in spec.get_command()?.iter() {
@@ -124,6 +127,7 @@ impl TaskRow {
             slot,
             cpu_millis,
             memory_mib,
+            gpu_count,
             command: if command.is_empty() {
                 "-".to_string()
             } else {

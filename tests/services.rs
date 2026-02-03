@@ -87,6 +87,7 @@ local_test!(services_gossip_propagates_across_peers, {
                 replicas: 1,
                 cpu_millis: 0,
                 memory_bytes: 0,
+                gpu_count: 0,
                 restart_policy: None,
                 env: vec![TaskEnvironmentVariable {
                     name: "DEMO_SECRET".into(),
@@ -183,6 +184,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
         replicas: 1,
         cpu_millis: 0,
         memory_bytes: 0,
+        gpu_count: 0,
         restart_policy: None,
         env: vec![TaskEnvironmentVariable {
             name: "ACK_SECRET".into(),
@@ -269,6 +271,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                 replicas: 1,
                 cpu_millis: 500_000, // intentionally exceeds any single-node capacity
                 memory_bytes: 8 * 1024 * 1024 * 1024, // 8 GiB to force allocation failure
+                gpu_count: 0,
                 restart_policy: None,
                 env: vec![TaskEnvironmentVariable {
                     name: "CAPACITY_SECRET".into(),
@@ -546,6 +549,7 @@ local_test!(services_redeploy_scales_replicas, {
         replicas: 1,
         cpu_millis: 100,
         memory_bytes: 32 * 1024 * 1024,
+        gpu_count: 0,
         restart_policy: None,
         env: Vec::new(),
         secret_files: Vec::new(),
@@ -655,6 +659,7 @@ local_test!(services_redeploy_updates_resources, {
         replicas: 1,
         cpu_millis: 100,
         memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
         restart_policy: None,
         env: Vec::new(),
         secret_files: Vec::new(),
@@ -857,6 +862,7 @@ fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskS
                 replicas: task.replicas,
                 cpu_millis: task.resources.cpu_millis,
                 memory_bytes: task.resources.memory_bytes(),
+                gpu_count: 0,
                 restart_policy: task.restart_policy.as_ref().map(|policy| {
                     ServiceTaskRestartPolicy {
                         name: match policy.name {

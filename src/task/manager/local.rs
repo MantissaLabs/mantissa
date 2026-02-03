@@ -91,6 +91,7 @@ impl TaskManager {
                 slot_id,
                 cpu_millis: plan.requested_cpu_millis,
                 memory_bytes: plan.requested_memory_bytes,
+                gpu_count: plan.requested_gpu_count,
                 restart_policy: plan.restart_policy.clone(),
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),
@@ -187,7 +188,7 @@ impl TaskManager {
             let mut resolved = self
                 .resolve_runtime_secrets(plan.id, &plan.env, &plan.secret_files)
                 .await?;
-            let env_vars = if resolved.env.is_empty() {
+            let mut env_vars = if resolved.env.is_empty() {
                 None
             } else {
                 Some(resolved.env.clone())
@@ -197,6 +198,32 @@ impl TaskManager {
             } else {
                 Some(resolved.mounts.clone())
             };
+
+            let gpu_device_ids: Vec<String> = plan
+                .slots
+                .iter()
+                .filter(|slot| slot.capacity.gpu_count > 0)
+                .map(|slot| slot.slot_id.to_string())
+                .collect();
+            if plan.requested_gpu_count > 0
+                && gpu_device_ids.len() < plan.requested_gpu_count as usize
+            {
+                return Err(anyhow::anyhow!(
+                    "task {} requested {} GPU(s) but only {} GPU slot(s) were reserved",
+                    plan.name,
+                    plan.requested_gpu_count,
+                    gpu_device_ids.len()
+                ));
+            }
+            let gpu_device_ids = if gpu_device_ids.is_empty() {
+                None
+            } else {
+                Some(gpu_device_ids)
+            };
+
+            if let Some(device_ids) = gpu_device_ids.as_ref() {
+                super::append_nvidia_visible_devices(&mut env_vars, device_ids);
+            }
 
             let create_request = ContainerCreateRequest {
                 name: plan.container_name.clone(),
@@ -212,6 +239,7 @@ impl TaskManager {
                 restart_policy,
                 resource_limits,
                 dns_servers,
+                gpu_device_ids,
             };
 
             let create_result = self
@@ -385,6 +413,7 @@ impl TaskManager {
                 slot_id,
                 cpu_millis: plan.requested_cpu_millis,
                 memory_bytes: plan.requested_memory_bytes,
+                gpu_count: plan.requested_gpu_count,
                 restart_policy: plan.restart_policy.clone(),
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),

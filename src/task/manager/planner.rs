@@ -34,6 +34,7 @@ pub(super) struct BatchStartPlan {
     pub(super) slots: Vec<SlotChoice>,
     pub(super) requested_cpu_millis: u64,
     pub(super) requested_memory_bytes: u64,
+    pub(super) requested_gpu_count: u32,
     pub(super) container_name: String,
     pub(super) container_id: Option<String>,
     pub(super) created_at: DateTime<Utc>,
@@ -64,6 +65,7 @@ pub(super) struct StartIntent {
     pub(super) command: Vec<String>,
     pub(super) cpu_millis: u64,
     pub(super) memory_bytes: u64,
+    pub(super) gpu_count: u32,
     pub(super) preassigned_slots: Vec<SlotId>,
     pub(super) restart_policy: Option<TaskRestartPolicy>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
@@ -117,27 +119,88 @@ impl Candidate {
         networks.iter().all(|net| self.ready_networks.contains(net))
     }
 
-    /// Attempts to reserve enough slots to satisfy the requested CPU and memory.
+    /// Attempts to reserve enough slots to satisfy the requested CPU, memory, and GPU counts.
     /// A greedy selection is used: for each iteration we pick the slot that
     /// contributes the largest share of the remaining requirement. The
     /// allocation only succeeds when the accumulated capacity fully covers the
     /// requested resources.
-    fn allocate(&mut self, cpu_millis: u64, memory_bytes: u64) -> Option<Vec<SlotChoice>> {
+    fn allocate(
+        &mut self,
+        cpu_millis: u64,
+        memory_bytes: u64,
+        gpu_count: u32,
+    ) -> Option<Vec<SlotChoice>> {
         if self.slots.is_empty() {
             return None;
         }
 
-        // Zero-capacity requests still require a single slot to run the task so
-        // we keep the previous behaviour.
-        if cpu_millis == 0 && memory_bytes == 0 {
-            let slot = self.slots.remove(0);
-            return Some(vec![slot]);
-        }
-
+        let mut remaining_gpu = gpu_count as u64;
         let mut remaining_cpu = cpu_millis;
         let mut remaining_mem = memory_bytes;
+
         let mut selected_indices: Vec<usize> = Vec::new();
         let mut available_indices: Vec<usize> = (0..self.slots.len()).collect();
+
+        if remaining_gpu > 0 {
+            // Consume GPU slots first so we never overbook accelerators.
+            let mut gpu_indices: Vec<usize> = available_indices
+                .iter()
+                .copied()
+                .filter(|&idx| self.slots[idx].capacity.gpu_count > 0)
+                .collect();
+
+            if gpu_indices.is_empty() {
+                return None;
+            }
+
+            // Prefer GPU slots that also contribute the most CPU/memory.
+            gpu_indices.sort_unstable_by(|&a, &b| {
+                let a_slot = &self.slots[a];
+                let b_slot = &self.slots[b];
+                let a_score = (a_slot.capacity.cpu_millis as u128) << 64
+                    | a_slot.capacity.memory_bytes as u128;
+                let b_score = (b_slot.capacity.cpu_millis as u128) << 64
+                    | b_slot.capacity.memory_bytes as u128;
+                b_score.cmp(&a_score)
+            });
+
+            for idx in gpu_indices {
+                if remaining_gpu == 0 {
+                    break;
+                }
+                let slot = &self.slots[idx];
+                let gpu_units = slot.capacity.gpu_count as u64;
+                if gpu_units == 0 {
+                    continue;
+                }
+                selected_indices.push(idx);
+                remaining_gpu = remaining_gpu.saturating_sub(gpu_units);
+                remaining_cpu = remaining_cpu.saturating_sub(slot.capacity.cpu_millis);
+                remaining_mem = remaining_mem.saturating_sub(slot.capacity.memory_bytes);
+                available_indices.retain(|&candidate| candidate != idx);
+            }
+
+            if remaining_gpu > 0 {
+                return None;
+            }
+        } else {
+            // Preserve GPU slots for GPU workloads whenever possible.
+            let non_gpu: Vec<usize> = available_indices
+                .iter()
+                .copied()
+                .filter(|&idx| self.slots[idx].capacity.gpu_count == 0)
+                .collect();
+            if !non_gpu.is_empty() {
+                available_indices = non_gpu;
+            }
+        }
+
+        // Zero-capacity requests still require a single slot to run the task so
+        // we keep the previous behaviour.
+        if remaining_cpu == 0 && remaining_mem == 0 && selected_indices.is_empty() {
+            let slot = self.slots.remove(available_indices[0]);
+            return Some(vec![slot]);
+        }
 
         while remaining_cpu > 0 || remaining_mem > 0 {
             if available_indices.is_empty() {
@@ -196,6 +259,7 @@ pub(super) struct RemoteStartPlan {
     pub(super) command: Vec<String>,
     pub(super) cpu_millis: u64,
     pub(super) memory_bytes: u64,
+    pub(super) gpu_count: u32,
     pub(super) slots: Vec<SlotChoice>,
     pub(super) peer_id: Uuid,
     pub(super) scheduler_version: u64,
@@ -226,6 +290,7 @@ impl TaskManager {
                 command: request.command,
                 cpu_millis: request.cpu_millis,
                 memory_bytes: request.memory_bytes,
+                gpu_count: request.gpu_count,
                 preassigned_slots: request.slot_ids,
                 restart_policy: request.restart_policy,
                 env: request.env,
@@ -373,8 +438,15 @@ impl TaskManager {
                 .iter()
                 .map(|slot| slot.capacity.memory_bytes)
                 .sum();
+            let total_gpu: u32 = chosen_slots
+                .iter()
+                .map(|slot| slot.capacity.gpu_count)
+                .sum();
 
-            if intent.cpu_millis > total_cpu || intent.memory_bytes > total_mem {
+            if intent.cpu_millis > total_cpu
+                || intent.memory_bytes > total_mem
+                || intent.gpu_count > total_gpu
+            {
                 return Err(anyhow::anyhow!(
                     "preassigned slots for task '{}' provide insufficient capacity",
                     intent.name
@@ -389,6 +461,7 @@ impl TaskManager {
                 slots: chosen_slots,
                 requested_cpu_millis: intent.cpu_millis,
                 requested_memory_bytes: intent.memory_bytes,
+                requested_gpu_count: intent.gpu_count,
                 container_name: String::new(),
                 container_id: None,
                 created_at: Utc::now(),
@@ -455,7 +528,11 @@ impl TaskManager {
                 .filter(|detail| matches!(detail.state, SchedulerSlotState::Free))
                 .map(|detail| SlotChoice {
                     slot_id: detail.slot_id,
-                    capacity: SlotCapacity::new(detail.cpu_millis, detail.memory_bytes),
+                    capacity: SlotCapacity::new(
+                        detail.cpu_millis,
+                        detail.memory_bytes,
+                        detail.gpu_count,
+                    ),
                 })
                 .collect();
 
@@ -532,7 +609,11 @@ impl TaskManager {
             .into());
         }
 
-        if let Some(slots) = candidate.allocate(intent.cpu_millis, intent.memory_bytes) {
+        if let Some(slots) = candidate.allocate(
+            intent.cpu_millis,
+            intent.memory_bytes,
+            intent.gpu_count,
+        ) {
             let location = candidate.location.clone();
             if !candidate.is_empty() {
                 candidates.push_back(candidate);
@@ -570,6 +651,7 @@ impl TaskManager {
                             slots,
                             requested_cpu_millis: intent.cpu_millis,
                             requested_memory_bytes: intent.memory_bytes,
+                            requested_gpu_count: intent.gpu_count,
                             container_name: String::new(),
                             container_id: None,
                             created_at: Utc::now(),
@@ -591,6 +673,7 @@ impl TaskManager {
                             command: intent.command.clone(),
                             cpu_millis: intent.cpu_millis,
                             memory_bytes: intent.memory_bytes,
+                            gpu_count: intent.gpu_count,
                             slots,
                             peer_id,
                             scheduler_version: version,
@@ -625,7 +708,11 @@ impl TaskManager {
                     continue;
                 }
 
-                if let Some(slots) = candidate.allocate(intent.cpu_millis, intent.memory_bytes) {
+                if let Some(slots) = candidate.allocate(
+                    intent.cpu_millis,
+                    intent.memory_bytes,
+                    intent.gpu_count,
+                ) {
                     let location = candidate.location.clone();
                     if !candidate.is_empty() {
                         candidates.push_back(candidate);
@@ -660,6 +747,7 @@ impl TaskManager {
                         slots,
                         requested_cpu_millis: intent.cpu_millis,
                         requested_memory_bytes: intent.memory_bytes,
+                        requested_gpu_count: intent.gpu_count,
                         container_name: String::new(),
                         container_id: None,
                         created_at: Utc::now(),
@@ -681,6 +769,7 @@ impl TaskManager {
                         command: intent.command.clone(),
                         cpu_millis: intent.cpu_millis,
                         memory_bytes: intent.memory_bytes,
+                        gpu_count: intent.gpu_count,
                         slots,
                         peer_id,
                         scheduler_version: version,

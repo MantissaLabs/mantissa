@@ -175,6 +175,7 @@ pub fn add_event(
             spec_builder.reborrow().init_slot_ids(0);
             spec_builder.set_cpu_millis(0);
             spec_builder.set_memory_bytes(0);
+            spec_builder.set_gpu_count(0);
             spec_builder.reborrow().init_command(0);
             spec_builder.reborrow().init_env(0);
             spec_builder.reborrow().init_secret_files(0);
@@ -220,6 +221,7 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     }
     builder.set_cpu_millis(spec.cpu_millis);
     builder.set_memory_bytes(spec.memory_bytes);
+    builder.set_gpu_count(spec.gpu_count);
 
     if let Some(policy) = &spec.restart_policy {
         let restart_builder = builder.reborrow().init_restart_policy();
@@ -289,6 +291,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     }
     let cpu_millis = reader.get_cpu_millis();
     let memory_bytes = reader.get_memory_bytes();
+    let gpu_count = reader.get_gpu_count();
 
     let slot_id = slot_ids.first().copied();
 
@@ -345,6 +348,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         slot_id,
         cpu_millis,
         memory_bytes,
+        gpu_count,
         restart_policy,
         env,
         secret_files,
@@ -397,6 +401,7 @@ impl task::Server for TaskService {
         }
         let cpu_millis = req.get_cpu_millis();
         let memory_bytes = req.get_memory_bytes();
+        let gpu_count = req.get_gpu_count();
         let mut slot_ids = Vec::new();
         for slot_id in req.get_slot_ids()?.iter() {
             slot_ids.push(slot_id);
@@ -426,6 +431,7 @@ impl task::Server for TaskService {
             command,
             cpu_millis,
             memory_bytes,
+            gpu_count,
             id: None,
             slot_ids,
             restart_policy,
@@ -465,6 +471,7 @@ impl task::Server for TaskService {
             let image = entry.get_image()?.to_str()?.to_string();
             let cpu_millis = entry.get_cpu_millis();
             let memory_bytes = entry.get_memory_bytes();
+            let gpu_count = entry.get_gpu_count();
             let slots_reader = entry.get_slot_ids()?;
             let mut slot_ids = Vec::with_capacity(slots_reader.len() as usize);
             for slot_id in slots_reader.iter() {
@@ -513,6 +520,7 @@ impl task::Server for TaskService {
                 command,
                 cpu_millis,
                 memory_bytes,
+                gpu_count,
                 id: task_id,
                 slot_ids,
                 restart_policy,

@@ -35,6 +35,7 @@ pub struct Info {
     pub load_info: Option<Load>,
     pub mem_info: Option<Memory>,
     pub disk_info: Option<Disk>,
+    pub gpu_info: Option<GpuInfo>,
 }
 
 /// # Description:
@@ -121,6 +122,29 @@ pub struct Disk {
     pub free: u64,
 }
 
+/// # Description:
+///
+/// Stores summary information for detected GPU devices on the host so the
+/// scheduler can reason about accelerator availability.
+#[derive(Clone, Debug)]
+pub struct GpuInfo {
+    pub vendor: String,
+    pub devices: Vec<GpuDevice>,
+}
+
+/// # Description:
+///
+/// Describes a single GPU device as reported by the platform inventory.
+#[derive(Clone, Debug)]
+pub struct GpuDevice {
+    pub index: u32,
+    pub uuid: Option<String>,
+    pub name: String,
+    pub memory_total_bytes: u64,
+    pub memory_free_bytes: u64,
+    pub compute_capability: Option<String>,
+}
+
 impl NodeInfo {
     /// Refresh the cached `sysinfo::System` instance so subsequent reads use
     /// up-to-date views without rebuilding the underlying snapshot.
@@ -135,6 +159,7 @@ impl NodeInfo {
         self.get_cpu_frequency();
         self.get_cpu_info();
         self.get_disk_info();
+        self.get_gpu_info();
         self.get_hostname();
         self.get_load_avg();
         self.get_memory_info();
@@ -205,6 +230,12 @@ impl NodeInfo {
         self.info.disk_info = Some(Disk { total, free });
     }
 
+    /// Collect NVIDIA GPU inventory via NVML so scheduler slots can reflect
+    /// accelerator capacity when available.
+    pub fn get_gpu_info(&mut self) {
+        self.info.gpu_info = collect_nvidia_gpus();
+    }
+
     pub fn get_os_info(&mut self) {
         let os_name = System::name().unwrap_or(String::from("Unknown"));
         let os_version = System::os_version().unwrap_or(String::from("Unknown"));
@@ -255,4 +286,60 @@ impl NodeInfo {
             l3_cache: None,
         })
     }
+}
+
+/// Collect NVIDIA GPUs using NVML on Linux. Returns `None` when NVML is
+/// unavailable or no devices are detected so callers can fall back cleanly.
+#[cfg(target_os = "linux")]
+fn collect_nvidia_gpus() -> Option<GpuInfo> {
+    use nvml_wrapper::Nvml;
+
+    let nvml = Nvml::init().ok()?;
+    let count = nvml.device_count().ok()?;
+    if count == 0 {
+        return None;
+    }
+
+    let mut devices = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let device = match nvml.device_by_index(index) {
+            Ok(device) => device,
+            Err(_) => continue,
+        };
+
+        let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+        let uuid = device.uuid().ok();
+        let memory = device.memory_info().ok();
+        let (memory_total_bytes, memory_free_bytes) = match memory {
+            Some(info) => (info.total, info.free),
+            None => (0, 0),
+        };
+
+        // NVML compute capability reporting varies across driver versions; keep it optional.
+        let compute_capability = None;
+
+        devices.push(GpuDevice {
+            index: index as u32,
+            uuid,
+            name,
+            memory_total_bytes,
+            memory_free_bytes,
+            compute_capability,
+        });
+    }
+
+    if devices.is_empty() {
+        None
+    } else {
+        Some(GpuInfo {
+            vendor: "nvidia".to_string(),
+            devices,
+        })
+    }
+}
+
+/// Placeholder for non-Linux builds where NVML is unavailable.
+#[cfg(not(target_os = "linux"))]
+fn collect_nvidia_gpus() -> Option<GpuInfo> {
+    None
 }

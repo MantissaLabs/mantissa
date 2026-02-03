@@ -72,6 +72,7 @@ pub struct TaskStartRequest {
     pub command: Vec<String>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    pub gpu_count: u32,
     pub id: Option<Uuid>,
     pub slot_ids: Vec<SlotId>,
     pub restart_policy: Option<TaskRestartPolicy>,
@@ -170,6 +171,7 @@ impl TaskManager {
             command,
             cpu_millis,
             memory_bytes,
+            gpu_count: 0,
             id: None,
             slot_ids: Vec::new(),
             restart_policy,
@@ -682,6 +684,32 @@ fn task_state_rank(state: &ContainerState) -> u8 {
     }
 }
 
+/// Ensures GPU-bound containers see the selected devices by injecting the
+/// NVIDIA_VISIBLE_DEVICES environment variable when missing.
+pub(super) fn append_nvidia_visible_devices(
+    env_vars: &mut Option<Vec<String>>,
+    device_ids: &[String],
+) {
+    if device_ids.is_empty() {
+        return;
+    }
+
+    let rendered = device_ids.join(",");
+    let entry = format!("NVIDIA_VISIBLE_DEVICES={rendered}");
+
+    match env_vars {
+        Some(vars) => {
+            if vars.iter().any(|var| var.starts_with("NVIDIA_VISIBLE_DEVICES=")) {
+                return;
+            }
+            vars.push(entry);
+        }
+        None => {
+            *env_vars = Some(vec![entry]);
+        }
+    }
+}
+
 fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
     let mut slot_ids = value.slot_ids;
     if slot_ids.is_empty() {
@@ -705,6 +733,7 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         slot_id,
         cpu_millis: value.cpu_millis,
         memory_bytes: value.memory_bytes,
+        gpu_count: value.gpu_count,
         restart_policy: value.restart_policy,
         env: value.env,
         secret_files: value.secret_files,

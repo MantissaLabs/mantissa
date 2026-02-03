@@ -36,6 +36,9 @@ struct SlotDetail {
 
   taskId @5 :Data;
   # 16-byte UUID of the task using the slot (empty if unassigned).
+
+  gpuCount @6 :UInt32;
+  # Number of GPUs attached to this slot.
 }
 
 struct Summary {

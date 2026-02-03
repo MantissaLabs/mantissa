@@ -238,6 +238,10 @@ pub struct TasksStartArgs {
         default_value = "536870912"
     )]
     pub memory_bytes: u64,
+
+    /// GPU count requested
+    #[arg(long = "gpu-count", value_name = "COUNT", default_value = "0")]
+    pub gpu_count: u32,
 }
 
 #[derive(Args, Debug)]

@@ -59,12 +59,13 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
         let details_reader = summary.get_details()?;
         if !details_reader.is_empty() {
             let mut tw = TabWriter::new(Vec::new());
-            writeln!(&mut tw, "SLOT\tCPU(m)\tMEM(MiB)\tSTATE\tOWNER\tTASK")?;
+            writeln!(&mut tw, "SLOT\tCPU(m)\tMEM(MiB)\tGPU\tSTATE\tOWNER\tTASK")?;
 
             for detail in details_reader.iter() {
                 let slot_id = detail.get_slot_id();
                 let cpu = detail.get_cpu_millis();
                 let mem_mib = detail.get_memory_bytes() / (1024 * 1024);
+                let gpu = detail.get_gpu_count();
                 let state = match detail.get_state()? {
                     scheduling::SlotState::Free => "free",
                     scheduling::SlotState::Reserved => "reserved",
@@ -79,7 +80,7 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
 
                 writeln!(
                     &mut tw,
-                    "{slot_id}\t{cpu}\t{mem_mib}\t{state}\t{owner}\t{task}",
+                    "{slot_id}\t{cpu}\t{mem_mib}\t{gpu}\t{state}\t{owner}\t{task}",
                 )?;
             }
 

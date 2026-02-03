@@ -18,6 +18,8 @@ pub struct TaskResources {
     pub cpu_millis: u64,
     #[serde(default)]
     pub memory_mb: u64,
+    #[serde(default)]
+    pub gpu_count: u32,
 }
 
 impl TaskResources {

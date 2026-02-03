@@ -295,7 +295,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
         node_id,
     } = setup_task_manager().await;
 
-    let slot = SlotSpec::new(1, SlotCapacity::new(500, 256 * 1_024 * 1_024));
+    let slot = SlotSpec::new(1, SlotCapacity::new(500, 256 * 1_024 * 1_024, 0));
     scheduler
         .init_slots(vec![slot.clone()])
         .await
@@ -334,6 +334,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
         command: vec!["/bin/true".into()],
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
         id: None,
         slot_ids: Vec::new(),
         restart_policy: None,
@@ -441,7 +442,7 @@ local_test!(task_manager_rejects_missing_secret_reference, {
         ..
     } = setup_task_manager().await;
 
-    let slot = SlotSpec::new(1, SlotCapacity::new(500, 256 * 1_024 * 1_024));
+    let slot = SlotSpec::new(1, SlotCapacity::new(500, 256 * 1_024 * 1_024, 0));
     scheduler
         .init_slots(vec![slot.clone()])
         .await
@@ -453,6 +454,7 @@ local_test!(task_manager_rejects_missing_secret_reference, {
         command: vec!["/bin/false".into()],
         cpu_millis: 100,
         memory_bytes: 32 * 1_024 * 1_024,
+        gpu_count: 0,
         id: None,
         slot_ids: Vec::new(),
         restart_policy: None,

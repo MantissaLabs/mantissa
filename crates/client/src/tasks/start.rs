@@ -12,6 +12,7 @@ pub async fn start(
     command: &[String],
     cpu_millis: u64,
     memory_bytes: u64,
+    gpu_count: u32,
 ) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
 
@@ -29,6 +30,7 @@ pub async fn start(
         }
         builder.set_cpu_millis(cpu_millis);
         builder.set_memory_bytes(memory_bytes);
+        builder.set_gpu_count(gpu_count);
         builder.reborrow().init_slot_ids(0);
     }
 
@@ -47,16 +49,17 @@ pub async fn start(
     let mut tw = tabwriter::TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tCOMMAND\tNODE\tSTATUS"
+        "ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tGPU\tCOMMAND\tNODE\tSTATUS"
     )?;
     writeln!(
         &mut tw,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         id,
         spec.get_name()?.to_str()?,
         spec.get_image()?.to_str()?,
         spec.get_cpu_millis(),
         spec.get_memory_bytes() / (1024 * 1024),
+        spec.get_gpu_count(),
         if command_display.is_empty() {
             "-".to_string()
         } else {

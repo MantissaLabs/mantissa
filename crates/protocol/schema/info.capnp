@@ -18,6 +18,9 @@ struct Info {
 
   disk @5 :Filesystem;
   # Filesystem contains informations about fs/inode usage on the machine.
+
+  gpu @6 :GpuInfo;
+  # GPU inventory and capabilities (empty when no GPU is detected).
 }
 
 struct Cpu {
@@ -110,4 +113,32 @@ struct Filesystem {
 
   free @1 :UInt64;
   # Free filesystem capacity in KB.
+}
+
+struct GpuInfo {
+  vendor @0 :Text;
+  # GPU vendor identifier (e.g., "nvidia"). Empty when no GPU is detected.
+
+  devices @1 :List(GpuDevice);
+  # List of GPU devices detected on the host.
+}
+
+struct GpuDevice {
+  index @0 :UInt32;
+  # NVML device index (stable per boot).
+
+  uuid @1 :Text;
+  # Vendor-reported UUID (empty when unavailable).
+
+  name @2 :Text;
+  # Human-readable model name.
+
+  memoryTotalBytes @3 :UInt64;
+  # Total device memory in bytes.
+
+  memoryFreeBytes @4 :UInt64;
+  # Free device memory in bytes.
+
+  computeCapability @5 :Text;
+  # Compute capability (empty when unavailable).
 }

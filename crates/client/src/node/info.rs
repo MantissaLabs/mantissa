@@ -58,5 +58,38 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
     println!("  total: {}", disk.get_total());
     println!("  free: {}", disk.get_free());
 
+    let gpu = info.get_gpu()?;
+    let devices = gpu.get_devices()?;
+    if devices.is_empty() {
+        println!("GPU:");
+        println!("  no GPU device detected");
+    } else {
+        println!("GPU:");
+        let vendor = gpu.get_vendor()?.to_str()?.to_string();
+        if !vendor.is_empty() {
+            println!("  vendor: {vendor}");
+        }
+        for device in devices.iter() {
+            println!(
+                "  - index: {}",
+                device.get_index(),
+            );
+            let name = device.get_name()?.to_str()?.to_string();
+            if !name.is_empty() {
+                println!("    name: {name}");
+            }
+            let uuid = device.get_uuid()?.to_str()?.to_string();
+            if !uuid.is_empty() {
+                println!("    uuid: {uuid}");
+            }
+            let cc = device.get_compute_capability()?.to_str()?.to_string();
+            if !cc.is_empty() {
+                println!("    compute_capability: {cc}");
+            }
+            println!("    memory_total_bytes: {}", device.get_memory_total_bytes());
+            println!("    memory_free_bytes: {}", device.get_memory_free_bytes());
+        }
+    }
+
     Ok(())
 }

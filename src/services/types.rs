@@ -68,6 +68,8 @@ pub struct ServiceTaskSpecValue {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
     #[serde(default)]
+    pub gpu_count: u32,
+    #[serde(default)]
     pub restart_policy: Option<ServiceTaskRestartPolicy>,
     #[serde(default)]
     pub env: Vec<TaskEnvironmentVariable>,

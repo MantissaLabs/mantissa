@@ -23,6 +23,8 @@ pub struct TaskSpec {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
     #[serde(default)]
+    pub gpu_count: u32,
+    #[serde(default)]
     pub restart_policy: Option<TaskRestartPolicy>,
     #[serde(default)]
     pub env: Vec<TaskEnvironmentVariable>,
@@ -141,6 +143,8 @@ pub struct TaskValue {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
     #[serde(default)]
+    pub gpu_count: u32,
+    #[serde(default)]
     pub restart_policy: Option<TaskRestartPolicy>,
     #[serde(default)]
     pub env: Vec<TaskEnvironmentVariable>,
@@ -167,6 +171,7 @@ pub struct TaskValueDraft {
     pub networks: Vec<Uuid>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    pub gpu_count: u32,
     pub env: Vec<TaskEnvironmentVariable>,
     pub secret_files: Vec<TaskSecretFile>,
     pub service_metadata: Option<TaskServiceMetadata>,
@@ -190,6 +195,7 @@ impl TaskValue {
             networks: draft.networks,
             cpu_millis: draft.cpu_millis,
             memory_bytes: draft.memory_bytes,
+            gpu_count: draft.gpu_count,
             restart_policy: None,
             env: draft.env,
             secret_files: draft.secret_files,

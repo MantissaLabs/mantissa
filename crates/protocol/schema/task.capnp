@@ -81,6 +81,9 @@ struct TaskSpec {
 
   updatedAt @16 :Text;
   # RFC3339 timestamp when the task was last updated.
+
+  gpuCount @17 :UInt32;
+  # Allocated GPU count.
 }
 
 struct ServiceMetadata {
@@ -124,6 +127,9 @@ struct TaskStartRequest {
 
   networks @10 :List(Data);
   # Required networks as 16-byte UUIDs.
+
+  gpuCount @11 :UInt32;
+  # Requested GPU count.
 }
 
 struct TaskStopRequest {

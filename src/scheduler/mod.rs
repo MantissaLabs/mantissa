@@ -37,13 +37,15 @@ pub enum SlotState {
 pub struct SlotCapacity {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    pub gpu_count: u32,
 }
 
 impl SlotCapacity {
-    pub const fn new(cpu_millis: u64, memory_bytes: u64) -> Self {
+    pub const fn new(cpu_millis: u64, memory_bytes: u64, gpu_count: u32) -> Self {
         Self {
             cpu_millis,
             memory_bytes,
+            gpu_count,
         }
     }
 }
@@ -258,6 +260,12 @@ impl Scheduler {
 
         let total_memory = info.mem_info.as_ref().map(|mem| mem.total).unwrap_or(0);
 
+        let total_gpus = info
+            .gpu_info
+            .as_ref()
+            .map(|gpu| gpu.devices.len() as u64)
+            .unwrap_or(0);
+
         let mut slot_count = if total_memory > 0 {
             total_memory.div_ceil(MIN_SLOT_MEMORY_BYTES).max(1)
         } else {
@@ -268,11 +276,17 @@ impl Scheduler {
             slot_count = 1;
         }
 
+        // Ensure we always have enough slots to map each physical GPU to a slot.
+        if total_gpus > slot_count {
+            slot_count = total_gpus;
+        }
+
         slot_count = slot_count.min(MAX_SLOTS.max(1));
 
         let total_cpu_millis = logical_cpus.saturating_mul(1_000);
         let mut remaining_cpu = total_cpu_millis;
         let mut remaining_memory = total_memory;
+        let mut remaining_gpus = total_gpus;
 
         let mut specs = Vec::with_capacity(slot_count as usize);
         for slot_idx in 0..slot_count {
@@ -305,14 +319,26 @@ impl Scheduler {
                 chunk
             };
 
+            // Assign one GPU per slot until we exhaust the detected devices so slot IDs can be
+            // used as stable GPU bindings later on (slot 0 -> GPU 0, etc.).
+            let gpu_count = if remaining_gpus > 0 {
+                remaining_gpus -= 1;
+                1
+            } else {
+                0
+            };
+
             specs.push(SlotSpec::new(
                 slot_idx,
-                SlotCapacity::new(cpu_millis, memory_bytes),
+                SlotCapacity::new(cpu_millis, memory_bytes, gpu_count),
             ));
         }
 
         if specs.is_empty() {
-            specs.push(SlotSpec::new(0, SlotCapacity::new(1_000, total_memory)));
+            specs.push(SlotSpec::new(
+                0,
+                SlotCapacity::new(1_000, total_memory, total_gpus.min(1) as u32),
+            ));
         }
 
         specs
@@ -710,9 +736,9 @@ mod tests {
         let (scheduler, _dir) = make_scheduler().await;
         let snapshot = scheduler
             .init_slots([
-                SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024)),
-                SlotSpec::new(2, SlotCapacity::new(500, 512 * 1024 * 1024)),
-                SlotSpec::new(3, SlotCapacity::new(1000, 1024 * 1024 * 1024)),
+                SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+                SlotSpec::new(2, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+                SlotSpec::new(3, SlotCapacity::new(1000, 1024 * 1024 * 1024, 0)),
             ])
             .await
             .unwrap();
@@ -738,8 +764,8 @@ mod tests {
         let (scheduler, _dir) = make_scheduler().await;
         scheduler
             .init_slots([
-                SlotSpec::new(10, SlotCapacity::new(1000, 1024 * 1024 * 1024)),
-                SlotSpec::new(20, SlotCapacity::new(500, 512 * 1024 * 1024)),
+                SlotSpec::new(10, SlotCapacity::new(1000, 1024 * 1024 * 1024, 0)),
+                SlotSpec::new(20, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
             ])
             .await
             .unwrap();
@@ -779,7 +805,7 @@ mod tests {
         scheduler
             .init_slots([SlotSpec::new(
                 1,
-                SlotCapacity::new(1000, 1024 * 1024 * 1024),
+                SlotCapacity::new(1000, 1024 * 1024 * 1024, 0),
             )])
             .await
             .unwrap();
@@ -831,7 +857,7 @@ mod tests {
         scheduler
             .init_slots([SlotSpec::new(
                 5,
-                SlotCapacity::new(1000, 1024 * 1024 * 1024),
+                SlotCapacity::new(1000, 1024 * 1024 * 1024, 0),
             )])
             .await
             .unwrap();
@@ -860,7 +886,7 @@ mod tests {
         scheduler
             .init_slots([SlotSpec::new(
                 5,
-                SlotCapacity::new(1000, 1024 * 1024 * 1024),
+                SlotCapacity::new(1000, 1024 * 1024 * 1024, 0),
             )])
             .await
             .unwrap();
@@ -879,8 +905,8 @@ mod tests {
         let (scheduler, _dir) = make_scheduler().await;
         scheduler
             .init_slots([
-                SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024)),
-                SlotSpec::new(2, SlotCapacity::new(500, 512 * 1024 * 1024)),
+                SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+                SlotSpec::new(2, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
             ])
             .await
             .unwrap();

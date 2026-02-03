@@ -14,6 +14,7 @@ pub struct SchedulerSlotDetail {
     pub slot_id: SlotId,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    pub gpu_count: u32,
     pub state: SchedulerSlotState,
     pub owner: Option<Uuid>,
     pub task_id: Option<Uuid>,
@@ -65,6 +66,7 @@ impl SchedulerSummary {
                     slot_id: slot.slot_id,
                     cpu_millis: slot.capacity.cpu_millis,
                     memory_bytes: slot.capacity.memory_bytes,
+                    gpu_count: slot.capacity.gpu_count,
                     state: match &slot.state {
                         SlotState::Free => SchedulerSlotState::Free,
                         SlotState::Reserved(_) => SchedulerSlotState::Reserved,
@@ -131,6 +133,7 @@ impl SchedulerSummary {
                 slot_id,
                 cpu_millis: detail.get_cpu_millis(),
                 memory_bytes: detail.get_memory_bytes(),
+                gpu_count: detail.get_gpu_count(),
                 state,
                 owner,
                 task_id,
@@ -165,6 +168,7 @@ impl SchedulerSummary {
             slot_builder.set_slot_id(detail.slot_id);
             slot_builder.set_cpu_millis(detail.cpu_millis);
             slot_builder.set_memory_bytes(detail.memory_bytes);
+            slot_builder.set_gpu_count(detail.gpu_count);
             slot_builder.set_state(match detail.state {
                 SchedulerSlotState::Free => scheduling::SlotState::Free,
                 SchedulerSlotState::Reserved => scheduling::SlotState::Reserved,

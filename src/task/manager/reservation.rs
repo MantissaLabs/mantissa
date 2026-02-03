@@ -435,6 +435,7 @@ impl TaskManager {
                 slot_id: slot_ids.first().copied(),
                 cpu_millis: plan.cpu_millis,
                 memory_bytes: plan.memory_bytes,
+                gpu_count: plan.gpu_count,
                 restart_policy: plan.restart_policy.clone(),
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),

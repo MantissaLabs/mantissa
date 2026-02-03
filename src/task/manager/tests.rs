@@ -376,7 +376,7 @@ async fn setup_manager_with_forwarding(
 async fn start_container_reserves_slot_and_records_resources() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
-    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024));
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
     scheduler
         .init_slots(vec![slot_spec.clone()])
         .await
@@ -426,6 +426,7 @@ async fn reconcile_rejects_missing_slot_assignments() {
         slot_id: None,
         cpu_millis: 0,
         memory_bytes: 0,
+        gpu_count: 0,
         restart_policy: None,
         env: Vec::new(),
         secret_files: Vec::new(),
@@ -448,8 +449,8 @@ async fn reconcile_rejects_missing_slot_assignments() {
 async fn start_container_reserves_multiple_slots_when_needed() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
-    let slot_a = SlotSpec::new(1, SlotCapacity::new(200, 64 * 1_024 * 1_024));
-    let slot_b = SlotSpec::new(2, SlotCapacity::new(200, 64 * 1_024 * 1_024));
+    let slot_a = SlotSpec::new(1, SlotCapacity::new(200, 64 * 1_024 * 1_024, 0));
+    let slot_b = SlotSpec::new(2, SlotCapacity::new(200, 64 * 1_024 * 1_024, 0));
     scheduler
         .init_slots(vec![slot_a.clone(), slot_b.clone()])
         .await
@@ -472,7 +473,7 @@ async fn start_container_reserves_multiple_slots_when_needed() {
 async fn stop_task_releases_slot_and_clears_resources() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
-    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024));
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
     scheduler
         .init_slots(vec![slot_spec])
         .await
@@ -499,7 +500,7 @@ async fn stop_task_releases_slot_and_clears_resources() {
 async fn stop_task_uses_container_name_when_cache_missing() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
-    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024));
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
     scheduler
         .init_slots(vec![slot_spec])
         .await
@@ -523,7 +524,7 @@ async fn stop_task_uses_container_name_when_cache_missing() {
 async fn list_tasks_respects_filters() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
-    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024));
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
     scheduler
         .init_slots(vec![slot_spec])
         .await
@@ -573,7 +574,7 @@ async fn start_tasks_batch_reserves_every_slot() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slots: Vec<_> = (1..=3)
-        .map(|id| SlotSpec::new(id, SlotCapacity::new(200, 64 * 1_024 * 1_024)))
+        .map(|id| SlotSpec::new(id, SlotCapacity::new(200, 64 * 1_024 * 1_024, 0)))
         .collect();
     scheduler.init_slots(slots).await.expect("init slots");
 
@@ -585,6 +586,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 command: vec![],
                 cpu_millis: 200,
                 memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
                 id: None,
                 slot_ids: Vec::new(),
                 restart_policy: None,
@@ -600,6 +602,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 command: vec![],
                 cpu_millis: 200,
                 memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
                 id: None,
                 slot_ids: Vec::new(),
                 restart_policy: None,
@@ -624,7 +627,7 @@ async fn start_tasks_batch_reserves_every_slot() {
 async fn start_tasks_batch_respects_existing_reservations() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
-    let slot_spec = SlotSpec::new(1, SlotCapacity::new(400, 128 * 1_024 * 1_024));
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(400, 128 * 1_024 * 1_024, 0));
     scheduler
         .init_slots(vec![slot_spec.clone()])
         .await
@@ -650,6 +653,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
             command: vec![],
             cpu_millis: 200,
             memory_bytes: 64 * 1_024 * 1_024,
+            gpu_count: 0,
             id: Some(task_id),
             slot_ids: vec![slot_spec.slot_id],
             restart_policy: None,
@@ -676,7 +680,7 @@ async fn task_owned_locally_detects_remote_entries() {
     scheduler
         .init_slots(vec![SlotSpec::new(
             1,
-            SlotCapacity::new(500, 128 * 1_024 * 1_024),
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
         )])
         .await
         .expect("init slots");
@@ -708,6 +712,7 @@ async fn task_owned_locally_detects_remote_entries() {
         networks: Vec::new(),
         cpu_millis: 100,
         memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
@@ -733,8 +738,8 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
 
     scheduler
         .init_slots(vec![
-            SlotSpec::new(1, SlotCapacity::new(400, 128 * 1_024 * 1_024)),
-            SlotSpec::new(2, SlotCapacity::new(400, 128 * 1_024 * 1_024)),
+            SlotSpec::new(1, SlotCapacity::new(400, 128 * 1_024 * 1_024, 0)),
+            SlotSpec::new(2, SlotCapacity::new(400, 128 * 1_024 * 1_024, 0)),
         ])
         .await
         .expect("init slots");
@@ -754,6 +759,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 command: vec![],
                 cpu_millis: 200,
                 memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
                 id: None,
                 slot_ids: Vec::new(),
                 restart_policy: None,
@@ -769,6 +775,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 command: vec![],
                 cpu_millis: 200,
                 memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
                 id: None,
                 slot_ids: Vec::new(),
                 restart_policy: None,
@@ -806,7 +813,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
     scheduler
         .init_slots(vec![SlotSpec::new(
             1,
-            SlotCapacity::new(500, 128 * 1_024 * 1_024),
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
         )])
         .await
         .expect("init slots");
@@ -844,6 +851,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         command: Vec::new(),
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
         id: None,
         slot_ids: Vec::new(),
         restart_policy: None,
@@ -898,7 +906,7 @@ async fn stop_task_cleans_up_after_teardown_failure() {
     scheduler
         .init_slots(vec![SlotSpec::new(
             1,
-            SlotCapacity::new(500, 128 * 1_024 * 1_024),
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
         )])
         .await
         .expect("init slots");
@@ -936,6 +944,7 @@ async fn stop_task_cleans_up_after_teardown_failure() {
         command: Vec::new(),
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
         id: None,
         slot_ids: Vec::new(),
         restart_policy: None,
@@ -975,7 +984,7 @@ async fn attachment_ready_triggers_forwarding_event() {
     scheduler
         .init_slots(vec![SlotSpec::new(
             1,
-            SlotCapacity::new(500, 128 * 1_024 * 1_024),
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
         )])
         .await
         .expect("init slots");
@@ -1013,6 +1022,7 @@ async fn attachment_ready_triggers_forwarding_event() {
         command: Vec::new(),
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
         id: None,
         slot_ids: Vec::new(),
         restart_policy: None,
@@ -1044,7 +1054,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
     scheduler
         .init_slots(vec![SlotSpec::new(
             1,
-            SlotCapacity::new(500, 128 * 1_024 * 1_024),
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
         )])
         .await
         .expect("init slots");
@@ -1108,6 +1118,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         command: Vec::new(),
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
         id: None,
         slot_ids: Vec::new(),
         restart_policy: None,
@@ -1174,7 +1185,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
     scheduler
         .init_slots(vec![SlotSpec::new(
             1,
-            SlotCapacity::new(500, 128 * 1_024 * 1_024),
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
         )])
         .await
         .expect("init slots");
@@ -1212,6 +1223,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         command: Vec::new(),
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
         id: None,
         slot_ids: Vec::new(),
         restart_policy: None,

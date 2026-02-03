@@ -13,7 +13,7 @@ use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
     RemoveContainerOptions, RestartContainerOptions, StartContainerOptions, StopContainerOptions,
 };
-use bollard::models::{HostConfig, RestartPolicy, RestartPolicyNameEnum};
+use bollard::models::{DeviceRequest, HostConfig, RestartPolicy, RestartPolicyNameEnum};
 use bollard::service::ContainerInspectResponse;
 
 use async_trait::async_trait;
@@ -55,6 +55,7 @@ pub struct ContainerCreateRequest {
     pub restart_policy: Option<RestartPolicyConfig>,
     pub resource_limits: ResourceLimits,
     pub dns_servers: Option<Vec<String>>,
+    pub gpu_device_ids: Option<Vec<String>>,
 }
 
 /// Interface for container management operations
@@ -274,6 +275,7 @@ impl ContainerManager for DockerContainerManager {
             restart_policy,
             resource_limits,
             dns_servers,
+            gpu_device_ids,
         } = request;
 
         // Configure host settings
@@ -305,6 +307,22 @@ impl ContainerManager for DockerContainerManager {
 
         if let Some(cpu_shares) = resource_limits.cpu_shares {
             host_config.cpu_shares = Some(cpu_shares);
+        }
+
+        if let Some(device_ids) = gpu_device_ids {
+            if !device_ids.is_empty() {
+                host_config.device_requests = Some(vec![DeviceRequest {
+                    driver: Some("nvidia".to_string()),
+                    count: None,
+                    device_ids: Some(device_ids),
+                    capabilities: Some(vec![vec![
+                        "gpu".to_string(),
+                        "compute".to_string(),
+                        "utility".to_string(),
+                    ]]),
+                    options: None,
+                }]);
+            }
         }
 
         // Set volumes if provided

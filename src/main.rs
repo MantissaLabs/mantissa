@@ -89,6 +89,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         &args.command,
                         args.cpu_millis,
                         args.memory_bytes,
+                        args.gpu_count,
                     ))
                     .await?;
             }
