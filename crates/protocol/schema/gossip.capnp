@@ -25,14 +25,26 @@ struct GossipMessage {
   # updates, etc.
 
   id @0 :Data;
+  # Unique identifier for de-duplication and ordering hints.
 
   union {
-    void @1: Void;
+    void @1 :Void;
+    # No-op payload used for keepalive or testing.
+
     topology @2 :TopologyEvent;
+    # Topology membership event.
+
     task @3 :TaskEvent;
+    # Task upsert/remove event.
+
     service @4 :ServiceEvent;
+    # Service upsert/remove event.
+
     network @5 :NetworkEvent;
+    # Network upsert/remove event.
+
     secret @6 :SecretEvent;
+    # Secret upsert/remove event.
   }
 }
 

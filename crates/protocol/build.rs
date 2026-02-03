@@ -1,3 +1,4 @@
+/// Compile Cap'n Proto schemas into Rust code for the protocol crate.
 fn main() {
     let mut cmd = capnpc::CompilerCommand::new();
     cmd.src_prefix("schema")
@@ -9,7 +10,6 @@ fn main() {
         .file("schema/task.capnp")
         .file("schema/services.capnp")
         .file("schema/info.capnp")
-        .file("schema/utils.capnp")
         .file("schema/sync.capnp")
         .file("schema/health.capnp")
         .file("schema/secrets.capnp")

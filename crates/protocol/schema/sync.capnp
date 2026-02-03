@@ -2,53 +2,92 @@
 
 enum Domain {
   peers @0;
+  # Peer registry domain.
+
   tasks @1;
+  # Task registry domain.
+
   services @2;
+  # Service registry domain.
+
   secrets @3;
+  # Secret registry domain.
+
   networks @4;
+  # Network registry domain.
+
   networkPeers @5;
+  # Network peer registry domain.
+
   networkAttachments @6;
+  # Network attachment registry domain.
 }
 
 struct PageRange {
   start @0 :Data;
+  # Inclusive range start key (raw bytes).
+
   end   @1 :Data;
+  # Exclusive range end key (raw bytes).
+
   hash  @2 :Data;
+  # Digest of the range contents.
 }
 
 struct PageRangeSummary {
   ranges @0 :List(PageRange);
+  # Summary ranges describing a domain subtree.
 }
 
 struct DeltaChunk {
   domain @0 :Domain;
+  # Domain the delta applies to.
+
   regs   @1 :List(RegItem);
+  # Register updates for the chunk.
+
   tombs  @2 :List(TombItem);
+  # Tombstone updates for the chunk.
 }
 
 struct DomainRoot {
   domain  @0 :Domain;
+  # Domain identifier.
+
   rootHex @1 :Text;
+  # Hex-encoded MST root hash.
 }
 
 struct DomainRangeSummary {
   domain  @0 :Domain;
+  # Domain identifier.
+
   summary @1 :PageRangeSummary;
+  # Range summary for the domain.
 }
 
 struct DomainWant {
   domain @0 :Domain;
+  # Domain identifier.
+
   want   @1 :PageRangeSummary;
+  # Desired ranges for delta streaming.
 }
 
 struct RegItem {
-  key @0 :Data;  # raw key bytes
-  reg @1 :Data;  # bincode(MVReg<...>)
+  key @0 :Data;
+  # Raw key bytes.
+
+  reg @1 :Data;
+  # bincode(MVReg<...>) payload.
 }
 
 struct TombItem {
-  key @0 :Data;  # raw key bytes
+  key @0 :Data;
+  # Raw key bytes.
+
   ts  @1 :UInt64;
+  # Tombstone timestamp or version.
 }
 
 interface DeltaSink {
@@ -64,8 +103,10 @@ interface DeltaSink {
 
 interface Sync {
   getRoots @0 () -> (roots :List(DomainRoot));
+  # Fetch root hashes for all domains.
 
   getRanges @1 (domains :List(Domain)) -> (ranges :List(DomainRangeSummary));
+  # Fetch range summaries for selected domains.
 
   # Client passes per-domain ranges it wants, and a DeltaSink it implements locally.
   # Server streams domain-tagged chunks into that sink and calls end() when done.

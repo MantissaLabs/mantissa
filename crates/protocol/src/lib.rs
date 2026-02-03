@@ -6,7 +6,6 @@ capnp::generated_code!(pub mod gossip_capnp);
 capnp::generated_code!(pub mod topology_capnp);
 capnp::generated_code!(pub mod scheduling_capnp);
 capnp::generated_code!(pub mod info_capnp);
-capnp::generated_code!(pub mod utils_capnp);
 capnp::generated_code!(pub mod sync_capnp);
 capnp::generated_code!(pub mod health_capnp);
 capnp::generated_code!(pub mod task_capnp);
@@ -37,8 +36,6 @@ pub mod node {
     pub use super::node_capnp::node::*;
     pub use super::node_capnp::*;
     pub type NodeClient = super::node_capnp::node::Client;
-    pub type ExecutorClient = super::node_capnp::executor::Client;
-    pub type SchedulerClient = super::node_capnp::scheduler::Client;
 }
 
 pub mod topology {
@@ -56,11 +53,6 @@ pub mod info {
     pub use super::info_capnp::info;
     pub use super::info_capnp::info::*;
     pub use super::info_capnp::*;
-}
-
-pub mod utils {
-    pub use super::utils_capnp::*;
-    // Some utils schemas may not define an inner `utils` module; only export siblings.
 }
 
 pub mod sync {
