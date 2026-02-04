@@ -139,6 +139,7 @@ pub struct GpuInfo {
 pub struct GpuDevice {
     pub index: u32,
     pub uuid: Option<String>,
+    pub pci_bus_id: Option<String>,
     pub name: String,
     pub memory_total_bytes: u64,
     pub memory_free_bytes: u64,
@@ -309,6 +310,7 @@ fn collect_nvidia_gpus() -> Option<GpuInfo> {
 
         let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
         let uuid = device.uuid().ok();
+        let pci_bus_id = device.pci_info().ok().map(|info| info.bus_id);
         let memory = device.memory_info().ok();
         let (memory_total_bytes, memory_free_bytes) = match memory {
             Some(info) => (info.total, info.free),
@@ -321,6 +323,7 @@ fn collect_nvidia_gpus() -> Option<GpuInfo> {
         devices.push(GpuDevice {
             index: index as u32,
             uuid,
+            pci_bus_id,
             name,
             memory_total_bytes,
             memory_free_bytes,

@@ -1,7 +1,8 @@
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use chrono::Utc;
 use tracing::{debug, warn};
 
@@ -92,6 +93,7 @@ impl TaskManager {
                 cpu_millis: plan.requested_cpu_millis,
                 memory_bytes: plan.requested_memory_bytes,
                 gpu_count: plan.requested_gpu_count,
+                gpu_device_ids: plan.gpu_device_ids.clone(),
                 restart_policy: plan.restart_policy.clone(),
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),
@@ -199,29 +201,22 @@ impl TaskManager {
                 Some(resolved.mounts.clone())
             };
 
-            let gpu_device_ids: Vec<String> = plan
-                .slots
-                .iter()
-                .filter(|slot| slot.capacity.gpu_count > 0)
-                .map(|slot| slot.slot_id.to_string())
-                .collect();
-            if plan.requested_gpu_count > 0
-                && gpu_device_ids.len() < plan.requested_gpu_count as usize
-            {
-                return Err(anyhow::anyhow!(
-                    "task {} requested {} GPU(s) but only {} GPU slot(s) were reserved",
-                    plan.name,
-                    plan.requested_gpu_count,
-                    gpu_device_ids.len()
-                ));
-            }
-            let gpu_device_ids = if gpu_device_ids.is_empty() {
-                None
+            let gpu_device_ids = if plan.requested_gpu_count > 0 {
+                if plan.gpu_device_ids.len() < plan.requested_gpu_count as usize {
+                    return Err(anyhow!(
+                        "task {} requested {} GPU(s) but only {} GPU device(s) were reserved",
+                        plan.name,
+                        plan.requested_gpu_count,
+                        plan.gpu_device_ids.len()
+                    ));
+                }
+                Some(plan.gpu_device_ids.clone())
             } else {
-                Some(gpu_device_ids)
+                None
             };
 
             if let Some(device_ids) = gpu_device_ids.as_ref() {
+                self.ensure_gpu_runtime_ready(device_ids).await?;
                 super::append_nvidia_visible_devices(&mut env_vars, device_ids);
             }
 
@@ -414,6 +409,7 @@ impl TaskManager {
                 cpu_millis: plan.requested_cpu_millis,
                 memory_bytes: plan.requested_memory_bytes,
                 gpu_count: plan.requested_gpu_count,
+                gpu_device_ids: plan.gpu_device_ids.clone(),
                 restart_policy: plan.restart_policy.clone(),
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),
@@ -478,6 +474,52 @@ impl TaskManager {
         Ok(specs)
     }
 
+    /// Ensures the local runtime has the GPU bindings required to launch a GPU-bound container.
+    pub(super) async fn ensure_gpu_runtime_ready(
+        &self,
+        gpu_device_ids: &[String],
+    ) -> Result<(), anyhow::Error> {
+        if gpu_device_ids.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot = self
+            .scheduler
+            .snapshot()
+            .await
+            .ok_or_else(|| anyhow!("scheduler snapshot unavailable while validating GPUs"))?;
+        let known: HashSet<&str> = snapshot
+            .gpu_devices
+            .iter()
+            .map(|device| device.device_id.as_str())
+            .collect();
+        for device_id in gpu_device_ids {
+            if !known.contains(device_id.as_str()) {
+                return Err(anyhow!(
+                    "gpu device id '{device_id}' is not present in the scheduler inventory"
+                ));
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if !nvidia_toolkit_present() {
+                return Err(anyhow!(
+                    "nvidia container toolkit not detected; install drivers and toolkit (see docs/gpu-setup.md)"
+                ));
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(anyhow!(
+                "gpu scheduling requires a Linux host with NVIDIA drivers and toolkit"
+            ));
+        }
+
+        Ok(())
+    }
+
     async fn cleanup_batch(&self, plans: &[BatchStartPlan]) {
         for plan in plans {
             if let Some(container_id) = plan.container_id.as_ref() {
@@ -524,4 +566,41 @@ impl TaskManager {
 
         self.cleanup_orphaned_slots().await;
     }
+}
+
+/// Detects whether NVIDIA container runtime tooling is available on the host.
+fn nvidia_toolkit_present() -> bool {
+    let absolute_candidates = [
+        "/usr/bin/nvidia-container-runtime",
+        "/usr/bin/nvidia-container-cli",
+        "/usr/bin/nvidia-container-toolkit",
+        "/usr/local/bin/nvidia-container-runtime",
+        "/usr/local/bin/nvidia-container-cli",
+        "/usr/local/bin/nvidia-container-toolkit",
+    ];
+
+    if absolute_candidates
+        .iter()
+        .any(|path| Path::new(path).exists())
+    {
+        return true;
+    }
+
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+
+    for dir in path.split(':') {
+        for candidate in [
+            "nvidia-container-runtime",
+            "nvidia-container-cli",
+            "nvidia-container-toolkit",
+        ] {
+            if Path::new(dir).join(candidate).exists() {
+                return true;
+            }
+        }
+    }
+
+    false
 }

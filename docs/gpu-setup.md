@@ -51,9 +51,10 @@ You should see the GPU inventory. If this fails, the runtime is not configured c
 
 ## 4) How Mantissa maps GPUs
 
-Mantissa detects GPUs using NVML and assigns one GPU per scheduler slot. Slot IDs are assigned
-in the same order as NVML device indices (0..N-1). When a task requests `gpu_count > 0`, Mantissa
-reserves the corresponding GPU slots and passes the device IDs to Docker.
+Mantissa detects GPUs using NVML and tracks each GPU separately from CPU/memory slots. GPU
+devices are identified by their NVML UUIDs (stable across reboots). When a task requests
+`gpu_count > 0`, Mantissa reserves that many GPU device IDs and passes them to Docker via
+`NVIDIA_VISIBLE_DEVICES` and the Docker `DeviceRequests` API.
 
 ## 5) Request GPUs in Mantissa
 
@@ -97,6 +98,6 @@ mantissa tasks start my-task \
 
 ## Notes
 
-- Mantissa currently allocates whole GPUs (one GPU per slot). MIG or time-slicing is not yet
-  supported.
-- GPU scheduling is only enabled on nodes where NVML detects GPUs.
+- Mantissa currently allocates whole GPUs (one device per reservation). MIG or time-slicing is
+  not yet supported.
+- GPU scheduling is only enabled on nodes where NVML detects GPUs and UUIDs are available.

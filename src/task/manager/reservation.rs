@@ -7,7 +7,7 @@ use protocol::server::cluster_session;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::scheduler::{SchedulerError, SlotId, SlotReservationRequest};
+use crate::scheduler::{GpuReservationRequest, SchedulerError, SlotId, SlotReservationRequest};
 use crate::task::container::ContainerState;
 use crate::task::service::read_spec;
 use crate::task::types::{TaskEvent, TaskSpec};
@@ -21,9 +21,16 @@ pub(super) enum ExecutionError {
     Fatal(anyhow::Error),
 }
 
+/// Tracks local reservations so they can be released on rollback.
+pub(super) struct ReservedResources {
+    pub(super) slots: Vec<SlotId>,
+    pub(super) gpu_device_ids: Vec<String>,
+}
+
 /// Tracks slot reservations that happened on a peer so they can be released on rollback.
 pub(super) struct RemoteReservation {
     pub(super) slots: Vec<SlotId>,
+    pub(super) gpu_device_ids: Vec<String>,
     pub(super) version: u64,
 }
 
@@ -31,6 +38,8 @@ fn is_scheduler_retryable_message(message: &str) -> bool {
     message.contains("snapshot mismatch")
         || message.contains("slots unavailable")
         || message.contains("unknown slots")
+        || message.contains("gpu devices unavailable")
+        || message.contains("unknown gpu devices")
 }
 
 impl TaskManager {
@@ -58,18 +67,23 @@ impl TaskManager {
         ))
     }
 
-    /// Reserves the local slots required by the batch, returning the list of new reservations.
-    pub(super) async fn reserve_local_slots(
+    /// Reserves the local slots and GPUs required by the batch, returning the new reservations.
+    pub(super) async fn reserve_local_resources(
         &self,
         plans: &[BatchStartPlan],
         expected_version: u64,
-    ) -> Result<Vec<SlotId>, ExecutionError> {
+    ) -> Result<ReservedResources, ExecutionError> {
         if plans.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ReservedResources {
+                slots: Vec::new(),
+                gpu_device_ids: Vec::new(),
+            });
         }
 
-        let mut requests = Vec::new();
-        let mut newly_reserved = Vec::new();
+        let mut slot_requests = Vec::new();
+        let mut gpu_requests = Vec::new();
+        let mut newly_reserved_slots = Vec::new();
+        let mut newly_reserved_gpus = Vec::new();
 
         for plan in plans {
             if plan.preassigned {
@@ -77,53 +91,114 @@ impl TaskManager {
             }
 
             for slot in &plan.slots {
-                requests.push(SlotReservationRequest {
+                slot_requests.push(SlotReservationRequest {
                     slot_id: slot.slot_id,
                     owner: self.local_node_id,
                     task_id: Some(plan.id),
                 });
-                newly_reserved.push(slot.slot_id);
+                newly_reserved_slots.push(slot.slot_id);
+            }
+
+            for device_id in &plan.gpu_device_ids {
+                gpu_requests.push(GpuReservationRequest {
+                    device_id: device_id.clone(),
+                    owner: self.local_node_id,
+                    task_id: Some(plan.id),
+                });
+                newly_reserved_gpus.push(device_id.clone());
             }
         }
 
-        if requests.is_empty() {
-            return Ok(Vec::new());
+        if slot_requests.is_empty() && gpu_requests.is_empty() {
+            return Ok(ReservedResources {
+                slots: Vec::new(),
+                gpu_device_ids: Vec::new(),
+            });
         }
 
         match self
             .scheduler
-            .reserve_slots(expected_version, requests)
+            .reserve_resources(expected_version, slot_requests, gpu_requests)
             .await
         {
-            Ok(_) => Ok(newly_reserved),
+            Ok(_) => Ok(ReservedResources {
+                slots: newly_reserved_slots,
+                gpu_device_ids: newly_reserved_gpus,
+            }),
             Err(err @ SchedulerError::SnapshotMismatch { .. })
             | Err(err @ SchedulerError::SlotsUnavailable { .. })
             | Err(err @ SchedulerError::UnknownSlots { .. }) => {
+                Err(ExecutionError::Retry(anyhow::anyhow!(err)))
+            }
+            Err(err @ SchedulerError::GpuDevicesUnavailable { .. })
+            | Err(err @ SchedulerError::UnknownGpuDevices { .. }) => {
                 Err(ExecutionError::Retry(anyhow::anyhow!(err)))
             }
             Err(err) => Err(ExecutionError::Fatal(anyhow::anyhow!(err))),
         }
     }
 
-    /// Releases the provided local slots, logging but otherwise ignoring failures.
-    pub(super) async fn release_local_slots(&self, slots: &[SlotId]) {
-        let mut seen = HashSet::new();
-        for slot_id in slots {
-            if !seen.insert(*slot_id) {
-                continue;
-            }
+    /// Releases the provided local slots and GPUs, logging but otherwise ignoring failures.
+    pub(super) async fn release_local_resources(&self, resources: &ReservedResources) {
+        if resources.slots.is_empty() && resources.gpu_device_ids.is_empty() {
+            return;
+        }
 
-            if let Err(err) = self.release_slot(*slot_id).await {
-                warn!(
-                    target: "task",
-                    "failed to release local slot {slot_id}: {err}"
-                );
+        let mut slot_seen = HashSet::new();
+        let mut slots = Vec::new();
+        for slot_id in &resources.slots {
+            if slot_seen.insert(*slot_id) {
+                slots.push(*slot_id);
             }
         }
+
+        let mut gpu_seen = HashSet::new();
+        let mut gpu_device_ids = Vec::new();
+        for device_id in &resources.gpu_device_ids {
+            if gpu_seen.insert(device_id.as_str()) {
+                gpu_device_ids.push(device_id.clone());
+            }
+        }
+
+        const MAX_ATTEMPTS: usize = 10;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let expected_version = match self.scheduler.snapshot().await {
+                Some(snapshot) => snapshot.version,
+                None => {
+                    warn!(
+                        target: "task",
+                        "failed to release local resources; scheduler snapshot unavailable"
+                    );
+                    return;
+                }
+            };
+
+            match self
+                .scheduler
+                .free_resources(expected_version, slots.clone(), gpu_device_ids.clone())
+                .await
+            {
+                Ok(_) => return,
+                Err(SchedulerError::SnapshotMismatch { .. }) => continue,
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        "failed to release local resources: {err}"
+                    );
+                    return;
+                }
+            }
+        }
+
+        warn!(
+            target: "task",
+            "failed to release local resources after retries"
+        );
     }
 
-    /// Reserves slots on remote peers grouped per node, returning the reservations map.
-    pub(super) async fn reserve_remote_slots(
+    /// Reserves slots and GPUs on remote peers grouped per node, returning the reservations map.
+    pub(super) async fn reserve_remote_resources(
         &self,
         plans: &[RemoteStartPlan],
     ) -> Result<HashMap<Uuid, RemoteReservation>, ExecutionError> {
@@ -141,7 +216,7 @@ impl TaskManager {
             let session = match self.remote_session(peer_id).await {
                 Ok(session) => session,
                 Err(err) => {
-                    self.release_remote_slots(&reservations).await;
+                    self.release_remote_resources(&reservations).await;
                     return Err(ExecutionError::Retry(err));
                 }
             };
@@ -152,19 +227,19 @@ impl TaskManager {
                         Ok(result) => match result.get_scheduler() {
                             Ok(client) => client,
                             Err(err) => {
-                                self.release_remote_slots(&reservations).await;
+                                self.release_remote_resources(&reservations).await;
                                 return Err(ExecutionError::Retry(anyhow::anyhow!(
                                     err.to_string()
                                 )));
                             }
                         },
                         Err(err) => {
-                            self.release_remote_slots(&reservations).await;
+                            self.release_remote_resources(&reservations).await;
                             return Err(ExecutionError::Retry(anyhow::anyhow!(err.to_string())));
                         }
                     },
                     Err(err) => {
-                        self.release_remote_slots(&reservations).await;
+                        self.release_remote_resources(&reservations).await;
                         return Err(ExecutionError::Retry(anyhow::anyhow!(err.to_string())));
                     }
                 };
@@ -178,6 +253,10 @@ impl TaskManager {
                     .unwrap_or(0);
                 inner.set_expected_version(expected_version);
                 let total_slots: usize = peer_plans.iter().map(|plan| plan.slots.len()).sum();
+                let total_gpus: usize = peer_plans
+                    .iter()
+                    .map(|plan| plan.gpu_device_ids.len())
+                    .sum();
                 if total_slots == 0 {
                     return Err(ExecutionError::Fatal(anyhow::anyhow!(
                         "remote plan missing slot assignments"
@@ -195,6 +274,18 @@ impl TaskManager {
                         intent_idx += 1;
                     }
                 }
+
+                let mut gpu_builder = inner.reborrow().init_gpu_intents(total_gpus as u32);
+                let mut gpu_idx = 0u32;
+                for plan in &peer_plans {
+                    for device_id in &plan.gpu_device_ids {
+                        let mut entry = gpu_builder.reborrow().get(gpu_idx);
+                        entry.set_device_id(device_id);
+                        entry.set_owner(plan.peer_id.as_bytes());
+                        entry.set_task_id(plan.id.as_bytes());
+                        gpu_idx += 1;
+                    }
+                }
             }
 
             match reserve_req.send().promise.await {
@@ -205,12 +296,23 @@ impl TaskManager {
                                 .iter()
                                 .flat_map(|plan| plan.slots.iter().map(|slot| slot.slot_id))
                                 .collect();
+                            let gpu_device_ids: Vec<String> = peer_plans
+                                .iter()
+                                .flat_map(|plan| plan.gpu_device_ids.iter().cloned())
+                                .collect();
                             let version = response.get_new_version();
-                            reservations.insert(peer_id, RemoteReservation { slots, version });
+                            reservations.insert(
+                                peer_id,
+                                RemoteReservation {
+                                    slots,
+                                    gpu_device_ids,
+                                    version,
+                                },
+                            );
                         }
                         Err(err) => {
                             let message = err.to_string();
-                            self.release_remote_slots(&reservations).await;
+                            self.release_remote_resources(&reservations).await;
                             if is_scheduler_retryable_message(&message) {
                                 return Err(ExecutionError::Retry(anyhow::anyhow!(message)));
                             }
@@ -219,7 +321,7 @@ impl TaskManager {
                     },
                     Err(err) => {
                         let message = err.to_string();
-                        self.release_remote_slots(&reservations).await;
+                        self.release_remote_resources(&reservations).await;
                         if is_scheduler_retryable_message(&message) {
                             return Err(ExecutionError::Retry(anyhow::anyhow!(message)));
                         }
@@ -228,7 +330,7 @@ impl TaskManager {
                 },
                 Err(err) => {
                     let message = err.to_string();
-                    self.release_remote_slots(&reservations).await;
+                    self.release_remote_resources(&reservations).await;
                     if is_scheduler_retryable_message(&message) {
                         return Err(ExecutionError::Retry(anyhow::anyhow!(message)));
                     }
@@ -241,7 +343,7 @@ impl TaskManager {
     }
 
     /// Releases remote reservations accumulated during previous stages.
-    pub(super) async fn release_remote_slots(
+    pub(super) async fn release_remote_resources(
         &self,
         reservations: &HashMap<Uuid, RemoteReservation>,
     ) {
@@ -301,6 +403,13 @@ impl TaskManager {
                     .init_slot_ids(reservation.slots.len() as u32);
                 for (idx, slot_id) in reservation.slots.iter().enumerate() {
                     ids_builder.set(idx as u32, *slot_id);
+                }
+
+                let mut gpu_builder = inner
+                    .reborrow()
+                    .init_gpu_device_ids(reservation.gpu_device_ids.len() as u32);
+                for (idx, device_id) in reservation.gpu_device_ids.iter().enumerate() {
+                    gpu_builder.set(idx as u32, device_id);
                 }
             }
 
@@ -436,6 +545,7 @@ impl TaskManager {
                 cpu_millis: plan.cpu_millis,
                 memory_bytes: plan.memory_bytes,
                 gpu_count: plan.gpu_count,
+                gpu_device_ids: plan.gpu_device_ids.clone(),
                 restart_policy: plan.restart_policy.clone(),
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),

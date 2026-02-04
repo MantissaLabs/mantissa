@@ -32,6 +32,7 @@ pub async fn start(
         builder.set_memory_bytes(memory_bytes);
         builder.set_gpu_count(gpu_count);
         builder.reborrow().init_slot_ids(0);
+        builder.reborrow().init_gpu_device_ids(0);
     }
 
     let response = request.send().promise.await?;

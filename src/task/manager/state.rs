@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::gossip::Message;
 use crate::network::types::{NetworkAttachmentState, NetworkAttachmentValue};
-use crate::scheduler::{SchedulerError, SlotId, SlotReservationRequest, SlotState};
+use crate::scheduler::{
+    GpuReservationRequest, SchedulerError, SlotId, SlotReservationRequest, SlotState,
+};
 use crate::task::container::ContainerState;
 use crate::task::docker::{
     ContainerCreateRequest, ContainerError, ResourceLimits, RestartPolicyConfig, RestartPolicyType,
@@ -42,6 +44,7 @@ impl TaskManager {
             cpu_millis: spec.cpu_millis,
             memory_bytes: spec.memory_bytes,
             gpu_count: spec.gpu_count,
+            gpu_device_ids: spec.gpu_device_ids.clone(),
             env: spec.env.clone(),
             secret_files: spec.secret_files.clone(),
             service_metadata: spec.service_metadata.clone(),
@@ -68,36 +71,6 @@ impl TaskManager {
         self.tx.clone()
     }
 
-    /// Resolves GPU device identifiers from reserved slot ids by consulting the
-    /// scheduler snapshot, enabling container runtimes to bind GPUs correctly.
-    async fn gpu_device_ids_for_slots(
-        &self,
-        slot_ids: &[SlotId],
-    ) -> Result<Vec<String>, anyhow::Error> {
-        if slot_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let Some(snapshot) = self.scheduler.snapshot().await else {
-            return Ok(Vec::new());
-        };
-
-        let mut gpu_slots = HashMap::new();
-        for slot in &snapshot.slots {
-            if slot.capacity.gpu_count > 0 {
-                gpu_slots.insert(slot.slot_id, slot.capacity.gpu_count);
-            }
-        }
-
-        let mut ids = Vec::new();
-        for slot_id in slot_ids {
-            if gpu_slots.contains_key(slot_id) {
-                ids.push(slot_id.to_string());
-            }
-        }
-
-        Ok(ids)
-    }
 
     /// Broadcasts specs originating from remote peers to the local gossip loop.
     pub(super) async fn broadcast_remote_specs(&self, specs: &[TaskSpec]) {
@@ -141,7 +114,20 @@ impl TaskManager {
                 })
                 .collect();
 
-            if reserved.is_empty() {
+            let reserved_gpus: Vec<String> = snapshot
+                .gpu_devices
+                .iter()
+                .filter_map(|device| match &device.state {
+                    crate::scheduler::GpuDeviceState::Reserved(reservation)
+                        if reservation.owner == self.local_node_id =>
+                    {
+                        Some(device.device_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            if reserved.is_empty() && reserved_gpus.is_empty() {
                 return;
             }
 
@@ -156,28 +142,46 @@ impl TaskManager {
                 }
             };
 
+            let active_gpus = match self.collect_local_gpu_device_ids().await {
+                Ok(ids) => ids,
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        "failed to collect active gpu devices while cleaning orphans: {err}"
+                    );
+                    return;
+                }
+            };
+
             let to_free: Vec<SlotId> = reserved
                 .into_iter()
                 .filter(|slot_id| !active.contains(slot_id))
                 .collect();
 
-            if to_free.is_empty() {
+            let gpu_to_free: Vec<String> = reserved_gpus
+                .into_iter()
+                .filter(|device_id| !active_gpus.contains(device_id))
+                .collect();
+
+            if to_free.is_empty() && gpu_to_free.is_empty() {
                 return;
             }
 
             match self
                 .scheduler
-                .free_slots(snapshot.version, to_free.clone())
+                .free_resources(snapshot.version, to_free.clone(), gpu_to_free.clone())
                 .await
             {
                 Ok(_) => return,
                 Err(SchedulerError::SnapshotMismatch { .. })
-                | Err(SchedulerError::SlotsNotReserved { .. }) => continue,
+                | Err(SchedulerError::SlotsNotReserved { .. })
+                | Err(SchedulerError::GpuDevicesNotReserved { .. }) => continue,
                 Err(err) => {
                     warn!(
                         target: "task",
-                        "failed to free orphaned slots {:?}: {err}",
-                        to_free
+                        "failed to free orphaned resources slots={:?} gpus={:?}: {err}",
+                        to_free,
+                        gpu_to_free
                     );
                     return;
                 }
@@ -213,6 +217,32 @@ impl TaskManager {
         }
 
         Ok(slots)
+    }
+
+    /// Collects GPU device identifiers that belong to tasks owned by this node.
+    pub(super) async fn collect_local_gpu_device_ids(
+        &self,
+    ) -> Result<HashSet<String>, anyhow::Error> {
+        let (actives, _) = self
+            .store
+            .load_all()
+            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
+
+        let mut device_ids = HashSet::new();
+        for (key, snapshot) in actives {
+            let id = key.to_uuid();
+            if let Some(value) = select_best_task_value(snapshot.as_slice()) {
+                if value.node_id == self.local_node_id {
+                    for device_id in &value.gpu_device_ids {
+                        device_ids.insert(device_id.clone());
+                    }
+                }
+            } else {
+                let _ = self.remove_spec(id).await;
+            }
+        }
+
+        Ok(device_ids)
     }
 
     /// Pushes a gossip event into the dispatcher queue.
@@ -578,10 +608,10 @@ impl TaskManager {
         };
 
         let gpu_device_ids = if working.gpu_count > 0 {
-            let mut ids = self.gpu_device_ids_for_slots(&working.slot_ids).await?;
+            let mut ids = working.gpu_device_ids.clone();
             if ids.len() < working.gpu_count as usize {
                 let err = anyhow!(
-                    "task {} requested {} GPU(s) but only {} GPU slot(s) were reserved",
+                    "task {} requested {} GPU(s) but only {} GPU device(s) were reserved",
                     working.name,
                     working.gpu_count,
                     ids.len()
@@ -598,6 +628,7 @@ impl TaskManager {
         };
 
         if let Some(device_ids) = gpu_device_ids.as_ref() {
+            self.ensure_gpu_runtime_ready(device_ids).await?;
             super::append_nvidia_visible_devices(&mut env_vars, device_ids);
         }
 
@@ -1257,8 +1288,8 @@ impl TaskManager {
         Ok(())
     }
 
-    /// Ensures the scheduler snapshot reserves slots for locally running tasks so rollbacks or
-    /// restarts cannot leave active containers unaccounted for in the slot table.
+    /// Ensures the scheduler snapshot reserves slots and GPUs for locally running tasks so
+    /// rollbacks or restarts cannot leave active containers unaccounted for.
     pub(super) async fn reconcile_local_slot_reservations(&self) -> Result<(), anyhow::Error> {
         const MAX_ATTEMPTS: usize = 5;
 
@@ -1276,6 +1307,8 @@ impl TaskManager {
 
             let mut desired: HashMap<SlotId, Uuid> = HashMap::new();
             let mut conflicts: HashSet<SlotId> = HashSet::new();
+            let mut desired_gpus: HashMap<String, Uuid> = HashMap::new();
+            let mut gpu_conflicts: HashSet<String> = HashSet::new();
 
             for (key, values) in actives {
                 let Some(value) = select_best_task_value(values.as_slice()) else {
@@ -1308,9 +1341,30 @@ impl TaskManager {
                         );
                     }
                 }
+
+                if value.gpu_device_ids.is_empty() {
+                    continue;
+                }
+
+                for device_id in &value.gpu_device_ids {
+                    if gpu_conflicts.contains(device_id) {
+                        continue;
+                    }
+                    if let Some(existing) = desired_gpus.insert(device_id.clone(), task_id) {
+                        gpu_conflicts.insert(device_id.clone());
+                        desired_gpus.remove(device_id);
+                        warn!(
+                            target: "task",
+                            device_id = device_id.as_str(),
+                            task_a = %existing,
+                            task_b = %task_id,
+                            "gpu device conflict detected while reconciling reservations"
+                        );
+                    }
+                }
             }
 
-            if desired.is_empty() {
+            if desired.is_empty() && desired_gpus.is_empty() {
                 return Ok(());
             }
 
@@ -1340,24 +1394,52 @@ impl TaskManager {
                 }
             }
 
-            if requests.is_empty() {
+            let mut gpu_requests = Vec::new();
+            for device in &snapshot.gpu_devices {
+                let Some(task_id) = desired_gpus.get(&device.device_id).copied() else {
+                    continue;
+                };
+                match &device.state {
+                    crate::scheduler::GpuDeviceState::Free => {
+                        gpu_requests.push(GpuReservationRequest {
+                            device_id: device.device_id.clone(),
+                            owner: self.local_node_id,
+                            task_id: Some(task_id),
+                        });
+                    }
+                    crate::scheduler::GpuDeviceState::Reserved(reservation) => {
+                        if reservation.owner != self.local_node_id {
+                            warn!(
+                                target: "task",
+                                device_id = device.device_id.as_str(),
+                                owner = %reservation.owner,
+                                "gpu device needed by local task is already reserved by another node"
+                            );
+                        }
+                    }
+                }
+            }
+
+            if requests.is_empty() && gpu_requests.is_empty() {
                 return Ok(());
             }
 
             match self
                 .scheduler
-                .reserve_slots(snapshot.version, requests)
+                .reserve_resources(snapshot.version, requests, gpu_requests)
                 .await
             {
                 Ok(_) => return Ok(()),
                 Err(SchedulerError::SnapshotMismatch { .. })
                 | Err(SchedulerError::SlotsUnavailable { .. })
-                | Err(SchedulerError::UnknownSlots { .. }) => {
+                | Err(SchedulerError::UnknownSlots { .. })
+                | Err(SchedulerError::GpuDevicesUnavailable { .. })
+                | Err(SchedulerError::UnknownGpuDevices { .. }) => {
                     attempt += 1;
                     if attempt >= MAX_ATTEMPTS {
                         warn!(
                             target: "task",
-                            "slot reservation reconciliation exhausted retries"
+                            "resource reservation reconciliation exhausted retries"
                         );
                         return Ok(());
                     }

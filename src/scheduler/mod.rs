@@ -16,10 +16,18 @@ pub mod service;
 pub mod summary;
 
 pub type SlotId = u64;
+pub type GpuDeviceId = String;
 
 /// Reservation details attached to a slot when it is taken.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct SlotReservation {
+    pub owner: Uuid,
+    pub task_id: Option<Uuid>,
+}
+
+/// Reservation details attached to a GPU device when it is taken.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct GpuDeviceReservation {
     pub owner: Uuid,
     pub task_id: Option<Uuid>,
 }
@@ -31,12 +39,20 @@ pub enum SlotState {
     Reserved(SlotReservation),
 }
 
+/// Current state of a GPU device inside the scheduler snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum GpuDeviceState {
+    Free,
+    Reserved(GpuDeviceReservation),
+}
+
 /// Capacity assigned to a slot. Values are expressed in milli-CPUs and bytes so we can represent
 /// fractional CPU shares and precise memory allocations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct SlotCapacity {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
+    /// Deprecated GPU capacity kept for backward compatibility; GPU scheduling is now separate.
     pub gpu_count: u32,
 }
 
@@ -58,11 +74,29 @@ pub struct ResourceSlot {
     pub state: SlotState,
 }
 
+/// GPU device entry stored inside the CRDT snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct GpuDevice {
+    pub device_id: String,
+    pub index: u32,
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub pci_bus_id: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub memory_total_bytes: u64,
+    pub state: GpuDeviceState,
+}
+
 /// Full scheduler snapshot persisted in the MVReg-backed store.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct SchedulerSnapshot {
     pub version: u64,
     pub slots: Vec<ResourceSlot>,
+    #[serde(default)]
+    pub gpu_devices: Vec<GpuDevice>,
 }
 
 /// Definition used during initialisation to map node resources to scheduler slots.
@@ -78,10 +112,50 @@ impl SlotSpec {
     }
 }
 
+/// Definition used during initialisation to map node GPU devices into scheduler entries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuDeviceSpec {
+    pub device_id: String,
+    pub index: u32,
+    pub uuid: Option<String>,
+    pub pci_bus_id: Option<String>,
+    pub name: String,
+    pub memory_total_bytes: u64,
+}
+
+impl GpuDeviceSpec {
+    /// Constructs a GPU device spec from inventory data for scheduler initialization.
+    pub fn new(
+        device_id: impl Into<String>,
+        index: u32,
+        uuid: Option<String>,
+        pci_bus_id: Option<String>,
+        name: impl Into<String>,
+        memory_total_bytes: u64,
+    ) -> Self {
+        Self {
+            device_id: device_id.into(),
+            index,
+            uuid,
+            pci_bus_id,
+            name: name.into(),
+            memory_total_bytes,
+        }
+    }
+}
+
 /// Reservation intent provided by callers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlotReservationRequest {
     pub slot_id: SlotId,
+    pub owner: Uuid,
+    pub task_id: Option<Uuid>,
+}
+
+/// Reservation intent for GPU devices.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuReservationRequest {
+    pub device_id: String,
     pub owner: Uuid,
     pub task_id: Option<Uuid>,
 }
@@ -110,9 +184,21 @@ pub enum SchedulerError {
         snapshot: SchedulerSnapshot,
     },
 
+    #[error("duplicate gpu device ids in request: {duplicates:?}")]
+    DuplicateGpuDevices {
+        duplicates: Vec<String>,
+        snapshot: SchedulerSnapshot,
+    },
+
     #[error("unknown slots in request: {unknown:?}")]
     UnknownSlots {
         unknown: Vec<SlotId>,
+        snapshot: SchedulerSnapshot,
+    },
+
+    #[error("unknown gpu devices in request: {unknown:?}")]
+    UnknownGpuDevices {
+        unknown: Vec<String>,
         snapshot: SchedulerSnapshot,
     },
 
@@ -122,9 +208,21 @@ pub enum SchedulerError {
         snapshot: SchedulerSnapshot,
     },
 
+    #[error("gpu devices unavailable: {conflicts:?}")]
+    GpuDevicesUnavailable {
+        conflicts: Vec<String>,
+        snapshot: SchedulerSnapshot,
+    },
+
     #[error("slots not reserved: {slots:?}")]
     SlotsNotReserved {
         slots: Vec<SlotId>,
+        snapshot: SchedulerSnapshot,
+    },
+
+    #[error("gpu devices not reserved: {devices:?}")]
+    GpuDevicesNotReserved {
+        devices: Vec<String>,
         snapshot: SchedulerSnapshot,
     },
 }
@@ -132,19 +230,35 @@ pub enum SchedulerError {
 #[derive(Clone)]
 struct SchedulerState {
     snapshot: SchedulerSnapshot,
-    index: HashMap<SlotId, usize>,
+    slot_index: HashMap<SlotId, usize>,
+    gpu_index: HashMap<GpuDeviceId, usize>,
 }
 
 impl SchedulerState {
     fn new(snapshot: SchedulerSnapshot) -> Self {
-        let index = Self::build_index(&snapshot.slots);
-        Self { snapshot, index }
+        let slot_index = Self::build_slot_index(&snapshot.slots);
+        let gpu_index = Self::build_gpu_index(&snapshot.gpu_devices);
+        Self {
+            snapshot,
+            slot_index,
+            gpu_index,
+        }
     }
 
-    fn build_index(slots: &[ResourceSlot]) -> HashMap<SlotId, usize> {
+    /// Build the slot index used to resolve slot IDs to snapshot offsets.
+    fn build_slot_index(slots: &[ResourceSlot]) -> HashMap<SlotId, usize> {
         let mut index = HashMap::with_capacity(slots.len());
         for (pos, slot) in slots.iter().enumerate() {
             index.insert(slot.slot_id, pos);
+        }
+        index
+    }
+
+    /// Build the GPU index used to resolve device IDs to snapshot offsets.
+    fn build_gpu_index(devices: &[GpuDevice]) -> HashMap<GpuDeviceId, usize> {
+        let mut index = HashMap::with_capacity(devices.len());
+        for (pos, device) in devices.iter().enumerate() {
+            index.insert(device.device_id.clone(), pos);
         }
         index
     }
@@ -190,9 +304,24 @@ impl Scheduler {
         })
     }
 
+    /// Initializes slot-only schedulers (legacy path) by delegating to `init_resources`.
+    #[allow(dead_code)]
     pub async fn init_slots<I>(&self, slots: I) -> Result<SchedulerSnapshot, SchedulerError>
     where
         I: IntoIterator<Item = SlotSpec>,
+    {
+        self.init_resources(slots, Vec::new()).await
+    }
+
+    /// Initializes scheduler resources (slots and GPU devices) from the provided specs.
+    pub async fn init_resources<I, G>(
+        &self,
+        slots: I,
+        gpu_devices: G,
+    ) -> Result<SchedulerSnapshot, SchedulerError>
+    where
+        I: IntoIterator<Item = SlotSpec>,
+        G: IntoIterator<Item = GpuDeviceSpec>,
     {
         let current = self.state.load_full();
         if let Some(current) = current.as_ref() {
@@ -214,7 +343,13 @@ impl Scheduler {
             })
             .collect();
 
-        let snapshot = SchedulerSnapshot { version: 0, slots };
+        let gpu_devices = Self::materialize_gpu_devices(gpu_devices);
+
+        let snapshot = SchedulerSnapshot {
+            version: 0,
+            slots,
+            gpu_devices,
+        };
 
         let state_arc = Arc::new(SchedulerState::new(snapshot.clone()));
 
@@ -235,6 +370,29 @@ impl Scheduler {
         }
 
         Ok(snapshot)
+    }
+
+    /// Normalizes GPU specs into snapshot entries with stable ordering.
+    fn materialize_gpu_devices<I>(gpu_devices: I) -> Vec<GpuDevice>
+    where
+        I: IntoIterator<Item = GpuDeviceSpec>,
+    {
+        let mut gpu_specs: Vec<GpuDeviceSpec> = gpu_devices.into_iter().collect();
+        gpu_specs.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        gpu_specs.dedup_by(|a, b| a.device_id == b.device_id);
+
+        gpu_specs
+            .into_iter()
+            .map(|spec| GpuDevice {
+                device_id: spec.device_id,
+                index: spec.index,
+                uuid: spec.uuid,
+                pci_bus_id: spec.pci_bus_id,
+                name: spec.name,
+                memory_total_bytes: spec.memory_total_bytes,
+                state: GpuDeviceState::Free,
+            })
+            .collect()
     }
 
     pub async fn snapshot(&self) -> Option<SchedulerSnapshot> {
@@ -260,12 +418,6 @@ impl Scheduler {
 
         let total_memory = info.mem_info.as_ref().map(|mem| mem.total).unwrap_or(0);
 
-        let total_gpus = info
-            .gpu_info
-            .as_ref()
-            .map(|gpu| gpu.devices.len() as u64)
-            .unwrap_or(0);
-
         let mut slot_count = if total_memory > 0 {
             total_memory.div_ceil(MIN_SLOT_MEMORY_BYTES).max(1)
         } else {
@@ -276,18 +428,11 @@ impl Scheduler {
             slot_count = 1;
         }
 
-        // Ensure we always have enough slots to map each physical GPU to a slot.
-        if total_gpus > slot_count {
-            slot_count = total_gpus;
-        }
-
         slot_count = slot_count.min(MAX_SLOTS.max(1));
 
         let total_cpu_millis = logical_cpus.saturating_mul(1_000);
         let mut remaining_cpu = total_cpu_millis;
         let mut remaining_memory = total_memory;
-        let mut remaining_gpus = total_gpus;
-
         let mut specs = Vec::with_capacity(slot_count as usize);
         for slot_idx in 0..slot_count {
             let slots_left = slot_count - slot_idx;
@@ -319,28 +464,53 @@ impl Scheduler {
                 chunk
             };
 
-            // Assign one GPU per slot until we exhaust the detected devices so slot IDs can be
-            // used as stable GPU bindings later on (slot 0 -> GPU 0, etc.).
-            let gpu_count = if remaining_gpus > 0 {
-                remaining_gpus -= 1;
-                1
-            } else {
-                0
-            };
-
             specs.push(SlotSpec::new(
                 slot_idx,
-                SlotCapacity::new(cpu_millis, memory_bytes, gpu_count),
+                SlotCapacity::new(cpu_millis, memory_bytes, 0),
             ));
         }
 
         if specs.is_empty() {
             specs.push(SlotSpec::new(
                 0,
-                SlotCapacity::new(1_000, total_memory, total_gpus.min(1) as u32),
+                SlotCapacity::new(1_000, total_memory, 0),
             ));
         }
 
+        specs
+    }
+
+    /// Derives GPU device specs from node inventory so GPUs can be reserved independently of slots.
+    pub fn derive_gpu_specs(node: &crate::node::Node) -> Vec<GpuDeviceSpec> {
+        let info = &node.system_info.info;
+        let Some(gpu_info) = info.gpu_info.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut specs: Vec<GpuDeviceSpec> = Vec::new();
+        for device in &gpu_info.devices {
+            let uuid = device
+                .uuid
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            if uuid.is_none() {
+                // Skip devices without a UUID to keep GPU bindings stable across reboots.
+                continue;
+            }
+
+            let device_id = uuid.clone().expect("uuid presence ensured");
+            specs.push(GpuDeviceSpec::new(
+                device_id,
+                device.index,
+                uuid,
+                device.pci_bus_id.clone(),
+                device.name.clone(),
+                device.memory_total_bytes,
+            ));
+        }
+
+        specs.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         specs
     }
 
@@ -352,22 +522,116 @@ impl Scheduler {
         node: &crate::node::Node,
     ) -> Result<SchedulerSnapshot, SchedulerError> {
         if let Some(snapshot) = self.snapshot().await {
+            if snapshot.gpu_devices.is_empty() {
+                let gpu_specs = Self::derive_gpu_specs(node);
+                if !gpu_specs.is_empty() {
+                    if let Ok(updated) =
+                        self.populate_gpu_devices(snapshot.version, gpu_specs).await
+                    {
+                        return Ok(updated);
+                    }
+                }
+            }
             return Ok(snapshot);
         }
 
-        match self.init_slots(Self::derive_slot_specs(node)).await {
+        match self
+            .init_resources(
+                Self::derive_slot_specs(node),
+                Self::derive_gpu_specs(node),
+            )
+            .await
+        {
             Ok(snapshot) => Ok(snapshot),
             Err(SchedulerError::AlreadyInitialized { snapshot }) => Ok(snapshot),
             Err(err) => Err(err),
         }
     }
 
+    /// Populates GPU devices in the snapshot when upgrading from a slot-only scheduler.
+    async fn populate_gpu_devices(
+        &self,
+        expected_version: u64,
+        gpu_devices: Vec<GpuDeviceSpec>,
+    ) -> Result<SchedulerSnapshot, SchedulerError> {
+        if gpu_devices.is_empty() {
+            return self
+                .state
+                .load_full()
+                .as_ref()
+                .ok_or(SchedulerError::Uninitialized)
+                .map(|state| state.snapshot.clone());
+        }
+
+        loop {
+            let current_opt = self.state.load_full();
+            let current_arc = match current_opt.as_ref() {
+                Some(state) => state.clone(),
+                None => return Err(SchedulerError::Uninitialized),
+            };
+            let current = current_arc.as_ref();
+
+            if current.snapshot.version != expected_version {
+                return Err(SchedulerError::SnapshotMismatch {
+                    expected_version,
+                    current_version: current.snapshot.version,
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            if !current.snapshot.gpu_devices.is_empty() {
+                return Ok(current.snapshot.clone());
+            }
+
+            let mut new_snapshot = current.snapshot.clone();
+            new_snapshot.gpu_devices = Self::materialize_gpu_devices(gpu_devices.clone());
+            new_snapshot.version = new_snapshot
+                .version
+                .checked_add(1)
+                .expect("scheduler snapshot version overflow");
+
+            let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
+            let prev = self
+                .state
+                .compare_and_swap(&current_opt, Some(new_state_arc.clone()));
+            if !ptr_eq_option(&prev, &current_opt) {
+                continue;
+            }
+
+            if let Err(e) = self
+                .store
+                .upsert(&self.store_key, new_snapshot.clone())
+                .await
+            {
+                let _ = self
+                    .state
+                    .compare_and_swap(&Some(new_state_arc.clone()), current_opt.clone());
+                return Err(SchedulerError::Store(e));
+            }
+
+            return Ok(new_snapshot);
+        }
+    }
+
+    /// Reserves slots only (legacy path) by delegating to `reserve_resources`.
+    #[allow(dead_code)]
     pub async fn reserve_slots(
         &self,
         expected_version: u64,
         requests: Vec<SlotReservationRequest>,
     ) -> Result<SchedulerSnapshot, SchedulerError> {
-        if requests.is_empty() {
+        self.reserve_resources(expected_version, requests, Vec::new())
+            .await
+    }
+
+    /// Reserves slots and GPU devices in a single optimistic transaction.
+    pub async fn reserve_resources(
+        &self,
+        expected_version: u64,
+        slot_requests: Vec<SlotReservationRequest>,
+        gpu_requests: Vec<GpuReservationRequest>,
+    ) -> Result<SchedulerSnapshot, SchedulerError> {
+        if slot_requests.is_empty() && gpu_requests.is_empty() {
             return self
                 .state
                 .load_full()
@@ -401,47 +665,92 @@ impl Scheduler {
 
             // Track the validation outcome using deterministic sets so callers receive stable
             // ordering without the extra sort/dedup passes we previously needed.
-            let mut seen = HashSet::with_capacity(requests.len());
-            let mut duplicates = BTreeSet::new();
-            let mut unknown = BTreeSet::new();
-            let mut conflicts = BTreeSet::new();
+            let mut slot_seen = HashSet::with_capacity(slot_requests.len());
+            let mut slot_duplicates = BTreeSet::new();
+            let mut slot_unknown = BTreeSet::new();
+            let mut slot_conflicts = BTreeSet::new();
 
-            for req in &requests {
+            for req in &slot_requests {
                 // Reject duplicate requests first.
-                if !seen.insert(req.slot_id) {
-                    duplicates.insert(req.slot_id);
+                if !slot_seen.insert(req.slot_id) {
+                    slot_duplicates.insert(req.slot_id);
                     continue;
                 }
 
-                match current.index.get(&req.slot_id) {
+                match current.slot_index.get(&req.slot_id) {
                     Some(&idx) => {
                         if !matches!(current.snapshot.slots[idx].state, SlotState::Free) {
-                            conflicts.insert(req.slot_id);
+                            slot_conflicts.insert(req.slot_id);
                         }
                     }
                     None => {
-                        unknown.insert(req.slot_id);
+                        slot_unknown.insert(req.slot_id);
                     }
                 }
             }
 
-            if !duplicates.is_empty() {
+            if !slot_duplicates.is_empty() {
                 return Err(SchedulerError::DuplicateSlots {
-                    duplicates: duplicates.into_iter().collect(),
+                    duplicates: slot_duplicates.into_iter().collect(),
                     snapshot: current.snapshot.clone(),
                 });
             }
 
-            if !unknown.is_empty() {
+            if !slot_unknown.is_empty() {
                 return Err(SchedulerError::UnknownSlots {
-                    unknown: unknown.into_iter().collect(),
+                    unknown: slot_unknown.into_iter().collect(),
                     snapshot: current.snapshot.clone(),
                 });
             }
 
-            if !conflicts.is_empty() {
+            if !slot_conflicts.is_empty() {
                 return Err(SchedulerError::SlotsUnavailable {
-                    conflicts: conflicts.into_iter().collect(),
+                    conflicts: slot_conflicts.into_iter().collect(),
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            let mut gpu_seen = HashSet::with_capacity(gpu_requests.len());
+            let mut gpu_duplicates = BTreeSet::new();
+            let mut gpu_unknown = BTreeSet::new();
+            let mut gpu_conflicts = BTreeSet::new();
+
+            for req in &gpu_requests {
+                if !gpu_seen.insert(req.device_id.clone()) {
+                    gpu_duplicates.insert(req.device_id.clone());
+                    continue;
+                }
+
+                match current.gpu_index.get(&req.device_id) {
+                    Some(&idx) => {
+                        if !matches!(current.snapshot.gpu_devices[idx].state, GpuDeviceState::Free)
+                        {
+                            gpu_conflicts.insert(req.device_id.clone());
+                        }
+                    }
+                    None => {
+                        gpu_unknown.insert(req.device_id.clone());
+                    }
+                }
+            }
+
+            if !gpu_duplicates.is_empty() {
+                return Err(SchedulerError::DuplicateGpuDevices {
+                    duplicates: gpu_duplicates.into_iter().collect(),
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            if !gpu_unknown.is_empty() {
+                return Err(SchedulerError::UnknownGpuDevices {
+                    unknown: gpu_unknown.into_iter().collect(),
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            if !gpu_conflicts.is_empty() {
+                return Err(SchedulerError::GpuDevicesUnavailable {
+                    conflicts: gpu_conflicts.into_iter().collect(),
                     snapshot: current.snapshot.clone(),
                 });
             }
@@ -449,9 +758,16 @@ impl Scheduler {
             // Clone the snapshot so we can safely mutate a private copy while readers continue to
             // observe the old data. We only publish the new snapshot once every validation passes.
             let mut new_snapshot = current.snapshot.clone();
-            for req in &requests {
-                let idx = current.index[&req.slot_id];
+            for req in &slot_requests {
+                let idx = current.slot_index[&req.slot_id];
                 new_snapshot.slots[idx].state = SlotState::Reserved(SlotReservation {
+                    owner: req.owner,
+                    task_id: req.task_id,
+                });
+            }
+            for req in &gpu_requests {
+                let idx = current.gpu_index[&req.device_id];
+                new_snapshot.gpu_devices[idx].state = GpuDeviceState::Reserved(GpuDeviceReservation {
                     owner: req.owner,
                     task_id: req.task_id,
                 });
@@ -587,8 +903,22 @@ impl Scheduler {
     where
         I: IntoIterator<Item = SlotId>,
     {
+        let slot_ids: Vec<SlotId> = slots.into_iter().collect();
+        self.free_resources(expected_version, slot_ids, Vec::new())
+            .await
+    }
+
+    /// Releases slots and GPU devices in a single optimistic transaction.
+    pub async fn free_resources(
+        &self,
+        expected_version: u64,
+        slots: Vec<SlotId>,
+        gpu_device_ids: Vec<String>,
+    ) -> Result<SchedulerSnapshot, SchedulerError> {
         let slot_ids: BTreeSet<SlotId> = slots.into_iter().collect();
-        if slot_ids.is_empty() {
+        let gpu_ids: BTreeSet<String> = gpu_device_ids.into_iter().collect();
+
+        if slot_ids.is_empty() && gpu_ids.is_empty() {
             return self
                 .state
                 .load_full()
@@ -597,7 +927,7 @@ impl Scheduler {
                 .map(|state| state.snapshot.clone());
         }
 
-        // Retry loop mirroring `reserve_slots` but toggling slot states back to free.
+        // Retry loop mirroring `reserve_resources` but toggling states back to free.
         loop {
             let current_opt = self.state.load_full();
             let current_arc = match current_opt.as_ref() {
@@ -614,37 +944,68 @@ impl Scheduler {
                 });
             }
 
-            let mut unknown = Vec::new();
-            let mut not_reserved = Vec::new();
+            let mut unknown_slots = Vec::new();
+            let mut not_reserved_slots = Vec::new();
             for slot_id in &slot_ids {
-                let Some(&idx) = current.index.get(slot_id) else {
-                    unknown.push(*slot_id);
+                let Some(&idx) = current.slot_index.get(slot_id) else {
+                    unknown_slots.push(*slot_id);
                     continue;
                 };
 
                 if matches!(current.snapshot.slots[idx].state, SlotState::Free) {
-                    not_reserved.push(*slot_id);
+                    not_reserved_slots.push(*slot_id);
                 }
             }
 
-            if !unknown.is_empty() {
+            if !unknown_slots.is_empty() {
                 return Err(SchedulerError::UnknownSlots {
-                    unknown,
+                    unknown: unknown_slots,
                     snapshot: current.snapshot.clone(),
                 });
             }
 
-            if !not_reserved.is_empty() {
+            if !not_reserved_slots.is_empty() {
                 return Err(SchedulerError::SlotsNotReserved {
-                    slots: not_reserved,
+                    slots: not_reserved_slots,
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            let mut unknown_gpus = Vec::new();
+            let mut not_reserved_gpus = Vec::new();
+            for device_id in &gpu_ids {
+                let Some(&idx) = current.gpu_index.get(device_id) else {
+                    unknown_gpus.push(device_id.clone());
+                    continue;
+                };
+
+                if matches!(current.snapshot.gpu_devices[idx].state, GpuDeviceState::Free) {
+                    not_reserved_gpus.push(device_id.clone());
+                }
+            }
+
+            if !unknown_gpus.is_empty() {
+                return Err(SchedulerError::UnknownGpuDevices {
+                    unknown: unknown_gpus,
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            if !not_reserved_gpus.is_empty() {
+                return Err(SchedulerError::GpuDevicesNotReserved {
+                    devices: not_reserved_gpus,
                     snapshot: current.snapshot.clone(),
                 });
             }
 
             let mut new_snapshot = current.snapshot.clone();
             for slot_id in &slot_ids {
-                let idx = current.index[slot_id];
+                let idx = current.slot_index[slot_id];
                 new_snapshot.slots[idx].state = SlotState::Free;
+            }
+            for device_id in &gpu_ids {
+                let idx = current.gpu_index[device_id];
+                new_snapshot.gpu_devices[idx].state = GpuDeviceState::Free;
             }
 
             new_snapshot.version = new_snapshot

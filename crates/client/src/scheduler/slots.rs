@@ -40,9 +40,12 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
     let free = summary.get_free_slots();
     let reserved = summary.get_reserved_slots();
     let version = summary.get_version();
+    let gpu_total = summary.get_gpu_total();
+    let gpu_free = summary.get_gpu_free();
+    let gpu_reserved = summary.get_gpu_reserved();
 
     output::emit_block(format!(
-        "Scheduler Summary:\n  Node: {} ({})\n  Total slots: {}\n  Free slots: {}\n  Reserved slots: {}\n  Snapshot version: {}",
+        "Scheduler Summary:\n  Node: {} ({})\n  Total slots: {}\n  Free slots: {}\n  Reserved slots: {}\n  GPU devices: {} (free {}, reserved {})\n  Snapshot version: {}",
         if node_name.is_empty() {
             "<unknown>".to_string()
         } else {
@@ -52,6 +55,9 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
         total,
         free,
         reserved,
+        gpu_total,
+        gpu_free,
+        gpu_reserved,
         version,
     ));
 
@@ -59,13 +65,12 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
         let details_reader = summary.get_details()?;
         if !details_reader.is_empty() {
             let mut tw = TabWriter::new(Vec::new());
-            writeln!(&mut tw, "SLOT\tCPU(m)\tMEM(MiB)\tGPU\tSTATE\tOWNER\tTASK")?;
+            writeln!(&mut tw, "SLOT\tCPU(m)\tMEM(MiB)\tSTATE\tOWNER\tTASK")?;
 
             for detail in details_reader.iter() {
                 let slot_id = detail.get_slot_id();
                 let cpu = detail.get_cpu_millis();
                 let mem_mib = detail.get_memory_bytes() / (1024 * 1024);
-                let gpu = detail.get_gpu_count();
                 let state = match detail.get_state()? {
                     scheduling::SlotState::Free => "free",
                     scheduling::SlotState::Reserved => "reserved",
@@ -80,7 +85,7 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
 
                 writeln!(
                     &mut tw,
-                    "{slot_id}\t{cpu}\t{mem_mib}\t{gpu}\t{state}\t{owner}\t{task}",
+                    "{slot_id}\t{cpu}\t{mem_mib}\t{state}\t{owner}\t{task}",
                 )?;
             }
 
@@ -89,6 +94,40 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
             output::emit_block(format!("\nSlot Details:\n{output}"));
         } else {
             println!("\nNo slot details available.");
+        }
+
+        let gpu_reader = summary.get_gpu_devices()?;
+        if !gpu_reader.is_empty() {
+            let mut tw = TabWriter::new(Vec::new());
+            writeln!(&mut tw, "GPU_ID\tNAME\tMEM(GiB)\tSTATE\tOWNER\tTASK")?;
+
+            for device in gpu_reader.iter() {
+                let device_id = device.get_device_id()?.to_str()?.to_string();
+                let name = device.get_name()?.to_str()?.to_string();
+                let mem_gib = device.get_memory_total_bytes() as f64 / (1024.0 * 1024.0 * 1024.0);
+                let state = match device.get_state()? {
+                    scheduling::GpuState::Free => "free",
+                    scheduling::GpuState::Reserved => "reserved",
+                };
+
+                let owner = bytes_to_uuid(device.get_owner()?)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let task = bytes_to_uuid(device.get_task_id()?)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+
+                writeln!(
+                    &mut tw,
+                    "{device_id}\t{name}\t{mem_gib:.2}\t{state}\t{owner}\t{task}",
+                )?;
+            }
+
+            tw.flush()?;
+            let output = String::from_utf8(tw.into_inner()?)?;
+            output::emit_block(format!("\nGPU Devices:\n{output}"));
+        } else {
+            println!("\nNo GPU devices available.");
         }
     }
 

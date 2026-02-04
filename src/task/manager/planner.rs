@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use rand::rng;
 use rand::seq::SliceRandom;
@@ -7,8 +8,10 @@ use thiserror::Error;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::scheduler::summary::SchedulerSlotState;
-use crate::scheduler::{SchedulerSnapshot, SlotCapacity, SlotId, SlotState};
+use crate::scheduler::summary::{SchedulerGpuState, SchedulerSlotState};
+use crate::scheduler::{
+    GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
+};
 use crate::task::types::{
     TaskEnvironmentVariable, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata,
 };
@@ -35,6 +38,7 @@ pub(super) struct BatchStartPlan {
     pub(super) requested_cpu_millis: u64,
     pub(super) requested_memory_bytes: u64,
     pub(super) requested_gpu_count: u32,
+    pub(super) gpu_device_ids: Vec<String>,
     pub(super) container_name: String,
     pub(super) container_id: Option<String>,
     pub(super) created_at: DateTime<Utc>,
@@ -66,6 +70,7 @@ pub(super) struct StartIntent {
     pub(super) cpu_millis: u64,
     pub(super) memory_bytes: u64,
     pub(super) gpu_count: u32,
+    pub(super) gpu_device_ids: Vec<String>,
     pub(super) preassigned_slots: Vec<SlotId>,
     pub(super) restart_policy: Option<TaskRestartPolicy>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
@@ -81,6 +86,17 @@ pub(super) struct SlotChoice {
     pub(super) capacity: SlotCapacity,
 }
 
+#[derive(Clone)]
+pub(super) struct GpuChoice {
+    pub(super) device_id: String,
+}
+
+#[derive(Clone)]
+pub(super) struct ResourceAllocation {
+    pub(super) slots: Vec<SlotChoice>,
+    pub(super) gpu_device_ids: Vec<String>,
+}
+
 /// Identifies whether a scheduling candidate refers to this node or a remote peer.
 #[derive(Clone)]
 enum CandidateLocation {
@@ -93,6 +109,7 @@ enum CandidateLocation {
 struct Candidate {
     location: CandidateLocation,
     slots: Vec<SlotChoice>,
+    gpu_devices: Vec<GpuChoice>,
     ready_networks: HashSet<Uuid>,
 }
 
@@ -102,6 +119,7 @@ impl Candidate {
     fn new(
         location: CandidateLocation,
         slots: Vec<SlotChoice>,
+        gpu_devices: Vec<GpuChoice>,
         ready_networks: HashSet<Uuid>,
     ) -> Option<Self> {
         if slots.is_empty() {
@@ -110,6 +128,7 @@ impl Candidate {
             Some(Self {
                 location,
                 slots,
+                gpu_devices,
                 ready_networks,
             })
         }
@@ -129,77 +148,47 @@ impl Candidate {
         cpu_millis: u64,
         memory_bytes: u64,
         gpu_count: u32,
-    ) -> Option<Vec<SlotChoice>> {
+    ) -> Option<ResourceAllocation> {
         if self.slots.is_empty() {
             return None;
         }
 
-        let mut remaining_gpu = gpu_count as u64;
+        let selected_gpu_ids = if gpu_count > 0 {
+            if self.gpu_devices.len() < gpu_count as usize {
+                return None;
+            }
+
+            let mut ids: Vec<String> = self
+                .gpu_devices
+                .iter()
+                .map(|device| device.device_id.clone())
+                .collect();
+            ids.sort();
+            ids.truncate(gpu_count as usize);
+            ids
+        } else {
+            Vec::new()
+        };
+
         let mut remaining_cpu = cpu_millis;
         let mut remaining_mem = memory_bytes;
 
         let mut selected_indices: Vec<usize> = Vec::new();
         let mut available_indices: Vec<usize> = (0..self.slots.len()).collect();
 
-        if remaining_gpu > 0 {
-            // Consume GPU slots first so we never overbook accelerators.
-            let mut gpu_indices: Vec<usize> = available_indices
-                .iter()
-                .copied()
-                .filter(|&idx| self.slots[idx].capacity.gpu_count > 0)
-                .collect();
-
-            if gpu_indices.is_empty() {
-                return None;
-            }
-
-            // Prefer GPU slots that also contribute the most CPU/memory.
-            gpu_indices.sort_unstable_by(|&a, &b| {
-                let a_slot = &self.slots[a];
-                let b_slot = &self.slots[b];
-                let a_score = (a_slot.capacity.cpu_millis as u128) << 64
-                    | a_slot.capacity.memory_bytes as u128;
-                let b_score = (b_slot.capacity.cpu_millis as u128) << 64
-                    | b_slot.capacity.memory_bytes as u128;
-                b_score.cmp(&a_score)
-            });
-
-            for idx in gpu_indices {
-                if remaining_gpu == 0 {
-                    break;
-                }
-                let slot = &self.slots[idx];
-                let gpu_units = slot.capacity.gpu_count as u64;
-                if gpu_units == 0 {
-                    continue;
-                }
-                selected_indices.push(idx);
-                remaining_gpu = remaining_gpu.saturating_sub(gpu_units);
-                remaining_cpu = remaining_cpu.saturating_sub(slot.capacity.cpu_millis);
-                remaining_mem = remaining_mem.saturating_sub(slot.capacity.memory_bytes);
-                available_indices.retain(|&candidate| candidate != idx);
-            }
-
-            if remaining_gpu > 0 {
-                return None;
-            }
-        } else {
-            // Preserve GPU slots for GPU workloads whenever possible.
-            let non_gpu: Vec<usize> = available_indices
-                .iter()
-                .copied()
-                .filter(|&idx| self.slots[idx].capacity.gpu_count == 0)
-                .collect();
-            if !non_gpu.is_empty() {
-                available_indices = non_gpu;
-            }
-        }
-
         // Zero-capacity requests still require a single slot to run the task so
         // we keep the previous behaviour.
         if remaining_cpu == 0 && remaining_mem == 0 && selected_indices.is_empty() {
             let slot = self.slots.remove(available_indices[0]);
-            return Some(vec![slot]);
+            if !selected_gpu_ids.is_empty() {
+                let selected: HashSet<&String> = selected_gpu_ids.iter().collect();
+                self.gpu_devices
+                    .retain(|device| !selected.contains(&device.device_id));
+            }
+            return Some(ResourceAllocation {
+                slots: vec![slot],
+                gpu_device_ids: selected_gpu_ids,
+            });
         }
 
         while remaining_cpu > 0 || remaining_mem > 0 {
@@ -242,7 +231,17 @@ impl Candidate {
             allocated.push(self.slots.remove(idx));
         }
         allocated.reverse();
-        Some(allocated)
+
+        if !selected_gpu_ids.is_empty() {
+            let selected: HashSet<&String> = selected_gpu_ids.iter().collect();
+            self.gpu_devices
+                .retain(|device| !selected.contains(&device.device_id));
+        }
+
+        Some(ResourceAllocation {
+            slots: allocated,
+            gpu_device_ids: selected_gpu_ids,
+        })
     }
 
     fn is_empty(&self) -> bool {
@@ -261,6 +260,7 @@ pub(super) struct RemoteStartPlan {
     pub(super) memory_bytes: u64,
     pub(super) gpu_count: u32,
     pub(super) slots: Vec<SlotChoice>,
+    pub(super) gpu_device_ids: Vec<String>,
     pub(super) peer_id: Uuid,
     pub(super) scheduler_version: u64,
     pub(super) restart_policy: Option<TaskRestartPolicy>,
@@ -278,11 +278,49 @@ pub(super) struct Assignment {
 
 impl TaskManager {
     /// Normalizes user requests into deterministic scheduling intents, applying IDs and defaults.
-    pub(super) fn build_start_intents(requests: Vec<TaskStartRequest>) -> Vec<StartIntent> {
-        requests
-            .into_iter()
-            .enumerate()
-            .map(|(index, request)| StartIntent {
+    pub(super) fn build_start_intents(
+        requests: Vec<TaskStartRequest>,
+    ) -> Result<Vec<StartIntent>, anyhow::Error> {
+        let mut intents = Vec::with_capacity(requests.len());
+
+        for (index, request) in requests.into_iter().enumerate() {
+            let gpu_device_ids = request.gpu_device_ids;
+            if !gpu_device_ids.is_empty() {
+                let mut seen = HashSet::with_capacity(gpu_device_ids.len());
+                for id in &gpu_device_ids {
+                    if !seen.insert(id) {
+                        return Err(anyhow!(
+                            "duplicate gpu device id '{id}' supplied for task {}",
+                            request.name
+                        ));
+                    }
+                }
+                if request.slot_ids.is_empty() {
+                    return Err(anyhow!(
+                        "gpu_device_ids require preassigned slots for task {}",
+                        request.name
+                    ));
+                }
+            }
+
+            let resolved_gpu_count = if request.gpu_count == 0 {
+                gpu_device_ids.len() as u32
+            } else {
+                request.gpu_count
+            };
+
+            if !gpu_device_ids.is_empty()
+                && resolved_gpu_count != gpu_device_ids.len() as u32
+            {
+                return Err(anyhow!(
+                    "gpu_count {} does not match {} gpu device ids for task {}",
+                    resolved_gpu_count,
+                    gpu_device_ids.len(),
+                    request.name
+                ));
+            }
+
+            intents.push(StartIntent {
                 index,
                 id: request.id.unwrap_or_else(Uuid::new_v4),
                 name: request.name,
@@ -290,7 +328,8 @@ impl TaskManager {
                 command: request.command,
                 cpu_millis: request.cpu_millis,
                 memory_bytes: request.memory_bytes,
-                gpu_count: request.gpu_count,
+                gpu_count: resolved_gpu_count,
+                gpu_device_ids,
                 preassigned_slots: request.slot_ids,
                 restart_policy: request.restart_policy,
                 env: request.env,
@@ -298,8 +337,10 @@ impl TaskManager {
                 networks: request.networks,
                 service_metadata: request.service_metadata,
                 target_node: request.target_node,
-            })
-            .collect()
+            });
+        }
+
+        Ok(intents)
     }
 
     /// Computes the full placement assignment for a batch of tasks across local and remote nodes.
@@ -327,7 +368,7 @@ impl TaskManager {
             .get(&self.local_node_id)
             .cloned()
             .unwrap_or_else(HashSet::new);
-        let (mut assignment, remaining_intents, available_slots) =
+        let (mut assignment, remaining_intents, available_slots, available_gpus) =
             self.seed_local_plans(intents, &snapshot, local_version, &local_ready)?;
 
         if remaining_intents.is_empty() {
@@ -336,7 +377,7 @@ impl TaskManager {
         }
 
         let mut candidates = self
-            .build_candidate_queue(available_slots, &readiness_map, &local_ready)
+            .build_candidate_queue(available_slots, available_gpus, &readiness_map, &local_ready)
             .await?;
         if candidates.is_empty() {
             return Err(anyhow::anyhow!(
@@ -359,7 +400,15 @@ impl TaskManager {
         snapshot: &SchedulerSnapshot,
         local_version: u64,
         local_ready: &HashSet<Uuid>,
-    ) -> Result<(Assignment, Vec<&'a StartIntent>, Vec<SlotChoice>), anyhow::Error> {
+    ) -> Result<
+        (
+            Assignment,
+            Vec<&'a StartIntent>,
+            Vec<SlotChoice>,
+            Vec<GpuChoice>,
+        ),
+        anyhow::Error,
+    > {
         let mut slot_lookup = HashMap::new();
         let mut available_local_slots = Vec::new();
         for slot in snapshot.slots.iter() {
@@ -371,6 +420,18 @@ impl TaskManager {
                 });
             }
         }
+
+        let mut gpu_lookup = HashMap::new();
+        let mut available_local_gpus = Vec::new();
+        for device in snapshot.gpu_devices.iter() {
+            gpu_lookup.insert(device.device_id.clone(), device.clone());
+            if matches!(device.state, GpuDeviceState::Free) {
+                available_local_gpus.push(GpuChoice {
+                    device_id: device.device_id.clone(),
+                });
+            }
+        }
+        available_local_gpus.sort_by(|a, b| a.device_id.cmp(&b.device_id));
 
         let mut local_plans = Vec::new();
         for intent in intents.iter() {
@@ -438,19 +499,63 @@ impl TaskManager {
                 .iter()
                 .map(|slot| slot.capacity.memory_bytes)
                 .sum();
-            let total_gpu: u32 = chosen_slots
-                .iter()
-                .map(|slot| slot.capacity.gpu_count)
-                .sum();
-
-            if intent.cpu_millis > total_cpu
-                || intent.memory_bytes > total_mem
-                || intent.gpu_count > total_gpu
-            {
+            if intent.cpu_millis > total_cpu || intent.memory_bytes > total_mem {
                 return Err(anyhow::anyhow!(
                     "preassigned slots for task '{}' provide insufficient capacity",
                     intent.name
                 ));
+            }
+
+            let mut chosen_gpu_device_ids = Vec::new();
+            if !intent.gpu_device_ids.is_empty() {
+                for device_id in &intent.gpu_device_ids {
+                    let device = gpu_lookup.get(device_id).ok_or_else(|| {
+                        anyhow::anyhow!("unknown preassigned gpu device {device_id}")
+                    })?;
+
+                    if let GpuDeviceState::Reserved(GpuDeviceReservation { owner, task_id }) =
+                        &device.state
+                    {
+                        if *owner != self.local_node_id {
+                            return Err(anyhow::anyhow!(
+                                "preassigned gpu device {device_id} owned by different node"
+                            ));
+                        }
+
+                        if let Some(reserved_task) = task_id {
+                            if *reserved_task != intent.id {
+                                return Err(anyhow::anyhow!(
+                                    "preassigned gpu device {device_id} reserved for task {reserved_task}"
+                                ));
+                            }
+                        }
+                    }
+
+                    available_local_gpus
+                        .retain(|gpu| gpu.device_id.as_str() != device_id);
+                    chosen_gpu_device_ids.push(device_id.clone());
+                }
+            }
+
+            let missing_gpu = intent
+                .gpu_count
+                .saturating_sub(chosen_gpu_device_ids.len() as u32);
+            if missing_gpu > 0 {
+                if available_local_gpus.len() < missing_gpu as usize {
+                    return Err(anyhow::anyhow!(
+                        "preassigned task '{}' requested {} GPU(s) but only {} GPU(s) are available",
+                        intent.name,
+                        intent.gpu_count,
+                        chosen_gpu_device_ids.len() + available_local_gpus.len()
+                    ));
+                }
+
+                for _ in 0..missing_gpu {
+                    let next = available_local_gpus
+                        .remove(0)
+                        .device_id;
+                    chosen_gpu_device_ids.push(next);
+                }
             }
 
             local_plans.push(BatchStartPlan {
@@ -462,6 +567,7 @@ impl TaskManager {
                 requested_cpu_millis: intent.cpu_millis,
                 requested_memory_bytes: intent.memory_bytes,
                 requested_gpu_count: intent.gpu_count,
+                gpu_device_ids: chosen_gpu_device_ids,
                 container_name: String::new(),
                 container_id: None,
                 created_at: Utc::now(),
@@ -485,7 +591,12 @@ impl TaskManager {
             .filter(|intent| intent.preassigned_slots.is_empty())
             .collect();
 
-        Ok((assignment, remaining_intents, available_local_slots))
+        Ok((
+            assignment,
+            remaining_intents,
+            available_local_slots,
+            available_local_gpus,
+        ))
     }
 
     /// Build the round-robin candidate queue starting with the local node followed
@@ -494,12 +605,13 @@ impl TaskManager {
     async fn build_candidate_queue(
         &self,
         local_slots: Vec<SlotChoice>,
+        local_gpus: Vec<GpuChoice>,
         readiness: &HashMap<Uuid, HashSet<Uuid>>,
         local_ready: &HashSet<Uuid>,
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
         if let Some(local_candidate) =
-            Candidate::new(CandidateLocation::Local, local_slots, local_ready.clone())
+            Candidate::new(CandidateLocation::Local, local_slots, local_gpus, local_ready.clone())
         {
             queue.push_back(local_candidate);
         }
@@ -531,10 +643,20 @@ impl TaskManager {
                     capacity: SlotCapacity::new(
                         detail.cpu_millis,
                         detail.memory_bytes,
-                        detail.gpu_count,
+                        0,
                     ),
                 })
                 .collect();
+
+            let mut gpu_devices: Vec<GpuChoice> = summary
+                .gpu_devices
+                .iter()
+                .filter(|device| matches!(device.state, SchedulerGpuState::Free))
+                .map(|device| GpuChoice {
+                    device_id: device.device_id.clone(),
+                })
+                .collect();
+            gpu_devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
 
             let ready_networks = readiness
                 .get(&peer_id)
@@ -547,6 +669,7 @@ impl TaskManager {
                     version: summary.version,
                 },
                 slots,
+                gpu_devices,
                 ready_networks,
             ) {
                 remote_candidates.push(candidate);
@@ -569,7 +692,7 @@ impl TaskManager {
         candidates: &mut VecDeque<Candidate>,
         intent: &StartIntent,
         target_node: Uuid,
-    ) -> Result<(CandidateLocation, Vec<SlotChoice>), anyhow::Error> {
+    ) -> Result<(CandidateLocation, ResourceAllocation), anyhow::Error> {
         let candidate_count = candidates.len();
         if candidate_count == 0 {
             return Err(anyhow::anyhow!(
@@ -609,7 +732,7 @@ impl TaskManager {
             .into());
         }
 
-        if let Some(slots) = candidate.allocate(
+        if let Some(allocation) = candidate.allocate(
             intent.cpu_millis,
             intent.memory_bytes,
             intent.gpu_count,
@@ -618,7 +741,7 @@ impl TaskManager {
             if !candidate.is_empty() {
                 candidates.push_back(candidate);
             }
-            return Ok((location, slots));
+            return Ok((location, allocation));
         }
 
         candidates.push_back(candidate);
@@ -638,7 +761,7 @@ impl TaskManager {
     ) -> Result<(), anyhow::Error> {
         for intent in intents {
             if let Some(target_node) = intent.target_node {
-                let (location, slots) =
+                let (location, allocation) =
                     self.allocate_targeted_intent(candidates, intent, target_node)?;
 
                 match location {
@@ -648,10 +771,11 @@ impl TaskManager {
                             name: intent.name.clone(),
                             image: intent.image.clone(),
                             command: intent.command.clone(),
-                            slots,
+                            slots: allocation.slots,
                             requested_cpu_millis: intent.cpu_millis,
                             requested_memory_bytes: intent.memory_bytes,
                             requested_gpu_count: intent.gpu_count,
+                            gpu_device_ids: allocation.gpu_device_ids,
                             container_name: String::new(),
                             container_id: None,
                             created_at: Utc::now(),
@@ -674,7 +798,8 @@ impl TaskManager {
                             cpu_millis: intent.cpu_millis,
                             memory_bytes: intent.memory_bytes,
                             gpu_count: intent.gpu_count,
-                            slots,
+                            slots: allocation.slots,
+                            gpu_device_ids: allocation.gpu_device_ids,
                             peer_id,
                             scheduler_version: version,
                             restart_policy: intent.restart_policy.clone(),
@@ -695,7 +820,7 @@ impl TaskManager {
                 ));
             }
 
-            let mut allocated: Option<(CandidateLocation, Vec<SlotChoice>)> = None;
+            let mut allocated: Option<(CandidateLocation, ResourceAllocation)> = None;
             let mut skipped_for_networks = false;
             for _ in 0..candidate_count {
                 let mut candidate = candidates
@@ -708,7 +833,7 @@ impl TaskManager {
                     continue;
                 }
 
-                if let Some(slots) = candidate.allocate(
+                if let Some(allocation) = candidate.allocate(
                     intent.cpu_millis,
                     intent.memory_bytes,
                     intent.gpu_count,
@@ -717,14 +842,14 @@ impl TaskManager {
                     if !candidate.is_empty() {
                         candidates.push_back(candidate);
                     }
-                    allocated = Some((location, slots));
+                    allocated = Some((location, allocation));
                     break;
                 } else {
                     candidates.push_back(candidate);
                 }
             }
 
-            let Some((location, slots)) = allocated else {
+            let Some((location, allocation)) = allocated else {
                 if skipped_for_networks {
                     return Err(SchedulingError::NetworksUnavailable {
                         networks: intent.networks.clone(),
@@ -744,10 +869,11 @@ impl TaskManager {
                         name: intent.name.clone(),
                         image: intent.image.clone(),
                         command: intent.command.clone(),
-                        slots,
+                        slots: allocation.slots,
                         requested_cpu_millis: intent.cpu_millis,
                         requested_memory_bytes: intent.memory_bytes,
                         requested_gpu_count: intent.gpu_count,
+                        gpu_device_ids: allocation.gpu_device_ids,
                         container_name: String::new(),
                         container_id: None,
                         created_at: Utc::now(),
@@ -770,7 +896,8 @@ impl TaskManager {
                         cpu_millis: intent.cpu_millis,
                         memory_bytes: intent.memory_bytes,
                         gpu_count: intent.gpu_count,
-                        slots,
+                        slots: allocation.slots,
+                        gpu_device_ids: allocation.gpu_device_ids,
                         peer_id,
                         scheduler_version: version,
                         restart_policy: intent.restart_policy.clone(),

@@ -41,7 +41,7 @@ mod state;
 mod tests;
 
 use self::planner::{RemoteStartPlan, SchedulingError};
-use self::reservation::{ExecutionError, RemoteReservation};
+use self::reservation::{ExecutionError, RemoteReservation, ReservedResources};
 use self::secrets::TaskSecretArtifacts;
 
 #[derive(Clone)]
@@ -73,6 +73,7 @@ pub struct TaskStartRequest {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
     pub gpu_count: u32,
+    pub gpu_device_ids: Vec<String>,
     pub id: Option<Uuid>,
     pub slot_ids: Vec<SlotId>,
     pub restart_policy: Option<TaskRestartPolicy>,
@@ -172,6 +173,7 @@ impl TaskManager {
             cpu_millis,
             memory_bytes,
             gpu_count: 0,
+            gpu_device_ids: Vec::new(),
             id: None,
             slot_ids: Vec::new(),
             restart_policy,
@@ -198,7 +200,7 @@ impl TaskManager {
 
         self.ensure_secret_dependencies(&requests)?;
 
-        let intents = Self::build_start_intents(requests);
+        let intents = Self::build_start_intents(requests)?;
 
         const MAX_ATTEMPTS: usize = 5;
         const NETWORK_READINESS_MAX_ATTEMPTS: usize = 30;
@@ -235,7 +237,7 @@ impl TaskManager {
             let mut local_plans = assignment.local;
             let remote_plans = assignment.remote;
 
-            let mut reserved_local_slots: Option<Vec<SlotId>> = None;
+            let mut reserved_local_resources: Option<ReservedResources> = None;
             let mut reserved_remote: HashMap<Uuid, RemoteReservation> = HashMap::new();
 
             if let Err(err) = self.ensure_remote_secret_availability(&remote_plans).await {
@@ -247,10 +249,10 @@ impl TaskManager {
                 continue;
             }
 
-            match self.reserve_local_slots(&local_plans, local_version).await {
-                Ok(slots) => {
-                    if !slots.is_empty() {
-                        reserved_local_slots = Some(slots);
+            match self.reserve_local_resources(&local_plans, local_version).await {
+                Ok(resources) => {
+                    if !resources.slots.is_empty() || !resources.gpu_device_ids.is_empty() {
+                        reserved_local_resources = Some(resources);
                     }
                 }
                 Err(ExecutionError::Retry(err)) => {
@@ -263,7 +265,7 @@ impl TaskManager {
                 Err(ExecutionError::Fatal(err)) => return Err(err),
             }
 
-            match self.reserve_remote_slots(&remote_plans).await {
+            match self.reserve_remote_resources(&remote_plans).await {
                 Ok(map) => {
                     reserved_remote = map;
                 }
@@ -272,15 +274,15 @@ impl TaskManager {
                         target: "task",
                         "remote reservation conflicted on attempt {attempt}: {err}"
                     );
-                    if let Some(slots) = reserved_local_slots.take() {
-                        self.release_local_slots(&slots).await;
+                    if let Some(resources) = reserved_local_resources.take() {
+                        self.release_local_resources(&resources).await;
                     }
                     reserved_remote.clear();
                     continue;
                 }
                 Err(ExecutionError::Fatal(err)) => {
-                    if let Some(slots) = reserved_local_slots.take() {
-                        self.release_local_slots(&slots).await;
+                    if let Some(resources) = reserved_local_resources.take() {
+                        self.release_local_resources(&resources).await;
                     }
                     reserved_remote.clear();
                     return Err(err);
@@ -294,18 +296,18 @@ impl TaskManager {
                         target: "task",
                         "remote materialization conflicted on attempt {attempt}: {err}"
                     );
-                    self.release_remote_slots(&reserved_remote).await;
+                    self.release_remote_resources(&reserved_remote).await;
                     reserved_remote.clear();
-                    if let Some(slots) = reserved_local_slots.take() {
-                        self.release_local_slots(&slots).await;
+                    if let Some(resources) = reserved_local_resources.take() {
+                        self.release_local_resources(&resources).await;
                     }
                     continue;
                 }
                 Err(ExecutionError::Fatal(err)) => {
-                    self.release_remote_slots(&reserved_remote).await;
+                    self.release_remote_resources(&reserved_remote).await;
                     reserved_remote.clear();
-                    if let Some(slots) = reserved_local_slots.take() {
-                        self.release_local_slots(&slots).await;
+                    if let Some(resources) = reserved_local_resources.take() {
+                        self.release_local_resources(&resources).await;
                     }
                     return Err(err);
                 }
@@ -335,10 +337,10 @@ impl TaskManager {
                         "local execution failed; rolling back remote tasks: {err}"
                     );
                     self.signal_remote_stop(&remote_specs).await;
-                    self.release_remote_slots(&reserved_remote).await;
+                    self.release_remote_resources(&reserved_remote).await;
                     reserved_remote.clear();
-                    if let Some(slots) = reserved_local_slots.take() {
-                        self.release_local_slots(&slots).await;
+                    if let Some(resources) = reserved_local_resources.take() {
+                        self.release_local_resources(&resources).await;
                     }
                     return Err(err);
                 }
@@ -734,6 +736,7 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         cpu_millis: value.cpu_millis,
         memory_bytes: value.memory_bytes,
         gpu_count: value.gpu_count,
+        gpu_device_ids: value.gpu_device_ids,
         restart_policy: value.restart_policy,
         env: value.env,
         secret_files: value.secret_files,

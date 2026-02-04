@@ -82,6 +82,10 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
             if !uuid.is_empty() {
                 println!("    uuid: {uuid}");
             }
+            let pci_bus_id = device.get_pci_bus_id()?.to_str()?.to_string();
+            if !pci_bus_id.is_empty() {
+                println!("    pci_bus_id: {pci_bus_id}");
+            }
             let cc = device.get_compute_capability()?.to_str()?.to_string();
             if !cc.is_empty() {
                 println!("    compute_capability: {cc}");

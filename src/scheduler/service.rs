@@ -4,7 +4,7 @@ use protocol::scheduling::scheduler;
 use uuid::Uuid;
 
 use super::summary::SchedulerSummary;
-use super::{Scheduler, SlotReservationRequest};
+use super::{GpuReservationRequest, Scheduler, SlotReservationRequest};
 
 pub struct SchedulerService {
     scheduler: Rc<Scheduler>,
@@ -81,6 +81,7 @@ impl scheduler::Server for SchedulerService {
         let request = params.get()?.get_request()?;
         let expected_version = request.get_expected_version();
         let intents = request.get_intents()?;
+        let gpu_intents = request.get_gpu_intents()?;
 
         let mut reservations = Vec::with_capacity(intents.len() as usize);
         for intent in intents.iter() {
@@ -105,9 +106,32 @@ impl scheduler::Server for SchedulerService {
             });
         }
 
+        let mut gpu_reservations = Vec::with_capacity(gpu_intents.len() as usize);
+        for intent in gpu_intents.iter() {
+            let device_id = intent.get_device_id()?.to_str()?.to_string();
+            let owner = Self::parse_uuid(intent.get_owner()?)?;
+
+            let task_id = {
+                let bytes = intent.get_task_id()?;
+                if bytes.len() == 16 {
+                    let mut arr = [0u8; 16];
+                    arr.copy_from_slice(bytes);
+                    Some(Uuid::from_bytes(arr))
+                } else {
+                    None
+                }
+            };
+
+            gpu_reservations.push(GpuReservationRequest {
+                device_id,
+                owner,
+                task_id,
+            });
+        }
+
         let snapshot = self
             .scheduler
-            .reserve_slots(expected_version, reservations)
+            .reserve_resources(expected_version, reservations, gpu_reservations)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
 
@@ -133,9 +157,15 @@ impl scheduler::Server for SchedulerService {
             slot_ids.push(slot_id);
         }
 
+        let gpu_reader = request.get_gpu_device_ids()?;
+        let mut gpu_device_ids = Vec::with_capacity(gpu_reader.len() as usize);
+        for device_id in gpu_reader.iter() {
+            gpu_device_ids.push(device_id?.to_str()?.to_string());
+        }
+
         let snapshot = self
             .scheduler
-            .free_slots(expected_version, slot_ids)
+            .free_resources(expected_version, slot_ids, gpu_device_ids)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
 

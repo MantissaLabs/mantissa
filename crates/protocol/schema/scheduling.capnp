@@ -8,6 +8,14 @@ enum SlotState {
   # Slot is currently reserved by a task.
 }
 
+enum GpuState {
+  free @0;
+  # GPU device is available for reservation.
+
+  reserved @1;
+  # GPU device is currently reserved by a task.
+}
+
 struct SlotDetail {
   # Per-slot view of scheduler capacity. Slots are independent capacity slices
   # stored in a flat list rather than a linked list.
@@ -41,6 +49,32 @@ struct SlotDetail {
   # Number of GPUs attached to this slot.
 }
 
+struct GpuDeviceDetail {
+  deviceId @0 :Text;
+  # Stable GPU identifier (UUID preferred).
+
+  uuid @1 :Text;
+  # Vendor-reported UUID (empty when unavailable).
+
+  pciBusId @2 :Text;
+  # PCI bus identifier (empty when unavailable).
+
+  name @3 :Text;
+  # Human-readable model name.
+
+  memoryTotalBytes @4 :UInt64;
+  # Total device memory in bytes.
+
+  state @5 :GpuState;
+  # Current reservation state.
+
+  owner @6 :Data;
+  # 16-byte UUID of the node owning the GPU reservation.
+
+  taskId @7 :Data;
+  # 16-byte UUID of the task using the GPU (empty if unassigned).
+}
+
 struct Summary {
   nodeId @0 :Data;
   # 16-byte UUID of the node that produced the summary.
@@ -62,6 +96,18 @@ struct Summary {
 
   version @6 :UInt64;
   # Monotonic version for optimistic reservation updates.
+
+  gpuTotal @7 :UInt32;
+  # Total number of GPU devices available on the node.
+
+  gpuFree @8 :UInt32;
+  # GPU devices currently available.
+
+  gpuReserved @9 :UInt32;
+  # GPU devices currently reserved.
+
+  gpuDevices @10 :List(GpuDeviceDetail);
+  # Optional per-device details (present when requested).
 }
 
 struct SummaryRequest {
@@ -83,12 +129,26 @@ struct SlotReservationIntent {
   # 16-byte UUID of the task to associate (empty if none).
 }
 
+struct GpuReservationIntent {
+  deviceId @0 :Text;
+  # GPU device identifier to reserve.
+
+  owner @1 :Data;
+  # 16-byte UUID of the node requesting the reservation.
+
+  taskId @2 :Data;
+  # 16-byte UUID of the task to associate (empty if none).
+}
+
 struct ReserveSlotsRequest {
   expectedVersion @0 :UInt64;
   # Expected scheduler version for optimistic locking.
 
   intents @1 :List(SlotReservationIntent);
   # Reservation intents to apply.
+
+  gpuIntents @2 :List(GpuReservationIntent);
+  # GPU reservation intents to apply.
 }
 
 struct ReserveSlotsResponse {
@@ -102,6 +162,9 @@ struct ReleaseSlotsRequest {
 
   slotIds @1 :List(UInt64);
   # Slot identifiers to release.
+
+  gpuDeviceIds @2 :List(Text);
+  # GPU device identifiers to release.
 }
 
 struct ReleaseSlotsResponse {

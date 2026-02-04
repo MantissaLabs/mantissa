@@ -141,4 +141,7 @@ struct GpuDevice {
 
   computeCapability @5 :Text;
   # Compute capability (empty when unavailable).
+
+  pciBusId @6 :Text;
+  # PCI bus identifier (empty when unavailable).
 }

@@ -195,6 +195,7 @@ impl node::Server for Node {
                         entry.set_compute_capability(
                             device.compute_capability.as_deref().unwrap_or(""),
                         );
+                        entry.set_pci_bus_id(device.pci_bus_id.as_deref().unwrap_or(""));
                     }
                 } else {
                     gpu.set_vendor("");

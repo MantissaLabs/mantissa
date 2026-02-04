@@ -84,6 +84,9 @@ struct TaskSpec {
 
   gpuCount @17 :UInt32;
   # Allocated GPU count.
+
+  gpuDeviceIds @18 :List(Text);
+  # Allocated GPU device identifiers (UUIDs preferred).
 }
 
 struct ServiceMetadata {
@@ -130,6 +133,9 @@ struct TaskStartRequest {
 
   gpuCount @11 :UInt32;
   # Requested GPU count.
+
+  gpuDeviceIds @12 :List(Text);
+  # Requested GPU device identifiers (UUIDs preferred).
 }
 
 struct TaskStopRequest {
