@@ -83,6 +83,7 @@ impl PlatformNodePortManager {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{NodePortMapping, NodePortProtocol};
+    use crate::config;
     use crate::network::attachment::host_access_host_iface_name;
     use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
     use crate::node::address::compute_advertise_ip;
@@ -174,22 +175,25 @@ mod platform {
     }
 
     impl PlatformNodePortManager {
-        /// Capture nodeport configuration from the environment for later attachment.
+        /// Capture nodeport configuration from the global config for later attachment.
         pub(super) fn new() -> Self {
-            let iface = env::var("MANTISSA_NODEPORT_IFACE").ok();
-            let node_ip = env::var("MANTISSA_NODEPORT_IP")
-                .ok()
-                .and_then(|val| val.parse::<Ipv4Addr>().ok())
-                .or_else(|| {
-                    compute_advertise_ip(None, None)
-                        .ok()
-                        .and_then(|ip| match ip {
-                            IpAddr::V4(v4) => Some(v4),
-                            _ => None,
-                        })
-                });
-            let enabled = env::var_os("MANTISSA_BPF_NO_ATTACH").is_none()
-                && env::var_os("MANTISSA_SKIP_BPF").is_none();
+            let iface = config::nodeport_iface();
+            let node_ip = config::nodeport_ip().or_else(|| {
+                compute_advertise_ip(None, None)
+                    .ok()
+                    .and_then(|ip| match ip {
+                        IpAddr::V4(v4) => Some(v4),
+                        _ => None,
+                    })
+            });
+            let mut enabled = config::nodeport_enabled();
+            if enabled && !config::bpf_attach_enabled() {
+                debug!(
+                    target: "network",
+                    "nodeport disabled because bpf attachment is disabled"
+                );
+                enabled = false;
+            }
 
             if enabled {
                 info!(
@@ -364,7 +368,7 @@ mod platform {
             let Some(iface) = self.iface.clone() else {
                 warn!(
                     target: "network",
-                    "nodeport interface missing; disable nodeport (set MANTISSA_NODEPORT_IFACE to override)"
+                    "nodeport interface missing; disable nodeport or set network.nodeport.iface in config"
                 );
                 self.enabled = false;
                 return Ok(());
@@ -373,7 +377,7 @@ mod platform {
                 warn!(
                     target: "network",
                     iface = %iface,
-                    "nodeport IP missing; disable nodeport (set MANTISSA_NODEPORT_IP to override)"
+                    "nodeport IP missing; disable nodeport or set network.nodeport.ip in config"
                 );
                 self.enabled = false;
                 return Ok(());
@@ -914,17 +918,17 @@ mod platform {
         search_roots: Vec<PathBuf>,
     }
 
-    impl ArtifactResolver {
-        /// Build a resolver using the same search roots as the core BPF loader.
-        fn new() -> Self {
-            let mut roots = Vec::new();
-            if let Some(dir) = env::var_os("MANTISSA_BPF_DIR") {
-                roots.push(PathBuf::from(dir));
-            }
-            if let Ok(pwd) = env::current_dir() {
-                roots.push(pwd.join("target/bpf"));
-                roots.push(pwd.join("assets/bpf"));
-            }
+        impl ArtifactResolver {
+            /// Build a resolver using the same search roots as the core BPF loader.
+            fn new() -> Self {
+                let mut roots = Vec::new();
+                if let Some(dir) = config::bpf_artifact_dir() {
+                    roots.push(dir);
+                }
+                if let Ok(pwd) = env::current_dir() {
+                    roots.push(pwd.join("target/bpf"));
+                    roots.push(pwd.join("assets/bpf"));
+                }
             Self {
                 search_roots: roots,
             }

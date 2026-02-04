@@ -8,6 +8,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::gossip::Message;
+use crate::config;
 use crate::network::allocator::{allocate_overlay_address, parse_ipv4_cidr};
 use crate::network::attachment::{AttachmentProvisioningRequest, bridge_name};
 use crate::network::controller::DEFAULT_MTU;
@@ -512,7 +513,7 @@ impl TaskManager {
             let (_, prefix) = parse_ipv4_cidr(&spec.subnet_cidr)
                 .context("failed to parse network subnet for attachment")?;
             let mut mtu = if spec.mtu == 0 { DEFAULT_MTU } else { spec.mtu };
-            if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_none() {
+            if config::wireguard_enabled() {
                 mtu = mtu.min(wireguard::MANTISSA_WIREGUARD_VXLAN_MTU);
             }
             let bridge = bridge_name(spec.id);

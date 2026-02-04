@@ -103,12 +103,12 @@ pub fn persist_wireguard_underlay_preference(enabled: bool) -> io::Result<()> {
 /// Resolve a stable UDP listen port for the Mantissa-managed WireGuard underlay.
 ///
 /// Precedence:
-/// 1) `MANTISSA_WIREGUARD_PORT` env var (useful in tests or when running multiple clusters).
+/// 1) Explicit override port supplied by the caller.
 /// 2) `wireguard.port` persisted in the state dir (survives restarts).
 /// 3) Optional preferred port supplied by the caller (typically the node advertise port).
 /// 4) `DEFAULT_WIREGUARD_LISTEN_PORT`.
 pub fn load_or_choose_wireguard_listen_port() -> io::Result<u16> {
-    load_or_choose_wireguard_listen_port_with_preferred(None)
+    load_or_choose_wireguard_listen_port_with_preferred_and_override(None, None)
 }
 
 /// Resolve a stable UDP listen port for the Mantissa-managed WireGuard underlay, optionally
@@ -121,11 +121,21 @@ pub fn load_or_choose_wireguard_listen_port() -> io::Result<u16> {
 pub fn load_or_choose_wireguard_listen_port_with_preferred(
     preferred_port: Option<u16>,
 ) -> io::Result<u16> {
-    if let Ok(raw) = std::env::var("MANTISSA_WIREGUARD_PORT") {
-        let port = raw
-            .trim()
-            .parse::<u16>()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid wireguard port"))?;
+    load_or_choose_wireguard_listen_port_with_preferred_and_override(preferred_port, None)
+}
+
+/// Resolve a stable UDP listen port for the Mantissa-managed WireGuard underlay, optionally
+/// preferring a specific port and honoring an explicit override.
+///
+/// This is used to keep the deployment "zero-config" by selecting a port that is already known
+/// to be reachable between nodes (for example the existing control-plane advertise port).
+///
+/// The returned port is persisted so restarts keep a stable endpoint unless explicitly overridden.
+pub fn load_or_choose_wireguard_listen_port_with_preferred_and_override(
+    preferred_port: Option<u16>,
+    override_port: Option<u16>,
+) -> io::Result<u16> {
+    if let Some(port) = override_port {
         if port == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

@@ -81,6 +81,13 @@ pub enum Command {
         cmd: SchedulerCommand,
     },
 
+    /// Configuration inspection subcommands
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCommand,
+    },
+
     /// Service deployment subcommands
     #[command(
         alias = "svc",
@@ -286,6 +293,16 @@ pub enum SchedulerCommand {
     /// Show slot usage for a node
     #[command(alias = "ls")]
     Slots(SchedulerSlotsArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Show the currently loaded configuration.
+    Show,
+    /// Validate the resolved configuration and exit.
+    Validate,
+    /// Print the config file path being used (if any).
+    Path,
 }
 
 #[derive(Args, Debug)]

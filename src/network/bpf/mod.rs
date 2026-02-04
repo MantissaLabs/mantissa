@@ -102,6 +102,7 @@ impl NetworkBpfManager {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{BpfProgramSpec, NetworkInterfaceContext};
+    use crate::config;
     use crate::network::types::BpfAttachPoint;
     use anyhow::{Context, Result, anyhow};
     use aya::maps::MapData;
@@ -220,11 +221,11 @@ mod platform {
             programs: &[BpfProgramSpec],
             interfaces: &NetworkInterfaceContext,
         ) -> Result<()> {
-            if std::env::var_os("MANTISSA_BPF_NO_ATTACH").is_some() {
+            if !config::bpf_attach_enabled() {
                 tracing::debug!(
                     target: "network",
                     network = %interfaces.network_id(),
-                    "skipping bpf ensure_programs because MANTISSA_BPF_NO_ATTACH is set"
+                    "skipping bpf ensure_programs because bpf attachment is disabled"
                 );
                 return Ok(());
             }
@@ -424,9 +425,19 @@ mod platform {
     }
 
     impl ArtifactResolver {
+        /// # Description:
+        ///
+        /// Build an artifact resolver using configured search roots so BPF bytecode can be found.
         fn new() -> Self {
+            Self::new_with_config(&config::global_config())
+        }
+
+        /// # Description:
+        ///
+        /// Build an artifact resolver using the provided configuration snapshot.
+        fn new_with_config(config: &crate::config::Config) -> Self {
             let mut roots = Vec::new();
-            if let Some(dir) = env::var_os("MANTISSA_BPF_DIR") {
+            if let Some(dir) = config.network.bpf.artifact_dir.clone() {
                 roots.push(PathBuf::from(dir));
             }
             if let Ok(pwd) = env::current_dir() {
@@ -472,8 +483,11 @@ mod platform {
         }
     }
 
+    /// # Description:
+    ///
+    /// Pick the program loader based on whether BPF attachment is enabled in config.
     fn default_loader() -> Arc<dyn ProgramLoader> {
-        if env::var_os("MANTISSA_BPF_NO_ATTACH").is_some() {
+        if !config::bpf_attach_enabled() {
             Arc::new(NoopProgramLoader)
         } else {
             Arc::new(AyaProgramLoader)
@@ -1182,35 +1196,20 @@ mod platform {
         use tempfile::TempDir;
         use uuid::Uuid;
 
-        fn reset_env(original: Option<std::ffi::OsString>) {
-            if let Some(value) = original {
-                unsafe {
-                    env::set_var("MANTISSA_BPF_DIR", value);
-                }
-            } else {
-                unsafe {
-                    env::remove_var("MANTISSA_BPF_DIR");
-                }
-            }
-        }
-
         #[test]
-        fn resolves_artifact_from_env_directory() -> Result<()> {
+        fn resolves_artifact_from_config_directory() -> Result<()> {
             let dir = TempDir::new().context("create temp dir")?;
             let artifact_path = dir.path().join("resolver-example.bpf.o");
             fs::write(&artifact_path, b"test").context("write artifact stub")?;
 
-            let original = env::var_os("MANTISSA_BPF_DIR");
-            unsafe {
-                env::set_var("MANTISSA_BPF_DIR", dir.path());
-            }
-
-            let resolver = ArtifactResolver::new();
+            let mut config = crate::config::global_config();
+            config.network.bpf.artifact_dir =
+                Some(dir.path().to_string_lossy().to_string());
+            let resolver = ArtifactResolver::new_with_config(&config);
             let spec = BpfProgramSpec::new("resolver-example");
             let resolved = resolver.resolve(&spec)?;
             assert_eq!(resolved, artifact_path);
 
-            reset_env(original);
             Ok(())
         }
 

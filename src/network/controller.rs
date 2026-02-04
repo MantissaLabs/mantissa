@@ -13,6 +13,7 @@ use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
 use crate::services::registry::ServiceRegistry;
 use crate::store::task_store::TaskStore;
+use crate::config;
 use anyhow::{Context, Result};
 use async_channel::Sender;
 #[cfg(target_os = "linux")]
@@ -81,9 +82,7 @@ struct NetworkPlan {
 
 #[cfg(target_os = "linux")]
 fn default_bpf_programs() -> Vec<BpfProgramSpec> {
-    if std::env::var_os("MANTISSA_BPF_NO_ATTACH").is_some()
-        || std::env::var_os("MANTISSA_SKIP_BPF").is_some()
-    {
+    if !config::bpf_attach_enabled() {
         return Vec::new();
     }
 

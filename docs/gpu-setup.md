@@ -58,13 +58,16 @@ devices are identified by their NVML UUIDs (stable across reboots). When a task 
 
 ## 5) Optional per-device overrides
 
-Mantissa reads per-node overrides from `MANTISSA_GPU_DEVICE_OVERRIDES` to disable GPUs or
-override the device IDs used for scheduling and Docker binding.
+Mantissa reads per-node overrides from the config file (`gpu.device_overrides`) to disable GPUs
+or override the device IDs used for scheduling and Docker binding. Environment variables still
+override the config for backwards compatibility.
 
 Format (semicolon-delimited entries):
 
 ```bash
-export MANTISSA_GPU_DEVICE_OVERRIDES="uuid:GPU-abc=id:GPU-abc; pci:0000:81:00.0=disable; index:0=id:0"
+gpu: (
+    device_overrides: "uuid:GPU-abc=id:GPU-abc; pci:0000:81:00.0=disable; index:0=id:0",
+)
 ```
 
 Selectors:

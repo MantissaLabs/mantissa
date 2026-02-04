@@ -13,6 +13,7 @@ use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
 use crate::task::manager::select_best_task_value;
 use crate::task::types::TaskValue;
+use crate::config;
 use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use crdt_store::uuid_key::UuidKey;
@@ -72,9 +73,7 @@ impl ServiceDiscovery {
         bpf: NetworkBpfManager,
         health_monitor: Arc<HealthMonitor>,
     ) -> Self {
-        let health_port = std::env::var("MANTISSA_LB_HEALTH_PORT")
-            .ok()
-            .and_then(|text| text.parse::<u16>().ok());
+        let health_port = config::discovery_health_port();
         Self {
             registry,
             tasks,

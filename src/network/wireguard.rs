@@ -1,3 +1,4 @@
+use crate::config;
 use crate::registry::Registry;
 use crate::topology::peers::WireGuardPeerValue;
 use anyhow::{Context, Result};
@@ -118,7 +119,7 @@ pub async fn ensure_wireguard_underlay(
     self_id: Uuid,
     previous: Option<WireGuardUnderlayState>,
 ) -> Result<WireGuardUnderlayState> {
-    if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_some() {
+    if !config::wireguard_enabled() {
         return Ok(WireGuardUnderlayState {
             underlay_active: false,
             ifname: MANTISSA_WIREGUARD_IFNAME.to_string(),
@@ -155,8 +156,11 @@ pub async fn ensure_wireguard_underlay(
     let keys = net::wireguard::load_or_generate_wireguard_keys(keys_path)
         .context("load wireguard keys")?;
 
-    let listen_port = net::wireguard::load_or_choose_wireguard_listen_port()
-        .context("load wireguard listen port")?;
+    let listen_port = net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
+        None,
+        config::wireguard_port_override(),
+    )
+    .context("load wireguard listen port")?;
 
     let tunnel_v6 = net::wireguard::wireguard_tunnel_ipv6(self_id);
     let tunnel_ip = IpAddr::V6(tunnel_v6);
@@ -380,7 +384,7 @@ fn build_wireguard_endpoint(advertise: &str, listen_port: u16) -> Option<String>
 /// best-effort step. Failures are logged and do not block networking setup.
 #[cfg(target_os = "linux")]
 fn ensure_vxlan_firewall_accept(ifname: &str) {
-    if std::env::var_os("MANTISSA_WIREGUARD_NO_FIREWALL").is_some() {
+    if !config::wireguard_manage_firewall() {
         return;
     }
 

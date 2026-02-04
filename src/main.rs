@@ -5,6 +5,7 @@ extern crate log;
 extern crate sysinfo;
 
 mod cli;
+mod config;
 mod crypto;
 mod gossip;
 mod gpu;
@@ -29,6 +30,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use std::error::Error;
 use std::io::{self, Read, Write};
+use std::path::Path;
 use tabwriter::TabWriter;
 use tokio::task::LocalSet;
 
@@ -45,6 +47,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let local = LocalSet::new();
     let args = MantissaCli::parse();
+    let config_path = args.config.as_deref().map(Path::new);
+    let (config, source) = config::load_config_with_source(config_path)?;
+    config::set_global_config_with_source(config, source);
 
     // Global listen address (only used by `init`/daemon start)
     let listen = args.listen.clone();
@@ -108,6 +113,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         args.details,
                     ))
                     .await?;
+            }
+        },
+
+        Command::Config { cmd } => match cmd {
+            ConfigCommand::Show => {
+                let source = config::global_config_source();
+                let config_snapshot = config::global_config();
+                let rendered = config::render_config_ron(&config_snapshot)?;
+                let path = source
+                    .path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<default>".to_string());
+                println!(
+                    "Config Source:\n  Path: {path}\n  Env overrides: {}\n\nConfig:\n{rendered}",
+                    source.env_overrides
+                );
+            }
+            ConfigCommand::Validate => {
+                let config_snapshot = config::global_config();
+                config_snapshot.validate()?;
+                println!("Config OK");
+            }
+            ConfigCommand::Path => {
+                let source = config::global_config_source();
+                if let Some(path) = source.path {
+                    println!("{}", path.display());
+                } else {
+                    println!("<default>");
+                }
             }
         },
 

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tracing::warn;
 
-const GPU_OVERRIDE_ENV: &str = "MANTISSA_GPU_DEVICE_OVERRIDES";
+use crate::config;
 
 /// # Description:
 ///
@@ -38,16 +38,10 @@ pub struct GpuDeviceOverride {
 /// Reads GPU device overrides from the environment so operators can pin or
 /// disable specific devices without code changes.
 pub fn read_gpu_device_overrides() -> Vec<GpuDeviceOverride> {
-    match std::env::var(GPU_OVERRIDE_ENV) {
-        Ok(raw) => parse_gpu_device_overrides(&raw),
-        Err(std::env::VarError::NotPresent) => Vec::new(),
-        Err(err) => {
-            warn!(
-                target: "gpu",
-                "failed to read {GPU_OVERRIDE_ENV} overrides: {err}"
-            );
-            Vec::new()
-        }
+    let raw = config::gpu_device_overrides();
+    match raw {
+        Some(raw) => parse_gpu_device_overrides(&raw),
+        None => Vec::new(),
     }
 }
 

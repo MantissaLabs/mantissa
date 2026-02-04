@@ -3,6 +3,7 @@ use crate::node::Node;
 use crate::node::address::compute_advertise_ip;
 use crate::node::address::extract_port;
 use crate::node::id::set_node_id;
+use crate::config;
 use crate::registry::Registry;
 use crate::secrets::crypto::SecretKeyring;
 use crate::store::local_credential_store::LocalCredentialStore;
@@ -418,17 +419,16 @@ impl Topology {
             registry.register_peer_handle(local_id, handle).await;
 
             let key = UuidKey::from(local_id);
-            let wireguard = if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_some()
-                || !net::paths::running_as_root()
-            {
+            let wireguard = if !config::wireguard_enabled() || !net::paths::running_as_root() {
                 None
             } else {
                 match net::wireguard::resolve_wireguard_key_path()
                     .and_then(net::wireguard::load_or_generate_wireguard_keys)
                 {
                     Ok(keys) => {
-                        match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(
+                        match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
                             preferred_wireguard_port,
+                            config::wireguard_port_override(),
                         ) {
                             Ok(port) => Some(crate::topology::peers::WireGuardPeerValue {
                                 public_key: keys.public_bytes(),
@@ -584,14 +584,14 @@ impl Topology {
         // We intentionally keep this non-fatal: nodes without kernel networking privileges
         // should still be able to participate in the control plane, even if they cannot
         // encrypt the data-plane underlay.
-        if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_none() && net::paths::running_as_root()
-        {
+        if config::wireguard_enabled() && net::paths::running_as_root() {
             match net::wireguard::resolve_wireguard_key_path()
                 .and_then(net::wireguard::load_or_generate_wireguard_keys)
             {
                 Ok(keys) => {
-                    match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(
+                    match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
                         preferred_wireguard_port,
+                        config::wireguard_port_override(),
                     ) {
                         Ok(port) => {
                             let enabled = self

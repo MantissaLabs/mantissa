@@ -2,6 +2,7 @@ use super::{Topology, types::TopologyEvent};
 use crate::node::address::extract_port;
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::pubkey_from_slice;
+use crate::config;
 use crate::server::credential::ClusterCredential;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
@@ -80,17 +81,16 @@ impl Topology {
             .clone()
             .ok_or_else(|| Error::failed("hostname not set".into()))?;
 
-        let wireguard = if std::env::var_os("MANTISSA_WIREGUARD_DISABLE").is_some()
-            || !net::paths::running_as_root()
-        {
+        let wireguard = if !config::wireguard_enabled() || !net::paths::running_as_root() {
             None
         } else {
             match net::wireguard::resolve_wireguard_key_path()
                 .and_then(net::wireguard::load_or_generate_wireguard_keys)
             {
                 Ok(keys) => {
-                    match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred(
+                    match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
                         preferred_wireguard_port,
+                        config::wireguard_port_override(),
                     ) {
                         Ok(port) => Some(WireGuardPeerValue {
                             public_key: keys.public_bytes(),
