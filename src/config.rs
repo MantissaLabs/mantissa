@@ -1,7 +1,7 @@
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{RwLock, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -143,6 +143,7 @@ pub struct GpuConfig {
 static GLOBAL_CONFIG: Lazy<RwLock<Config>> = Lazy::new(|| RwLock::new(Config::default()));
 static GLOBAL_SOURCE: Lazy<RwLock<ConfigSource>> =
     Lazy::new(|| RwLock::new(ConfigSource::default()));
+static GLOBAL_LOADED: AtomicBool = AtomicBool::new(false);
 
 /// # Description:
 ///
@@ -192,12 +193,14 @@ pub fn set_global_config_with_source(config: Config, source: ConfigSource) {
         .write()
         .expect("global config source lock poisoned");
     *source_guard = source;
+    GLOBAL_LOADED.store(true, Ordering::Release);
 }
 
 /// # Description:
 ///
 /// Return a cloned snapshot of the current global configuration.
 pub fn global_config() -> Config {
+    ensure_config_loaded();
     let guard = GLOBAL_CONFIG
         .read()
         .expect("global config lock poisoned");
@@ -208,6 +211,7 @@ pub fn global_config() -> Config {
 ///
 /// Return a snapshot of the metadata describing where the current config came from.
 pub fn global_config_source() -> ConfigSource {
+    ensure_config_loaded();
     let guard = GLOBAL_SOURCE
         .read()
         .expect("global config source lock poisoned");
@@ -320,6 +324,44 @@ pub fn spawn_config_watcher() -> Option<std::thread::JoinHandle<()>> {
 /// Return a default true value for serde defaults.
 fn default_true() -> bool {
     true
+}
+
+/// # Description:
+///
+/// Ensure the global configuration has been loaded at least once.
+fn ensure_config_loaded() {
+    if GLOBAL_LOADED.load(Ordering::Acquire) {
+        return;
+    }
+
+    if GLOBAL_LOADED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let mut config = Config::default();
+    let env_overrides = config.apply_env_overrides();
+    if let Err(err) = config.validate() {
+        warn!(
+            target: "config",
+            "default config validation failed: {err}"
+        );
+    }
+    let source = ConfigSource {
+        path: None,
+        env_overrides,
+    };
+    let mut guard = GLOBAL_CONFIG
+        .write()
+        .expect("global config lock poisoned");
+    *guard = config;
+
+    let mut source_guard = GLOBAL_SOURCE
+        .write()
+        .expect("global config source lock poisoned");
+    *source_guard = source;
 }
 
 /// # Description:
