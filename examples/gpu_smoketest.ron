@@ -1,0 +1,20 @@
+(
+    name: "gpu-smoke",
+    tasks: [
+        (
+            name: "nvidia-smi",
+            image: "nvidia/cuda:12.4.0-base-ubuntu22.04",
+            command: [
+                "bash",
+                "-lc",
+                "while true; do nvidia-smi; sleep 10; done",
+            ],
+            replicas: 1,
+            resources: (
+                cpu_millis: 500,
+                memory_mb: 512,
+                gpu_count: 1,
+            ),
+        ),
+    ],
+)
