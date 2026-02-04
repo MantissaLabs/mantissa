@@ -2,8 +2,10 @@ use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -306,6 +308,15 @@ pub fn render_config_ron(config: &Config) -> Result<String> {
 
 /// # Description:
 ///
+/// Start a background watcher that reloads configuration when the config file changes.
+pub fn spawn_config_watcher() -> Option<std::thread::JoinHandle<()>> {
+    let source = global_config_source();
+    let path = source.path?;
+    Some(start_config_watch_thread(path))
+}
+
+/// # Description:
+///
 /// Return a default true value for serde defaults.
 fn default_true() -> bool {
     true
@@ -473,4 +484,125 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// # Description:
+///
+/// Start a watcher thread for the provided config path and reload on changes.
+fn start_config_watch_thread(path: PathBuf) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("mantissa-config-watch".to_string())
+        .spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut watcher = match RecommendedWatcher::new(tx, notify::Config::default()) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    warn!(target: "config", "failed to create config watcher: {err}");
+                    return;
+                }
+            };
+
+            if let Err(err) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+                warn!(
+                    target: "config",
+                    path = %path.display(),
+                    "failed to watch config path: {err}"
+                );
+                return;
+            }
+
+            let mut last_reload = Instant::now().checked_sub(Duration::from_secs(5)).unwrap_or_else(Instant::now);
+
+            loop {
+                let event = match rx.recv() {
+                    Ok(Ok(event)) => event,
+                    Ok(Err(err)) => {
+                        warn!(target: "config", "config watcher error: {err}");
+                        continue;
+                    }
+                    Err(err) => {
+                        warn!(target: "config", "config watcher channel closed: {err}");
+                        break;
+                    }
+                };
+
+                if !should_reload_for_event(&event.kind) {
+                    continue;
+                }
+
+                if last_reload.elapsed() < Duration::from_millis(200) {
+                    continue;
+                }
+                last_reload = Instant::now();
+
+                match load_config_with_source(Some(&path)) {
+                    Ok((new_config, new_source)) => {
+                        let previous = global_config();
+                        let restart_required = restart_required_changes(&previous, &new_config);
+                        if !restart_required.is_empty() {
+                            warn!(
+                                target: "config",
+                                "config change requires restart to fully apply: {}",
+                                restart_required.join(", ")
+                            );
+                        }
+                        set_global_config_with_source(new_config, new_source);
+                    }
+                    Err(err) => {
+                        warn!(
+                            target: "config",
+                            path = %path.display(),
+                            "failed to reload config: {err}"
+                        );
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn config watcher thread")
+}
+
+/// # Description:
+///
+/// Decide whether a notify event should trigger a reload.
+fn should_reload_for_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Modify(_)
+            | EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Any
+    )
+}
+
+/// # Description:
+///
+/// Returns the list of config fields that require a restart to fully apply.
+fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
+    let mut changes = Vec::new();
+
+    if old.docker.host != new.docker.host {
+        changes.push("docker.host".to_string());
+    }
+
+    if old.gpu.device_overrides != new.gpu.device_overrides {
+        changes.push("gpu.device_overrides".to_string());
+    }
+
+    if old.network.nodeport.enabled != new.network.nodeport.enabled {
+        changes.push("network.nodeport.enabled".to_string());
+    }
+
+    if old.network.nodeport.iface != new.network.nodeport.iface {
+        changes.push("network.nodeport.iface".to_string());
+    }
+
+    if old.network.nodeport.ip != new.network.nodeport.ip {
+        changes.push("network.nodeport.ip".to_string());
+    }
+
+    if old.network.wireguard.port != new.network.wireguard.port {
+        changes.push("network.wireguard.port".to_string());
+    }
+
+    changes
 }

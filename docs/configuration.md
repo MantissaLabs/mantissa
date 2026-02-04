@@ -18,6 +18,11 @@ override the config for backwards compatibility.
 - `mantissa config validate` validates the resolved configuration and exits.
 - `mantissa config path` prints the config file path in use (or `<default>`).
 
+## Hot reload
+
+When Mantissa loads a config file, it watches that file for changes and reloads on updates.
+Some changes require a restart to fully apply (Mantissa logs a warning when those fields change).
+
 ## Example
 
 ```ron

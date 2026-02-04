@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config_path = args.config.as_deref().map(Path::new);
     let (config, source) = config::load_config_with_source(config_path)?;
     config::set_global_config_with_source(config, source);
+    let _config_watcher = config::spawn_config_watcher();
 
     // Global listen address (only used by `init`/daemon start)
     let listen = args.listen.clone();
