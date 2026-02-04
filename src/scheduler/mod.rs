@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
+use tracing::warn;
 
+use crate::gpu::{GpuDeviceOverrideAction, gpu_device_override_for, read_gpu_device_overrides};
 use crate::registry::Registry;
 use crate::store::scheduler_store::SchedulerStore;
 
@@ -487,19 +489,56 @@ impl Scheduler {
             return Vec::new();
         };
 
+        let overrides = read_gpu_device_overrides();
         let mut specs: Vec<GpuDeviceSpec> = Vec::new();
+        let mut seen_device_ids = HashSet::new();
         for device in &gpu_info.devices {
             let uuid = device
                 .uuid
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty());
-            if uuid.is_none() {
-                // Skip devices without a UUID to keep GPU bindings stable across reboots.
-                continue;
+            let mut override_device_id: Option<String> = None;
+            if let Some(entry) = gpu_device_override_for(
+                uuid.as_deref(),
+                device.pci_bus_id.as_deref(),
+                device.index,
+                &overrides,
+            ) {
+                match &entry.action {
+                    GpuDeviceOverrideAction::Disable => {
+                        continue;
+                    }
+                    GpuDeviceOverrideAction::OverrideId(id) => {
+                        if id.trim().is_empty() {
+                            warn!(
+                                target: "scheduler",
+                                "gpu override for device index {} uses an empty id; ignoring device",
+                                device.index
+                            );
+                            continue;
+                        }
+                        override_device_id = Some(id.clone());
+                    }
+                }
             }
 
-            let device_id = uuid.clone().expect("uuid presence ensured");
+            let device_id = match override_device_id.or_else(|| uuid.clone()) {
+                Some(id) => id,
+                None => {
+                    // Skip devices without a UUID unless an override supplied an ID.
+                    continue;
+                }
+            };
+
+            if !seen_device_ids.insert(device_id.clone()) {
+                warn!(
+                    target: "scheduler",
+                    "duplicate gpu device id '{device_id}' detected; skipping device index {}",
+                    device.index
+                );
+                continue;
+            }
             specs.push(GpuDeviceSpec::new(
                 device_id,
                 device.index,

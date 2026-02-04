@@ -56,7 +56,31 @@ devices are identified by their NVML UUIDs (stable across reboots). When a task 
 `gpu_count > 0`, Mantissa reserves that many GPU device IDs and passes them to Docker via
 `NVIDIA_VISIBLE_DEVICES` and the Docker `DeviceRequests` API.
 
-## 5) Request GPUs in Mantissa
+## 5) Optional per-device overrides
+
+Mantissa reads per-node overrides from `MANTISSA_GPU_DEVICE_OVERRIDES` to disable GPUs or
+override the device IDs used for scheduling and Docker binding.
+
+Format (semicolon-delimited entries):
+
+```bash
+export MANTISSA_GPU_DEVICE_OVERRIDES="uuid:GPU-abc=id:GPU-abc; pci:0000:81:00.0=disable; index:0=id:0"
+```
+
+Selectors:
+- `uuid:<value>` (preferred, stable)
+- `pci:<bus>` / `pcibus:<bus>` / `pcibusid:<bus>`
+- `index:<n>`
+
+Actions:
+- `disable` or `disabled` (exclude the device)
+- `id:<device_id>` (override the device ID passed to Docker)
+
+Notes:
+- The override `id` must be accepted by the NVIDIA container runtime (typically a GPU UUID or index).
+- Use UUID-based selectors whenever possible to keep bindings stable across reboots.
+
+## 6) Request GPUs in Mantissa
 
 ### CLI
 
@@ -88,7 +112,7 @@ mantissa tasks start my-task \
 )
 ```
 
-## 6) Common failure modes
+## 7) Common failure modes
 
 - `nvidia-smi` fails: driver missing or not loaded.
 - `docker run --gpus all ...` fails: NVIDIA Container Toolkit not installed or runtime not
