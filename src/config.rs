@@ -606,3 +606,87 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
 
     changes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_validate() {
+        let config = Config::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_wireguard_port() {
+        let mut config = Config::default();
+        config.network.wireguard.port = Some(0);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_health_port() {
+        let mut config = Config::default();
+        config.network.discovery.health_port = Some(0);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_nodeport_ip() {
+        let mut config = Config::default();
+        config.network.nodeport.ip = Some("not-an-ip".to_string());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_nodeport_without_bpf() {
+        let mut config = Config::default();
+        config.network.nodeport.enabled = true;
+        config.network.bpf.attach = false;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn env_overrides_apply_and_validate() {
+        unsafe {
+            std::env::set_var("MANTISSA_WIREGUARD_DISABLE", "1");
+            std::env::set_var("MANTISSA_WIREGUARD_PORT", "51820");
+            std::env::set_var("MANTISSA_BPF_NO_ATTACH", "1");
+            std::env::set_var("MANTISSA_NODEPORT_IFACE", "eth0");
+            std::env::set_var("MANTISSA_LB_HEALTH_PORT", "30080");
+            std::env::set_var("MANTISSA_DOCKER_HOST", "unix:///var/run/docker.sock");
+            std::env::set_var(
+                "MANTISSA_GPU_DEVICE_OVERRIDES",
+                "uuid:GPU-abc=id:GPU-abc",
+            );
+        }
+
+        let mut config = Config::default();
+        let applied = config.apply_env_overrides();
+        assert!(applied);
+        assert!(!config.network.wireguard.enabled);
+        assert_eq!(config.network.wireguard.port, Some(51820));
+        assert!(!config.network.bpf.attach);
+        assert!(!config.network.nodeport.enabled);
+        assert_eq!(config.network.nodeport.iface.as_deref(), Some("eth0"));
+        assert_eq!(config.network.discovery.health_port, Some(30080));
+        assert_eq!(
+            config.docker.host.as_deref(),
+            Some("unix:///var/run/docker.sock")
+        );
+        assert_eq!(
+            config.gpu.device_overrides.as_deref(),
+            Some("uuid:GPU-abc=id:GPU-abc")
+        );
+
+        unsafe {
+            std::env::remove_var("MANTISSA_WIREGUARD_DISABLE");
+            std::env::remove_var("MANTISSA_WIREGUARD_PORT");
+            std::env::remove_var("MANTISSA_BPF_NO_ATTACH");
+            std::env::remove_var("MANTISSA_NODEPORT_IFACE");
+            std::env::remove_var("MANTISSA_LB_HEALTH_PORT");
+            std::env::remove_var("MANTISSA_DOCKER_HOST");
+            std::env::remove_var("MANTISSA_GPU_DEVICE_OVERRIDES");
+        }
+    }
+}
