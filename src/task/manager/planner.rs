@@ -8,6 +8,7 @@ use thiserror::Error;
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::gpu::gpu_runtime_status;
 use crate::scheduler::summary::{SchedulerGpuState, SchedulerSlotState};
 use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
@@ -276,6 +277,31 @@ pub(super) struct Assignment {
     pub(super) remote: Vec<RemoteStartPlan>,
 }
 
+/// # Description:
+///
+/// Determines whether the local node's GPU runtime can safely launch GPU tasks
+/// so scheduling can preflight readiness before placement decisions.
+fn gpu_runtime_preflight(snapshot: &SchedulerSnapshot) -> (bool, Option<String>) {
+    if snapshot.gpu_devices.is_empty() {
+        return (false, Some("no GPU device detected".to_string()));
+    }
+
+    let status = gpu_runtime_status();
+    if status.is_ready() {
+        (true, None)
+    } else {
+        (
+            false,
+            Some(
+                status
+                    .reason()
+                    .unwrap_or("gpu runtime is not ready on this node")
+                    .to_string(),
+            ),
+        )
+    }
+}
+
 impl TaskManager {
     /// Normalizes user requests into deterministic scheduling intents, applying IDs and defaults.
     pub(super) fn build_start_intents(
@@ -368,8 +394,16 @@ impl TaskManager {
             .get(&self.local_node_id)
             .cloned()
             .unwrap_or_else(HashSet::new);
+        let (local_gpu_ready, local_gpu_reason) = gpu_runtime_preflight(&snapshot);
         let (mut assignment, remaining_intents, available_slots, available_gpus) =
-            self.seed_local_plans(intents, &snapshot, local_version, &local_ready)?;
+            self.seed_local_plans(
+                intents,
+                &snapshot,
+                local_version,
+                &local_ready,
+                local_gpu_ready,
+                local_gpu_reason.as_deref(),
+            )?;
 
         if remaining_intents.is_empty() {
             assignment.local.sort_by_key(|plan| plan.index);
@@ -400,6 +434,8 @@ impl TaskManager {
         snapshot: &SchedulerSnapshot,
         local_version: u64,
         local_ready: &HashSet<Uuid>,
+        local_gpu_ready: bool,
+        local_gpu_reason: Option<&str>,
     ) -> Result<
         (
             Assignment,
@@ -432,11 +468,23 @@ impl TaskManager {
             }
         }
         available_local_gpus.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        if !local_gpu_ready {
+            available_local_gpus.clear();
+        }
 
         let mut local_plans = Vec::new();
         for intent in intents.iter() {
             if intent.preassigned_slots.is_empty() {
                 continue;
+            }
+
+            let requires_gpu = intent.gpu_count > 0 || !intent.gpu_device_ids.is_empty();
+            if requires_gpu && !local_gpu_ready {
+                return Err(anyhow::anyhow!(
+                    "local gpu runtime not ready for task '{}': {}",
+                    intent.name,
+                    local_gpu_reason.unwrap_or("gpu runtime is not ready on this node"),
+                ));
             }
 
             if !intent.networks.iter().all(|net| local_ready.contains(net)) {
@@ -657,6 +705,9 @@ impl TaskManager {
                 })
                 .collect();
             gpu_devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+            if !summary.gpu_runtime_ready {
+                gpu_devices.clear();
+            }
 
             let ready_networks = readiness
                 .get(&peer_id)

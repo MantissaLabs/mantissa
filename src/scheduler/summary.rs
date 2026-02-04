@@ -1,6 +1,8 @@
 use protocol::scheduling::{self, summary as summary_capnp};
 use uuid::Uuid;
 
+use crate::gpu::gpu_runtime_status;
+
 use super::{SlotId, SlotReservation, SlotState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +52,8 @@ pub struct SchedulerSummary {
     pub gpu_free: u32,
     pub gpu_reserved: u32,
     pub gpu_devices: Vec<SchedulerGpuDeviceDetail>,
+    pub gpu_runtime_ready: bool,
+    pub gpu_runtime_reason: Option<String>,
     pub version: u64,
 }
 
@@ -71,6 +75,8 @@ impl SchedulerSummary {
             gpu_free: 0,
             gpu_reserved: 0,
             gpu_devices: Vec::new(),
+            gpu_runtime_ready: false,
+            gpu_runtime_reason: None,
             version: 0,
         };
 
@@ -110,6 +116,16 @@ impl SchedulerSummary {
         }
 
         summary.gpu_total = snapshot.gpu_devices.len() as u32;
+        if summary.gpu_total == 0 {
+            summary.gpu_runtime_ready = false;
+            summary.gpu_runtime_reason = Some("no GPU device detected".to_string());
+        } else {
+            let status = gpu_runtime_status();
+            summary.gpu_runtime_ready = status.is_ready();
+            summary.gpu_runtime_reason =
+                status.reason().map(|reason: &str| reason.to_string());
+        }
+
         for device in &snapshot.gpu_devices {
             match &device.state {
                 super::GpuDeviceState::Free => summary.gpu_free += 1,
@@ -166,6 +182,11 @@ impl SchedulerSummary {
         let gpu_total = reader.get_gpu_total();
         let gpu_free = reader.get_gpu_free();
         let gpu_reserved = reader.get_gpu_reserved();
+        let gpu_runtime_ready = reader.get_gpu_runtime_ready();
+        let gpu_runtime_reason = reader
+            .get_gpu_runtime_reason()?
+            .to_str()?
+            .to_string();
 
         let mut details = Vec::new();
         for detail in reader.get_details()?.iter() {
@@ -260,6 +281,12 @@ impl SchedulerSummary {
             gpu_free,
             gpu_reserved,
             gpu_devices,
+            gpu_runtime_ready,
+            gpu_runtime_reason: if gpu_runtime_reason.is_empty() {
+                None
+            } else {
+                Some(gpu_runtime_reason)
+            },
             version,
         })
     }
@@ -277,6 +304,8 @@ impl SchedulerSummary {
         builder.set_gpu_total(self.gpu_total);
         builder.set_gpu_free(self.gpu_free);
         builder.set_gpu_reserved(self.gpu_reserved);
+        builder.set_gpu_runtime_ready(self.gpu_runtime_ready);
+        builder.set_gpu_runtime_reason(self.gpu_runtime_reason.as_deref().unwrap_or(""));
 
         let mut details_builder = builder.reborrow().init_details(self.details.len() as u32);
         for (idx, detail) in self.details.iter().enumerate() {

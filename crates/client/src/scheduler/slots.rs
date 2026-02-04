@@ -43,9 +43,19 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
     let gpu_total = summary.get_gpu_total();
     let gpu_free = summary.get_gpu_free();
     let gpu_reserved = summary.get_gpu_reserved();
+    let gpu_runtime_ready = summary.get_gpu_runtime_ready();
+    let gpu_runtime_reason = summary.get_gpu_runtime_reason()?.to_str()?.to_string();
+
+    let gpu_runtime_line = if gpu_runtime_ready {
+        "ready".to_string()
+    } else if gpu_runtime_reason.is_empty() {
+        "not ready".to_string()
+    } else {
+        format!("not ready ({gpu_runtime_reason})")
+    };
 
     output::emit_block(format!(
-        "Scheduler Summary:\n  Node: {} ({})\n  Total slots: {}\n  Free slots: {}\n  Reserved slots: {}\n  GPU devices: {} (free {}, reserved {})\n  Snapshot version: {}",
+        "Scheduler Summary:\n  Node: {} ({})\n  Total slots: {}\n  Free slots: {}\n  Reserved slots: {}\n  GPU devices: {} (free {}, reserved {})\n  GPU runtime: {}\n  Snapshot version: {}",
         if node_name.is_empty() {
             "<unknown>".to_string()
         } else {
@@ -58,6 +68,7 @@ pub async fn slots(cfg: &ClientConfig, peer_id: Option<&str>, details: bool) -> 
         gpu_total,
         gpu_free,
         gpu_reserved,
+        gpu_runtime_line,
         version,
     ));
 

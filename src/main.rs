@@ -7,6 +7,7 @@ extern crate sysinfo;
 mod cli;
 mod crypto;
 mod gossip;
+mod gpu;
 mod logger;
 mod network;
 mod node;

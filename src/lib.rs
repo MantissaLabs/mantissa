@@ -8,6 +8,7 @@ pub use protocol::{
 pub mod cli;
 pub mod crypto;
 pub mod gossip;
+pub mod gpu;
 pub mod logger;
 pub mod network;
 pub mod node;

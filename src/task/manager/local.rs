@@ -1,11 +1,11 @@
 use std::collections::HashSet;
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use chrono::Utc;
 use tracing::{debug, warn};
 
+use crate::gpu::gpu_runtime_status;
 use crate::task::container::ContainerState;
 use crate::task::docker::{
     ContainerCreateRequest, ResourceLimits, RestartPolicyConfig, RestartPolicyType,
@@ -501,20 +501,12 @@ impl TaskManager {
             }
         }
 
-        #[cfg(target_os = "linux")]
-        {
-            if !nvidia_toolkit_present() {
-                return Err(anyhow!(
-                    "nvidia container toolkit not detected; install drivers and toolkit (see docs/gpu-setup.md)"
-                ));
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            return Err(anyhow!(
-                "gpu scheduling requires a Linux host with NVIDIA drivers and toolkit"
-            ));
+        let status = gpu_runtime_status();
+        if !status.is_ready() {
+            let reason = status
+                .reason()
+                .unwrap_or("gpu runtime is not ready on this node");
+            return Err(anyhow!("{reason}"));
         }
 
         Ok(())
@@ -566,41 +558,4 @@ impl TaskManager {
 
         self.cleanup_orphaned_slots().await;
     }
-}
-
-/// Detects whether NVIDIA container runtime tooling is available on the host.
-fn nvidia_toolkit_present() -> bool {
-    let absolute_candidates = [
-        "/usr/bin/nvidia-container-runtime",
-        "/usr/bin/nvidia-container-cli",
-        "/usr/bin/nvidia-container-toolkit",
-        "/usr/local/bin/nvidia-container-runtime",
-        "/usr/local/bin/nvidia-container-cli",
-        "/usr/local/bin/nvidia-container-toolkit",
-    ];
-
-    if absolute_candidates
-        .iter()
-        .any(|path| Path::new(path).exists())
-    {
-        return true;
-    }
-
-    let Ok(path) = std::env::var("PATH") else {
-        return false;
-    };
-
-    for dir in path.split(':') {
-        for candidate in [
-            "nvidia-container-runtime",
-            "nvidia-container-cli",
-            "nvidia-container-toolkit",
-        ] {
-            if Path::new(dir).join(candidate).exists() {
-                return true;
-            }
-        }
-    }
-
-    false
 }

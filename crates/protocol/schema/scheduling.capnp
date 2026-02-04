@@ -108,6 +108,12 @@ struct Summary {
 
   gpuDevices @10 :List(GpuDeviceDetail);
   # Optional per-device details (present when requested).
+
+  gpuRuntimeReady @11 :Bool;
+  # Whether the node's GPU container runtime is prepared for scheduling.
+
+  gpuRuntimeReason @12 :Text;
+  # Diagnostic message when GPU runtime readiness is false.
 }
 
 struct SummaryRequest {
