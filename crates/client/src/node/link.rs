@@ -31,7 +31,16 @@ pub async fn link(cfg: &ClientConfig) -> Result<()> {
         .get()
         .set_link(builder.get_root::<JoinRequest::Builder>()?.into_reader());
 
-    let response = request.send().promise.await?;
+    let response = request.send().promise.await.map_err(|e| {
+        let mut msg = e.to_string();
+        if let Some(stripped) = msg.strip_prefix("Failed: ") {
+            msg = stripped.to_string();
+        }
+        if let Some(stripped) = msg.strip_prefix("remote exception: ") {
+            msg = stripped.to_string();
+        }
+        anyhow!(msg)
+    })?;
     let join_resp = response.get()?.get_resp()?;
     let err = join_resp.get_error()?.to_string()?;
 

@@ -278,9 +278,9 @@ async fn setup_manager_with_forwarding(
         .await
         .expect("rebuild peers store");
 
-    let noise_keys = NoiseKeys::from_private_bytes([0x11; 32]);
+    let noise_keys = Arc::new(NoiseKeys::from_private_bytes([0x11; 32]));
     let session_store =
-        LocalSessionStore::open(registry_db.clone(), &noise_keys).expect("open sessions");
+        LocalSessionStore::open(registry_db.clone(), noise_keys.as_ref()).expect("open sessions");
 
     let (task_db, _task_dir) = temp_db("tasks");
     let task_store = open_task_store(task_db.clone(), actor).expect("open task store");
@@ -335,6 +335,7 @@ async fn setup_manager_with_forwarding(
         peers_store.clone(),
         session_store,
         signing_key,
+        noise_keys.clone(),
         actor,
         HealthMonitor::new(HealthConfig::default()),
     );

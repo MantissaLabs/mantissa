@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use data_encoding::Specification;
 use getrandom::getrandom;
 use redb::Database;
@@ -34,6 +35,7 @@ impl TokenStoreInMemory {
     }
 
     /// Replace the current token with `token`.
+    #[allow(dead_code)]
     pub async fn set(&self, token: &str) {
         *self.inner.write().await = token.to_string();
     }
@@ -124,6 +126,7 @@ impl TokenStore {
     }
 
     /// Replace the token with `token` and persist it.
+    #[allow(dead_code)]
     pub async fn set_and_persist(&self, token: &str) -> io::Result<()> {
         self.in_memory.set(token).await;
         self.local_store.write(token)?;
@@ -133,6 +136,15 @@ impl TokenStore {
     /// Convenience for server join checks.
     pub async fn matches(&self, presented: &str) -> bool {
         self.in_memory.matches(presented).await
+    }
+}
+
+#[async_trait(?Send)]
+impl net::noise::NoisePskProvider for TokenStore {
+    /// Derive the active Noise PSK from the current join token.
+    async fn psk(&self) -> io::Result<[u8; 32]> {
+        let token = self.current_token().await;
+        net::noise::derive_psk_from_token(&token)
     }
 }
 

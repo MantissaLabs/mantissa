@@ -327,6 +327,7 @@ impl Bootstrap {
             stores.peers.clone(),
             stores.local_sessions.clone(),
             ctx.signing_key.clone(),
+            ctx.noise_keys.clone(),
             ctx.self_id,
             health_monitor.clone(),
         );

@@ -1,9 +1,9 @@
+use crate::config;
 use crate::gossip::{GossipContext, Message};
 use crate::node::Node;
 use crate::node::address::compute_advertise_ip;
 use crate::node::address::extract_port;
 use crate::node::id::set_node_id;
-use crate::config;
 use crate::registry::Registry;
 use crate::secrets::crypto::SecretKeyring;
 use crate::store::local_credential_store::LocalCredentialStore;
@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use capnp::Error;
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use net::noise::NoisePeerVerifier;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::server::{self, ServerClient};
 use std::cell::{OnceCell, RefCell};
@@ -977,6 +978,29 @@ impl Topology {
         // Convert the stored 32-byte pk -> ed25519_dalek::VerifyingKey
         let arr: [u8; 32] = last.signing_pub.as_slice().try_into().ok()?;
         VerifyingKey::from_bytes(&arr).ok()
+    }
+}
+
+#[async_trait(?Send)]
+impl NoisePeerVerifier for Topology {
+    /// Check whether a remote Noise static public key belongs to a known peer.
+    async fn is_allowed(&self, remote_static: &[u8]) -> io::Result<bool> {
+        if remote_static.len() != 32 {
+            return Ok(false);
+        }
+
+        let snapshot = match self.peer_snapshot().await {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        for entry in snapshot.entries.iter() {
+            if entry.value.noise_static_pub.as_slice() == remote_static {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 }
 

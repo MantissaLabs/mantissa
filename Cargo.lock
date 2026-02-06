@@ -1956,15 +1956,18 @@ dependencies = [
 name = "net"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "capnp",
  "capnp-futures",
  "capnp-rpc",
  "ed25519-dalek",
  "futures",
  "getrandom 0.2.16",
+ "hkdf",
  "libc",
  "protocol",
  "serde",
+ "sha2",
  "snow",
  "thiserror 1.0.69",
  "tokio",

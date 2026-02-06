@@ -1122,6 +1122,7 @@ mod tests {
             peers_store,
             session_store,
             SigningKey::from_bytes(&[0xA5; 32]),
+            Arc::new(noise_keys),
             actor,
             health_monitor,
         );

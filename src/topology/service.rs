@@ -1,8 +1,8 @@
 use super::{Topology, types::TopologyEvent};
+use crate::config;
 use crate::node::address::extract_port;
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::pubkey_from_slice;
-use crate::config;
 use crate::server::credential::ClusterCredential;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
@@ -250,14 +250,23 @@ impl topology::Server for Topology {
             return Err(capnp::Error::failed("cannot join own address".to_string()));
         }
 
-        let client = client::connection::get_client_secure(&inputs.anchor)
-            .await
-            .map_err(|e| {
-                Error::failed(format!(
-                    "could not connect to anchor {}: {e}",
-                    inputs.anchor
-                ))
-            })?;
+        let noise_keys = self.registry.noise_keys();
+        let client = client::connection::get_client_secure_join_with_keys(
+            &inputs.anchor,
+            &inputs.join_token,
+            noise_keys.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            let mut msg = e.to_string();
+            if let Some(stripped) = msg.strip_prefix("Failed: ") {
+                msg = stripped.to_string();
+            }
+            Error::failed(format!(
+                "could not connect to anchor {}: {msg}",
+                inputs.anchor
+            ))
+        })?;
         let anchor_handle = client.clone();
 
         let response = Topology::register_with_anchor(client, &payload, &inputs.join_token).await?;
@@ -280,11 +289,6 @@ impl topology::Server for Topology {
             &credential,
         )
         .await?;
-
-        self.token_store
-            .set_and_persist(&inputs.join_token)
-            .await
-            .map_err(|e| Error::failed(format!("failed to persist join token: {e}")))?;
 
         self.install_master_key_from_anchor(session.clone()).await?;
 

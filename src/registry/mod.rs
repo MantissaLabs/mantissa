@@ -5,6 +5,7 @@ use ::health::HealthMonitor;
 use anyhow::{Result as AnyResult, anyhow};
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::SigningKey;
+use net::noise::NoiseKeys;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::health;
 use protocol::server::{self, cluster_session};
@@ -61,6 +62,7 @@ pub struct Registry {
     sessions: LocalSessionStore,
     peers: PeersStore,
     signing_key: Arc<AsyncMutex<SigningKey>>,
+    noise_keys: Arc<NoiseKeys>,
     node_id: Uuid,
     health_monitor: Arc<HealthMonitor>,
 }
@@ -77,6 +79,7 @@ impl Registry {
         peers: PeersStore,
         sessions: LocalSessionStore,
         signing_key: SigningKey,
+        noise_keys: Arc<NoiseKeys>,
         node_id: Uuid,
         health_monitor: Arc<HealthMonitor>,
     ) -> Self {
@@ -85,9 +88,14 @@ impl Registry {
             sessions,
             peers,
             signing_key: Arc::new(AsyncMutex::new(signing_key)),
+            noise_keys,
             node_id,
             health_monitor,
         }
+    }
+
+    pub fn noise_keys(&self) -> Arc<NoiseKeys> {
+        self.noise_keys.clone()
     }
 
     pub async fn register_peer_handle(&self, id: Uuid, handle: server::Client) {
@@ -129,10 +137,9 @@ impl Registry {
 
     pub async fn refresh_peer_handle(&self, peer_id: Uuid) -> Option<server::Client> {
         let peer = self.peer_latest_value(peer_id)?;
-
         let addr = peer.address.clone();
 
-        match Self::connect_to_peer(&addr).await {
+        match self.connect_to_peer(&addr, &peer.noise_static_pub).await {
             Ok(client) => {
                 let entry = self.ensure_entry(peer_id).await;
                 let mut state = entry.lock().await;
@@ -280,7 +287,7 @@ impl Registry {
             };
             let addr = val.address.clone();
 
-            let client = match Self::connect_to_peer(&addr).await {
+            let client = match self.connect_to_peer(&addr, &val.noise_static_pub).await {
                 Ok(c) => c,
                 Err(e) => {
                     error!(target: "connect", "dial {addr} failed: {e}");
@@ -310,7 +317,7 @@ impl Registry {
     pub async fn resume_sessions_on_boot(&self, local_addr: &str) {
         println!("Resuming sessions with peers...");
 
-        let mut addr_map = HashMap::<Uuid, String>::new();
+        let mut addr_map = HashMap::<Uuid, (String, [u8; 32])>::new();
         if let Ok((actives, _tombs)) = self.peers.load_all() {
             for (k, snap) in actives {
                 let id = k.to_uuid();
@@ -323,7 +330,7 @@ impl Registry {
                     if val.address == local_addr {
                         continue;
                     }
-                    addr_map.insert(id, val.address);
+                    addr_map.insert(id, (val.address, val.noise_static_pub));
                 }
             }
         }
@@ -337,12 +344,12 @@ impl Registry {
         };
 
         for (peer_id, ticket) in entries {
-            let Some(addr) = addr_map.get(&peer_id) else {
+            let Some((addr, static_pub)) = addr_map.get(&peer_id) else {
                 eprintln!("resume: peer {peer_id} has no known address; skipping");
                 continue;
             };
 
-            match Self::connect_to_peer(addr).await {
+            match self.connect_to_peer(addr, static_pub).await {
                 Ok(client) => {
                     let mut req = client.get_session_request();
                     req.get().set_ticket(&ticket);
@@ -785,8 +792,18 @@ impl Registry {
             .and_then(|(_, snap)| Self::select_peer_value(snap.as_slice()))
     }
 
-    async fn connect_to_peer(addr: &str) -> Result<server::Client, String> {
-        client::connection::get_client_secure(addr)
+    /// Dial a peer over authenticated Noise using the current join token.
+    /// This enforces cluster membership for all inter-node RPC traffic.
+    async fn connect_to_peer(
+        &self,
+        addr: &str,
+        peer_static: &[u8; 32],
+    ) -> Result<server::Client, String> {
+        client::connection::get_client_secure_peer_with_keys(
+            addr,
+            peer_static,
+            self.noise_keys.as_ref(),
+        )
             .await
             .map_err(|e| e.to_string())
     }

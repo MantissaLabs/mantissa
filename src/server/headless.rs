@@ -54,7 +54,8 @@ impl Default for HeadlessConfig {
 /// How this headless node exposes its Server during tests.
 #[derive(Clone, Debug)]
 pub enum HeadlessTransport {
-    /// In-process transport: `get_client_secure("inproc://<uuid>")` will resolve
+    /// In-process transport: `get_client_secure_join/get_client_secure_peer("inproc://<uuid>", ..)`
+    /// will resolve
     /// to the registered server capability without opening sockets.
     Inproc,
     /// TCP transport (Noise + Cap’n Proto) bound at `addr`.
@@ -166,7 +167,7 @@ impl HeadlessNode {
         // Transport wiring + readiness: compute the effective transport we report back
         let (handles, effective_transport) = match transport {
             HeadlessTransport::Inproc => {
-                // Register in-process so get_client_secure("inproc://<uuid>") resolves here
+                // Register in-process so get_client_secure_join/get_client_secure_peer resolves here
                 net::inproc::register(ctx.self_id.to_string(), server_client.clone());
 
                 // Ensure peers advertise the inproc URI in tests

@@ -2,7 +2,10 @@ use crate::errors::ClientSocketError;
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use net::{
-    noise::{client_handshake, load_or_generate_noise_keys},
+    noise::{
+        client_handshake_join, client_handshake_peer, join_probe_client,
+        load_or_generate_noise_keys, NoiseKeys,
+    },
     unix_socket::candidate_unix_socket_paths,
 };
 use protocol::server::{cluster_session, server};
@@ -10,44 +13,34 @@ use std::{
     fs, io,
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 use tokio::net::UnixStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-/// Used to get a client connection with Capn'proto.
-/// At the moment, any method using `get_client` needs to be run in a tokio task,
-/// otherwise this will panic.
-pub async fn get_client_secure(addr: &str) -> Result<server::Client, capnp::Error> {
-    // Only useful for tests, catch the capnp capability in-process to
-    // avoid any networking call.
+/// Resolve an in-process client handle when using the inproc transport.
+fn inproc_client(addr: &str) -> Result<Option<server::Client>, capnp::Error> {
     if let Some(rest) = addr.strip_prefix("inproc://") {
         if let Some(c) = net::inproc::get(rest) {
-            return Ok(c);
+            return Ok(Some(c));
         }
         return Err(capnp::Error::failed(format!(
             "inproc target not found: {rest}"
         )));
     }
+    Ok(None)
+}
 
+fn to_socket_addr(addr: &str) -> Result<std::net::SocketAddr, capnp::Error> {
     use std::net::ToSocketAddrs;
-    let sock = addr
-        .to_socket_addrs()
+    addr.to_socket_addrs()
         .map_err(|e| capnp::Error::failed(format!("bad addr: {e}")))?
         .next()
-        .ok_or_else(|| capnp::Error::failed("no addr".into()))?;
+        .ok_or_else(|| capnp::Error::failed("no addr".into()))
+}
 
-    let tcp = tokio::net::TcpStream::connect(sock)
-        .await
-        .map_err(|e| capnp::Error::failed(format!("tcp connect: {e}")))?;
-    tcp.set_nodelay(true).ok();
-
-    let keys_path = net::noise::resolve_noise_key_path()?;
-    let keys = Arc::new(load_or_generate_noise_keys(keys_path)?);
-    let noise_stream = client_handshake(tcp, &keys)
-        .await
-        .map_err(|e| capnp::Error::failed(format!("noise: {e}")))?;
-
+async fn rpc_client_from_stream(
+    noise_stream: tokio::io::DuplexStream,
+) -> Result<server::Client, capnp::Error> {
     let (r, w) = tokio_util::compat::TokioAsyncReadCompatExt::compat(noise_stream).split();
 
     let network = Box::new(twoparty::VatNetwork::new(
@@ -65,6 +58,81 @@ pub async fn get_client_secure(addr: &str) -> Result<server::Client, capnp::Erro
         }
     });
     Ok(client)
+}
+
+/// Join an anchor over TCP+Noise using the join token PSK (Noise_XXpsk3).
+pub async fn get_client_secure_join(
+    addr: &str,
+    join_token: &str,
+) -> Result<server::Client, capnp::Error> {
+    let keys_path = net::noise::resolve_noise_key_path()?;
+    let keys = load_or_generate_noise_keys(keys_path)?;
+    get_client_secure_join_with_keys(addr, join_token, &keys).await
+}
+
+/// Join an anchor over TCP+Noise using the join token PSK (Noise_XXpsk3),
+/// supplying explicit Noise keys for the initiator.
+pub async fn get_client_secure_join_with_keys(
+    addr: &str,
+    join_token: &str,
+    keys: &NoiseKeys,
+) -> Result<server::Client, capnp::Error> {
+    if let Some(c) = inproc_client(addr)? {
+        return Ok(c);
+    }
+
+    let sock = to_socket_addr(addr)?;
+    let tcp = tokio::net::TcpStream::connect(sock)
+        .await
+        .map_err(|e| capnp::Error::failed(format!("tcp connect: {e}")))?;
+    tcp.set_nodelay(true).ok();
+
+    let psk = net::noise::derive_psk_from_token(join_token)
+        .map_err(|e| capnp::Error::failed(format!("psk derivation: {e}")))?;
+
+    let mut noise_stream = client_handshake_join(tcp, keys, &psk)
+        .await
+        .map_err(|e| capnp::Error::failed(format!("noise: {e}")))?;
+
+    if join_probe_client(&mut noise_stream).await.is_err() {
+        return Err(capnp::Error::failed("invalid join token".to_string()));
+    }
+
+    rpc_client_from_stream(noise_stream).await
+}
+
+/// Connect to a known peer over TCP+Noise using static key authentication (Noise IK).
+pub async fn get_client_secure_peer(
+    addr: &str,
+    peer_static: &[u8; 32],
+) -> Result<server::Client, capnp::Error> {
+    let keys_path = net::noise::resolve_noise_key_path()?;
+    let keys = load_or_generate_noise_keys(keys_path)?;
+    get_client_secure_peer_with_keys(addr, peer_static, &keys).await
+}
+
+/// Connect to a known peer over TCP+Noise using static key authentication (Noise IK),
+/// supplying explicit Noise keys for the initiator.
+pub async fn get_client_secure_peer_with_keys(
+    addr: &str,
+    peer_static: &[u8; 32],
+    keys: &NoiseKeys,
+) -> Result<server::Client, capnp::Error> {
+    if let Some(c) = inproc_client(addr)? {
+        return Ok(c);
+    }
+
+    let sock = to_socket_addr(addr)?;
+    let tcp = tokio::net::TcpStream::connect(sock)
+        .await
+        .map_err(|e| capnp::Error::failed(format!("tcp connect: {e}")))?;
+    tcp.set_nodelay(true).ok();
+
+    let noise_stream = client_handshake_peer(tcp, keys, peer_static)
+        .await
+        .map_err(|e| capnp::Error::failed(format!("noise: {e}")))?;
+
+    rpc_client_from_stream(noise_stream).await
 }
 
 /// Shared helper to build a client from a connected UnixStream

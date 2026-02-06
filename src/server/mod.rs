@@ -170,12 +170,18 @@ impl Server {
         let server_handle: protocol::server::server::Client = capnp_rpc::new_client(self.clone());
         let noise_keys = self.noise_keys.clone();
 
+        let psk_provider: Arc<dyn net::noise::NoisePskProvider> =
+            Arc::new(self.stores.token_store.clone());
+        let peer_verifier: Arc<dyn net::noise::NoisePeerVerifier> = Arc::new(self.topology.clone());
+
         // Non-blocking TCP listener with readiness + bound addr.
         let (tcp_task, tcp_ready, bound) =
             net::tcp_secure::start_tcp_secure_listener_nonblocking_with_ready(
                 listen_addr,
                 server_handle.clone(),
                 noise_keys,
+                psk_provider,
+                peer_verifier,
             )
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;

@@ -1,10 +1,14 @@
 use crate::paths::{ensure_mantissa_group, ensure_state_dir, running_as_root};
+use async_trait::async_trait;
 use futures::lock::Mutex;
 use getrandom::getrandom;
+use hkdf::Hkdf;
+use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, io};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::{Duration, timeout};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct NoiseKeys {
@@ -35,13 +39,84 @@ impl NoiseKeys {
     }
 }
 
-const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+const NOISE_PARAMS_JOIN: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
+const NOISE_PARAMS_PEER: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const MAX_FRAME: usize = 64 * 1024;
+const TOKEN_PSK_SALT: &[u8] = b"mantissa/noise-psk-salt/v1";
+const TOKEN_PSK_INFO: &[u8] = b"mantissa/noise-psk-info/v1";
+const TOKEN_PSK_LOCATION: u8 = 3;
+const JOIN_PROBE_REQ: &[u8; 8] = b"MNTJNP01";
+const JOIN_PROBE_RESP: &[u8; 8] = b"MNTJNP02";
+const JOIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn parsed_noise_params() -> io::Result<snow::params::NoiseParams> {
-    NOISE_PARAMS
+/// Indicates whether a Noise handshake authenticated a peer or a joiner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HandshakeKind {
+    Join,
+    Peer,
+}
+
+/// Result of a server-side Noise handshake, including the authenticated kind.
+pub struct ServerHandshake {
+    pub stream: tokio::io::DuplexStream,
+    pub kind: HandshakeKind,
+}
+
+/// Parse and validate the configured Noise parameters.
+/// This centralizes handshake configuration for both client and server.
+fn parsed_noise_params(params: &str) -> io::Result<snow::params::NoiseParams> {
+    params
         .parse()
         .map_err(|e| io::Error::other(format!("invalid noise params: {e}")))
+}
+
+/// Provide a Noise PSK derived from the current join token.
+/// This authenticates the connection at the transport layer for cluster peers.
+#[async_trait(?Send)]
+pub trait NoisePskProvider {
+    /// Return the current Noise PSK used to authenticate transport connections.
+    async fn psk(&self) -> io::Result<[u8; 32]>;
+}
+
+/// Verify whether a remote static public key is allowed for peer connections.
+#[async_trait(?Send)]
+pub trait NoisePeerVerifier {
+    /// Return true if `remote_static` is an authorized peer static key.
+    async fn is_allowed(&self, remote_static: &[u8]) -> io::Result<bool>;
+}
+
+#[derive(Debug)]
+pub enum PeerHandshakeError {
+    PatternMismatch,
+    UnknownPeer,
+    Io(io::Error),
+}
+
+impl From<io::Error> for PeerHandshakeError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+/// Derive a 32-byte PSK from the join token using HKDF-SHA256.
+/// This turns the human-pasted token into a Noise-compatible shared secret.
+pub fn derive_psk_from_token(token: &str) -> io::Result<[u8; 32]> {
+    if token.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "join token is empty",
+        ));
+    }
+
+    let hk = Hkdf::<Sha256>::new(Some(TOKEN_PSK_SALT), token.as_bytes());
+    let mut out = [0u8; 32];
+    hk.expand(TOKEN_PSK_INFO, &mut out).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "failed to derive Noise PSK from token",
+        )
+    })?;
+    Ok(out)
 }
 
 // prologue no longer contains the token — just a static tag
@@ -49,18 +124,20 @@ fn prologue() -> &'static [u8] {
     b"MANTISSA|v1"
 }
 
-/// Client side handshake
-/// Handshake (Noise_XX) with length-prefixed frames; no token in Noise.
+/// Client side handshake.
+/// Handshake (Noise_XXpsk3) with length-prefixed frames and a PSK for authentication.
 /// Returns a duplex stream bridged through the Noise transport.
-pub async fn client_handshake(
+pub async fn client_handshake_join(
     tcp: tokio::net::TcpStream,
     keys: &crate::noise::NoiseKeys,
+    psk: &[u8; 32],
 ) -> io::Result<tokio::io::DuplexStream> {
     let pk_bytes = keys.private.to_bytes();
 
-    let builder = snow::Builder::new(parsed_noise_params()?)
+    let builder = snow::Builder::new(parsed_noise_params(NOISE_PARAMS_JOIN)?)
         .prologue(prologue())
-        .local_private_key(&pk_bytes);
+        .local_private_key(&pk_bytes)
+        .psk(TOKEN_PSK_LOCATION, psk);
 
     let mut hs = builder
         .build_initiator()
@@ -99,29 +176,83 @@ pub async fn client_handshake(
     Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
 }
 
-/// Server side handshake
-/// Handshake (Noise_XX) with length-prefixed frames; no token in Noise.
-/// Returns a duplex stream bridged through the Noise transport.
-pub async fn server_handshake(
+/// Confirm the join PSK on the client side by round-tripping a short probe.
+/// This ensures an invalid join token fails before Cap'n Proto setup.
+pub async fn join_probe_client(
+    stream: &mut tokio::io::DuplexStream,
+) -> io::Result<()> {
+    let fut = async {
+        stream.write_all(JOIN_PROBE_REQ).await?;
+        stream.flush().await?;
+        let mut buf = [0u8; JOIN_PROBE_RESP.len()];
+        stream.read_exact(&mut buf).await?;
+        if buf != *JOIN_PROBE_RESP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "join probe response mismatch",
+            ));
+        }
+        Ok(())
+    };
+
+    timeout(JOIN_PROBE_TIMEOUT, fut)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "join probe timed out"))?
+}
+
+/// Confirm the join PSK on the server side by validating a short probe and responding.
+/// This rejects invalid tokens before Cap'n Proto setup.
+pub async fn join_probe_server(
+    stream: &mut tokio::io::DuplexStream,
+) -> io::Result<()> {
+    let fut = async {
+        let mut buf = [0u8; JOIN_PROBE_REQ.len()];
+        stream.read_exact(&mut buf).await?;
+        if buf != *JOIN_PROBE_REQ {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "join probe request mismatch",
+            ));
+        }
+        stream.write_all(JOIN_PROBE_RESP).await?;
+        stream.flush().await?;
+        Ok(())
+    };
+
+    timeout(JOIN_PROBE_TIMEOUT, fut)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "join probe timed out"))?
+}
+
+/// Client side handshake for authenticated peer-to-peer connections.
+/// Uses Noise IK to authenticate the responder's static key and reveal our static key.
+pub async fn client_handshake_peer(
     tcp: tokio::net::TcpStream,
     keys: &crate::noise::NoiseKeys,
+    responder_static: &[u8; 32],
 ) -> io::Result<tokio::io::DuplexStream> {
     let pk_bytes = keys.private.to_bytes();
 
-    let builder = snow::Builder::new(parsed_noise_params()?)
+    let builder = snow::Builder::new(parsed_noise_params(NOISE_PARAMS_PEER)?)
         .prologue(prologue())
-        .local_private_key(&pk_bytes);
+        .local_private_key(&pk_bytes)
+        .remote_public_key(responder_static);
 
     let mut hs = builder
-        .build_responder()
+        .build_initiator()
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     let (mut rd, mut wr) = tcp.into_split();
 
-    // <- e
-    let mut inb = vec![0u8; 65535];
+    // -> e, es, s, ss
     let mut out = vec![0u8; 65535];
+    let n = hs
+        .write_message(&[], &mut out)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    write_framed(&mut wr, &out[..n]).await?;
 
+    // <- e, ee, se
+    let mut inb = vec![0u8; 65535];
     let nread = read_framed_len(&mut rd, &mut inb).await?;
     hs.read_message(&inb[..nread], &mut out).map_err(|e| {
         io::Error::new(
@@ -129,6 +260,62 @@ pub async fn server_handshake(
             format!("handshake failed: {e}"),
         )
     })?;
+
+    let transport = hs
+        .into_transport_mode()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
+}
+
+/// Server side handshake.
+/// Handshake (Noise_XXpsk3) with length-prefixed frames and a PSK for authentication.
+/// Returns a duplex stream bridged through the Noise transport.
+pub async fn server_handshake_join(
+    tcp: tokio::net::TcpStream,
+    keys: &crate::noise::NoiseKeys,
+    psk: &[u8; 32],
+) -> io::Result<tokio::io::DuplexStream> {
+    let (mut rd, wr) = tcp.into_split();
+    let mut first = vec![0u8; 65535];
+    let nread = read_framed_len(&mut rd, &mut first).await?;
+    server_handshake_join_with_first_frame(rd, wr, keys, psk, &first[..nread]).await
+}
+
+/// Server side join handshake (Noise_XXpsk3) using a pre-read first frame.
+pub async fn server_handshake_join_with_first_frame(
+    mut rd: tokio::net::tcp::OwnedReadHalf,
+    mut wr: tokio::net::tcp::OwnedWriteHalf,
+    keys: &crate::noise::NoiseKeys,
+    psk: &[u8; 32],
+    first_frame: &[u8],
+) -> io::Result<tokio::io::DuplexStream> {
+    fn map_join_error(err: snow::Error) -> io::Error {
+        let msg = err.to_string();
+        if msg.contains("decrypt") || msg.contains("psk") {
+            io::Error::new(io::ErrorKind::PermissionDenied, "invalid join token")
+        } else {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("handshake failed: {msg}"),
+            )
+        }
+    }
+
+    let pk_bytes = keys.private.to_bytes();
+
+    let builder = snow::Builder::new(parsed_noise_params(NOISE_PARAMS_JOIN)?)
+        .prologue(prologue())
+        .local_private_key(&pk_bytes)
+        .psk(TOKEN_PSK_LOCATION, psk);
+
+    let mut hs = builder
+        .build_responder()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let mut out = vec![0u8; 65535];
+    hs.read_message(first_frame, &mut out)
+        .map_err(map_join_error)?;
 
     // -> e, ee, s, es
     let n = hs
@@ -137,15 +324,11 @@ pub async fn server_handshake(
     write_framed(&mut wr, &out[..n]).await?;
 
     // <- s, se
+    let mut inb = vec![0u8; 65535];
     let nread = read_framed_len(&mut rd, &mut inb).await?;
-    hs.read_message(&inb[..nread], &mut out).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("handshake failed: {e}"),
-        )
-    })?;
+    hs.read_message(&inb[..nread], &mut out)
+        .map_err(map_join_error)?;
 
-    // Done
     let transport = hs
         .into_transport_mode()
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -153,6 +336,117 @@ pub async fn server_handshake(
     Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
 }
 
+/// Server side peer handshake (Noise IK) using a pre-read first frame.
+pub async fn server_handshake_peer_with_first_frame(
+    rd: tokio::net::tcp::OwnedReadHalf,
+    mut wr: tokio::net::tcp::OwnedWriteHalf,
+    keys: &crate::noise::NoiseKeys,
+    first_frame: &[u8],
+    verifier: Arc<dyn NoisePeerVerifier>,
+) -> Result<tokio::io::DuplexStream, PeerHandshakeError> {
+    let pk_bytes = keys.private.to_bytes();
+
+    let builder = snow::Builder::new(parsed_noise_params(NOISE_PARAMS_PEER)?)
+        .prologue(prologue())
+        .local_private_key(&pk_bytes);
+
+    let mut hs = builder
+        .build_responder()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let mut out = vec![0u8; 65535];
+    hs.read_message(first_frame, &mut out)
+        .map_err(|_| PeerHandshakeError::PatternMismatch)?;
+
+    let remote = hs
+        .get_remote_static()
+        .ok_or(PeerHandshakeError::PatternMismatch)?;
+
+    if !verifier.is_allowed(remote).await? {
+        return Err(PeerHandshakeError::UnknownPeer);
+    }
+
+    let n = hs
+        .write_message(&[], &mut out)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    write_framed(&mut wr, &out[..n]).await?;
+
+    let transport = hs
+        .into_transport_mode()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
+}
+
+#[derive(Debug)]
+pub enum ServerHandshakeError {
+    UnknownPeer,
+    Io(io::Error),
+}
+
+impl From<io::Error> for ServerHandshakeError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+/// Select a server-side handshake based on the first frame:
+/// - Try peer IK first (requires authorized static key).
+/// - Fallback to join XXpsk3 when the peer pattern doesn't match.
+pub async fn server_handshake_select(
+    rd: tokio::net::tcp::OwnedReadHalf,
+    wr: tokio::net::tcp::OwnedWriteHalf,
+    keys: &crate::noise::NoiseKeys,
+    psk: &[u8; 32],
+    first_frame: &[u8],
+    verifier: Arc<dyn NoisePeerVerifier>,
+) -> Result<ServerHandshake, ServerHandshakeError> {
+    let pk_bytes = keys.private.to_bytes();
+
+    let builder = snow::Builder::new(parsed_noise_params(NOISE_PARAMS_PEER)?)
+        .prologue(prologue())
+        .local_private_key(&pk_bytes);
+
+    let mut hs = builder
+        .build_responder()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let mut out = vec![0u8; 65535];
+    match hs.read_message(first_frame, &mut out) {
+        Ok(_) => {
+            let remote = hs
+                .get_remote_static()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing peer static"))?;
+
+            if !verifier.is_allowed(remote).await? {
+                return Err(ServerHandshakeError::UnknownPeer);
+            }
+
+            let mut wr = wr;
+            let n = hs
+                .write_message(&[], &mut out)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            write_framed(&mut wr, &out[..n]).await?;
+
+            let transport = hs
+                .into_transport_mode()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+
+            return Ok(ServerHandshake {
+                stream: crate::noise::spawn_noise_io_bridge(rd, wr, transport),
+                kind: HandshakeKind::Peer,
+            });
+        }
+        Err(_) => {
+            let join =
+                server_handshake_join_with_first_frame(rd, wr, keys, psk, first_frame).await?;
+            return Ok(ServerHandshake {
+                stream: join,
+                kind: HandshakeKind::Join,
+            });
+        }
+    }
+}
 /// Spawn a Noise-protected I/O bridge between the TCP socket and an in-process
 /// duplex stream returned to the caller (the "application end").
 ///
