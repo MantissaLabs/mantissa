@@ -3,7 +3,7 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use net::{
     noise::{
-        client_handshake_join, client_handshake_peer, join_probe_client,
+        client_handshake_join_with_probe, client_handshake_peer, join_probe_client,
         load_or_generate_noise_keys, NoiseKeys,
     },
     unix_socket::candidate_unix_socket_paths,
@@ -90,15 +90,17 @@ pub async fn get_client_secure_join_with_keys(
     let psk = net::noise::derive_psk_from_token(join_token)
         .map_err(|e| capnp::Error::failed(format!("psk derivation: {e}")))?;
 
-    let mut noise_stream = client_handshake_join(tcp, keys, &psk)
+    let mut handshake = client_handshake_join_with_probe(tcp, keys, &psk)
         .await
         .map_err(|e| capnp::Error::failed(format!("noise: {e}")))?;
 
-    if join_probe_client(&mut noise_stream).await.is_err() {
-        return Err(capnp::Error::failed("invalid join token".to_string()));
+    if handshake.probe_enabled {
+        if join_probe_client(&mut handshake.stream).await.is_err() {
+            return Err(capnp::Error::failed("invalid join token".to_string()));
+        }
     }
 
-    rpc_client_from_stream(noise_stream).await
+    rpc_client_from_stream(handshake.stream).await
 }
 
 /// Connect to a known peer over TCP+Noise using static key authentication (Noise IK).

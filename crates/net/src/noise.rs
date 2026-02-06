@@ -47,6 +47,8 @@ const TOKEN_PSK_INFO: &[u8] = b"mantissa/noise-psk-info/v1";
 const TOKEN_PSK_LOCATION: u8 = 3;
 const JOIN_PROBE_REQ: &[u8; 8] = b"MNTJNP01";
 const JOIN_PROBE_RESP: &[u8; 8] = b"MNTJNP02";
+const JOIN_PROBE_HELLO: &[u8; 8] = b"MNTJNH01";
+const JOIN_PROBE_ACK: &[u8; 8] = b"MNTJNA01";
 const JOIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Indicates whether a Noise handshake authenticated a peer or a joiner.
@@ -60,6 +62,18 @@ pub enum HandshakeKind {
 pub struct ServerHandshake {
     pub stream: tokio::io::DuplexStream,
     pub kind: HandshakeKind,
+    pub join_probe: bool,
+}
+
+/// Client-side join handshake result, including whether the server supports probes.
+pub struct ClientJoinHandshake {
+    pub stream: tokio::io::DuplexStream,
+    pub probe_enabled: bool,
+}
+
+struct ServerJoinHandshake {
+    stream: tokio::io::DuplexStream,
+    probe_required: bool,
 }
 
 /// Parse and validate the configured Noise parameters.
@@ -124,14 +138,14 @@ fn prologue() -> &'static [u8] {
     b"MANTISSA|v1"
 }
 
-/// Client side handshake.
+/// Client side join handshake with probe negotiation.
 /// Handshake (Noise_XXpsk3) with length-prefixed frames and a PSK for authentication.
-/// Returns a duplex stream bridged through the Noise transport.
-pub async fn client_handshake_join(
+/// The client sends a small payload indicating probe support and reads the server's ack.
+pub async fn client_handshake_join_with_probe(
     tcp: tokio::net::TcpStream,
     keys: &crate::noise::NoiseKeys,
     psk: &[u8; 32],
-) -> io::Result<tokio::io::DuplexStream> {
+) -> io::Result<ClientJoinHandshake> {
     let pk_bytes = keys.private.to_bytes();
 
     let builder = snow::Builder::new(parsed_noise_params(NOISE_PARAMS_JOIN)?)
@@ -145,22 +159,23 @@ pub async fn client_handshake_join(
 
     let (mut rd, mut wr) = tcp.into_split();
 
-    // -> e
+    // -> e (send probe hello payload)
     let mut out = vec![0u8; 65535];
     let n = hs
-        .write_message(&[], &mut out)
+        .write_message(JOIN_PROBE_HELLO, &mut out)
         .map_err(|e| io::Error::other(e.to_string()))?;
     write_framed(&mut wr, &out[..n]).await?;
 
     // <- e, ee, s, es
     let mut inb = vec![0u8; 65535];
     let nread = read_framed_len(&mut rd, &mut inb).await?;
-    hs.read_message(&inb[..nread], &mut out).map_err(|e| {
+    let n = hs.read_message(&inb[..nread], &mut out).map_err(|e| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("handshake failed: {e}"),
         )
     })?;
+    let probe_enabled = &out[..n] == JOIN_PROBE_ACK;
 
     // -> s, se (no payload)
     let n = hs
@@ -173,7 +188,23 @@ pub async fn client_handshake_join(
         .into_transport_mode()
         .map_err(|e| io::Error::other(e.to_string()))?;
 
-    Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
+    Ok(ClientJoinHandshake {
+        stream: crate::noise::spawn_noise_io_bridge(rd, wr, transport),
+        probe_enabled,
+    })
+}
+
+/// Client side handshake (legacy-compatible).
+/// Handshake (Noise_XXpsk3) with length-prefixed frames and a PSK for authentication.
+/// Returns a duplex stream bridged through the Noise transport.
+pub async fn client_handshake_join(
+    tcp: tokio::net::TcpStream,
+    keys: &crate::noise::NoiseKeys,
+    psk: &[u8; 32],
+) -> io::Result<tokio::io::DuplexStream> {
+    Ok(client_handshake_join_with_probe(tcp, keys, psk)
+        .await?
+        .stream)
 }
 
 /// Confirm the join PSK on the client side by round-tripping a short probe.
@@ -284,12 +315,28 @@ pub async fn server_handshake_join(
 
 /// Server side join handshake (Noise_XXpsk3) using a pre-read first frame.
 pub async fn server_handshake_join_with_first_frame(
+    rd: tokio::net::tcp::OwnedReadHalf,
+    wr: tokio::net::tcp::OwnedWriteHalf,
+    keys: &crate::noise::NoiseKeys,
+    psk: &[u8; 32],
+    first_frame: &[u8],
+) -> io::Result<tokio::io::DuplexStream> {
+    Ok(
+        server_handshake_join_with_first_frame_probe(rd, wr, keys, psk, first_frame)
+            .await?
+            .stream,
+    )
+}
+
+/// Server side join handshake (Noise_XXpsk3) using a pre-read first frame.
+/// Returns the Noise stream plus whether the client requested the join probe.
+async fn server_handshake_join_with_first_frame_probe(
     mut rd: tokio::net::tcp::OwnedReadHalf,
     mut wr: tokio::net::tcp::OwnedWriteHalf,
     keys: &crate::noise::NoiseKeys,
     psk: &[u8; 32],
     first_frame: &[u8],
-) -> io::Result<tokio::io::DuplexStream> {
+) -> io::Result<ServerJoinHandshake> {
     fn map_join_error(err: snow::Error) -> io::Error {
         let msg = err.to_string();
         if msg.contains("decrypt") || msg.contains("psk") {
@@ -314,12 +361,19 @@ pub async fn server_handshake_join_with_first_frame(
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut out = vec![0u8; 65535];
-    hs.read_message(first_frame, &mut out)
+    let n = hs
+        .read_message(first_frame, &mut out)
         .map_err(map_join_error)?;
+    let probe_required = &out[..n] == JOIN_PROBE_HELLO;
 
     // -> e, ee, s, es
+    let payload = if probe_required {
+        JOIN_PROBE_ACK.as_ref()
+    } else {
+        &[][..]
+    };
     let n = hs
-        .write_message(&[], &mut out)
+        .write_message(payload, &mut out)
         .map_err(|e| io::Error::other(e.to_string()))?;
     write_framed(&mut wr, &out[..n]).await?;
 
@@ -333,7 +387,10 @@ pub async fn server_handshake_join_with_first_frame(
         .into_transport_mode()
         .map_err(|e| io::Error::other(e.to_string()))?;
 
-    Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
+    Ok(ServerJoinHandshake {
+        stream: crate::noise::spawn_noise_io_bridge(rd, wr, transport),
+        probe_required,
+    })
 }
 
 /// Server side peer handshake (Noise IK) using a pre-read first frame.
@@ -435,14 +492,16 @@ pub async fn server_handshake_select(
             return Ok(ServerHandshake {
                 stream: crate::noise::spawn_noise_io_bridge(rd, wr, transport),
                 kind: HandshakeKind::Peer,
+                join_probe: false,
             });
         }
         Err(_) => {
             let join =
-                server_handshake_join_with_first_frame(rd, wr, keys, psk, first_frame).await?;
+                server_handshake_join_with_first_frame_probe(rd, wr, keys, psk, first_frame).await?;
             return Ok(ServerHandshake {
-                stream: join,
+                stream: join.stream,
                 kind: HandshakeKind::Join,
+                join_probe: join.probe_required,
             });
         }
     }

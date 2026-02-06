@@ -2,9 +2,12 @@
 
 use async_trait::async_trait;
 use net::noise::{
-    NoisePeerVerifier, client_handshake_join, client_handshake_peer, read_framed_len,
-    server_handshake_join, server_handshake_peer_with_first_frame, write_framed,
+    ClientJoinHandshake, HandshakeKind, NoisePeerVerifier, client_handshake_join,
+    client_handshake_join_with_probe, client_handshake_peer, join_probe_client,
+    join_probe_server, read_framed_len, server_handshake_join, server_handshake_peer_with_first_frame,
+    server_handshake_select, write_framed,
 };
+use snow::params::NoiseParams;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use tokio::io;
@@ -24,6 +27,95 @@ impl NoisePeerVerifier for AllowPeer {
     async fn is_allowed(&self, remote_static: &[u8]) -> std::io::Result<bool> {
         Ok(remote_static == self.0)
     }
+}
+
+struct DenyPeer;
+
+#[async_trait(?Send)]
+impl NoisePeerVerifier for DenyPeer {
+    async fn is_allowed(&self, _remote_static: &[u8]) -> std::io::Result<bool> {
+        Ok(false)
+    }
+}
+
+const PROLOGUE: &[u8] = b"MANTISSA|v1";
+const NOISE_PARAMS_JOIN: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
+
+async fn legacy_client_handshake_no_hello(
+    mut tcp: TcpStream,
+    keys: &net::noise::NoiseKeys,
+    psk: &[u8; 32],
+) -> std::io::Result<()> {
+    let pk_bytes = keys.private.to_bytes();
+    let params: NoiseParams = NOISE_PARAMS_JOIN.parse().unwrap();
+    let builder = snow::Builder::new(params)
+        .prologue(PROLOGUE)
+        .local_private_key(&pk_bytes)
+        .psk(3, psk);
+    let mut hs = builder
+        .build_initiator()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let (mut rd, mut wr) = tcp.split();
+    let mut out = vec![0u8; 65535];
+
+    // -> e (legacy: empty payload)
+    let n = hs
+        .write_message(&[], &mut out)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    write_framed(&mut wr, &out[..n]).await?;
+
+    // <- e, ee, s, es (ignore payload)
+    let mut inb = vec![0u8; 65535];
+    let nread = read_framed_len(&mut rd, &mut inb).await?;
+    hs.read_message(&inb[..nread], &mut out)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    // -> s, se (empty payload)
+    let n = hs
+        .write_message(&[], &mut out)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    write_framed(&mut wr, &out[..n]).await?;
+
+    Ok(())
+}
+
+async fn legacy_server_handshake_no_probe(
+    tcp: TcpStream,
+    keys: &net::noise::NoiseKeys,
+    psk: &[u8; 32],
+) -> std::io::Result<()> {
+    let pk_bytes = keys.private.to_bytes();
+    let params: NoiseParams = NOISE_PARAMS_JOIN.parse().unwrap();
+    let builder = snow::Builder::new(params)
+        .prologue(PROLOGUE)
+        .local_private_key(&pk_bytes)
+        .psk(3, psk);
+    let mut hs = builder
+        .build_responder()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let (mut rd, mut wr) = tcp.into_split();
+    let mut out = vec![0u8; 65535];
+    let mut inb = vec![0u8; 65535];
+
+    // <- e (ignore payload)
+    let nread = read_framed_len(&mut rd, &mut inb).await?;
+    hs.read_message(&inb[..nread], &mut out)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    // -> e, ee, s, es (legacy: no probe ack)
+    let n = hs
+        .write_message(&[], &mut out)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    write_framed(&mut wr, &out[..n]).await?;
+
+    // <- s, se
+    let nread = read_framed_len(&mut rd, &mut inb).await?;
+    hs.read_message(&inb[..nread], &mut out)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -175,6 +267,130 @@ async fn noise_ik_peer_handshake_and_echo() {
         .unwrap()
         .unwrap();
     assert_eq!(&buf, b"ping");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn noise_join_probe_negotiation_enabled() {
+    let server_keys = fixed_noise_keys(11);
+    let client_keys = fixed_noise_keys(22);
+    let psk = net::noise::derive_psk_from_token("MNTISA-1-probe-token").expect("derive psk");
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().unwrap();
+
+    let server_task = async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (mut rd, wr) = sock.into_split();
+        let mut first = vec![0u8; 65535];
+        let nread = read_framed_len(&mut rd, &mut first).await.unwrap();
+        let mut handshake = server_handshake_select(
+            rd,
+            wr,
+            &server_keys,
+            &psk,
+            &first[..nread],
+            Arc::new(DenyPeer),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(handshake.kind, HandshakeKind::Join);
+        assert!(handshake.join_probe);
+
+        join_probe_server(&mut handshake.stream).await.unwrap();
+        handshake.stream.write_all(b"ping").await.unwrap();
+        handshake.stream.flush().await.unwrap();
+    };
+
+    let client_task = async move {
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let mut handshake: ClientJoinHandshake =
+            client_handshake_join_with_probe(sock, &client_keys, &psk)
+                .await
+                .unwrap();
+        assert!(handshake.probe_enabled);
+        join_probe_client(&mut handshake.stream).await.unwrap();
+        let mut buf = [0u8; 4];
+        handshake.stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+    };
+
+    tokio::join!(server_task, client_task);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn noise_join_probe_legacy_server_ignored() {
+    let server_keys = fixed_noise_keys(11);
+    let client_keys = fixed_noise_keys(22);
+    let psk = net::noise::derive_psk_from_token("MNTISA-1-legacy-server")
+        .expect("derive psk");
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().unwrap();
+
+    let server_task = async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        legacy_server_handshake_no_probe(sock, &server_keys, &psk)
+            .await
+            .unwrap();
+    };
+
+    let client_task = async move {
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let handshake: ClientJoinHandshake =
+            client_handshake_join_with_probe(sock, &client_keys, &psk)
+                .await
+                .unwrap();
+        assert!(!handshake.probe_enabled);
+    };
+
+    tokio::join!(server_task, client_task);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn noise_join_probe_legacy_client_no_hello() {
+    let server_keys = fixed_noise_keys(11);
+    let client_keys = fixed_noise_keys(22);
+    let psk = net::noise::derive_psk_from_token("MNTISA-1-legacy-client")
+        .expect("derive psk");
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().unwrap();
+
+    let server_task = async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (mut rd, wr) = sock.into_split();
+        let mut first = vec![0u8; 65535];
+        let nread = read_framed_len(&mut rd, &mut first).await.unwrap();
+        let handshake = server_handshake_select(
+            rd,
+            wr,
+            &server_keys,
+            &psk,
+            &first[..nread],
+            Arc::new(DenyPeer),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(handshake.kind, HandshakeKind::Join);
+        assert!(!handshake.join_probe);
+    };
+
+    let client_task = async move {
+        let sock = TcpStream::connect(addr).await.unwrap();
+        legacy_client_handshake_no_hello(sock, &client_keys, &psk)
+            .await
+            .unwrap();
+    };
+
+    tokio::join!(server_task, client_task);
 }
 
 #[tokio::test(flavor = "current_thread")]

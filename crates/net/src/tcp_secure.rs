@@ -61,7 +61,7 @@ async fn accept_loop(
             .await
             {
                 Ok(mut handshake) => {
-                    if matches!(handshake.kind, HandshakeKind::Join) {
+                    if matches!(handshake.kind, HandshakeKind::Join) && handshake.join_probe {
                         if let Err(e) = crate::noise::join_probe_server(&mut handshake.stream).await
                         {
                             warn!(target: "server", "Noise join probe failed: {e}");
