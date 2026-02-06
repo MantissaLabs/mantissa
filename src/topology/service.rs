@@ -30,6 +30,7 @@ struct JoinPayload {
     server_handle: server::Client,
     public_key: [u8; 32],
     signing_key: [u8; 32],
+    identity_sig: [u8; 64],
     wireguard: Option<WireGuardPeerValue>,
 }
 
@@ -120,6 +121,12 @@ impl Topology {
             server_handle,
             public_key: self.public_key.to_bytes(),
             signing_key: self.signing_key.verifying_key().to_bytes(),
+            identity_sig: crate::node::identity::sign_peer_identity(
+                &self.signing_key,
+                &self.node.id,
+                &self.public_key.to_bytes(),
+                &self.signing_key.verifying_key().to_bytes(),
+            ),
             wireguard,
         })
     }
@@ -138,6 +145,7 @@ impl Topology {
         info.set_handle(payload.server_handle.clone());
         info.set_public_key(&payload.public_key);
         info.set_signing_key(&payload.signing_key);
+        info.set_identity_sig(&payload.identity_sig);
         if let Some(wg) = payload.wireguard.as_ref() {
             info.set_wireguard_public_key(&wg.public_key);
             info.set_wireguard_port(wg.port);
@@ -154,7 +162,7 @@ impl Topology {
         let credential = resp.get_credential()?.to_vec();
         let node_info = resp.get_node_info()?;
         let peer_id = read_node_id(node_info.get_id()?)?;
-        let peer_value = PeerValue::from_node_info(node_info)?;
+        let peer_value = PeerValue::from_node_info(peer_id, node_info)?;
 
         Ok(JoinResponse {
             peer_id,
@@ -440,6 +448,17 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
     let id = read_node_id(node.get_id()?)?;
     let pubkey = pubkey_from_slice(node.get_public_key()?).expect("Failed to parse public key");
     let signing_pub = verifying_key_from_data(node.get_signing_key()?)?;
+    let identity_sig = node.get_identity_sig()?;
+    if identity_sig.is_empty() {
+        return Err(capnp::Error::failed(
+            "identitySig must be set for peer identity verification".into(),
+        ));
+    }
+    if identity_sig.len() != 64 {
+        return Err(capnp::Error::failed(
+            "identitySig must be exactly 64 bytes".into(),
+        ));
+    }
     let wg_pk_bytes = node.get_wireguard_public_key()?;
     let wireguard = if wg_pk_bytes.is_empty() {
         None
@@ -475,6 +494,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 client,
                 noise_static_pub: pubkey,
                 signing_pub: Box::new(signing_pub),
+                identity_sig: identity_sig.to_vec(),
                 wireguard,
             }
         }
@@ -501,6 +521,7 @@ pub fn add_event(
             client,
             noise_static_pub,
             signing_pub,
+            identity_sig,
             wireguard,
         } => {
             let mut topo = msg.init_topology();
@@ -514,6 +535,7 @@ pub fn add_event(
             node.set_root_hash(root_hash);
             node.set_public_key(&noise_static_pub.to_bytes());
             node.set_signing_key(&signing_pub.to_bytes());
+            node.set_identity_sig(identity_sig);
             if let Some(wg) = wireguard.as_ref() {
                 node.set_wireguard_public_key(&wg.public_key);
                 node.set_wireguard_port(wg.port);

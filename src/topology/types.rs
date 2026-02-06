@@ -48,6 +48,7 @@ pub enum TopologyEvent {
         client: Option<server::Client>,
         noise_static_pub: PublicKey,
         signing_pub: Box<VerifyingKey>,
+        identity_sig: Vec<u8>,
         wireguard: Option<WireGuardPeerValue>,
     },
     Leave {

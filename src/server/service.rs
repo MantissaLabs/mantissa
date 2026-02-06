@@ -1,7 +1,7 @@
 use super::Server;
 use crate::crypto::rand;
 use crate::node::id;
-use crate::node::identity::pubkey_from_slice;
+use crate::node::identity::{pubkey_from_slice, verify_peer_identity};
 use crate::server::credential::ClusterCredential;
 use crate::topology::TopologyEvent;
 use crate::topology::peers::{PeerValue, WireGuardPeerValue};
@@ -65,6 +65,20 @@ impl protocol::server::Server for Server {
 
         let signing_pub = signing_vk.to_bytes();
 
+        let identity_sig = info.get_identity_sig()?;
+        if identity_sig.is_empty() {
+            return Err(capnp::Error::failed(
+                "identitySig must be set for peer identity verification".to_string(),
+            ));
+        }
+        if identity_sig.len() != 64 {
+            return Err(capnp::Error::failed(
+                "identitySig must be exactly 64 bytes".to_string(),
+            ));
+        }
+        verify_peer_identity(&signing_vk, &joiner_id, &pubkey.to_bytes(), identity_sig)
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
         let wg_pk_bytes = info.get_wireguard_public_key()?;
         let wireguard = if wg_pk_bytes.is_empty() {
             None
@@ -88,6 +102,7 @@ impl protocol::server::Server for Server {
             hostname,
             noise_static_pub: pubkey.to_bytes(),
             signing_pub,
+            identity_sig: identity_sig.to_vec(),
             wireguard,
         };
 
@@ -138,6 +153,7 @@ impl protocol::server::Server for Server {
             client: Some(handle.clone()),
             noise_static_pub: pubkey,
             signing_pub: Box::new(signing_vk),
+            identity_sig: identity_sig.to_vec(),
             wireguard: peer.wireguard.clone(),
         };
 

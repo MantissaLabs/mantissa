@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
@@ -387,6 +387,13 @@ impl Topology {
         let public_key = self.public_key;
         let verifying_key = self.signing_key.verifying_key();
         let health = self.health_monitor.clone();
+        // Precompute the identity signature so the async task doesn't capture `self`.
+        let identity_sig = crate::node::identity::sign_peer_identity(
+            &self.signing_key,
+            &local_id,
+            &public_key.to_bytes(),
+            &verifying_key.to_bytes(),
+        );
 
         // Compute advertise address before registering. If this fails we abort so the node
         // does not appear joined without a reachable address.
@@ -458,6 +465,7 @@ impl Topology {
                 hostname: host,
                 noise_static_pub: public_key.to_bytes(),
                 signing_pub: verifying_key.to_bytes(),
+                identity_sig: identity_sig.to_vec(),
                 wireguard,
             };
 
@@ -577,8 +585,14 @@ impl Topology {
         info.set_addr(&addr);
 
         // Keys
-        info.set_public_key(&self.public_key.to_bytes());
-        info.set_signing_key(&self.signing_key.verifying_key().to_bytes());
+        let noise_pub = self.public_key.to_bytes();
+        let signing_pub = self.signing_key.verifying_key().to_bytes();
+        let identity_sig =
+            crate::node::identity::sign_peer_identity(&self.signing_key, &self.node.id, &noise_pub, &signing_pub);
+
+        info.set_public_key(&noise_pub);
+        info.set_signing_key(&signing_pub);
+        info.set_identity_sig(&identity_sig);
 
         // WireGuard underlay advertisement (best-effort).
         //
@@ -677,15 +691,30 @@ impl Topology {
                             ref client,
                             ref noise_static_pub,
                             ref signing_pub,
+                            ref identity_sig,
                             ref wireguard,
                         } => {
                             info!(target: "topology", "Node joined: {id} at {address}");
+
+                            if let Err(e) = self
+                                .verify_peer_identity_event(
+                                    id,
+                                    noise_static_pub,
+                                    signing_pub,
+                                    identity_sig,
+                                )
+                                .await
+                            {
+                                warn!(target: "topology", "rejecting peer {id}: {e}");
+                                continue;
+                            }
 
                             let v = PeerValue {
                                 address: address.clone(),
                                 hostname: hostname.clone(),
                                 noise_static_pub: noise_static_pub.to_bytes(),
                                 signing_pub: signing_pub.to_bytes(),
+                                identity_sig: identity_sig.clone(),
                                 wireguard: wireguard.clone(),
                             };
 
@@ -719,6 +748,7 @@ impl Topology {
                             client,
                             noise_static_pub,
                             signing_pub,
+                            identity_sig,
                             wireguard,
                         } => {
                             // Never re-gossip a capability we only know as an import. Cap’n Proto
@@ -733,6 +763,7 @@ impl Topology {
                                 client,
                                 noise_static_pub,
                                 signing_pub,
+                                identity_sig,
                                 wireguard,
                             }
                         }
@@ -844,6 +875,42 @@ impl Topology {
                 None
             }
         }
+    }
+
+    /// Verify a peer identity signature and enforce signing-key pinning for an existing node id.
+    /// This prevents gossip updates from swapping a node id onto a new signing key.
+    async fn verify_peer_identity_event(
+        &self,
+        peer_id: Uuid,
+        noise_static_pub: &x25519_dalek::PublicKey,
+        signing_pub: &VerifyingKey,
+        identity_sig: &[u8],
+    ) -> Result<(), String> {
+        if identity_sig.is_empty() {
+            return Err("identitySig is required for peer identity verification".to_string());
+        }
+        if identity_sig.len() != 64 {
+            return Err("identitySig must be exactly 64 bytes".to_string());
+        }
+
+        crate::node::identity::verify_peer_identity(
+            signing_pub,
+            &peer_id,
+            &noise_static_pub.to_bytes(),
+            identity_sig,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // If we already know this peer, its signing key is pinned and cannot change.
+        if let Some(snapshot) = self.peer_snapshot().await {
+            if let Some(entry) = snapshot.entries.iter().find(|entry| entry.peer_id == peer_id) {
+                if entry.value.signing_pub != signing_pub.to_bytes() {
+                    return Err("peer signing key does not match existing record".to_string());
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Run one sync "tick":

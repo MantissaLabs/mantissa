@@ -104,6 +104,9 @@ struct NodeInfo {
 
   wireguardEnabled @11 :Bool;
   # True once the node has created and configured its WireGuard interface.
+
+  identitySig @12 :Data;
+  # Ed25519 signature binding (id, publicKey, signingKey) for peer identity verification.
 }
 
 struct NodeList {

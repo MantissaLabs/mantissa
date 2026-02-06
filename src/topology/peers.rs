@@ -1,7 +1,9 @@
 use crate::topology::{PeerHandle, Topology, peer_provider::PeerProvider};
+use ed25519_dalek::VerifyingKey;
 use async_trait::async_trait;
 use capnp::Error as CapnpError;
 use protocol::topology::node_info as node_info_capnp;
+use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,10 @@ pub struct PeerValue {
     /// Verifying key for cluster credentials signing.
     pub signing_pub: [u8; 32],
 
+    /// Signature binding (id, noise_static_pub, signing_pub) to prevent identity spoofing.
+    #[serde(default)]
+    pub identity_sig: Vec<u8>,
+
     /// Optional WireGuard configuration used to encrypt the VXLAN underlay.
     // Always serialize the option tag to keep bincode framing stable across reads.
     #[serde(default)]
@@ -71,8 +77,11 @@ impl PeerProvider for Topology {
 }
 
 impl PeerValue {
-    /// Build a `PeerValue` from a Cap'n Proto `NodeInfo` reader.
-    pub fn from_node_info(ni: node_info_capnp::Reader<'_>) -> Result<PeerValue, CapnpError> {
+    /// Build a `PeerValue` from a Cap'n Proto `NodeInfo` reader and verify its identity signature.
+    pub fn from_node_info(
+        node_id: Uuid,
+        ni: node_info_capnp::Reader<'_>,
+    ) -> Result<PeerValue, CapnpError> {
         let address = ni.get_addr()?.to_string()?;
         let hostname = ni.get_hostname()?.to_string()?;
 
@@ -93,6 +102,28 @@ impl PeerValue {
         }
         let mut signing_pub = [0u8; 32];
         signing_pub.copy_from_slice(sk_bytes);
+
+        let identity_sig = ni.get_identity_sig()?;
+        if identity_sig.is_empty() {
+            return Err(CapnpError::failed(
+                "identitySig must be set for peer identity verification".into(),
+            ));
+        }
+        if identity_sig.len() != 64 {
+            return Err(CapnpError::failed(
+                "identitySig must be exactly 64 bytes".into(),
+            ));
+        }
+
+        let signing_vk = VerifyingKey::from_bytes(&signing_pub)
+            .map_err(|e| CapnpError::failed(e.to_string()))?;
+        crate::node::identity::verify_peer_identity(
+            &signing_vk,
+            &node_id,
+            &noise_static_pub,
+            identity_sig,
+        )
+        .map_err(|e| CapnpError::failed(e.to_string()))?;
 
         let wg_key_bytes = ni.get_wireguard_public_key()?;
         let wireguard = if wg_key_bytes.is_empty() {
@@ -118,6 +149,7 @@ impl PeerValue {
             hostname,
             noise_static_pub,
             signing_pub,
+            identity_sig: identity_sig.to_vec(),
             wireguard,
         })
     }

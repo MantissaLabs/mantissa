@@ -681,7 +681,7 @@ impl Registry {
                 };
 
                 if let Ok(ni) = r.get_node_info() {
-                    if let Ok(v) = PeerValue::from_node_info(ni) {
+                    if let Ok(v) = PeerValue::from_node_info(peer_id, ni) {
                         if let Err(e) = self
                             .peers
                             .upsert(&crdt_store::uuid_key::UuidKey::from(peer_id), v)
@@ -734,6 +734,7 @@ impl Registry {
         let mut hostname: Option<&str> = None;
         let mut noise_static_pub: Option<[u8; 32]> = None;
         let mut signing_pub: Option<[u8; 32]> = None;
+        let mut identity_sig: Option<Vec<u8>> = None;
         let mut wireguard: Option<WireGuardPeerValue> = None;
 
         for value in values {
@@ -761,6 +762,13 @@ impl Registry {
                 Some(current) => Some(std::cmp::max(current, value.signing_pub)),
             };
 
+            if value.identity_sig.len() == 64 {
+                identity_sig = match identity_sig {
+                    None => Some(value.identity_sig.clone()),
+                    Some(current) => Some(std::cmp::max(current, value.identity_sig.clone())),
+                };
+            }
+
             if let Some(candidate) = value.wireguard.as_ref() {
                 wireguard = match wireguard.as_ref() {
                     None => Some(candidate.clone()),
@@ -780,6 +788,7 @@ impl Registry {
             hostname: hostname.unwrap_or_default().to_string(),
             noise_static_pub: noise_static_pub.unwrap_or_default(),
             signing_pub: signing_pub.unwrap_or_default(),
+            identity_sig: identity_sig.unwrap_or_default(),
             wireguard,
         })
     }
