@@ -18,6 +18,11 @@ const RATE_LIMIT_MAX_ENTRIES: usize = 10_000;
 const RATE_LIMIT_TTL: Duration = Duration::from_secs(60);
 const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(10);
 
+// Stricter limiter for repeated invalid join tokens (aggressive throttling).
+const INVALID_TOKEN_BURST: f32 = 10.0;
+const INVALID_TOKEN_REFILL_PER_SEC: f32 = 0.0;
+const INVALID_TOKEN_TTL: Duration = Duration::from_secs(60);
+
 struct RateState {
     tokens: f32,
     last_refill: Instant,
@@ -124,6 +129,13 @@ async fn accept_loop(
         RATE_LIMIT_TTL,
         RATE_LIMIT_PRUNE_INTERVAL,
     )));
+    let invalid_token_limiter = Arc::new(AsyncMutex::new(RateLimiter::new(
+        RATE_LIMIT_MAX_ENTRIES,
+        INVALID_TOKEN_BURST,
+        INVALID_TOKEN_REFILL_PER_SEC,
+        INVALID_TOKEN_TTL,
+        RATE_LIMIT_PRUNE_INTERVAL,
+    )));
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -155,6 +167,7 @@ async fn accept_loop(
         let psk_provider = psk_provider.clone();
         let peer_verifier = peer_verifier.clone();
         let rate_limiter = rate_limiter.clone();
+        let invalid_token_limiter = invalid_token_limiter.clone();
 
         tokio::task::spawn_local(async move {
             let _permit = permit;
@@ -240,6 +253,17 @@ async fn accept_loop(
                 }
                 Err(crate::noise::ServerHandshakeError::Io(e)) => {
                     if e.to_string() == "invalid join token" {
+                        let allowed = invalid_token_limiter
+                            .lock()
+                            .await
+                            .allow(peer_ip, Instant::now());
+                        if !allowed {
+                            warn!(
+                                target: "server",
+                                "rate-limited invalid join token from {peer_ip}"
+                            );
+                            return;
+                        }
                         warn!(target: "server", "Noise join handshake failed: invalid join token");
                     } else {
                         error!(target: "server", "Noise handshake failed: {e}");
