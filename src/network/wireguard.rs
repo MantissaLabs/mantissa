@@ -156,11 +156,12 @@ pub async fn ensure_wireguard_underlay(
     let keys = net::wireguard::load_or_generate_wireguard_keys(keys_path)
         .context("load wireguard keys")?;
 
-    let listen_port = net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
-        None,
-        config::wireguard_port_override(),
-    )
-    .context("load wireguard listen port")?;
+    let listen_port =
+        net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
+            None,
+            config::wireguard_port_override(),
+        )
+        .context("load wireguard listen port")?;
 
     let tunnel_v6 = net::wireguard::wireguard_tunnel_ipv6(self_id);
     let tunnel_ip = IpAddr::V6(tunnel_v6);

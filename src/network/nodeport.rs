@@ -918,17 +918,17 @@ mod platform {
         search_roots: Vec<PathBuf>,
     }
 
-        impl ArtifactResolver {
-            /// Build a resolver using the same search roots as the core BPF loader.
-            fn new() -> Self {
-                let mut roots = Vec::new();
-                if let Some(dir) = config::bpf_artifact_dir() {
-                    roots.push(dir);
-                }
-                if let Ok(pwd) = env::current_dir() {
-                    roots.push(pwd.join("target/bpf"));
-                    roots.push(pwd.join("assets/bpf"));
-                }
+    impl ArtifactResolver {
+        /// Build a resolver using the same search roots as the core BPF loader.
+        fn new() -> Self {
+            let mut roots = Vec::new();
+            if let Some(dir) = config::bpf_artifact_dir() {
+                roots.push(dir);
+            }
+            if let Ok(pwd) = env::current_dir() {
+                roots.push(pwd.join("target/bpf"));
+                roots.push(pwd.join("assets/bpf"));
+            }
             Self {
                 search_roots: roots,
             }

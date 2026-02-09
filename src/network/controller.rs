@@ -1,3 +1,4 @@
+use crate::config;
 use crate::gossip::Message;
 use crate::network::allocator::{parse_ipv4_cidr, resolver_ipv4_address};
 use crate::network::attachment::PlatformAttachmentProvisioner;
@@ -13,7 +14,6 @@ use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
 use crate::services::registry::ServiceRegistry;
 use crate::store::task_store::TaskStore;
-use crate::config;
 use anyhow::{Context, Result};
 use async_channel::Sender;
 #[cfg(target_os = "linux")]
@@ -1741,8 +1741,9 @@ mod platform {
                         )
                     })?;
                 if let Some(mac) = plan.host_access_mac {
-                    if let Err(err) =
-                        self.announce_host_access_ip(host_index, ip, mac, &host_ifname).await
+                    if let Err(err) = self
+                        .announce_host_access_ip(host_index, ip, mac, &host_ifname)
+                        .await
                     {
                         debug!(
                             target: "network",
@@ -1794,9 +1795,10 @@ mod platform {
         /// MAC for host-access IPs.
         fn configure_arp_tuning(&self, iface: &str) -> Result<()> {
             Self::write_sysctl_value(&format!("/proc/sys/net/ipv4/conf/{iface}/arp_ignore"), "1")?;
-            Self::write_sysctl_value(&format!(
-                "/proc/sys/net/ipv4/conf/{iface}/arp_announce"
-            ), "2")?;
+            Self::write_sysctl_value(
+                &format!("/proc/sys/net/ipv4/conf/{iface}/arp_announce"),
+                "2",
+            )?;
             Ok(())
         }
 

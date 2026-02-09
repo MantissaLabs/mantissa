@@ -610,8 +610,12 @@ impl Topology {
         // Keys
         let noise_pub = self.public_key.to_bytes();
         let signing_pub = self.signing_key.verifying_key().to_bytes();
-        let identity_sig =
-            crate::node::identity::sign_peer_identity(&self.signing_key, &self.node.id, &noise_pub, &signing_pub);
+        let identity_sig = crate::node::identity::sign_peer_identity(
+            &self.signing_key,
+            &self.node.id,
+            &noise_pub,
+            &signing_pub,
+        );
 
         info.set_public_key(&noise_pub);
         info.set_signing_key(&signing_pub);
@@ -926,7 +930,11 @@ impl Topology {
 
         // If we already know this peer, its signing key is pinned and cannot change.
         if let Some(snapshot) = self.peer_snapshot().await {
-            if let Some(entry) = snapshot.entries.iter().find(|entry| entry.peer_id == peer_id) {
+            if let Some(entry) = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.peer_id == peer_id)
+            {
                 if entry.value.signing_pub != signing_pub.to_bytes() {
                     return Err("peer signing key does not match existing record".to_string());
                 }

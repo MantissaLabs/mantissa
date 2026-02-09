@@ -1,4 +1,5 @@
 use crate::gossip::Message;
+use crate::registry::Registry;
 use crate::services::reconcile::{
     ReplicaReplacement, ServiceTaskAssignment, compute_change_plan, parse_template_and_replica,
 };
@@ -7,7 +8,6 @@ use crate::services::types::{
     ServiceEvent, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
     ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, compute_service_id,
 };
-use crate::registry::Registry;
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
@@ -395,16 +395,16 @@ impl ServiceController {
             };
 
             if let Err(err) = self
-                    .reconcile_slot(
-                        &spec,
-                        &slot,
-                        task_id,
-                        inventory,
-                        health_snapshot,
-                        &slot_targets,
-                        &key,
-                        service_degraded,
-                    )
+                .reconcile_slot(
+                    &spec,
+                    &slot,
+                    task_id,
+                    inventory,
+                    health_snapshot,
+                    &slot_targets,
+                    &key,
+                    service_degraded,
+                )
                 .await
             {
                 tracing::warn!(
@@ -703,7 +703,9 @@ impl ServiceController {
         let now = Instant::now();
         let mut guard = self.slot_missing_since.lock().await;
         match guard.get(key) {
-            Some(started) => now.duration_since(*started) >= Duration::from_secs(SERVICE_SLOT_MISSING_GRACE_SECS),
+            Some(started) => {
+                now.duration_since(*started) >= Duration::from_secs(SERVICE_SLOT_MISSING_GRACE_SECS)
+            }
             None => {
                 guard.insert(key.clone(), now);
                 false
@@ -777,10 +779,7 @@ impl ServiceController {
         );
 
         let task_specs = match self
-            .start_tasks_with_fallback(
-                requests,
-                &format!("service '{}' deployment", service_name),
-            )
+            .start_tasks_with_fallback(requests, &format!("service '{}' deployment", service_name))
             .await
         {
             Ok(specs) => specs,
@@ -1406,7 +1405,12 @@ fn rank_nodes_for_slot(
 ) -> Vec<Uuid> {
     let mut scored: Vec<(Uuid, u128)> = candidates
         .iter()
-        .map(|node_id| (*node_id, rendezvous_score(service_id, template, replica, *node_id)))
+        .map(|node_id| {
+            (
+                *node_id,
+                rendezvous_score(service_id, template, replica, *node_id),
+            )
+        })
         .collect();
     scored.sort_by(|(left_id, left_score), (right_id, right_score)| {
         right_score
@@ -1425,12 +1429,7 @@ fn max_replicas_per_node(replicas: usize, node_count: usize) -> usize {
 }
 
 /// Computes the rendezvous hash score for a node given a replica identity.
-fn rendezvous_score(
-    service_id: Uuid,
-    template: &str,
-    replica: u16,
-    node_id: Uuid,
-) -> u128 {
+fn rendezvous_score(service_id: Uuid, template: &str, replica: u16, node_id: Uuid) -> u128 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(service_id.as_bytes());
     hasher.update(template.as_bytes());
@@ -1458,7 +1457,9 @@ fn task_state_rebalanceable(state: &ContainerState) -> bool {
 
 /// Returns true when a task has been running long enough to permit rebalancing.
 fn task_age_allows_rebalance(task: &TaskSpec) -> bool {
-    let Some(anchor) = parse_timestamp(&task.updated_at).or_else(|| parse_timestamp(&task.created_at)) else {
+    let Some(anchor) =
+        parse_timestamp(&task.updated_at).or_else(|| parse_timestamp(&task.created_at))
+    else {
         return false;
     };
     let min_age = ChronoDuration::seconds(SERVICE_REBALANCE_MIN_AGE_SECS);
@@ -1467,7 +1468,9 @@ fn task_age_allows_rebalance(task: &TaskSpec) -> bool {
 
 /// Returns true when a task is old enough to be considered for cleanup.
 fn task_age_allows_cleanup(task: &TaskSpec) -> bool {
-    let Some(anchor) = parse_timestamp(&task.updated_at).or_else(|| parse_timestamp(&task.created_at)) else {
+    let Some(anchor) =
+        parse_timestamp(&task.updated_at).or_else(|| parse_timestamp(&task.created_at))
+    else {
         return false;
     };
     let min_age = ChronoDuration::seconds(SERVICE_REBALANCE_MIN_AGE_SECS);
@@ -1699,12 +1702,7 @@ async fn redeploy_service_tasks(
 
     let health_snapshot = controller.health_monitor.snapshot();
     let eligible_nodes = controller.collect_eligible_nodes(&health_snapshot);
-    let requests = build_start_requests(
-        &spec.service_name,
-        spec.id,
-        &spec.tasks,
-        &eligible_nodes,
-    );
+    let requests = build_start_requests(&spec.service_name, spec.id, &spec.tasks, &eligible_nodes);
     if requests.is_empty() {
         let mut updated = spec.clone();
         updated.set_status(ServiceStatus::Running);

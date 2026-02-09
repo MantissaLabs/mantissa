@@ -7,8 +7,8 @@ use tokio::time::{Duration, interval};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::gossip::Message;
 use crate::config;
+use crate::gossip::Message;
 use crate::network::allocator::{allocate_overlay_address, parse_ipv4_cidr};
 use crate::network::attachment::{AttachmentProvisioningRequest, bridge_name};
 use crate::network::controller::DEFAULT_MTU;
@@ -46,8 +46,7 @@ impl TaskManager {
         let mut attachment_index: HashMap<
             Uuid,
             HashMap<Uuid, (NetworkAttachmentState, Option<String>)>,
-        > =
-            HashMap::new();
+        > = HashMap::new();
         for attachment in &attachments {
             attachment_index
                 .entry(attachment.task_id)
@@ -192,7 +191,9 @@ impl TaskManager {
 
             let known = attachment_index.get(&value.id);
             let missing = value.networks.iter().any(|network_id| {
-                let state = known.and_then(|map| map.get(network_id)).map(|entry| entry.0);
+                let state = known
+                    .and_then(|map| map.get(network_id))
+                    .map(|entry| entry.0);
                 !matches!(
                     state,
                     Some(NetworkAttachmentState::Ready | NetworkAttachmentState::Configuring)
@@ -637,13 +638,9 @@ impl TaskManager {
                 .get_snapshot(&UuidKey::from(attachment.task_id))
                 .with_context(|| format!("lookup task {}", attachment.task_id))?
                 .and_then(|snap| select_best_task_value(snap.as_slice()));
-            let task_state = task_value
-                .as_ref()
-                .map(|value| value.state.clone());
+            let task_state = task_value.as_ref().map(|value| value.state.clone());
             let task_owner = task_value.as_ref().map(|value| value.node_id);
-            let task_revision = task_value
-                .as_ref()
-                .and_then(task_revision_timestamp);
+            let task_revision = task_value.as_ref().and_then(task_revision_timestamp);
 
             let should_remove = match task_state {
                 None => true,
@@ -669,11 +666,7 @@ impl TaskManager {
                         .teardown_attachment(attachment.id)
                         .await;
                 }
-                if let Err(err) = self
-                    .network_registry
-                    .remove_attachment(attachment.id)
-                    .await
-                {
+                if let Err(err) = self.network_registry.remove_attachment(attachment.id).await {
                     warn!(
                         target: "task",
                         attachment = %attachment.id,
@@ -728,9 +721,7 @@ impl TaskManager {
         keep: HashSet<Uuid>,
     ) -> Result<()> {
         let allow_registry_updates = match self.load_spec(task_id).await {
-            Ok(spec) if spec.node_id == self.local_node_id => {
-                true
-            }
+            Ok(spec) if spec.node_id == self.local_node_id => true,
             _ => false,
         };
         let attachments = self
@@ -796,9 +787,7 @@ fn attachment_age_exceeds(attachment: &NetworkAttachmentValue, grace_secs: i64) 
 }
 
 /// Extract a stable revision timestamp from a task value so attachment updates track reschedules.
-fn task_revision_timestamp(
-    value: &crate::task::types::TaskValue,
-) -> Option<String> {
+fn task_revision_timestamp(value: &crate::task::types::TaskValue) -> Option<String> {
     if !value.updated_at.is_empty() {
         Some(value.updated_at.clone())
     } else if !value.created_at.is_empty() {

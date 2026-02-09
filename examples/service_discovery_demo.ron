@@ -10,7 +10,7 @@
                 "-text",
                 "hello from backend replica",
             ],
-            replicas: 2,
+            replicas: 3,
             resources: (
                 cpu_millis: 200,
                 memory_mb: 64,

@@ -474,7 +474,9 @@ impl TaskManager {
             .get()
             .context(format!("invalid stop response from peer {peer_id}"))?
             .get_spec()
-            .context(format!("missing task spec in stop response from peer {peer_id}"))?;
+            .context(format!(
+                "missing task spec in stop response from peer {peer_id}"
+            ))?;
 
         read_spec(reader).map_err(|err| anyhow::anyhow!("failed to decode stop response: {err}"))
     }

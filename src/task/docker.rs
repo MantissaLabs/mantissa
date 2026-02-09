@@ -16,12 +16,12 @@ use bollard::container::{
 use bollard::models::{DeviceRequest, HostConfig, RestartPolicy, RestartPolicyNameEnum};
 use bollard::service::ContainerInspectResponse;
 
+use crate::config;
 use async_trait::async_trait;
 use log::{debug, info, warn};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use crate::config;
 
 /// Errors that can occur during container operations
 #[derive(Error, Debug)]

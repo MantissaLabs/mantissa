@@ -5,8 +5,8 @@ use crdt_store::uuid_key::UuidKey;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
-use uuid::Uuid;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::gpu::{GpuDeviceOverrideAction, gpu_device_override_for, read_gpu_device_overrides};
 use crate::registry::Registry;
@@ -473,10 +473,7 @@ impl Scheduler {
         }
 
         if specs.is_empty() {
-            specs.push(SlotSpec::new(
-                0,
-                SlotCapacity::new(1_000, total_memory, 0),
-            ));
+            specs.push(SlotSpec::new(0, SlotCapacity::new(1_000, total_memory, 0)));
         }
 
         specs
@@ -575,10 +572,7 @@ impl Scheduler {
         }
 
         match self
-            .init_resources(
-                Self::derive_slot_specs(node),
-                Self::derive_gpu_specs(node),
-            )
+            .init_resources(Self::derive_slot_specs(node), Self::derive_gpu_specs(node))
             .await
         {
             Ok(snapshot) => Ok(snapshot),
@@ -762,8 +756,10 @@ impl Scheduler {
 
                 match current.gpu_index.get(&req.device_id) {
                     Some(&idx) => {
-                        if !matches!(current.snapshot.gpu_devices[idx].state, GpuDeviceState::Free)
-                        {
+                        if !matches!(
+                            current.snapshot.gpu_devices[idx].state,
+                            GpuDeviceState::Free
+                        ) {
                             gpu_conflicts.insert(req.device_id.clone());
                         }
                     }
@@ -806,10 +802,11 @@ impl Scheduler {
             }
             for req in &gpu_requests {
                 let idx = current.gpu_index[&req.device_id];
-                new_snapshot.gpu_devices[idx].state = GpuDeviceState::Reserved(GpuDeviceReservation {
-                    owner: req.owner,
-                    task_id: req.task_id,
-                });
+                new_snapshot.gpu_devices[idx].state =
+                    GpuDeviceState::Reserved(GpuDeviceReservation {
+                        owner: req.owner,
+                        task_id: req.task_id,
+                    });
             }
 
             // Monotonic versioning gives downstream consumers a simple way to detect updates and
@@ -1018,7 +1015,10 @@ impl Scheduler {
                     continue;
                 };
 
-                if matches!(current.snapshot.gpu_devices[idx].state, GpuDeviceState::Free) {
+                if matches!(
+                    current.snapshot.gpu_devices[idx].state,
+                    GpuDeviceState::Free
+                ) {
                     not_reserved_gpus.push(device_id.clone());
                 }
             }

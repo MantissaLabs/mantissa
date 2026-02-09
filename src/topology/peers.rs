@@ -1,7 +1,7 @@
 use crate::topology::{PeerHandle, Topology, peer_provider::PeerProvider};
-use ed25519_dalek::VerifyingKey;
 use async_trait::async_trait;
 use capnp::Error as CapnpError;
+use ed25519_dalek::VerifyingKey;
 use protocol::topology::node_info as node_info_capnp;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;

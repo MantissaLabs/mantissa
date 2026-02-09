@@ -3,8 +3,8 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use net::{
     noise::{
-        client_handshake_join_with_probe, client_handshake_peer, join_probe_client,
-        load_or_generate_noise_keys, NoiseKeys,
+        NoiseKeys, client_handshake_join_with_probe, client_handshake_peer, join_probe_client,
+        load_or_generate_noise_keys,
     },
     unix_socket::candidate_unix_socket_paths,
 };

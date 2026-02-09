@@ -209,9 +209,7 @@ pub async fn client_handshake_join(
 
 /// Confirm the join PSK on the client side by round-tripping a short probe.
 /// This ensures an invalid join token fails before Cap'n Proto setup.
-pub async fn join_probe_client(
-    stream: &mut tokio::io::DuplexStream,
-) -> io::Result<()> {
+pub async fn join_probe_client(stream: &mut tokio::io::DuplexStream) -> io::Result<()> {
     let fut = async {
         stream.write_all(JOIN_PROBE_REQ).await?;
         stream.flush().await?;
@@ -233,9 +231,7 @@ pub async fn join_probe_client(
 
 /// Confirm the join PSK on the server side by validating a short probe and responding.
 /// This rejects invalid tokens before Cap'n Proto setup.
-pub async fn join_probe_server(
-    stream: &mut tokio::io::DuplexStream,
-) -> io::Result<()> {
+pub async fn join_probe_server(stream: &mut tokio::io::DuplexStream) -> io::Result<()> {
     let fut = async {
         let mut buf = [0u8; JOIN_PROBE_REQ.len()];
         stream.read_exact(&mut buf).await?;
@@ -496,8 +492,8 @@ pub async fn server_handshake_select(
             });
         }
         Err(_) => {
-            let join =
-                server_handshake_join_with_first_frame_probe(rd, wr, keys, psk, first_frame).await?;
+            let join = server_handshake_join_with_first_frame_probe(rd, wr, keys, psk, first_frame)
+                .await?;
             return Ok(ServerHandshake {
                 stream: join.stream,
                 kind: HandshakeKind::Join,

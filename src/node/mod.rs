@@ -182,9 +182,7 @@ impl node::Server for Node {
                 let mut gpu = system.reborrow().init_gpu();
                 if let Some(gpu_info) = info.gpu_info {
                     gpu.set_vendor(&gpu_info.vendor);
-                    let mut devices = gpu
-                        .reborrow()
-                        .init_devices(gpu_info.devices.len() as u32);
+                    let mut devices = gpu.reborrow().init_devices(gpu_info.devices.len() as u32);
                     for (idx, device) in gpu_info.devices.iter().enumerate() {
                         let mut entry = devices.reborrow().get(idx as u32);
                         entry.set_index(device.index);

@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use net::noise::{
     ClientJoinHandshake, HandshakeKind, NoisePeerVerifier, client_handshake_join,
-    client_handshake_join_with_probe, client_handshake_peer, join_probe_client,
-    join_probe_server, read_framed_len, server_handshake_join, server_handshake_peer_with_first_frame,
+    client_handshake_join_with_probe, client_handshake_peer, join_probe_client, join_probe_server,
+    read_framed_len, server_handshake_join, server_handshake_peer_with_first_frame,
     server_handshake_select, write_framed,
 };
 use snow::params::NoiseParams;
@@ -324,8 +324,7 @@ async fn noise_join_probe_negotiation_enabled() {
 async fn noise_join_probe_legacy_server_ignored() {
     let server_keys = fixed_noise_keys(11);
     let client_keys = fixed_noise_keys(22);
-    let psk = net::noise::derive_psk_from_token("MNTISA-1-legacy-server")
-        .expect("derive psk");
+    let psk = net::noise::derive_psk_from_token("MNTISA-1-legacy-server").expect("derive psk");
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -355,8 +354,7 @@ async fn noise_join_probe_legacy_server_ignored() {
 async fn noise_join_probe_legacy_client_no_hello() {
     let server_keys = fixed_noise_keys(11);
     let client_keys = fixed_noise_keys(22);
-    let psk = net::noise::derive_psk_from_token("MNTISA-1-legacy-client")
-        .expect("derive psk");
+    let psk = net::noise::derive_psk_from_token("MNTISA-1-legacy-client").expect("derive psk");
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

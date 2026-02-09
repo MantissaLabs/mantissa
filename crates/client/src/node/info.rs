@@ -70,10 +70,7 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
             println!("  vendor: {vendor}");
         }
         for device in devices.iter() {
-            println!(
-                "  - index: {}",
-                device.get_index(),
-            );
+            println!("  - index: {}", device.get_index(),);
             let name = device.get_name()?.to_str()?.to_string();
             if !name.is_empty() {
                 println!("    name: {name}");
@@ -90,7 +87,10 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
             if !cc.is_empty() {
                 println!("    compute_capability: {cc}");
             }
-            println!("    memory_total_bytes: {}", device.get_memory_total_bytes());
+            println!(
+                "    memory_total_bytes: {}",
+                device.get_memory_total_bytes()
+            );
             println!("    memory_free_bytes: {}", device.get_memory_free_bytes());
         }
     }

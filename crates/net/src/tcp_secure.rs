@@ -102,11 +102,7 @@ impl RateLimiter {
 
     /// Evict the least recently seen entry when at capacity.
     fn evict_oldest(&mut self) {
-        if let Some((oldest, _)) = self
-            .entries
-            .iter()
-            .min_by_key(|(_, state)| state.last_seen)
-        {
+        if let Some((oldest, _)) = self.entries.iter().min_by_key(|(_, state)| state.last_seen) {
             let key = *oldest;
             self.entries.remove(&key);
         }
@@ -201,10 +197,7 @@ async fn accept_loop(
             {
                 Ok(mut handshake) => {
                     if matches!(handshake.kind, HandshakeKind::Join) {
-                        let allowed = rate_limiter
-                            .lock()
-                            .await
-                            .allow(peer_ip, Instant::now());
+                        let allowed = rate_limiter.lock().await.allow(peer_ip, Instant::now());
                         if !allowed {
                             warn!(
                                 target: "server",
@@ -384,13 +377,8 @@ mod tests {
     /// Verifies the limiter evicts the oldest entry when at capacity.
     #[test]
     fn rate_limiter_evicts_oldest() {
-        let mut limiter = RateLimiter::new(
-            2,
-            1.0,
-            0.0,
-            Duration::from_secs(60),
-            Duration::from_secs(0),
-        );
+        let mut limiter =
+            RateLimiter::new(2, 1.0, 0.0, Duration::from_secs(60), Duration::from_secs(0));
         let ip1 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
         let ip2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4));
         let ip3 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
@@ -408,13 +396,8 @@ mod tests {
     /// Verifies idle entries are pruned after TTL expiration.
     #[test]
     fn rate_limiter_prunes_expired_entries() {
-        let mut limiter = RateLimiter::new(
-            10,
-            1.0,
-            0.0,
-            Duration::from_secs(1),
-            Duration::from_secs(0),
-        );
+        let mut limiter =
+            RateLimiter::new(10, 1.0, 0.0, Duration::from_secs(1), Duration::from_secs(0));
         let ip1 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
         let ip2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
 

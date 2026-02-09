@@ -14,10 +14,10 @@ use crate::task::types::{
     TaskEnvironmentVariable, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata, TaskSpec,
     TaskStateFilter, TaskValue,
 };
-use chrono::{DateTime, Utc};
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use bollard::errors::Error as BollardError;
+use chrono::{DateTime, Utc};
 use crdt_store::uuid_key::UuidKey;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -249,7 +249,10 @@ impl TaskManager {
                 continue;
             }
 
-            match self.reserve_local_resources(&local_plans, local_version).await {
+            match self
+                .reserve_local_resources(&local_plans, local_version)
+                .await
+            {
                 Ok(resources) => {
                     if !resources.slots.is_empty() || !resources.gpu_device_ids.is_empty() {
                         reserved_local_resources = Some(resources);
@@ -701,7 +704,10 @@ pub(super) fn append_nvidia_visible_devices(
 
     match env_vars {
         Some(vars) => {
-            if vars.iter().any(|var| var.starts_with("NVIDIA_VISIBLE_DEVICES=")) {
+            if vars
+                .iter()
+                .any(|var| var.starts_with("NVIDIA_VISIBLE_DEVICES="))
+            {
                 return;
             }
             vars.push(entry);

@@ -813,7 +813,7 @@ impl Registry {
             peer_static,
             self.noise_keys.as_ref(),
         )
-            .await
-            .map_err(|e| e.to_string())
+        .await
+        .map_err(|e| e.to_string())
     }
 }

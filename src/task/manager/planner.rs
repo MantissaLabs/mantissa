@@ -335,9 +335,7 @@ impl TaskManager {
                 request.gpu_count
             };
 
-            if !gpu_device_ids.is_empty()
-                && resolved_gpu_count != gpu_device_ids.len() as u32
-            {
+            if !gpu_device_ids.is_empty() && resolved_gpu_count != gpu_device_ids.len() as u32 {
                 return Err(anyhow!(
                     "gpu_count {} does not match {} gpu device ids for task {}",
                     resolved_gpu_count,
@@ -395,8 +393,8 @@ impl TaskManager {
             .cloned()
             .unwrap_or_else(HashSet::new);
         let (local_gpu_ready, local_gpu_reason) = gpu_runtime_preflight(&snapshot);
-        let (mut assignment, remaining_intents, available_slots, available_gpus) =
-            self.seed_local_plans(
+        let (mut assignment, remaining_intents, available_slots, available_gpus) = self
+            .seed_local_plans(
                 intents,
                 &snapshot,
                 local_version,
@@ -411,7 +409,12 @@ impl TaskManager {
         }
 
         let mut candidates = self
-            .build_candidate_queue(available_slots, available_gpus, &readiness_map, &local_ready)
+            .build_candidate_queue(
+                available_slots,
+                available_gpus,
+                &readiness_map,
+                &local_ready,
+            )
             .await?;
         if candidates.is_empty() {
             return Err(anyhow::anyhow!(
@@ -579,8 +582,7 @@ impl TaskManager {
                         }
                     }
 
-                    available_local_gpus
-                        .retain(|gpu| gpu.device_id.as_str() != device_id);
+                    available_local_gpus.retain(|gpu| gpu.device_id.as_str() != device_id);
                     chosen_gpu_device_ids.push(device_id.clone());
                 }
             }
@@ -599,9 +601,7 @@ impl TaskManager {
                 }
 
                 for _ in 0..missing_gpu {
-                    let next = available_local_gpus
-                        .remove(0)
-                        .device_id;
+                    let next = available_local_gpus.remove(0).device_id;
                     chosen_gpu_device_ids.push(next);
                 }
             }
@@ -658,9 +658,12 @@ impl TaskManager {
         local_ready: &HashSet<Uuid>,
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
-        if let Some(local_candidate) =
-            Candidate::new(CandidateLocation::Local, local_slots, local_gpus, local_ready.clone())
-        {
+        if let Some(local_candidate) = Candidate::new(
+            CandidateLocation::Local,
+            local_slots,
+            local_gpus,
+            local_ready.clone(),
+        ) {
             queue.push_back(local_candidate);
         }
 
@@ -688,11 +691,7 @@ impl TaskManager {
                 .filter(|detail| matches!(detail.state, SchedulerSlotState::Free))
                 .map(|detail| SlotChoice {
                     slot_id: detail.slot_id,
-                    capacity: SlotCapacity::new(
-                        detail.cpu_millis,
-                        detail.memory_bytes,
-                        0,
-                    ),
+                    capacity: SlotCapacity::new(detail.cpu_millis, detail.memory_bytes, 0),
                 })
                 .collect();
 
@@ -783,11 +782,9 @@ impl TaskManager {
             .into());
         }
 
-        if let Some(allocation) = candidate.allocate(
-            intent.cpu_millis,
-            intent.memory_bytes,
-            intent.gpu_count,
-        ) {
+        if let Some(allocation) =
+            candidate.allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
+        {
             let location = candidate.location.clone();
             if !candidate.is_empty() {
                 candidates.push_back(candidate);
@@ -884,11 +881,9 @@ impl TaskManager {
                     continue;
                 }
 
-                if let Some(allocation) = candidate.allocate(
-                    intent.cpu_millis,
-                    intent.memory_bytes,
-                    intent.gpu_count,
-                ) {
+                if let Some(allocation) =
+                    candidate.allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
+                {
                     let location = candidate.location.clone();
                     if !candidate.is_empty() {
                         candidates.push_back(candidate);

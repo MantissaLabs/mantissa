@@ -122,8 +122,7 @@ impl SchedulerSummary {
         } else {
             let status = gpu_runtime_status();
             summary.gpu_runtime_ready = status.is_ready();
-            summary.gpu_runtime_reason =
-                status.reason().map(|reason: &str| reason.to_string());
+            summary.gpu_runtime_reason = status.reason().map(|reason: &str| reason.to_string());
         }
 
         for device in &snapshot.gpu_devices {
@@ -152,7 +151,8 @@ impl SchedulerSummary {
                     },
                     task_id: match &device.state {
                         super::GpuDeviceState::Reserved(super::GpuDeviceReservation {
-                            task_id, ..
+                            task_id,
+                            ..
                         }) => *task_id,
                         _ => None,
                     },
@@ -183,10 +183,7 @@ impl SchedulerSummary {
         let gpu_free = reader.get_gpu_free();
         let gpu_reserved = reader.get_gpu_reserved();
         let gpu_runtime_ready = reader.get_gpu_runtime_ready();
-        let gpu_runtime_reason = reader
-            .get_gpu_runtime_reason()?
-            .to_str()?
-            .to_string();
+        let gpu_runtime_reason = reader.get_gpu_runtime_reason()?.to_str()?.to_string();
 
         let mut details = Vec::new();
         for detail in reader.get_details()?.iter() {

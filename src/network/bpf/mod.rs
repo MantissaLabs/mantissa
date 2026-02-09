@@ -1203,8 +1203,7 @@ mod platform {
             fs::write(&artifact_path, b"test").context("write artifact stub")?;
 
             let mut config = crate::config::global_config();
-            config.network.bpf.artifact_dir =
-                Some(dir.path().to_string_lossy().to_string());
+            config.network.bpf.artifact_dir = Some(dir.path().to_string_lossy().to_string());
             let resolver = ArtifactResolver::new_with_config(&config);
             let spec = BpfProgramSpec::new("resolver-example");
             let resolved = resolver.resolve(&spec)?;

@@ -170,9 +170,8 @@ async fn setup_task_manager() -> TestHarness {
         .expect("rebuild peers store");
 
     let noise_keys = Arc::new(NoiseKeys::from_private_bytes([0x11; 32]));
-    let session_store =
-        LocalSessionStore::open(registry_db.clone(), noise_keys.as_ref())
-            .expect("open session store");
+    let session_store = LocalSessionStore::open(registry_db.clone(), noise_keys.as_ref())
+        .expect("open session store");
 
     let task_dir = tempdir().expect("task tempdir");
     let task_path = task_dir

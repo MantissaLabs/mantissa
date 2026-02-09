@@ -458,10 +458,7 @@ mod platform {
     }
 
     /// Look up an element from a pinned BPF map by key, returning None if it is absent.
-    fn lookup_elem<K: Pod, V: Pod + Default>(
-        fd: std::os::fd::RawFd,
-        key: &K,
-    ) -> Result<Option<V>> {
+    fn lookup_elem<K: Pod, V: Pod + Default>(fd: std::os::fd::RawFd, key: &K) -> Result<Option<V>> {
         #[repr(C)]
         struct BpfAttrLookup {
             map_fd: u32,

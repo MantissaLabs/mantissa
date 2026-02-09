@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, SigningKey, Signer, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use std::convert::TryInto;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
@@ -24,7 +24,10 @@ pub fn peer_identity_payload(
 ) -> Vec<u8> {
     // Layout is fixed and versioned so signatures can't be replayed across protocols.
     let mut out = Vec::with_capacity(
-        PEER_IDENTITY_DOMAIN.len() + node_id.as_bytes().len() + noise_static_pub.len() + signing_pub.len(),
+        PEER_IDENTITY_DOMAIN.len()
+            + node_id.as_bytes().len()
+            + noise_static_pub.len()
+            + signing_pub.len(),
     );
     out.extend_from_slice(PEER_IDENTITY_DOMAIN);
     out.extend_from_slice(node_id.as_bytes());
@@ -54,8 +57,8 @@ pub fn verify_peer_identity(
     noise_static_pub: &[u8; 32],
     identity_sig: &[u8],
 ) -> Result<(), &'static str> {
-    let sig = Signature::from_slice(identity_sig)
-        .map_err(|_| "identity signature must be 64 bytes")?;
+    let sig =
+        Signature::from_slice(identity_sig).map_err(|_| "identity signature must be 64 bytes")?;
     let signing_pub_bytes = signing_pub.to_bytes();
     let payload = peer_identity_payload(node_id, noise_static_pub, &signing_pub_bytes);
     signing_pub

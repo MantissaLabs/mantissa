@@ -1,3 +1,4 @@
+use crate::config;
 use crate::network::allocator::parse_ipv4_cidr;
 use crate::network::attachment::{bridge_name, host_access_host_iface_name, vxlan_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
@@ -13,7 +14,6 @@ use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
 use crate::task::manager::select_best_task_value;
 use crate::task::types::TaskValue;
-use crate::config;
 use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use crdt_store::uuid_key::UuidKey;
@@ -523,16 +523,15 @@ async fn answer_query(
         return Ok(LookupOutcome::NxDomain);
     };
 
-    let candidates =
-        resolve_service_backends(
-            registry,
-            tasks,
-            template_index,
-            network_id,
-            &service_name,
-            health_snapshot,
-        )
-            .await?;
+    let candidates = resolve_service_backends(
+        registry,
+        tasks,
+        template_index,
+        network_id,
+        &service_name,
+        health_snapshot,
+    )
+    .await?;
     let service_port = health_port
         .or_else(|| service_health_port(service_specs, &service_name))
         .and_then(|port| if port == 0 { None } else { Some(port) });
@@ -763,29 +762,29 @@ async fn resolve_service_backends(
         }
 
         if task.node_id != attachment.node_id {
-                if attachment_is_newer_than_task(&attachment, task) {
-                    tracing::debug!(
-                        target: "network",
-                        network = %network_id,
-                        attachment = %attachment.id,
-                        task = %task.id,
-                        expected_node = %task.node_id,
-                        actual_node = %attachment.node_id,
-                        "keeping attachment; task record appears stale"
-                    );
-                } else {
-                    tracing::debug!(
-                        target: "network",
-                        network = %network_id,
-                        attachment = %attachment.id,
-                        task = %task.id,
-                        expected_node = %task.node_id,
-                        actual_node = %attachment.node_id,
-                        "skipping attachment; task moved to another node"
-                    );
-                    continue;
-                }
+            if attachment_is_newer_than_task(&attachment, task) {
+                tracing::debug!(
+                    target: "network",
+                    network = %network_id,
+                    attachment = %attachment.id,
+                    task = %task.id,
+                    expected_node = %task.node_id,
+                    actual_node = %attachment.node_id,
+                    "keeping attachment; task record appears stale"
+                );
+            } else {
+                tracing::debug!(
+                    target: "network",
+                    network = %network_id,
+                    attachment = %attachment.id,
+                    task = %task.id,
+                    expected_node = %task.node_id,
+                    actual_node = %attachment.node_id,
+                    "skipping attachment; task moved to another node"
+                );
+                continue;
             }
+        }
         if task.state != ContainerState::Running {
             tracing::debug!(
                 target: "network",

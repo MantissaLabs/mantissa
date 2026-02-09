@@ -105,10 +105,9 @@ impl TaskManager {
                 for rollback in &persisted {
                     let _ = self.remove_spec(rollback.id).await;
                 }
-                return Err(err.context(format!(
-                    "failed to persist pending task spec {}",
-                    spec.name
-                )));
+                return Err(
+                    err.context(format!("failed to persist pending task spec {}", spec.name))
+                );
             }
 
             persisted.push(spec.clone());
@@ -246,7 +245,10 @@ impl TaskManager {
                 Ok(id) => (id, true),
                 Err(err) => {
                     if super::is_name_conflict(&err) {
-                        match self.resolve_existing_container_id(&plan.container_name).await {
+                        match self
+                            .resolve_existing_container_id(&plan.container_name)
+                            .await
+                        {
                             Ok(Some(existing_id)) => (existing_id, false),
                             Ok(None) => {
                                 if let Some(artifacts) = resolved.artifacts.take() {
@@ -258,8 +260,10 @@ impl TaskManager {
                                         );
                                     }
                                 }
-                                let err = anyhow::Error::from(err)
-                                    .context(format!("docker create failed for task {}", plan.name));
+                                let err = anyhow::Error::from(err).context(format!(
+                                    "docker create failed for task {}",
+                                    plan.name
+                                ));
                                 return Err(err);
                             }
                             Err(inspect_err) => {

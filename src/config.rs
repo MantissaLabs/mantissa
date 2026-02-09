@@ -1,7 +1,10 @@
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::{RwLock, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -184,9 +187,7 @@ pub fn load_config_with_source(path: Option<&Path>) -> Result<(Config, ConfigSou
 ///
 /// Replace the global configuration and record its origin metadata.
 pub fn set_global_config_with_source(config: Config, source: ConfigSource) {
-    let mut guard = GLOBAL_CONFIG
-        .write()
-        .expect("global config lock poisoned");
+    let mut guard = GLOBAL_CONFIG.write().expect("global config lock poisoned");
     *guard = config;
 
     let mut source_guard = GLOBAL_SOURCE
@@ -201,9 +202,7 @@ pub fn set_global_config_with_source(config: Config, source: ConfigSource) {
 /// Return a cloned snapshot of the current global configuration.
 pub fn global_config() -> Config {
     ensure_config_loaded();
-    let guard = GLOBAL_CONFIG
-        .read()
-        .expect("global config lock poisoned");
+    let guard = GLOBAL_CONFIG.read().expect("global config lock poisoned");
     guard.clone()
 }
 
@@ -252,11 +251,7 @@ pub fn bpf_attach_enabled() -> bool {
 ///
 /// Resolve the configured BPF artifact directory, if provided.
 pub fn bpf_artifact_dir() -> Option<PathBuf> {
-    global_config()
-        .network
-        .bpf
-        .artifact_dir
-        .map(PathBuf::from)
+    global_config().network.bpf.artifact_dir.map(PathBuf::from)
 }
 
 /// # Description:
@@ -306,8 +301,7 @@ pub fn gpu_device_overrides() -> Option<String> {
 /// Render a config snapshot as pretty-printed RON for diagnostics.
 pub fn render_config_ron(config: &Config) -> Result<String> {
     let pretty = ron::ser::PrettyConfig::default();
-    ron::ser::to_string_pretty(config, pretty)
-        .context("failed to serialize config to RON")
+    ron::ser::to_string_pretty(config, pretty).context("failed to serialize config to RON")
 }
 
 /// # Description:
@@ -353,9 +347,7 @@ fn ensure_config_loaded() {
         path: None,
         env_overrides,
     };
-    let mut guard = GLOBAL_CONFIG
-        .write()
-        .expect("global config lock poisoned");
+    let mut guard = GLOBAL_CONFIG.write().expect("global config lock poisoned");
     *guard = config;
 
     let mut source_guard = GLOBAL_SOURCE
@@ -370,8 +362,8 @@ fn ensure_config_loaded() {
 fn load_config_from_path(path: &Path) -> Result<Config> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    let config: Config =
-        ron::from_str(&raw).with_context(|| format!("failed to parse config {}", path.display()))?;
+    let config: Config = ron::from_str(&raw)
+        .with_context(|| format!("failed to parse config {}", path.display()))?;
     Ok(config)
 }
 
@@ -500,9 +492,7 @@ impl Config {
 
         if let Some(ref ip) = self.network.nodeport.ip {
             if ip.parse::<Ipv4Addr>().is_err() {
-                anyhow::bail!(
-                    "network.nodeport.ip must be a valid IPv4 address (got '{ip}')"
-                );
+                anyhow::bail!("network.nodeport.ip must be a valid IPv4 address (got '{ip}')");
             }
         }
 
@@ -519,9 +509,7 @@ impl Config {
         }
 
         if self.network.nodeport.enabled && !self.network.bpf.attach {
-            anyhow::bail!(
-                "network.nodeport.enabled requires network.bpf.attach to be true"
-            );
+            anyhow::bail!("network.nodeport.enabled requires network.bpf.attach to be true");
         }
 
         Ok(())
@@ -553,7 +541,9 @@ fn start_config_watch_thread(path: PathBuf) -> std::thread::JoinHandle<()> {
                 return;
             }
 
-            let mut last_reload = Instant::now().checked_sub(Duration::from_secs(5)).unwrap_or_else(Instant::now);
+            let mut last_reload = Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .unwrap_or_else(Instant::now);
 
             loop {
                 let event = match rx.recv() {
@@ -609,10 +599,7 @@ fn start_config_watch_thread(path: PathBuf) -> std::thread::JoinHandle<()> {
 fn should_reload_for_event(kind: &EventKind) -> bool {
     matches!(
         kind,
-        EventKind::Modify(_)
-            | EventKind::Create(_)
-            | EventKind::Remove(_)
-            | EventKind::Any
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) | EventKind::Any
     )
 }
 
@@ -697,10 +684,7 @@ mod tests {
             std::env::set_var("MANTISSA_NODEPORT_IFACE", "eth0");
             std::env::set_var("MANTISSA_LB_HEALTH_PORT", "30080");
             std::env::set_var("MANTISSA_DOCKER_HOST", "unix:///var/run/docker.sock");
-            std::env::set_var(
-                "MANTISSA_GPU_DEVICE_OVERRIDES",
-                "uuid:GPU-abc=id:GPU-abc",
-            );
+            std::env::set_var("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc");
         }
 
         let mut config = Config::default();

@@ -71,7 +71,6 @@ impl TaskManager {
         self.tx.clone()
     }
 
-
     /// Broadcasts specs originating from remote peers to the local gossip loop.
     pub(super) async fn broadcast_remote_specs(&self, specs: &[TaskSpec]) {
         for spec in specs {
@@ -902,7 +901,10 @@ impl TaskManager {
     ) -> Result<Option<String>, ContainerError> {
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("name".to_string(), vec![container_name.to_string()]);
-        let candidates = self.container_manager.list_containers(Some(filters)).await?;
+        let candidates = self
+            .container_manager
+            .list_containers(Some(filters))
+            .await?;
         for candidate in candidates {
             if candidate.name == container_name {
                 if !candidate.id.is_empty() {
@@ -1050,7 +1052,8 @@ impl TaskManager {
             };
 
             let Some(value) = task_index.get(&task_id) else {
-                self.stop_unowned_container(task_id, &container.name, true).await;
+                self.stop_unowned_container(task_id, &container.name, true)
+                    .await;
                 continue;
             };
 
@@ -1058,7 +1061,8 @@ impl TaskManager {
                 if task_value_recent(value, UNOWNED_TASK_GRACE_SECS) {
                     continue;
                 }
-                self.stop_unowned_container(task_id, &container.name, false).await;
+                self.stop_unowned_container(task_id, &container.name, false)
+                    .await;
                 continue;
             }
 

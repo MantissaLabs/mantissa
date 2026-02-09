@@ -78,8 +78,7 @@ pub fn init_for_tests() {
     let _ = LogTracer::init(); // idempotent
 
     // Default to debug in tests unless overridden.
-    let mut filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     if !rust_log_mentions("bollard") {
         filter = filter.add_directive("bollard::docker=warn".parse().unwrap());
     }

@@ -54,9 +54,9 @@ pub fn gpu_device_override_for<'a>(
     index: u32,
     overrides: &'a [GpuDeviceOverride],
 ) -> Option<&'a GpuDeviceOverride> {
-    overrides.iter().find(|entry| {
-        selector_matches_device(&entry.selector, uuid, pci_bus_id, index)
-    })
+    overrides
+        .iter()
+        .find(|entry| selector_matches_device(&entry.selector, uuid, pci_bus_id, index))
 }
 
 /// # Description:
