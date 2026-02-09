@@ -625,7 +625,13 @@ impl ServiceController {
         Ok(())
     }
 
-    /// Moves a replica to the preferred node by stopping the current task and restarting it there.
+    /// Moves a replica to the preferred node using a start-first handoff to avoid downtime.
+    ///
+    /// The previous stop-then-start workflow could temporarily drop a healthy attachment entry
+    /// when the replacement launch retried due network/readiness lag (for example when a node
+    /// rejoins after being down and service scale changed while it was offline). Starting the
+    /// preferred placement first keeps the slot represented in attachment state throughout the
+    /// transition; stale local containers are then drained by task inventory reconciliation.
     async fn move_slot_task(
         &self,
         spec: &ServiceSpecValue,
@@ -634,17 +640,6 @@ impl ServiceController {
         preferred_node: Uuid,
         key: &SlotKey,
     ) -> anyhow::Result<()> {
-        self.set_rebalance_cooldown(key).await;
-
-        self.task_manager.stop_task(task.id).await.map_err(|err| {
-            anyhow::anyhow!(
-                "failed to stop task {} before rebalance of '{}' replica {}: {err}",
-                task.id,
-                slot.template.name,
-                slot.replica
-            )
-        })?;
-
         let request = make_replica_request(
             &spec.service_name,
             &slot.template,
@@ -653,34 +648,30 @@ impl ServiceController {
             Some(preferred_node),
         );
 
-        if let Err(err) = self.task_manager.start_tasks_batch(vec![request]).await {
-            tracing::warn!(
-                target: "services",
-                "rebalance placement failed for '{}' replica {} on {}: {err}",
-                slot.template.name,
-                slot.replica,
-                preferred_node
-            );
+        self.task_manager
+            .start_tasks_batch(vec![request])
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "rebalance placement failed for '{}' replica {} on {}: {err}",
+                    slot.template.name,
+                    slot.replica,
+                    preferred_node
+                )
+            })?;
 
-            let fallback = make_replica_request(
-                &spec.service_name,
-                &slot.template,
-                slot.replica,
-                task.id,
-                Some(task.node_id),
-            );
+        self.set_rebalance_cooldown(key).await;
 
-            self.task_manager
-                .start_tasks_batch(vec![fallback])
-                .await
-                .map_err(|fallback_err| {
-                    anyhow::anyhow!(
-                        "rebalance fallback failed for '{}' replica {}: {fallback_err}",
-                        slot.template.name,
-                        slot.replica
-                    )
-                })?;
-        }
+        tracing::debug!(
+            target: "services",
+            service = %spec.service_name,
+            template = %slot.template.name,
+            replica = slot.replica,
+            task = %task.id,
+            previous_node = %task.node_id,
+            preferred_node = %preferred_node,
+            "rebalance replacement accepted; previous owner will drain stale local runtime"
+        );
 
         Ok(())
     }
