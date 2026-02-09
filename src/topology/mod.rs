@@ -40,7 +40,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
-use self::peer_snapshot::{PeerSnapshot, PeerSnapshotCache};
+use self::peer_snapshot::{PeerCacheEntry, PeerSnapshot, PeerSnapshotCache};
 
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
     match mutex.lock() {
@@ -61,6 +61,12 @@ mod types;
 
 pub use self::types::{PeerHandle, TopologyEvent};
 pub use service::{add_event, read_topology_event};
+
+/// Default anti-entropy interval for periodic sync loops.
+const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Default number of peers sampled per anti-entropy sync tick.
+const DEFAULT_SYNC_FANOUT: usize = 8;
 
 /// Bundles the store handles required to construct a `Topology`.
 #[derive(Clone)]
@@ -181,6 +187,9 @@ struct SyncState {
     /// Interval between periodic peer synchronization ticks.
     interval: Arc<Mutex<Duration>>,
 
+    /// Maximum number of peers sampled per sync tick (`0` means all peers).
+    fanout: Arc<Mutex<usize>>,
+
     /// Flag telling whether the periodic sync task is currently running.
     running: Rc<AtomicBool>,
 
@@ -189,9 +198,10 @@ struct SyncState {
 }
 
 impl SyncState {
-    fn new(default_interval: Duration) -> Self {
+    fn new(default_interval: Duration, default_fanout: usize) -> Self {
         Self {
             interval: Arc::new(Mutex::new(default_interval)),
+            fanout: Arc::new(Mutex::new(default_fanout)),
             running: Rc::new(AtomicBool::new(false)),
             handle: Rc::new(RefCell::new(None)),
         }
@@ -203,6 +213,14 @@ impl SyncState {
 
     fn interval(&self) -> Duration {
         *lock_or_recover(&self.interval, "topology.sync_interval")
+    }
+
+    fn set_fanout(&self, fanout: usize) {
+        *lock_or_recover(&self.fanout, "topology.sync_fanout") = fanout;
+    }
+
+    fn fanout(&self) -> usize {
+        *lock_or_recover(&self.fanout, "topology.sync_fanout")
     }
 
     fn start_if_idle(&self) -> bool {
@@ -349,7 +367,7 @@ impl Topology {
             server_handle: Rc::new(OnceCell::new()),
             public_key: noise_public_key,
             signing_key,
-            sync: SyncState::new(Duration::from_secs(5)),
+            sync: SyncState::new(DEFAULT_SYNC_INTERVAL, DEFAULT_SYNC_FANOUT),
             token_store,
             secret_master_store,
             secret_keyring,
@@ -548,6 +566,11 @@ impl Topology {
     /// Set the periodic sync interval (useful for tests to speed up convergence).
     pub fn set_sync_interval(&self, d: Duration) {
         self.sync.set_interval(d);
+    }
+
+    /// Set the number of peers to sample per sync tick (`0` means sync against all peers).
+    pub fn set_sync_fanout(&self, fanout: usize) {
+        self.sync.set_fanout(fanout);
     }
 
     pub fn set_gossip_interval(&self, d: Duration) {
@@ -914,7 +937,7 @@ impl Topology {
     }
 
     /// Run one sync "tick":
-    ///  - for each known peer (except self), open a Server client,
+    ///  - sample up to `sync_fanout` known peers (except self),
     ///  - obtain a ClusterSession (prefer ticket, else short-lived credential),
     ///  - get Sync and do a one-shot delta.
     ///
@@ -926,35 +949,54 @@ impl Topology {
         };
 
         let peers = snapshot.entries.clone();
-        for entry in peers.iter() {
-            let peer_id = entry.peer_id;
-            if peer_id == self.node.id {
-                continue; // skip self
-            }
-
-            let value = entry.value.as_ref();
-
-            let sync_cap = match self.registry.fetch_sync_capability(peer_id).await {
-                Ok(Some(cap)) => cap,
-                Ok(None) => continue,
-                Err(e) => {
-                    error!(target: "sync", "get_sync failed for {}: {e}", value.address);
-                    continue;
-                }
-            };
-
-            let stores = SyncStores {
-                peers: self.peers.clone(),
-                tasks: self.tasks.clone(),
-                services: self.services.clone(),
-                secrets: self.secrets.clone(),
-                networks: self.networks.clone(),
-                network_peers: self.network_peers.clone(),
-                network_attachments: self.network_attachments.clone(),
-            };
-
-            sync_all_domains(stores, sync_cap).await;
+        let sync_fanout = self.sync.fanout();
+        let entries = peers.as_ref();
+        if entries.is_empty() {
+            return;
         }
+
+        let selected_entries = self.select_sync_peers(entries, sync_fanout);
+        for entry in selected_entries {
+            self.sync_with_peer(entry).await;
+        }
+    }
+
+    /// Select peers to target during one anti-entropy tick.
+    ///
+    /// This keeps periodic sync efficient by sampling in `O(k)` expected time where `k` is
+    /// `sync_fanout`, while preserving `sync_fanout = 0` as "sync with all peers".
+    fn select_sync_peers<'a>(
+        &self,
+        entries: &'a [PeerCacheEntry],
+        sync_fanout: usize,
+    ) -> Vec<&'a PeerCacheEntry> {
+        select_sync_peers_for_node(self.node.id, entries, sync_fanout)
+    }
+
+    async fn sync_with_peer(&self, entry: &PeerCacheEntry) {
+        let peer_id = entry.peer_id;
+        let value = entry.value.as_ref();
+
+        let sync_cap = match self.registry.fetch_sync_capability(peer_id).await {
+            Ok(Some(cap)) => cap,
+            Ok(None) => return,
+            Err(e) => {
+                error!(target: "sync", "get_sync failed for {}: {e}", value.address);
+                return;
+            }
+        };
+
+        let stores = SyncStores {
+            peers: self.peers.clone(),
+            tasks: self.tasks.clone(),
+            services: self.services.clone(),
+            secrets: self.secrets.clone(),
+            networks: self.networks.clone(),
+            network_peers: self.network_peers.clone(),
+            network_attachments: self.network_attachments.clone(),
+        };
+
+        sync_all_domains(stores, sync_cap).await;
     }
 
     /// Kick a one-shot sync pass immediately (no waiting for the next interval).
@@ -1086,5 +1128,134 @@ impl GossipContext for Topology {
 
     async fn invalidate_peer_capabilities(&self, peer: &PeerHandle) {
         self.registry.invalidate_peer_capabilities(peer.id).await;
+    }
+}
+
+/// Select peers for one sync tick while excluding `local_id`.
+///
+/// This helper keeps peer sampling logic testable without constructing a full `Topology`.
+fn select_sync_peers_for_node<'a>(
+    local_id: Uuid,
+    entries: &'a [PeerCacheEntry],
+    sync_fanout: usize,
+) -> Vec<&'a PeerCacheEntry> {
+    // `sync_fanout = 0` preserves the legacy behavior (sync against all peers).
+    if sync_fanout == 0 {
+        return entries
+            .iter()
+            .filter(|entry| entry.peer_id != local_id)
+            .collect();
+    }
+
+    // Select peers in O(k) expected time without shuffling the full slice.
+    use ::rand::Rng as _;
+    use ::rand::seq::index;
+
+    let target = sync_fanout.min(entries.len());
+    if target == 0 {
+        return Vec::new();
+    }
+
+    let mut rng = ::rand::rng();
+    let mut selected_indices: HashSet<usize> = HashSet::with_capacity(target * 2);
+    let mut selected_entries = Vec::with_capacity(target);
+
+    for idx in index::sample(&mut rng, entries.len(), target).into_vec() {
+        selected_indices.insert(idx);
+        let entry = &entries[idx];
+        if entry.peer_id != local_id {
+            selected_entries.push(entry);
+        }
+    }
+
+    // If `self` was selected (or duplicate protection reduced candidates), top up from
+    // remaining indices without scanning or shuffling the entire peer list.
+    while selected_entries.len() < target && selected_indices.len() < entries.len() {
+        let idx = rng.random_range(0..entries.len());
+        if !selected_indices.insert(idx) {
+            continue;
+        }
+        let entry = &entries[idx];
+        if entry.peer_id != local_id {
+            selected_entries.push(entry);
+        }
+    }
+
+    selected_entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PeerCacheEntry, PeerValue, select_sync_peers_for_node};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// Build a synthetic peer cache entry with deterministic placeholder values.
+    fn make_entry(peer_id: Uuid, idx: usize) -> PeerCacheEntry {
+        PeerCacheEntry {
+            peer_id,
+            value: Arc::new(PeerValue {
+                address: format!("127.0.0.1:{}", 10_000 + idx),
+                hostname: format!("peer-{idx}"),
+                noise_static_pub: [idx as u8; 32],
+                signing_pub: [idx as u8; 32],
+                identity_sig: Vec::new(),
+                wireguard: None,
+            }),
+        }
+    }
+
+    /// `fanout = 0` should keep legacy behavior: return every peer except self.
+    #[test]
+    fn select_sync_peers_fanout_zero_returns_all_except_self() {
+        let local_id = Uuid::new_v4();
+        let peer_ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let mut entries = vec![make_entry(local_id, 0)];
+        for (idx, peer_id) in peer_ids.iter().copied().enumerate() {
+            entries.push(make_entry(peer_id, idx + 1));
+        }
+
+        let selected = select_sync_peers_for_node(local_id, &entries, 0);
+        assert_eq!(selected.len(), peer_ids.len());
+        assert!(selected.iter().all(|entry| entry.peer_id != local_id));
+
+        let selected_ids: HashSet<Uuid> = selected.iter().map(|entry| entry.peer_id).collect();
+        let expected_ids: HashSet<Uuid> = peer_ids.into_iter().collect();
+        assert_eq!(selected_ids, expected_ids);
+    }
+
+    /// Selected peers should never include self and should never exceed `fanout`.
+    #[test]
+    fn select_sync_peers_bounds_count_and_excludes_self() {
+        let local_id = Uuid::new_v4();
+        let mut entries = vec![make_entry(local_id, 0)];
+        for idx in 0..32 {
+            entries.push(make_entry(Uuid::new_v4(), idx + 1));
+        }
+
+        let fanout = 8;
+        for _ in 0..64 {
+            let selected = select_sync_peers_for_node(local_id, &entries, fanout);
+            assert_eq!(selected.len(), fanout);
+            assert!(selected.iter().all(|entry| entry.peer_id != local_id));
+
+            let unique_ids: HashSet<Uuid> = selected.iter().map(|entry| entry.peer_id).collect();
+            assert_eq!(unique_ids.len(), selected.len());
+        }
+    }
+
+    /// When `fanout` is larger than available peers, return all non-self peers.
+    #[test]
+    fn select_sync_peers_fanout_above_population_returns_all_non_self() {
+        let local_id = Uuid::new_v4();
+        let mut entries = vec![make_entry(local_id, 0)];
+        for idx in 0..4 {
+            entries.push(make_entry(Uuid::new_v4(), idx + 1));
+        }
+
+        let selected = select_sync_peers_for_node(local_id, &entries, 32);
+        assert_eq!(selected.len(), 4);
+        assert!(selected.iter().all(|entry| entry.peer_id != local_id));
     }
 }

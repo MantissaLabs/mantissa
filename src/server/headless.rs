@@ -35,6 +35,7 @@ pub struct HeadlessConfig {
     pub listen_addr: String,
     pub transport: HeadlessTransport,
     pub sync_tick: Option<Duration>,
+    pub sync_fanout: Option<usize>,
     pub gossip_tick: Option<Duration>,
     pub gossip_fanout: Option<usize>,
 }
@@ -45,6 +46,7 @@ impl Default for HeadlessConfig {
             listen_addr: "127.0.0.1:0".to_string(),
             transport: HeadlessTransport::Inproc,
             sync_tick: None,
+            sync_fanout: None,
             gossip_tick: None,
             gossip_fanout: None,
         }
@@ -119,6 +121,7 @@ impl HeadlessNode {
             listen_addr,
             transport,
             sync_tick,
+            sync_fanout,
             gossip_tick,
             gossip_fanout,
         } = cfg;
@@ -142,6 +145,9 @@ impl HeadlessNode {
         let (comps, gossip_rx) = Bootstrap::build_components(&ctx, &stores).await?;
         if let Some(d) = sync_tick {
             comps.topology.set_sync_interval(d);
+        }
+        if let Some(fanout) = sync_fanout {
+            comps.topology.set_sync_fanout(fanout);
         }
         if let Some(d) = gossip_tick {
             comps.topology.set_gossip_interval(d);
@@ -408,6 +414,7 @@ impl HeadlessNode {
                 listen_addr: "127.0.0.1:0".to_string(),
                 transport: HeadlessTransport::Inproc,
                 sync_tick,
+                sync_fanout: None,
                 gossip_tick,
                 gossip_fanout: fanout,
             },
