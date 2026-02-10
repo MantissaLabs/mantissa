@@ -29,6 +29,13 @@ pub enum ClusterOperationStage {
     Aborted,
 }
 
+/// Records the deterministic split target index selected for one node.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SplitNodeAssignment {
+    pub node_id: Uuid,
+    pub target_index: usize,
+}
+
 impl ClusterOperationStage {
     /// Converts the internal stage value to the Cap'n Proto representation for RPC responses.
     fn to_capnp(self) -> protocol::topology::ClusterOperationStage {
@@ -48,9 +55,12 @@ pub struct ClusterOperationRecord {
     pub id: Uuid,
     pub kind: ClusterOperationKind,
     pub stage: ClusterOperationStage,
+    #[serde(default)]
     pub dry_run: bool,
     pub source_views: Vec<ClusterViewId>,
     pub target_views: Vec<ClusterViewId>,
+    #[serde(default)]
+    pub split_assignments: Vec<SplitNodeAssignment>,
     pub details: String,
 }
 

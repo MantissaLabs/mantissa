@@ -12,7 +12,7 @@ use crate::store::secret_master_store::MasterKeyRecord;
 use crate::sync::delta::{SyncStores, sync_all_domains};
 use crate::topology::health::status_to_node_status;
 use crate::topology::operation::{
-    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage,
+    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, SplitNodeAssignment,
 };
 use crate::topology::peers::{PeerValue, WireGuardPeerValue};
 use capnp::Error;
@@ -22,7 +22,9 @@ use ed25519_dalek::VerifyingKey;
 use protocol::gossip::gossip_message;
 use protocol::server::{self, cluster_session};
 use protocol::topology::{topology, topology_event};
+use protocol::topology::split_selector_clause::Operator as SplitOperator;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -66,6 +68,28 @@ struct JoinResponse {
     ticket: Vec<u8>,
     credential: Vec<u8>,
     session: cluster_session::Client,
+}
+
+#[derive(Clone, Debug)]
+struct SplitSelectorClauseSpec {
+    key: String,
+    op: SplitOperator,
+    value: String,
+}
+
+#[derive(Clone, Debug)]
+struct SplitTargetSpec {
+    name: String,
+    clauses: Vec<SplitSelectorClauseSpec>,
+    explicit_nodes: HashSet<Uuid>,
+}
+
+#[derive(Clone, Debug)]
+struct SplitNodeCandidate {
+    node_id: Uuid,
+    hostname: String,
+    address: String,
+    wireguard_enabled: bool,
 }
 
 impl Topology {
@@ -245,6 +269,245 @@ impl Topology {
         Ok(())
     }
 
+    /// Collects a deterministic snapshot of nodes eligible for split partition assignment.
+    fn collect_split_node_candidates(&self) -> Result<Vec<SplitNodeCandidate>, capnp::Error> {
+        let (actives, _) = self
+            .peers
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        let mut candidates: HashMap<Uuid, SplitNodeCandidate> = HashMap::new();
+        for (key, snapshots) in actives {
+            let Some(value) = snapshots.as_slice().last() else {
+                continue;
+            };
+
+            let node_id = key.to_uuid();
+            let wireguard_enabled = value
+                .wireguard
+                .as_ref()
+                .map(|wg| wg.enabled)
+                .unwrap_or(false);
+            candidates.insert(
+                node_id,
+                SplitNodeCandidate {
+                    node_id,
+                    hostname: value.hostname.clone(),
+                    address: value.address.clone(),
+                    wireguard_enabled,
+                },
+            );
+        }
+
+        candidates
+            .entry(self.node.id)
+            .or_insert_with(|| SplitNodeCandidate {
+                node_id: self.node.id,
+                hostname: self
+                    .node
+                    .system_info
+                    .info
+                    .hostname
+                    .clone()
+                    .unwrap_or_default(),
+                address: self
+                    .compute_advertise_addr()
+                    .unwrap_or_else(|_| String::new()),
+                wireguard_enabled: false,
+            });
+
+        let mut values = candidates.into_values().collect::<Vec<_>>();
+        values.sort_by_key(|candidate| candidate.node_id);
+        Ok(values)
+    }
+
+    /// Parses a textual boolean selector value accepted by split selector clauses.
+    fn parse_split_boolean(value: &str) -> Option<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Evaluates one selector clause against one node candidate in split assignment planning.
+    fn evaluate_split_clause(
+        node: &SplitNodeCandidate,
+        clause: &SplitSelectorClauseSpec,
+    ) -> Result<bool, capnp::Error> {
+        match clause.key.as_str() {
+            "node.id" => match clause.op {
+                SplitOperator::Eq => Ok(node.node_id.to_string() == clause.value),
+                SplitOperator::Ne => Ok(node.node_id.to_string() != clause.value),
+                _ => Err(capnp::Error::failed(
+                    "node.id supports only eq/ne operators".to_string(),
+                )),
+            },
+            "node.hostname" => match clause.op {
+                SplitOperator::Eq => Ok(node.hostname == clause.value),
+                SplitOperator::Ne => Ok(node.hostname != clause.value),
+                _ => Err(capnp::Error::failed(
+                    "node.hostname supports only eq/ne operators".to_string(),
+                )),
+            },
+            "node.address" => match clause.op {
+                SplitOperator::Eq => Ok(node.address == clause.value),
+                SplitOperator::Ne => Ok(node.address != clause.value),
+                _ => Err(capnp::Error::failed(
+                    "node.address supports only eq/ne operators".to_string(),
+                )),
+            },
+            "wireguard.enabled" => {
+                let expected = Self::parse_split_boolean(&clause.value).ok_or_else(|| {
+                    capnp::Error::failed(format!(
+                        "wireguard.enabled expects a boolean value, got '{}'",
+                        clause.value
+                    ))
+                })?;
+                match clause.op {
+                    SplitOperator::Eq => Ok(node.wireguard_enabled == expected),
+                    SplitOperator::Ne => Ok(node.wireguard_enabled != expected),
+                    _ => Err(capnp::Error::failed(
+                        "wireguard.enabled supports only eq/ne operators".to_string(),
+                    )),
+                }
+            }
+            _ => Err(capnp::Error::failed(format!(
+                "unsupported split selector key '{}'",
+                clause.key
+            ))),
+        }
+    }
+
+    /// Evaluates whether one split target selector matches the provided node candidate.
+    fn split_target_matches_node(
+        target: &SplitTargetSpec,
+        node: &SplitNodeCandidate,
+    ) -> Result<bool, capnp::Error> {
+        if target.clauses.is_empty() {
+            return Ok(true);
+        }
+
+        for clause in &target.clauses {
+            if !Self::evaluate_split_clause(node, clause)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Assigns nodes to split targets deterministically when no explicit selectors are provided.
+    fn assign_split_targets_by_order(
+        source_view: ClusterViewId,
+        nodes: &[SplitNodeCandidate],
+        target_count: usize,
+    ) -> Vec<SplitNodeAssignment> {
+        let offset = source_view.epoch as usize % target_count;
+        let mut assignments = Vec::with_capacity(nodes.len());
+        for (index, node) in nodes.iter().enumerate() {
+            assignments.push(SplitNodeAssignment {
+                node_id: node.node_id,
+                target_index: (index + offset) % target_count,
+            });
+        }
+        assignments.sort_by_key(|assignment| assignment.node_id);
+        assignments
+    }
+
+    /// Computes deterministic split assignments and validates selector coverage for all nodes.
+    fn build_split_assignments(
+        &self,
+        source_view: ClusterViewId,
+        targets: &[SplitTargetSpec],
+    ) -> Result<Vec<SplitNodeAssignment>, capnp::Error> {
+        if targets.is_empty() {
+            return Err(capnp::Error::failed(
+                "split assignment requires at least one target".to_string(),
+            ));
+        }
+
+        let nodes = self.collect_split_node_candidates()?;
+        if nodes.is_empty() {
+            return Err(capnp::Error::failed(
+                "split assignment requires at least one node candidate".to_string(),
+            ));
+        }
+
+        let selectorless = targets
+            .iter()
+            .all(|target| target.clauses.is_empty() && target.explicit_nodes.is_empty());
+        if selectorless {
+            return Ok(Self::assign_split_targets_by_order(
+                source_view,
+                &nodes,
+                targets.len(),
+            ));
+        }
+
+        let mut assignments = Vec::with_capacity(nodes.len());
+        let mut per_target_count = vec![0usize; targets.len()];
+
+        for node in nodes {
+            let explicit_matches = targets
+                .iter()
+                .enumerate()
+                .filter(|(_, target)| target.explicit_nodes.contains(&node.node_id))
+                .map(|(idx, _)| idx)
+                .collect::<Vec<_>>();
+            if explicit_matches.len() > 1 {
+                return Err(capnp::Error::failed(format!(
+                    "node {} is explicitly assigned to multiple split targets",
+                    node.node_id
+                )));
+            }
+
+            let chosen = if let Some(index) = explicit_matches.first().copied() {
+                index
+            } else {
+                let mut selector_matches = Vec::new();
+                for (idx, target) in targets.iter().enumerate() {
+                    if Self::split_target_matches_node(target, &node)? {
+                        selector_matches.push(idx);
+                    }
+                }
+
+                match selector_matches.as_slice() {
+                    [] => {
+                        return Err(capnp::Error::failed(format!(
+                            "node {} did not match any split target selectors",
+                            node.node_id
+                        )));
+                    }
+                    [only] => *only,
+                    _ => {
+                        return Err(capnp::Error::failed(format!(
+                            "node {} matched multiple split target selectors",
+                            node.node_id
+                        )));
+                    }
+                }
+            };
+
+            per_target_count[chosen] = per_target_count[chosen].saturating_add(1);
+            assignments.push(SplitNodeAssignment {
+                node_id: node.node_id,
+                target_index: chosen,
+            });
+        }
+
+        for (index, count) in per_target_count.into_iter().enumerate() {
+            if count == 0 {
+                return Err(capnp::Error::failed(format!(
+                    "split target '{}' has no matched nodes",
+                    targets[index].name
+                )));
+            }
+        }
+
+        assignments.sort_by_key(|assignment| assignment.node_id);
+        Ok(assignments)
+    }
+
     /// Persists a cluster operation record in the local durable operation store.
     fn persist_cluster_operation(&self, op: &ClusterOperationRecord) -> Result<(), capnp::Error> {
         let encoded = bincode::serialize(op).map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -334,7 +597,19 @@ impl Topology {
     ) -> Result<(), capnp::Error> {
         let target_view = match operation.kind {
             ClusterOperationKind::Merge => operation.target_views.first().copied(),
-            ClusterOperationKind::Split => operation.target_views.first().copied(),
+            ClusterOperationKind::Split => {
+                let assignment = operation
+                    .split_assignments
+                    .iter()
+                    .find(|assignment| assignment.node_id == self.node.id)
+                    .ok_or_else(|| {
+                        capnp::Error::failed(format!(
+                            "split operation {} has no assignment for local node {}",
+                            operation.id, self.node.id
+                        ))
+                    })?;
+                operation.target_views.get(assignment.target_index).copied()
+            }
         }
         .ok_or_else(|| {
             capnp::Error::failed("operation has no target views for commit".to_string())
@@ -710,6 +985,7 @@ impl topology::Server for Topology {
             dry_run,
             source_views: vec![source_view],
             target_views: vec![destination_view],
+            split_assignments: Vec::new(),
             details: format!(
                 "merge proposed: source={source_view}, destination={destination_view}, dry_run={dry_run}"
             ),
@@ -755,7 +1031,8 @@ impl topology::Server for Topology {
             ));
         }
 
-        let mut seen_names = std::collections::HashSet::<String>::new();
+        let mut seen_names = HashSet::<String>::new();
+        let mut target_specs = Vec::with_capacity(targets.len() as usize);
         let mut target_views = Vec::with_capacity(targets.len() as usize);
         let mut detail_targets = Vec::with_capacity(targets.len() as usize);
 
@@ -774,8 +1051,37 @@ impl topology::Server for Topology {
             }
 
             let selector = target.get_selector()?;
-            let clause_count = selector.get_clauses()?.len();
-            let explicit_count = selector.get_explicit_nodes()?.len();
+            let clauses_reader = selector.get_clauses()?;
+            let explicit_nodes_reader = selector.get_explicit_nodes()?;
+            let clause_count = clauses_reader.len();
+            let explicit_count = explicit_nodes_reader.len();
+            let mut clauses = Vec::with_capacity(clause_count as usize);
+            for clause_index in 0..clauses_reader.len() {
+                let clause = clauses_reader.get(clause_index);
+                let key = clause.get_key()?.to_string()?;
+                if key.trim().is_empty() {
+                    return Err(capnp::Error::failed(
+                        "split selector clause key must not be empty".into(),
+                    ));
+                }
+
+                clauses.push(SplitSelectorClauseSpec {
+                    key,
+                    op: clause.get_op()?,
+                    value: clause.get_value()?.to_string()?,
+                });
+            }
+
+            let mut explicit_nodes = HashSet::with_capacity(explicit_count as usize);
+            for node_index in 0..explicit_nodes_reader.len() {
+                let node_id = read_node_id(explicit_nodes_reader.get(node_index))?;
+                if !explicit_nodes.insert(node_id) {
+                    return Err(capnp::Error::failed(format!(
+                        "split target '{name}' contains duplicate explicit node {node_id}"
+                    )));
+                }
+            }
+
             let mut hasher = Sha256::new();
             hasher.update(source_view.cluster_id.as_bytes());
             hasher.update(source_view.epoch.to_le_bytes());
@@ -786,10 +1092,29 @@ impl topology::Server for Topology {
             let target_cluster = ClusterId::from_bytes(cluster_bytes);
             let view = ClusterViewId::new(target_cluster, source_view.epoch.saturating_add(1));
             target_views.push(view);
+            target_specs.push(SplitTargetSpec {
+                name: name.clone(),
+                clauses,
+                explicit_nodes,
+            });
             detail_targets.push(format!(
                 "{name}(clauses={clause_count}, explicit_nodes={explicit_count}, view={view})"
             ));
         }
+
+        let split_assignments = self.build_split_assignments(source_view, &target_specs)?;
+        let mut assignments_per_target = vec![0usize; target_views.len()];
+        for assignment in &split_assignments {
+            if let Some(slot) = assignments_per_target.get_mut(assignment.target_index) {
+                *slot = slot.saturating_add(1);
+            }
+        }
+        let assignment_detail = target_specs
+            .iter()
+            .enumerate()
+            .map(|(idx, target)| format!("{}={}", target.name, assignments_per_target[idx]))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let operation = ClusterOperationRecord {
             id: Uuid::new_v4(),
@@ -798,9 +1123,11 @@ impl topology::Server for Topology {
             dry_run,
             source_views: vec![source_view],
             target_views: target_views.clone(),
+            split_assignments,
             details: format!(
-                "split proposed: source={source_view}, dry_run={dry_run}, targets=[{}]",
-                detail_targets.join(", ")
+                "split proposed: source={source_view}, dry_run={dry_run}, targets=[{}], assignments=[{}]",
+                detail_targets.join(", "),
+                assignment_detail
             ),
         };
         self.persist_cluster_operation(&operation)?;

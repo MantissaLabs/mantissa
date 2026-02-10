@@ -3,6 +3,7 @@ mod common;
 
 use common::testkit::TestNode;
 use mantissa::cluster_view::ClusterViewId;
+use mantissa::node::id::set_node_id;
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 use mantissa::store::cluster_operation_store::ClusterOperationStore;
 use mantissa::topology::operation::{
@@ -488,6 +489,121 @@ local_test!(cluster_view_split_commits_inproc, {
     );
 });
 
+// Validates split selectors drive the local target choice instead of always selecting the first target.
+local_test!(cluster_view_split_selectors_choose_assigned_target, {
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let joiner = TestNode::new_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join cluster");
+    anchor
+        .assert_cluster_size(2, "anchor should observe both nodes")
+        .await;
+    joiner
+        .assert_cluster_size(2, "joiner should observe both nodes")
+        .await;
+
+    let view_resp = joiner
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let initial_view = view_resp
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    let cluster_id = initial_view
+        .get_cluster_id()
+        .expect("cluster id")
+        .get_value()
+        .expect("cluster id bytes")
+        .to_vec();
+    let epoch = initial_view.get_epoch();
+
+    let mut split_req = joiner.topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        let mut src = req.reborrow().init_source_view();
+        src.reborrow().init_cluster_id().set_value(&cluster_id);
+        src.set_epoch(epoch);
+
+        let mut targets = req.reborrow().init_targets(2);
+        let mut target_a = targets.reborrow().get(0);
+        target_a.set_name("target-a");
+        let mut selector_a = target_a.reborrow().init_selector();
+        selector_a.reborrow().init_clauses(0);
+        let mut explicit_a = selector_a.reborrow().init_explicit_nodes(1);
+        set_node_id(explicit_a.reborrow().get(0), &anchor.id());
+
+        let mut target_b = targets.reborrow().get(1);
+        target_b.set_name("target-b");
+        let mut selector_b = target_b.reborrow().init_selector();
+        selector_b.reborrow().init_clauses(0);
+        let mut explicit_b = selector_b.reborrow().init_explicit_nodes(1);
+        set_node_id(explicit_b.reborrow().get(0), &joiner.id());
+
+        req.set_dry_run(false);
+    }
+
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split op");
+    assert_eq!(
+        split_op.get_stage().expect("split stage"),
+        ClusterOperationStage::Proposed
+    );
+    let target_views = split_op.get_target_views().expect("split target views");
+    assert_eq!(target_views.len(), 2, "split should include two targets");
+    let assigned_target = target_views.get(1);
+    let expected_cluster_id = assigned_target
+        .get_cluster_id()
+        .expect("assigned cluster id")
+        .get_value()
+        .expect("assigned cluster id bytes")
+        .to_vec();
+    let expected_epoch = assigned_target.get_epoch();
+    let split_id = split_op.get_id().expect("split id").to_vec();
+    wait_for_operation_stage(
+        &joiner.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let post_view_resp = joiner
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("post getClusterView send");
+    let post_view = post_view_resp
+        .get()
+        .expect("post getClusterView get")
+        .get_view()
+        .expect("post view payload");
+    assert_eq!(
+        post_view
+            .get_cluster_id()
+            .expect("post cluster id")
+            .get_value()
+            .expect("post cluster id bytes")
+            .to_vec(),
+        expected_cluster_id,
+        "split selector assignment should activate joiner's selected target view"
+    );
+    assert_eq!(
+        post_view.get_epoch(),
+        expected_epoch,
+        "split selector assignment should activate joiner's selected target epoch"
+    );
+});
+
 // Validates startup replay resumes non-finalized durable operations and applies their commit side effects.
 local_test!(cluster_view_replays_pending_operation_on_startup, {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -504,6 +620,7 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
         dry_run: false,
         source_views: vec![source_view],
         target_views: vec![target_view],
+        split_assignments: Vec::new(),
         details: "replay test operation".to_string(),
     };
 
@@ -568,6 +685,7 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
         dry_run: true,
         source_views: vec![source_view],
         target_views: vec![target_view],
+        split_assignments: Vec::new(),
         details: "dry-run replay test operation".to_string(),
     };
 
