@@ -233,3 +233,196 @@ local_test!(cluster_view_protocol_strict_inproc, {
         ClusterOperationKind::Split
     );
 });
+
+// Validates that non-dry-run merge advances through finalize and switches the local active view.
+local_test!(cluster_view_merge_commits_inproc, {
+    let node = TestNode::new_with_tick_ms(100).await;
+
+    let view_resp = node
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let initial_view = view_resp
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    let cluster_id = initial_view
+        .get_cluster_id()
+        .expect("cluster id")
+        .get_value()
+        .expect("cluster id bytes")
+        .to_vec();
+    let epoch = initial_view.get_epoch();
+
+    let mut merge_req = node.topology().merge_clusters_request();
+    {
+        let mut req = merge_req.get().init_req();
+        let mut src = req.reborrow().init_source_view();
+        src.reborrow().init_cluster_id().set_value(&cluster_id);
+        src.set_epoch(epoch);
+
+        let mut dst = req.reborrow().init_destination_view();
+        dst.reborrow().init_cluster_id().set_value(&cluster_id);
+        dst.set_epoch(epoch + 1);
+        req.set_dry_run(false);
+    }
+
+    let merge_resp = merge_req.send().promise.await.expect("mergeClusters send");
+    let merge_op = merge_resp
+        .get()
+        .expect("mergeClusters get")
+        .get_op()
+        .expect("merge op");
+    assert_eq!(
+        merge_op.get_stage().expect("merge stage"),
+        ClusterOperationStage::Finalized
+    );
+    let merge_id = merge_op.get_id().expect("merge id").to_vec();
+    assert_eq!(merge_id.len(), 16, "merge operation id must be 16 bytes");
+
+    let mut lookup_req = node.topology().get_cluster_operation_request();
+    lookup_req.get().set_id(&merge_id);
+    let lookup_resp = lookup_req
+        .send()
+        .promise
+        .await
+        .expect("getClusterOperation send");
+    let looked_up = lookup_resp
+        .get()
+        .expect("getClusterOperation get")
+        .get_op()
+        .expect("lookup operation");
+    assert_eq!(
+        looked_up.get_stage().expect("lookup stage"),
+        ClusterOperationStage::Finalized
+    );
+
+    let post_view_resp = node
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("post getClusterView send");
+    let post_view = post_view_resp
+        .get()
+        .expect("post getClusterView get")
+        .get_view()
+        .expect("post view payload");
+    assert_eq!(
+        post_view
+            .get_cluster_id()
+            .expect("post cluster id")
+            .get_value()
+            .expect("post cluster id bytes")
+            .to_vec(),
+        cluster_id,
+        "merge should keep cluster lineage for same-cluster destination"
+    );
+    assert_eq!(
+        post_view.get_epoch(),
+        epoch + 1,
+        "merge commit should activate destination epoch"
+    );
+});
+
+// Validates that non-dry-run split advances through finalize and switches local view to a target.
+local_test!(cluster_view_split_commits_inproc, {
+    let node = TestNode::new_with_tick_ms(100).await;
+
+    let view_resp = node
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let initial_view = view_resp
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    let cluster_id = initial_view
+        .get_cluster_id()
+        .expect("cluster id")
+        .get_value()
+        .expect("cluster id bytes")
+        .to_vec();
+    let epoch = initial_view.get_epoch();
+
+    let mut split_req = node.topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        let mut src = req.reborrow().init_source_view();
+        src.reborrow().init_cluster_id().set_value(&cluster_id);
+        src.set_epoch(epoch);
+
+        let mut targets = req.reborrow().init_targets(2);
+        let mut target_a = targets.reborrow().get(0);
+        target_a.set_name("target-a");
+        let mut selector_a = target_a.reborrow().init_selector();
+        selector_a.reborrow().init_clauses(0);
+        selector_a.reborrow().init_explicit_nodes(0);
+
+        let mut target_b = targets.reborrow().get(1);
+        target_b.set_name("target-b");
+        let mut selector_b = target_b.reborrow().init_selector();
+        selector_b.reborrow().init_clauses(0);
+        selector_b.reborrow().init_explicit_nodes(0);
+
+        req.set_dry_run(false);
+    }
+
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split op");
+    assert_eq!(
+        split_op.get_stage().expect("split stage"),
+        ClusterOperationStage::Finalized
+    );
+    let target_views = split_op.get_target_views().expect("split target views");
+    assert_eq!(target_views.len(), 2, "split should include two targets");
+    let active_target = target_views.get(0);
+    let expected_cluster_id = active_target
+        .get_cluster_id()
+        .expect("target cluster id")
+        .get_value()
+        .expect("target cluster id bytes")
+        .to_vec();
+    let expected_epoch = active_target.get_epoch();
+
+    let post_view_resp = node
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("post getClusterView send");
+    let post_view = post_view_resp
+        .get()
+        .expect("post getClusterView get")
+        .get_view()
+        .expect("post view payload");
+    assert_eq!(
+        post_view
+            .get_cluster_id()
+            .expect("post cluster id")
+            .get_value()
+            .expect("post cluster id bytes")
+            .to_vec(),
+        expected_cluster_id,
+        "split commit should activate first target cluster id"
+    );
+    assert_eq!(
+        post_view.get_epoch(),
+        expected_epoch,
+        "split commit should activate first target epoch"
+    );
+});

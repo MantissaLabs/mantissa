@@ -22,6 +22,7 @@ use ed25519_dalek::VerifyingKey;
 use protocol::gossip::gossip_message;
 use protocol::server::{self, cluster_session};
 use protocol::topology::{topology, topology_event};
+use sha2::{Digest, Sha256};
 use std::rc::Rc;
 use tracing::info;
 use uuid::Uuid;
@@ -276,6 +277,78 @@ impl Topology {
             .map_err(|_| capnp::Error::failed("cluster operation id must be 16 bytes".into()))?;
         Ok(Uuid::from_bytes(id_bytes))
     }
+
+    /// Updates an operation stage, appends stage details, and persists the updated record.
+    fn update_cluster_operation_stage(
+        &self,
+        operation: &mut ClusterOperationRecord,
+        stage: ClusterOperationStage,
+        detail: &str,
+    ) -> Result<(), capnp::Error> {
+        operation.stage = stage;
+        if !detail.is_empty() {
+            operation.details = format!("{} | {}", operation.details, detail);
+        }
+        self.persist_cluster_operation(operation)
+    }
+
+    /// Applies local side effects for a committed operation, including active view switch.
+    async fn apply_committed_operation_side_effects(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<(), capnp::Error> {
+        let target_view = match operation.kind {
+            ClusterOperationKind::Merge => operation.target_views.first().copied(),
+            ClusterOperationKind::Split => operation.target_views.first().copied(),
+        }
+        .ok_or_else(|| {
+            capnp::Error::failed("operation has no target views for commit".to_string())
+        })?;
+
+        let previous = self.set_active_cluster_view(target_view);
+        self.registry.clear().await;
+        info!(
+            target: "cluster_view",
+            operation_id = %operation.id,
+            previous_view = %previous,
+            target_view = %target_view,
+            "applied operation commit side effects"
+        );
+
+        Ok(())
+    }
+
+    /// Advances non-dry-run operations through prepared, committed, and finalized stages.
+    async fn advance_operation_state_machine(
+        &self,
+        operation: &mut ClusterOperationRecord,
+        dry_run: bool,
+    ) -> Result<(), capnp::Error> {
+        if dry_run {
+            return Ok(());
+        }
+
+        self.update_cluster_operation_stage(
+            operation,
+            ClusterOperationStage::Prepared,
+            "prepared",
+        )?;
+
+        self.apply_committed_operation_side_effects(operation)
+            .await?;
+        self.update_cluster_operation_stage(
+            operation,
+            ClusterOperationStage::Committed,
+            &format!("committed active_view={}", self.active_cluster_view()),
+        )?;
+
+        self.update_cluster_operation_stage(
+            operation,
+            ClusterOperationStage::Finalized,
+            "finalized",
+        )?;
+        Ok(())
+    }
 }
 
 impl topology::Server for Topology {
@@ -516,7 +589,7 @@ impl topology::Server for Topology {
             )));
         }
 
-        let operation = ClusterOperationRecord {
+        let mut operation = ClusterOperationRecord {
             id: Uuid::new_v4(),
             kind: ClusterOperationKind::Merge,
             stage: ClusterOperationStage::Proposed,
@@ -527,6 +600,8 @@ impl topology::Server for Topology {
             ),
         };
         self.persist_cluster_operation(&operation)?;
+        self.advance_operation_state_machine(&mut operation, dry_run)
+            .await?;
 
         info!(
             target: "cluster_view",
@@ -534,7 +609,8 @@ impl topology::Server for Topology {
             source_view = %source_view,
             destination_view = %destination_view,
             dry_run,
-            "merge operation proposed"
+            stage = ?operation.stage,
+            "merge operation accepted"
         );
 
         operation.write_capnp(results.get().init_op());
@@ -586,14 +662,22 @@ impl topology::Server for Topology {
             let selector = target.get_selector()?;
             let clause_count = selector.get_clauses()?.len();
             let explicit_count = selector.get_explicit_nodes()?.len();
-            let view = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 0);
+            let mut hasher = Sha256::new();
+            hasher.update(source_view.cluster_id.as_bytes());
+            hasher.update(source_view.epoch.to_le_bytes());
+            hasher.update(name.as_bytes());
+            let digest = hasher.finalize();
+            let mut cluster_bytes = [0u8; 16];
+            cluster_bytes.copy_from_slice(&digest[..16]);
+            let target_cluster = ClusterId::from_bytes(cluster_bytes);
+            let view = ClusterViewId::new(target_cluster, source_view.epoch.saturating_add(1));
             target_views.push(view);
             detail_targets.push(format!(
                 "{name}(clauses={clause_count}, explicit_nodes={explicit_count}, view={view})"
             ));
         }
 
-        let operation = ClusterOperationRecord {
+        let mut operation = ClusterOperationRecord {
             id: Uuid::new_v4(),
             kind: ClusterOperationKind::Split,
             stage: ClusterOperationStage::Proposed,
@@ -605,6 +689,8 @@ impl topology::Server for Topology {
             ),
         };
         self.persist_cluster_operation(&operation)?;
+        self.advance_operation_state_machine(&mut operation, dry_run)
+            .await?;
 
         info!(
             target: "cluster_view",
@@ -612,7 +698,8 @@ impl topology::Server for Topology {
             source_view = %source_view,
             target_count = operation.target_views.len(),
             dry_run,
-            "split operation proposed"
+            stage = ?operation.stage,
+            "split operation accepted"
         );
 
         operation.write_capnp(results.get().init_op());
