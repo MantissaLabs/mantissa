@@ -24,7 +24,7 @@ use protocol::server::{self, cluster_session};
 use protocol::topology::{topology, topology_event};
 use sha2::{Digest, Sha256};
 use std::rc::Rc;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -318,35 +318,76 @@ impl Topology {
         Ok(())
     }
 
-    /// Advances non-dry-run operations through prepared, committed, and finalized stages.
-    async fn advance_operation_state_machine(
-        &self,
-        operation: &mut ClusterOperationRecord,
-        dry_run: bool,
-    ) -> Result<(), capnp::Error> {
+    /// Starts asynchronous local progression for a cluster operation if it is not a dry run.
+    fn trigger_operation_progress(&self, operation_id: Uuid, dry_run: bool) {
         if dry_run {
-            return Ok(());
+            return;
         }
 
-        self.update_cluster_operation_stage(
-            operation,
-            ClusterOperationStage::Prepared,
-            "prepared",
-        )?;
+        let topology = self.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(err) = topology.progress_cluster_operation(operation_id).await {
+                warn!(
+                    target: "cluster_view",
+                    operation_id = %operation_id,
+                    "failed to progress cluster operation: {err}"
+                );
+            }
+        });
+    }
 
-        self.apply_committed_operation_side_effects(operation)
-            .await?;
-        self.update_cluster_operation_stage(
-            operation,
-            ClusterOperationStage::Committed,
-            &format!("committed active_view={}", self.active_cluster_view()),
-        )?;
+    /// Progresses one operation forward based on its current persisted stage.
+    async fn progress_cluster_operation(&self, operation_id: Uuid) -> Result<(), capnp::Error> {
+        let _guard = self.operations.gate.lock().await;
 
-        self.update_cluster_operation_stage(
-            operation,
-            ClusterOperationStage::Finalized,
-            "finalized",
-        )?;
+        let mut operation = self.load_cluster_operation(operation_id)?.ok_or_else(|| {
+            capnp::Error::failed(format!("cluster operation not found: {operation_id}"))
+        })?;
+
+        match operation.stage {
+            ClusterOperationStage::Proposed => {
+                self.update_cluster_operation_stage(
+                    &mut operation,
+                    ClusterOperationStage::Prepared,
+                    "prepared",
+                )?;
+                self.apply_committed_operation_side_effects(&operation)
+                    .await?;
+                self.update_cluster_operation_stage(
+                    &mut operation,
+                    ClusterOperationStage::Committed,
+                    &format!("committed active_view={}", self.active_cluster_view()),
+                )?;
+                self.update_cluster_operation_stage(
+                    &mut operation,
+                    ClusterOperationStage::Finalized,
+                    "finalized",
+                )?;
+            }
+            ClusterOperationStage::Prepared => {
+                self.apply_committed_operation_side_effects(&operation)
+                    .await?;
+                self.update_cluster_operation_stage(
+                    &mut operation,
+                    ClusterOperationStage::Committed,
+                    &format!("committed active_view={}", self.active_cluster_view()),
+                )?;
+                self.update_cluster_operation_stage(
+                    &mut operation,
+                    ClusterOperationStage::Finalized,
+                    "finalized",
+                )?;
+            }
+            ClusterOperationStage::Committed => {
+                self.update_cluster_operation_stage(
+                    &mut operation,
+                    ClusterOperationStage::Finalized,
+                    "finalized",
+                )?;
+            }
+            ClusterOperationStage::Finalized | ClusterOperationStage::Aborted => {}
+        }
+
         Ok(())
     }
 }
@@ -589,7 +630,7 @@ impl topology::Server for Topology {
             )));
         }
 
-        let mut operation = ClusterOperationRecord {
+        let operation = ClusterOperationRecord {
             id: Uuid::new_v4(),
             kind: ClusterOperationKind::Merge,
             stage: ClusterOperationStage::Proposed,
@@ -600,8 +641,7 @@ impl topology::Server for Topology {
             ),
         };
         self.persist_cluster_operation(&operation)?;
-        self.advance_operation_state_machine(&mut operation, dry_run)
-            .await?;
+        self.trigger_operation_progress(operation.id, dry_run);
 
         info!(
             target: "cluster_view",
@@ -677,7 +717,7 @@ impl topology::Server for Topology {
             ));
         }
 
-        let mut operation = ClusterOperationRecord {
+        let operation = ClusterOperationRecord {
             id: Uuid::new_v4(),
             kind: ClusterOperationKind::Split,
             stage: ClusterOperationStage::Proposed,
@@ -689,8 +729,7 @@ impl topology::Server for Topology {
             ),
         };
         self.persist_cluster_operation(&operation)?;
-        self.advance_operation_state_machine(&mut operation, dry_run)
-            .await?;
+        self.trigger_operation_progress(operation.id, dry_run);
 
         info!(
             target: "cluster_view",

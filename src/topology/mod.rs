@@ -254,6 +254,20 @@ impl SyncState {
 }
 
 #[derive(Clone)]
+struct ClusterOperationState {
+    /// Gate used to serialize local operation progression and active-view commits.
+    gate: Arc<AsyncMutex<()>>,
+}
+
+impl ClusterOperationState {
+    fn new() -> Self {
+        Self {
+            gate: Arc::new(AsyncMutex::new(())),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Topology {
     /// Snapshot of the local node (id, host info, capabilities).
     node: Node,
@@ -300,6 +314,9 @@ pub struct Topology {
 
     /// Runtime state for background sync loop management.
     sync: SyncState,
+
+    /// Runtime state for merge/split operation progression.
+    operations: ClusterOperationState,
 
     /// Persistent token store, holding the current token for joining the cluster.
     token_store: TokenStore,
@@ -381,6 +398,7 @@ impl Topology {
             public_key: noise_public_key,
             signing_key,
             sync: SyncState::new(DEFAULT_SYNC_INTERVAL, DEFAULT_SYNC_FANOUT),
+            operations: ClusterOperationState::new(),
             token_store,
             secret_master_store,
             secret_keyring,

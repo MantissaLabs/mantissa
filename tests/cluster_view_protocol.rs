@@ -3,6 +3,42 @@ mod common;
 
 use common::testkit::TestNode;
 use protocol::topology::{ClusterOperationKind, ClusterOperationStage};
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+
+async fn wait_for_operation_stage(
+    topology: &mantissa::topology_capnp::topology::Client,
+    operation_id: &[u8],
+    expected: ClusterOperationStage,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut request = topology.get_cluster_operation_request();
+        request.get().set_id(operation_id);
+        let response = request
+            .send()
+            .promise
+            .await
+            .expect("getClusterOperation send");
+        let operation = response
+            .get()
+            .expect("getClusterOperation get")
+            .get_op()
+            .expect("operation payload");
+        let stage = operation.get_stage().expect("operation stage");
+        if stage == expected {
+            return;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "operation did not reach expected stage {:?}, current stage {:?}",
+            expected,
+            stage
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
 
 // Validates strict view-scoped protocol behavior for sync and topology.
 local_test!(cluster_view_protocol_strict_inproc, {
@@ -279,10 +315,17 @@ local_test!(cluster_view_merge_commits_inproc, {
         .expect("merge op");
     assert_eq!(
         merge_op.get_stage().expect("merge stage"),
-        ClusterOperationStage::Finalized
+        ClusterOperationStage::Proposed
     );
     let merge_id = merge_op.get_id().expect("merge id").to_vec();
     assert_eq!(merge_id.len(), 16, "merge operation id must be 16 bytes");
+    wait_for_operation_stage(
+        &node.topology(),
+        &merge_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
 
     let mut lookup_req = node.topology().get_cluster_operation_request();
     lookup_req.get().set_id(&merge_id);
@@ -385,7 +428,7 @@ local_test!(cluster_view_split_commits_inproc, {
         .expect("split op");
     assert_eq!(
         split_op.get_stage().expect("split stage"),
-        ClusterOperationStage::Finalized
+        ClusterOperationStage::Proposed
     );
     let target_views = split_op.get_target_views().expect("split target views");
     assert_eq!(target_views.len(), 2, "split should include two targets");
@@ -397,6 +440,14 @@ local_test!(cluster_view_split_commits_inproc, {
         .expect("target cluster id bytes")
         .to_vec();
     let expected_epoch = active_target.get_epoch();
+    let split_id = split_op.get_id().expect("split id").to_vec();
+    wait_for_operation_stage(
+        &node.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
 
     let post_view_resp = node
         .topology()
