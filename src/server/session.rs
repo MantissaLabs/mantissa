@@ -1,3 +1,4 @@
+use crate::cluster_view::ClusterViewId;
 use protocol::{
     gossip::gossip, health::health, network::networks, node::node, scheduling::scheduler,
     secrets::secrets, server::cluster_session, services::services, sync::sync, task::task,
@@ -25,11 +26,20 @@ pub struct ClusterSessionClients {
 pub struct ClusterSessionImpl {
     clients: ClusterSessionClients,
     online: Arc<AtomicBool>,
+    cluster_view: ClusterViewId,
 }
 
 impl ClusterSessionImpl {
-    pub fn new(clients: ClusterSessionClients, online: Arc<AtomicBool>) -> Self {
-        Self { clients, online }
+    pub fn new(
+        clients: ClusterSessionClients,
+        online: Arc<AtomicBool>,
+        cluster_view: ClusterViewId,
+    ) -> Self {
+        Self {
+            clients,
+            online,
+            cluster_view,
+        }
     }
 
     fn ensure_online(&self) -> Result<(), capnp::Error> {
@@ -61,6 +71,8 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_services(self.clients.services.clone());
         caps.set_secrets(self.clients.secrets.clone());
         caps.set_networks(self.clients.networks.clone());
+        self.cluster_view
+            .write_capnp(caps.reborrow().init_active_view());
 
         Ok(())
     }
@@ -161,6 +173,17 @@ impl cluster_session::Server for ClusterSessionImpl {
         self.ensure_online()?;
 
         results.get().set_networks(self.clients.networks.clone());
+        Ok(())
+    }
+
+    /// Returns the active cluster view associated with this session.
+    async fn get_cluster_view(
+        self: Rc<Self>,
+        _params: cluster_session::GetClusterViewParams,
+        mut results: cluster_session::GetClusterViewResults,
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
+        self.cluster_view.write_capnp(results.get().init_view());
         Ok(())
     }
 }

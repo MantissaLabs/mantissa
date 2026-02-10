@@ -1,4 +1,5 @@
 use super::{Topology, types::TopologyEvent};
+use crate::cluster_view::ClusterViewId;
 use crate::config;
 use crate::node::address::extract_port;
 use crate::node::id::{read_node_id, set_node_id};
@@ -19,7 +20,7 @@ use protocol::gossip::gossip_message;
 use protocol::server::{self, cluster_session};
 use protocol::topology::{topology, topology_event};
 use std::rc::Rc;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -134,12 +135,14 @@ impl Topology {
     async fn register_with_anchor(
         client: server::Client,
         payload: &JoinPayload,
+        cluster_view: ClusterViewId,
         join_token: &str,
     ) -> Result<JoinResponse, Error> {
         let mut request = client.register_node_request();
 
         let mut info = request.get().init_info();
         set_node_id(info.reborrow().init_id(), &payload.id);
+        cluster_view.write_capnp(info.reborrow().init_active_cluster_view());
         info.set_hostname(&payload.hostname);
         info.set_addr(&payload.advertise_addr);
         info.set_handle(payload.server_handle.clone());
@@ -277,7 +280,13 @@ impl topology::Server for Topology {
         })?;
         let anchor_handle = client.clone();
 
-        let response = Topology::register_with_anchor(client, &payload, &inputs.join_token).await?;
+        let response = Topology::register_with_anchor(
+            client,
+            &payload,
+            self.active_cluster_view(),
+            &inputs.join_token,
+        )
+        .await?;
 
         let JoinResponse {
             peer_id,
@@ -324,8 +333,9 @@ impl topology::Server for Topology {
 
         tokio::task::spawn_local({
             let stores = sync_stores;
+            let cluster_view = self.active_cluster_view();
             async move {
-                sync_all_domains(stores, sync_cap).await;
+                sync_all_domains(stores, sync_cap, cluster_view).await;
             }
         });
 
@@ -379,11 +389,13 @@ impl topology::Server for Topology {
 
         let list_builder = results.get().init_nodes();
         let mut node_list = list_builder.init_nodes(actives.len() as u32);
+        let active_cluster_view = self.active_cluster_view();
 
         for (i, (k, snap)) in actives.into_iter().enumerate() {
             let id = k.to_uuid();
             let mut node = node_list.reborrow().get(i as u32);
             set_node_id(node.reborrow().init_id(), &id);
+            active_cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
 
             if let Some(val) = snap.as_slice().last().cloned() {
                 node.set_addr(&val.address);
@@ -430,6 +442,78 @@ impl topology::Server for Topology {
         let new_token = self.token_store.rotate_and_persist().await?;
         results.get().set_token(&new_token);
         Ok(())
+    }
+
+    /// Returns the local active cluster view. This is currently a single legacy default view.
+    async fn get_cluster_view(
+        self: Rc<Self>,
+        _params: topology::GetClusterViewParams,
+        mut results: topology::GetClusterViewResults,
+    ) -> Result<(), capnp::Error> {
+        self.active_cluster_view()
+            .write_capnp(results.get().init_view());
+        Ok(())
+    }
+
+    /// Merge RPC placeholder for protocol compatibility during phased rollout.
+    async fn merge_clusters(
+        self: Rc<Self>,
+        params: topology::MergeClustersParams,
+        _results: topology::MergeClustersResults,
+    ) -> Result<(), capnp::Error> {
+        if let Ok(req) = params.get().and_then(|p| p.get_req()) {
+            let dry_run = req.get_dry_run();
+            warn!(
+                target: "cluster_view",
+                dry_run,
+                "merge_clusters RPC invoked before merge engine implementation"
+            );
+        } else {
+            warn!(
+                target: "cluster_view",
+                "merge_clusters RPC invoked with unreadable request payload"
+            );
+        }
+
+        Err(capnp::Error::unimplemented(
+            "merge_clusters is not implemented yet".to_string(),
+        ))
+    }
+
+    /// Split RPC placeholder for protocol compatibility during phased rollout.
+    async fn split_cluster(
+        self: Rc<Self>,
+        params: topology::SplitClusterParams,
+        _results: topology::SplitClusterResults,
+    ) -> Result<(), capnp::Error> {
+        if let Ok(req) = params.get().and_then(|p| p.get_req()) {
+            let dry_run = req.get_dry_run();
+            warn!(
+                target: "cluster_view",
+                dry_run,
+                "split_cluster RPC invoked before split engine implementation"
+            );
+        } else {
+            warn!(
+                target: "cluster_view",
+                "split_cluster RPC invoked with unreadable request payload"
+            );
+        }
+
+        Err(capnp::Error::unimplemented(
+            "split_cluster is not implemented yet".to_string(),
+        ))
+    }
+
+    /// Operation lookup placeholder for protocol compatibility during phased rollout.
+    async fn get_cluster_operation(
+        self: Rc<Self>,
+        _params: topology::GetClusterOperationParams,
+        _results: topology::GetClusterOperationResults,
+    ) -> Result<(), capnp::Error> {
+        Err(capnp::Error::unimplemented(
+            "get_cluster_operation is not implemented yet".to_string(),
+        ))
     }
 }
 
@@ -530,6 +614,7 @@ pub fn add_event(
             let mut node = topo.init_node();
 
             set_node_id(node.reborrow().init_id(), id);
+            ClusterViewId::legacy_default().write_capnp(node.reborrow().init_active_cluster_view());
             node.set_hostname(hostname);
             node.set_addr(address);
             node.set_root_hash(root_hash);
@@ -555,6 +640,7 @@ pub fn add_event(
             topo.set_event(topology_event::EventType::Remove);
             let mut node = topo.init_node();
             set_node_id(node.reborrow().init_id(), id);
+            ClusterViewId::legacy_default().write_capnp(node.reborrow().init_active_cluster_view());
         }
 
         TopologyEvent::Suspect { id } => {
@@ -562,6 +648,7 @@ pub fn add_event(
             topo.set_event(topology_event::EventType::Suspect);
             let mut node = topo.init_node();
             set_node_id(node.reborrow().init_id(), id);
+            ClusterViewId::legacy_default().write_capnp(node.reborrow().init_active_cluster_view());
         }
     }
 }

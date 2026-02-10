@@ -138,7 +138,11 @@ impl Server {
             secrets: self.clients.secrets_client.clone(),
             networks: self.clients.networks_client.clone(),
         };
-        let session = ClusterSessionImpl::new(session_clients, self.online.clone());
+        let session = ClusterSessionImpl::new(
+            session_clients,
+            self.online.clone(),
+            self.topology.active_cluster_view(),
+        );
 
         capnp_rpc::new_client(session)
     }

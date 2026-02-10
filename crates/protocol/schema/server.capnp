@@ -11,6 +11,7 @@ using import "services.capnp".Services;
 using import "scheduling.capnp".Scheduler;
 using import "secrets.capnp".Secrets;
 using import "network.capnp".Networks;
+using import "topology.capnp".ClusterViewId;
 
 interface Server {
   registerNode @0 (info :NodeInfo, token :Text) -> (session :ClusterSession, ticket :Data, nodeInfo :NodeInfo, credential :Data);
@@ -62,6 +63,9 @@ interface ClusterSession {
 
   getNetworks @10 () -> (networks :Networks);
   # Access the networks interface.
+
+  getClusterView @11 () -> (view :ClusterViewId);
+  # Returns the active cluster view associated with this session.
 }
 
 struct Capabilities {
@@ -94,4 +98,7 @@ struct Capabilities {
 
   networks @9 :Networks;
   # Networks interface capability.
+
+  activeView @10 :ClusterViewId;
+  # Active cluster view for this capability bundle.
 }

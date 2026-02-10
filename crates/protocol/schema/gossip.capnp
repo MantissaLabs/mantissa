@@ -1,6 +1,7 @@
 @0xbfbfd4615e1d9b8a;
 
 using import "topology.capnp".TopologyEvent;
+using import "topology.capnp".ClusterViewId;
 using import "task.capnp".TaskEvent;
 using import "services.capnp".ServiceEvent;
 using import "network.capnp".NetworkEvent;
@@ -26,6 +27,9 @@ struct GossipMessage {
 
   id @0 :Data;
   # Unique identifier for de-duplication and ordering hints.
+
+  view @7 :ClusterViewId;
+  # Cluster view identifier associated with this gossip message.
 
   union {
     void @1 :Void;

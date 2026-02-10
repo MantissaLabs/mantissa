@@ -27,6 +27,18 @@ interface Topology {
 
   rotateToken @4 () -> (token :Text);
   # Rotates the token for the node, invalidates existing token.
+
+  getClusterView @5 () -> (view :ClusterViewId);
+  # Returns the local node's currently active cluster view identifier.
+
+  mergeClusters @6 (req :MergeRequest) -> (op :ClusterOperation);
+  # Starts a merge operation between source and destination views.
+
+  splitCluster @7 (req :SplitRequest) -> (op :ClusterOperation);
+  # Starts a split operation from one source view into target views.
+
+  getClusterOperation @8 (id :Data) -> (op :ClusterOperation);
+  # Fetches the latest known state for a cluster operation id.
 }
 
 struct TopologyEvent {
@@ -107,9 +119,116 @@ struct NodeInfo {
 
   identitySig @12 :Data;
   # Ed25519 signature binding (id, publicKey, signingKey) for peer identity verification.
+
+  activeClusterView @13 :ClusterViewId;
+  # Active cluster view currently used by this node for control-plane operations.
 }
 
 struct NodeList {
   nodes @0 :List(NodeInfo);
   # List of nodes currently known to the cluster.
+}
+
+struct ClusterId {
+  value @0 :Data;
+  # Stable 16-byte lineage identifier for a cluster.
+}
+
+struct ClusterViewId {
+  clusterId @0 :ClusterId;
+  # Stable lineage identifier for the cluster.
+
+  epoch @1 :UInt64;
+  # Monotonically increasing view epoch.
+}
+
+enum ClusterOperationKind {
+  merge @0;
+  split @1;
+}
+
+enum ClusterOperationStage {
+  proposed @0;
+  prepared @1;
+  committed @2;
+  finalized @3;
+  aborted @4;
+}
+
+struct ClusterOperation {
+  id @0 :Data;
+  # Operation id (UUID bytes).
+
+  kind @1 :ClusterOperationKind;
+  # Kind of operation being executed.
+
+  stage @2 :ClusterOperationStage;
+  # Current stage in the operation state machine.
+
+  sourceViews @3 :List(ClusterViewId);
+  # Source cluster views involved in the operation.
+
+  targetViews @4 :List(ClusterViewId);
+  # Target cluster views resulting from the operation.
+
+  details @5 :Text;
+  # Human-readable details, including conflict hints.
+}
+
+struct MergeRequest {
+  sourceView @0 :ClusterViewId;
+  # Source view that will be merged.
+
+  destinationView @1 :ClusterViewId;
+  # Destination view that receives source state.
+
+  dryRun @2 :Bool;
+  # If true, perform validation only and do not commit state changes.
+}
+
+struct SplitSelectorClause {
+  key @0 :Text;
+  # Selector key (for example label or hardware attribute).
+
+  op @1 :Operator;
+  # Comparison operation.
+
+  value @2 :Text;
+  # Selector value encoded as text.
+
+  enum Operator {
+    eq @0;
+    ne @1;
+    gt @2;
+    gte @3;
+    lt @4;
+    lte @5;
+  }
+}
+
+struct SplitSelector {
+  clauses @0 :List(SplitSelectorClause);
+  # Conjunction of selector clauses.
+
+  explicitNodes @1 :List(Node.NodeId);
+  # Explicit node ids selected into this target partition.
+}
+
+struct SplitTarget {
+  name @0 :Text;
+  # Friendly target name for this partition.
+
+  selector @1 :SplitSelector;
+  # Selector rules for placing nodes into this target.
+}
+
+struct SplitRequest {
+  sourceView @0 :ClusterViewId;
+  # Source view that will be partitioned.
+
+  targets @1 :List(SplitTarget);
+  # Target partitions to materialize.
+
+  dryRun @2 :Bool;
+  # If true, validate only and do not commit state changes.
 }

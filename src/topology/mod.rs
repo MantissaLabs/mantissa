@@ -1,3 +1,4 @@
+use crate::cluster_view::{ClusterViewId, ClusterViewState};
 use crate::config;
 use crate::gossip::{GossipContext, Message};
 use crate::node::Node;
@@ -254,6 +255,9 @@ pub struct Topology {
     /// Snapshot of the local node (id, host info, capabilities).
     node: Node,
 
+    /// Shared active cluster view identifier for control-plane observability.
+    cluster_view: ClusterViewState,
+
     /// Addresses and advertise decision logic for the local node.
     networking: Networking,
 
@@ -311,6 +315,7 @@ pub struct TopologyConfig {
     pub gossip_receiver: Receiver<Message>,
     pub gossip_sender: Sender<Message>,
     pub node: Node,
+    pub cluster_view: ClusterViewState,
     pub stores: TopologyStores,
     pub crypto: Keys,
     pub registry: Registry,
@@ -324,6 +329,7 @@ impl Topology {
             gossip_receiver,
             gossip_sender,
             node,
+            cluster_view,
             stores,
             crypto,
             registry,
@@ -349,8 +355,9 @@ impl Topology {
             signing_key,
         } = crypto;
 
-        Ok(Self {
+        let topology = Self {
             node,
+            cluster_view,
             networking: Networking::new(addr),
             gossip: GossipState::new(gossip_receiver, gossip_sender),
             peers,
@@ -372,7 +379,33 @@ impl Topology {
             secret_master_store,
             secret_keyring,
             health_monitor,
-        })
+        };
+
+        info!(
+            target: "cluster_view",
+            active_view = %topology.active_cluster_view(),
+            "initialized topology with active cluster view"
+        );
+
+        Ok(topology)
+    }
+
+    /// Returns the currently active cluster view identifier.
+    pub fn active_cluster_view(&self) -> ClusterViewId {
+        self.cluster_view.active_view()
+    }
+
+    /// Replaces the active cluster view identifier and returns the previous value.
+    #[allow(dead_code)]
+    pub fn set_active_cluster_view(&self, next: ClusterViewId) -> ClusterViewId {
+        let previous = self.cluster_view.set_active_view(next);
+        info!(
+            target: "cluster_view",
+            previous = %previous,
+            next = %next,
+            "updated active cluster view"
+        );
+        previous
     }
 
     pub async fn gossip_topology_event(&self, event: TopologyEvent) -> Result<(), capnp::Error> {
@@ -583,8 +616,11 @@ impl Topology {
 
     /// Populate a NodeInfo builder with this node's identity and addresses.
     pub fn populate_self_node_info(&self, mut info: crate::topology_capnp::node_info::Builder) {
+        let cluster_view = self.active_cluster_view();
+
         // id
         set_node_id(info.reborrow().init_id(), &self.node.id);
+        cluster_view.write_capnp(info.reborrow().init_active_cluster_view());
 
         // handle to this Server (stored in Topology)
         if let Some(h) = self.get_server_handle() {
@@ -958,14 +994,23 @@ impl Topology {
 
         let peers = snapshot.entries.clone();
         let sync_fanout = self.sync.fanout();
+        let cluster_view = self.active_cluster_view();
         let entries = peers.as_ref();
         if entries.is_empty() {
             return;
         }
 
+        debug!(
+            target: "sync",
+            cluster_view = %cluster_view,
+            peer_count = entries.len(),
+            fanout = sync_fanout,
+            "running periodic sync tick"
+        );
+
         let selected_entries = self.select_sync_peers(entries, sync_fanout);
         for entry in selected_entries {
-            self.sync_with_peer(entry).await;
+            self.sync_with_peer(entry, cluster_view).await;
         }
     }
 
@@ -981,7 +1026,7 @@ impl Topology {
         select_sync_peers_for_node(self.node.id, entries, sync_fanout)
     }
 
-    async fn sync_with_peer(&self, entry: &PeerCacheEntry) {
+    async fn sync_with_peer(&self, entry: &PeerCacheEntry, cluster_view: ClusterViewId) {
         let peer_id = entry.peer_id;
         let value = entry.value.as_ref();
 
@@ -1004,7 +1049,7 @@ impl Topology {
             network_attachments: self.network_attachments.clone(),
         };
 
-        sync_all_domains(stores, sync_cap).await;
+        sync_all_domains(stores, sync_cap, cluster_view).await;
     }
 
     /// Kick a one-shot sync pass immediately (no waiting for the next interval).
@@ -1125,6 +1170,10 @@ impl NoisePeerVerifier for Topology {
 impl GossipContext for Topology {
     fn local_peer_id(&self) -> Uuid {
         self.self_id()
+    }
+
+    fn active_cluster_view(&self) -> ClusterViewId {
+        Topology::active_cluster_view(self)
     }
 
     async fn gossip_client_for(

@@ -1,3 +1,4 @@
+use crate::cluster_view::ClusterViewState;
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::{DEFAULT_FANOUT, Message};
 use crate::network::controller::NetworkController;
@@ -317,6 +318,7 @@ impl Bootstrap {
             network_attachments: stores.network_attachments.clone(),
             secret_keyring: stores.secret_keyring.clone(),
         };
+        let cluster_view = ClusterViewState::legacy_default();
 
         let keys = Keys {
             noise_public_key: ctx.noise_keys.public,
@@ -353,6 +355,7 @@ impl Bootstrap {
             gossip_receiver: topology_rx,
             gossip_sender: gossip_tx.clone(),
             node: ctx.node.clone(),
+            cluster_view: cluster_view.clone(),
             stores: topology_stores.clone(),
             crypto: keys,
             registry: registry.clone(),
@@ -363,6 +366,7 @@ impl Bootstrap {
 
         // sync capability
         let sync_service = SyncService::new(
+            cluster_view,
             topology_stores.peers.clone(),
             stores.tasks.clone(),
             stores.services.clone(),

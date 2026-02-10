@@ -5,6 +5,7 @@
 //! other nodes in the cluster based on events and updates to be applied.
 //!
 
+use crate::cluster_view::ClusterViewId;
 use crate::network::service::{read_network_event, write_network_event};
 use crate::network::types::NetworkEvent;
 use crate::secrets::service::{read_secret_event, write_secret_event};
@@ -28,11 +29,16 @@ use std::convert::TryFrom;
 use std::rc::Rc;
 use std::time::Duration;
 use topology::PeerHandle;
-use tracing::error;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 #[async_trait(?Send)]
 pub trait GossipContext: PeerProvider {
+    /// Returns the currently active cluster view used for observability tags.
+    fn active_cluster_view(&self) -> ClusterViewId {
+        ClusterViewId::legacy_default()
+    }
+
     fn local_peer_id(&self) -> Uuid;
 
     async fn gossip_client_for(
@@ -124,6 +130,26 @@ impl gossip::Server for Gossip {
                     continue;
                 }
             };
+            let message_view = match msg.get_view() {
+                Ok(view) => match ClusterViewId::from_capnp(view) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        debug!(
+                            target: "gossip",
+                            gossip_id = %id,
+                            "failed to decode gossip view; falling back to legacy default: {err}"
+                        );
+                        ClusterViewId::legacy_default()
+                    }
+                },
+                Err(_) => ClusterViewId::legacy_default(),
+            };
+            debug!(
+                target: "gossip",
+                gossip_id = %id,
+                view = %message_view,
+                "received gossip message"
+            );
 
             match msg.reborrow().which().expect("failed to read variant") {
                 Void(_) => {
@@ -223,6 +249,14 @@ pub async fn start<C>(
                     None => fanout_sample(&context, DEFAULT_FANOUT).await,
                 };
                 let self_id = context.local_peer_id();
+                let cluster_view = context.active_cluster_view();
+                debug!(
+                    target: "gossip",
+                    cluster_view = %cluster_view,
+                    peer_count = peers.len(),
+                    message_count = pending.len(),
+                    "gossip tick dispatch"
+                );
 
                 for peer in peers.iter() {
                     if peer.id == self_id {
@@ -271,6 +305,7 @@ where
     if messages.is_empty() {
         return Ok(());
     }
+    let cluster_view = ctx.active_cluster_view();
 
     let Some(gossip_cap) = ctx.gossip_client_for(peer).await? else {
         return Ok(());
@@ -284,6 +319,7 @@ where
     for (idx, msg) in messages.iter().enumerate() {
         let mut builder = msgs.reborrow().get(idx as u32);
         builder.set_id(msg.id().as_bytes());
+        cluster_view.write_capnp(builder.reborrow().init_view());
 
         match msg {
             Message::Void { .. } => {
@@ -311,7 +347,16 @@ where
     }
 
     match req.send().promise.await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            debug!(
+                target: "gossip",
+                cluster_view = %cluster_view,
+                peer = %peer.id,
+                message_count = messages.len(),
+                "gossip batch delivered"
+            );
+            Ok(())
+        }
         Err(err) => {
             ctx.invalidate_peer_capabilities(peer).await;
             Err(err)

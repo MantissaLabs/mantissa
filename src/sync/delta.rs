@@ -1,3 +1,4 @@
+use crate::cluster_view::ClusterViewId;
 use crate::network::types::{NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue};
 use crate::secrets::types::SecretValue;
 use crate::services::types::ServiceSpecValue;
@@ -78,6 +79,18 @@ impl delta_sink::Server for DeltaSinkImpl {
         let domain = chunk
             .get_domain()
             .map_err(|_| capnp::Error::failed("unknown sync domain".into()))?;
+        let chunk_view = match chunk.get_view() {
+            Ok(view) => {
+                ClusterViewId::from_capnp(view).unwrap_or_else(|_| ClusterViewId::legacy_default())
+            }
+            Err(_) => ClusterViewId::legacy_default(),
+        };
+        debug!(
+            target: "delta",
+            cluster_view = %chunk_view,
+            ?domain,
+            "received delta chunk"
+        );
 
         match domain {
             Domain::Peers => {
@@ -277,7 +290,11 @@ impl DeltaStore<NetworkAttachmentValue> for NetworkAttachmentStore {
     }
 }
 
-pub async fn sync_all_domains(stores: SyncStores, sync_cap: sync::Client) {
+pub async fn sync_all_domains(
+    stores: SyncStores,
+    sync_cap: sync::Client,
+    cluster_view: ClusterViewId,
+) {
     let res: Result<(), capnp::Error> = async {
         let domains = [
             Domain::Peers,
@@ -359,17 +376,27 @@ pub async fn sync_all_domains(stores: SyncStores, sync_cap: sync::Client) {
                 entry.set_domain(*domain);
                 let summary_builder = entry.reborrow().init_want();
                 capnp_fill_ranges(want_ranges, summary_builder)?;
+                cluster_view.write_capnp(entry.reborrow().init_view());
             }
             od.get().set_sink(sink_client);
         }
 
-        debug!(target: "sync", domains = ?domains_wants.len(), "opening multi-domain delta stream");
+        debug!(
+            target: "sync",
+            cluster_view = %cluster_view,
+            domains = ?domains_wants.len(),
+            "opening multi-domain delta stream"
+        );
         od.send().promise.await?;
         Ok(())
     }
     .await;
 
     if let Err(e) = res {
-        warn!(target: "sync", "sync_all_domains error: {e}");
+        warn!(
+            target: "sync",
+            cluster_view = %cluster_view,
+            "sync_all_domains error: {e}"
+        );
     }
 }
