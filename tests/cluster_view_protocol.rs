@@ -3,8 +3,8 @@ mod common;
 
 use common::testkit::TestNode;
 
-// Validates that Phase-1 view-scoped protocol methods are reachable and backward-compatible.
-local_test!(cluster_view_protocol_compat_inproc, {
+// Validates strict view-scoped protocol behavior for sync and topology.
+local_test!(cluster_view_protocol_strict_inproc, {
     let node = TestNode::new_with_tick_ms(100).await;
 
     let get_view = node.topology().get_cluster_view_request();
@@ -44,6 +44,39 @@ local_test!(cluster_view_protocol_compat_inproc, {
         "view-scoped roots should expose all domains"
     );
 
+    let legacy_roots_req = node.node.sync_client.get_roots_request();
+    let legacy_roots_err = match legacy_roots_req.send().promise.await {
+        Ok(_) => panic!("legacy getRoots should be rejected"),
+        Err(err) => err,
+    };
+    let legacy_roots_msg = legacy_roots_err.to_string();
+    assert!(
+        legacy_roots_msg.contains("no longer supported"),
+        "unexpected legacy getRoots error: {}",
+        legacy_roots_msg
+    );
+
+    let mut mismatched_roots_req = node.node.sync_client.get_roots_for_view_request();
+    {
+        let mut req = mismatched_roots_req.get().init_req();
+        let mut req_view = req.reborrow().init_view();
+        req_view
+            .reborrow()
+            .init_cluster_id()
+            .set_value(&uuid::Uuid::new_v4().into_bytes());
+        req_view.set_epoch(0);
+    }
+    let mismatched_roots_err = match mismatched_roots_req.send().promise.await {
+        Ok(_) => panic!("mismatched view getRootsForView should fail"),
+        Err(err) => err,
+    };
+    let mismatched_roots_msg = mismatched_roots_err.to_string();
+    assert!(
+        mismatched_roots_msg.contains("cluster view mismatch"),
+        "unexpected mismatched getRootsForView error: {}",
+        mismatched_roots_msg
+    );
+
     let mut ranges_req = node.node.sync_client.get_ranges_for_view_request();
     {
         let mut req = ranges_req.get().init_req();
@@ -66,6 +99,19 @@ local_test!(cluster_view_protocol_compat_inproc, {
         ranges.len(),
         7,
         "view-scoped ranges should expose all domains when none requested"
+    );
+
+    let mut legacy_ranges_req = node.node.sync_client.get_ranges_request();
+    legacy_ranges_req.get().init_domains(0);
+    let legacy_ranges_err = match legacy_ranges_req.send().promise.await {
+        Ok(_) => panic!("legacy getRanges should be rejected"),
+        Err(err) => err,
+    };
+    let legacy_ranges_msg = legacy_ranges_err.to_string();
+    assert!(
+        legacy_ranges_msg.contains("no longer supported"),
+        "unexpected legacy getRanges error: {}",
+        legacy_ranges_msg
     );
 
     // Merge/split/operation lookup are intentionally present but unimplemented at this phase.

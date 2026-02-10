@@ -593,6 +593,7 @@ pub fn add_event(
     list: &mut capnp::struct_list::Builder<gossip_message::Owned>,
     index: u32,
     event: &TopologyEvent,
+    cluster_view: ClusterViewId,
 ) {
     let msg = list.reborrow().get(index);
 
@@ -614,7 +615,7 @@ pub fn add_event(
             let mut node = topo.init_node();
 
             set_node_id(node.reborrow().init_id(), id);
-            ClusterViewId::legacy_default().write_capnp(node.reborrow().init_active_cluster_view());
+            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
             node.set_hostname(hostname);
             node.set_addr(address);
             node.set_root_hash(root_hash);
@@ -640,7 +641,7 @@ pub fn add_event(
             topo.set_event(topology_event::EventType::Remove);
             let mut node = topo.init_node();
             set_node_id(node.reborrow().init_id(), id);
-            ClusterViewId::legacy_default().write_capnp(node.reborrow().init_active_cluster_view());
+            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
         }
 
         TopologyEvent::Suspect { id } => {
@@ -648,7 +649,7 @@ pub fn add_event(
             topo.set_event(topology_event::EventType::Suspect);
             let mut node = topo.init_node();
             set_node_id(node.reborrow().init_id(), id);
-            ClusterViewId::legacy_default().write_capnp(node.reborrow().init_active_cluster_view());
+            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
         }
     }
 }

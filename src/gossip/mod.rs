@@ -5,7 +5,7 @@
 //! other nodes in the cluster based on events and updates to be applied.
 //!
 
-use crate::cluster_view::ClusterViewId;
+use crate::cluster_view::{ClusterViewId, ClusterViewState};
 use crate::network::service::{read_network_event, write_network_event};
 use crate::network::types::NetworkEvent;
 use crate::secrets::service::{read_secret_event, write_secret_event};
@@ -80,6 +80,7 @@ pub const DEFAULT_FANOUT: usize = 5;
 /// Represents the gossip server.
 pub struct Gossip {
     pub chans: Channels,
+    pub cluster_view: ClusterViewState,
 }
 
 pub struct Channels {
@@ -137,13 +138,31 @@ impl gossip::Server for Gossip {
                         debug!(
                             target: "gossip",
                             gossip_id = %id,
-                            "failed to decode gossip view; falling back to legacy default: {err}"
+                            "dropping gossip message with invalid cluster view: {err}"
                         );
-                        ClusterViewId::legacy_default()
+                        continue;
                     }
                 },
-                Err(_) => ClusterViewId::legacy_default(),
+                Err(_) => {
+                    debug!(
+                        target: "gossip",
+                        gossip_id = %id,
+                        "dropping gossip message without cluster view"
+                    );
+                    continue;
+                }
             };
+            let active_view = self.cluster_view.active_view();
+            if message_view != active_view {
+                debug!(
+                    target: "gossip",
+                    gossip_id = %id,
+                    message_view = %message_view,
+                    active_view = %active_view,
+                    "dropping gossip message for non-active cluster view"
+                );
+                continue;
+            }
             debug!(
                 target: "gossip",
                 gossip_id = %id,
@@ -326,7 +345,7 @@ where
                 builder.init_void();
             }
             Message::Topology { event, .. } => {
-                topology::add_event(&mut msgs, idx as u32, event);
+                topology::add_event(&mut msgs, idx as u32, event, cluster_view);
             }
             Message::Task { event, .. } => {
                 task_service::add_event(&mut msgs, idx as u32, event);

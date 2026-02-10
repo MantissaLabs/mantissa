@@ -4,6 +4,7 @@ use std::{io, net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
+    cluster_view::ClusterViewId,
     gossip::DEFAULT_FANOUT,
     node,
     server::{
@@ -464,7 +465,27 @@ impl HeadlessNode {
     }
 
     pub async fn local_peers_root_hex(&self) -> String {
-        match self.sync_client.get_roots_request().send().promise.await {
+        let cluster_view = {
+            let view_req = self.topology_client.get_cluster_view_request();
+            match view_req.send().promise.await {
+                Ok(resp) => match resp.get().and_then(|reader| reader.get_view()) {
+                    Ok(view_reader) => match ClusterViewId::from_capnp(view_reader) {
+                        Ok(view) => view,
+                        Err(_) => return String::new(),
+                    },
+                    Err(_) => return String::new(),
+                },
+                Err(_) => return String::new(),
+            }
+        };
+
+        let mut roots_req = self.sync_client.get_roots_for_view_request();
+        {
+            let mut req = roots_req.get().init_req();
+            cluster_view.write_capnp(req.reborrow().init_view());
+        }
+
+        match roots_req.send().promise.await {
             Ok(resp) => match resp.get() {
                 Ok(reader) => match reader.get_roots() {
                     Ok(list) => {

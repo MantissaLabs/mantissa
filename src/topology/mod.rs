@@ -1030,7 +1030,11 @@ impl Topology {
         let peer_id = entry.peer_id;
         let value = entry.value.as_ref();
 
-        let sync_cap = match self.registry.fetch_sync_capability(peer_id).await {
+        let sync_cap = match self
+            .registry
+            .fetch_sync_capability(peer_id, cluster_view)
+            .await
+        {
             Ok(Some(cap)) => cap,
             Ok(None) => return,
             Err(e) => {
@@ -1075,6 +1079,7 @@ impl Topology {
             Some(s) => s,
             None => return,
         };
+        let cluster_view = self.active_cluster_view();
 
         // Build list of peers excluding self
         let mut candidates: Vec<(uuid::Uuid, String)> = Vec::new();
@@ -1097,7 +1102,11 @@ impl Topology {
         let sample = candidates.into_iter().take(fanout);
 
         for (peer_id, addr) in sample {
-            let health_cap = match self.registry.fetch_health_capability(peer_id).await {
+            let health_cap = match self
+                .registry
+                .fetch_health_capability(peer_id, cluster_view)
+                .await
+            {
                 Ok(Some(h)) => h,
                 Ok(None) => continue,
                 Err(e) => {
@@ -1180,7 +1189,9 @@ impl GossipContext for Topology {
         &self,
         peer: &PeerHandle,
     ) -> Result<Option<GossipClient>, capnp::Error> {
-        self.registry.gossip_client_for(peer.id).await
+        self.registry
+            .gossip_client_for(peer.id, self.active_cluster_view())
+            .await
     }
 
     async fn invalidate_peer_capabilities(&self, peer: &PeerHandle) {

@@ -1,4 +1,5 @@
 use super::Server;
+use crate::cluster_view::ClusterViewId;
 use crate::crypto::rand;
 use crate::node::id;
 use crate::node::identity::{pubkey_from_slice, verify_peer_identity};
@@ -29,6 +30,15 @@ impl protocol::server::Server for Server {
         let joiner_id = id::read_node_id(info.get_id()?)?;
         if joiner_id == self.id {
             return Err(capnp::Error::failed("cannot join self".to_string()));
+        }
+
+        let joiner_view = ClusterViewId::from_capnp(info.get_active_cluster_view()?)
+            .map_err(capnp::Error::failed)?;
+        let active_view = self.topology.active_cluster_view();
+        if joiner_view != active_view {
+            return Err(capnp::Error::failed(format!(
+                "register_node view mismatch: joiner {joiner_view}, local {active_view}"
+            )));
         }
 
         // Already registered?

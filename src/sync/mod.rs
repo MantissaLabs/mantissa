@@ -5,7 +5,6 @@ use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
-use capnp_rpc::new_client;
 use crdt_store::mst_store::{Registers, Tombstones};
 use crdt_store::uuid_key::UuidKey;
 use protocol::sync::{Domain, delta_sink, sync};
@@ -57,9 +56,22 @@ impl SyncService {
         }
     }
 
-    /// Builds a local capability client bound to this service implementation.
-    fn client(&self) -> sync::Client {
-        new_client(self.clone())
+    /// Returns an error when a peer requests legacy non-view-scoped sync methods.
+    fn legacy_sync_method_error(method: &str) -> capnp::Error {
+        capnp::Error::failed(format!(
+            "{method} is no longer supported; use the view-scoped sync RPCs"
+        ))
+    }
+
+    /// Validates that the requested view matches this node's active control-plane view.
+    fn require_active_view(&self, requested: ClusterViewId) -> Result<ClusterViewId, capnp::Error> {
+        let active = self.cluster_view.active_view();
+        if requested != active {
+            return Err(capnp::Error::failed(format!(
+                "cluster view mismatch: requested {requested}, active {active}"
+            )));
+        }
+        Ok(active)
     }
 }
 
@@ -67,13 +79,42 @@ impl sync::Server for SyncService {
     async fn get_roots(
         self: Rc<Self>,
         _params: sync::GetRootsParams,
-        mut results: sync::GetRootsResults,
+        _results: sync::GetRootsResults,
     ) -> Result<(), capnp::Error> {
-        let cluster_view = self.cluster_view.active_view();
+        Err(Self::legacy_sync_method_error("getRoots"))
+    }
+
+    async fn get_ranges(
+        self: Rc<Self>,
+        _params: sync::GetRangesParams,
+        _results: sync::GetRangesResults,
+    ) -> Result<(), capnp::Error> {
+        Err(Self::legacy_sync_method_error("getRanges"))
+    }
+
+    async fn open_delta(
+        self: Rc<Self>,
+        _params: sync::OpenDeltaParams,
+        _results: sync::OpenDeltaResults,
+    ) -> Result<(), capnp::Error> {
+        Err(Self::legacy_sync_method_error("openDelta"))
+    }
+
+    /// Returns domain roots scoped to the caller-provided cluster view.
+    async fn get_roots_for_view(
+        self: Rc<Self>,
+        params: sync::GetRootsForViewParams,
+        mut results: sync::GetRootsForViewResults,
+    ) -> Result<(), capnp::Error> {
+        let req = params.get()?.get_req()?;
+        let requested_view =
+            ClusterViewId::from_capnp(req.get_view()?).map_err(capnp::Error::failed)?;
+        let active_view = self.require_active_view(requested_view)?;
         debug!(
             target: "sync",
-            cluster_view = %cluster_view,
-            "get_roots request received"
+            requested_view = %requested_view,
+            active_view = %active_view,
+            "get_roots_for_view request received"
         );
 
         let peers = &self.peers;
@@ -108,22 +149,27 @@ impl sync::Server for SyncService {
             let mut entry = list.reborrow().get(idx as u32);
             entry.set_domain(*domain);
             entry.set_root_hex(&root_hex);
-            cluster_view.write_capnp(entry.reborrow().init_view());
+            active_view.write_capnp(entry.reborrow().init_view());
         }
 
         Ok(())
     }
 
-    async fn get_ranges(
+    /// Returns range summaries scoped to the caller-provided cluster view.
+    async fn get_ranges_for_view(
         self: Rc<Self>,
-        params: sync::GetRangesParams,
-        mut results: sync::GetRangesResults,
+        params: sync::GetRangesForViewParams,
+        mut results: sync::GetRangesForViewResults,
     ) -> Result<(), capnp::Error> {
-        let cluster_view = self.cluster_view.active_view();
+        let req = params.get()?.get_req()?;
+        let requested_view =
+            ClusterViewId::from_capnp(req.get_view()?).map_err(capnp::Error::failed)?;
+        let active_view = self.require_active_view(requested_view)?;
         debug!(
             target: "sync",
-            cluster_view = %cluster_view,
-            "get_ranges request received"
+            requested_view = %requested_view,
+            active_view = %active_view,
+            "get_ranges_for_view request received"
         );
 
         let peers = &self.peers;
@@ -135,7 +181,7 @@ impl sync::Server for SyncService {
         let network_attachments = &self.network_attachments;
 
         let requested_domains: Vec<Domain> = {
-            let domains_reader = params.get()?.get_domains()?;
+            let domains_reader = req.get_domains()?;
             if domains_reader.is_empty() {
                 vec![
                     Domain::Peers,
@@ -159,7 +205,7 @@ impl sync::Server for SyncService {
         for (idx, domain) in requested_domains.iter().enumerate() {
             match domain {
                 Domain::Peers => {
-                    debug!("getRanges: received (peers)");
+                    debug!("getRangesForView: received (peers)");
                     peers.debug_dump_root("server.before.get_ranges").await;
                     peers.debug_dump_ranges("server.before.get_ranges", 5).await;
                     let ranges = peers
@@ -170,10 +216,10 @@ impl sync::Server for SyncService {
                     entry.set_domain(Domain::Peers);
                     let summary = entry.reborrow().init_summary();
                     capnp_fill_ranges(&ranges, summary)?;
-                    cluster_view.write_capnp(entry.reborrow().init_view());
+                    active_view.write_capnp(entry.reborrow().init_view());
                 }
                 Domain::Tasks => {
-                    debug!("getRanges: received (tasks)");
+                    debug!("getRangesForView: received (tasks)");
                     tasks
                         .debug_dump_root("server.before.get_ranges.tasks")
                         .await;
@@ -188,10 +234,10 @@ impl sync::Server for SyncService {
                     entry.set_domain(Domain::Tasks);
                     let summary = entry.reborrow().init_summary();
                     capnp_fill_ranges(&ranges, summary)?;
-                    cluster_view.write_capnp(entry.reborrow().init_view());
+                    active_view.write_capnp(entry.reborrow().init_view());
                 }
                 Domain::Services => {
-                    debug!("getRanges: received (services)");
+                    debug!("getRangesForView: received (services)");
                     services
                         .debug_dump_root("server.before.get_ranges.services")
                         .await;
@@ -206,10 +252,10 @@ impl sync::Server for SyncService {
                     entry.set_domain(Domain::Services);
                     let summary = entry.reborrow().init_summary();
                     capnp_fill_ranges(&ranges, summary)?;
-                    cluster_view.write_capnp(entry.reborrow().init_view());
+                    active_view.write_capnp(entry.reborrow().init_view());
                 }
                 Domain::Secrets => {
-                    debug!("getRanges: received (secrets)");
+                    debug!("getRangesForView: received (secrets)");
                     secrets
                         .debug_dump_root("server.before.get_ranges.secrets")
                         .await;
@@ -224,10 +270,10 @@ impl sync::Server for SyncService {
                     entry.set_domain(Domain::Secrets);
                     let summary = entry.reborrow().init_summary();
                     capnp_fill_ranges(&ranges, summary)?;
-                    cluster_view.write_capnp(entry.reborrow().init_view());
+                    active_view.write_capnp(entry.reborrow().init_view());
                 }
                 Domain::Networks => {
-                    debug!("getRanges: received (networks)");
+                    debug!("getRangesForView: received (networks)");
                     networks
                         .debug_dump_root("server.before.get_ranges.networks")
                         .await;
@@ -242,10 +288,10 @@ impl sync::Server for SyncService {
                     entry.set_domain(Domain::Networks);
                     let summary = entry.reborrow().init_summary();
                     capnp_fill_ranges(&ranges, summary)?;
-                    cluster_view.write_capnp(entry.reborrow().init_view());
+                    active_view.write_capnp(entry.reborrow().init_view());
                 }
                 Domain::NetworkPeers => {
-                    debug!("getRanges: received (network peers)");
+                    debug!("getRangesForView: received (network peers)");
                     network_peers
                         .debug_dump_root("server.before.get_ranges.network_peers")
                         .await;
@@ -260,10 +306,10 @@ impl sync::Server for SyncService {
                     entry.set_domain(Domain::NetworkPeers);
                     let summary = entry.reborrow().init_summary();
                     capnp_fill_ranges(&ranges, summary)?;
-                    cluster_view.write_capnp(entry.reborrow().init_view());
+                    active_view.write_capnp(entry.reborrow().init_view());
                 }
                 Domain::NetworkAttachments => {
-                    debug!("getRanges: received (network attachments)");
+                    debug!("getRangesForView: received (network attachments)");
                     network_attachments
                         .debug_dump_root("server.before.get_ranges.network_attachments")
                         .await;
@@ -278,7 +324,7 @@ impl sync::Server for SyncService {
                     entry.set_domain(Domain::NetworkAttachments);
                     let summary = entry.reborrow().init_summary();
                     capnp_fill_ranges(&ranges, summary)?;
-                    cluster_view.write_capnp(entry.reborrow().init_view());
+                    active_view.write_capnp(entry.reborrow().init_view());
                 }
             }
         }
@@ -286,16 +332,21 @@ impl sync::Server for SyncService {
         Ok(())
     }
 
-    async fn open_delta(
+    /// Streams delta chunks scoped to the caller-provided cluster view.
+    async fn open_delta_for_view(
         self: Rc<Self>,
-        params: sync::OpenDeltaParams,
-        _results: sync::OpenDeltaResults,
+        params: sync::OpenDeltaForViewParams,
+        _results: sync::OpenDeltaForViewResults,
     ) -> Result<(), capnp::Error> {
-        let cluster_view = self.cluster_view.active_view();
+        let req = params.get()?.get_req()?;
+        let requested_view =
+            ClusterViewId::from_capnp(req.get_view()?).map_err(capnp::Error::failed)?;
+        let active_view = self.require_active_view(requested_view)?;
         debug!(
             target: "delta",
-            cluster_view = %cluster_view,
-            "open_delta request received"
+            requested_view = %requested_view,
+            active_view = %active_view,
+            "open_delta_for_view request received"
         );
 
         let peers = &self.peers;
@@ -306,9 +357,8 @@ impl sync::Server for SyncService {
         let network_peers = &self.network_peers;
         let network_attachments = &self.network_attachments;
 
-        let p = params.get()?;
-        let wants_reader = p.get_wants()?;
-        let sink = p.get_sink()?;
+        let wants_reader = req.get_wants()?;
+        let sink = req.get_sink()?;
 
         if wants_reader.is_empty() {
             sink.end_request().send().promise.await?;
@@ -319,6 +369,14 @@ impl sync::Server for SyncService {
 
         for idx in 0..wants_reader.len() {
             let want = wants_reader.get(idx);
+            let want_view =
+                ClusterViewId::from_capnp(want.get_view()?).map_err(capnp::Error::failed)?;
+            if want_view != active_view {
+                return Err(capnp::Error::failed(format!(
+                    "domain want view mismatch: expected {active_view}, got {want_view}"
+                )));
+            }
+
             let domain = want
                 .get_domain()
                 .map_err(|_| capnp::Error::failed("unknown sync domain".into()))?;
@@ -329,18 +387,18 @@ impl sync::Server for SyncService {
 
             match domain {
                 Domain::Peers => {
-                    debug!(target: "delta", "open_delta: received (peers)");
+                    debug!(target: "delta", "open_delta_for_view: received (peers)");
                     peers.debug_dump_root("server.before.open_delta").await;
                     peers.debug_dump_ranges("server.before.open_delta", 5).await;
                     let (regs, tombs) = peers
                         .export_page_ranges_delta(&want_ranges)
                         .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, cluster_view, &sink).await? {
+                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
                         sent_chunks = true;
                     }
                 }
                 Domain::Tasks => {
-                    debug!(target: "delta", "open_delta: received (tasks)");
+                    debug!(target: "delta", "open_delta_for_view: received (tasks)");
                     tasks
                         .debug_dump_root("server.before.open_delta.tasks")
                         .await;
@@ -350,12 +408,12 @@ impl sync::Server for SyncService {
                     let (regs, tombs) = tasks
                         .export_page_ranges_delta(&want_ranges)
                         .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, cluster_view, &sink).await? {
+                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
                         sent_chunks = true;
                     }
                 }
                 Domain::Services => {
-                    debug!(target: "delta", "open_delta: received (services)");
+                    debug!(target: "delta", "open_delta_for_view: received (services)");
                     services
                         .debug_dump_root("server.before.open_delta.services")
                         .await;
@@ -365,12 +423,12 @@ impl sync::Server for SyncService {
                     let (regs, tombs) = services
                         .export_page_ranges_delta(&want_ranges)
                         .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, cluster_view, &sink).await? {
+                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
                         sent_chunks = true;
                     }
                 }
                 Domain::Secrets => {
-                    debug!(target: "delta", "open_delta: received (secrets)");
+                    debug!(target: "delta", "open_delta_for_view: received (secrets)");
                     secrets
                         .debug_dump_root("server.before.open_delta.secrets")
                         .await;
@@ -380,12 +438,12 @@ impl sync::Server for SyncService {
                     let (regs, tombs) = secrets
                         .export_page_ranges_delta(&want_ranges)
                         .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, cluster_view, &sink).await? {
+                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
                         sent_chunks = true;
                     }
                 }
                 Domain::Networks => {
-                    debug!(target: "delta", "open_delta: received (networks)");
+                    debug!(target: "delta", "open_delta_for_view: received (networks)");
                     networks
                         .debug_dump_root("server.before.open_delta.networks")
                         .await;
@@ -395,12 +453,15 @@ impl sync::Server for SyncService {
                     let (regs, tombs) = networks
                         .export_page_ranges_delta(&want_ranges)
                         .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, cluster_view, &sink).await? {
+                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
                         sent_chunks = true;
                     }
                 }
                 Domain::NetworkPeers => {
-                    debug!(target: "delta", "open_delta: received (network peers)");
+                    debug!(
+                        target: "delta",
+                        "open_delta_for_view: received (network peers)"
+                    );
                     network_peers
                         .debug_dump_root("server.before.open_delta.network_peers")
                         .await;
@@ -410,12 +471,15 @@ impl sync::Server for SyncService {
                     let (regs, tombs) = network_peers
                         .export_page_ranges_delta(&want_ranges)
                         .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, cluster_view, &sink).await? {
+                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
                         sent_chunks = true;
                     }
                 }
                 Domain::NetworkAttachments => {
-                    debug!(target: "delta", "open_delta: received (network attachments)");
+                    debug!(
+                        target: "delta",
+                        "open_delta_for_view: received (network attachments)"
+                    );
                     network_attachments
                         .debug_dump_root("server.before.open_delta.network_attachments")
                         .await;
@@ -425,7 +489,7 @@ impl sync::Server for SyncService {
                     let (regs, tombs) = network_attachments
                         .export_page_ranges_delta(&want_ranges)
                         .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, cluster_view, &sink).await? {
+                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
                         sent_chunks = true;
                     }
                 }
@@ -433,138 +497,10 @@ impl sync::Server for SyncService {
         }
 
         if !sent_chunks {
-            debug!(target: "delta", "open_delta: no chunks emitted");
+            debug!(target: "delta", "open_delta_for_view: no chunks emitted");
         }
 
         sink.end_request().send().promise.await?;
-        Ok(())
-    }
-
-    /// Compatibility method that accepts a view-scoped roots request and serves legacy roots.
-    async fn get_roots_for_view(
-        self: Rc<Self>,
-        params: sync::GetRootsForViewParams,
-        mut results: sync::GetRootsForViewResults,
-    ) -> Result<(), capnp::Error> {
-        let req = params.get()?.get_req()?;
-        let requested_view = ClusterViewId::from_capnp(req.get_view()?)
-            .unwrap_or_else(|_| ClusterViewId::legacy_default());
-        let active_view = self.cluster_view.active_view();
-        debug!(
-            target: "sync",
-            requested_view = %requested_view,
-            active_view = %active_view,
-            "get_roots_for_view request received"
-        );
-
-        let legacy = self.client();
-        let roots_resp = legacy.get_roots_request().send().promise.await?;
-        let roots_reader = roots_resp.get()?.get_roots()?;
-        let mut list = results.get().init_roots(roots_reader.len());
-        for idx in 0..roots_reader.len() {
-            let source = roots_reader.get(idx);
-            let domain = source
-                .get_domain()
-                .map_err(|_| capnp::Error::failed("unknown sync domain".into()))?;
-            let root_hex = source.get_root_hex()?;
-
-            let mut entry = list.reborrow().get(idx);
-            entry.set_domain(domain);
-            entry.set_root_hex(root_hex);
-            active_view.write_capnp(entry.reborrow().init_view());
-        }
-
-        Ok(())
-    }
-
-    /// Compatibility method that accepts a view-scoped ranges request and serves legacy ranges.
-    async fn get_ranges_for_view(
-        self: Rc<Self>,
-        params: sync::GetRangesForViewParams,
-        mut results: sync::GetRangesForViewResults,
-    ) -> Result<(), capnp::Error> {
-        let req = params.get()?.get_req()?;
-        let requested_view = ClusterViewId::from_capnp(req.get_view()?)
-            .unwrap_or_else(|_| ClusterViewId::legacy_default());
-        let active_view = self.cluster_view.active_view();
-        debug!(
-            target: "sync",
-            requested_view = %requested_view,
-            active_view = %active_view,
-            "get_ranges_for_view request received"
-        );
-
-        let legacy = self.client();
-        let mut legacy_req = legacy.get_ranges_request();
-        {
-            let domains = req.get_domains()?;
-            let mut out_domains = legacy_req.get().init_domains(domains.len());
-            for idx in 0..domains.len() {
-                out_domains.set(idx, domains.get(idx)?);
-            }
-        }
-
-        let legacy_resp = legacy_req.send().promise.await?;
-        let legacy_ranges = legacy_resp.get()?.get_ranges()?;
-        let mut out_ranges = results.get().init_ranges(legacy_ranges.len());
-        for idx in 0..legacy_ranges.len() {
-            let source = legacy_ranges.get(idx);
-            let domain = source
-                .get_domain()
-                .map_err(|_| capnp::Error::failed("unknown sync domain".into()))?;
-            let summary = source.get_summary()?;
-            let page_ranges = page_ranges_from_capnp(summary)?;
-
-            let mut target = out_ranges.reborrow().get(idx);
-            target.set_domain(domain);
-            let target_summary = target.reborrow().init_summary();
-            capnp_fill_ranges(&page_ranges, target_summary)?;
-            active_view.write_capnp(target.reborrow().init_view());
-        }
-
-        Ok(())
-    }
-
-    /// Compatibility method that accepts a view-scoped delta request and forwards to legacy openDelta.
-    async fn open_delta_for_view(
-        self: Rc<Self>,
-        params: sync::OpenDeltaForViewParams,
-        _results: sync::OpenDeltaForViewResults,
-    ) -> Result<(), capnp::Error> {
-        let req = params.get()?.get_req()?;
-        let requested_view = ClusterViewId::from_capnp(req.get_view()?)
-            .unwrap_or_else(|_| ClusterViewId::legacy_default());
-        let active_view = self.cluster_view.active_view();
-        debug!(
-            target: "delta",
-            requested_view = %requested_view,
-            active_view = %active_view,
-            "open_delta_for_view request received"
-        );
-
-        let legacy = self.client();
-        let mut legacy_req = legacy.open_delta_request();
-        {
-            let wants = req.get_wants()?;
-            let mut out_wants = legacy_req.get().init_wants(wants.len());
-            for idx in 0..wants.len() {
-                let source = wants.get(idx);
-                let domain = source
-                    .get_domain()
-                    .map_err(|_| capnp::Error::failed("unknown sync domain".into()))?;
-                let page_ranges = page_ranges_from_capnp(source.get_want()?)?;
-
-                let mut target = out_wants.reborrow().get(idx);
-                target.set_domain(domain);
-                let target_summary = target.reborrow().init_want();
-                capnp_fill_ranges(&page_ranges, target_summary)?;
-                active_view.write_capnp(target.reborrow().init_view());
-            }
-
-            legacy_req.get().set_sink(req.get_sink()?);
-        }
-
-        legacy_req.send().promise.await?;
         Ok(())
     }
 }

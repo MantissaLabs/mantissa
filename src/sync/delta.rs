@@ -62,11 +62,15 @@ impl SyncStores {
 
 pub struct DeltaSinkImpl {
     stores: SyncStores,
+    expected_view: ClusterViewId,
 }
 
 impl DeltaSinkImpl {
-    pub fn new(stores: SyncStores) -> Self {
-        Self { stores }
+    pub fn new(stores: SyncStores, expected_view: ClusterViewId) -> Self {
+        Self {
+            stores,
+            expected_view,
+        }
     }
 }
 
@@ -79,12 +83,14 @@ impl delta_sink::Server for DeltaSinkImpl {
         let domain = chunk
             .get_domain()
             .map_err(|_| capnp::Error::failed("unknown sync domain".into()))?;
-        let chunk_view = match chunk.get_view() {
-            Ok(view) => {
-                ClusterViewId::from_capnp(view).unwrap_or_else(|_| ClusterViewId::legacy_default())
-            }
-            Err(_) => ClusterViewId::legacy_default(),
-        };
+        let chunk_view =
+            ClusterViewId::from_capnp(chunk.get_view()?).map_err(capnp::Error::failed)?;
+        if chunk_view != self.expected_view {
+            return Err(capnp::Error::failed(format!(
+                "delta chunk view mismatch: expected {}, got {}",
+                self.expected_view, chunk_view
+            )));
+        }
         debug!(
             target: "delta",
             cluster_view = %chunk_view,
@@ -306,13 +312,24 @@ pub async fn sync_all_domains(
             Domain::NetworkAttachments,
         ];
 
-        let roots_req = sync_cap.get_roots_request();
+        let mut roots_req = sync_cap.get_roots_for_view_request();
+        {
+            let mut req = roots_req.get().init_req();
+            cluster_view.write_capnp(req.reborrow().init_view());
+        }
         let roots_resp = roots_req.send().promise.await?;
         let roots_reader = roots_resp.get()?.get_roots()?;
 
         let mut remote_roots = Vec::with_capacity(roots_reader.len() as usize);
         for idx in 0..roots_reader.len() {
             let entry = roots_reader.get(idx);
+            let root_view =
+                ClusterViewId::from_capnp(entry.get_view()?).map_err(capnp::Error::failed)?;
+            if root_view != cluster_view {
+                return Err(capnp::Error::failed(format!(
+                    "sync roots view mismatch: expected {cluster_view}, got {root_view}"
+                )));
+            }
             let domain = entry
                 .get_domain()
                 .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
@@ -337,9 +354,11 @@ pub async fn sync_all_domains(
             return Ok(());
         }
 
-        let mut ranges_req = sync_cap.get_ranges_request();
+        let mut ranges_req = sync_cap.get_ranges_for_view_request();
         {
-            let mut list = ranges_req.get().init_domains(domains_to_sync.len() as u32);
+            let mut req = ranges_req.get().init_req();
+            cluster_view.write_capnp(req.reborrow().init_view());
+            let mut list = req.reborrow().init_domains(domains_to_sync.len() as u32);
             for (idx, domain) in domains_to_sync.iter().enumerate() {
                 list.set(idx as u32, *domain);
             }
@@ -350,6 +369,13 @@ pub async fn sync_all_domains(
         let mut domains_wants = Vec::new();
         for idx in 0..ranges_reader.len() {
             let summary = ranges_reader.get(idx);
+            let summary_view =
+                ClusterViewId::from_capnp(summary.get_view()?).map_err(capnp::Error::failed)?;
+            if summary_view != cluster_view {
+                return Err(capnp::Error::failed(format!(
+                    "sync ranges view mismatch: expected {cluster_view}, got {summary_view}"
+                )));
+            }
             let domain = summary
                 .get_domain()
                 .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
@@ -366,11 +392,13 @@ pub async fn sync_all_domains(
             return Ok(());
         }
 
-        let sink_client = new_client(DeltaSinkImpl::new(stores.clone()));
+        let sink_client = new_client(DeltaSinkImpl::new(stores.clone(), cluster_view));
 
-        let mut od = sync_cap.open_delta_request();
+        let mut od = sync_cap.open_delta_for_view_request();
         {
-            let mut wants_builder = od.get().init_wants(domains_wants.len() as u32);
+            let mut req = od.get().init_req();
+            cluster_view.write_capnp(req.reborrow().init_view());
+            let mut wants_builder = req.reborrow().init_wants(domains_wants.len() as u32);
             for (idx, (domain, want_ranges)) in domains_wants.iter().enumerate() {
                 let mut entry = wants_builder.reborrow().get(idx as u32);
                 entry.set_domain(*domain);
@@ -378,7 +406,7 @@ pub async fn sync_all_domains(
                 capnp_fill_ranges(want_ranges, summary_builder)?;
                 cluster_view.write_capnp(entry.reborrow().init_view());
             }
-            od.get().set_sink(sink_client);
+            req.set_sink(sink_client);
         }
 
         debug!(

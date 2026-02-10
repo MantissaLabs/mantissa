@@ -286,6 +286,7 @@ impl Bootstrap {
             async_channel::bounded(128);
         let (secret_tx, secret_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(128);
+        let cluster_view = ClusterViewState::legacy_default();
 
         // gossip capability
         let gossip = crate::gossip::Gossip {
@@ -296,6 +297,7 @@ impl Bootstrap {
                 network_events: network_tx.clone(),
                 secret_events: secret_tx.clone(),
             },
+            cluster_view: cluster_view.clone(),
         };
         let gossip_client = capnp_rpc::new_client(gossip);
 
@@ -318,7 +320,6 @@ impl Bootstrap {
             network_attachments: stores.network_attachments.clone(),
             secret_keyring: stores.secret_keyring.clone(),
         };
-        let cluster_view = ClusterViewState::legacy_default();
 
         let keys = Keys {
             noise_public_key: ctx.noise_keys.public,
