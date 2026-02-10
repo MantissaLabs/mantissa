@@ -16,6 +16,7 @@ use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerStores};
 use crate::services::{ServiceController, ServiceRegistry, ServicesRPC};
+use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::local::load_or_create_node_id;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
@@ -103,6 +104,7 @@ pub(crate) struct Bootstrap {
 
 pub(crate) struct Stores {
     pub peers: PeersStore,
+    pub cluster_operations: ClusterOperationStore,
     pub session_auth: AuthStore,           // server-side issued tickets
     pub local_sessions: LocalSessionStore, // client-side resume tickets (encrypted)
     pub local_creds: LocalCredentialStore, // short-lived cluster creds
@@ -205,6 +207,7 @@ impl Bootstrap {
         // Peers store (CRDT+MST)
         let peers: PeersStore = open_peers_store(ctx.db.clone(), ctx.self_id)?;
         peers.rebuild_mst_from_disk().await?;
+        let cluster_operations = ClusterOperationStore::new(ctx.db.clone())?;
 
         // Server-side session ticket store (anchor issues)
         let session_auth = crate::server::auth::AuthStore::new(ctx.db.clone())?;
@@ -254,6 +257,7 @@ impl Bootstrap {
 
         Ok(Stores {
             peers,
+            cluster_operations,
             session_auth,
             local_sessions,
             local_creds,
@@ -310,6 +314,7 @@ impl Bootstrap {
             credentials: stores.local_creds.clone(),
             sessions: stores.local_sessions.clone(),
             peers: stores.peers.clone(),
+            cluster_operations: stores.cluster_operations.clone(),
             token_store: stores.token_store.clone(),
             secret_master_store: stores.secret_master_store.clone(),
             tasks: stores.tasks.clone(),

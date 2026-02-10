@@ -1,5 +1,5 @@
 use super::{Topology, types::TopologyEvent};
-use crate::cluster_view::ClusterViewId;
+use crate::cluster_view::{ClusterId, ClusterViewId};
 use crate::config;
 use crate::node::address::extract_port;
 use crate::node::id::{read_node_id, set_node_id};
@@ -11,6 +11,9 @@ use crate::store::peer_store::PeersStore;
 use crate::store::secret_master_store::MasterKeyRecord;
 use crate::sync::delta::{SyncStores, sync_all_domains};
 use crate::topology::health::status_to_node_status;
+use crate::topology::operation::{
+    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage,
+};
 use crate::topology::peers::{PeerValue, WireGuardPeerValue};
 use capnp::Error;
 use capnp::data;
@@ -20,7 +23,7 @@ use protocol::gossip::gossip_message;
 use protocol::server::{self, cluster_session};
 use protocol::topology::{topology, topology_event};
 use std::rc::Rc;
-use tracing::{info, warn};
+use tracing::info;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -240,6 +243,39 @@ impl Topology {
 
         Ok(())
     }
+
+    /// Persists a cluster operation record in the local durable operation store.
+    fn persist_cluster_operation(&self, op: &ClusterOperationRecord) -> Result<(), capnp::Error> {
+        let encoded = bincode::serialize(op).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        self.cluster_operations
+            .put(op.id, &encoded)
+            .map_err(|e| capnp::Error::failed(e.to_string()))
+    }
+
+    /// Loads a cluster operation record by id from the local durable operation store.
+    fn load_cluster_operation(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<ClusterOperationRecord>, capnp::Error> {
+        let bytes = self
+            .cluster_operations
+            .get(id)
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let decoded: ClusterOperationRecord =
+            bincode::deserialize(&bytes).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        Ok(Some(decoded))
+    }
+
+    /// Parses a cluster operation id from raw RPC bytes, enforcing UUID byte length.
+    fn operation_id_from_data(data: capnp::data::Reader<'_>) -> Result<Uuid, capnp::Error> {
+        let id_bytes: [u8; 16] = data
+            .try_into()
+            .map_err(|_| capnp::Error::failed("cluster operation id must be 16 bytes".into()))?;
+        Ok(Uuid::from_bytes(id_bytes))
+    }
 }
 
 impl topology::Server for Topology {
@@ -455,65 +491,146 @@ impl topology::Server for Topology {
         Ok(())
     }
 
-    /// Merge RPC placeholder for protocol compatibility during phased rollout.
+    /// Registers a merge operation intent and stores it durably for later orchestration stages.
     async fn merge_clusters(
         self: Rc<Self>,
         params: topology::MergeClustersParams,
-        _results: topology::MergeClustersResults,
+        mut results: topology::MergeClustersResults,
     ) -> Result<(), capnp::Error> {
-        if let Ok(req) = params.get().and_then(|p| p.get_req()) {
-            let dry_run = req.get_dry_run();
-            warn!(
-                target: "cluster_view",
-                dry_run,
-                "merge_clusters RPC invoked before merge engine implementation"
-            );
-        } else {
-            warn!(
-                target: "cluster_view",
-                "merge_clusters RPC invoked with unreadable request payload"
-            );
+        let req = params.get()?.get_req()?;
+        let source_view =
+            ClusterViewId::from_capnp(req.get_source_view()?).map_err(capnp::Error::failed)?;
+        let destination_view =
+            ClusterViewId::from_capnp(req.get_destination_view()?).map_err(capnp::Error::failed)?;
+        let dry_run = req.get_dry_run();
+        let active_view = self.active_cluster_view();
+
+        if source_view == destination_view {
+            return Err(capnp::Error::failed(
+                "merge request source and destination view must differ".into(),
+            ));
+        }
+        if source_view != active_view && destination_view != active_view {
+            return Err(capnp::Error::failed(format!(
+                "merge request must include local active view {active_view}"
+            )));
         }
 
-        Err(capnp::Error::unimplemented(
-            "merge_clusters is not implemented yet".to_string(),
-        ))
+        let operation = ClusterOperationRecord {
+            id: Uuid::new_v4(),
+            kind: ClusterOperationKind::Merge,
+            stage: ClusterOperationStage::Proposed,
+            source_views: vec![source_view],
+            target_views: vec![destination_view],
+            details: format!(
+                "merge proposed: source={source_view}, destination={destination_view}, dry_run={dry_run}"
+            ),
+        };
+        self.persist_cluster_operation(&operation)?;
+
+        info!(
+            target: "cluster_view",
+            operation_id = %operation.id,
+            source_view = %source_view,
+            destination_view = %destination_view,
+            dry_run,
+            "merge operation proposed"
+        );
+
+        operation.write_capnp(results.get().init_op());
+        Ok(())
     }
 
-    /// Split RPC placeholder for protocol compatibility during phased rollout.
+    /// Registers a split operation intent and stores derived target views durably.
     async fn split_cluster(
         self: Rc<Self>,
         params: topology::SplitClusterParams,
-        _results: topology::SplitClusterResults,
+        mut results: topology::SplitClusterResults,
     ) -> Result<(), capnp::Error> {
-        if let Ok(req) = params.get().and_then(|p| p.get_req()) {
-            let dry_run = req.get_dry_run();
-            warn!(
-                target: "cluster_view",
-                dry_run,
-                "split_cluster RPC invoked before split engine implementation"
-            );
-        } else {
-            warn!(
-                target: "cluster_view",
-                "split_cluster RPC invoked with unreadable request payload"
-            );
+        let req = params.get()?.get_req()?;
+        let source_view =
+            ClusterViewId::from_capnp(req.get_source_view()?).map_err(capnp::Error::failed)?;
+        let dry_run = req.get_dry_run();
+        let active_view = self.active_cluster_view();
+        if source_view != active_view {
+            return Err(capnp::Error::failed(format!(
+                "split request source view must equal local active view {active_view}"
+            )));
         }
 
-        Err(capnp::Error::unimplemented(
-            "split_cluster is not implemented yet".to_string(),
-        ))
+        let targets = req.get_targets()?;
+        if targets.is_empty() {
+            return Err(capnp::Error::failed(
+                "split request requires at least one target".into(),
+            ));
+        }
+
+        let mut seen_names = std::collections::HashSet::<String>::new();
+        let mut target_views = Vec::with_capacity(targets.len() as usize);
+        let mut detail_targets = Vec::with_capacity(targets.len() as usize);
+
+        for idx in 0..targets.len() {
+            let target = targets.get(idx);
+            let name = target.get_name()?.to_string()?;
+            if name.trim().is_empty() {
+                return Err(capnp::Error::failed(
+                    "split target name must not be empty".into(),
+                ));
+            }
+            if !seen_names.insert(name.clone()) {
+                return Err(capnp::Error::failed(format!(
+                    "duplicate split target name: {name}"
+                )));
+            }
+
+            let selector = target.get_selector()?;
+            let clause_count = selector.get_clauses()?.len();
+            let explicit_count = selector.get_explicit_nodes()?.len();
+            let view = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 0);
+            target_views.push(view);
+            detail_targets.push(format!(
+                "{name}(clauses={clause_count}, explicit_nodes={explicit_count}, view={view})"
+            ));
+        }
+
+        let operation = ClusterOperationRecord {
+            id: Uuid::new_v4(),
+            kind: ClusterOperationKind::Split,
+            stage: ClusterOperationStage::Proposed,
+            source_views: vec![source_view],
+            target_views: target_views.clone(),
+            details: format!(
+                "split proposed: source={source_view}, dry_run={dry_run}, targets=[{}]",
+                detail_targets.join(", ")
+            ),
+        };
+        self.persist_cluster_operation(&operation)?;
+
+        info!(
+            target: "cluster_view",
+            operation_id = %operation.id,
+            source_view = %source_view,
+            target_count = operation.target_views.len(),
+            dry_run,
+            "split operation proposed"
+        );
+
+        operation.write_capnp(results.get().init_op());
+        Ok(())
     }
 
-    /// Operation lookup placeholder for protocol compatibility during phased rollout.
+    /// Returns the most recent locally persisted operation record for the requested operation id.
     async fn get_cluster_operation(
         self: Rc<Self>,
-        _params: topology::GetClusterOperationParams,
-        _results: topology::GetClusterOperationResults,
+        params: topology::GetClusterOperationParams,
+        mut results: topology::GetClusterOperationResults,
     ) -> Result<(), capnp::Error> {
-        Err(capnp::Error::unimplemented(
-            "get_cluster_operation is not implemented yet".to_string(),
-        ))
+        let id = Self::operation_id_from_data(params.get()?.get_id()?)?;
+        let operation = self
+            .load_cluster_operation(id)?
+            .ok_or_else(|| capnp::Error::failed(format!("cluster operation not found: {id}")))?;
+        operation.write_capnp(results.get().init_op());
+        Ok(())
     }
 }
 

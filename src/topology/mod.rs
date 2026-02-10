@@ -7,6 +7,7 @@ use crate::node::address::extract_port;
 use crate::node::id::set_node_id;
 use crate::registry::Registry;
 use crate::secrets::crypto::SecretKeyring;
+use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
@@ -54,6 +55,7 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGu
 }
 
 pub mod health;
+pub mod operation;
 pub mod peer_provider;
 mod peer_snapshot;
 pub mod peers;
@@ -75,6 +77,7 @@ pub struct TopologyStores {
     pub credentials: LocalCredentialStore,
     pub sessions: LocalSessionStore,
     pub peers: PeersStore,
+    pub cluster_operations: ClusterOperationStore,
     pub token_store: TokenStore,
     pub secret_master_store: SecretMasterStore,
     pub tasks: TaskStore,
@@ -266,6 +269,7 @@ pub struct Topology {
 
     /// Persistent peer store backing the CRDT state published cluster-wide.
     peers: PeersStore,
+    cluster_operations: ClusterOperationStore,
     tasks: TaskStore,
     services: ServiceStore,
     secrets: SecretStore,
@@ -339,6 +343,7 @@ impl Topology {
             credentials,
             sessions,
             peers,
+            cluster_operations,
             token_store,
             secret_master_store,
             tasks,
@@ -361,6 +366,7 @@ impl Topology {
             networking: Networking::new(addr),
             gossip: GossipState::new(gossip_receiver, gossip_sender),
             peers,
+            cluster_operations,
             tasks,
             services,
             secrets,

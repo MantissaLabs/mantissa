@@ -534,13 +534,17 @@ pub struct SubmitArgs {
 
 #[derive(Args, Debug)]
 pub struct MergeArgs {
-    /// The first cluster
-    #[arg(index = 1)]
-    pub origin: String,
+    /// Source cluster view (`CLUSTER_UUID@EPOCH`)
+    #[arg(index = 1, value_name = "SOURCE_VIEW")]
+    pub source_view: String,
 
-    /// The second cluster
-    #[arg(index = 2)]
-    pub destination: String,
+    /// Destination cluster view (`CLUSTER_UUID@EPOCH`)
+    #[arg(index = 2, value_name = "DESTINATION_VIEW")]
+    pub destination_view: String,
+
+    /// Validate and record the operation without applying control-plane changes.
+    #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+    pub dry_run: bool,
 
     /// Print debug information verbosely
     #[arg(short = 'd', action = ArgAction::SetTrue)]
@@ -549,9 +553,17 @@ pub struct MergeArgs {
 
 #[derive(Args, Debug)]
 pub struct SplitArgs {
-    /// The cluster to split into multiple sub-clusters
-    #[arg(index = 1)]
-    pub cluster: String,
+    /// Source cluster view (`CLUSTER_UUID@EPOCH`)
+    #[arg(index = 1, value_name = "SOURCE_VIEW")]
+    pub source_view: String,
+
+    /// Target partition names (repeat for each target).
+    #[arg(long = "target", value_name = "NAME", action = ArgAction::Append)]
+    pub targets: Vec<String>,
+
+    /// Validate and record the operation without applying control-plane changes.
+    #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+    pub dry_run: bool,
 
     /// Print debug information verbosely
     #[arg(short = 'd', action = ArgAction::SetTrue)]

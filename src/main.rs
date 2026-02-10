@@ -452,13 +452,65 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Command::Merge(m) => {
-            // e.g., client::cluster::merge(&cfg, &m.origin, &m.destination).await?;
-            eprintln!("merge {} -> {}", m.origin, m.destination);
+            let summary = local
+                .run_until(client::cluster::merge(
+                    &cfg,
+                    &m.source_view,
+                    &m.destination_view,
+                    m.dry_run,
+                ))
+                .await?;
+            println!("operation {}", summary.id);
+            println!("kind: {}", summary.kind);
+            println!("stage: {}", summary.stage);
+            if !summary.source_views.is_empty() {
+                let source_views: Vec<String> = summary
+                    .source_views
+                    .iter()
+                    .map(|view| view.to_string())
+                    .collect();
+                println!("source views: {}", source_views.join(", "));
+            }
+            if !summary.target_views.is_empty() {
+                let target_views: Vec<String> = summary
+                    .target_views
+                    .iter()
+                    .map(|view| view.to_string())
+                    .collect();
+                println!("target views: {}", target_views.join(", "));
+            }
+            println!("details: {}", summary.details);
         }
 
         Command::Split(s) => {
-            // e.g., client::cluster::split(&cfg, &s.cluster).await?;
-            eprintln!("split {}", s.cluster);
+            let summary = local
+                .run_until(client::cluster::split(
+                    &cfg,
+                    &s.source_view,
+                    &s.targets,
+                    s.dry_run,
+                ))
+                .await?;
+            println!("operation {}", summary.id);
+            println!("kind: {}", summary.kind);
+            println!("stage: {}", summary.stage);
+            if !summary.source_views.is_empty() {
+                let source_views: Vec<String> = summary
+                    .source_views
+                    .iter()
+                    .map(|view| view.to_string())
+                    .collect();
+                println!("source views: {}", source_views.join(", "));
+            }
+            if !summary.target_views.is_empty() {
+                let target_views: Vec<String> = summary
+                    .target_views
+                    .iter()
+                    .map(|view| view.to_string())
+                    .collect();
+                println!("target views: {}", target_views.join(", "));
+            }
+            println!("details: {}", summary.details);
         }
     }
 

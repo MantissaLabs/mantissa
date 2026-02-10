@@ -2,6 +2,7 @@
 mod common;
 
 use common::testkit::TestNode;
+use protocol::topology::{ClusterOperationKind, ClusterOperationStage};
 
 // Validates strict view-scoped protocol behavior for sync and topology.
 local_test!(cluster_view_protocol_strict_inproc, {
@@ -114,7 +115,7 @@ local_test!(cluster_view_protocol_strict_inproc, {
         legacy_ranges_msg
     );
 
-    // Merge/split/operation lookup are intentionally present but unimplemented at this phase.
+    // Merge should now register a durable operation record.
     let mut merge_req = node.topology().merge_clusters_request();
     {
         let mut req = merge_req.get().init_req();
@@ -123,20 +124,37 @@ local_test!(cluster_view_protocol_strict_inproc, {
         src.set_epoch(epoch);
         let mut dst = req.reborrow().init_destination_view();
         dst.reborrow().init_cluster_id().set_value(&cluster_id);
-        dst.set_epoch(epoch);
+        dst.set_epoch(epoch + 1);
         req.set_dry_run(true);
     }
-    let merge_err = match merge_req.send().promise.await {
-        Ok(_) => panic!("merge should be unimplemented in phase-1"),
-        Err(err) => err,
-    };
-    let merge_err_msg = merge_err.to_string();
+    let merge_resp = merge_req.send().promise.await.expect("mergeClusters send");
+    let merge_op = merge_resp
+        .get()
+        .expect("mergeClusters get")
+        .get_op()
+        .expect("merge op");
+    let merge_err_msg = merge_op
+        .get_details()
+        .expect("merge details")
+        .to_string()
+        .expect("merge details text");
     assert!(
-        merge_err_msg.contains("not implemented") || merge_err_msg.contains("unimplemented"),
-        "unexpected merge error: {}",
+        merge_err_msg.contains("merge proposed"),
+        "unexpected merge details: {}",
         merge_err_msg
     );
+    assert_eq!(
+        merge_op.get_kind().expect("merge kind"),
+        ClusterOperationKind::Merge
+    );
+    assert_eq!(
+        merge_op.get_stage().expect("merge stage"),
+        ClusterOperationStage::Proposed
+    );
+    let merge_id = merge_op.get_id().expect("merge id").to_vec();
+    assert_eq!(merge_id.len(), 16, "merge operation id must be 16 bytes");
 
+    // Split should register a durable operation record.
     let mut split_req = node.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
@@ -152,27 +170,66 @@ local_test!(cluster_view_protocol_strict_inproc, {
         selector.reborrow().init_explicit_nodes(0);
         req.set_dry_run(true);
     }
-    let split_err = match split_req.send().promise.await {
-        Ok(_) => panic!("split should be unimplemented in phase-1"),
-        Err(err) => err,
-    };
-    let split_err_msg = split_err.to_string();
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split op");
+    let split_err_msg = split_op
+        .get_details()
+        .expect("split details")
+        .to_string()
+        .expect("split details text");
     assert!(
-        split_err_msg.contains("not implemented") || split_err_msg.contains("unimplemented"),
-        "unexpected split error: {}",
+        split_err_msg.contains("split proposed"),
+        "unexpected split details: {}",
         split_err_msg
     );
+    assert_eq!(
+        split_op.get_kind().expect("split kind"),
+        ClusterOperationKind::Split
+    );
+    assert_eq!(
+        split_op.get_stage().expect("split stage"),
+        ClusterOperationStage::Proposed
+    );
+    assert_eq!(
+        split_op
+            .get_target_views()
+            .expect("split target views")
+            .len(),
+        1,
+        "split operation should include one target view"
+    );
+    let split_id = split_op.get_id().expect("split id").to_vec();
+    assert_eq!(split_id.len(), 16, "split operation id must be 16 bytes");
 
+    // Operation lookup should return the persisted split operation.
     let mut op_req = node.topology().get_cluster_operation_request();
-    op_req.get().set_id(&[0u8; 16]);
-    let op_err = match op_req.send().promise.await {
-        Ok(_) => panic!("operation lookup should be unimplemented in phase-1"),
-        Err(err) => err,
-    };
-    let op_err_msg = op_err.to_string();
+    op_req.get().set_id(&split_id);
+    let op_resp = op_req
+        .send()
+        .promise
+        .await
+        .expect("getClusterOperation send");
+    let op = op_resp
+        .get()
+        .expect("getClusterOperation get")
+        .get_op()
+        .expect("operation payload");
+    let op_err_msg = op
+        .get_details()
+        .expect("operation details")
+        .to_string()
+        .expect("operation details text");
     assert!(
-        op_err_msg.contains("not implemented") || op_err_msg.contains("unimplemented"),
-        "unexpected operation error: {}",
+        op_err_msg.contains("split proposed"),
+        "unexpected operation details: {}",
         op_err_msg
+    );
+    assert_eq!(
+        op.get_kind().expect("operation kind"),
+        ClusterOperationKind::Split
     );
 });
