@@ -60,6 +60,13 @@ pub enum Command {
         cmd: NodesCommand,
     },
 
+    /// Clusters subcommands
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Clusters {
+        #[command(subcommand)]
+        cmd: ClustersCommand,
+    },
+
     /// Token subcommands
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Token {
@@ -173,6 +180,13 @@ pub enum NodesCommand {
     /// List nodes in a cluster
     #[command(alias = "ls")]
     List(NodesListArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ClustersCommand {
+    /// List known clusters and their node counts
+    #[command(alias = "ls")]
+    List,
 }
 
 #[derive(Args, Debug)]
@@ -534,13 +548,13 @@ pub struct SubmitArgs {
 
 #[derive(Args, Debug)]
 pub struct MergeArgs {
-    /// Source cluster view (`CLUSTER_UUID@EPOCH`)
-    #[arg(index = 1, value_name = "SOURCE_VIEW")]
-    pub source_view: String,
+    /// Source cluster lineage identifier (`CLUSTER_UUID`)
+    #[arg(index = 1, value_name = "SOURCE_CLUSTER_ID")]
+    pub source_cluster_id: String,
 
-    /// Destination cluster view (`CLUSTER_UUID@EPOCH`)
-    #[arg(index = 2, value_name = "DESTINATION_VIEW")]
-    pub destination_view: String,
+    /// Destination cluster lineage identifier (`CLUSTER_UUID`)
+    #[arg(index = 2, value_name = "DESTINATION_CLUSTER_ID")]
+    pub destination_cluster_id: String,
 
     /// Validate and record the operation without applying control-plane changes.
     #[arg(long = "dry-run", action = ArgAction::SetTrue)]
@@ -553,13 +567,43 @@ pub struct MergeArgs {
 
 #[derive(Args, Debug)]
 pub struct SplitArgs {
-    /// Source cluster view (`CLUSTER_UUID@EPOCH`)
-    #[arg(index = 1, value_name = "SOURCE_VIEW")]
-    pub source_view: String,
+    /// Optional cluster lineage identifier (`CLUSTER_UUID`).
+    /// When omitted, the local active cluster is used.
+    #[arg(long = "cluster", value_name = "CLUSTER_ID")]
+    pub cluster: Option<String>,
 
-    /// Target partition names (repeat for each target).
-    #[arg(long = "target", value_name = "NAME", action = ArgAction::Append)]
-    pub targets: Vec<String>,
+    /// Built-in simple split by GPU vendor list (example: --filter-per-gpu NVIDIA,AMD).
+    #[arg(
+        long = "filter-per-gpu",
+        value_name = "VENDORS",
+        value_delimiter = ',',
+        num_args = 1..,
+        conflicts_with_all = ["by", "values"]
+    )]
+    pub filter_per_gpu: Vec<String>,
+
+    /// Generic split selector kind.
+    #[arg(
+        long = "by",
+        value_enum,
+        value_name = "FILTER",
+        required_unless_present = "filter_per_gpu"
+    )]
+    pub by: Option<SplitFilterOpt>,
+
+    /// Comma-separated selector values matched by `--by` (example: --values Intel,AMD).
+    #[arg(
+        long = "values",
+        value_name = "VALUES",
+        value_delimiter = ',',
+        num_args = 1..,
+        required_unless_present = "filter_per_gpu"
+    )]
+    pub values: Vec<String>,
+
+    /// Name for the automatic fallback split target when nodes do not match any listed value.
+    #[arg(long = "remainder-name", value_name = "NAME", default_value = "other")]
+    pub remainder_name: String,
 
     /// Validate and record the operation without applying control-plane changes.
     #[arg(long = "dry-run", action = ArgAction::SetTrue)]
@@ -568,4 +612,17 @@ pub struct SplitArgs {
     /// Print debug information verbosely
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub debug: bool,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum SplitFilterOpt {
+    GpuVendor,
+    GpuModel,
+    CpuVendor,
+    CpuBrand,
+    GpuCount,
+    CpuCores,
+    CpuLogical,
+    MemoryTotalKb,
+    MemoryTotalBytes,
 }

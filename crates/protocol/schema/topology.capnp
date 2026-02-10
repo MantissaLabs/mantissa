@@ -39,6 +39,12 @@ interface Topology {
 
   getClusterOperation @8 (id :Data) -> (op :ClusterOperation);
   # Fetches the latest known state for a cluster operation id.
+
+  submitClusterOperation @9 (id :Data, payload :Data) -> ();
+  # Replicates a serialized cluster operation record to this node.
+
+  listClusterViews @10 () -> (views :List(ClusterViewSummary));
+  # Lists known cluster views and per-view node counts from this node's control-plane perspective.
 }
 
 struct TopologyEvent {
@@ -140,6 +146,17 @@ struct ClusterViewId {
 
   epoch @1 :UInt64;
   # Monotonically increasing view epoch.
+}
+
+struct ClusterViewSummary {
+  view @0 :ClusterViewId;
+  # Concrete cluster view represented by this summary row.
+
+  nodeCount @1 :UInt32;
+  # Number of known nodes currently associated with this view.
+
+  localActive @2 :Bool;
+  # True when this row corresponds to the local node's active view.
 }
 
 enum ClusterOperationKind {

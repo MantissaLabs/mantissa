@@ -76,6 +76,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         },
 
+        Command::Clusters { cmd } => match cmd {
+            ClustersCommand::List => {
+                let summaries = local
+                    .run_until(client::cluster::list_clusters(&cfg))
+                    .await?;
+                if summaries.is_empty() {
+                    println!("no clusters known");
+                } else {
+                    let mut tw = TabWriter::new(Vec::new());
+                    writeln!(&mut tw, "CLUSTER_ID\tEPOCH\tNODES\tLOCAL_ACTIVE")?;
+                    for summary in summaries {
+                        writeln!(
+                            &mut tw,
+                            "{}\t{}\t{}\t{}",
+                            summary.cluster_id,
+                            summary.epoch,
+                            summary.node_count,
+                            if summary.local_active { "yes" } else { "no" }
+                        )?;
+                    }
+                    tw.flush()?;
+                    let output = String::from_utf8(tw.into_inner()?)?;
+                    output::emit_block(output);
+                }
+            }
+        },
+
         Command::Token { cmd } => match cmd {
             TokenCommand::Show => local.run_until(client::token::show(&cfg)).await?,
             TokenCommand::Rotate => local.run_until(client::token::rotate(&cfg)).await?,
@@ -453,10 +480,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         Command::Merge(m) => {
             let summary = local
-                .run_until(client::cluster::merge(
+                .run_until(client::cluster::merge_by_cluster_id(
                     &cfg,
-                    &m.source_view,
-                    &m.destination_view,
+                    &m.source_cluster_id,
+                    &m.destination_cluster_id,
                     m.dry_run,
                 ))
                 .await?;
@@ -483,11 +510,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Command::Split(s) => {
+            let (filter, values) = if !s.filter_per_gpu.is_empty() {
+                (
+                    client::cluster::SplitFilterKind::GpuVendor,
+                    s.filter_per_gpu.clone(),
+                )
+            } else {
+                let filter = match s.by.ok_or_else(|| anyhow!("--by is required"))? {
+                    SplitFilterOpt::GpuVendor => client::cluster::SplitFilterKind::GpuVendor,
+                    SplitFilterOpt::GpuModel => client::cluster::SplitFilterKind::GpuModel,
+                    SplitFilterOpt::CpuVendor => client::cluster::SplitFilterKind::CpuVendor,
+                    SplitFilterOpt::CpuBrand => client::cluster::SplitFilterKind::CpuBrand,
+                    SplitFilterOpt::GpuCount => client::cluster::SplitFilterKind::GpuCount,
+                    SplitFilterOpt::CpuCores => client::cluster::SplitFilterKind::CpuCores,
+                    SplitFilterOpt::CpuLogical => client::cluster::SplitFilterKind::CpuLogical,
+                    SplitFilterOpt::MemoryTotalKb => {
+                        client::cluster::SplitFilterKind::MemoryTotalKb
+                    }
+                    SplitFilterOpt::MemoryTotalBytes => {
+                        client::cluster::SplitFilterKind::MemoryTotalBytes
+                    }
+                };
+                (filter, s.values.clone())
+            };
+
             let summary = local
-                .run_until(client::cluster::split(
+                .run_until(client::cluster::split_by_filter(
                     &cfg,
-                    &s.source_view,
-                    &s.targets,
+                    s.cluster.as_deref(),
+                    filter,
+                    &values,
+                    &s.remainder_name,
                     s.dry_run,
                 ))
                 .await?;

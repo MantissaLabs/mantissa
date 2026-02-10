@@ -295,15 +295,16 @@ Likely file:
 
 ## CLI and client API plan
 
-Current `merge` and `split` commands are placeholders.
+Current UX goal is cluster-centric commands while keeping `ClusterViewId` internal:
 
-1. Add client endpoints and request models:
-- new client module `crates/client/src/cluster.rs`
-- wire into `src/main.rs` `Command::Merge` and `Command::Split`
+1. Expose:
+- `mantissa clusters list`
+- `mantissa merge <source-cluster-id> <destination-cluster-id> [--dry-run]`
+- `mantissa split --cluster <cluster-id> --by <filter> --values <v1,v2,...> [--dry-run]`
+- `mantissa split --filter-per-gpu <vendor-a,vendor-b,...>` (shortcut)
 
-2. Extend CLI args:
-- `merge`: source, destination, conflict policy, dry-run.
-- `split`: selector expression, target labels, dry-run.
+2. Client layer resolves cluster IDs to latest known views and compiles simple filters into
+split selector targets (plus one fallback partition).
 
 Likely files:
 

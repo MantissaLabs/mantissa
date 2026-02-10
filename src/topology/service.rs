@@ -21,8 +21,8 @@ use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::VerifyingKey;
 use protocol::gossip::gossip_message;
 use protocol::server::{self, cluster_session};
-use protocol::topology::{topology, topology_event};
 use protocol::topology::split_selector_clause::Operator as SplitOperator;
+use protocol::topology::{topology, topology_event};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -90,6 +90,14 @@ struct SplitNodeCandidate {
     hostname: String,
     address: String,
     wireguard_enabled: bool,
+    cpu_vendor: Option<String>,
+    cpu_brand: Option<String>,
+    cpu_logical: Option<u64>,
+    cpu_cores: Option<u64>,
+    memory_total_kb: Option<u64>,
+    gpu_vendor: Option<String>,
+    gpu_count: Option<u64>,
+    gpu_models: Vec<String>,
 }
 
 impl Topology {
@@ -269,8 +277,69 @@ impl Topology {
         Ok(())
     }
 
+    /// Applies host resource metadata from an `Info` payload onto one split node candidate.
+    fn apply_split_node_info(
+        candidate: &mut SplitNodeCandidate,
+        info: protocol::info_capnp::info::Reader<'_>,
+    ) {
+        if let Ok(cpu) = info.get_cpu() {
+            if let Ok(vendor) = cpu.get_vendor() {
+                let text = vendor.to_string().unwrap_or_default();
+                if !text.is_empty() {
+                    candidate.cpu_vendor = Some(text);
+                }
+            }
+            if let Ok(brand) = cpu.get_brand() {
+                let text = brand.to_string().unwrap_or_default();
+                if !text.is_empty() {
+                    candidate.cpu_brand = Some(text);
+                }
+            }
+            let logical = cpu.get_logical_cpus();
+            if logical > 0 {
+                candidate.cpu_logical = Some(logical as u64);
+            }
+            let cores = cpu.get_num_cores();
+            if cores > 0 {
+                candidate.cpu_cores = Some(cores as u64);
+            }
+        }
+
+        if let Ok(memory) = info.get_memory() {
+            let total = memory.get_total();
+            if total > 0 {
+                candidate.memory_total_kb = Some(total);
+            }
+        }
+
+        if let Ok(gpu) = info.get_gpu() {
+            if let Ok(vendor) = gpu.get_vendor() {
+                let text = vendor.to_string().unwrap_or_default();
+                if !text.is_empty() {
+                    candidate.gpu_vendor = Some(text);
+                }
+            }
+            if let Ok(devices) = gpu.get_devices() {
+                candidate.gpu_count = Some(devices.len() as u64);
+                let mut models = Vec::with_capacity(devices.len() as usize);
+                for device in devices.iter() {
+                    if let Ok(name) = device.get_name() {
+                        let text = name.to_string().unwrap_or_default();
+                        if !text.is_empty() {
+                            models.push(text);
+                        }
+                    }
+                }
+                candidate.gpu_models = models;
+            }
+        }
+    }
+
     /// Collects a deterministic snapshot of nodes eligible for split partition assignment.
-    fn collect_split_node_candidates(&self) -> Result<Vec<SplitNodeCandidate>, capnp::Error> {
+    async fn collect_split_node_candidates(
+        &self,
+        source_view: ClusterViewId,
+    ) -> Result<Vec<SplitNodeCandidate>, capnp::Error> {
         let (actives, _) = self
             .peers
             .load_all()
@@ -295,11 +364,19 @@ impl Topology {
                     hostname: value.hostname.clone(),
                     address: value.address.clone(),
                     wireguard_enabled,
+                    cpu_vendor: None,
+                    cpu_brand: None,
+                    cpu_logical: None,
+                    cpu_cores: None,
+                    memory_total_kb: None,
+                    gpu_vendor: None,
+                    gpu_count: None,
+                    gpu_models: Vec::new(),
                 },
             );
         }
 
-        candidates
+        let self_entry = candidates
             .entry(self.node.id)
             .or_insert_with(|| SplitNodeCandidate {
                 node_id: self.node.id,
@@ -314,10 +391,70 @@ impl Topology {
                     .compute_advertise_addr()
                     .unwrap_or_else(|_| String::new()),
                 wireguard_enabled: false,
+                cpu_vendor: None,
+                cpu_brand: None,
+                cpu_logical: None,
+                cpu_cores: None,
+                memory_total_kb: None,
+                gpu_vendor: None,
+                gpu_count: None,
+                gpu_models: Vec::new(),
             });
+        if let Some(cpu) = self.node.system_info.info.cpu_info.as_ref() {
+            self_entry.cpu_vendor = cpu.vendor.clone();
+            self_entry.cpu_brand = cpu.brand.clone();
+            if cpu.num_logical_cpus > 0 {
+                self_entry.cpu_logical = Some(cpu.num_logical_cpus as u64);
+            }
+            if cpu.num_cores > 0 {
+                self_entry.cpu_cores = Some(cpu.num_cores as u64);
+            }
+        }
+        if let Some(memory) = self.node.system_info.info.mem_info.as_ref() {
+            if memory.total > 0 {
+                self_entry.memory_total_kb = Some(memory.total);
+            }
+        }
+        if let Some(gpu) = self.node.system_info.info.gpu_info.as_ref() {
+            if !gpu.vendor.is_empty() {
+                self_entry.gpu_vendor = Some(gpu.vendor.clone());
+            }
+            self_entry.gpu_count = Some(gpu.devices.len() as u64);
+            self_entry.gpu_models = gpu
+                .devices
+                .iter()
+                .map(|device| device.name.clone())
+                .filter(|name| !name.is_empty())
+                .collect();
+        }
 
         let mut values = candidates.into_values().collect::<Vec<_>>();
         values.sort_by_key(|candidate| candidate.node_id);
+
+        for candidate in &mut values {
+            if candidate.node_id == self.node.id {
+                continue;
+            }
+
+            let Some(session) = self.registry.session_for_peer(candidate.node_id).await else {
+                continue;
+            };
+            let peer_view = match Self::session_cluster_view(&session).await {
+                Ok(view) => view,
+                Err(_) => continue,
+            };
+            if peer_view != source_view {
+                continue;
+            }
+
+            let node = session.get_node_request().send().pipeline.get_node();
+            if let Ok(response) = node.info_request().send().promise.await {
+                if let Ok(info_reader) = response.get().and_then(|reader| reader.get_info()) {
+                    Self::apply_split_node_info(candidate, info_reader);
+                }
+            }
+        }
+
         Ok(values)
     }
 
@@ -327,6 +464,40 @@ impl Topology {
             "true" | "1" | "yes" | "on" => Some(true),
             "false" | "0" | "no" | "off" => Some(false),
             _ => None,
+        }
+    }
+
+    /// Parses a split selector numeric operand as an unsigned integer.
+    fn parse_split_u64(value: &str, key: &str) -> Result<u64, capnp::Error> {
+        value.parse::<u64>().map_err(|_| {
+            capnp::Error::failed(format!(
+                "selector key '{key}' expects an unsigned integer value, got '{value}'"
+            ))
+        })
+    }
+
+    /// Evaluates one numeric selector clause against an optional node metric.
+    fn evaluate_u64_clause(
+        node: &SplitNodeCandidate,
+        key: &str,
+        op: SplitOperator,
+        expected_raw: &str,
+        actual: Option<u64>,
+    ) -> Result<bool, capnp::Error> {
+        let expected = Self::parse_split_u64(expected_raw, key)?;
+        let actual = actual.ok_or_else(|| {
+            capnp::Error::failed(format!(
+                "node {} has no metric for selector key '{}'",
+                node.node_id, key
+            ))
+        })?;
+        match op {
+            SplitOperator::Eq => Ok(actual == expected),
+            SplitOperator::Ne => Ok(actual != expected),
+            SplitOperator::Gt => Ok(actual > expected),
+            SplitOperator::Gte => Ok(actual >= expected),
+            SplitOperator::Lt => Ok(actual < expected),
+            SplitOperator::Lte => Ok(actual <= expected),
         }
     }
 
@@ -372,6 +543,69 @@ impl Topology {
                     )),
                 }
             }
+            "resources.cpu.logical" => Self::evaluate_u64_clause(
+                node,
+                &clause.key,
+                clause.op,
+                &clause.value,
+                node.cpu_logical,
+            ),
+            "resources.cpu.cores" => Self::evaluate_u64_clause(
+                node,
+                &clause.key,
+                clause.op,
+                &clause.value,
+                node.cpu_cores,
+            ),
+            "resources.memory.total_kb" => Self::evaluate_u64_clause(
+                node,
+                &clause.key,
+                clause.op,
+                &clause.value,
+                node.memory_total_kb,
+            ),
+            "resources.memory.total_bytes" => Self::evaluate_u64_clause(
+                node,
+                &clause.key,
+                clause.op,
+                &clause.value,
+                node.memory_total_kb.map(|kb| kb.saturating_mul(1024)),
+            ),
+            "resources.gpu.count" => Self::evaluate_u64_clause(
+                node,
+                &clause.key,
+                clause.op,
+                &clause.value,
+                node.gpu_count,
+            ),
+            "resources.cpu.vendor" => match clause.op {
+                SplitOperator::Eq => Ok(node.cpu_vendor.as_deref() == Some(clause.value.as_str())),
+                SplitOperator::Ne => Ok(node.cpu_vendor.as_deref() != Some(clause.value.as_str())),
+                _ => Err(capnp::Error::failed(
+                    "resources.cpu.vendor supports only eq/ne operators".to_string(),
+                )),
+            },
+            "resources.cpu.brand" => match clause.op {
+                SplitOperator::Eq => Ok(node.cpu_brand.as_deref() == Some(clause.value.as_str())),
+                SplitOperator::Ne => Ok(node.cpu_brand.as_deref() != Some(clause.value.as_str())),
+                _ => Err(capnp::Error::failed(
+                    "resources.cpu.brand supports only eq/ne operators".to_string(),
+                )),
+            },
+            "resources.gpu.vendor" => match clause.op {
+                SplitOperator::Eq => Ok(node.gpu_vendor.as_deref() == Some(clause.value.as_str())),
+                SplitOperator::Ne => Ok(node.gpu_vendor.as_deref() != Some(clause.value.as_str())),
+                _ => Err(capnp::Error::failed(
+                    "resources.gpu.vendor supports only eq/ne operators".to_string(),
+                )),
+            },
+            "resources.gpu.model" => match clause.op {
+                SplitOperator::Eq => Ok(node.gpu_models.iter().any(|model| model == &clause.value)),
+                SplitOperator::Ne => Ok(node.gpu_models.iter().all(|model| model != &clause.value)),
+                _ => Err(capnp::Error::failed(
+                    "resources.gpu.model supports only eq/ne operators".to_string(),
+                )),
+            },
             _ => Err(capnp::Error::failed(format!(
                 "unsupported split selector key '{}'",
                 clause.key
@@ -415,7 +649,7 @@ impl Topology {
     }
 
     /// Computes deterministic split assignments and validates selector coverage for all nodes.
-    fn build_split_assignments(
+    async fn build_split_assignments(
         &self,
         source_view: ClusterViewId,
         targets: &[SplitTargetSpec],
@@ -426,7 +660,7 @@ impl Topology {
             ));
         }
 
-        let nodes = self.collect_split_node_candidates()?;
+        let nodes = self.collect_split_node_candidates(source_view).await?;
         if nodes.is_empty() {
             return Err(capnp::Error::failed(
                 "split assignment requires at least one node candidate".to_string(),
@@ -443,6 +677,24 @@ impl Topology {
                 targets.len(),
             ));
         }
+
+        let fallback_targets = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, target)| {
+                if target.clauses.is_empty() && target.explicit_nodes.is_empty() {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if fallback_targets.len() > 1 {
+            return Err(capnp::Error::failed(
+                "split supports at most one fallback target without selectors".to_string(),
+            ));
+        }
+        let fallback_target = fallback_targets.first().copied();
 
         let mut assignments = Vec::with_capacity(nodes.len());
         let mut per_target_count = vec![0usize; targets.len()];
@@ -466,18 +718,21 @@ impl Topology {
             } else {
                 let mut selector_matches = Vec::new();
                 for (idx, target) in targets.iter().enumerate() {
+                    if Some(idx) == fallback_target {
+                        continue;
+                    }
                     if Self::split_target_matches_node(target, &node)? {
                         selector_matches.push(idx);
                     }
                 }
 
                 match selector_matches.as_slice() {
-                    [] => {
-                        return Err(capnp::Error::failed(format!(
+                    [] => fallback_target.ok_or_else(|| {
+                        capnp::Error::failed(format!(
                             "node {} did not match any split target selectors",
                             node.node_id
-                        )));
-                    }
+                        ))
+                    })?,
                     [only] => *only,
                     _ => {
                         return Err(capnp::Error::failed(format!(
@@ -496,6 +751,9 @@ impl Topology {
         }
 
         for (index, count) in per_target_count.into_iter().enumerate() {
+            if Some(index) == fallback_target {
+                continue;
+            }
             if count == 0 {
                 return Err(capnp::Error::failed(format!(
                     "split target '{}' has no matched nodes",
@@ -506,6 +764,139 @@ impl Topology {
 
         assignments.sort_by_key(|assignment| assignment.node_id);
         Ok(assignments)
+    }
+
+    /// Resolves the target view this node should activate when committing the operation.
+    fn local_target_view_for_operation(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<ClusterViewId, capnp::Error> {
+        match operation.kind {
+            ClusterOperationKind::Merge => operation.target_views.first().copied(),
+            ClusterOperationKind::Split => {
+                let assignment = operation
+                    .split_assignments
+                    .iter()
+                    .find(|assignment| assignment.node_id == self.node.id)
+                    .ok_or_else(|| {
+                        capnp::Error::failed(format!(
+                            "split operation {} has no assignment for local node {}",
+                            operation.id, self.node.id
+                        ))
+                    })?;
+                operation.target_views.get(assignment.target_index).copied()
+            }
+        }
+        .ok_or_else(|| capnp::Error::failed("operation has no target views for commit".to_string()))
+    }
+
+    /// Reads the cluster view currently bound to a session for operation relay validation.
+    async fn session_cluster_view(
+        session: &cluster_session::Client,
+    ) -> Result<ClusterViewId, capnp::Error> {
+        let request = session.get_cluster_view_request();
+        let response = request.send().promise.await?;
+        ClusterViewId::from_capnp(response.get()?.get_view()?).map_err(capnp::Error::failed)
+    }
+
+    /// Resolves the best-known cluster view for one peer session, if available.
+    async fn best_known_peer_view(&self, peer_id: Uuid) -> Option<ClusterViewId> {
+        if peer_id == self.node.id {
+            return Some(self.active_cluster_view());
+        }
+
+        let session = self.registry.session_for_peer(peer_id).await?;
+        Self::session_cluster_view(&session).await.ok()
+    }
+
+    /// Best-effort relay of one operation record to peers that are still in the source view.
+    async fn broadcast_cluster_operation(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<usize, capnp::Error> {
+        let source_view = operation
+            .source_views
+            .first()
+            .copied()
+            .ok_or_else(|| capnp::Error::failed("operation missing source view".to_string()))?;
+        let snapshot = match self.peer_snapshot().await {
+            Some(snapshot) => snapshot,
+            None => return Ok(0),
+        };
+        let payload =
+            bincode::serialize(operation).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let mut relayed = 0usize;
+
+        for entry in snapshot.entries.iter() {
+            let peer_id = entry.peer_id;
+            if peer_id == self.node.id {
+                continue;
+            }
+
+            let Some(session) = self.registry.session_for_peer(peer_id).await else {
+                continue;
+            };
+            let peer_view = match Self::session_cluster_view(&session).await {
+                Ok(view) => view,
+                Err(err) => {
+                    warn!(
+                        target: "cluster_view",
+                        operation_id = %operation.id,
+                        peer_id = %peer_id,
+                        "failed to read peer session view for operation relay: {err}"
+                    );
+                    continue;
+                }
+            };
+            if peer_view != source_view {
+                continue;
+            }
+
+            let topology = session
+                .get_topology_request()
+                .send()
+                .pipeline
+                .get_topology();
+            let mut relay = topology.submit_cluster_operation_request();
+            relay.get().set_id(operation.id.as_bytes());
+            relay.get().set_payload(&payload);
+            match relay.send().promise.await {
+                Ok(_) => {
+                    relayed = relayed.saturating_add(1);
+                }
+                Err(err) => {
+                    warn!(
+                        target: "cluster_view",
+                        operation_id = %operation.id,
+                        peer_id = %peer_id,
+                        "failed to relay cluster operation: {err}"
+                    );
+                }
+            }
+        }
+
+        if relayed > 0 {
+            info!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                relayed,
+                source_view = %source_view,
+                "relayed cluster operation to peers"
+            );
+        }
+
+        Ok(relayed)
+    }
+
+    /// Maps operation stage values into a monotonic ordering used for conflict resolution.
+    fn stage_rank(stage: ClusterOperationStage) -> u8 {
+        match stage {
+            ClusterOperationStage::Proposed => 0,
+            ClusterOperationStage::Prepared => 1,
+            ClusterOperationStage::Committed => 2,
+            ClusterOperationStage::Finalized => 3,
+            ClusterOperationStage::Aborted => 4,
+        }
     }
 
     /// Persists a cluster operation record in the local durable operation store.
@@ -595,25 +986,7 @@ impl Topology {
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
-        let target_view = match operation.kind {
-            ClusterOperationKind::Merge => operation.target_views.first().copied(),
-            ClusterOperationKind::Split => {
-                let assignment = operation
-                    .split_assignments
-                    .iter()
-                    .find(|assignment| assignment.node_id == self.node.id)
-                    .ok_or_else(|| {
-                        capnp::Error::failed(format!(
-                            "split operation {} has no assignment for local node {}",
-                            operation.id, self.node.id
-                        ))
-                    })?;
-                operation.target_views.get(assignment.target_index).copied()
-            }
-        }
-        .ok_or_else(|| {
-            capnp::Error::failed("operation has no target views for commit".to_string())
-        })?;
+        let target_view = self.local_target_view_for_operation(operation)?;
 
         let previous = self.set_active_cluster_view(target_view);
         self.registry.clear().await;
@@ -696,6 +1069,12 @@ impl Topology {
                 )?;
             }
             ClusterOperationStage::Finalized | ClusterOperationStage::Aborted => {}
+        }
+
+        drop(_guard);
+
+        if !operation.dry_run {
+            let _ = self.broadcast_cluster_operation(&operation).await?;
         }
 
         Ok(())
@@ -887,13 +1266,14 @@ impl topology::Server for Topology {
 
         let list_builder = results.get().init_nodes();
         let mut node_list = list_builder.init_nodes(actives.len() as u32);
-        let active_cluster_view = self.active_cluster_view();
+        let local_view = self.active_cluster_view();
 
         for (i, (k, snap)) in actives.into_iter().enumerate() {
             let id = k.to_uuid();
             let mut node = node_list.reborrow().get(i as u32);
             set_node_id(node.reborrow().init_id(), &id);
-            active_cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
+            let view = self.best_known_peer_view(id).await.unwrap_or(local_view);
+            view.write_capnp(node.reborrow().init_active_cluster_view());
 
             if let Some(val) = snap.as_slice().last().cloned() {
                 node.set_addr(&val.address);
@@ -991,6 +1371,9 @@ impl topology::Server for Topology {
             ),
         };
         self.persist_cluster_operation(&operation)?;
+        if !dry_run {
+            let _ = self.broadcast_cluster_operation(&operation).await?;
+        }
         self.trigger_operation_progress(operation.id, dry_run);
 
         info!(
@@ -1102,7 +1485,9 @@ impl topology::Server for Topology {
             ));
         }
 
-        let split_assignments = self.build_split_assignments(source_view, &target_specs)?;
+        let split_assignments = self
+            .build_split_assignments(source_view, &target_specs)
+            .await?;
         let mut assignments_per_target = vec![0usize; target_views.len()];
         for assignment in &split_assignments {
             if let Some(slot) = assignments_per_target.get_mut(assignment.target_index) {
@@ -1131,6 +1516,9 @@ impl topology::Server for Topology {
             ),
         };
         self.persist_cluster_operation(&operation)?;
+        if !dry_run {
+            let _ = self.broadcast_cluster_operation(&operation).await?;
+        }
         self.trigger_operation_progress(operation.id, dry_run);
 
         info!(
@@ -1147,6 +1535,58 @@ impl topology::Server for Topology {
         Ok(())
     }
 
+    /// Accepts a relayed operation record and triggers local progression when appropriate.
+    async fn submit_cluster_operation(
+        self: Rc<Self>,
+        params: topology::SubmitClusterOperationParams,
+        _results: topology::SubmitClusterOperationResults,
+    ) -> Result<(), capnp::Error> {
+        let reader = params.get()?;
+        let operation_id = Self::operation_id_from_data(reader.get_id()?)?;
+        let payload = reader.get_payload()?;
+        let incoming: ClusterOperationRecord =
+            bincode::deserialize(payload).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        if incoming.id != operation_id {
+            return Err(capnp::Error::failed(format!(
+                "relayed operation id mismatch: envelope={operation_id}, payload={}",
+                incoming.id
+            )));
+        }
+
+        let merged = match self.load_cluster_operation(operation_id)? {
+            Some(current)
+                if Self::stage_rank(current.stage) >= Self::stage_rank(incoming.stage) =>
+            {
+                current
+            }
+            _ => {
+                self.persist_cluster_operation(&incoming)?;
+                incoming
+            }
+        };
+
+        if merged.dry_run {
+            return Ok(());
+        }
+
+        match merged.stage {
+            ClusterOperationStage::Proposed
+            | ClusterOperationStage::Prepared
+            | ClusterOperationStage::Committed => {
+                self.trigger_operation_progress(merged.id, false);
+            }
+            ClusterOperationStage::Finalized => {
+                let target = self.local_target_view_for_operation(&merged)?;
+                if self.active_cluster_view() != target {
+                    self.apply_committed_operation_side_effects(&merged).await?;
+                }
+            }
+            ClusterOperationStage::Aborted => {}
+        }
+
+        Ok(())
+    }
+
     /// Returns the most recent locally persisted operation record for the requested operation id.
     async fn get_cluster_operation(
         self: Rc<Self>,
@@ -1158,6 +1598,60 @@ impl topology::Server for Topology {
             .load_cluster_operation(id)?
             .ok_or_else(|| capnp::Error::failed(format!("cluster operation not found: {id}")))?;
         operation.write_capnp(results.get().init_op());
+        Ok(())
+    }
+
+    /// Lists known cluster views and best-effort member counts.
+    async fn list_cluster_views(
+        self: Rc<Self>,
+        _params: topology::ListClusterViewsParams,
+        mut results: topology::ListClusterViewsResults,
+    ) -> Result<(), capnp::Error> {
+        let local_view = self.active_cluster_view();
+        let mut counts = HashMap::<ClusterViewId, u32>::new();
+        counts.insert(local_view, 1);
+
+        let (actives, _) = self
+            .peers
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        for (key, _snapshot) in actives {
+            let peer_id = key.to_uuid();
+            if peer_id == self.node.id {
+                continue;
+            }
+
+            if let Some(view) = self.best_known_peer_view(peer_id).await {
+                let entry = counts.entry(view).or_insert(0);
+                *entry = entry.saturating_add(1);
+            }
+        }
+
+        for operation in self.load_cluster_operations()? {
+            for view in operation.source_views {
+                counts.entry(view).or_insert(0);
+            }
+            for view in operation.target_views {
+                counts.entry(view).or_insert(0);
+            }
+        }
+
+        let mut rows = counts.into_iter().collect::<Vec<_>>();
+        rows.sort_by(|(left, _), (right, _)| {
+            left.cluster_id
+                .as_bytes()
+                .cmp(right.cluster_id.as_bytes())
+                .then(left.epoch.cmp(&right.epoch))
+        });
+
+        let mut list = results.get().init_views(rows.len() as u32);
+        for (idx, (view, node_count)) in rows.into_iter().enumerate() {
+            let mut row = list.reborrow().get(idx as u32);
+            view.write_capnp(row.reborrow().init_view());
+            row.set_node_count(node_count);
+            row.set_local_active(view == local_view);
+        }
+
         Ok(())
     }
 }

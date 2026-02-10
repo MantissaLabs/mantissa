@@ -51,6 +51,39 @@ async fn wait_for_operation_stage(
     }
 }
 
+async fn wait_for_cluster_view(
+    topology: &mantissa::topology_capnp::topology::Client,
+    expected: ClusterViewId,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let response = topology
+            .get_cluster_view_request()
+            .send()
+            .promise
+            .await
+            .expect("getClusterView send");
+        let view = response
+            .get()
+            .expect("getClusterView get")
+            .get_view()
+            .expect("view payload");
+        let current = ClusterViewId::from_capnp(view).expect("decode view");
+        if current == expected {
+            return;
+        }
+
+        assert!(
+            Instant::now() <= deadline,
+            "cluster view did not converge to expected {}, current {}",
+            expected,
+            current
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 // Validates strict view-scoped protocol behavior for sync and topology.
 local_test!(cluster_view_protocol_strict_inproc, {
     let node = TestNode::new_with_tick_ms(100).await;
@@ -558,14 +591,23 @@ local_test!(cluster_view_split_selectors_choose_assigned_target, {
     );
     let target_views = split_op.get_target_views().expect("split target views");
     assert_eq!(target_views.len(), 2, "split should include two targets");
-    let assigned_target = target_views.get(1);
-    let expected_cluster_id = assigned_target
+    let anchor_target = target_views.get(0);
+    let expected_anchor_cluster_id = anchor_target
+        .get_cluster_id()
+        .expect("anchor cluster id")
+        .get_value()
+        .expect("anchor cluster id bytes")
+        .to_vec();
+    let expected_anchor_epoch = anchor_target.get_epoch();
+
+    let joiner_target = target_views.get(1);
+    let expected_joiner_cluster_id = joiner_target
         .get_cluster_id()
         .expect("assigned cluster id")
         .get_value()
         .expect("assigned cluster id bytes")
         .to_vec();
-    let expected_epoch = assigned_target.get_epoch();
+    let expected_joiner_epoch = joiner_target.get_epoch();
     let split_id = split_op.get_id().expect("split id").to_vec();
     wait_for_operation_stage(
         &joiner.topology(),
@@ -594,14 +636,202 @@ local_test!(cluster_view_split_selectors_choose_assigned_target, {
             .get_value()
             .expect("post cluster id bytes")
             .to_vec(),
-        expected_cluster_id,
+        expected_joiner_cluster_id,
         "split selector assignment should activate joiner's selected target view"
     );
     assert_eq!(
         post_view.get_epoch(),
-        expected_epoch,
+        expected_joiner_epoch,
         "split selector assignment should activate joiner's selected target epoch"
     );
+
+    wait_for_cluster_view(
+        &anchor.topology(),
+        ClusterViewId::new(
+            mantissa::cluster_view::ClusterId::from_uuid(
+                Uuid::from_slice(&expected_anchor_cluster_id).expect("anchor cluster uuid"),
+            ),
+            expected_anchor_epoch,
+        ),
+        Duration::from_secs(5),
+    )
+    .await;
+});
+
+// Validates merge proposals are relayed so peers in the same source view commit the merge too.
+local_test!(cluster_view_merge_propagates_to_peer, {
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let joiner = TestNode::new_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join cluster");
+    anchor
+        .assert_cluster_size(2, "anchor should observe both nodes")
+        .await;
+    joiner
+        .assert_cluster_size(2, "joiner should observe both nodes")
+        .await;
+
+    let view_resp = joiner
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let initial_view = view_resp
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    let source_view = ClusterViewId::from_capnp(initial_view).expect("decode source view");
+    let destination_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 1);
+
+    let mut merge_req = joiner.topology().merge_clusters_request();
+    {
+        let mut req = merge_req.get().init_req();
+        source_view.write_capnp(req.reborrow().init_source_view());
+        destination_view.write_capnp(req.reborrow().init_destination_view());
+        req.set_dry_run(false);
+    }
+    let merge_resp = merge_req.send().promise.await.expect("mergeClusters send");
+    let merge_op = merge_resp
+        .get()
+        .expect("mergeClusters get")
+        .get_op()
+        .expect("merge op");
+    let merge_id = merge_op.get_id().expect("merge id").to_vec();
+
+    wait_for_operation_stage(
+        &joiner.topology(),
+        &merge_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_cluster_view(&joiner.topology(), destination_view, Duration::from_secs(5)).await;
+    wait_for_cluster_view(&anchor.topology(), destination_view, Duration::from_secs(5)).await;
+});
+
+// Validates resource selector clauses can drive split assignment alongside explicit-node targeting.
+local_test!(cluster_view_split_resource_selector_assigns_peers, {
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let joiner = TestNode::new_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join cluster");
+    anchor
+        .assert_cluster_size(2, "anchor should observe both nodes")
+        .await;
+    joiner
+        .assert_cluster_size(2, "joiner should observe both nodes")
+        .await;
+
+    let view_resp = joiner
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let initial_view = view_resp
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    let cluster_id = initial_view
+        .get_cluster_id()
+        .expect("cluster id")
+        .get_value()
+        .expect("cluster id bytes")
+        .to_vec();
+    let epoch = initial_view.get_epoch();
+
+    let mut split_req = joiner.topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        let mut src = req.reborrow().init_source_view();
+        src.reborrow().init_cluster_id().set_value(&cluster_id);
+        src.set_epoch(epoch);
+
+        let mut targets = req.reborrow().init_targets(2);
+
+        let mut target_a = targets.reborrow().get(0);
+        target_a.set_name("target-a");
+        let mut selector_a = target_a.reborrow().init_selector();
+        let mut clauses_a = selector_a.reborrow().init_clauses(1);
+        let mut clause_a = clauses_a.reborrow().get(0);
+        clause_a.set_key("resources.cpu.logical");
+        clause_a.set_op(protocol::topology::split_selector_clause::Operator::Gte);
+        clause_a.set_value("1");
+        selector_a.reborrow().init_explicit_nodes(0);
+
+        let mut target_b = targets.reborrow().get(1);
+        target_b.set_name("target-b");
+        let mut selector_b = target_b.reborrow().init_selector();
+        let mut clauses_b = selector_b.reborrow().init_clauses(1);
+        let mut clause_b = clauses_b.reborrow().get(0);
+        clause_b.set_key("node.id");
+        clause_b.set_op(protocol::topology::split_selector_clause::Operator::Eq);
+        clause_b.set_value(&joiner.id().to_string());
+        let mut explicit_b = selector_b.reborrow().init_explicit_nodes(1);
+        set_node_id(explicit_b.reborrow().get(0), &joiner.id());
+
+        req.set_dry_run(false);
+    }
+
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split op");
+    let target_views = split_op.get_target_views().expect("split target views");
+    let anchor_target = target_views.get(0);
+    let joiner_target = target_views.get(1);
+    let expected_anchor_view = ClusterViewId::new(
+        mantissa::cluster_view::ClusterId::from_uuid(
+            Uuid::from_slice(
+                anchor_target
+                    .get_cluster_id()
+                    .expect("anchor cluster id")
+                    .get_value()
+                    .expect("anchor cluster id bytes"),
+            )
+            .expect("anchor cluster uuid"),
+        ),
+        anchor_target.get_epoch(),
+    );
+    let expected_joiner_view = ClusterViewId::new(
+        mantissa::cluster_view::ClusterId::from_uuid(
+            Uuid::from_slice(
+                joiner_target
+                    .get_cluster_id()
+                    .expect("joiner cluster id")
+                    .get_value()
+                    .expect("joiner cluster id bytes"),
+            )
+            .expect("joiner cluster uuid"),
+        ),
+        joiner_target.get_epoch(),
+    );
+    let split_id = split_op.get_id().expect("split id").to_vec();
+
+    wait_for_operation_stage(
+        &joiner.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_cluster_view(
+        &joiner.topology(),
+        expected_joiner_view,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_cluster_view(
+        &anchor.topology(),
+        expected_anchor_view,
+        Duration::from_secs(5),
+    )
+    .await;
 });
 
 // Validates startup replay resumes non-finalized durable operations and applies their commit side effects.
@@ -745,4 +975,145 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
         ClusterViewId::legacy_default(),
         "dry-run startup records must not change active view"
     );
+});
+
+// Validates cluster view listing exposes the local active row and a non-zero member count.
+local_test!(cluster_view_lists_local_active_row, {
+    let node = TestNode::new_with_tick_ms(100).await;
+
+    let view_resp = node
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let local_view_reader = view_resp
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    let local_view = ClusterViewId::from_capnp(local_view_reader).expect("decode local view");
+
+    let list_resp = node
+        .topology()
+        .list_cluster_views_request()
+        .send()
+        .promise
+        .await
+        .expect("listClusterViews send");
+    let rows = list_resp
+        .get()
+        .expect("listClusterViews get")
+        .get_views()
+        .expect("cluster view rows");
+    assert!(
+        !rows.is_empty(),
+        "cluster view list must include at least the local active view"
+    );
+
+    let mut found_local = false;
+    for idx in 0..rows.len() {
+        let row = rows.get(idx);
+        let view = ClusterViewId::from_capnp(row.get_view().expect("row view"))
+            .expect("decode row cluster view");
+        if row.get_local_active() {
+            found_local = true;
+            assert_eq!(
+                view, local_view,
+                "local-active row must match getClusterView"
+            );
+            assert!(
+                row.get_node_count() >= 1,
+                "local-active row must report at least one node"
+            );
+        }
+    }
+    assert!(
+        found_local,
+        "cluster view list must include a local-active row"
+    );
+});
+
+// Validates split planning accepts a single fallback target and routes unmatched peers into it.
+local_test!(cluster_view_split_selector_with_fallback_target, {
+    let anchor = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner = TestNode::new_tcp_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join");
+    anchor
+        .assert_cluster_size(2, "cluster size after join")
+        .await;
+    sleep(Duration::from_millis(400)).await;
+
+    let view_resp = joiner
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let source_view = ClusterViewId::from_capnp(
+        view_resp
+            .get()
+            .expect("getClusterView get")
+            .get_view()
+            .expect("source view payload"),
+    )
+    .expect("decode source view");
+
+    let mut split_req = joiner.topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        source_view.write_capnp(req.reborrow().init_source_view());
+        let mut targets = req.reborrow().init_targets(2);
+
+        let mut selected = targets.reborrow().get(0);
+        selected.set_name("selected");
+        let mut selector_a = selected.reborrow().init_selector();
+        let mut clauses = selector_a.reborrow().init_clauses(1);
+        let mut clause = clauses.reborrow().get(0);
+        clause.set_key("node.id");
+        clause.set_op(protocol::topology::split_selector_clause::Operator::Eq);
+        clause.set_value(&joiner.id().to_string());
+        selector_a.reborrow().init_explicit_nodes(0);
+
+        let mut fallback = targets.reborrow().get(1);
+        fallback.set_name("other");
+        let mut selector_b = fallback.reborrow().init_selector();
+        selector_b.reborrow().init_clauses(0);
+        selector_b.reborrow().init_explicit_nodes(0);
+        req.set_dry_run(false);
+    }
+
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split operation");
+    assert_eq!(
+        split_op.get_stage().expect("split stage"),
+        ClusterOperationStage::Proposed
+    );
+
+    let target_views = split_op.get_target_views().expect("target views");
+    assert_eq!(
+        target_views.len(),
+        2,
+        "split should expose two target views"
+    );
+    let selected_view = ClusterViewId::from_capnp(target_views.get(0)).expect("selected view");
+    let fallback_view = ClusterViewId::from_capnp(target_views.get(1)).expect("fallback view");
+
+    let split_id = split_op.get_id().expect("split id").to_vec();
+    wait_for_operation_stage(
+        &joiner.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    wait_for_cluster_view(&joiner.topology(), selected_view, Duration::from_secs(5)).await;
+    wait_for_cluster_view(&anchor.topology(), fallback_view, Duration::from_secs(5)).await;
 });
