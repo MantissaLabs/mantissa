@@ -70,6 +70,32 @@ pub struct ClusterSummary {
     pub local_active: bool,
 }
 
+/// Node candidate row returned for interactive split planning.
+#[derive(Clone, Debug)]
+pub struct SplitCandidate {
+    pub node_id: Uuid,
+    pub hostname: String,
+    pub address: String,
+    pub health: String,
+    pub active_view: ClusterViewSpec,
+    pub cpu_vendor: Option<String>,
+    pub cpu_brand: Option<String>,
+    pub cpu_logical: Option<u64>,
+    pub cpu_cores: Option<u64>,
+    pub memory_total_kb: Option<u64>,
+    pub gpu_vendor: Option<String>,
+    pub gpu_count: Option<u64>,
+    pub gpu_models: Vec<String>,
+    pub wireguard_enabled: bool,
+}
+
+/// Snapshot used by interactive split planners to display candidate nodes.
+#[derive(Clone, Debug)]
+pub struct SplitCandidateList {
+    pub source_view: ClusterViewSpec,
+    pub candidates: Vec<SplitCandidate>,
+}
+
 /// Operator-friendly split filters supported by the simplified CLI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SplitFilterKind {
@@ -139,6 +165,7 @@ struct SplitClauseSpec {
 struct SplitTargetSpec {
     name: String,
     clauses: Vec<SplitClauseSpec>,
+    explicit_nodes: Vec<Uuid>,
 }
 
 /// Human-friendly summary returned for merge/split operation submissions.
@@ -407,6 +434,163 @@ pub async fn resolve_cluster_view_by_cluster_id(
     resolve_view_from_summaries(&summaries, cluster_id)
 }
 
+/// Resolves the split/merge source view from either an explicit cluster id or the local active view.
+async fn resolve_source_view(
+    cfg: &ClientConfig,
+    source_cluster_id: Option<&str>,
+) -> Result<ClusterViewSpec> {
+    match source_cluster_id {
+        Some(cluster_id) => {
+            let cluster_id = parse_cluster_id(cluster_id, "cluster id")?;
+            resolve_cluster_view_by_cluster_id(cfg, cluster_id).await
+        }
+        None => active_cluster_view(cfg).await,
+    }
+}
+
+/// Converts empty strings returned by Cap'n Proto into `None` for optional display fields.
+fn text_or_none(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Lists split candidates for one source cluster so interactive UIs can present rich node details.
+pub async fn list_split_candidates(
+    cfg: &ClientConfig,
+    source_cluster_id: Option<&str>,
+) -> Result<SplitCandidateList> {
+    let source_view = resolve_source_view(cfg, source_cluster_id).await?;
+    let topology = topology_capability(cfg).await?;
+    let mut request = topology.list_split_candidates_request();
+    source_view.write_capnp(request.get().init_source_view());
+
+    let response = request
+        .send()
+        .promise
+        .await
+        .context("listSplitCandidates RPC failed")?;
+    let rows = response
+        .get()
+        .context("failed to read listSplitCandidates response")?
+        .get_nodes()
+        .context("listSplitCandidates response missing nodes")?;
+
+    let mut candidates = Vec::with_capacity(rows.len() as usize);
+    for idx in 0..rows.len() {
+        let row = rows.get(idx);
+        let node_bytes = row
+            .get_node_id()
+            .context("split candidate missing node id")?
+            .get_bytes()
+            .context("split candidate missing node id bytes")?
+            .to_vec();
+        if node_bytes.len() != 16 {
+            return Err(anyhow!(
+                "split candidate contained invalid node id length {}",
+                node_bytes.len()
+            ));
+        }
+
+        let node_id = Uuid::from_slice(&node_bytes).context("invalid split candidate node id")?;
+        let hostname = row
+            .get_hostname()
+            .context("split candidate missing hostname")?
+            .to_string()
+            .context("split candidate hostname invalid utf8")?;
+        let address = row
+            .get_addr()
+            .context("split candidate missing address")?
+            .to_string()
+            .context("split candidate address invalid utf8")?;
+        let health = format!(
+            "{:?}",
+            row.get_health().context("split candidate missing health")?
+        );
+        let active_view = ClusterViewSpec::from_capnp(
+            row.get_active_cluster_view()
+                .context("split candidate missing active cluster view")?,
+        )?;
+
+        let cpu_vendor = text_or_none(
+            row.get_cpu_vendor()
+                .context("split candidate missing cpu vendor")?
+                .to_string()
+                .context("split candidate cpu vendor invalid utf8")?,
+        );
+        let cpu_brand = text_or_none(
+            row.get_cpu_brand()
+                .context("split candidate missing cpu brand")?
+                .to_string()
+                .context("split candidate cpu brand invalid utf8")?,
+        );
+        let gpu_vendor = text_or_none(
+            row.get_gpu_vendor()
+                .context("split candidate missing gpu vendor")?
+                .to_string()
+                .context("split candidate gpu vendor invalid utf8")?,
+        );
+
+        let gpu_models_reader = row
+            .get_gpu_models()
+            .context("split candidate missing gpu models")?;
+        let mut gpu_models = Vec::with_capacity(gpu_models_reader.len() as usize);
+        for model_idx in 0..gpu_models_reader.len() {
+            let model = gpu_models_reader
+                .get(model_idx)
+                .context("split candidate gpu model missing")?
+                .to_string()
+                .context("split candidate gpu model invalid utf8")?;
+            if !model.trim().is_empty() {
+                gpu_models.push(model);
+            }
+        }
+
+        candidates.push(SplitCandidate {
+            node_id,
+            hostname,
+            address,
+            health,
+            active_view,
+            cpu_vendor,
+            cpu_brand,
+            cpu_logical: {
+                let value = row.get_cpu_logical();
+                if value == 0 { None } else { Some(value) }
+            },
+            cpu_cores: {
+                let value = row.get_cpu_cores();
+                if value == 0 { None } else { Some(value) }
+            },
+            memory_total_kb: {
+                let value = row.get_memory_total_kb();
+                if value == 0 { None } else { Some(value) }
+            },
+            gpu_vendor,
+            gpu_count: {
+                let value = row.get_gpu_count();
+                if value == 0 { None } else { Some(value) }
+            },
+            gpu_models,
+            wireguard_enabled: row.get_wireguard_enabled(),
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        left.hostname
+            .cmp(&right.hostname)
+            .then(left.node_id.cmp(&right.node_id))
+    });
+
+    Ok(SplitCandidateList {
+        source_view,
+        candidates,
+    })
+}
+
 /// Submits a merge request using cluster lineage identifiers instead of raw view ids.
 pub async fn merge_by_cluster_id(
     cfg: &ClientConfig,
@@ -437,13 +621,7 @@ pub async fn split_by_filter(
     remainder_name: &str,
     dry_run: bool,
 ) -> Result<ClusterOperationSummary> {
-    let source_view = match source_cluster_id {
-        Some(cluster_id) => {
-            let cluster_id = parse_cluster_id(cluster_id, "cluster id")?;
-            resolve_cluster_view_by_cluster_id(cfg, cluster_id).await?
-        }
-        None => active_cluster_view(cfg).await?,
-    };
+    let source_view = resolve_source_view(cfg, source_cluster_id).await?;
     let selector_key = filter.selector_key();
     let value_list = normalize_split_values(values, filter.expects_numeric_value())?;
 
@@ -464,6 +642,7 @@ pub async fn split_by_filter(
                 op: SplitOperator::Eq,
                 value,
             }],
+            explicit_nodes: Vec::new(),
         });
     }
 
@@ -477,7 +656,77 @@ pub async fn split_by_filter(
     targets.push(SplitTargetSpec {
         name: fallback_name,
         clauses: Vec::new(),
+        explicit_nodes: Vec::new(),
     });
+
+    submit_split_request(cfg, source_view, &targets, dry_run).await
+}
+
+/// Submits a split request from explicit per-node assignments selected by interactive tooling.
+pub async fn split_by_explicit_nodes(
+    cfg: &ClientConfig,
+    source_cluster_id: Option<&str>,
+    left_name: &str,
+    right_name: &str,
+    left_nodes: &[Uuid],
+    right_nodes: &[Uuid],
+    dry_run: bool,
+) -> Result<ClusterOperationSummary> {
+    let source_view = resolve_source_view(cfg, source_cluster_id).await?;
+    let left_name = left_name.trim();
+    let right_name = right_name.trim();
+    if left_name.is_empty() {
+        return Err(anyhow!("left partition name must not be empty"));
+    }
+    if right_name.is_empty() {
+        return Err(anyhow!("right partition name must not be empty"));
+    }
+    if left_name == right_name {
+        return Err(anyhow!(
+            "left and right partition names must differ ('{left_name}')"
+        ));
+    }
+    if left_nodes.is_empty() || right_nodes.is_empty() {
+        return Err(anyhow!(
+            "interactive split requires at least one node on each side"
+        ));
+    }
+
+    let mut seen = HashSet::<Uuid>::with_capacity(left_nodes.len() + right_nodes.len());
+    let mut left_unique = Vec::with_capacity(left_nodes.len());
+    for node_id in left_nodes {
+        if seen.insert(*node_id) {
+            left_unique.push(*node_id);
+        } else {
+            return Err(anyhow!(
+                "node {node_id} is assigned multiple times across split partitions"
+            ));
+        }
+    }
+
+    let mut right_unique = Vec::with_capacity(right_nodes.len());
+    for node_id in right_nodes {
+        if seen.insert(*node_id) {
+            right_unique.push(*node_id);
+        } else {
+            return Err(anyhow!(
+                "node {node_id} is assigned multiple times across split partitions"
+            ));
+        }
+    }
+
+    let targets = vec![
+        SplitTargetSpec {
+            name: left_name.to_string(),
+            clauses: Vec::new(),
+            explicit_nodes: left_unique,
+        },
+        SplitTargetSpec {
+            name: right_name.to_string(),
+            clauses: Vec::new(),
+            explicit_nodes: right_unique,
+        },
+    ];
 
     submit_split_request(cfg, source_view, &targets, dry_run).await
 }
@@ -542,7 +791,15 @@ async fn submit_split_request(
                 clause.set_op(clause_spec.op);
                 clause.set_value(&clause_spec.value);
             }
-            selector.reborrow().init_explicit_nodes(0);
+            let mut explicit_nodes = selector
+                .reborrow()
+                .init_explicit_nodes(target_spec.explicit_nodes.len() as u32);
+            for (node_idx, node_id) in target_spec.explicit_nodes.iter().enumerate() {
+                explicit_nodes
+                    .reborrow()
+                    .get(node_idx as u32)
+                    .set_bytes(node_id.as_bytes());
+            }
         }
         req.set_dry_run(dry_run);
     }

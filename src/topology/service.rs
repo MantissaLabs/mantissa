@@ -766,6 +766,24 @@ impl Topology {
         Ok(assignments)
     }
 
+    /// Resolves the split target index selected for the local node in a split operation.
+    fn local_split_target_index(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<usize, capnp::Error> {
+        operation
+            .split_assignments
+            .iter()
+            .find(|assignment| assignment.node_id == self.node.id)
+            .map(|assignment| assignment.target_index)
+            .ok_or_else(|| {
+                capnp::Error::failed(format!(
+                    "split operation {} has no assignment for local node {}",
+                    operation.id, self.node.id
+                ))
+            })
+    }
+
     /// Resolves the target view this node should activate when committing the operation.
     fn local_target_view_for_operation(
         &self,
@@ -773,21 +791,121 @@ impl Topology {
     ) -> Result<ClusterViewId, capnp::Error> {
         match operation.kind {
             ClusterOperationKind::Merge => operation.target_views.first().copied(),
-            ClusterOperationKind::Split => {
-                let assignment = operation
-                    .split_assignments
-                    .iter()
-                    .find(|assignment| assignment.node_id == self.node.id)
-                    .ok_or_else(|| {
-                        capnp::Error::failed(format!(
-                            "split operation {} has no assignment for local node {}",
-                            operation.id, self.node.id
-                        ))
-                    })?;
-                operation.target_views.get(assignment.target_index).copied()
-            }
+            ClusterOperationKind::Split => operation
+                .target_views
+                .get(self.local_split_target_index(operation)?)
+                .copied(),
         }
         .ok_or_else(|| capnp::Error::failed("operation has no target views for commit".to_string()))
+    }
+
+    /// Removes peers, session tickets, and credentials that no longer belong to the local split target.
+    async fn prune_split_state_for_local_target(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<(), capnp::Error> {
+        let local_target_index = self.local_split_target_index(operation)?;
+        let retained_ids = operation
+            .split_assignments
+            .iter()
+            .filter(|assignment| assignment.target_index == local_target_index)
+            .map(|assignment| assignment.node_id)
+            .collect::<HashSet<_>>();
+
+        if !retained_ids.contains(&self.node.id) {
+            return Err(capnp::Error::failed(format!(
+                "split operation {} local target {} does not retain local node {}",
+                operation.id, local_target_index, self.node.id
+            )));
+        }
+
+        let (actives, _) = self
+            .peers
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let mut evicted_ids = actives
+            .into_iter()
+            .map(|(key, _)| key.to_uuid())
+            .filter(|peer_id| !retained_ids.contains(peer_id))
+            .collect::<HashSet<_>>();
+        for assignment in operation.split_assignments.iter() {
+            if assignment.target_index != local_target_index {
+                evicted_ids.insert(assignment.node_id);
+            }
+        }
+        evicted_ids.remove(&self.node.id);
+
+        let mut evicted = evicted_ids.into_iter().collect::<Vec<_>>();
+        evicted.sort_unstable();
+
+        let mut removed_peers = 0usize;
+        let mut removed_sessions = 0usize;
+        let mut removed_credentials = 0usize;
+        for peer_id in evicted.iter().copied() {
+            let key = UuidKey::from(peer_id);
+            match self.peers.exists(&key) {
+                Ok(true) => match self.peers.remove(&key).await {
+                    Ok(_) => removed_peers = removed_peers.saturating_add(1),
+                    Err(err) => {
+                        warn!(
+                            target: "cluster_view",
+                            operation_id = %operation.id,
+                            peer_id = %peer_id,
+                            "failed to remove out-of-view peer during split prune: {err}"
+                        );
+                    }
+                },
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(
+                        target: "cluster_view",
+                        operation_id = %operation.id,
+                        peer_id = %peer_id,
+                        "failed to check out-of-view peer during split prune: {err}"
+                    );
+                }
+            }
+
+            match self.local_sessions.remove(peer_id) {
+                Ok(()) => removed_sessions = removed_sessions.saturating_add(1),
+                Err(err) => {
+                    warn!(
+                        target: "cluster_view",
+                        operation_id = %operation.id,
+                        peer_id = %peer_id,
+                        "failed to remove local session ticket during split prune: {err}"
+                    );
+                }
+            }
+
+            match self.local_credential_store.remove(peer_id) {
+                Ok(()) => removed_credentials = removed_credentials.saturating_add(1),
+                Err(err) => {
+                    warn!(
+                        target: "cluster_view",
+                        operation_id = %operation.id,
+                        peer_id = %peer_id,
+                        "failed to remove local credential during split prune: {err}"
+                    );
+                }
+            }
+
+            self.registry.remove_peer(peer_id).await;
+        }
+
+        info!(
+            target: "cluster_view",
+            operation_id = %operation.id,
+            local_target_index,
+            retained_count = retained_ids.len(),
+            evicted_count = evicted.len(),
+            removed_peers,
+            removed_sessions,
+            removed_credentials,
+            "completed split prune for local target"
+        );
+
+        Ok(())
     }
 
     /// Reads the cluster view currently bound to a session for operation relay validation.
@@ -987,6 +1105,9 @@ impl Topology {
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
         let target_view = self.local_target_view_for_operation(operation)?;
+        if operation.kind == ClusterOperationKind::Split {
+            self.prune_split_state_for_local_target(operation).await?;
+        }
 
         let previous = self.set_active_cluster_view(target_view);
         self.registry.clear().await;
@@ -1264,18 +1385,41 @@ impl topology::Server for Topology {
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-        let list_builder = results.get().init_nodes();
-        let mut node_list = list_builder.init_nodes(actives.len() as u32);
         let local_view = self.active_cluster_view();
+        let mut scoped_nodes =
+            Vec::<(Uuid, Option<PeerValue>, protocol::health::NodeStatus)>::with_capacity(
+                actives.len(),
+            );
 
-        for (i, (k, snap)) in actives.into_iter().enumerate() {
+        for (k, snap) in actives.into_iter() {
             let id = k.to_uuid();
-            let mut node = node_list.reborrow().get(i as u32);
-            set_node_id(node.reborrow().init_id(), &id);
-            let view = self.best_known_peer_view(id).await.unwrap_or(local_view);
-            view.write_capnp(node.reborrow().init_active_cluster_view());
+            let candidate_view = if id == self.node.id {
+                Some(local_view)
+            } else {
+                self.best_known_peer_view(id).await
+            };
+            if candidate_view != Some(local_view) {
+                continue;
+            }
 
-            if let Some(val) = snap.as_slice().last().cloned() {
+            // Map health snapshot to NodeStatus.
+            let health_status = health_snapshot
+                .get(&id)
+                .cloned()
+                .unwrap_or(::health::Status::Unknown);
+            let node_status = status_to_node_status(health_status);
+            scoped_nodes.push((id, snap.as_slice().last().cloned(), node_status));
+        }
+
+        scoped_nodes.sort_by_key(|(id, _, _)| *id);
+        let list_builder = results.get().init_nodes();
+        let mut node_list = list_builder.init_nodes(scoped_nodes.len() as u32);
+        for (index, (id, value, node_status)) in scoped_nodes.into_iter().enumerate() {
+            let mut node = node_list.reborrow().get(index as u32);
+            set_node_id(node.reborrow().init_id(), &id);
+            local_view.write_capnp(node.reborrow().init_active_cluster_view());
+
+            if let Some(val) = value {
                 node.set_addr(&val.address);
                 node.set_hostname(&val.hostname);
                 node.set_public_key(&val.noise_static_pub);
@@ -1286,13 +1430,6 @@ impl topology::Server for Topology {
                     node.set_wireguard_enabled(wg.enabled);
                 }
             }
-
-            // Map health snapshot to NodeStatus.
-            let health_status = health_snapshot
-                .get(&id)
-                .cloned()
-                .unwrap_or(::health::Status::Unknown);
-            let node_status = status_to_node_status(health_status);
             node.set_health(node_status);
         }
 
@@ -1330,6 +1467,69 @@ impl topology::Server for Topology {
     ) -> Result<(), capnp::Error> {
         self.active_cluster_view()
             .write_capnp(results.get().init_view());
+        Ok(())
+    }
+
+    /// Lists split candidates for one source view with host details used by interactive planners.
+    async fn list_split_candidates(
+        self: Rc<Self>,
+        params: topology::ListSplitCandidatesParams,
+        mut results: topology::ListSplitCandidatesResults,
+    ) -> Result<(), capnp::Error> {
+        let source_view = ClusterViewId::from_capnp(params.get()?.get_source_view()?)
+            .map_err(capnp::Error::failed)?;
+        let local_view = self.active_cluster_view();
+        if source_view != local_view {
+            return Err(capnp::Error::failed(format!(
+                "split candidates source view must equal local active view {local_view}"
+            )));
+        }
+
+        let candidates = self.collect_split_node_candidates(source_view).await?;
+        let health_snapshot = self.health_monitor.snapshot();
+        let mut list = results.get().init_nodes(candidates.len() as u32);
+        for (idx, candidate) in candidates.into_iter().enumerate() {
+            let mut row = list.reborrow().get(idx as u32);
+            set_node_id(row.reborrow().init_node_id(), &candidate.node_id);
+            row.set_hostname(&candidate.hostname);
+            row.set_addr(&candidate.address);
+            row.set_wireguard_enabled(candidate.wireguard_enabled);
+            row.set_health(status_to_node_status(
+                health_snapshot
+                    .get(&candidate.node_id)
+                    .cloned()
+                    .unwrap_or(::health::Status::Unknown),
+            ));
+
+            let view = self
+                .best_known_peer_view(candidate.node_id)
+                .await
+                .unwrap_or(local_view);
+            view.write_capnp(row.reborrow().init_active_cluster_view());
+
+            if let Some(cpu_vendor) = candidate.cpu_vendor.as_deref() {
+                row.set_cpu_vendor(cpu_vendor);
+            }
+            if let Some(cpu_brand) = candidate.cpu_brand.as_deref() {
+                row.set_cpu_brand(cpu_brand);
+            }
+            row.set_cpu_logical(candidate.cpu_logical.unwrap_or_default());
+            row.set_cpu_cores(candidate.cpu_cores.unwrap_or_default());
+            row.set_memory_total_kb(candidate.memory_total_kb.unwrap_or_default());
+
+            if let Some(gpu_vendor) = candidate.gpu_vendor.as_deref() {
+                row.set_gpu_vendor(gpu_vendor);
+            }
+            row.set_gpu_count(candidate.gpu_count.unwrap_or_default());
+
+            let mut gpu_models = row
+                .reborrow()
+                .init_gpu_models(candidate.gpu_models.len() as u32);
+            for (gpu_idx, model) in candidate.gpu_models.iter().enumerate() {
+                gpu_models.set(gpu_idx as u32, model);
+            }
+        }
+
         Ok(())
     }
 
@@ -1627,16 +1827,42 @@ impl topology::Server for Topology {
             }
         }
 
+        // Preserve split sibling discoverability even after peer pruning removes direct sessions.
+        // This keeps merge UX simple because both split target clusters stay listable from either side.
         for operation in self.load_cluster_operations()? {
-            for view in operation.source_views {
-                counts.entry(view).or_insert(0);
+            if operation.kind != ClusterOperationKind::Split
+                || operation.dry_run
+                || operation.stage == ClusterOperationStage::Aborted
+            {
+                continue;
             }
-            for view in operation.target_views {
-                counts.entry(view).or_insert(0);
+            if !operation.target_views.contains(&local_view) {
+                continue;
+            }
+
+            let mut inferred_target_counts = vec![0u32; operation.target_views.len()];
+            for assignment in operation.split_assignments.iter() {
+                if let Some(slot) = inferred_target_counts.get_mut(assignment.target_index) {
+                    *slot = slot.saturating_add(1);
+                }
+            }
+
+            for (idx, view) in operation.target_views.iter().copied().enumerate() {
+                let inferred_count = inferred_target_counts.get(idx).copied().unwrap_or_default();
+                if inferred_count == 0 {
+                    continue;
+                }
+                let entry = counts.entry(view).or_insert(0);
+                if *entry < inferred_count {
+                    *entry = inferred_count;
+                }
             }
         }
 
-        let mut rows = counts.into_iter().collect::<Vec<_>>();
+        let mut rows = counts
+            .into_iter()
+            .filter(|(_, node_count)| *node_count > 0)
+            .collect::<Vec<_>>();
         rows.sort_by(|(left, _), (right, _)| {
             left.cluster_id
                 .as_bytes()

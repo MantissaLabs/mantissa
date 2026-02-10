@@ -302,6 +302,7 @@ Current UX goal is cluster-centric commands while keeping `ClusterViewId` intern
 - `mantissa merge <source-cluster-id> <destination-cluster-id> [--dry-run]`
 - `mantissa split --cluster <cluster-id> --by <filter> --values <v1,v2,...> [--dry-run]`
 - `mantissa split --filter-per-gpu <vendor-a,vendor-b,...>` (shortcut)
+- `mantissa split --interactive [--left-name <name>] [--right-name <name>]` (interactive node picker)
 
 2. Client layer resolves cluster IDs to latest known views and compiles simple filters into
 split selector targets (plus one fallback partition).

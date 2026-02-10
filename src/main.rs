@@ -23,6 +23,7 @@ mod sync;
 mod task;
 mod token;
 mod topology;
+mod ui;
 
 use clap::Parser;
 use protocol::{info_capnp, node_capnp, topology_capnp};
@@ -85,7 +86,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("no clusters known");
                 } else {
                     let mut tw = TabWriter::new(Vec::new());
-                    writeln!(&mut tw, "CLUSTER_ID\tEPOCH\tNODES\tLOCAL_ACTIVE")?;
+                    writeln!(&mut tw, "CLUSTER_ID\tEPOCH\tNODES\tACTIVE_ON_THIS_NODE")?;
                     for summary in summaries {
                         writeln!(
                             &mut tw,
@@ -510,40 +511,72 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Command::Split(s) => {
-            let (filter, values) = if !s.filter_per_gpu.is_empty() {
-                (
-                    client::cluster::SplitFilterKind::GpuVendor,
-                    s.filter_per_gpu.clone(),
-                )
+            let summary = if s.interactive {
+                let payload = local
+                    .run_until(client::cluster::list_split_candidates(
+                        &cfg,
+                        s.cluster.as_deref(),
+                    ))
+                    .await?;
+                if payload.candidates.is_empty() {
+                    return Err(anyhow!("no split candidates found in the selected cluster").into());
+                }
+
+                let selection =
+                    ui::split_interactive::run_split_planner(payload, &s.left_name, &s.right_name)?;
+                if selection.cancelled {
+                    println!("split cancelled");
+                    return Ok(());
+                }
+
+                local
+                    .run_until(client::cluster::split_by_explicit_nodes(
+                        &cfg,
+                        s.cluster.as_deref(),
+                        &selection.left_name,
+                        &selection.right_name,
+                        &selection.left_nodes,
+                        &selection.right_nodes,
+                        s.dry_run,
+                    ))
+                    .await?
             } else {
-                let filter = match s.by.ok_or_else(|| anyhow!("--by is required"))? {
-                    SplitFilterOpt::GpuVendor => client::cluster::SplitFilterKind::GpuVendor,
-                    SplitFilterOpt::GpuModel => client::cluster::SplitFilterKind::GpuModel,
-                    SplitFilterOpt::CpuVendor => client::cluster::SplitFilterKind::CpuVendor,
-                    SplitFilterOpt::CpuBrand => client::cluster::SplitFilterKind::CpuBrand,
-                    SplitFilterOpt::GpuCount => client::cluster::SplitFilterKind::GpuCount,
-                    SplitFilterOpt::CpuCores => client::cluster::SplitFilterKind::CpuCores,
-                    SplitFilterOpt::CpuLogical => client::cluster::SplitFilterKind::CpuLogical,
-                    SplitFilterOpt::MemoryTotalKb => {
-                        client::cluster::SplitFilterKind::MemoryTotalKb
-                    }
-                    SplitFilterOpt::MemoryTotalBytes => {
-                        client::cluster::SplitFilterKind::MemoryTotalBytes
-                    }
+                let (filter, values) = if !s.filter_per_gpu.is_empty() {
+                    (
+                        client::cluster::SplitFilterKind::GpuVendor,
+                        s.filter_per_gpu.clone(),
+                    )
+                } else {
+                    let filter = match s.by.ok_or_else(|| anyhow!("--by is required"))? {
+                        SplitFilterOpt::GpuVendor => client::cluster::SplitFilterKind::GpuVendor,
+                        SplitFilterOpt::GpuModel => client::cluster::SplitFilterKind::GpuModel,
+                        SplitFilterOpt::CpuVendor => client::cluster::SplitFilterKind::CpuVendor,
+                        SplitFilterOpt::CpuBrand => client::cluster::SplitFilterKind::CpuBrand,
+                        SplitFilterOpt::GpuCount => client::cluster::SplitFilterKind::GpuCount,
+                        SplitFilterOpt::CpuCores => client::cluster::SplitFilterKind::CpuCores,
+                        SplitFilterOpt::CpuLogical => client::cluster::SplitFilterKind::CpuLogical,
+                        SplitFilterOpt::MemoryTotalKb => {
+                            client::cluster::SplitFilterKind::MemoryTotalKb
+                        }
+                        SplitFilterOpt::MemoryTotalBytes => {
+                            client::cluster::SplitFilterKind::MemoryTotalBytes
+                        }
+                    };
+                    (filter, s.values.clone())
                 };
-                (filter, s.values.clone())
+
+                local
+                    .run_until(client::cluster::split_by_filter(
+                        &cfg,
+                        s.cluster.as_deref(),
+                        filter,
+                        &values,
+                        &s.remainder_name,
+                        s.dry_run,
+                    ))
+                    .await?
             };
 
-            let summary = local
-                .run_until(client::cluster::split_by_filter(
-                    &cfg,
-                    s.cluster.as_deref(),
-                    filter,
-                    &values,
-                    &s.remainder_name,
-                    s.dry_run,
-                ))
-                .await?;
             println!("operation {}", summary.id);
             println!("kind: {}", summary.kind);
             println!("stage: {}", summary.stage);

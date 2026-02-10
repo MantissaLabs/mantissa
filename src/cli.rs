@@ -572,13 +572,21 @@ pub struct SplitArgs {
     #[arg(long = "cluster", value_name = "CLUSTER_ID")]
     pub cluster: Option<String>,
 
+    /// Start an interactive split planner with left/right node assignment.
+    #[arg(
+        long = "interactive",
+        action = ArgAction::SetTrue,
+        conflicts_with_all = ["filter_per_gpu", "by", "values", "remainder_name"]
+    )]
+    pub interactive: bool,
+
     /// Built-in simple split by GPU vendor list (example: --filter-per-gpu NVIDIA,AMD).
     #[arg(
         long = "filter-per-gpu",
         value_name = "VENDORS",
         value_delimiter = ',',
         num_args = 1..,
-        conflicts_with_all = ["by", "values"]
+        conflicts_with_all = ["by", "values", "interactive"]
     )]
     pub filter_per_gpu: Vec<String>,
 
@@ -587,7 +595,7 @@ pub struct SplitArgs {
         long = "by",
         value_enum,
         value_name = "FILTER",
-        required_unless_present = "filter_per_gpu"
+        required_unless_present_any = ["filter_per_gpu", "interactive"]
     )]
     pub by: Option<SplitFilterOpt>,
 
@@ -597,13 +605,26 @@ pub struct SplitArgs {
         value_name = "VALUES",
         value_delimiter = ',',
         num_args = 1..,
-        required_unless_present = "filter_per_gpu"
+        required_unless_present_any = ["filter_per_gpu", "interactive"]
     )]
     pub values: Vec<String>,
 
     /// Name for the automatic fallback split target when nodes do not match any listed value.
-    #[arg(long = "remainder-name", value_name = "NAME", default_value = "other")]
+    #[arg(
+        long = "remainder-name",
+        value_name = "NAME",
+        default_value = "other",
+        conflicts_with = "interactive"
+    )]
     pub remainder_name: String,
+
+    /// Left partition name used by `--interactive`.
+    #[arg(long = "left-name", value_name = "NAME", default_value = "left")]
+    pub left_name: String,
+
+    /// Right partition name used by `--interactive`.
+    #[arg(long = "right-name", value_name = "NAME", default_value = "right")]
+    pub right_name: String,
 
     /// Validate and record the operation without applying control-plane changes.
     #[arg(long = "dry-run", action = ArgAction::SetTrue)]

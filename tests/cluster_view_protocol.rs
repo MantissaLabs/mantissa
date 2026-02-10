@@ -1035,6 +1035,302 @@ local_test!(cluster_view_lists_local_active_row, {
     );
 });
 
+// Validates split candidate listing returns node rows with active-view and resource metadata.
+local_test!(cluster_view_lists_split_candidates, {
+    let anchor = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner = TestNode::new_tcp_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join");
+    anchor
+        .assert_cluster_size(2, "cluster size after join")
+        .await;
+    sleep(Duration::from_millis(400)).await;
+
+    let view_resp = joiner
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let source_view = ClusterViewId::from_capnp(
+        view_resp
+            .get()
+            .expect("getClusterView get")
+            .get_view()
+            .expect("source view payload"),
+    )
+    .expect("decode source view");
+
+    let mut list_req = joiner.topology().list_split_candidates_request();
+    source_view.write_capnp(list_req.get().init_source_view());
+    let list_resp = list_req
+        .send()
+        .promise
+        .await
+        .expect("listSplitCandidates send");
+    let rows = list_resp
+        .get()
+        .expect("listSplitCandidates get")
+        .get_nodes()
+        .expect("split candidate rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "split candidate list should include both nodes"
+    );
+
+    let mut saw_joiner = false;
+    let mut saw_anchor = false;
+    for idx in 0..rows.len() {
+        let row = rows.get(idx);
+        let node_id = Uuid::from_slice(
+            row.get_node_id()
+                .expect("node id")
+                .get_bytes()
+                .expect("node id bytes"),
+        )
+        .expect("decode node id");
+        if node_id == joiner.id() {
+            saw_joiner = true;
+        }
+        if node_id == anchor.id() {
+            saw_anchor = true;
+        }
+
+        let row_view = ClusterViewId::from_capnp(
+            row.get_active_cluster_view()
+                .expect("candidate active cluster view"),
+        )
+        .expect("decode candidate active view");
+        assert_eq!(
+            row_view, source_view,
+            "split candidates should be scoped to the current active view"
+        );
+        assert!(
+            !row.get_hostname().expect("candidate hostname").is_empty(),
+            "candidate hostname must be present"
+        );
+    }
+
+    assert!(saw_joiner, "split candidates should include the local node");
+    assert!(
+        saw_anchor,
+        "split candidates should include the joined peer"
+    );
+});
+
+// Validates finalized split scopes node listing to local active view and omits empty legacy rows.
+local_test!(cluster_view_split_scopes_listings_to_active_view, {
+    let anchor = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner_a = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner_b = TestNode::new_tcp_with_tick_ms(100).await;
+    joiner_a.join(&anchor).await.expect("join A");
+    joiner_b.join(&anchor).await.expect("join B");
+    anchor
+        .assert_cluster_size(3, "cluster size after joins")
+        .await;
+    sleep(Duration::from_millis(600)).await;
+
+    let view_resp = anchor
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let source_view = ClusterViewId::from_capnp(
+        view_resp
+            .get()
+            .expect("getClusterView get")
+            .get_view()
+            .expect("source view payload"),
+    )
+    .expect("decode source view");
+
+    let mut split_req = anchor.topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        source_view.write_capnp(req.reborrow().init_source_view());
+
+        let mut targets = req.reborrow().init_targets(2);
+        let mut target_self = targets.reborrow().get(0);
+        target_self.set_name("self-only");
+        let mut selector_self = target_self.reborrow().init_selector();
+        selector_self.reborrow().init_clauses(0);
+        let mut explicit_self = selector_self.reborrow().init_explicit_nodes(1);
+        set_node_id(explicit_self.reborrow().get(0), &anchor.id());
+
+        let mut target_others = targets.reborrow().get(1);
+        target_others.set_name("others");
+        let mut selector_others = target_others.reborrow().init_selector();
+        selector_others.reborrow().init_clauses(0);
+        let mut explicit_others = selector_others.reborrow().init_explicit_nodes(2);
+        set_node_id(explicit_others.reborrow().get(0), &joiner_a.id());
+        set_node_id(explicit_others.reborrow().get(1), &joiner_b.id());
+
+        req.set_dry_run(false);
+    }
+
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split operation");
+    let split_targets = split_op.get_target_views().expect("split target views");
+    let mut expected_cluster_ids = Vec::with_capacity(split_targets.len() as usize);
+    for idx in 0..split_targets.len() {
+        expected_cluster_ids.push(
+            Uuid::from_slice(
+                split_targets
+                    .get(idx)
+                    .get_cluster_id()
+                    .expect("split target cluster id")
+                    .get_value()
+                    .expect("split target cluster id bytes"),
+            )
+            .expect("decode split target cluster id"),
+        );
+    }
+    expected_cluster_ids.sort_unstable();
+    let split_id = split_op.get_id().expect("split operation id").to_vec();
+    wait_for_operation_stage(
+        &anchor.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Node listing must only include nodes in anchor's active split view.
+    let list_resp = anchor
+        .topology()
+        .list_request()
+        .send()
+        .promise
+        .await
+        .expect("topology list send");
+    let nodes = list_resp
+        .get()
+        .expect("topology list get")
+        .get_nodes()
+        .expect("node list payload")
+        .get_nodes()
+        .expect("node rows");
+    assert_eq!(
+        nodes.len(),
+        1,
+        "anchor node listing should only include its active-view members"
+    );
+    let only_id = Uuid::from_slice(
+        nodes
+            .get(0)
+            .get_id()
+            .expect("node id")
+            .get_bytes()
+            .expect("node id bytes"),
+    )
+    .expect("decode listed node id");
+    assert_eq!(
+        only_id,
+        anchor.id(),
+        "anchor list should only contain itself"
+    );
+
+    // Cluster view listing should not include empty/legacy rows after split finalize.
+    let views_resp = anchor
+        .topology()
+        .list_cluster_views_request()
+        .send()
+        .promise
+        .await
+        .expect("listClusterViews send");
+    let rows = views_resp
+        .get()
+        .expect("listClusterViews get")
+        .get_views()
+        .expect("cluster view rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "cluster view listing should expose both split target clusters"
+    );
+    let mut observed_cluster_ids = Vec::with_capacity(rows.len() as usize);
+    for idx in 0..rows.len() {
+        let row = rows.get(idx);
+        assert!(
+            row.get_node_count() > 0,
+            "cluster view rows should never expose empty views"
+        );
+        let row_view =
+            ClusterViewId::from_capnp(row.get_view().expect("row view")).expect("decode row view");
+        observed_cluster_ids.push(row_view.cluster_id.to_uuid());
+        assert_ne!(
+            row_view,
+            ClusterViewId::legacy_default(),
+            "legacy default view should not remain listed once fully split"
+        );
+    }
+    observed_cluster_ids.sort_unstable();
+    assert_eq!(
+        observed_cluster_ids, expected_cluster_ids,
+        "cluster view listing should include both split target cluster ids"
+    );
+
+    // Split commit side effects must physically prune out-of-view peers and credentials.
+    let (active_peers, _) = anchor
+        .node
+        .peers
+        .load_all()
+        .expect("load anchor peers after split");
+    let mut peer_ids = active_peers
+        .into_iter()
+        .map(|(key, _)| key.to_uuid())
+        .collect::<Vec<_>>();
+    peer_ids.sort_unstable();
+    assert_eq!(
+        peer_ids,
+        vec![anchor.id()],
+        "anchor peer store should only keep peers from its split target"
+    );
+    assert!(
+        anchor
+            .node
+            .local_sessions
+            .get(joiner_a.id())
+            .expect("joiner-a ticket lookup")
+            .is_none(),
+        "split prune should drop out-of-view session tickets"
+    );
+    assert!(
+        anchor
+            .node
+            .local_sessions
+            .get(joiner_b.id())
+            .expect("joiner-b ticket lookup")
+            .is_none(),
+        "split prune should drop out-of-view session tickets"
+    );
+    assert!(
+        anchor
+            .node
+            .local_creds
+            .get(joiner_a.id())
+            .expect("joiner-a credential lookup")
+            .is_none(),
+        "split prune should drop out-of-view cached credentials"
+    );
+    assert!(
+        anchor
+            .node
+            .local_creds
+            .get(joiner_b.id())
+            .expect("joiner-b credential lookup")
+            .is_none(),
+        "split prune should drop out-of-view cached credentials"
+    );
+});
+
 // Validates split planning accepts a single fallback target and routes unmatched peers into it.
 local_test!(cluster_view_split_selector_with_fallback_target, {
     let anchor = TestNode::new_tcp_with_tick_ms(100).await;

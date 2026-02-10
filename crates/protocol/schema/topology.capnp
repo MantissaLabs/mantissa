@@ -45,6 +45,9 @@ interface Topology {
 
   listClusterViews @10 () -> (views :List(ClusterViewSummary));
   # Lists known cluster views and per-view node counts from this node's control-plane perspective.
+
+  listSplitCandidates @11 (sourceView :ClusterViewId) -> (nodes :List(SplitCandidate));
+  # Lists node candidates and host metadata used to prepare interactive split assignments.
 }
 
 struct TopologyEvent {
@@ -157,6 +160,50 @@ struct ClusterViewSummary {
 
   localActive @2 :Bool;
   # True when this row corresponds to the local node's active view.
+}
+
+struct SplitCandidate {
+  nodeId @0 :Node.NodeId;
+  # Candidate node identifier.
+
+  hostname @1 :Text;
+  # Hostname reported by the candidate node.
+
+  addr @2 :Text;
+  # Advertised endpoint for the candidate node.
+
+  health @3 :NodeStatus;
+  # Most recent health state observed for the candidate node.
+
+  activeClusterView @4 :ClusterViewId;
+  # Best-known active cluster view for this candidate.
+
+  cpuVendor @5 :Text;
+  # CPU vendor string when available.
+
+  cpuBrand @6 :Text;
+  # CPU brand/model string when available.
+
+  cpuLogical @7 :UInt64;
+  # Logical CPU count.
+
+  cpuCores @8 :UInt64;
+  # Physical core count.
+
+  memoryTotalKb @9 :UInt64;
+  # Total memory in KiB.
+
+  gpuVendor @10 :Text;
+  # GPU vendor string when available.
+
+  gpuCount @11 :UInt64;
+  # Number of GPU devices detected.
+
+  gpuModels @12 :List(Text);
+  # GPU model names detected on the host.
+
+  wireguardEnabled @13 :Bool;
+  # Whether this node has WireGuard dataplane enabled.
 }
 
 enum ClusterOperationKind {

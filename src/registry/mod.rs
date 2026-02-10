@@ -393,13 +393,16 @@ impl Registry {
                 state.session.clone()
             };
             if let Some(session) = cached_session {
-                if Self::ensure_session_view(&session, expected_view)
-                    .await
-                    .is_ok()
-                {
-                    return Ok(Some(sync_cap));
+                match Self::session_matches_view(&session, expected_view).await {
+                    Ok(true) => return Ok(Some(sync_cap)),
+                    Ok(false) => {
+                        self.invalidate_peer(peer_id, &entry).await;
+                        return Ok(None);
+                    }
+                    Err(_) => {
+                        self.invalidate_peer(peer_id, &entry).await;
+                    }
                 }
-                self.invalidate_peer(peer_id, &entry).await;
             }
         }
 
@@ -409,7 +412,10 @@ impl Registry {
         else {
             return Ok(None);
         };
-        Self::ensure_session_view(&session, expected_view).await?;
+        if !Self::session_matches_view(&session, expected_view).await? {
+            self.invalidate_peer(peer_id, &entry).await;
+            return Ok(None);
+        }
 
         match Self::fetch_sync_from_session(&session).await {
             Ok(sync_cap) => {
@@ -426,7 +432,10 @@ impl Registry {
                 else {
                     return Err(err);
                 };
-                Self::ensure_session_view(&session, expected_view).await?;
+                if !Self::session_matches_view(&session, expected_view).await? {
+                    self.invalidate_peer(peer_id, &entry).await;
+                    return Ok(None);
+                }
 
                 let sync_cap = Self::fetch_sync_from_session(&session).await?;
                 let mut state = entry.lock().await;
@@ -452,13 +461,16 @@ impl Registry {
                 state.session.clone()
             };
             if let Some(session) = cached_session {
-                if Self::ensure_session_view(&session, expected_view)
-                    .await
-                    .is_ok()
-                {
-                    return Ok(Some(health_cap));
+                match Self::session_matches_view(&session, expected_view).await {
+                    Ok(true) => return Ok(Some(health_cap)),
+                    Ok(false) => {
+                        self.invalidate_peer(peer_id, &entry).await;
+                        return Ok(None);
+                    }
+                    Err(_) => {
+                        self.invalidate_peer(peer_id, &entry).await;
+                    }
                 }
-                self.invalidate_peer(peer_id, &entry).await;
             }
         }
 
@@ -468,7 +480,10 @@ impl Registry {
         else {
             return Ok(None);
         };
-        Self::ensure_session_view(&session, expected_view).await?;
+        if !Self::session_matches_view(&session, expected_view).await? {
+            self.invalidate_peer(peer_id, &entry).await;
+            return Ok(None);
+        }
 
         match Self::fetch_health_from_session(&session).await {
             Ok(health_cap) => {
@@ -485,7 +500,10 @@ impl Registry {
                 else {
                     return Err(err);
                 };
-                Self::ensure_session_view(&session, expected_view).await?;
+                if !Self::session_matches_view(&session, expected_view).await? {
+                    self.invalidate_peer(peer_id, &entry).await;
+                    return Ok(None);
+                }
 
                 let health_cap = Self::fetch_health_from_session(&session).await?;
                 let mut state = entry.lock().await;
@@ -511,13 +529,16 @@ impl Registry {
                 state.session.clone()
             };
             if let Some(session) = cached_session {
-                if Self::ensure_session_view(&session, expected_view)
-                    .await
-                    .is_ok()
-                {
-                    return Ok(Some(gossip_cap));
+                match Self::session_matches_view(&session, expected_view).await {
+                    Ok(true) => return Ok(Some(gossip_cap)),
+                    Ok(false) => {
+                        self.invalidate_peer(peer_id, &entry).await;
+                        return Ok(None);
+                    }
+                    Err(_) => {
+                        self.invalidate_peer(peer_id, &entry).await;
+                    }
                 }
-                self.invalidate_peer(peer_id, &entry).await;
             }
         }
 
@@ -527,7 +548,10 @@ impl Registry {
         else {
             return Ok(None);
         };
-        Self::ensure_session_view(&session, expected_view).await?;
+        if !Self::session_matches_view(&session, expected_view).await? {
+            self.invalidate_peer(peer_id, &entry).await;
+            return Ok(None);
+        }
 
         match Self::fetch_gossip_from_session(&session).await {
             Ok(gossip_cap) => {
@@ -544,7 +568,10 @@ impl Registry {
                 else {
                     return Err(err);
                 };
-                Self::ensure_session_view(&session, expected_view).await?;
+                if !Self::session_matches_view(&session, expected_view).await? {
+                    self.invalidate_peer(peer_id, &entry).await;
+                    return Ok(None);
+                }
 
                 let gossip_cap = Self::fetch_gossip_from_session(&session).await?;
                 let mut state = entry.lock().await;
@@ -649,21 +676,16 @@ impl Registry {
         resp.get()?.get_gossip()
     }
 
-    /// Ensures the provided session is scoped to `expected_view`.
-    async fn ensure_session_view(
+    /// Returns whether the provided session is scoped to `expected_view`.
+    async fn session_matches_view(
         session: &cluster_session::Client,
         expected_view: ClusterViewId,
-    ) -> Result<(), capnp::Error> {
+    ) -> Result<bool, capnp::Error> {
         let req = session.get_cluster_view_request();
         let resp = req.send().promise.await?;
         let actual_view =
             ClusterViewId::from_capnp(resp.get()?.get_view()?).map_err(capnp::Error::failed)?;
-        if actual_view != expected_view {
-            return Err(capnp::Error::failed(format!(
-                "session view mismatch: expected {expected_view}, got {actual_view}"
-            )));
-        }
-        Ok(())
+        Ok(actual_view == expected_view)
     }
 
     async fn session_for_strategy(
