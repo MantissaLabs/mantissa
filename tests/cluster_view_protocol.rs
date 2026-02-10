@@ -2,9 +2,19 @@
 mod common;
 
 use common::testkit::TestNode;
+use mantissa::cluster_view::ClusterViewId;
+use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
+use mantissa::store::cluster_operation_store::ClusterOperationStore;
+use mantissa::topology::operation::{
+    ClusterOperationKind as StoredOperationKind, ClusterOperationRecord,
+    ClusterOperationStage as StoredOperationStage,
+};
+use net::noise::NoiseKeys;
 use protocol::topology::{ClusterOperationKind, ClusterOperationStage};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
+use uuid::Uuid;
 
 async fn wait_for_operation_stage(
     topology: &mantissa::topology_capnp::topology::Client,
@@ -475,5 +485,146 @@ local_test!(cluster_view_split_commits_inproc, {
         post_view.get_epoch(),
         expected_epoch,
         "split commit should activate first target epoch"
+    );
+});
+
+// Validates startup replay resumes non-finalized durable operations and applies their commit side effects.
+local_test!(cluster_view_replays_pending_operation_on_startup, {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+
+    let source_view = ClusterViewId::legacy_default();
+    let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 3);
+    let operation = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Merge,
+        stage: StoredOperationStage::Prepared,
+        dry_run: false,
+        source_views: vec![source_view],
+        target_views: vec![target_view],
+        details: "replay test operation".to_string(),
+    };
+
+    let payload = bincode::serialize(&operation).expect("serialize operation");
+    operation_store
+        .put(operation.id, &payload)
+        .expect("persist operation");
+
+    let node = HeadlessNode::new_with(
+        db,
+        Uuid::new_v4(),
+        HeadlessKeys::new(
+            Arc::new(NoiseKeys::from_private_bytes([0x31; 32])),
+            ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]),
+        ),
+        HeadlessConfig::default(),
+    )
+    .await
+    .expect("start replay node");
+
+    wait_for_operation_stage(
+        &node.topology_client,
+        operation.id.as_bytes(),
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let view_resp = node
+        .topology_client
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let view = view_resp
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    let active_view =
+        ClusterViewId::from_capnp(view).expect("decode active cluster view after replay");
+    assert_eq!(
+        active_view, target_view,
+        "startup replay should apply the committed target view"
+    );
+});
+
+// Validates startup replay ignores dry-run operations so intent-only records never commit implicitly.
+local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+
+    let source_view = ClusterViewId::legacy_default();
+    let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 9);
+    let operation = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Merge,
+        stage: StoredOperationStage::Proposed,
+        dry_run: true,
+        source_views: vec![source_view],
+        target_views: vec![target_view],
+        details: "dry-run replay test operation".to_string(),
+    };
+
+    let payload = bincode::serialize(&operation).expect("serialize operation");
+    operation_store
+        .put(operation.id, &payload)
+        .expect("persist operation");
+
+    let node = HeadlessNode::new_with(
+        db,
+        Uuid::new_v4(),
+        HeadlessKeys::new(
+            Arc::new(NoiseKeys::from_private_bytes([0x51; 32])),
+            ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]),
+        ),
+        HeadlessConfig::default(),
+    )
+    .await
+    .expect("start replay node");
+
+    sleep(Duration::from_millis(200)).await;
+
+    let mut lookup_req = node.topology_client.get_cluster_operation_request();
+    lookup_req.get().set_id(operation.id.as_bytes());
+    let lookup_resp = lookup_req
+        .send()
+        .promise
+        .await
+        .expect("getClusterOperation send");
+    let looked_up = lookup_resp
+        .get()
+        .expect("getClusterOperation get")
+        .get_op()
+        .expect("operation payload");
+    assert_eq!(
+        looked_up.get_stage().expect("stage"),
+        ClusterOperationStage::Proposed,
+        "dry-run operation should remain Proposed after startup replay"
+    );
+
+    let view_resp = node
+        .topology_client
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let view = view_resp
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    let active_view =
+        ClusterViewId::from_capnp(view).expect("decode active cluster view after replay");
+    assert_eq!(
+        active_view,
+        ClusterViewId::legacy_default(),
+        "dry-run startup records must not change active view"
     );
 });

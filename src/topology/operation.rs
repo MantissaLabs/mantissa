@@ -48,6 +48,7 @@ pub struct ClusterOperationRecord {
     pub id: Uuid,
     pub kind: ClusterOperationKind,
     pub stage: ClusterOperationStage,
+    pub dry_run: bool,
     pub source_views: Vec<ClusterViewId>,
     pub target_views: Vec<ClusterViewId>,
     pub details: String,

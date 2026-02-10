@@ -368,6 +368,15 @@ impl Bootstrap {
             health_monitor: health_monitor.clone(),
         })?;
 
+        let replayed = topology.replay_cluster_operations_on_startup().await?;
+        if replayed > 0 {
+            info!(
+                target: "cluster_view",
+                replayed,
+                "replayed pending cluster operations during startup"
+            );
+        }
+
         let topology_client: TopologyClient = capnp_rpc::new_client(topology.clone());
 
         // sync capability

@@ -1,4 +1,4 @@
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use std::io;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -49,5 +49,19 @@ impl ClusterOperationStore {
             .map_err(ioerr)?
             .map(|guard| guard.value().to_vec());
         Ok(value)
+    }
+
+    /// Lists all serialized operation payloads currently present in the store.
+    pub fn list(&self) -> io::Result<Vec<(Uuid, Vec<u8>)>> {
+        let r = self.db.begin_read().map_err(ioerr)?;
+        let table = r.open_table(T_CLUSTER_OPERATIONS).map_err(ioerr)?;
+        let mut out = Vec::new();
+
+        for entry in table.iter().map_err(ioerr)? {
+            let (key, value) = entry.map_err(ioerr)?;
+            out.push((Uuid::from_bytes(key.value()), value.value().to_vec()));
+        }
+
+        Ok(out)
     }
 }

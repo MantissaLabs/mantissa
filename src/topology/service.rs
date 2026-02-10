@@ -270,6 +270,41 @@ impl Topology {
         Ok(Some(decoded))
     }
 
+    /// Loads all operation records from the local durable store, skipping malformed rows.
+    fn load_cluster_operations(&self) -> Result<Vec<ClusterOperationRecord>, capnp::Error> {
+        let encoded_rows = self
+            .cluster_operations
+            .list()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let mut operations = Vec::with_capacity(encoded_rows.len());
+
+        for (operation_id, payload) in encoded_rows {
+            match bincode::deserialize::<ClusterOperationRecord>(&payload) {
+                Ok(operation) => {
+                    if operation.id != operation_id {
+                        warn!(
+                            target: "cluster_view",
+                            key_id = %operation_id,
+                            payload_id = %operation.id,
+                            "skipping cluster operation with mismatched durable key and payload id"
+                        );
+                        continue;
+                    }
+                    operations.push(operation);
+                }
+                Err(err) => {
+                    warn!(
+                        target: "cluster_view",
+                        operation_id = %operation_id,
+                        "skipping malformed cluster operation payload: {err}"
+                    );
+                }
+            }
+        }
+
+        Ok(operations)
+    }
+
     /// Parses a cluster operation id from raw RPC bytes, enforcing UUID byte length.
     fn operation_id_from_data(data: capnp::data::Reader<'_>) -> Result<Uuid, capnp::Error> {
         let id_bytes: [u8; 16] = data
@@ -389,6 +424,44 @@ impl Topology {
         }
 
         Ok(())
+    }
+
+    /// Replays any non-finalized durable operation records so crashes do not strand topology changes.
+    pub(crate) async fn replay_cluster_operations_on_startup(&self) -> Result<usize, capnp::Error> {
+        let mut operations = self.load_cluster_operations()?;
+        operations.sort_by_key(|operation| operation.id);
+
+        let mut replayed = 0usize;
+        for operation in operations {
+            if operation.dry_run {
+                continue;
+            }
+            if matches!(
+                operation.stage,
+                ClusterOperationStage::Finalized | ClusterOperationStage::Aborted
+            ) {
+                continue;
+            }
+
+            info!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                stage = ?operation.stage,
+                kind = ?operation.kind,
+                "replaying pending cluster operation from durable store"
+            );
+
+            self.progress_cluster_operation(operation.id).await?;
+            replayed = replayed.saturating_add(1);
+        }
+
+        info!(
+            target: "cluster_view",
+            replayed,
+            "cluster operation startup replay complete"
+        );
+
+        Ok(replayed)
     }
 }
 
@@ -634,6 +707,7 @@ impl topology::Server for Topology {
             id: Uuid::new_v4(),
             kind: ClusterOperationKind::Merge,
             stage: ClusterOperationStage::Proposed,
+            dry_run,
             source_views: vec![source_view],
             target_views: vec![destination_view],
             details: format!(
@@ -721,6 +795,7 @@ impl topology::Server for Topology {
             id: Uuid::new_v4(),
             kind: ClusterOperationKind::Split,
             stage: ClusterOperationStage::Proposed,
+            dry_run,
             source_views: vec![source_view],
             target_views: target_views.clone(),
             details: format!(
