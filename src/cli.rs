@@ -560,6 +560,10 @@ pub struct MergeArgs {
     #[arg(long = "dry-run", action = ArgAction::SetTrue)]
     pub dry_run: bool,
 
+    /// Service behavior policy applied when the merge commits.
+    #[arg(long = "services", value_enum, default_value = "rebalance")]
+    pub services: MergeServicePolicyOpt,
+
     /// Print debug information verbosely
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub debug: bool,
@@ -630,6 +634,14 @@ pub struct SplitArgs {
     #[arg(long = "dry-run", action = ArgAction::SetTrue)]
     pub dry_run: bool,
 
+    /// Service behavior policy applied when the split commits.
+    #[arg(long = "services", value_enum, default_value = "partitioned")]
+    pub services: SplitServicePolicyOpt,
+
+    /// Overlay/network behavior policy applied when the split commits.
+    #[arg(long = "networks", value_enum, default_value = "isolate")]
+    pub networks: SplitNetworkPolicyOpt,
+
     /// Print debug information verbosely
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub debug: bool,
@@ -646,4 +658,22 @@ pub enum SplitFilterOpt {
     CpuLogical,
     MemoryTotalKb,
     MemoryTotalBytes,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum SplitServicePolicyOpt {
+    Partitioned,
+    Preserve,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum SplitNetworkPolicyOpt {
+    Isolate,
+    Preserve,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum MergeServicePolicyOpt {
+    Rebalance,
+    Preserve,
 }

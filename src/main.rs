@@ -480,12 +480,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Command::Merge(m) => {
+            let service_policy = match m.services {
+                MergeServicePolicyOpt::Rebalance => client::cluster::MergeServicePolicy::Rebalance,
+                MergeServicePolicyOpt::Preserve => client::cluster::MergeServicePolicy::Preserve,
+            };
             let summary = local
                 .run_until(client::cluster::merge_by_cluster_id(
                     &cfg,
                     &m.source_cluster_id,
                     &m.destination_cluster_id,
                     m.dry_run,
+                    service_policy,
                 ))
                 .await?;
             println!("operation {}", summary.id);
@@ -511,6 +516,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         Command::Split(s) => {
+            let service_policy = match s.services {
+                SplitServicePolicyOpt::Partitioned => {
+                    client::cluster::SplitServicePolicy::Partitioned
+                }
+                SplitServicePolicyOpt::Preserve => client::cluster::SplitServicePolicy::Preserve,
+            };
+            let network_policy = match s.networks {
+                SplitNetworkPolicyOpt::Isolate => client::cluster::SplitNetworkPolicy::Isolate,
+                SplitNetworkPolicyOpt::Preserve => client::cluster::SplitNetworkPolicy::Preserve,
+            };
             let summary = if s.interactive {
                 let payload = local
                     .run_until(client::cluster::list_split_candidates(
@@ -538,6 +553,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         &selection.left_nodes,
                         &selection.right_nodes,
                         s.dry_run,
+                        service_policy,
+                        network_policy,
                     ))
                     .await?
             } else {
@@ -573,6 +590,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         &values,
                         &s.remainder_name,
                         s.dry_run,
+                        service_policy,
+                        network_policy,
                     ))
                     .await?
             };

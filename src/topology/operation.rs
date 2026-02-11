@@ -29,6 +29,36 @@ pub enum ClusterOperationStage {
     Aborted,
 }
 
+/// Service behavior policy applied when a split operation commits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub enum SplitServicePolicy {
+    /// Keep services active in each resulting partition and prune out-of-scope runtime tasks.
+    #[default]
+    Partitioned,
+    /// Preserve service/task runtime rows as-is after split.
+    Preserve,
+}
+
+/// Network behavior policy applied when a split operation commits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub enum SplitNetworkPolicy {
+    /// Isolate overlays per partition by pruning out-of-scope peer and attachment rows.
+    #[default]
+    Isolate,
+    /// Preserve network peer/attachment rows as-is after split.
+    Preserve,
+}
+
+/// Service behavior policy applied when a merge operation commits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub enum MergeServicePolicy {
+    /// Trigger post-merge service reconciliation so replicas can rebalance across all nodes.
+    #[default]
+    Rebalance,
+    /// Preserve current service placement without reconciliation hints.
+    Preserve,
+}
+
 /// Records the deterministic split target index selected for one node.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SplitNodeAssignment {
@@ -61,6 +91,12 @@ pub struct ClusterOperationRecord {
     pub target_views: Vec<ClusterViewId>,
     #[serde(default)]
     pub split_assignments: Vec<SplitNodeAssignment>,
+    #[serde(default)]
+    pub split_service_policy: SplitServicePolicy,
+    #[serde(default)]
+    pub split_network_policy: SplitNetworkPolicy,
+    #[serde(default)]
+    pub merge_service_policy: MergeServicePolicy,
     pub details: String,
 }
 

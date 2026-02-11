@@ -11,7 +11,7 @@ use protocol::gossip::gossip::Client as GossipClient;
 use protocol::health;
 use protocol::server::{self, cluster_session};
 use protocol::sync;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::error;
@@ -66,6 +66,7 @@ pub struct Registry {
     noise_keys: Arc<NoiseKeys>,
     node_id: Uuid,
     health_monitor: Arc<HealthMonitor>,
+    excluded_peers: Arc<std::sync::RwLock<HashSet<Uuid>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -92,6 +93,7 @@ impl Registry {
             noise_keys,
             node_id,
             health_monitor,
+            excluded_peers: Arc::new(std::sync::RwLock::new(HashSet::new())),
         }
     }
 
@@ -127,6 +129,9 @@ impl Registry {
     }
 
     pub async fn server_handle_for(&self, peer_id: Uuid) -> Option<server::Client> {
+        if self.peer_is_excluded(peer_id) {
+            return None;
+        }
         let entry = {
             let guard = self.cache.read().await;
             guard.get(&peer_id).cloned()
@@ -137,7 +142,26 @@ impl Registry {
     }
 
     pub async fn refresh_peer_handle(&self, peer_id: Uuid) -> Option<server::Client> {
-        let peer = self.peer_latest_value(peer_id)?;
+        self.refresh_peer_handle_inner(peer_id, false).await
+    }
+
+    async fn refresh_peer_handle_unscoped(&self, peer_id: Uuid) -> Option<server::Client> {
+        self.refresh_peer_handle_inner(peer_id, true).await
+    }
+
+    async fn refresh_peer_handle_inner(
+        &self,
+        peer_id: Uuid,
+        allow_excluded: bool,
+    ) -> Option<server::Client> {
+        if !allow_excluded && self.peer_is_excluded(peer_id) {
+            return None;
+        }
+        let peer = if allow_excluded {
+            self.peer_latest_value_unscoped(peer_id)?
+        } else {
+            self.peer_latest_value(peer_id)?
+        };
         let addr = peer.address.clone();
 
         match self.connect_to_peer(&addr, &peer.noise_static_pub).await {
@@ -166,6 +190,9 @@ impl Registry {
             if peer_id == self.node_id {
                 continue;
             }
+            if self.peer_is_excluded(peer_id) {
+                continue;
+            }
 
             if snapshot.as_slice().last().is_some() {
                 ids.push(peer_id);
@@ -177,11 +204,17 @@ impl Registry {
 
     /// Returns the last recorded hostname for the provided `peer_id`, if available.
     pub fn peer_hostname(&self, peer_id: Uuid) -> Option<String> {
+        if self.peer_is_excluded(peer_id) {
+            return None;
+        }
         self.peer_latest_value(peer_id)
             .map(|value| value.hostname.clone())
     }
 
     pub fn peer_address(&self, peer_id: Uuid) -> Option<String> {
+        if self.peer_is_excluded(peer_id) {
+            return None;
+        }
         self.peer_latest_value(peer_id)
             .map(|value| value.address.clone())
     }
@@ -189,6 +222,9 @@ impl Registry {
     /// Returns the last recorded WireGuard underlay configuration for the provided `peer_id`, if
     /// available.
     pub fn peer_wireguard(&self, peer_id: Uuid) -> Option<WireGuardPeerValue> {
+        if self.peer_is_excluded(peer_id) {
+            return None;
+        }
         self.peer_latest_value(peer_id)
             .and_then(|value| value.wireguard)
     }
@@ -196,6 +232,27 @@ impl Registry {
     /// Returns a shared handle to the cluster health monitor.
     pub fn health_monitor(&self) -> Arc<HealthMonitor> {
         self.health_monitor.clone()
+    }
+
+    /// Replaces the current out-of-scope peer set used to scope scheduling and dataplane lookups.
+    pub fn set_excluded_peers(&self, excluded: HashSet<Uuid>) {
+        match self.excluded_peers.write() {
+            Ok(mut guard) => {
+                *guard = excluded;
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = excluded;
+            }
+        }
+    }
+
+    /// Returns true when the peer should be ignored for control-plane and dataplane operations.
+    fn peer_is_excluded(&self, peer_id: Uuid) -> bool {
+        match self.excluded_peers.read() {
+            Ok(guard) => guard.contains(&peer_id),
+            Err(poisoned) => poisoned.into_inner().contains(&peer_id),
+        }
     }
 
     /// Returns a best-effort snapshot of the latest `PeerValue` for every active peer.
@@ -210,6 +267,9 @@ impl Registry {
 
         let mut out = Vec::with_capacity(actives.len());
         for (key, snapshot) in actives {
+            if self.peer_is_excluded(key.to_uuid()) {
+                continue;
+            }
             if let Some(value) = Self::select_peer_value(snapshot.as_slice()) {
                 out.push((key.to_uuid(), value));
             }
@@ -236,8 +296,24 @@ impl Registry {
     }
 
     pub async fn session_for_peer(&self, peer_id: Uuid) -> Option<cluster_session::Client> {
+        if self.peer_is_excluded(peer_id) {
+            return None;
+        }
         let entry = self.ensure_entry(peer_id).await;
         self.ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
+            .await
+    }
+
+    /// Returns a session for a peer while ignoring split-time exclusion scope.
+    ///
+    /// This is reserved for topology operation relay flows (for example merge handoff) where
+    /// nodes must briefly talk across split partitions to converge back into one cluster.
+    pub async fn session_for_peer_unscoped(
+        &self,
+        peer_id: Uuid,
+    ) -> Option<cluster_session::Client> {
+        let entry = self.ensure_entry(peer_id).await;
+        self.ensure_session_unscoped(peer_id, &entry, SessionStrategy::TicketThenCredential)
             .await
     }
 
@@ -246,6 +322,9 @@ impl Registry {
         client: &server::Client,
         peer_id: Uuid,
     ) -> Option<cluster_session::Client> {
+        if self.peer_is_excluded(peer_id) {
+            return None;
+        }
         if let Some(entry) = self.entry_if_present(peer_id).await {
             if let Some(session) = self.cached_session(&entry).await {
                 return Some(session);
@@ -276,6 +355,9 @@ impl Registry {
             let peer_id = k.to_uuid();
 
             if peer_id == self.node_id {
+                continue;
+            }
+            if self.peer_is_excluded(peer_id) {
                 continue;
             }
 
@@ -382,6 +464,9 @@ impl Registry {
         peer_id: Uuid,
         expected_view: ClusterViewId,
     ) -> Result<Option<sync::Client>, capnp::Error> {
+        if self.peer_is_excluded(peer_id) {
+            return Ok(None);
+        }
         let entry = self.ensure_entry(peer_id).await;
 
         if let Some(sync_cap) = {
@@ -450,6 +535,9 @@ impl Registry {
         peer_id: Uuid,
         expected_view: ClusterViewId,
     ) -> Result<Option<health::health::Client>, capnp::Error> {
+        if self.peer_is_excluded(peer_id) {
+            return Ok(None);
+        }
         let entry = self.ensure_entry(peer_id).await;
 
         if let Some(health_cap) = {
@@ -518,6 +606,9 @@ impl Registry {
         peer_id: Uuid,
         expected_view: ClusterViewId,
     ) -> Result<Option<GossipClient>, capnp::Error> {
+        if self.peer_is_excluded(peer_id) {
+            return Ok(None);
+        }
         let entry = self.ensure_entry(peer_id).await;
 
         if let Some(gossip_cap) = {
@@ -633,6 +724,38 @@ impl Registry {
         }
 
         let refreshed = self.refresh_peer_handle(peer_id).await?;
+        let session = self
+            .session_for_strategy(&refreshed, peer_id, strategy)
+            .await?;
+
+        let mut state = entry.lock().await;
+        state.replace_session(session.clone());
+        Some(session)
+    }
+
+    /// Guarantees a ClusterSession for `peer_id` while bypassing split exclusion filters.
+    async fn ensure_session_unscoped(
+        &self,
+        peer_id: Uuid,
+        entry: &PeerEntry,
+        strategy: SessionStrategy,
+    ) -> Option<cluster_session::Client> {
+        if let Some(session) = self.cached_session(entry).await {
+            return Some(session);
+        }
+
+        if let Some(server) = {
+            let state = entry.lock().await;
+            state.server.clone()
+        } {
+            if let Some(session) = self.session_for_strategy(&server, peer_id, strategy).await {
+                let mut state = entry.lock().await;
+                state.replace_session(session.clone());
+                return Some(session);
+            }
+        }
+
+        let refreshed = self.refresh_peer_handle_unscoped(peer_id).await?;
         let session = self
             .session_for_strategy(&refreshed, peer_id, strategy)
             .await?;
@@ -879,6 +1002,13 @@ impl Registry {
     }
 
     fn peer_latest_value(&self, peer_id: Uuid) -> Option<PeerValue> {
+        if self.peer_is_excluded(peer_id) {
+            return None;
+        }
+        self.peer_latest_value_unscoped(peer_id)
+    }
+
+    fn peer_latest_value_unscoped(&self, peer_id: Uuid) -> Option<PeerValue> {
         let (actives, _) = self.peers.load_all().ok()?;
         actives
             .into_iter()

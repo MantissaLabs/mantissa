@@ -851,6 +851,9 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
         source_views: vec![source_view],
         target_views: vec![target_view],
         split_assignments: Vec::new(),
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
         details: "replay test operation".to_string(),
     };
 
@@ -916,6 +919,9 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
         source_views: vec![source_view],
         target_views: vec![target_view],
         split_assignments: Vec::new(),
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
         details: "dry-run replay test operation".to_string(),
     };
 

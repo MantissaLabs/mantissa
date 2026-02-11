@@ -110,6 +110,63 @@ pub enum SplitFilterKind {
     MemoryTotalBytes,
 }
 
+/// Split-time service behavior policy exposed by the CLI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SplitServicePolicy {
+    /// Keep services active per resulting partition by pruning out-of-scope task runtime rows.
+    Partitioned,
+    /// Preserve service/task runtime rows without split-time pruning.
+    Preserve,
+}
+
+impl SplitServicePolicy {
+    /// Encodes this policy into the topology RPC enum.
+    fn to_capnp(self) -> topology::SplitServicePolicy {
+        match self {
+            Self::Partitioned => topology::SplitServicePolicy::Partitioned,
+            Self::Preserve => topology::SplitServicePolicy::Preserve,
+        }
+    }
+}
+
+/// Split-time network behavior policy exposed by the CLI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SplitNetworkPolicy {
+    /// Isolate overlays per partition by pruning out-of-scope network runtime rows.
+    Isolate,
+    /// Preserve network peer/attachment rows without split-time pruning.
+    Preserve,
+}
+
+impl SplitNetworkPolicy {
+    /// Encodes this policy into the topology RPC enum.
+    fn to_capnp(self) -> topology::SplitNetworkPolicy {
+        match self {
+            Self::Isolate => topology::SplitNetworkPolicy::Isolate,
+            Self::Preserve => topology::SplitNetworkPolicy::Preserve,
+        }
+    }
+}
+
+/// Merge-time service behavior policy exposed by the CLI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MergeServicePolicy {
+    /// Trigger service reconciliation after merge so replicas can rebalance cluster-wide.
+    Rebalance,
+    /// Preserve current service placement without extra merge-time reconciliation hints.
+    Preserve,
+}
+
+impl MergeServicePolicy {
+    /// Encodes this policy into the topology RPC enum.
+    fn to_capnp(self) -> topology::MergeServicePolicy {
+        match self {
+            Self::Rebalance => topology::MergeServicePolicy::Rebalance,
+            Self::Preserve => topology::MergeServicePolicy::Preserve,
+        }
+    }
+}
+
 impl SplitFilterKind {
     /// Maps the CLI filter selector to the backend split selector key.
     fn selector_key(self) -> &'static str {
@@ -597,6 +654,7 @@ pub async fn merge_by_cluster_id(
     source_cluster_id: &str,
     destination_cluster_id: &str,
     dry_run: bool,
+    service_policy: MergeServicePolicy,
 ) -> Result<ClusterOperationSummary> {
     let source_cluster = parse_cluster_id(source_cluster_id, "source cluster id")?;
     let destination_cluster = parse_cluster_id(destination_cluster_id, "destination cluster id")?;
@@ -609,7 +667,7 @@ pub async fn merge_by_cluster_id(
     let summaries = list_cluster_views(cfg).await?;
     let source_view = resolve_view_from_summaries(&summaries, source_cluster)?;
     let destination_view = resolve_view_from_summaries(&summaries, destination_cluster)?;
-    submit_merge_request(cfg, source_view, destination_view, dry_run).await
+    submit_merge_request(cfg, source_view, destination_view, dry_run, service_policy).await
 }
 
 /// Submits a split request derived from a simple filter and value list.
@@ -620,6 +678,8 @@ pub async fn split_by_filter(
     values: &[String],
     remainder_name: &str,
     dry_run: bool,
+    service_policy: SplitServicePolicy,
+    network_policy: SplitNetworkPolicy,
 ) -> Result<ClusterOperationSummary> {
     let source_view = resolve_source_view(cfg, source_cluster_id).await?;
     let selector_key = filter.selector_key();
@@ -659,7 +719,15 @@ pub async fn split_by_filter(
         explicit_nodes: Vec::new(),
     });
 
-    submit_split_request(cfg, source_view, &targets, dry_run).await
+    submit_split_request(
+        cfg,
+        source_view,
+        &targets,
+        dry_run,
+        service_policy,
+        network_policy,
+    )
+    .await
 }
 
 /// Submits a split request from explicit per-node assignments selected by interactive tooling.
@@ -671,6 +739,8 @@ pub async fn split_by_explicit_nodes(
     left_nodes: &[Uuid],
     right_nodes: &[Uuid],
     dry_run: bool,
+    service_policy: SplitServicePolicy,
+    network_policy: SplitNetworkPolicy,
 ) -> Result<ClusterOperationSummary> {
     let source_view = resolve_source_view(cfg, source_cluster_id).await?;
     let left_name = left_name.trim();
@@ -728,7 +798,15 @@ pub async fn split_by_explicit_nodes(
         },
     ];
 
-    submit_split_request(cfg, source_view, &targets, dry_run).await
+    submit_split_request(
+        cfg,
+        source_view,
+        &targets,
+        dry_run,
+        service_policy,
+        network_policy,
+    )
+    .await
 }
 
 /// Sends a merge request to topology using resolved source and destination views.
@@ -737,6 +815,7 @@ async fn submit_merge_request(
     source_view: ClusterViewSpec,
     destination_view: ClusterViewSpec,
     dry_run: bool,
+    service_policy: MergeServicePolicy,
 ) -> Result<ClusterOperationSummary> {
     let topology = topology_capability(cfg).await?;
     let mut request = topology.merge_clusters_request();
@@ -745,6 +824,7 @@ async fn submit_merge_request(
         source_view.write_capnp(req.reborrow().init_source_view());
         destination_view.write_capnp(req.reborrow().init_destination_view());
         req.set_dry_run(dry_run);
+        req.set_service_policy(service_policy.to_capnp());
     }
 
     let response = request
@@ -766,6 +846,8 @@ async fn submit_split_request(
     source_view: ClusterViewSpec,
     targets: &[SplitTargetSpec],
     dry_run: bool,
+    service_policy: SplitServicePolicy,
+    network_policy: SplitNetworkPolicy,
 ) -> Result<ClusterOperationSummary> {
     if targets.is_empty() {
         return Err(anyhow!("split requires at least one target"));
@@ -802,6 +884,8 @@ async fn submit_split_request(
             }
         }
         req.set_dry_run(dry_run);
+        req.set_service_policy(service_policy.to_capnp());
+        req.set_network_policy(network_policy.to_capnp());
     }
 
     let response = request

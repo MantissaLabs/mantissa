@@ -211,6 +211,30 @@ enum ClusterOperationKind {
   split @1;
 }
 
+enum SplitServicePolicy {
+  partitioned @0;
+  # Keep service control-plane scoped per split target by pruning out-of-scope task runtime state.
+
+  preserve @1;
+  # Preserve existing service/task runtime rows as-is after split.
+}
+
+enum SplitNetworkPolicy {
+  isolate @0;
+  # Isolate overlays per split target by pruning out-of-scope network peer/attachment state.
+
+  preserve @1;
+  # Preserve existing network peer/attachment rows as-is after split.
+}
+
+enum MergeServicePolicy {
+  rebalance @0;
+  # Trigger post-merge service reconciliation so replicas can rebalance across the merged cluster.
+
+  preserve @1;
+  # Preserve service runtime placement after merge without reconciliation hints.
+}
+
 enum ClusterOperationStage {
   proposed @0;
   prepared @1;
@@ -248,6 +272,9 @@ struct MergeRequest {
 
   dryRun @2 :Bool;
   # If true, perform validation only and do not commit state changes.
+
+  servicePolicy @3 :MergeServicePolicy;
+  # Service behavior policy applied when the merge commits.
 }
 
 struct SplitSelectorClause {
@@ -295,4 +322,10 @@ struct SplitRequest {
 
   dryRun @2 :Bool;
   # If true, validate only and do not commit state changes.
+
+  servicePolicy @3 :SplitServicePolicy;
+  # Service behavior policy applied when the split commits.
+
+  networkPolicy @4 :SplitNetworkPolicy;
+  # Overlay/network behavior policy applied when the split commits.
 }

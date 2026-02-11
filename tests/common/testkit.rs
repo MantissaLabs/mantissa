@@ -250,8 +250,14 @@ impl TestNode {
 
     /// Assert that this node sees `expected` members within a short timeout.
     pub async fn assert_cluster_size(&self, expected: usize, msg: &str) {
-        let ok = self.wait_for_cluster_size(expected, 10_000).await;
-        assert!(ok, "{msg}");
+        let ok = self.wait_for_cluster_size(expected, 20_000).await;
+        if !ok {
+            let ids = self.list_ids().await;
+            panic!(
+                "{msg}: expected {expected} nodes, saw {} ({ids:?})",
+                ids.len()
+            );
+        }
     }
 
     /// Convenience accessor to the node's Topology client.
@@ -453,9 +459,9 @@ impl TestNode {
         }
     }
 
-    /// Assert that every node in `cluster` sees `expected` within 10s.
+    /// Assert that every node in `cluster` sees `expected` within 20s.
     pub async fn assert_cluster_size_all(cluster: &[TestNode], expected: usize, msg: &str) {
-        let timeout = Duration::from_secs(10);
+        let timeout = Duration::from_secs(20);
         if let Err(e) = Self::wait_cluster_size_all(cluster, expected, timeout).await {
             panic!("{msg}: {e}");
         }

@@ -5,6 +5,7 @@ use crate::node::address::extract_port;
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::pubkey_from_slice;
 use crate::server::credential::ClusterCredential;
+use crate::services::types::ServiceStatus;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
@@ -12,7 +13,8 @@ use crate::store::secret_master_store::MasterKeyRecord;
 use crate::sync::delta::{SyncStores, sync_all_domains};
 use crate::topology::health::status_to_node_status;
 use crate::topology::operation::{
-    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, SplitNodeAssignment,
+    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
+    SplitNetworkPolicy, SplitNodeAssignment, SplitServicePolicy,
 };
 use crate::topology::peers::{PeerValue, WireGuardPeerValue};
 use capnp::Error;
@@ -805,6 +807,144 @@ impl Topology {
         .ok_or_else(|| capnp::Error::failed("operation has no target views for commit".to_string()))
     }
 
+    /// Converts the merge request policy from the Cap'n Proto enum into local durable policy state.
+    fn merge_service_policy_from_capnp(
+        policy: protocol::topology::MergeServicePolicy,
+    ) -> MergeServicePolicy {
+        match policy {
+            protocol::topology::MergeServicePolicy::Rebalance => MergeServicePolicy::Rebalance,
+            protocol::topology::MergeServicePolicy::Preserve => MergeServicePolicy::Preserve,
+        }
+    }
+
+    /// Converts the split request service policy into local durable policy state.
+    fn split_service_policy_from_capnp(
+        policy: protocol::topology::SplitServicePolicy,
+    ) -> SplitServicePolicy {
+        match policy {
+            protocol::topology::SplitServicePolicy::Partitioned => SplitServicePolicy::Partitioned,
+            protocol::topology::SplitServicePolicy::Preserve => SplitServicePolicy::Preserve,
+        }
+    }
+
+    /// Converts the split request network policy into local durable policy state.
+    fn split_network_policy_from_capnp(
+        policy: protocol::topology::SplitNetworkPolicy,
+    ) -> SplitNetworkPolicy {
+        match policy {
+            protocol::topology::SplitNetworkPolicy::Isolate => SplitNetworkPolicy::Isolate,
+            protocol::topology::SplitNetworkPolicy::Preserve => SplitNetworkPolicy::Preserve,
+        }
+    }
+
+    /// Removes out-of-scope task runtime rows after split so each partition reconciles services locally.
+    async fn prune_split_task_runtime_state(
+        &self,
+        evicted: &HashSet<Uuid>,
+    ) -> Result<usize, capnp::Error> {
+        let (actives, _) = self
+            .tasks
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        let mut removed = 0usize;
+        for (key, snapshot) in actives {
+            let Some(task) = snapshot.as_slice().last() else {
+                continue;
+            };
+            if !evicted.contains(&task.node_id) {
+                continue;
+            }
+
+            self.tasks
+                .remove(&UuidKey::from(key.to_uuid()))
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            removed = removed.saturating_add(1);
+        }
+
+        Ok(removed)
+    }
+
+    /// Removes out-of-scope overlay peer/attachment rows after split to isolate data-plane state.
+    async fn prune_split_network_runtime_state(
+        &self,
+        evicted: &HashSet<Uuid>,
+    ) -> Result<(usize, usize), capnp::Error> {
+        let (peer_rows, _) = self
+            .network_peers
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let mut removed_peer_states = 0usize;
+        for (key, snapshot) in peer_rows {
+            let Some(peer_state) = snapshot.as_slice().last() else {
+                continue;
+            };
+            if !evicted.contains(&peer_state.peer_id) {
+                continue;
+            }
+
+            self.network_peers
+                .remove(&UuidKey::from(key.to_uuid()))
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            removed_peer_states = removed_peer_states.saturating_add(1);
+        }
+
+        let (attachment_rows, _) = self
+            .network_attachments
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let mut removed_attachments = 0usize;
+        for (key, snapshot) in attachment_rows {
+            let Some(attachment) = snapshot.as_slice().last() else {
+                continue;
+            };
+            if !evicted.contains(&attachment.node_id) {
+                continue;
+            }
+
+            self.network_attachments
+                .remove(&UuidKey::from(key.to_uuid()))
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            removed_attachments = removed_attachments.saturating_add(1);
+        }
+
+        Ok((removed_peer_states, removed_attachments))
+    }
+
+    /// Touches active service specs after merge so controllers promptly rebalance replicas cluster-wide.
+    async fn nudge_running_services_for_merge_rebalance(&self) -> Result<usize, capnp::Error> {
+        let (actives, _) = self
+            .services
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        let mut updated = 0usize;
+        for (key, snapshot) in actives {
+            let Some(current) = snapshot.as_slice().last().cloned() else {
+                continue;
+            };
+            if !matches!(
+                current.status,
+                ServiceStatus::Running | ServiceStatus::Deploying
+            ) {
+                continue;
+            }
+
+            let mut next = current.clone();
+            next.touch();
+            self.services
+                .upsert(&UuidKey::from(key.to_uuid()), next)
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            updated = updated.saturating_add(1);
+        }
+
+        Ok(updated)
+    }
+
     /// Clears session/capability state and excludes peers that no longer belong to the local split target.
     async fn prune_split_state_for_local_target(
         &self,
@@ -843,6 +983,7 @@ impl Topology {
 
         let mut evicted = evicted_ids.into_iter().collect::<Vec<_>>();
         evicted.sort_unstable();
+        let excluded = evicted.iter().copied().collect::<HashSet<_>>();
 
         let mut removed_sessions = 0usize;
         let mut removed_credentials = 0usize;
@@ -873,17 +1014,35 @@ impl Topology {
 
             self.registry.remove_peer(peer_id).await;
         }
-        self.set_excluded_peers(evicted.iter().copied().collect())
-            .await;
+        self.set_excluded_peers(excluded.clone()).await;
+        self.registry.set_excluded_peers(excluded.clone());
+
+        let mut removed_tasks = 0usize;
+        let mut removed_network_peer_states = 0usize;
+        let mut removed_network_attachments = 0usize;
+        if operation.split_service_policy == SplitServicePolicy::Partitioned {
+            removed_tasks = self.prune_split_task_runtime_state(&excluded).await?;
+        }
+        if operation.split_network_policy == SplitNetworkPolicy::Isolate {
+            let (peers_removed, attachments_removed) =
+                self.prune_split_network_runtime_state(&excluded).await?;
+            removed_network_peer_states = peers_removed;
+            removed_network_attachments = attachments_removed;
+        }
 
         info!(
             target: "cluster_view",
             operation_id = %operation.id,
             local_target_index,
+            split_service_policy = ?operation.split_service_policy,
+            split_network_policy = ?operation.split_network_policy,
             retained_count = retained_ids.len(),
             evicted_count = evicted.len(),
             removed_sessions,
             removed_credentials,
+            removed_tasks,
+            removed_network_peer_states,
+            removed_network_attachments,
             "completed split prune for local target"
         );
 
@@ -946,7 +1105,12 @@ impl Topology {
                 continue;
             }
 
-            let Some(session) = self.registry.session_for_peer(peer_id).await else {
+            let session = if operation.kind == ClusterOperationKind::Merge {
+                self.registry.session_for_peer_unscoped(peer_id).await
+            } else {
+                self.registry.session_for_peer(peer_id).await
+            };
+            let Some(session) = session else {
                 continue;
             };
             let peer_view = match Self::session_cluster_view(&session).await {
@@ -1106,6 +1270,16 @@ impl Topology {
             }
             ClusterOperationKind::Merge => {
                 self.set_excluded_peers(HashSet::new()).await;
+                self.registry.set_excluded_peers(HashSet::new());
+                if operation.merge_service_policy == MergeServicePolicy::Rebalance {
+                    let nudged = self.nudge_running_services_for_merge_rebalance().await?;
+                    info!(
+                        target: "cluster_view",
+                        operation_id = %operation.id,
+                        nudged_services = nudged,
+                        "nudged running services for post-merge rebalancing"
+                    );
+                }
             }
         }
 
@@ -1400,7 +1574,7 @@ impl topology::Server for Topology {
             let candidate_view = if id == self.node.id {
                 Some(local_view)
             } else {
-                self.best_known_peer_view(id).await
+                Some(self.best_known_peer_view(id).await.unwrap_or(local_view))
             };
             if candidate_view != Some(local_view) {
                 continue;
@@ -1549,6 +1723,7 @@ impl topology::Server for Topology {
         let destination_view =
             ClusterViewId::from_capnp(req.get_destination_view()?).map_err(capnp::Error::failed)?;
         let dry_run = req.get_dry_run();
+        let merge_service_policy = Self::merge_service_policy_from_capnp(req.get_service_policy()?);
         let active_view = self.active_cluster_view();
 
         if source_view == destination_view {
@@ -1570,8 +1745,11 @@ impl topology::Server for Topology {
             source_views: vec![source_view],
             target_views: vec![destination_view],
             split_assignments: Vec::new(),
+            split_service_policy: SplitServicePolicy::default(),
+            split_network_policy: SplitNetworkPolicy::default(),
+            merge_service_policy,
             details: format!(
-                "merge proposed: source={source_view}, destination={destination_view}, dry_run={dry_run}"
+                "merge proposed: source={source_view}, destination={destination_view}, dry_run={dry_run}, service_policy={merge_service_policy:?}"
             ),
         };
         self.persist_cluster_operation(&operation)?;
@@ -1585,6 +1763,7 @@ impl topology::Server for Topology {
             operation_id = %operation.id,
             source_view = %source_view,
             destination_view = %destination_view,
+            merge_service_policy = ?operation.merge_service_policy,
             dry_run,
             stage = ?operation.stage,
             "merge operation accepted"
@@ -1604,6 +1783,8 @@ impl topology::Server for Topology {
         let source_view =
             ClusterViewId::from_capnp(req.get_source_view()?).map_err(capnp::Error::failed)?;
         let dry_run = req.get_dry_run();
+        let split_service_policy = Self::split_service_policy_from_capnp(req.get_service_policy()?);
+        let split_network_policy = Self::split_network_policy_from_capnp(req.get_network_policy()?);
         let active_view = self.active_cluster_view();
         if source_view != active_view {
             return Err(capnp::Error::failed(format!(
@@ -1713,8 +1894,11 @@ impl topology::Server for Topology {
             source_views: vec![source_view],
             target_views: target_views.clone(),
             split_assignments,
+            split_service_policy,
+            split_network_policy,
+            merge_service_policy: MergeServicePolicy::default(),
             details: format!(
-                "split proposed: source={source_view}, dry_run={dry_run}, targets=[{}], assignments=[{}]",
+                "split proposed: source={source_view}, dry_run={dry_run}, service_policy={split_service_policy:?}, network_policy={split_network_policy:?}, targets=[{}], assignments=[{}]",
                 detail_targets.join(", "),
                 assignment_detail
             ),
@@ -1730,6 +1914,8 @@ impl topology::Server for Topology {
             operation_id = %operation.id,
             source_view = %source_view,
             target_count = operation.target_views.len(),
+            split_service_policy = ?operation.split_service_policy,
+            split_network_policy = ?operation.split_network_policy,
             dry_run,
             stage = ?operation.stage,
             "split operation accepted"
@@ -1781,7 +1967,9 @@ impl topology::Server for Topology {
             }
             ClusterOperationStage::Finalized => {
                 let target = self.local_target_view_for_operation(&merged)?;
-                if self.active_cluster_view() != target {
+                if merged.kind == ClusterOperationKind::Merge
+                    || self.active_cluster_view() != target
+                {
                     self.apply_committed_operation_side_effects(&merged).await?;
                 }
             }
