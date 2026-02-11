@@ -496,6 +496,102 @@ async fn reconcile_running_task_restarts_when_container_is_missing() {
 }
 
 #[tokio::test]
+async fn reconcile_local_slot_reservations_releases_stale_local_slots() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_a = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    let slot_b = SlotSpec::new(2, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_a.clone(), slot_b.clone()])
+        .await
+        .expect("init slots");
+
+    let running = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    assert_eq!(
+        running.slot_ids.len(),
+        1,
+        "expected one active slot reservation"
+    );
+    let active_slot = running.slot_ids[0];
+    let stale_slot = if active_slot == slot_a.slot_id {
+        slot_b.slot_id
+    } else {
+        slot_a.slot_id
+    };
+
+    let before = scheduler
+        .snapshot()
+        .await
+        .expect("snapshot before stale reserve");
+    scheduler
+        .reserve_slots(
+            before.version,
+            vec![SlotReservationRequest {
+                slot_id: stale_slot,
+                owner: manager.local_node_id,
+                task_id: Some(Uuid::new_v4()),
+            }],
+        )
+        .await
+        .expect("reserve stale slot");
+
+    let snapshot_with_stale = scheduler
+        .snapshot()
+        .await
+        .expect("snapshot with stale slot");
+    let local_reserved_before = snapshot_with_stale
+        .slots
+        .iter()
+        .filter(|slot| {
+            matches!(
+                slot.state,
+                SlotState::Reserved(ref reservation) if reservation.owner == manager.local_node_id
+            )
+        })
+        .count();
+    assert_eq!(
+        local_reserved_before, 2,
+        "expected stale extra local reservation"
+    );
+
+    manager
+        .reconcile_local_slot_reservations()
+        .await
+        .expect("reconcile local slot reservations");
+
+    let after = scheduler
+        .snapshot()
+        .await
+        .expect("snapshot after reconcile");
+    let local_reserved_after = after
+        .slots
+        .iter()
+        .filter(|slot| {
+            matches!(
+                slot.state,
+                SlotState::Reserved(ref reservation) if reservation.owner == manager.local_node_id
+            )
+        })
+        .count();
+    assert_eq!(
+        local_reserved_after, 1,
+        "stale local reservation should be released"
+    );
+
+    let stale_state = after
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == stale_slot)
+        .map(|slot| slot.state.clone())
+        .expect("stale slot present");
+    assert!(matches!(stale_state, SlotState::Free));
+}
+
+#[tokio::test]
 async fn start_container_reserves_multiple_slots_when_needed() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 

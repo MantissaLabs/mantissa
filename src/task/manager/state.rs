@@ -1430,6 +1430,73 @@ impl TaskManager {
                 }
             }
 
+            let mut release_slots = Vec::new();
+            for slot in &snapshot.slots {
+                let SlotState::Reserved(reservation) = &slot.state else {
+                    continue;
+                };
+                if reservation.owner != self.local_node_id {
+                    continue;
+                }
+
+                match desired.get(&slot.slot_id).copied() {
+                    Some(task_id) if reservation.task_id == Some(task_id) => {}
+                    _ => release_slots.push(slot.slot_id),
+                }
+            }
+
+            let mut release_gpus = Vec::new();
+            for device in &snapshot.gpu_devices {
+                let crate::scheduler::GpuDeviceState::Reserved(reservation) = &device.state else {
+                    continue;
+                };
+                if reservation.owner != self.local_node_id {
+                    continue;
+                }
+
+                match desired_gpus.get(&device.device_id).copied() {
+                    Some(task_id) if reservation.task_id == Some(task_id) => {}
+                    _ => release_gpus.push(device.device_id.clone()),
+                }
+            }
+
+            if !release_slots.is_empty() || !release_gpus.is_empty() {
+                match self
+                    .scheduler
+                    .free_resources(
+                        snapshot.version,
+                        release_slots.clone(),
+                        release_gpus.clone(),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        // Re-run against a fresh snapshot so any desired local reservations can
+                        // be reacquired with the current version in the next iteration.
+                        attempt = 0;
+                        continue;
+                    }
+                    Err(SchedulerError::SnapshotMismatch { .. })
+                    | Err(SchedulerError::SlotsNotReserved { .. })
+                    | Err(SchedulerError::GpuDevicesNotReserved { .. })
+                    | Err(SchedulerError::UnknownSlots { .. })
+                    | Err(SchedulerError::UnknownGpuDevices { .. }) => {
+                        attempt += 1;
+                        if attempt >= MAX_ATTEMPTS {
+                            warn!(
+                                target: "task",
+                                slots = ?release_slots,
+                                gpus = ?release_gpus,
+                                "resource release reconciliation exhausted retries"
+                            );
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Err(err) => return Err(anyhow::anyhow!(err)),
+                }
+            }
+
             if desired.is_empty() && desired_gpus.is_empty() {
                 return Ok(());
             }
