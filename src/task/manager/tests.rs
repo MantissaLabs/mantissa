@@ -176,6 +176,10 @@ impl AttachmentProvisionerApi for FakeAttachmentProvisioner {
     async fn remove_flood_entry(&self, _vxlan_name: &str, _dst: std::net::IpAddr) -> Result<()> {
         Ok(())
     }
+
+    async fn list_remote_fdb(&self, _vxlan_name: &str) -> Result<Vec<(String, std::net::IpAddr)>> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Default)]
@@ -234,6 +238,10 @@ impl AttachmentProvisionerApi for FlakyAttachmentProvisioner {
 
     async fn remove_flood_entry(&self, _vxlan_name: &str, _dst: std::net::IpAddr) -> Result<()> {
         Ok(())
+    }
+
+    async fn list_remote_fdb(&self, _vxlan_name: &str) -> Result<Vec<(String, std::net::IpAddr)>> {
+        Ok(Vec::new())
     }
 }
 
@@ -444,6 +452,46 @@ async fn reconcile_rejects_missing_slot_assignments() {
         err.to_string()
             .contains("missing scheduler slot assignments"),
         "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_running_task_restarts_when_container_is_missing() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    assert!(matches!(spec.state, ContainerState::Running));
+    assert_eq!(mock_cm.created.lock().await.len(), 1);
+
+    {
+        let mut inspect = mock_cm.inspect.lock().await;
+        inspect.clear();
+    }
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("reconcile should restart missing runtime");
+
+    let created = mock_cm.created.lock().await.clone();
+    assert_eq!(created.len(), 2, "task runtime should be recreated");
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load refreshed spec");
+    assert!(
+        matches!(refreshed.state, ContainerState::Running),
+        "task should converge back to running after restart"
     );
 }
 

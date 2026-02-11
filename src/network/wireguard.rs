@@ -3,7 +3,7 @@ use crate::registry::Registry;
 use crate::topology::peers::WireGuardPeerValue;
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::process::Command;
@@ -307,6 +307,17 @@ pub async fn ensure_wireguard_underlay(
         }
     }
 
+    let mut desired_tunnel_routes = HashSet::with_capacity(peer_configs.len() + 1);
+    desired_tunnel_routes.insert(tunnel_v6);
+    desired_tunnel_routes.extend(peer_configs.iter().map(|peer| peer.allowed_ip));
+    if let Err(err) = prune_stale_wireguard_routes(&ifname, &desired_tunnel_routes) {
+        tracing::warn!(
+            target: "network",
+            ifname,
+            "failed to prune stale wireguard tunnel routes: {err:#}"
+        );
+    }
+
     Ok(WireGuardUnderlayState {
         underlay_active: published && cluster_ready_for_encryption,
         ifname,
@@ -453,6 +464,84 @@ fn ensure_vxlan_firewall_accept(ifname: &str) {
 
 #[cfg(not(target_os = "linux"))]
 fn ensure_vxlan_firewall_accept(_ifname: &str) {}
+
+/// Remove stale `/128` tunnel routes from the WireGuard interface.
+///
+/// Kernel route helpers can leave old peer routes behind after cluster membership churn. Keeping
+/// those stale routes can blackhole VXLAN traffic whenever stale forwarding entries still point at
+/// retired tunnel addresses, so we prune every route outside the current self + peer set.
+#[cfg(target_os = "linux")]
+fn prune_stale_wireguard_routes(ifname: &str, desired_routes: &HashSet<Ipv6Addr>) -> Result<()> {
+    let output = Command::new("ip")
+        .arg("-6")
+        .arg("route")
+        .arg("show")
+        .arg("dev")
+        .arg(ifname)
+        .output()
+        .with_context(|| format!("list ipv6 routes on {ifname}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "ip -6 route show dev {ifname} failed (status {:?}): {}",
+            output.status.code(),
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Some(prefix) = line.split_whitespace().next() else {
+            continue;
+        };
+        let (ip_text, prefix_len) = if let Some((ip_text, prefix_len)) = prefix.split_once('/') {
+            (ip_text, prefix_len.parse::<u8>().ok())
+        } else {
+            // `ip route` may omit `/128` for host routes; treat bare IPv6 addresses as /128.
+            (prefix, Some(128))
+        };
+        if prefix_len != Some(128) {
+            continue;
+        }
+
+        let Ok(route_ip) = ip_text.parse::<Ipv6Addr>() else {
+            continue;
+        };
+        if !is_mantissa_tunnel_ipv6(route_ip) || desired_routes.contains(&route_ip) {
+            continue;
+        }
+
+        let cidr = format!("{route_ip}/128");
+        let delete = Command::new("ip")
+            .arg("-6")
+            .arg("route")
+            .arg("del")
+            .arg(cidr.as_str())
+            .arg("dev")
+            .arg(ifname)
+            .output()
+            .with_context(|| format!("delete stale ipv6 route {cidr} on {ifname}"))?;
+        if !delete.status.success() {
+            let stderr = String::from_utf8_lossy(&delete.stderr);
+            if !stderr.contains("No such process") {
+                return Err(anyhow::anyhow!(
+                    "ip -6 route del {cidr} dev {ifname} failed (status {:?}): {}",
+                    delete.status.code(),
+                    stderr.trim()
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check whether an IPv6 address belongs to Mantissa's deterministic tunnel prefix.
+#[cfg(target_os = "linux")]
+fn is_mantissa_tunnel_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0xfd42 && segments[1] == 0x6d61 && segments[2] == 0x6e74 && segments[3] == 0x6973
+}
 
 #[cfg(target_os = "linux")]
 fn ip6tables_has_rule(chain: &str, spec: &[&str]) -> bool {

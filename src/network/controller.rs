@@ -1062,74 +1062,77 @@ impl NetworkController {
             }
         }
 
-        {
-            let mut guard = self.inner.remote_fdb.lock().await;
-            let entry = guard.entry(plan.network_id).or_default();
+        const FLOOD_MAC: &str = "00:00:00:00:00:00";
 
-            // Apply desired entries; retry when the kernel previously rejected them.
-            for (mac, ip) in &desired {
-                let needs_update = entry
-                    .get(mac)
-                    .map(|existing| existing != ip)
-                    .unwrap_or(true);
+        // Reconcile from kernel truth so split/merge churn cannot leave stale FDB entries behind
+        // when in-memory caches are dropped (process restart, interface recreation).
+        let observed = self
+            .inner
+            .attachment
+            .list_remote_fdb(&plan.vxlan_name)
+            .await
+            .with_context(|| format!("list remote fdb entries on {}", plan.vxlan_name))?;
 
-                if !needs_update {
-                    continue;
-                }
+        let mut observed_unicast: HashMap<String, IpAddr> = HashMap::new();
+        let mut observed_unicast_entries: Vec<(String, IpAddr)> = Vec::new();
+        let mut observed_flood: HashSet<IpAddr> = HashSet::new();
+        for (mac, dst) in observed {
+            if mac == FLOOD_MAC {
+                observed_flood.insert(dst);
+                continue;
+            }
+            observed_unicast.insert(mac.clone(), dst);
+            observed_unicast_entries.push((mac, dst));
+        }
 
-                let installed = self
-                    .inner
-                    .attachment
-                    .ensure_remote_fdb(&plan.vxlan_name, mac, *ip)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "ensure remote fdb entry for mac {mac} to {ip} on {}",
-                            plan.vxlan_name
-                        )
-                    })?;
-
-                if installed {
-                    entry.insert(mac.clone(), *ip);
-                } else {
-                    entry.remove(mac);
-                    debug!(
-                        target: "network",
-                        vxlan = %plan.vxlan_name,
-                        mac,
-                        dst = %ip,
-                        "deferring remote fdb entry; kernel reported unsupported"
-                    );
-                }
+        for (mac, ip) in &desired {
+            if observed_unicast.get(mac) == Some(ip) {
+                continue;
             }
 
-            let stale: Vec<(String, IpAddr)> = entry
-                .iter()
-                .filter(|(mac, ip)| desired.get(*mac) != Some(ip))
-                .map(|(mac, ip)| (mac.clone(), *ip))
-                .collect();
+            let installed = self
+                .inner
+                .attachment
+                .ensure_remote_fdb(&plan.vxlan_name, mac, *ip)
+                .await
+                .with_context(|| {
+                    format!(
+                        "ensure remote fdb entry for mac {mac} to {ip} on {}",
+                        plan.vxlan_name
+                    )
+                })?;
 
-            for (mac, ip) in stale {
-                if let Err(err) = self
-                    .inner
-                    .attachment
-                    .remove_remote_fdb(&plan.vxlan_name, &mac, ip)
-                    .await
-                {
-                    warn!(
-                        target: "network",
-                        "failed to remove stale fdb entry for mac {mac} dst {ip}: {err}"
-                    );
-                }
-                entry.remove(&mac);
+            if !installed {
+                debug!(
+                    target: "network",
+                    vxlan = %plan.vxlan_name,
+                    mac,
+                    dst = %ip,
+                    "deferring remote fdb entry; kernel reported unsupported"
+                );
             }
         }
 
-        let mut flood_guard = self.inner.flood_entries.lock().await;
-        let flood_entry = flood_guard.entry(plan.network_id).or_default();
+        let stale_unicast: Vec<(String, IpAddr)> = observed_unicast_entries
+            .into_iter()
+            .filter(|(mac, ip)| desired.get(mac) != Some(ip))
+            .collect();
+        for (mac, ip) in stale_unicast {
+            if let Err(err) = self
+                .inner
+                .attachment
+                .remove_remote_fdb(&plan.vxlan_name, &mac, ip)
+                .await
+            {
+                warn!(
+                    target: "network",
+                    "failed to remove stale fdb entry for mac {mac} dst {ip}: {err}"
+                );
+            }
+        }
 
         for ip in flood_targets.keys() {
-            if flood_entry.contains(ip) {
+            if observed_flood.contains(ip) {
                 continue;
             }
 
@@ -1145,9 +1148,7 @@ impl NetworkController {
                     )
                 })?;
 
-            if installed {
-                flood_entry.insert(*ip);
-            } else {
+            if !installed {
                 debug!(
                     target: "network",
                     vxlan = %plan.vxlan_name,
@@ -1157,13 +1158,11 @@ impl NetworkController {
             }
         }
 
-        let obsolete: Vec<IpAddr> = flood_entry
-            .iter()
-            .copied()
+        let obsolete_flood: Vec<IpAddr> = observed_flood
+            .into_iter()
             .filter(|ip| !flood_targets.contains_key(ip))
             .collect();
-
-        for ip in obsolete {
+        for ip in obsolete_flood {
             if let Err(err) = self
                 .inner
                 .attachment
@@ -1177,7 +1176,17 @@ impl NetworkController {
                     ip
                 );
             }
-            flood_entry.remove(&ip);
+        }
+
+        {
+            let mut guard = self.inner.remote_fdb.lock().await;
+            guard.insert(plan.network_id, desired);
+        }
+        {
+            let mut guard = self.inner.flood_entries.lock().await;
+            let entry = guard.entry(plan.network_id).or_default();
+            entry.clear();
+            entry.extend(flood_targets.into_keys());
         }
 
         Ok(())
@@ -1732,6 +1741,15 @@ mod platform {
                         )
                     })?;
 
+                self.remove_stale_interface_addresses(host_index, ip, prefix, &host_ifname)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "remove stale resolver addresses from host access {} (idx {})",
+                            host_ifname, host_index
+                        )
+                    })?;
+
                 self.ensure_interface_address(host_index, ip, prefix, &host_ifname)
                     .await
                     .with_context(|| {
@@ -1786,6 +1804,68 @@ mod platform {
                 .execute()
                 .await
                 .with_context(|| format!("assign resolver {ip}/{prefix} on {link_name}"))
+        }
+
+        /// Remove stale IPv4 addresses from a dedicated host-access interface.
+        ///
+        /// Split/merge transitions can move a network onto a new resolver address while reusing
+        /// the same `mnhost-*` link name. We must delete old addresses first so the kernel does
+        /// not keep multiple /16s on the interface and pick an unexpected source IP for overlay
+        /// ARP + health probe traffic.
+        async fn remove_stale_interface_addresses(
+            &self,
+            link_index: u32,
+            keep_ip: Ipv4Addr,
+            keep_prefix: u8,
+            link_name: &str,
+        ) -> Result<()> {
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
+            let mut stream = handle
+                .address()
+                .get()
+                .set_link_index_filter(link_index)
+                .execute();
+
+            while let Some(message) = stream
+                .try_next()
+                .await
+                .context("list interface addresses")?
+            {
+                if message.header.family != AddressFamily::Inet {
+                    continue;
+                }
+
+                let mut address: Option<Ipv4Addr> = None;
+                for attr in message.attributes.iter() {
+                    match attr {
+                        AddressAttribute::Address(IpAddr::V4(ip))
+                        | AddressAttribute::Local(IpAddr::V4(ip)) => {
+                            address = Some(*ip);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                let Some(ip) = address else {
+                    continue;
+                };
+                let prefix = message.header.prefix_len;
+                if ip == keep_ip && prefix == keep_prefix {
+                    continue;
+                }
+
+                self.remove_interface_address(link_index, ip, prefix, link_name)
+                    .await
+                    .with_context(|| {
+                        format!("remove stale resolver {ip}/{prefix} from {link_name}")
+                    })?;
+            }
+
+            Ok(())
         }
 
         /// Apply ARP flux mitigation to an interface so it does not answer for foreign IPs.

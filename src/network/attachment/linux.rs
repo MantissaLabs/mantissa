@@ -315,6 +315,52 @@ impl AttachmentProvisioner {
             .await
     }
 
+    /// Read the VXLAN FDB entries currently programmed in the kernel for this device.
+    ///
+    /// Returns `(mac, dst)` tuples only for entries that carry an explicit destination, which is
+    /// exactly the shape Mantissa manages for remote unicast and flood forwarding.
+    pub async fn list_remote_fdb(&self, vxlan_name: &str) -> Result<Vec<(String, IpAddr)>> {
+        let Some(handle) = self.handle() else {
+            return Ok(Vec::new());
+        };
+        let vxlan_index = match self.link_index(handle, vxlan_name).await? {
+            Some(idx) => idx,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut stream = handle.neighbours().get().execute();
+        let mut entries = Vec::new();
+
+        while let Some(msg) = stream.try_next().await.context("list vxlan fdb entries")? {
+            if msg.header.ifindex != vxlan_index {
+                continue;
+            }
+
+            let mut mac: Option<String> = None;
+            let mut dst: Option<IpAddr> = None;
+            for attr in msg.attributes {
+                match attr {
+                    NeighbourAttribute::LinkLocalAddress(value) => {
+                        mac = format_mac_bytes(&value);
+                    }
+                    NeighbourAttribute::Destination(NeighbourAddress::Inet(addr)) => {
+                        dst = Some(IpAddr::V4(addr));
+                    }
+                    NeighbourAttribute::Destination(NeighbourAddress::Inet6(addr)) => {
+                        dst = Some(IpAddr::V6(addr));
+                    }
+                    _ => {}
+                }
+            }
+
+            if let (Some(mac), Some(dst)) = (mac, dst) {
+                entries.push((mac, dst));
+            }
+        }
+
+        Ok(entries)
+    }
+
     async fn create_veth(&self, handle: &Handle, host_if: &str, container_if: &str) -> Result<()> {
         handle
             .link()
@@ -425,8 +471,6 @@ impl AttachmentProvisioner {
         let mut message = NeighbourMessage::default();
         message.header.family = AddressFamily::Bridge;
         message.header.ifindex = vxlan_index;
-        message.header.state = NeighbourState::Permanent;
-        message.header.flags = NeighbourFlags::Own;
 
         message
             .attributes
@@ -489,6 +533,10 @@ impl AttachmentProvisionerApi for AttachmentProvisioner {
     async fn remove_flood_entry(&self, vxlan_name: &str, dst: IpAddr) -> Result<()> {
         AttachmentProvisioner::remove_flood_entry(self, vxlan_name, dst).await
     }
+
+    async fn list_remote_fdb(&self, vxlan_name: &str) -> Result<Vec<(String, IpAddr)>> {
+        AttachmentProvisioner::list_remote_fdb(self, vxlan_name).await
+    }
 }
 
 fn parse_mac(mac: &str) -> Result<Vec<u8>> {
@@ -503,6 +551,16 @@ fn parse_mac(mac: &str) -> Result<Vec<u8>> {
         return Err(anyhow!("invalid mac address {mac}"));
     }
     Ok(bytes)
+}
+
+fn format_mac_bytes(mac: &[u8]) -> Option<String> {
+    if mac.len() != 6 {
+        return None;
+    }
+    Some(format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    ))
 }
 
 fn warn_unless_not_found(err: rtnetlink::Error, context: impl FnOnce() -> String) {

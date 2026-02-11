@@ -46,6 +46,9 @@ pub trait AttachmentProvisionerApi: Send + Sync {
 
     #[allow(dead_code)]
     async fn remove_flood_entry(&self, vxlan_name: &str, dst: IpAddr) -> Result<()>;
+
+    #[allow(dead_code)]
+    async fn list_remote_fdb(&self, vxlan_name: &str) -> Result<Vec<(String, IpAddr)>>;
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -109,6 +112,11 @@ impl AttachmentProvisioner {
     pub async fn remove_flood_entry(&self, _vxlan_name: &str, _dst: IpAddr) -> Result<()> {
         Ok(())
     }
+
+    #[allow(dead_code)]
+    pub async fn list_remote_fdb(&self, _vxlan_name: &str) -> Result<Vec<(String, IpAddr)>> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -140,6 +148,10 @@ impl AttachmentProvisionerApi for AttachmentProvisioner {
 
     async fn remove_flood_entry(&self, _vxlan_name: &str, _dst: IpAddr) -> Result<()> {
         Ok(())
+    }
+
+    async fn list_remote_fdb(&self, _vxlan_name: &str) -> Result<Vec<(String, IpAddr)>> {
+        Ok(Vec::new())
     }
 }
 

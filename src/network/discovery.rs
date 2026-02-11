@@ -1071,27 +1071,36 @@ fn filter_cached_backends(
     backends: Vec<BackendAddress>,
 ) -> Vec<BackendAddress> {
     let now = Instant::now();
-    let mut filtered = Vec::with_capacity(backends.len());
+    let mut preferred = Vec::with_capacity(backends.len());
+    let mut stale_unhealthy = Vec::with_capacity(backends.len());
     for backend in backends {
         let entry = health.get_entry(network_id, service_name, backend.ip);
-        let include = match entry {
-            None => true,
+        match entry {
+            None => preferred.push(backend),
             Some(entry) => {
                 let is_stale =
                     now.saturating_duration_since(entry.checked_at) >= HEALTH_CACHE_STALE_AFTER;
                 match entry.state {
-                    HealthState::Healthy | HealthState::Unknown => true,
-                    // If refresh stalls, treat stale unhealthy entries as unknown so we do not
-                    // permanently exclude an endpoint without fresh data.
-                    HealthState::Unhealthy => is_stale,
+                    HealthState::Healthy | HealthState::Unknown => preferred.push(backend),
+                    HealthState::Unhealthy => {
+                        // Keep stale unhealthy endpoints out of normal DNS responses whenever at
+                        // least one non-unhealthy endpoint exists. This avoids periodic latency
+                        // spikes where clients connect-timeout on a dead backend before falling
+                        // back to another A record.
+                        if is_stale {
+                            stale_unhealthy.push(backend);
+                        }
+                    }
                 }
             }
-        };
-        if include {
-            filtered.push(backend);
         }
     }
-    filtered
+
+    if preferred.is_empty() {
+        stale_unhealthy
+    } else {
+        preferred
+    }
 }
 
 /// Actively probe candidate backends so the cached health state and dataplane MACs stay fresh.
@@ -1759,4 +1768,74 @@ fn default_bpf_programs() -> Vec<BpfProgramSpec> {
         BpfProgramSpec::with_attach_point("bridge_tc_ingress", BpfAttachPoint::BridgeTcIngress),
         BpfProgramSpec::with_attach_point("bridge_tc_egress", BpfAttachPoint::BridgeTcEgress),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend(ip: [u8; 4], mac: [u8; 6]) -> BackendAddress {
+        BackendAddress {
+            ip: Ipv4Addr::from(ip),
+            mac,
+        }
+    }
+
+    #[test]
+    fn filter_cached_backends_excludes_stale_unhealthy_when_alternative_exists() {
+        let network_id = Uuid::new_v4();
+        let service = "backend";
+        let unhealthy_ip = Ipv4Addr::new(10, 42, 1, 10);
+        let healthy_ip = Ipv4Addr::new(10, 42, 1, 11);
+
+        let mut health = BackendHealth::default();
+        let key = (network_id, service.to_string());
+        health.statuses.entry(key).or_default().insert(
+            unhealthy_ip,
+            HealthEntry {
+                state: HealthState::Unhealthy,
+                checked_at: Instant::now() - HEALTH_CACHE_STALE_AFTER - Duration::from_secs(1),
+            },
+        );
+
+        let filtered = filter_cached_backends(
+            &health,
+            network_id,
+            service,
+            vec![
+                backend([10, 42, 1, 10], [0x02, 0, 0, 0, 0, 1]),
+                backend([10, 42, 1, 11], [0x02, 0, 0, 0, 0, 2]),
+            ],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].ip, healthy_ip);
+    }
+
+    #[test]
+    fn filter_cached_backends_keeps_stale_unhealthy_when_only_choice() {
+        let network_id = Uuid::new_v4();
+        let service = "backend";
+        let unhealthy_ip = Ipv4Addr::new(10, 42, 1, 10);
+
+        let mut health = BackendHealth::default();
+        let key = (network_id, service.to_string());
+        health.statuses.entry(key).or_default().insert(
+            unhealthy_ip,
+            HealthEntry {
+                state: HealthState::Unhealthy,
+                checked_at: Instant::now() - HEALTH_CACHE_STALE_AFTER - Duration::from_secs(1),
+            },
+        );
+
+        let filtered = filter_cached_backends(
+            &health,
+            network_id,
+            service,
+            vec![backend([10, 42, 1, 10], [0x02, 0, 0, 0, 0, 1])],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].ip, unhealthy_ip);
+    }
 }

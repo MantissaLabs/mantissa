@@ -506,12 +506,48 @@ impl TaskManager {
         }
     }
 
-    /// Ensures the in-memory container tracking reflects the persisted spec.
-    pub(super) async fn ensure_local_tracking(&self, spec: &TaskSpec) {
-        let mut guard = self.local_containers.lock().await;
-        guard
-            .entry(spec.id)
-            .or_insert_with(|| format!("mantissa-{}", spec.id));
+    /// Resolves the live container identifier for a task from cache and deterministic name.
+    ///
+    /// This keeps running-task reconciliation resilient when local in-memory tracking drifts
+    /// or Docker returns canonical ids that differ from Mantissa's deterministic names.
+    pub(super) async fn resolve_live_container_id_for_task(
+        &self,
+        spec: &TaskSpec,
+    ) -> Result<Option<String>, ContainerError> {
+        let desired_name = format!("mantissa-{}", spec.id);
+        let candidate = {
+            let guard = self.local_containers.lock().await;
+            guard
+                .get(&spec.id)
+                .cloned()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| desired_name.clone())
+        };
+
+        let resolve_id =
+            |fallback: String, info: bollard::service::ContainerInspectResponse| -> String {
+                info.id
+                    .map(|value| value.trim_start_matches('/').to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(fallback)
+            };
+
+        match self.container_manager.inspect_container(&candidate).await {
+            Ok(info) => Ok(Some(resolve_id(candidate, info))),
+            Err(ContainerError::NotFound(_)) if candidate != desired_name => {
+                match self
+                    .container_manager
+                    .inspect_container(&desired_name)
+                    .await
+                {
+                    Ok(info) => Ok(Some(resolve_id(desired_name, info))),
+                    Err(ContainerError::NotFound(_)) => Ok(None),
+                    Err(err) => Err(err),
+                }
+            }
+            Err(ContainerError::NotFound(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     /// Starts or reuses a container so the task transitions into running state locally.
@@ -520,8 +556,37 @@ impl TaskManager {
         let task_name = working.name.clone();
 
         if matches!(working.state, ContainerState::Running) {
-            self.ensure_local_tracking(&working).await;
-            return Ok(());
+            match self.resolve_live_container_id_for_task(&working).await {
+                Ok(Some(container_id)) => {
+                    let mut guard = self.local_containers.lock().await;
+                    guard.insert(working.id, container_id);
+                    return Ok(());
+                }
+                Ok(None) => {
+                    warn!(
+                        target: "task",
+                        task = %working.id,
+                        "running task container missing locally; restarting task runtime"
+                    );
+                    working.state = ContainerState::Pending;
+                    working.updated_at = Utc::now().to_rfc3339();
+                    self.persist_spec(&working).await?;
+                    if let Err(err) = self
+                        .enqueue_gossip(TaskEvent::Upsert(Box::new(working.clone())))
+                        .await
+                    {
+                        warn!(
+                            target: "task",
+                            task = %working.id,
+                            "failed to broadcast pending restart state: {err}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    return Err(anyhow::Error::from(err)
+                        .context(format!("inspect running container for task {}", working.id)));
+                }
+            }
         }
 
         if matches!(
@@ -989,10 +1054,7 @@ impl TaskManager {
             ContainerState::Pending | ContainerState::Creating => {
                 self.ensure_task_running(spec).await
             }
-            ContainerState::Running => {
-                self.ensure_local_tracking(&spec).await;
-                Ok(())
-            }
+            ContainerState::Running => self.ensure_task_running(spec).await,
             ContainerState::Stopping | ContainerState::Stopped => {
                 self.ensure_task_stopped(spec).await
             }
