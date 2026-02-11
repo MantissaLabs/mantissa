@@ -294,6 +294,9 @@ pub struct Topology {
     /// Cached Peers snapshot to avoid hitting storage on every tick.
     peer_snapshot_cache: Arc<AsyncMutex<PeerSnapshotCache>>,
 
+    /// Peer ids currently excluded from active control-plane loops for the local cluster view.
+    excluded_peers: Arc<AsyncMutex<HashSet<Uuid>>>,
+
     /// Store holding locally issued session tickets keyed by peer id.
     local_sessions: LocalSessionStore,
 
@@ -391,6 +394,7 @@ impl Topology {
             network_peers,
             network_attachments,
             peer_snapshot_cache: Arc::new(AsyncMutex::new(PeerSnapshotCache::new())),
+            excluded_peers: Arc::new(AsyncMutex::new(HashSet::new())),
             local_sessions: sessions,
             local_credential_store: credentials,
             registry,
@@ -430,6 +434,16 @@ impl Topology {
             "updated active cluster view"
         );
         previous
+    }
+
+    /// Returns a snapshot of peers currently excluded from active control-plane loops.
+    pub(crate) async fn excluded_peers_snapshot(&self) -> HashSet<Uuid> {
+        self.excluded_peers.lock().await.clone()
+    }
+
+    /// Replaces the excluded-peer set used to scope active control-plane loops.
+    pub(crate) async fn set_excluded_peers(&self, excluded: HashSet<Uuid>) {
+        *self.excluded_peers.lock().await = excluded;
     }
 
     pub async fn gossip_topology_event(&self, event: TopologyEvent) -> Result<(), capnp::Error> {
@@ -1019,21 +1033,34 @@ impl Topology {
         let peers = snapshot.entries.clone();
         let sync_fanout = self.sync.fanout();
         let cluster_view = self.active_cluster_view();
+        let excluded_peers = self.excluded_peers_snapshot().await;
         let entries = peers.as_ref();
         if entries.is_empty() {
+            return;
+        }
+        let in_scope_peer_count = entries
+            .iter()
+            .filter(|entry| {
+                entry.peer_id != self.node.id && !excluded_peers.contains(&entry.peer_id)
+            })
+            .count();
+        if in_scope_peer_count == 0 {
             return;
         }
 
         debug!(
             target: "sync",
             cluster_view = %cluster_view,
-            peer_count = entries.len(),
+            peer_count = in_scope_peer_count,
             fanout = sync_fanout,
             "running periodic sync tick"
         );
 
         let selected_entries = self.select_sync_peers(entries, sync_fanout);
         for entry in selected_entries {
+            if excluded_peers.contains(&entry.peer_id) {
+                continue;
+            }
             self.sync_with_peer(entry, cluster_view).await;
         }
     }
@@ -1104,12 +1131,16 @@ impl Topology {
             None => return,
         };
         let cluster_view = self.active_cluster_view();
+        let excluded_peers = self.excluded_peers_snapshot().await;
 
         // Build list of peers excluding self
         let mut candidates: Vec<(uuid::Uuid, String)> = Vec::new();
         let peers = snapshot.entries.clone();
         for entry in peers.iter() {
             if entry.peer_id == self.node.id {
+                continue;
+            }
+            if excluded_peers.contains(&entry.peer_id) {
                 continue;
             }
             let value = entry.value.as_ref();

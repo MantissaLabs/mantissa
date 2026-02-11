@@ -428,7 +428,13 @@ impl Topology {
                 .collect();
         }
 
-        let mut values = candidates.into_values().collect::<Vec<_>>();
+        let excluded_peers = self.excluded_peers_snapshot().await;
+        let mut values = candidates
+            .into_values()
+            .filter(|candidate| {
+                candidate.node_id == self.node.id || !excluded_peers.contains(&candidate.node_id)
+            })
+            .collect::<Vec<_>>();
         values.sort_by_key(|candidate| candidate.node_id);
 
         for candidate in &mut values {
@@ -799,7 +805,7 @@ impl Topology {
         .ok_or_else(|| capnp::Error::failed("operation has no target views for commit".to_string()))
     }
 
-    /// Removes peers, session tickets, and credentials that no longer belong to the local split target.
+    /// Clears session/capability state and excludes peers that no longer belong to the local split target.
     async fn prune_split_state_for_local_target(
         &self,
         operation: &ClusterOperationRecord,
@@ -838,34 +844,9 @@ impl Topology {
         let mut evicted = evicted_ids.into_iter().collect::<Vec<_>>();
         evicted.sort_unstable();
 
-        let mut removed_peers = 0usize;
         let mut removed_sessions = 0usize;
         let mut removed_credentials = 0usize;
         for peer_id in evicted.iter().copied() {
-            let key = UuidKey::from(peer_id);
-            match self.peers.exists(&key) {
-                Ok(true) => match self.peers.remove(&key).await {
-                    Ok(_) => removed_peers = removed_peers.saturating_add(1),
-                    Err(err) => {
-                        warn!(
-                            target: "cluster_view",
-                            operation_id = %operation.id,
-                            peer_id = %peer_id,
-                            "failed to remove out-of-view peer during split prune: {err}"
-                        );
-                    }
-                },
-                Ok(false) => {}
-                Err(err) => {
-                    warn!(
-                        target: "cluster_view",
-                        operation_id = %operation.id,
-                        peer_id = %peer_id,
-                        "failed to check out-of-view peer during split prune: {err}"
-                    );
-                }
-            }
-
             match self.local_sessions.remove(peer_id) {
                 Ok(()) => removed_sessions = removed_sessions.saturating_add(1),
                 Err(err) => {
@@ -892,6 +873,8 @@ impl Topology {
 
             self.registry.remove_peer(peer_id).await;
         }
+        self.set_excluded_peers(evicted.iter().copied().collect())
+            .await;
 
         info!(
             target: "cluster_view",
@@ -899,7 +882,6 @@ impl Topology {
             local_target_index,
             retained_count = retained_ids.len(),
             evicted_count = evicted.len(),
-            removed_peers,
             removed_sessions,
             removed_credentials,
             "completed split prune for local target"
@@ -927,16 +909,29 @@ impl Topology {
         Self::session_cluster_view(&session).await.ok()
     }
 
-    /// Best-effort relay of one operation record to peers that are still in the source view.
+    /// Best-effort relay of one operation record to peers in the operation's relay scope.
     async fn broadcast_cluster_operation(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<usize, capnp::Error> {
-        let source_view = operation
-            .source_views
-            .first()
-            .copied()
-            .ok_or_else(|| capnp::Error::failed("operation missing source view".to_string()))?;
+        let relay_views = match operation.kind {
+            ClusterOperationKind::Split => {
+                let source_view = operation.source_views.first().copied().ok_or_else(|| {
+                    capnp::Error::failed("split operation missing source view".to_string())
+                })?;
+                HashSet::from([source_view])
+            }
+            ClusterOperationKind::Merge => {
+                let source_view = operation.source_views.first().copied().ok_or_else(|| {
+                    capnp::Error::failed("merge operation missing source view".to_string())
+                })?;
+                let mut views = HashSet::from([source_view]);
+                for target in operation.target_views.iter().copied() {
+                    views.insert(target);
+                }
+                views
+            }
+        };
         let snapshot = match self.peer_snapshot().await {
             Some(snapshot) => snapshot,
             None => return Ok(0),
@@ -966,7 +961,7 @@ impl Topology {
                     continue;
                 }
             };
-            if peer_view != source_view {
+            if !relay_views.contains(&peer_view) {
                 continue;
             }
 
@@ -998,7 +993,7 @@ impl Topology {
                 target: "cluster_view",
                 operation_id = %operation.id,
                 relayed,
-                source_view = %source_view,
+                relay_view_count = relay_views.len(),
                 "relayed cluster operation to peers"
             );
         }
@@ -1105,8 +1100,13 @@ impl Topology {
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
         let target_view = self.local_target_view_for_operation(operation)?;
-        if operation.kind == ClusterOperationKind::Split {
-            self.prune_split_state_for_local_target(operation).await?;
+        match operation.kind {
+            ClusterOperationKind::Split => {
+                self.prune_split_state_for_local_target(operation).await?;
+            }
+            ClusterOperationKind::Merge => {
+                self.set_excluded_peers(HashSet::new()).await;
+            }
         }
 
         let previous = self.set_active_cluster_view(target_view);
@@ -1386,6 +1386,7 @@ impl topology::Server for Topology {
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         let local_view = self.active_cluster_view();
+        let excluded_peers = self.excluded_peers_snapshot().await;
         let mut scoped_nodes =
             Vec::<(Uuid, Option<PeerValue>, protocol::health::NodeStatus)>::with_capacity(
                 actives.len(),
@@ -1393,6 +1394,9 @@ impl topology::Server for Topology {
 
         for (k, snap) in actives.into_iter() {
             let id = k.to_uuid();
+            if excluded_peers.contains(&id) {
+                continue;
+            }
             let candidate_view = if id == self.node.id {
                 Some(local_view)
             } else {
@@ -1808,6 +1812,27 @@ impl topology::Server for Topology {
         mut results: topology::ListClusterViewsResults,
     ) -> Result<(), capnp::Error> {
         let local_view = self.active_cluster_view();
+        let excluded_peers = self.excluded_peers_snapshot().await;
+        let operations = self.load_cluster_operations()?;
+        let mut retired_views = HashSet::<ClusterViewId>::new();
+        for operation in operations.iter() {
+            if operation.kind != ClusterOperationKind::Merge
+                || operation.dry_run
+                || operation.stage == ClusterOperationStage::Aborted
+            {
+                continue;
+            }
+            if !matches!(
+                operation.stage,
+                ClusterOperationStage::Committed | ClusterOperationStage::Finalized
+            ) {
+                continue;
+            }
+            for source_view in operation.source_views.iter().copied() {
+                retired_views.insert(source_view);
+            }
+        }
+
         let mut counts = HashMap::<ClusterViewId, u32>::new();
         counts.insert(local_view, 1);
 
@@ -1820,8 +1845,14 @@ impl topology::Server for Topology {
             if peer_id == self.node.id {
                 continue;
             }
+            if excluded_peers.contains(&peer_id) {
+                continue;
+            }
 
             if let Some(view) = self.best_known_peer_view(peer_id).await {
+                if retired_views.contains(&view) {
+                    continue;
+                }
                 let entry = counts.entry(view).or_insert(0);
                 *entry = entry.saturating_add(1);
             }
@@ -1829,7 +1860,7 @@ impl topology::Server for Topology {
 
         // Preserve split sibling discoverability even after peer pruning removes direct sessions.
         // This keeps merge UX simple because both split target clusters stay listable from either side.
-        for operation in self.load_cluster_operations()? {
+        for operation in operations.iter() {
             if operation.kind != ClusterOperationKind::Split
                 || operation.dry_run
                 || operation.stage == ClusterOperationStage::Aborted
@@ -1848,6 +1879,9 @@ impl topology::Server for Topology {
             }
 
             for (idx, view) in operation.target_views.iter().copied().enumerate() {
+                if retired_views.contains(&view) {
+                    continue;
+                }
                 let inferred_count = inferred_target_counts.get(idx).copied().unwrap_or_default();
                 if inferred_count == 0 {
                     continue;
@@ -1861,7 +1895,9 @@ impl topology::Server for Topology {
 
         let mut rows = counts
             .into_iter()
-            .filter(|(_, node_count)| *node_count > 0)
+            .filter(|(view, node_count)| {
+                *node_count > 0 && (*view == local_view || !retired_views.contains(view))
+            })
             .collect::<Vec<_>>();
         rows.sort_by(|(left, _), (right, _)| {
             left.cluster_id
