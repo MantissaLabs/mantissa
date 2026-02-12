@@ -1178,6 +1178,136 @@ async fn remove_event_purges_remote_attachment_without_local_spec() {
 }
 
 #[tokio::test]
+async fn teardown_local_attachment_records_preserves_remote_rows() {
+    let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let local_network = Uuid::new_v4();
+    let remote_network = Uuid::new_v4();
+    let remote_node = Uuid::new_v4();
+
+    let local_attachment = NetworkAttachmentValue::new(NetworkAttachmentDraft {
+        id: crate::network::types::compute_network_attachment_id(task_id, local_network),
+        task_id,
+        node_id: manager.local_node_id,
+        container_id: format!("mantissa-{task_id}"),
+        network_id: local_network,
+        task_updated_at: Some(Utc::now().to_rfc3339()),
+        requested_ip: Some("10.78.0.2".to_string()),
+        assigned_ip: Some("10.78.0.2".to_string()),
+        mac: Some("02:11:22:33:44:66".to_string()),
+        state: NetworkAttachmentState::Ready,
+        error: None,
+        service_name: Some("svc".to_string()),
+        template_name: Some("backend".to_string()),
+    });
+    let remote_attachment = NetworkAttachmentValue::new(NetworkAttachmentDraft {
+        id: crate::network::types::compute_network_attachment_id(task_id, remote_network),
+        task_id,
+        node_id: remote_node,
+        container_id: format!("mantissa-{task_id}"),
+        network_id: remote_network,
+        task_updated_at: Some(Utc::now().to_rfc3339()),
+        requested_ip: Some("10.78.0.3".to_string()),
+        assigned_ip: Some("10.78.0.3".to_string()),
+        mac: Some("02:11:22:33:44:77".to_string()),
+        state: NetworkAttachmentState::Ready,
+        error: None,
+        service_name: Some("svc".to_string()),
+        template_name: Some("backend".to_string()),
+    });
+
+    network_registry
+        .upsert_attachment(local_attachment)
+        .await
+        .expect("insert local attachment");
+    network_registry
+        .upsert_attachment(remote_attachment)
+        .await
+        .expect("insert remote attachment");
+
+    manager
+        .teardown_local_attachment_records(task_id)
+        .await
+        .expect("teardown local attachment records");
+
+    let remaining = network_registry
+        .list_attachments_for_task(task_id)
+        .expect("list remaining attachments");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].node_id, remote_node);
+}
+
+#[tokio::test]
+async fn repair_runtime_attachments_purges_unowned_local_rows() {
+    let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let network_id = Uuid::new_v4();
+    let remote_node = Uuid::new_v4();
+    let now = Utc::now().to_rfc3339();
+
+    let remote_value = TaskValue::new(TaskValueDraft {
+        id: task_id,
+        name: "remote-task".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Running,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        command: vec![],
+        node_id: remote_node,
+        node_name: "remote-node".to_string(),
+        slot_ids: vec![1],
+        networks: vec![network_id],
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        service_metadata: None,
+    });
+    manager
+        .store
+        .upsert(&UuidKey::from(task_id), remote_value)
+        .await
+        .expect("insert remote task value");
+
+    let stale_local_attachment = NetworkAttachmentValue::new(NetworkAttachmentDraft {
+        id: crate::network::types::compute_network_attachment_id(task_id, network_id),
+        task_id,
+        node_id: manager.local_node_id,
+        container_id: format!("mantissa-{task_id}"),
+        network_id,
+        task_updated_at: Some(now),
+        requested_ip: Some("10.79.0.2".to_string()),
+        assigned_ip: Some("10.79.0.2".to_string()),
+        mac: Some("02:11:22:33:44:88".to_string()),
+        state: NetworkAttachmentState::Ready,
+        error: None,
+        service_name: Some("svc".to_string()),
+        template_name: Some("backend".to_string()),
+    });
+    network_registry
+        .upsert_attachment(stale_local_attachment)
+        .await
+        .expect("insert stale local attachment");
+
+    manager
+        .repair_runtime_attachments()
+        .await
+        .expect("repair runtime attachments");
+
+    assert!(
+        network_registry
+            .list_attachments_for_task(task_id)
+            .expect("list attachments after repair")
+            .is_empty(),
+        "repair should remove local attachment rows for tasks now owned by remote nodes"
+    );
+}
+
+#[tokio::test]
 async fn attachment_ready_triggers_forwarding_event() {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (manager, scheduler, _mock_cm, network_registry) =

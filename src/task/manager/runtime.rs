@@ -34,7 +34,7 @@ impl TaskManager {
     /// Periodically re-attach networks to running containers whose attachment interfaces vanished
     /// (for example after a container restart) so backends rejoin service discovery and load
     /// balancing without manual intervention.
-    async fn repair_runtime_attachments(&self) -> Result<()> {
+    pub(super) async fn repair_runtime_attachments(&self) -> Result<()> {
         self.cleanup_orphaned_local_attachments()
             .await
             .context("cleanup orphaned network attachments")?;
@@ -89,6 +89,13 @@ impl TaskManager {
                     continue;
                 }
             };
+
+            // The task is now owned by another node, so any attachment row still owned locally
+            // is stale and must be removed to prevent discovery from selecting dead backends.
+            if spec.node_id != self.local_node_id {
+                self.remove_local_attachment_record(&attachment).await;
+                continue;
+            }
 
             let desired_name = format!("mantissa-{}", spec.id);
             let mut container_id = {
@@ -247,6 +254,33 @@ impl TaskManager {
         }
 
         Ok(())
+    }
+
+    /// Remove one local attachment row and tear down its local interface when present.
+    async fn remove_local_attachment_record(&self, attachment: &NetworkAttachmentValue) {
+        if attachment.node_id != self.local_node_id {
+            return;
+        }
+
+        if let Err(err) = self
+            .attachment_provisioner
+            .teardown_attachment(attachment.id)
+            .await
+        {
+            warn!(
+                target: "task",
+                attachment = %attachment.id,
+                "failed to teardown local attachment interface during stale cleanup: {err}"
+            );
+        }
+
+        if let Err(err) = self.network_registry.remove_attachment(attachment.id).await {
+            warn!(
+                target: "task",
+                attachment = %attachment.id,
+                "failed to remove stale local attachment record: {err}"
+            );
+        }
     }
 
     /// Main gossip processing loop for the task manager.
@@ -709,6 +743,20 @@ impl TaskManager {
                     );
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// Remove only local attachment records for a task while preserving remote ownership rows.
+    pub(super) async fn teardown_local_attachment_records(&self, task_id: Uuid) -> Result<()> {
+        let attachments = self
+            .network_registry
+            .list_attachments_for_task(task_id)
+            .context("failed to list task attachments for local record teardown")?;
+
+        for attachment in attachments {
+            self.remove_local_attachment_record(&attachment).await;
         }
 
         Ok(())

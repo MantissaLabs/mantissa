@@ -1275,37 +1275,13 @@ impl TaskManager {
                     "failed to run orphaned attachment cleanup after unowned stop: {err}"
                 );
             }
-        } else if let Err(err) = self.teardown_local_attachments(task_id).await {
+        } else if let Err(err) = self.teardown_local_attachment_records(task_id).await {
             warn!(
                 target: "task",
                 task = %task_id,
-                "failed to teardown local attachments for unowned task: {err}"
+                "failed to teardown local attachment records for unowned task: {err}"
             );
         }
-    }
-
-    /// Removes local attachment interfaces without mutating replicated attachment records.
-    async fn teardown_local_attachments(&self, task_id: Uuid) -> Result<(), anyhow::Error> {
-        let attachments = self
-            .network_registry
-            .list_attachments_for_task(task_id)
-            .context("failed to list task attachments for local teardown")?;
-
-        for attachment in attachments {
-            if let Err(err) = self
-                .attachment_provisioner
-                .teardown_attachment(attachment.id)
-                .await
-            {
-                warn!(
-                    target: "task",
-                    attachment = %attachment.id,
-                    "failed to teardown local attachment interface: {err}"
-                );
-            }
-        }
-
-        Ok(())
     }
 
     /// Periodically reconciles all locally owned tasks so missed gossip updates still apply.
