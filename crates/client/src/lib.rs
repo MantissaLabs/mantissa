@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
-pub mod cluster;
+pub mod clusters;
 pub mod config;
 pub mod connection;
 mod errors;

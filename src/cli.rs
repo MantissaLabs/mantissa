@@ -126,12 +126,6 @@ pub enum Command {
 
     /// Submit a job to the cluster
     Submit(SubmitArgs),
-
-    /// Merge one or more existing clusters together
-    Merge(MergeArgs),
-
-    /// Split an existing cluster into multiple sub-clusters
-    Split(SplitArgs),
 }
 
 #[derive(Args, Debug)]
@@ -187,6 +181,12 @@ pub enum ClustersCommand {
     /// List known clusters and their node counts
     #[command(alias = "ls")]
     List,
+
+    /// Merge one or more existing clusters together
+    Merge(MergeArgs),
+
+    /// Split an existing cluster into multiple sub-clusters
+    Split(SplitArgs),
 }
 
 #[derive(Args, Debug)]

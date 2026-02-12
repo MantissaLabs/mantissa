@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Clusters { cmd } => match cmd {
             ClustersCommand::List => {
                 let summaries = local
-                    .run_until(client::cluster::list_clusters(&cfg))
+                    .run_until(client::clusters::list_clusters(&cfg))
                     .await?;
                 if summaries.is_empty() {
                     println!("no clusters known");
@@ -101,6 +101,162 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let output = String::from_utf8(tw.into_inner()?)?;
                     output::emit_block(output);
                 }
+            }
+            ClustersCommand::Merge(m) => {
+                let service_policy = match m.services {
+                    MergeServicePolicyOpt::Rebalance => {
+                        client::clusters::MergeServicePolicy::Rebalance
+                    }
+                    MergeServicePolicyOpt::Preserve => {
+                        client::clusters::MergeServicePolicy::Preserve
+                    }
+                };
+                let summary = local
+                    .run_until(client::clusters::merge_by_cluster_id(
+                        &cfg,
+                        &m.source_cluster_id,
+                        &m.destination_cluster_id,
+                        m.dry_run,
+                        service_policy,
+                    ))
+                    .await?;
+                println!("operation {}", summary.id);
+                println!("kind: {}", summary.kind);
+                println!("stage: {}", summary.stage);
+                if !summary.source_views.is_empty() {
+                    let source_views: Vec<String> = summary
+                        .source_views
+                        .iter()
+                        .map(|view| view.to_string())
+                        .collect();
+                    println!("source views: {}", source_views.join(", "));
+                }
+                if !summary.target_views.is_empty() {
+                    let target_views: Vec<String> = summary
+                        .target_views
+                        .iter()
+                        .map(|view| view.to_string())
+                        .collect();
+                    println!("target views: {}", target_views.join(", "));
+                }
+                println!("details: {}", summary.details);
+            }
+            ClustersCommand::Split(s) => {
+                let service_policy = match s.services {
+                    SplitServicePolicyOpt::Partitioned => {
+                        client::clusters::SplitServicePolicy::Partitioned
+                    }
+                    SplitServicePolicyOpt::Preserve => {
+                        client::clusters::SplitServicePolicy::Preserve
+                    }
+                };
+                let network_policy = match s.networks {
+                    SplitNetworkPolicyOpt::Isolate => client::clusters::SplitNetworkPolicy::Isolate,
+                    SplitNetworkPolicyOpt::Preserve => {
+                        client::clusters::SplitNetworkPolicy::Preserve
+                    }
+                };
+                let summary = if s.interactive {
+                    let payload = local
+                        .run_until(client::clusters::list_split_candidates(
+                            &cfg,
+                            s.cluster.as_deref(),
+                        ))
+                        .await?;
+                    if payload.candidates.is_empty() {
+                        return Err(
+                            anyhow!("no split candidates found in the selected cluster").into()
+                        );
+                    }
+
+                    let selection = ui::split_interactive::run_split_planner(
+                        payload,
+                        &s.left_name,
+                        &s.right_name,
+                    )?;
+                    if selection.cancelled {
+                        println!("split cancelled");
+                        return Ok(());
+                    }
+
+                    local
+                        .run_until(client::clusters::split_by_explicit_nodes(
+                            &cfg,
+                            s.cluster.as_deref(),
+                            &selection.left_name,
+                            &selection.right_name,
+                            &selection.left_nodes,
+                            &selection.right_nodes,
+                            s.dry_run,
+                            service_policy,
+                            network_policy,
+                        ))
+                        .await?
+                } else {
+                    let (filter, values) = if !s.filter_per_gpu.is_empty() {
+                        (
+                            client::clusters::SplitFilterKind::GpuVendor,
+                            s.filter_per_gpu.clone(),
+                        )
+                    } else {
+                        let filter = match s.by.ok_or_else(|| anyhow!("--by is required"))? {
+                            SplitFilterOpt::GpuVendor => {
+                                client::clusters::SplitFilterKind::GpuVendor
+                            }
+                            SplitFilterOpt::GpuModel => client::clusters::SplitFilterKind::GpuModel,
+                            SplitFilterOpt::CpuVendor => {
+                                client::clusters::SplitFilterKind::CpuVendor
+                            }
+                            SplitFilterOpt::CpuBrand => client::clusters::SplitFilterKind::CpuBrand,
+                            SplitFilterOpt::GpuCount => client::clusters::SplitFilterKind::GpuCount,
+                            SplitFilterOpt::CpuCores => client::clusters::SplitFilterKind::CpuCores,
+                            SplitFilterOpt::CpuLogical => {
+                                client::clusters::SplitFilterKind::CpuLogical
+                            }
+                            SplitFilterOpt::MemoryTotalKb => {
+                                client::clusters::SplitFilterKind::MemoryTotalKb
+                            }
+                            SplitFilterOpt::MemoryTotalBytes => {
+                                client::clusters::SplitFilterKind::MemoryTotalBytes
+                            }
+                        };
+                        (filter, s.values.clone())
+                    };
+
+                    local
+                        .run_until(client::clusters::split_by_filter(
+                            &cfg,
+                            s.cluster.as_deref(),
+                            filter,
+                            &values,
+                            &s.remainder_name,
+                            s.dry_run,
+                            service_policy,
+                            network_policy,
+                        ))
+                        .await?
+                };
+
+                println!("operation {}", summary.id);
+                println!("kind: {}", summary.kind);
+                println!("stage: {}", summary.stage);
+                if !summary.source_views.is_empty() {
+                    let source_views: Vec<String> = summary
+                        .source_views
+                        .iter()
+                        .map(|view| view.to_string())
+                        .collect();
+                    println!("source views: {}", source_views.join(", "));
+                }
+                if !summary.target_views.is_empty() {
+                    let target_views: Vec<String> = summary
+                        .target_views
+                        .iter()
+                        .map(|view| view.to_string())
+                        .collect();
+                    println!("target views: {}", target_views.join(", "));
+                }
+                println!("details: {}", summary.details);
             }
         },
 
@@ -477,145 +633,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         Command::Leave(_) => {
             local.run_until(client::node::leave(&cfg)).await?;
-        }
-
-        Command::Merge(m) => {
-            let service_policy = match m.services {
-                MergeServicePolicyOpt::Rebalance => client::cluster::MergeServicePolicy::Rebalance,
-                MergeServicePolicyOpt::Preserve => client::cluster::MergeServicePolicy::Preserve,
-            };
-            let summary = local
-                .run_until(client::cluster::merge_by_cluster_id(
-                    &cfg,
-                    &m.source_cluster_id,
-                    &m.destination_cluster_id,
-                    m.dry_run,
-                    service_policy,
-                ))
-                .await?;
-            println!("operation {}", summary.id);
-            println!("kind: {}", summary.kind);
-            println!("stage: {}", summary.stage);
-            if !summary.source_views.is_empty() {
-                let source_views: Vec<String> = summary
-                    .source_views
-                    .iter()
-                    .map(|view| view.to_string())
-                    .collect();
-                println!("source views: {}", source_views.join(", "));
-            }
-            if !summary.target_views.is_empty() {
-                let target_views: Vec<String> = summary
-                    .target_views
-                    .iter()
-                    .map(|view| view.to_string())
-                    .collect();
-                println!("target views: {}", target_views.join(", "));
-            }
-            println!("details: {}", summary.details);
-        }
-
-        Command::Split(s) => {
-            let service_policy = match s.services {
-                SplitServicePolicyOpt::Partitioned => {
-                    client::cluster::SplitServicePolicy::Partitioned
-                }
-                SplitServicePolicyOpt::Preserve => client::cluster::SplitServicePolicy::Preserve,
-            };
-            let network_policy = match s.networks {
-                SplitNetworkPolicyOpt::Isolate => client::cluster::SplitNetworkPolicy::Isolate,
-                SplitNetworkPolicyOpt::Preserve => client::cluster::SplitNetworkPolicy::Preserve,
-            };
-            let summary = if s.interactive {
-                let payload = local
-                    .run_until(client::cluster::list_split_candidates(
-                        &cfg,
-                        s.cluster.as_deref(),
-                    ))
-                    .await?;
-                if payload.candidates.is_empty() {
-                    return Err(anyhow!("no split candidates found in the selected cluster").into());
-                }
-
-                let selection =
-                    ui::split_interactive::run_split_planner(payload, &s.left_name, &s.right_name)?;
-                if selection.cancelled {
-                    println!("split cancelled");
-                    return Ok(());
-                }
-
-                local
-                    .run_until(client::cluster::split_by_explicit_nodes(
-                        &cfg,
-                        s.cluster.as_deref(),
-                        &selection.left_name,
-                        &selection.right_name,
-                        &selection.left_nodes,
-                        &selection.right_nodes,
-                        s.dry_run,
-                        service_policy,
-                        network_policy,
-                    ))
-                    .await?
-            } else {
-                let (filter, values) = if !s.filter_per_gpu.is_empty() {
-                    (
-                        client::cluster::SplitFilterKind::GpuVendor,
-                        s.filter_per_gpu.clone(),
-                    )
-                } else {
-                    let filter = match s.by.ok_or_else(|| anyhow!("--by is required"))? {
-                        SplitFilterOpt::GpuVendor => client::cluster::SplitFilterKind::GpuVendor,
-                        SplitFilterOpt::GpuModel => client::cluster::SplitFilterKind::GpuModel,
-                        SplitFilterOpt::CpuVendor => client::cluster::SplitFilterKind::CpuVendor,
-                        SplitFilterOpt::CpuBrand => client::cluster::SplitFilterKind::CpuBrand,
-                        SplitFilterOpt::GpuCount => client::cluster::SplitFilterKind::GpuCount,
-                        SplitFilterOpt::CpuCores => client::cluster::SplitFilterKind::CpuCores,
-                        SplitFilterOpt::CpuLogical => client::cluster::SplitFilterKind::CpuLogical,
-                        SplitFilterOpt::MemoryTotalKb => {
-                            client::cluster::SplitFilterKind::MemoryTotalKb
-                        }
-                        SplitFilterOpt::MemoryTotalBytes => {
-                            client::cluster::SplitFilterKind::MemoryTotalBytes
-                        }
-                    };
-                    (filter, s.values.clone())
-                };
-
-                local
-                    .run_until(client::cluster::split_by_filter(
-                        &cfg,
-                        s.cluster.as_deref(),
-                        filter,
-                        &values,
-                        &s.remainder_name,
-                        s.dry_run,
-                        service_policy,
-                        network_policy,
-                    ))
-                    .await?
-            };
-
-            println!("operation {}", summary.id);
-            println!("kind: {}", summary.kind);
-            println!("stage: {}", summary.stage);
-            if !summary.source_views.is_empty() {
-                let source_views: Vec<String> = summary
-                    .source_views
-                    .iter()
-                    .map(|view| view.to_string())
-                    .collect();
-                println!("source views: {}", source_views.join(", "));
-            }
-            if !summary.target_views.is_empty() {
-                let target_views: Vec<String> = summary
-                    .target_views
-                    .iter()
-                    .map(|view| view.to_string())
-                    .collect();
-                println!("target views: {}", target_views.join(", "));
-            }
-            println!("details: {}", summary.details);
         }
     }
 

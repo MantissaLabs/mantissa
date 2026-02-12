@@ -1,5 +1,5 @@
 use anyhow::Result;
-use client::cluster::{ClusterViewSpec, SplitCandidate, SplitCandidateList};
+use client::clusters::{ClusterViewSpec, SplitCandidate, SplitCandidateList};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, MouseButton,
