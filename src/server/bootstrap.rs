@@ -1,4 +1,4 @@
-use crate::cluster_view::ClusterViewState;
+use crate::cluster::ClusterViewState;
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::{DEFAULT_FANOUT, Message};
 use crate::network::controller::NetworkController;

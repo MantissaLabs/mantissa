@@ -1,4 +1,4 @@
-use crate::cluster_view::{ClusterViewId, ClusterViewState};
+use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
 use crate::store::secret_store::SecretStore;

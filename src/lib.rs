@@ -6,7 +6,7 @@ pub use protocol::{
 };
 
 pub mod cli;
-pub mod cluster_view;
+pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod gossip;

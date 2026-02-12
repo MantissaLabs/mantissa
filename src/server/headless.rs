@@ -4,7 +4,7 @@ use std::{io, net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
-    cluster_view::ClusterViewId,
+    cluster::ClusterViewId,
     gossip::DEFAULT_FANOUT,
     node,
     server::{

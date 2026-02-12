@@ -1,4 +1,4 @@
-use crate::cluster_view::{ClusterViewId, ClusterViewState};
+use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::config;
 use crate::gossip::{GossipContext, Message};
 use crate::node::Node;

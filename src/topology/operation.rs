@@ -1,4 +1,4 @@
-use crate::cluster_view::ClusterViewId;
+use crate::cluster::ClusterViewId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

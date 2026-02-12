@@ -1,5 +1,8 @@
 use super::{Topology, types::TopologyEvent};
-use crate::cluster_view::{ClusterId, ClusterViewId};
+use crate::cluster::coordinator::ClusterTransitionCoordinator;
+use crate::cluster::participant::{ClusterParticipantReport, ClusterTransitionParticipant};
+use crate::cluster::transition::ClusterTransition;
+use crate::cluster::{ClusterId, ClusterViewId};
 use crate::config;
 use crate::node::address::extract_port;
 use crate::node::id::{read_node_id, set_node_id};
@@ -17,6 +20,7 @@ use crate::topology::operation::{
     SplitNetworkPolicy, SplitNodeAssignment, SplitServicePolicy,
 };
 use crate::topology::peers::{PeerValue, WireGuardPeerValue};
+use async_trait::async_trait;
 use capnp::Error;
 use capnp::data;
 use crdt_store::uuid_key::UuidKey;
@@ -100,6 +104,205 @@ struct SplitNodeCandidate {
     gpu_vendor: Option<String>,
     gpu_count: Option<u64>,
     gpu_models: Vec<String>,
+}
+
+struct PeerScopeParticipant {
+    topology: Topology,
+}
+
+#[async_trait(?Send)]
+impl ClusterTransitionParticipant for PeerScopeParticipant {
+    /// Returns the participant identifier used by transition diagnostics.
+    fn name(&self) -> &'static str {
+        "peer_scope"
+    }
+
+    /// Applies split/merge peer-scope side effects so control-plane sessions match the local view.
+    async fn on_commit(
+        &self,
+        transition: &ClusterTransition,
+    ) -> Result<ClusterParticipantReport, capnp::Error> {
+        let mut report = ClusterParticipantReport::new(self.name());
+        if transition.is_split() {
+            let local_target_index = transition.local_split_target_index.ok_or_else(|| {
+                capnp::Error::failed(format!(
+                    "split transition {} missing local target index",
+                    transition.operation_id
+                ))
+            })?;
+
+            if !transition
+                .retained_node_ids
+                .contains(&self.topology.node.id)
+            {
+                return Err(capnp::Error::failed(format!(
+                    "split operation {} local target {} does not retain local node {}",
+                    transition.operation_id, local_target_index, self.topology.node.id
+                )));
+            }
+
+            let mut evicted = transition
+                .evicted_node_ids
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            evicted.sort_unstable();
+
+            let mut removed_sessions = 0usize;
+            let mut removed_credentials = 0usize;
+            for peer_id in evicted.iter().copied() {
+                match self.topology.local_sessions.remove(peer_id) {
+                    Ok(()) => removed_sessions = removed_sessions.saturating_add(1),
+                    Err(err) => {
+                        warn!(
+                            target: "cluster_view",
+                            operation_id = %transition.operation_id,
+                            peer_id = %peer_id,
+                            "failed to remove local session ticket during split prune: {err}"
+                        );
+                    }
+                }
+
+                match self.topology.local_credential_store.remove(peer_id) {
+                    Ok(()) => removed_credentials = removed_credentials.saturating_add(1),
+                    Err(err) => {
+                        warn!(
+                            target: "cluster_view",
+                            operation_id = %transition.operation_id,
+                            peer_id = %peer_id,
+                            "failed to remove local credential during split prune: {err}"
+                        );
+                    }
+                }
+
+                self.topology.registry.remove_peer(peer_id).await;
+            }
+
+            self.topology
+                .set_excluded_peers(transition.evicted_node_ids.clone())
+                .await;
+            self.topology
+                .registry
+                .set_excluded_peers(transition.evicted_node_ids.clone());
+
+            report = report
+                .add_detail("local_target_index", local_target_index.to_string())
+                .add_detail(
+                    "retained_count",
+                    transition.retained_node_ids.len().to_string(),
+                )
+                .add_detail(
+                    "evicted_count",
+                    transition.evicted_node_ids.len().to_string(),
+                )
+                .add_detail("removed_sessions", removed_sessions.to_string())
+                .add_detail("removed_credentials", removed_credentials.to_string());
+            return Ok(report);
+        }
+
+        if transition.is_merge() {
+            self.topology.set_excluded_peers(HashSet::new()).await;
+            self.topology.registry.set_excluded_peers(HashSet::new());
+            report = report.add_detail("excluded_peers_reset", "true");
+        }
+
+        Ok(report)
+    }
+}
+
+struct SplitTaskRuntimeParticipant {
+    topology: Topology,
+}
+
+#[async_trait(?Send)]
+impl ClusterTransitionParticipant for SplitTaskRuntimeParticipant {
+    /// Returns the participant identifier used by transition diagnostics.
+    fn name(&self) -> &'static str {
+        "split_task_runtime"
+    }
+
+    /// Prunes out-of-scope task runtime rows when split policy requests service partitioning.
+    async fn on_commit(
+        &self,
+        transition: &ClusterTransition,
+    ) -> Result<ClusterParticipantReport, capnp::Error> {
+        let mut report = ClusterParticipantReport::new(self.name());
+        if transition.is_split()
+            && transition.split_service_policy == SplitServicePolicy::Partitioned
+        {
+            let removed = self
+                .topology
+                .prune_split_task_runtime_state(&transition.evicted_node_ids)
+                .await?;
+            report = report.add_detail("removed_tasks", removed.to_string());
+        }
+        Ok(report)
+    }
+}
+
+struct SplitNetworkRuntimeParticipant {
+    topology: Topology,
+}
+
+#[async_trait(?Send)]
+impl ClusterTransitionParticipant for SplitNetworkRuntimeParticipant {
+    /// Returns the participant identifier used by transition diagnostics.
+    fn name(&self) -> &'static str {
+        "split_network_runtime"
+    }
+
+    /// Prunes out-of-scope network runtime rows when split policy requests network isolation.
+    async fn on_commit(
+        &self,
+        transition: &ClusterTransition,
+    ) -> Result<ClusterParticipantReport, capnp::Error> {
+        let mut report = ClusterParticipantReport::new(self.name());
+        if transition.is_split() && transition.split_network_policy == SplitNetworkPolicy::Isolate {
+            let (removed_peer_states, removed_attachments) = self
+                .topology
+                .prune_split_network_runtime_state(&transition.evicted_node_ids)
+                .await?;
+            report = report
+                .add_detail(
+                    "removed_network_peer_states",
+                    removed_peer_states.to_string(),
+                )
+                .add_detail(
+                    "removed_network_attachments",
+                    removed_attachments.to_string(),
+                );
+        }
+        Ok(report)
+    }
+}
+
+struct MergeServiceParticipant {
+    topology: Topology,
+}
+
+#[async_trait(?Send)]
+impl ClusterTransitionParticipant for MergeServiceParticipant {
+    /// Returns the participant identifier used by transition diagnostics.
+    fn name(&self) -> &'static str {
+        "merge_services"
+    }
+
+    /// Nudges running services after merge so replicas can rebalance across the unified view.
+    async fn on_commit(
+        &self,
+        transition: &ClusterTransition,
+    ) -> Result<ClusterParticipantReport, capnp::Error> {
+        let mut report = ClusterParticipantReport::new(self.name());
+        if transition.is_merge() && transition.merge_service_policy == MergeServicePolicy::Rebalance
+        {
+            let nudged = self
+                .topology
+                .nudge_running_services_for_merge_rebalance()
+                .await?;
+            report = report.add_detail("nudged_services", nudged.to_string());
+        }
+        Ok(report)
+    }
 }
 
 impl Topology {
@@ -807,6 +1010,45 @@ impl Topology {
         .ok_or_else(|| capnp::Error::failed("operation has no target views for commit".to_string()))
     }
 
+    /// Builds a canonical local transition snapshot from one durable operation record.
+    fn transition_for_operation(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<ClusterTransition, capnp::Error> {
+        let (actives, _) = self
+            .peers
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let known_peers = actives
+            .into_iter()
+            .map(|(key, _)| key.to_uuid())
+            .filter(|peer_id| *peer_id != self.node.id)
+            .collect::<HashSet<_>>();
+        ClusterTransition::from_operation(operation, self.node.id, &known_peers)
+    }
+
+    /// Runs all registered transition participants for commit-time side effects.
+    async fn run_transition_commit_hooks(
+        &self,
+        transition: &ClusterTransition,
+    ) -> Result<Vec<ClusterParticipantReport>, capnp::Error> {
+        let coordinator = ClusterTransitionCoordinator::new(vec![
+            Box::new(PeerScopeParticipant {
+                topology: self.clone(),
+            }),
+            Box::new(SplitTaskRuntimeParticipant {
+                topology: self.clone(),
+            }),
+            Box::new(SplitNetworkRuntimeParticipant {
+                topology: self.clone(),
+            }),
+            Box::new(MergeServiceParticipant {
+                topology: self.clone(),
+            }),
+        ]);
+        coordinator.on_commit(transition).await
+    }
+
     /// Converts the merge request policy from the Cap'n Proto enum into local durable policy state.
     fn merge_service_policy_from_capnp(
         policy: protocol::topology::MergeServicePolicy,
@@ -943,110 +1185,6 @@ impl Topology {
         }
 
         Ok(updated)
-    }
-
-    /// Clears session/capability state and excludes peers that no longer belong to the local split target.
-    async fn prune_split_state_for_local_target(
-        &self,
-        operation: &ClusterOperationRecord,
-    ) -> Result<(), capnp::Error> {
-        let local_target_index = self.local_split_target_index(operation)?;
-        let retained_ids = operation
-            .split_assignments
-            .iter()
-            .filter(|assignment| assignment.target_index == local_target_index)
-            .map(|assignment| assignment.node_id)
-            .collect::<HashSet<_>>();
-
-        if !retained_ids.contains(&self.node.id) {
-            return Err(capnp::Error::failed(format!(
-                "split operation {} local target {} does not retain local node {}",
-                operation.id, local_target_index, self.node.id
-            )));
-        }
-
-        let (actives, _) = self
-            .peers
-            .load_all()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let mut evicted_ids = actives
-            .into_iter()
-            .map(|(key, _)| key.to_uuid())
-            .filter(|peer_id| !retained_ids.contains(peer_id))
-            .collect::<HashSet<_>>();
-        for assignment in operation.split_assignments.iter() {
-            if assignment.target_index != local_target_index {
-                evicted_ids.insert(assignment.node_id);
-            }
-        }
-        evicted_ids.remove(&self.node.id);
-
-        let mut evicted = evicted_ids.into_iter().collect::<Vec<_>>();
-        evicted.sort_unstable();
-        let excluded = evicted.iter().copied().collect::<HashSet<_>>();
-
-        let mut removed_sessions = 0usize;
-        let mut removed_credentials = 0usize;
-        for peer_id in evicted.iter().copied() {
-            match self.local_sessions.remove(peer_id) {
-                Ok(()) => removed_sessions = removed_sessions.saturating_add(1),
-                Err(err) => {
-                    warn!(
-                        target: "cluster_view",
-                        operation_id = %operation.id,
-                        peer_id = %peer_id,
-                        "failed to remove local session ticket during split prune: {err}"
-                    );
-                }
-            }
-
-            match self.local_credential_store.remove(peer_id) {
-                Ok(()) => removed_credentials = removed_credentials.saturating_add(1),
-                Err(err) => {
-                    warn!(
-                        target: "cluster_view",
-                        operation_id = %operation.id,
-                        peer_id = %peer_id,
-                        "failed to remove local credential during split prune: {err}"
-                    );
-                }
-            }
-
-            self.registry.remove_peer(peer_id).await;
-        }
-        self.set_excluded_peers(excluded.clone()).await;
-        self.registry.set_excluded_peers(excluded.clone());
-
-        let mut removed_tasks = 0usize;
-        let mut removed_network_peer_states = 0usize;
-        let mut removed_network_attachments = 0usize;
-        if operation.split_service_policy == SplitServicePolicy::Partitioned {
-            removed_tasks = self.prune_split_task_runtime_state(&excluded).await?;
-        }
-        if operation.split_network_policy == SplitNetworkPolicy::Isolate {
-            let (peers_removed, attachments_removed) =
-                self.prune_split_network_runtime_state(&excluded).await?;
-            removed_network_peer_states = peers_removed;
-            removed_network_attachments = attachments_removed;
-        }
-
-        info!(
-            target: "cluster_view",
-            operation_id = %operation.id,
-            local_target_index,
-            split_service_policy = ?operation.split_service_policy,
-            split_network_policy = ?operation.split_network_policy,
-            retained_count = retained_ids.len(),
-            evicted_count = evicted.len(),
-            removed_sessions,
-            removed_credentials,
-            removed_tasks,
-            removed_network_peer_states,
-            removed_network_attachments,
-            "completed split prune for local target"
-        );
-
-        Ok(())
     }
 
     /// Reads the cluster view currently bound to a session for operation relay validation.
@@ -1263,33 +1401,25 @@ impl Topology {
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
-        let target_view = self.local_target_view_for_operation(operation)?;
-        match operation.kind {
-            ClusterOperationKind::Split => {
-                self.prune_split_state_for_local_target(operation).await?;
-            }
-            ClusterOperationKind::Merge => {
-                self.set_excluded_peers(HashSet::new()).await;
-                self.registry.set_excluded_peers(HashSet::new());
-                if operation.merge_service_policy == MergeServicePolicy::Rebalance {
-                    let nudged = self.nudge_running_services_for_merge_rebalance().await?;
-                    info!(
-                        target: "cluster_view",
-                        operation_id = %operation.id,
-                        nudged_services = nudged,
-                        "nudged running services for post-merge rebalancing"
-                    );
-                }
-            }
+        let transition = self.transition_for_operation(operation)?;
+        let reports = self.run_transition_commit_hooks(&transition).await?;
+        for report in reports {
+            info!(
+                target: "cluster_view",
+                operation_id = %transition.operation_id,
+                participant = report.name,
+                details = %report.render(),
+                "applied cluster transition participant"
+            );
         }
 
-        let previous = self.set_active_cluster_view(target_view);
+        let previous = self.set_active_cluster_view(transition.local_target_view);
         self.registry.clear().await;
         info!(
             target: "cluster_view",
-            operation_id = %operation.id,
+            operation_id = %transition.operation_id,
             previous_view = %previous,
-            target_view = %target_view,
+            target_view = %transition.local_target_view,
             "applied operation commit side effects"
         );
 

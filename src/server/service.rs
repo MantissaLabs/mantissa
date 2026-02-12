@@ -1,5 +1,5 @@
 use super::Server;
-use crate::cluster_view::ClusterViewId;
+use crate::cluster::ClusterViewId;
 use crate::crypto::rand;
 use crate::node::id;
 use crate::node::identity::{pubkey_from_slice, verify_peer_identity};

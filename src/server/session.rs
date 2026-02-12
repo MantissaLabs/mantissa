@@ -1,4 +1,4 @@
-use crate::cluster_view::ClusterViewId;
+use crate::cluster::ClusterViewId;
 use protocol::{
     gossip::gossip, health::health, network::networks, node::node, scheduling::scheduler,
     secrets::secrets, server::cluster_session, services::services, sync::sync, task::task,

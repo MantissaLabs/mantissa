@@ -5,7 +5,7 @@
 //! other nodes in the cluster based on events and updates to be applied.
 //!
 
-use crate::cluster_view::{ClusterViewId, ClusterViewState};
+use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::network::service::{read_network_event, write_network_event};
 use crate::network::types::NetworkEvent;
 use crate::secrets::service::{read_secret_event, write_secret_event};

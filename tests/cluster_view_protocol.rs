@@ -2,7 +2,7 @@
 mod common;
 
 use common::testkit::TestNode;
-use mantissa::cluster_view::ClusterViewId;
+use mantissa::cluster::ClusterViewId;
 use mantissa::node::id::set_node_id;
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 use mantissa::store::cluster_operation_store::ClusterOperationStore;
@@ -648,7 +648,7 @@ local_test!(cluster_view_split_selectors_choose_assigned_target, {
     wait_for_cluster_view(
         &anchor.topology(),
         ClusterViewId::new(
-            mantissa::cluster_view::ClusterId::from_uuid(
+            mantissa::cluster::ClusterId::from_uuid(
                 Uuid::from_slice(&expected_anchor_cluster_id).expect("anchor cluster uuid"),
             ),
             expected_anchor_epoch,
@@ -786,7 +786,7 @@ local_test!(cluster_view_split_resource_selector_assigns_peers, {
     let anchor_target = target_views.get(0);
     let joiner_target = target_views.get(1);
     let expected_anchor_view = ClusterViewId::new(
-        mantissa::cluster_view::ClusterId::from_uuid(
+        mantissa::cluster::ClusterId::from_uuid(
             Uuid::from_slice(
                 anchor_target
                     .get_cluster_id()
@@ -799,7 +799,7 @@ local_test!(cluster_view_split_resource_selector_assigns_peers, {
         anchor_target.get_epoch(),
     );
     let expected_joiner_view = ClusterViewId::new(
-        mantissa::cluster_view::ClusterId::from_uuid(
+        mantissa::cluster::ClusterId::from_uuid(
             Uuid::from_slice(
                 joiner_target
                     .get_cluster_id()

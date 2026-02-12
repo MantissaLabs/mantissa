@@ -1,4 +1,4 @@
-use crate::cluster_view::ClusterViewId;
+use crate::cluster::ClusterViewId;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::topology::peers::{PeerValue, WireGuardPeerValue};

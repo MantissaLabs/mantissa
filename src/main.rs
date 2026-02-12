@@ -5,7 +5,7 @@ extern crate log;
 extern crate sysinfo;
 
 mod cli;
-mod cluster_view;
+mod cluster;
 mod config;
 mod crypto;
 mod gossip;

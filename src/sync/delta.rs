@@ -1,4 +1,4 @@
-use crate::cluster_view::ClusterViewId;
+use crate::cluster::ClusterViewId;
 use crate::network::types::{NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue};
 use crate::secrets::types::SecretValue;
 use crate::services::types::ServiceSpecValue;
