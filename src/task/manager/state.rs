@@ -326,7 +326,10 @@ impl TaskManager {
 
         self.cleanup_secret_artifacts(id).await;
 
-        if let Err(err) = self.teardown_runtime_attachments(id, HashSet::new()).await {
+        if let Err(err) = self
+            .teardown_runtime_attachments(id, HashSet::new(), false)
+            .await
+        {
             warn!(
                 target: "task",
                 "failed to teardown network attachments for task {}: {err}",
@@ -388,7 +391,7 @@ impl TaskManager {
         self.cleanup_secret_artifacts(task_id).await;
 
         if let Err(err) = self
-            .teardown_runtime_attachments(task_id, HashSet::new())
+            .teardown_runtime_attachments(task_id, HashSet::new(), false)
             .await
         {
             warn!(
@@ -832,7 +835,7 @@ impl TaskManager {
                 working.name
             ));
             if let Err(teardown_err) = self
-                .teardown_runtime_attachments(working.id, HashSet::new())
+                .teardown_runtime_attachments(working.id, HashSet::new(), false)
                 .await
             {
                 warn!(
@@ -1017,7 +1020,7 @@ impl TaskManager {
         if !has_container {
             self.cleanup_secret_artifacts(spec.id).await;
             if let Err(err) = self
-                .teardown_runtime_attachments(spec.id, HashSet::new())
+                .teardown_runtime_attachments(spec.id, HashSet::new(), false)
                 .await
             {
                 warn!(
@@ -1256,7 +1259,7 @@ impl TaskManager {
         self.cleanup_secret_artifacts(task_id).await;
         if remove_attachments {
             if let Err(err) = self
-                .teardown_runtime_attachments(task_id, HashSet::new())
+                .teardown_runtime_attachments(task_id, HashSet::new(), true)
                 .await
             {
                 warn!(

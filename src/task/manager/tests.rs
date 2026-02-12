@@ -6,8 +6,8 @@ use crate::network::attachment::{AttachmentProvisionerApi, AttachmentProvisionin
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    NetworkAttachmentState, NetworkDriver, NetworkPeerState, NetworkPeerStateValue,
-    NetworkSpecDraft, NetworkSpecValue,
+    NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver,
+    NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
 };
 use crate::registry::Registry;
 use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
@@ -1126,6 +1126,54 @@ async fn stop_task_cleans_up_after_teardown_failure() {
     assert!(
         attachments_after.is_empty(),
         "expected attachments to be purged after teardown failure"
+    );
+}
+
+#[tokio::test]
+async fn remove_event_purges_remote_attachment_without_local_spec() {
+    let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let network_id = Uuid::new_v4();
+    let attachment = NetworkAttachmentValue::new(NetworkAttachmentDraft {
+        id: crate::network::types::compute_network_attachment_id(task_id, network_id),
+        task_id,
+        node_id: Uuid::new_v4(),
+        container_id: format!("mantissa-{task_id}"),
+        network_id,
+        task_updated_at: Some(Utc::now().to_rfc3339()),
+        requested_ip: Some("10.77.0.2".to_string()),
+        assigned_ip: Some("10.77.0.2".to_string()),
+        mac: Some("02:11:22:33:44:55".to_string()),
+        state: NetworkAttachmentState::Ready,
+        error: None,
+        service_name: Some("svc".to_string()),
+        template_name: Some("backend".to_string()),
+    });
+
+    network_registry
+        .upsert_attachment(attachment)
+        .await
+        .expect("insert remote-owned attachment");
+    assert_eq!(
+        network_registry
+            .list_attachments_for_task(task_id)
+            .expect("list attachment before remove")
+            .len(),
+        1
+    );
+
+    manager
+        .teardown_runtime_attachments(task_id, HashSet::new(), true)
+        .await
+        .expect("force teardown for removed task");
+
+    assert!(
+        network_registry
+            .list_attachments_for_task(task_id)
+            .expect("list attachment after remove")
+            .is_empty(),
+        "remove event should purge stale replicated attachment rows even without a local spec"
     );
 }
 

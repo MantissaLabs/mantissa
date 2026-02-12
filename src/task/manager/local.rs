@@ -373,7 +373,7 @@ impl TaskManager {
                     );
                 }
                 let _ = self
-                    .teardown_runtime_attachments(plan.id, HashSet::new())
+                    .teardown_runtime_attachments(plan.id, HashSet::new(), false)
                     .await;
                 return Err(err);
             }

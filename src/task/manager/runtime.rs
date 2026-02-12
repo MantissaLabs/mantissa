@@ -323,7 +323,10 @@ impl TaskManager {
             }
             TaskEvent::Remove { id } => {
                 self.local_containers.lock().await.remove(&id);
-                if let Err(err) = self.teardown_runtime_attachments(id, HashSet::new()).await {
+                if let Err(err) = self
+                    .teardown_runtime_attachments(id, HashSet::new(), true)
+                    .await
+                {
                     warn!(
                         target: "task",
                         "failed to cleanup runtime attachments for removed task {id}: {err}"
@@ -621,7 +624,8 @@ impl TaskManager {
             return Ok(());
         }
 
-        self.teardown_runtime_attachments(task_id, desired).await
+        self.teardown_runtime_attachments(task_id, desired, false)
+            .await
     }
 
     pub(super) async fn cleanup_orphaned_local_attachments(&self) -> Result<()> {
@@ -639,7 +643,6 @@ impl TaskManager {
                 .with_context(|| format!("lookup task {}", attachment.task_id))?
                 .and_then(|snap| select_best_task_value(snap.as_slice()));
             let task_state = task_value.as_ref().map(|value| value.state.clone());
-            let task_owner = task_value.as_ref().map(|value| value.node_id);
             let task_revision = task_value.as_ref().and_then(task_revision_timestamp);
 
             let should_remove = match task_state {
@@ -676,18 +679,6 @@ impl TaskManager {
                 continue;
             }
 
-            if attachment.node_id != self.local_node_id {
-                continue;
-            }
-
-            if matches!(task_owner, Some(owner) if owner != self.local_node_id) {
-                let _ = self
-                    .attachment_provisioner
-                    .teardown_attachment(attachment.id)
-                    .await;
-                continue;
-            }
-
             let mut removing = attachment.clone();
             if let Some(revision) = task_revision.as_deref() {
                 if removing.task_updated_at.as_deref() != Some(revision) {
@@ -695,19 +686,28 @@ impl TaskManager {
                 }
             }
             removing.set_state(NetworkAttachmentState::Removing, None);
-            let _ = self.network_registry.upsert_attachment(removing).await;
-
-            if let Err(err) = self
-                .attachment_provisioner
-                .teardown_attachment(attachment.id)
-                .await
-            {
+            if let Err(err) = self.network_registry.upsert_attachment(removing).await {
                 warn!(
                     target: "task",
                     attachment = %attachment.id,
-                    error = %err,
-                    "failed to teardown orphaned attachment interface"
+                    "failed to mark orphaned attachment removing: {err}"
                 );
+                continue;
+            }
+
+            if attachment.node_id == self.local_node_id {
+                if let Err(err) = self
+                    .attachment_provisioner
+                    .teardown_attachment(attachment.id)
+                    .await
+                {
+                    warn!(
+                        target: "task",
+                        attachment = %attachment.id,
+                        error = %err,
+                        "failed to teardown orphaned attachment interface"
+                    );
+                }
             }
         }
 
@@ -719,11 +719,13 @@ impl TaskManager {
         &self,
         task_id: Uuid,
         keep: HashSet<Uuid>,
+        force_registry_updates: bool,
     ) -> Result<()> {
-        let allow_registry_updates = match self.load_spec(task_id).await {
-            Ok(spec) if spec.node_id == self.local_node_id => true,
-            _ => false,
-        };
+        let allow_registry_updates = force_registry_updates
+            || matches!(
+                self.load_spec(task_id).await,
+                Ok(spec) if spec.node_id == self.local_node_id
+            );
         let attachments = self
             .network_registry
             .list_attachments_for_task(task_id)
