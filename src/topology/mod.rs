@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
@@ -1048,7 +1048,7 @@ impl Topology {
             return;
         }
 
-        debug!(
+        trace!(
             target: "sync",
             cluster_view = %cluster_view,
             peer_count = in_scope_peer_count,

@@ -9,7 +9,7 @@ use crdt_store::mst_store::{Registers, Tombstones};
 use crdt_store::uuid_key::UuidKey;
 use protocol::sync::{Domain, delta_sink, sync};
 use std::rc::Rc;
-use tracing::debug;
+use tracing::{debug, trace};
 
 pub mod delta;
 pub mod ranges;
@@ -110,7 +110,7 @@ impl sync::Server for SyncService {
         let requested_view =
             ClusterViewId::from_capnp(req.get_view()?).map_err(capnp::Error::failed)?;
         let active_view = self.require_active_view(requested_view)?;
-        debug!(
+        trace!(
             target: "sync",
             requested_view = %requested_view,
             active_view = %active_view,
@@ -165,7 +165,7 @@ impl sync::Server for SyncService {
         let requested_view =
             ClusterViewId::from_capnp(req.get_view()?).map_err(capnp::Error::failed)?;
         let active_view = self.require_active_view(requested_view)?;
-        debug!(
+        trace!(
             target: "sync",
             requested_view = %requested_view,
             active_view = %active_view,
