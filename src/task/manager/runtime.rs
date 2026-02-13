@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use crdt_store::uuid_key::UuidKey;
-use tokio::time::{Duration, interval};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -19,6 +20,7 @@ use crate::network::types::{
 };
 use crate::network::wireguard;
 use crate::task::container::ContainerState;
+use crate::task::docker::ContainerRuntimeEvent;
 use crate::task::types::{TaskEvent, TaskServiceMetadata};
 
 use super::TaskManager;
@@ -287,6 +289,17 @@ impl TaskManager {
     pub async fn run(&mut self) {
         let mut repair_tick = interval(Duration::from_secs(5));
         let mut reconcile_tick = interval(Duration::from_secs(5));
+        let mut runtime_event_tick = interval(Duration::from_millis(500));
+        runtime_event_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut runtime_reconcile_pending = false;
+        let (runtime_events_tx, mut runtime_events_rx) = unbounded_channel();
+        let mut runtime_events_enabled = self.container_manager.supports_runtime_events();
+        if runtime_events_enabled {
+            let manager = self.clone();
+            tokio::task::spawn_local(async move {
+                manager.watch_runtime_event_stream(runtime_events_tx).await;
+            });
+        }
 
         if let Err(err) = self.reconcile_local_container_inventory().await {
             warn!(
@@ -307,6 +320,22 @@ impl TaskManager {
                         warn!(target: "task", "failed to reconcile local tasks: {err:#}");
                     }
                 }
+                event = runtime_events_rx.recv(), if runtime_events_enabled => {
+                    match event {
+                        Some(ContainerRuntimeEvent::ContainerStateChanged) => {
+                            runtime_reconcile_pending = true;
+                        }
+                        None => {
+                            runtime_events_enabled = false;
+                        }
+                    }
+                }
+                _ = runtime_event_tick.tick(), if runtime_reconcile_pending => {
+                    runtime_reconcile_pending = false;
+                    if let Err(err) = self.reconcile_local_tasks().await {
+                        warn!(target: "task", "failed to reconcile local tasks from runtime events: {err:#}");
+                    }
+                }
                 message = self.rx.recv() => {
                     let Ok(message) = message else { break; };
                     match message {
@@ -322,6 +351,34 @@ impl TaskManager {
                         _ => {}
                     }
                 }
+            }
+        }
+    }
+
+    /// Watches runtime lifecycle events and reconnects the stream when it drops.
+    async fn watch_runtime_event_stream(&self, events_tx: UnboundedSender<ContainerRuntimeEvent>) {
+        loop {
+            let result = self
+                .container_manager
+                .watch_runtime_events(events_tx.clone())
+                .await;
+            if events_tx.is_closed() {
+                return;
+            }
+            if let Err(err) = result {
+                warn!(
+                    target: "task",
+                    "container runtime event stream failed; retrying: {err}"
+                );
+            } else {
+                warn!(
+                    target: "task",
+                    "container runtime event stream ended; reconnecting"
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if events_tx.is_closed() {
+                return;
             }
         }
     }

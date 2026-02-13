@@ -15,7 +15,8 @@ use crate::scheduler::{
 };
 use crate::task::container::ContainerState;
 use crate::task::docker::{
-    ContainerCreateRequest, ContainerError, ResourceLimits, RestartPolicyConfig, RestartPolicyType,
+    ContainerCreateRequest, ContainerError, ContainerInfo, ResourceLimits, RestartPolicyConfig,
+    RestartPolicyType,
 };
 use crate::task::types::{
     TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskValue, TaskValueDraft,
@@ -25,6 +26,12 @@ use super::{
     TaskManager, container_already_running, is_name_conflict, select_best_task_value,
     value_to_spec, wrap_create_error, wrap_existing_inspect_error, wrap_start_error,
 };
+
+/// Snapshot of containers currently known by the local runtime.
+struct RuntimeInventory {
+    task_containers: HashMap<Uuid, String>,
+    container_ids: HashSet<String>,
+}
 
 impl TaskManager {
     /// Persists a task snapshot in the backing store.
@@ -527,23 +534,31 @@ impl TaskManager {
                 .unwrap_or_else(|| desired_name.clone())
         };
 
-        let resolve_id =
-            |fallback: String, info: bollard::service::ContainerInspectResponse| -> String {
-                info.id
-                    .map(|value| value.trim_start_matches('/').to_string())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(fallback)
-            };
+        let resolve_id = |fallback: String,
+                          info: bollard::service::ContainerInspectResponse|
+         -> Option<String> {
+            let state = info.state.as_ref();
+            let running = state.and_then(|value| value.running).unwrap_or(true);
+            let pid = state.and_then(|value| value.pid).unwrap_or(1);
+            if !running || pid == 0 {
+                return None;
+            }
+            info.id
+                .map(|value| value.trim_start_matches('/').to_string())
+                .filter(|value| !value.is_empty())
+                .map(Some)
+                .unwrap_or_else(|| Some(fallback))
+        };
 
         match self.container_manager.inspect_container(&candidate).await {
-            Ok(info) => Ok(Some(resolve_id(candidate, info))),
+            Ok(info) => Ok(resolve_id(candidate, info)),
             Err(ContainerError::NotFound(_)) if candidate != desired_name => {
                 match self
                     .container_manager
                     .inspect_container(&desired_name)
                     .await
                 {
-                    Ok(info) => Ok(Some(resolve_id(desired_name, info))),
+                    Ok(info) => Ok(resolve_id(desired_name, info)),
                     Err(ContainerError::NotFound(_)) => Ok(None),
                     Err(err) => Err(err),
                 }
@@ -1286,6 +1301,17 @@ impl TaskManager {
 
     /// Periodically reconciles all locally owned tasks so missed gossip updates still apply.
     pub(super) async fn reconcile_local_tasks(&self) -> Result<(), anyhow::Error> {
+        let runtime_inventory = match self.list_runtime_inventory().await {
+            Ok(inventory) => Some(inventory),
+            Err(err) => {
+                warn!(
+                    target: "task",
+                    "failed to list runtime inventory for reconcile fallback: {err:#}"
+                );
+                None
+            }
+        };
+
         let (actives, _) = self
             .store
             .load_all()
@@ -1300,6 +1326,13 @@ impl TaskManager {
             }
 
             let spec = value_to_spec(key.to_uuid(), value);
+            if matches!(spec.state, ContainerState::Running)
+                && self
+                    .refresh_running_task_from_runtime_inventory(&spec, runtime_inventory.as_ref())
+                    .await
+            {
+                continue;
+            }
             let manager = self.clone();
             let spec_for_reconcile = spec.clone();
             tokio::task::spawn_local(async move {
@@ -1331,6 +1364,91 @@ impl TaskManager {
         }
 
         Ok(())
+    }
+
+    /// Lists runtime containers once so reconcile can avoid per-task inspect calls.
+    async fn list_runtime_inventory(&self) -> Result<RuntimeInventory, anyhow::Error> {
+        let containers = self
+            .container_manager
+            .list_containers(None)
+            .await
+            .map_err(anyhow::Error::from)
+            .context("list runtime containers for reconcile")?;
+
+        let mut task_containers = HashMap::new();
+        let mut container_ids = HashSet::new();
+
+        for container in containers {
+            if !Self::container_is_running(&container) {
+                continue;
+            }
+            let container_id = Self::container_identity(&container);
+            if container_id.is_empty() {
+                continue;
+            }
+            container_ids.insert(container_id.clone());
+
+            let Some(task_id) = container
+                .name
+                .strip_prefix("mantissa-")
+                .and_then(|suffix| Uuid::parse_str(suffix).ok())
+            else {
+                continue;
+            };
+            task_containers.insert(task_id, container_id);
+        }
+
+        Ok(RuntimeInventory {
+            task_containers,
+            container_ids,
+        })
+    }
+
+    /// Refreshes a running task's local runtime cache from the latest inventory snapshot.
+    async fn refresh_running_task_from_runtime_inventory(
+        &self,
+        spec: &TaskSpec,
+        runtime_inventory: Option<&RuntimeInventory>,
+    ) -> bool {
+        let Some(runtime_inventory) = runtime_inventory else {
+            return false;
+        };
+
+        if let Some(container_id) = runtime_inventory.task_containers.get(&spec.id).cloned() {
+            let mut guard = self.local_containers.lock().await;
+            guard.insert(spec.id, container_id);
+            return true;
+        }
+
+        let cached = {
+            let guard = self.local_containers.lock().await;
+            guard.get(&spec.id).cloned()
+        };
+        if let Some(container_id) = cached {
+            if runtime_inventory.container_ids.contains(&container_id) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Resolves the best local identity string for one runtime container row.
+    fn container_identity(container: &ContainerInfo) -> String {
+        if !container.id.is_empty() {
+            return container.id.clone();
+        }
+        container.name.clone()
+    }
+
+    /// Reports whether one runtime listing row represents a running container.
+    fn container_is_running(container: &ContainerInfo) -> bool {
+        if container.state.eq_ignore_ascii_case("running") {
+            return true;
+        }
+        container.status.starts_with("Up ")
+            || container.status.eq_ignore_ascii_case("up")
+            || container.status.eq_ignore_ascii_case("running")
     }
 
     /// Ensures the scheduler snapshot reserves slots and GPUs for locally running tasks so

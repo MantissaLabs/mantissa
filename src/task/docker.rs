@@ -13,15 +13,20 @@ use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
     RemoveContainerOptions, RestartContainerOptions, StartContainerOptions, StopContainerOptions,
 };
-use bollard::models::{DeviceRequest, HostConfig, RestartPolicy, RestartPolicyNameEnum};
+use bollard::models::{
+    DeviceRequest, EventMessageTypeEnum, HostConfig, RestartPolicy, RestartPolicyNameEnum,
+};
 use bollard::service::ContainerInspectResponse;
+use bollard::system::EventsOptions;
 
 use crate::config;
 use async_trait::async_trait;
-use log::{debug, info, warn};
+use futures::StreamExt;
+use log::{debug, info, trace, warn};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// Errors that can occur during container operations
 #[derive(Error, Debug)]
@@ -106,6 +111,19 @@ pub trait ContainerManager {
 
     // Pull an image
     async fn pull_image(&self, image: &str) -> ContainerResult<()>;
+
+    /// Indicates whether the runtime supports lifecycle event streaming.
+    fn supports_runtime_events(&self) -> bool {
+        false
+    }
+
+    /// Streams runtime lifecycle events into the provided queue until the stream ends.
+    async fn watch_runtime_events(
+        &self,
+        _events_tx: UnboundedSender<ContainerRuntimeEvent>,
+    ) -> ContainerResult<()> {
+        Ok(())
+    }
 }
 
 /// Configuration for container restart policy
@@ -187,6 +205,12 @@ pub struct ContainerInfo {
     pub status: String,
     pub state: String,
     pub created: i64,
+}
+
+/// Normalized container runtime events used by task reconciliation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContainerRuntimeEvent {
+    ContainerStateChanged,
 }
 
 /// Docker container manager implementation
@@ -529,7 +553,7 @@ impl ContainerManager for DockerContainerManager {
         &self,
         container_id: &str,
     ) -> ContainerResult<ContainerInspectResponse> {
-        debug!("Inspecting container: {}", container_id);
+        trace!("Inspecting container: {}", container_id);
 
         let options = Some(InspectContainerOptions { size: false });
 
@@ -544,8 +568,6 @@ impl ContainerManager for DockerContainerManager {
 
     async fn pull_image(&self, image: &str) -> ContainerResult<()> {
         debug!("Pulling image: {}", image);
-
-        use futures::StreamExt;
 
         let options = Some(bollard::image::CreateImageOptions {
             from_image: image,
@@ -570,6 +592,58 @@ impl ContainerManager for DockerContainerManager {
         }
 
         info!("Image pulled: {}", image);
+        Ok(())
+    }
+
+    fn supports_runtime_events(&self) -> bool {
+        true
+    }
+
+    async fn watch_runtime_events(
+        &self,
+        events_tx: UnboundedSender<ContainerRuntimeEvent>,
+    ) -> ContainerResult<()> {
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert("type".to_string(), vec!["container".to_string()]);
+        let options = EventsOptions::<String> {
+            since: None,
+            until: None,
+            filters,
+        };
+
+        let mut stream = self.docker.events(Some(options));
+        while let Some(next) = stream.next().await {
+            let event = next.map_err(ContainerError::DockerAPI)?;
+            if event.typ != Some(EventMessageTypeEnum::CONTAINER) {
+                continue;
+            }
+            let Some(action) = event.action.as_deref() else {
+                continue;
+            };
+            if !matches!(
+                action,
+                "start" | "stop" | "die" | "kill" | "destroy" | "rename"
+            ) {
+                continue;
+            }
+
+            let name = event
+                .actor
+                .as_ref()
+                .and_then(|actor| actor.attributes.as_ref())
+                .and_then(|attrs| attrs.get("name"));
+            if name.map(|value| value.starts_with("mantissa-")) != Some(true) {
+                continue;
+            }
+
+            if events_tx
+                .send(ContainerRuntimeEvent::ContainerStateChanged)
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+
         Ok(())
     }
 }

@@ -43,6 +43,8 @@ struct MockContainerManager {
     stopped: Arc<AsyncMutex<Vec<String>>>,
     limits: Arc<AsyncMutex<Vec<crate::task::docker::ResourceLimits>>>,
     inspect: Arc<AsyncMutex<HashMap<String, bollard::service::ContainerInspectResponse>>>,
+    inspect_calls: Arc<AsyncMutex<Vec<String>>>,
+    listed: Arc<AsyncMutex<Vec<crate::task::docker::ContainerInfo>>>,
 }
 
 #[async_trait]
@@ -108,13 +110,17 @@ impl ContainerManager for MockContainerManager {
         &self,
         _filters: Option<HashMap<String, Vec<String>>>,
     ) -> crate::task::docker::ContainerResult<Vec<crate::task::docker::ContainerInfo>> {
-        Ok(Vec::new())
+        Ok(self.listed.lock().await.clone())
     }
 
     async fn inspect_container(
         &self,
         container_id: &str,
     ) -> crate::task::docker::ContainerResult<bollard::service::ContainerInspectResponse> {
+        self.inspect_calls
+            .lock()
+            .await
+            .push(container_id.to_string());
         let guard = self.inspect.lock().await;
         guard
             .get(container_id)
@@ -492,6 +498,48 @@ async fn reconcile_running_task_restarts_when_container_is_missing() {
     assert!(
         matches!(refreshed.state, ContainerState::Running),
         "task should converge back to running after restart"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_local_tasks_uses_runtime_inventory_for_running_tasks() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    assert!(matches!(spec.state, ContainerState::Running));
+
+    {
+        let mut listed = mock_cm.listed.lock().await;
+        listed.clear();
+        listed.push(crate::task::docker::ContainerInfo {
+            id: "runtime-container-1".to_string(),
+            name: format!("mantissa-{}", spec.id),
+            image: "img".to_string(),
+            status: "Up".to_string(),
+            state: "running".to_string(),
+            created: 0,
+        });
+    }
+    mock_cm.inspect_calls.lock().await.clear();
+
+    manager
+        .reconcile_local_tasks()
+        .await
+        .expect("reconcile local tasks");
+
+    let inspect_calls = mock_cm.inspect_calls.lock().await.clone();
+    assert!(
+        inspect_calls.is_empty(),
+        "running tasks present in runtime inventory should not trigger inspect"
     );
 }
 
