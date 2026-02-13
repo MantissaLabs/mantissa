@@ -307,7 +307,7 @@ impl ServiceController {
 
         let inventory = Arc::new(self.collect_task_inventory().await?);
         let health_snapshot = Arc::new(self.health_monitor.snapshot());
-        let eligible_nodes = Arc::new(self.collect_eligible_nodes(health_snapshot.as_ref()));
+        let eligible_nodes = Arc::new(self.collect_eligible_nodes());
 
         for spec in specs {
             if spec.status() != ServiceStatus::Running {
@@ -429,7 +429,7 @@ impl ServiceController {
     }
 
     /// Builds the deterministic set of nodes eligible to host service replicas from peer metadata.
-    fn collect_eligible_nodes(&self, health_snapshot: &HashMap<Uuid, HealthStatus>) -> Vec<Uuid> {
+    fn collect_eligible_nodes(&self) -> Vec<Uuid> {
         let mut nodes: BTreeSet<Uuid> = BTreeSet::new();
         nodes.insert(self.local_node_id);
 
@@ -439,14 +439,7 @@ impl ServiceController {
             }
         }
 
-        let mut eligible = Vec::with_capacity(nodes.len());
-        for node_id in nodes {
-            if !matches!(health_snapshot.get(&node_id), Some(HealthStatus::Down)) {
-                eligible.push(node_id);
-            }
-        }
-
-        eligible
+        nodes.into_iter().collect()
     }
 
     /// Stops tasks that are no longer referenced by the service spec using deterministic cleanup ownership.
@@ -504,6 +497,11 @@ impl ServiceController {
         let Some(desired_node) = slot_targets.get(key).copied() else {
             return Ok(());
         };
+        let preferred_node = if node_is_down(desired_node, health_snapshot) {
+            None
+        } else {
+            Some(desired_node)
+        };
 
         let task = inventory.by_id.get(&task_id);
         let missing = match task {
@@ -515,7 +513,7 @@ impl ServiceController {
 
         if missing {
             if self.slot_missing_elapsed(key).await {
-                self.start_slot_task(spec, slot, task_id, desired_node, key)
+                self.start_slot_task(spec, slot, task_id, preferred_node, key)
                     .await?;
             }
             return Ok(());
@@ -545,6 +543,10 @@ impl ServiceController {
             return Ok(());
         }
 
+        if node_is_down(desired_node, health_snapshot) {
+            return Ok(());
+        }
+
         if desired_node == task.node_id {
             return Ok(());
         }
@@ -561,39 +563,41 @@ impl ServiceController {
         spec: &ServiceSpecValue,
         slot: &ReplicaSlot,
         task_id: Uuid,
-        preferred_node: Uuid,
+        preferred_node: Option<Uuid>,
         key: &SlotKey,
     ) -> anyhow::Result<()> {
-        let request = make_replica_request(
-            &spec.service_name,
-            &slot.template,
-            slot.replica,
-            task_id,
-            Some(preferred_node),
-        );
+        if let Some(preferred_node) = preferred_node {
+            let request = make_replica_request(
+                &spec.service_name,
+                &slot.template,
+                slot.replica,
+                task_id,
+                Some(preferred_node),
+            );
 
-        match self.task_manager.start_tasks_batch(vec![request]).await {
-            Ok(specs) => {
-                if specs.len() != 1 {
-                    tracing::warn!(
+            match self.task_manager.start_tasks_batch(vec![request]).await {
+                Ok(specs) => {
+                    if specs.len() != 1 {
+                        tracing::warn!(
+                            target: "services",
+                            "unexpected start response for '{}' replica {}: expected 1, got {}",
+                            slot.template.name,
+                            slot.replica,
+                            specs.len()
+                        );
+                    }
+                    self.clear_slot_missing(key).await;
+                    return Ok(());
+                }
+                Err(err) => {
+                    tracing::debug!(
                         target: "services",
-                        "unexpected start response for '{}' replica {}: expected 1, got {}",
+                        "preferred placement failed for '{}' replica {} on {}: {err}",
                         slot.template.name,
                         slot.replica,
-                        specs.len()
+                        preferred_node
                     );
                 }
-                self.clear_slot_missing(key).await;
-                return Ok(());
-            }
-            Err(err) => {
-                tracing::debug!(
-                    target: "services",
-                    "preferred placement failed for '{}' replica {} on {}: {err}",
-                    slot.template.name,
-                    slot.replica,
-                    preferred_node
-                );
             }
         }
 
@@ -740,8 +744,7 @@ impl ServiceController {
         } = job;
 
         let service_id = compute_service_id(&service_name);
-        let health_snapshot = self.health_monitor.snapshot();
-        let eligible_nodes = self.collect_eligible_nodes(&health_snapshot);
+        let eligible_nodes = self.collect_eligible_nodes();
         let requests = build_start_requests(&service_name, service_id, &templates, &eligible_nodes);
 
         if requests.is_empty() {
@@ -882,8 +885,7 @@ impl ServiceController {
             retain.len()
         );
 
-        let health_snapshot = self.health_monitor.snapshot();
-        let eligible_nodes = self.collect_eligible_nodes(&health_snapshot);
+        let eligible_nodes = self.collect_eligible_nodes();
         let start_requests = build_replacement_requests(
             &service_name,
             current_spec.id,
@@ -1085,27 +1087,13 @@ impl ServiceController {
                     let summary = format_task_state_summary(&last_observed_states);
                     tracing::warn!(
                         target: "services",
-                        "service '{}' deployment attempt {} did not converge; retrying in {:?} ({summary})",
+                        "service '{}' deployment attempt {} did not converge yet; retrying readiness probe in {:?} ({summary})",
                         service_name,
                         attempt,
                         backoff
                     );
-
-                    match redeploy_service_tasks(&self, snapshot.clone()).await {
-                        Ok(_) => {
-                            attempt = next_attempt;
-                            sleep(backoff).await;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "services",
-                                "service '{}' redeploy attempt failed: {err}",
-                                service_name
-                            );
-                            mark_service_failed(&self, snapshot, &last_observed_states).await;
-                            break;
-                        }
-                    }
+                    attempt = next_attempt;
+                    sleep(backoff).await;
                 }
                 ReadinessOutcome::Abort => break,
             }
@@ -1676,55 +1664,6 @@ async fn poll_service_attempt(
 
         sleep(Duration::from_millis(SERVICE_READY_POLL_INTERVAL_MS)).await;
     }
-}
-
-async fn redeploy_service_tasks(
-    controller: &ServiceController,
-    spec: ServiceSpecValue,
-) -> anyhow::Result<ServiceSpecValue> {
-    tracing::info!(
-        target: "services",
-        "service '{}' retrying deployment with {} template(s)",
-        spec.service_name,
-        spec.tasks.len()
-    );
-
-    controller.stop_tasks(&spec).await;
-
-    let health_snapshot = controller.health_monitor.snapshot();
-    let eligible_nodes = controller.collect_eligible_nodes(&health_snapshot);
-    let requests = build_start_requests(&spec.service_name, spec.id, &spec.tasks, &eligible_nodes);
-    if requests.is_empty() {
-        let mut updated = spec.clone();
-        updated.set_status(ServiceStatus::Running);
-        controller.apply_upsert(updated.clone()).await?;
-        controller
-            .broadcast(ServiceEvent::Upsert(updated.clone()))
-            .await?;
-        return Ok(updated);
-    }
-
-    let task_specs = controller
-        .start_tasks_with_fallback(
-            requests,
-            &format!("service '{}' redeploy attempt", spec.service_name),
-        )
-        .await?;
-    let task_ids: Vec<Uuid> = task_specs.iter().map(|spec| spec.id).collect();
-
-    let mut redeployed = ServiceSpecValue::new(
-        spec.manifest_id,
-        spec.manifest_name.clone(),
-        spec.service_name.clone(),
-        spec.tasks.clone(),
-        task_ids,
-    );
-    redeployed.set_status(ServiceStatus::Deploying);
-    controller.apply_upsert(redeployed.clone()).await?;
-    controller
-        .broadcast(ServiceEvent::Upsert(redeployed.clone()))
-        .await?;
-    Ok(redeployed)
 }
 
 async fn mark_service_failed(
