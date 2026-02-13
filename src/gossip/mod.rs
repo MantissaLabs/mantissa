@@ -259,7 +259,11 @@ pub async fn start<C>(
                 let mut pending = std::mem::take(&mut buffer);
 
                 if pending.is_empty() {
-                    pending.push(Message::Void { id: Uuid::new_v4() });
+                    // Idle ticks no longer emit synthetic void gossip messages. Health probing
+                    // runs on a separate loop, and anti-entropy sync already guarantees
+                    // convergence without per-tick heartbeat payloads.
+                    buffer = pending;
+                    continue;
                 }
 
                 let peers = match fanout {
