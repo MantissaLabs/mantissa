@@ -342,9 +342,9 @@ impl TaskManager {
                     self.signal_remote_stop(&remote_specs).await;
                     self.release_remote_resources(&reserved_remote).await;
                     reserved_remote.clear();
-                    if let Some(resources) = reserved_local_resources.take() {
-                        self.release_local_resources(&resources).await;
-                    }
+                    // start_local_containers already runs cleanup_batch on failure, which releases
+                    // any local slot/GPU reservations touched by this attempt.
+                    reserved_local_resources.take();
                     return Err(err);
                 }
             }
@@ -422,6 +422,11 @@ impl TaskManager {
             }
 
             return self.stop_remote_task(&spec).await;
+        }
+
+        if matches!(spec.state, ContainerState::Stopped) {
+            self.ensure_task_stopped(spec.clone()).await?;
+            return Ok(spec);
         }
 
         self.perform_local_stop(spec).await

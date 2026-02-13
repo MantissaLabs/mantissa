@@ -117,6 +117,21 @@ impl TaskManager {
                     task_id
                 );
             }
+            return;
+        }
+
+        let fallback_root = self.secret_runtime_root.join(task_id.to_string());
+        match fs::remove_dir_all(&fallback_root).await {
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                warn!(
+                    target: "task",
+                    "failed to cleanup fallback secret staging directory {} for task {}: {err}",
+                    fallback_root.display(),
+                    task_id
+                );
+            }
         }
     }
 
@@ -201,14 +216,12 @@ impl TaskManager {
         {
             use std::os::unix::fs::PermissionsExt;
 
-            let metadata = fs::metadata(&root_dir)
-                .await
-                .with_context(|| format!("failed to inspect {}", root_dir.display()))?;
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(0o700);
-            fs::set_permissions(&root_dir, permissions)
-                .await
-                .with_context(|| format!("failed to secure {}", root_dir.display()))?;
+            if let Err(err) =
+                fs::set_permissions(&root_dir, std::fs::Permissions::from_mode(0o700)).await
+            {
+                cleanup_dir_quietly(&root_dir).await;
+                return Err(anyhow!("failed to secure {}: {err}", root_dir.display()));
+            }
         }
 
         let mut mounts = Vec::with_capacity(files.len());
@@ -243,8 +256,20 @@ impl TaskManager {
             };
 
             let host_path = root_dir.join(format!("secret-{idx}"));
+            match fs::remove_file(&host_path).await {
+                Ok(_) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    cleanup_dir_quietly(&root_dir).await;
+                    return Err(anyhow!(
+                        "failed to reset secret staging file {}: {err}",
+                        host_path.display()
+                    ));
+                }
+            }
+
             let mut options = OpenOptions::new();
-            options.write(true).create(true).truncate(true);
+            options.write(true).create_new(true);
 
             #[cfg(unix)]
             {

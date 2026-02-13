@@ -2,6 +2,7 @@
 mod common;
 
 use capnp::Error as CapnpError;
+use chrono::Utc;
 use client::services::manifest::{
     RestartPolicyName as ManifestRestartPolicyName, SecretReference, ServiceManifest,
     load_manifest_from_path,
@@ -10,15 +11,18 @@ use common::testkit::{
     ClusterConfig, ContainerManagerOverrideGuard, InMemoryContainerManager, TestNode,
 };
 use crdt_store::uuid_key::UuidKey;
+use mantissa::scheduler::SlotReservationRequest;
 use mantissa::scheduler::SlotState;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
     ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
     ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
 };
+use mantissa::task::container::ContainerState;
 use mantissa::task::manager::TaskManager;
 use mantissa::task::types::{
-    TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskSpec, TaskStateFilter,
+    TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskServiceMetadata, TaskSpec,
+    TaskStateFilter, TaskValue,
 };
 use protocol::secrets::secrets;
 use protocol::services::services;
@@ -779,6 +783,136 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
     );
 });
 
+local_test!(services_stop_drains_stale_tasks_and_slots, {
+    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let node = TestNode::new().await;
+
+    let service_name = "stop-drain";
+    let templates = vec![demo_backend_task_template("backend", 1)];
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+        .await
+        .expect("submit deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "service should reach running state before stop"
+    );
+    assert!(
+        wait_for_service_task_count_all(
+            std::slice::from_ref(&node),
+            service_name,
+            1,
+            Duration::from_secs(8)
+        )
+        .await,
+        "deployment should converge to one active task"
+    );
+
+    let running_spec = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load running service")
+        .expect("running service spec present");
+    let task_id = *running_spec
+        .task_ids
+        .first()
+        .expect("running service should expose one task id");
+    let original_task = node
+        .node
+        .task_manager
+        .inspect_task(task_id)
+        .await
+        .expect("inspect running task");
+
+    node.node
+        .service_controller
+        .submit_stop(service_id)
+        .await
+        .expect("submit stop");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Stopped
+        )
+        .await,
+        "service should transition to stopped"
+    );
+    assert!(
+        wait_for_service_task_count_all(
+            std::slice::from_ref(&node),
+            service_name,
+            0,
+            Duration::from_secs(10)
+        )
+        .await,
+        "stop should drain all active tasks"
+    );
+    assert!(
+        wait_for_reserved_slots(&node, 0, Duration::from_secs(10)).await,
+        "stop should release local scheduler reservations"
+    );
+
+    let mut stale = original_task.clone();
+    stale.state = ContainerState::Running;
+    stale.updated_at = Utc::now().to_rfc3339();
+
+    node.node
+        .tasks
+        .upsert(&UuidKey::from(stale.id), task_spec_to_value(&stale))
+        .await
+        .expect("inject stale running task value");
+
+    let snapshot = node
+        .node
+        .scheduler
+        .snapshot()
+        .await
+        .expect("scheduler snapshot should be present");
+    if !stale.slot_ids.is_empty() {
+        let intents: Vec<SlotReservationRequest> = stale
+            .slot_ids
+            .iter()
+            .map(|slot_id| SlotReservationRequest {
+                slot_id: *slot_id,
+                owner: node.id(),
+                task_id: Some(stale.id),
+            })
+            .collect();
+        let _ = node
+            .node
+            .scheduler
+            .reserve_resources(snapshot.version, intents, Vec::new())
+            .await;
+    }
+
+    assert!(
+        wait_for_service_task_count_all(
+            std::slice::from_ref(&node),
+            service_name,
+            0,
+            Duration::from_secs(12)
+        )
+        .await,
+        "inactive service reconciliation should remove stale task resurrection"
+    );
+    assert!(
+        wait_for_reserved_slots(&node, 0, Duration::from_secs(12)).await,
+        "inactive service reconciliation should release stale slot reservations"
+    );
+});
+
 local_test!(services_sync_recovers_missing_entries, {
     let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
 
@@ -1188,6 +1322,57 @@ async fn wait_for_service_task_count_all(
         sleep(Duration::from_millis(100)).await;
     }
     false
+}
+
+/// Waits until the local scheduler reports the expected reserved slot count.
+async fn wait_for_reserved_slots(node: &TestNode, expected: usize, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(snapshot) = node.node.scheduler.snapshot().await {
+            let reserved = snapshot
+                .slots
+                .iter()
+                .filter(|slot| matches!(slot.state, SlotState::Reserved(_)))
+                .count();
+            if reserved == expected {
+                return true;
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Converts a task spec into a replicated task value for store-level fault-injection tests.
+fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
+    TaskValue {
+        id: spec.id,
+        name: spec.name.clone(),
+        image: spec.image.clone(),
+        state: spec.state.clone(),
+        created_at: spec.created_at.clone(),
+        updated_at: spec.updated_at.clone(),
+        command: spec.command.clone(),
+        node_id: spec.node_id,
+        node_name: spec.node_name.clone(),
+        slot_ids: spec.slot_ids.clone(),
+        slot_id: spec.slot_id,
+        cpu_millis: spec.cpu_millis,
+        memory_bytes: spec.memory_bytes,
+        gpu_count: spec.gpu_count,
+        gpu_device_ids: spec.gpu_device_ids.clone(),
+        restart_policy: spec.restart_policy.clone(),
+        env: spec.env.clone(),
+        secret_files: spec.secret_files.clone(),
+        networks: spec.networks.clone(),
+        service_metadata: spec
+            .service_metadata
+            .as_ref()
+            .map(|meta| TaskServiceMetadata {
+                service_name: meta.service_name.clone(),
+                template: meta.template.clone(),
+            }),
+    }
 }
 
 async fn remove_service_via_rpc(client: &services::Client, service_id: Uuid) {

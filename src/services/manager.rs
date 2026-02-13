@@ -310,30 +310,42 @@ impl ServiceController {
         let eligible_nodes = Arc::new(self.collect_eligible_nodes());
 
         for spec in specs {
-            if spec.status() != ServiceStatus::Running {
+            if spec.status() == ServiceStatus::Running {
+                let controller = self.clone();
+                let inventory = inventory.clone();
+                let health_snapshot = health_snapshot.clone();
+                let eligible_nodes = eligible_nodes.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(err) = controller
+                        .reconcile_service(
+                            spec,
+                            inventory.as_ref(),
+                            health_snapshot.as_ref(),
+                            eligible_nodes.as_ref(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "services",
+                            "service reconciliation failed: {err}"
+                        );
+                    }
+                });
                 continue;
             }
 
-            let controller = self.clone();
-            let inventory = inventory.clone();
-            let health_snapshot = health_snapshot.clone();
-            let eligible_nodes = eligible_nodes.clone();
-            tokio::task::spawn_local(async move {
-                if let Err(err) = controller
-                    .reconcile_service(
-                        spec,
-                        inventory.as_ref(),
-                        health_snapshot.as_ref(),
-                        eligible_nodes.as_ref(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "services",
-                        "service reconciliation failed: {err}"
-                    );
-                }
-            });
+            if matches!(
+                spec.status(),
+                ServiceStatus::Stopping | ServiceStatus::Stopped | ServiceStatus::Failed
+            ) {
+                let controller = self.clone();
+                let inventory = inventory.clone();
+                tokio::task::spawn_local(async move {
+                    controller
+                        .reconcile_inactive_service(spec, inventory.as_ref())
+                        .await;
+                });
+            }
         }
 
         Ok(())
@@ -1141,24 +1153,52 @@ impl ServiceController {
     }
 
     async fn stop_tasks(&self, spec: &ServiceSpecValue) {
-        for task_id in &spec.task_ids {
-            match self.task_manager.stop_task(*task_id).await {
+        let inventory = match self.collect_task_inventory().await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                tracing::warn!(
+                    target: "services",
+                    "failed to collect task inventory while stopping service {}: {err}",
+                    spec.service_name
+                );
+                return;
+            }
+        };
+        self.stop_local_service_tasks(spec, &inventory).await;
+    }
+
+    /// Continuously drains local tasks for inactive services so stale task gossip cannot
+    /// resurrect placement after a stop has been propagated.
+    async fn reconcile_inactive_service(&self, spec: ServiceSpecValue, inventory: &TaskInventory) {
+        self.stop_local_service_tasks(&spec, inventory).await;
+    }
+
+    /// Stops every locally owned task associated with the service, including stale rows that are
+    /// no longer referenced by the current service spec task id list.
+    async fn stop_local_service_tasks(&self, spec: &ServiceSpecValue, inventory: &TaskInventory) {
+        let mut task_ids: HashSet<Uuid> = spec.task_ids.iter().copied().collect();
+        if let Some(tasks) = inventory.by_service.get(&spec.service_name) {
+            for task in tasks {
+                task_ids.insert(task.id);
+            }
+        }
+
+        for task_id in task_ids {
+            let Some(task) = inventory.by_id.get(&task_id) else {
+                continue;
+            };
+            if task.node_id != self.local_node_id {
+                continue;
+            }
+            match self.task_manager.stop_task(task_id).await {
                 Ok(_) => {}
                 Err(err) => {
                     let message = err.to_string();
-                    if message.contains("is assigned to node") {
-                        tracing::debug!(
-                            target: "services",
-                            "skipping remote task {task_id} while stopping service {}",
-                            spec.service_name
-                        );
-                    } else {
-                        tracing::warn!(
-                            target: "services",
-                            "failed to stop task {task_id} for service {}: {message}",
-                            spec.service_name
-                        );
-                    }
+                    tracing::warn!(
+                        target: "services",
+                        "failed to stop task {task_id} for service {}: {message}",
+                        spec.service_name
+                    );
                 }
             }
         }
