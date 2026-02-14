@@ -326,15 +326,10 @@ impl ServiceController {
 
             if matches!(
                 spec.status(),
-                ServiceStatus::Stopping | ServiceStatus::Stopped | ServiceStatus::Failed
+                ServiceStatus::Stopped | ServiceStatus::Failed
             ) {
-                let controller = self.clone();
-                let inventory = inventory.clone();
-                tokio::task::spawn_local(async move {
-                    controller
-                        .reconcile_inactive_service(spec, inventory.as_ref())
-                        .await;
-                });
+                self.reconcile_inactive_service(spec, inventory.as_ref())
+                    .await;
             }
         }
 
@@ -1179,7 +1174,10 @@ impl ServiceController {
             if task.node_id != self.local_node_id {
                 continue;
             }
-            if matches!(task.state, ContainerState::Stopping) {
+            if matches!(
+                task.state,
+                ContainerState::Stopping | ContainerState::Stopped
+            ) {
                 continue;
             }
             match self.task_manager.stop_task(task_id).await {

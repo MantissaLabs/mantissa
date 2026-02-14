@@ -415,11 +415,18 @@ impl TaskManager {
         let spec = self.load_spec(id).await?;
 
         if spec.node_id != self.local_node_id {
-            if matches!(spec.state, ContainerState::Stopped) {
+            if matches!(
+                spec.state,
+                ContainerState::Stopping | ContainerState::Stopped
+            ) {
                 return Ok(spec);
             }
 
             return self.stop_remote_task(&spec).await;
+        }
+
+        if matches!(spec.state, ContainerState::Stopping) {
+            return Ok(spec);
         }
 
         if matches!(spec.state, ContainerState::Stopped) {
@@ -625,6 +632,14 @@ fn container_already_running(err: &ContainerError) -> bool {
         err,
         ContainerError::DockerAPI(BollardError::DockerResponseServerError { status_code, .. })
             if *status_code == 304
+    )
+}
+
+fn container_remove_in_progress(err: &ContainerError) -> bool {
+    matches!(
+        err,
+        ContainerError::DockerAPI(BollardError::DockerResponseServerError { status_code, .. })
+            if *status_code == 409
     )
 }
 

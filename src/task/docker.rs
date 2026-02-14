@@ -13,6 +13,7 @@ use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
     RemoveContainerOptions, RestartContainerOptions, StartContainerOptions, StopContainerOptions,
 };
+use bollard::errors::Error as BollardError;
 use bollard::models::{
     DeviceRequest, EventMessageTypeEnum, HostConfig, RestartPolicy, RestartPolicyNameEnum,
 };
@@ -48,6 +49,16 @@ pub enum ContainerError {
 
 /// Result type for container operations
 pub type ContainerResult<T> = Result<T, ContainerError>;
+
+/// Normalizes low-level Docker API errors into stable container error variants.
+fn classify_container_error(container_id: &str, err: BollardError) -> ContainerError {
+    match &err {
+        BollardError::DockerResponseServerError { status_code, .. } if *status_code == 404 => {
+            ContainerError::NotFound(container_id.to_string())
+        }
+        _ => ContainerError::DockerAPI(err),
+    }
+}
 
 /// Parameters describing how to launch a container.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -416,7 +427,7 @@ impl ContainerManager for DockerContainerManager {
         self.docker
             .start_container(container_id, None::<StartContainerOptions<String>>)
             .await
-            .map_err(ContainerError::DockerAPI)?;
+            .map_err(|err| classify_container_error(container_id, err))?;
 
         info!("Container started: {}", container_id);
 
@@ -441,7 +452,7 @@ impl ContainerManager for DockerContainerManager {
         self.docker
             .stop_container(container_id, Some(options))
             .await
-            .map_err(ContainerError::DockerAPI)?;
+            .map_err(|err| classify_container_error(container_id, err))?;
 
         info!("Container stopped: {}", container_id);
 
@@ -466,7 +477,7 @@ impl ContainerManager for DockerContainerManager {
         self.docker
             .restart_container(container_id, Some(options))
             .await
-            .map_err(ContainerError::DockerAPI)?;
+            .map_err(|err| classify_container_error(container_id, err))?;
 
         info!("Container restarted: {}", container_id);
 
@@ -493,7 +504,7 @@ impl ContainerManager for DockerContainerManager {
         self.docker
             .remove_container(container_id, Some(options))
             .await
-            .map_err(ContainerError::DockerAPI)?;
+            .map_err(|err| classify_container_error(container_id, err))?;
 
         info!("Container removed: {}", container_id);
 
@@ -561,7 +572,7 @@ impl ContainerManager for DockerContainerManager {
             .docker
             .inspect_container(container_id, options)
             .await
-            .map_err(ContainerError::DockerAPI)?;
+            .map_err(|err| classify_container_error(container_id, err))?;
 
         Ok(container_info)
     }
@@ -732,5 +743,31 @@ mod tests {
         if let Some(previous_manager) = previous {
             set_container_manager_override(previous_manager);
         }
+    }
+
+    #[test]
+    fn classify_container_error_maps_404_to_not_found() {
+        let error = bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "No such container".to_string(),
+        };
+        let mapped = classify_container_error("demo-container", error);
+        assert!(matches!(mapped, ContainerError::NotFound(ref id) if id == "demo-container"));
+    }
+
+    #[test]
+    fn classify_container_error_preserves_non_404_as_docker_api() {
+        let error = bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message: "Conflict".to_string(),
+        };
+        let mapped = classify_container_error("demo-container", error);
+        assert!(matches!(
+            mapped,
+            ContainerError::DockerAPI(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                ..
+            })
+        ));
     }
 }

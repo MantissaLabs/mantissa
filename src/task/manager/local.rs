@@ -235,6 +235,7 @@ impl TaskManager {
                 dns_servers,
                 gpu_device_ids,
             };
+            let retry_create_request = create_request.clone();
 
             let create_result = self
                 .container_manager
@@ -251,20 +252,35 @@ impl TaskManager {
                         {
                             Ok(Some(existing_id)) => (existing_id, false),
                             Ok(None) => {
-                                if let Some(artifacts) = resolved.artifacts.take() {
-                                    if let Err(clean_err) = artifacts.cleanup().await {
-                                        warn!(
-                                            target: "task",
-                                            "failed to cleanup staged secrets after missing container {}: {clean_err}",
-                                            plan.id
-                                        );
+                                debug!(
+                                    target: "task",
+                                    task = %plan.id,
+                                    container = %plan.container_name,
+                                    "name conflict had no resolvable existing container; retrying create once"
+                                );
+                                match self
+                                    .container_manager
+                                    .create_container(retry_create_request)
+                                    .await
+                                {
+                                    Ok(id) => (id, true),
+                                    Err(retry_err) => {
+                                        if let Some(artifacts) = resolved.artifacts.take() {
+                                            if let Err(clean_err) = artifacts.cleanup().await {
+                                                warn!(
+                                                    target: "task",
+                                                    "failed to cleanup staged secrets after missing container {}: {clean_err}",
+                                                    plan.id
+                                                );
+                                            }
+                                        }
+                                        let err = anyhow::Error::from(retry_err).context(format!(
+                                            "docker create failed for task {}",
+                                            plan.name
+                                        ));
+                                        return Err(err);
                                     }
                                 }
-                                let err = anyhow::Error::from(err).context(format!(
-                                    "docker create failed for task {}",
-                                    plan.name
-                                ));
-                                return Err(err);
                             }
                             Err(inspect_err) => {
                                 if let Some(artifacts) = resolved.artifacts.take() {

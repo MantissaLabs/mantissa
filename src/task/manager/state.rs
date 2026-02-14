@@ -23,8 +23,9 @@ use crate::task::types::{
 };
 
 use super::{
-    TaskManager, container_already_running, is_name_conflict, select_best_task_value,
-    value_to_spec, wrap_create_error, wrap_existing_inspect_error, wrap_start_error,
+    TaskManager, container_already_running, container_remove_in_progress, is_name_conflict,
+    select_best_task_value, value_to_spec, wrap_create_error, wrap_existing_inspect_error,
+    wrap_start_error,
 };
 
 /// Snapshot of containers currently known by the local runtime.
@@ -323,6 +324,10 @@ impl TaskManager {
                 ContainerError::NotFound(_) => debug!(
                     target: "task",
                     "container {container_identifier} already absent while removing task {id}"
+                ),
+                other if container_remove_in_progress(&other) => debug!(
+                    target: "task",
+                    "container {container_identifier} removal already in progress while stopping task {id}"
                 ),
                 other => warn!(
                     target: "task",
@@ -730,6 +735,7 @@ impl TaskManager {
             dns_servers,
             gpu_device_ids,
         };
+        let retry_create_request = create_request.clone();
 
         let create_outcome = self
             .container_manager
@@ -743,19 +749,37 @@ impl TaskManager {
                     match self.resolve_existing_container_id(&container_name).await {
                         Ok(Some(existing_id)) => (existing_id, false),
                         Ok(None) => {
-                            if let Some(artifacts) = resolved.artifacts.take() {
-                                if let Err(clean_err) = artifacts.cleanup().await {
-                                    warn!(
-                                        target: "task",
-                                        "failed to cleanup staged secrets after missing container {}: {clean_err}",
-                                        working.id
-                                    );
+                            debug!(
+                                target: "task",
+                                task = %working.id,
+                                container = %container_name,
+                                "name conflict had no resolvable existing container; retrying create once"
+                            );
+                            match self
+                                .container_manager
+                                .create_container(retry_create_request)
+                                .await
+                            {
+                                Ok(id) => (id, true),
+                                Err(retry_err) => {
+                                    if let Some(artifacts) = resolved.artifacts.take() {
+                                        if let Err(clean_err) = artifacts.cleanup().await {
+                                            warn!(
+                                                target: "task",
+                                                "failed to cleanup staged secrets after missing container {}: {clean_err}",
+                                                working.id
+                                            );
+                                        }
+                                    }
+                                    let err = self
+                                        .mark_task_failed(
+                                            working,
+                                            wrap_create_error(&task_name, retry_err),
+                                        )
+                                        .await;
+                                    return Err(err);
                                 }
                             }
-                            let err = self
-                                .mark_task_failed(working, wrap_create_error(&task_name, err))
-                                .await;
-                            return Err(err);
                         }
                         Err(inspect_err) => {
                             if let Some(artifacts) = resolved.artifacts.take() {
@@ -1001,6 +1025,8 @@ impl TaskManager {
 
     /// Ensures that a locally tracked task has completely stopped and released resources.
     pub(super) async fn ensure_task_stopped(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
+        const STOPPING_RETRY_GRACE_SECS: i64 = 3;
+
         let mut has_container = {
             let guard = self.local_containers.lock().await;
             guard.contains_key(&spec.id)
@@ -1054,6 +1080,15 @@ impl TaskManager {
                     "failed to run orphaned attachment cleanup for containerless task: {err}"
                 );
             }
+            return Ok(());
+        }
+
+        if matches!(spec.state, ContainerState::Stopping)
+            && task_spec_recent(&spec, STOPPING_RETRY_GRACE_SECS)
+        {
+            // A recent transition to `Stopping` means another path already initiated teardown.
+            // Avoid issuing duplicate stop/remove calls in the same second; periodic reconcile
+            // will retry if the task remains in `Stopping` beyond this grace window.
             return Ok(());
         }
 
@@ -1264,6 +1299,7 @@ impl TaskManager {
         {
             match err {
                 ContainerError::NotFound(_) => {}
+                other if container_remove_in_progress(&other) => {}
                 other => warn!(
                     target: "task",
                     "failed to remove unowned container {identifier} for task {task_id}: {other}"
@@ -1685,6 +1721,20 @@ impl TaskManager {
 fn task_value_recent(value: &TaskValue, grace_secs: i64) -> bool {
     let anchor = chrono::DateTime::parse_from_rfc3339(&value.updated_at)
         .or_else(|_| chrono::DateTime::parse_from_rfc3339(&value.created_at));
+
+    match anchor {
+        Ok(anchor) => {
+            let anchor = anchor.with_timezone(&Utc);
+            Utc::now().signed_duration_since(anchor) < chrono::Duration::seconds(grace_secs)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Returns true when a task spec has been updated within the provided grace window.
+fn task_spec_recent(spec: &TaskSpec, grace_secs: i64) -> bool {
+    let anchor = chrono::DateTime::parse_from_rfc3339(&spec.updated_at)
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(&spec.created_at));
 
     match anchor {
         Ok(anchor) => {

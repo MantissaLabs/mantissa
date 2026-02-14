@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use net::noise::NoiseKeys;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -40,6 +40,7 @@ use tokio::sync::{RwLock, mpsc};
 #[derive(Clone, Default)]
 struct MockContainerManager {
     created: Arc<AsyncMutex<Vec<String>>>,
+    create_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
     stopped: Arc<AsyncMutex<Vec<String>>>,
     limits: Arc<AsyncMutex<Vec<crate::task::docker::ResourceLimits>>>,
     inspect: Arc<AsyncMutex<HashMap<String, bollard::service::ContainerInspectResponse>>>,
@@ -53,6 +54,10 @@ impl ContainerManager for MockContainerManager {
         &self,
         request: crate::task::docker::ContainerCreateRequest,
     ) -> crate::task::docker::ContainerResult<String> {
+        if let Some(err) = self.create_errors.lock().await.pop_front() {
+            return Err(err);
+        }
+
         let resource_limits = request.resource_limits;
         let mut guard = self.created.lock().await;
         let id = format!("container-{}", guard.len());
@@ -502,6 +507,59 @@ async fn reconcile_running_task_restarts_when_container_is_missing() {
 }
 
 #[tokio::test]
+async fn reconcile_running_task_retries_create_after_stale_name_conflict() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    assert!(matches!(spec.state, ContainerState::Running));
+    assert_eq!(mock_cm.created.lock().await.len(), 1);
+
+    {
+        let mut inspect = mock_cm.inspect.lock().await;
+        inspect.clear();
+    }
+    {
+        let mut errors = mock_cm.create_errors.lock().await;
+        errors.push_back(crate::task::docker::ContainerError::DockerAPI(
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                message: "name already in use".to_string(),
+            },
+        ));
+    }
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("reconcile should recover from stale name conflict");
+
+    let created = mock_cm.created.lock().await.clone();
+    assert_eq!(
+        created.len(),
+        2,
+        "task runtime should be recreated after retry"
+    );
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load refreshed spec");
+    assert!(
+        matches!(refreshed.state, ContainerState::Running),
+        "task should converge back to running after retry"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_local_tasks_uses_runtime_inventory_for_running_tasks() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
@@ -712,6 +770,107 @@ async fn stop_task_uses_container_name_when_cache_missing() {
 
     let stopped = manager.stop_task(spec.id).await.expect("stop task");
     assert!(matches!(stopped.state, ContainerState::Stopped));
+}
+
+#[tokio::test]
+async fn stop_task_is_idempotent_while_stopping() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    spec.state = ContainerState::Stopping;
+    spec.updated_at = Utc::now().to_rfc3339();
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist stopping state");
+
+    mock_cm.stopped.lock().await.clear();
+
+    let current = manager.stop_task(spec.id).await.expect("idempotent stop");
+    assert!(matches!(current.state, ContainerState::Stopping));
+    assert!(
+        mock_cm.stopped.lock().await.is_empty(),
+        "stop should not invoke runtime stop again when task is already stopping"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_stopping_task_debounces_recent_stop_attempts() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    spec.state = ContainerState::Stopping;
+    spec.updated_at = Utc::now().to_rfc3339();
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist stopping state");
+
+    mock_cm.stopped.lock().await.clear();
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("reconcile stopping task");
+    assert!(
+        mock_cm.stopped.lock().await.is_empty(),
+        "reconcile should not re-issue stop immediately after entering stopping"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_stopping_task_retries_after_grace_window() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    spec.state = ContainerState::Stopping;
+    spec.updated_at = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist stale stopping state");
+
+    mock_cm.stopped.lock().await.clear();
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("reconcile stale stopping task");
+    assert_eq!(
+        mock_cm.stopped.lock().await.len(),
+        1,
+        "reconcile should retry stop once stopping state is stale"
+    );
 }
 
 #[tokio::test]
