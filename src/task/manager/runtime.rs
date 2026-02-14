@@ -27,12 +27,6 @@ use super::TaskManager;
 use super::select_best_task_value;
 
 impl TaskManager {
-    /// Records gossip identifiers to avoid processing duplicates.
-    async fn record_gossip_id(&self, id: uuid::Uuid) -> bool {
-        let mut guard = self.seen_ids.lock().await;
-        guard.insert(id)
-    }
-
     /// Periodically re-attach networks to running containers whose attachment interfaces vanished
     /// (for example after a container restart) so backends rejoin service discovery and load
     /// balancing without manual intervention.
@@ -339,10 +333,7 @@ impl TaskManager {
                 message = self.rx.recv() => {
                     let Ok(message) = message else { break; };
                     match message {
-                        Message::Task { id, event } => {
-                            if !self.record_gossip_id(id).await {
-                                continue;
-                            }
+                        Message::Task { event, .. } => {
                             if let Err(e) = self.handle_event(event).await {
                                 tracing::error!(target: "task", "failed to handle task event: {e}");
                             }

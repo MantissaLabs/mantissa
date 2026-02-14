@@ -1,6 +1,6 @@
 use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
-use crate::gossip::{DEFAULT_FANOUT, Message};
+use crate::gossip::{DEFAULT_FANOUT, DedupeStateHandle, Message};
 use crate::network::controller::NetworkController;
 use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
@@ -72,13 +72,21 @@ pub async fn start(
     let stores = Bootstrap::open_stores(&ctx).await?;
 
     // Build runtime components (gossip, topology, sync) and their clients
-    let (comps, gossip_rx) = Bootstrap::build_components(&ctx, &stores).await?;
+    let (comps, gossip_rx, gossip_dedupe) = Bootstrap::build_components(&ctx, &stores).await?;
 
     // Wire up ServerImpl and spawn listeners
     let server = Bootstrap::build_server(&ctx, &stores, &comps);
 
     // Fire background tasks: gossip loop, topology loop, best-effort reconnect
-    Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps, gossip_rx, DEFAULT_FANOUT).await;
+    Bootstrap::spawn_runtime_tasks(
+        &ctx,
+        &stores,
+        &comps,
+        gossip_rx,
+        gossip_dedupe,
+        DEFAULT_FANOUT,
+    )
+    .await;
 
     Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
 
@@ -282,7 +290,8 @@ impl Bootstrap {
     pub(crate) async fn build_components(
         ctx: &Bootstrap,
         stores: &Stores,
-    ) -> Result<(Components, Receiver<Message>), Box<dyn std::error::Error>> {
+    ) -> Result<(Components, Receiver<Message>, DedupeStateHandle), Box<dyn std::error::Error>>
+    {
         // gossip channels: topology -> gossip sender, gossip -> topology sender
         let (gossip_tx, gossip_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(128);
@@ -310,16 +319,17 @@ impl Bootstrap {
         }
 
         // gossip capability
-        let gossip = crate::gossip::Gossip {
-            chans: crate::gossip::Channels {
+        let gossip = crate::gossip::Gossip::new(
+            crate::gossip::Channels {
                 topology_events: topology_tx.clone(),
                 task_events: task_tx.clone(),
                 service_events: service_tx.clone(),
                 network_events: network_tx.clone(),
                 secret_events: secret_tx.clone(),
             },
-            cluster_view: cluster_view.clone(),
-        };
+            cluster_view.clone(),
+        );
+        let gossip_dedupe = gossip.dedupe_state_handle();
         let gossip_client = capnp_rpc::new_client(gossip);
 
         // topology object + client
@@ -531,6 +541,7 @@ impl Bootstrap {
                 secret_replicator,
             },
             gossip_rx,
+            gossip_dedupe,
         ))
     }
 
@@ -613,6 +624,7 @@ impl Bootstrap {
         _stores: &Stores,
         comps: &Components,
         gossip_rx: Receiver<Message>,
+        gossip_dedupe: DedupeStateHandle,
         gossip_fanout: usize,
     ) {
         // Start health monitor loop inside the local task set.
@@ -648,6 +660,7 @@ impl Bootstrap {
             crate::gossip::start(
                 gossip_rx,
                 topology_for_gossip,
+                gossip_dedupe,
                 Some(gossip_fanout),
                 gossip_tick,
             )

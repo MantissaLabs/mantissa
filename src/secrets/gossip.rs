@@ -1,19 +1,10 @@
-use crate::dedupe::BoundedSeenCache;
 use crate::gossip::Message;
 use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::SecretEvent;
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 use uuid::Uuid;
-
-/// Maximum number of secret gossip identifiers retained for deduplication.
-const SECRET_GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
-/// Time window used to suppress duplicate secret gossip messages.
-const SECRET_GOSSIP_DEDUPE_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Handles broadcasting and applying secret registry gossip events.
 #[derive(Clone)]
@@ -21,7 +12,6 @@ pub struct SecretReplicator {
     registry: SecretRegistry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
-    seen_ids: Arc<AsyncMutex<BoundedSeenCache>>,
 }
 
 impl SecretReplicator {
@@ -35,23 +25,15 @@ impl SecretReplicator {
             registry,
             gossip_tx,
             gossip_rx,
-            seen_ids: Arc::new(AsyncMutex::new(BoundedSeenCache::new(
-                SECRET_GOSSIP_DEDUPE_MAX_ENTRIES,
-                SECRET_GOSSIP_DEDUPE_TTL,
-            ))),
         }
     }
 
     /// Runs the inbound gossip loop, applying deduplicated events to the local registry.
     pub async fn run(&self) {
         while let Ok(message) = self.gossip_rx.recv().await {
-            let Message::Secret { id, event } = message else {
+            let Message::Secret { event, .. } = message else {
                 continue;
             };
-
-            if !self.record_gossip_id(id).await {
-                continue;
-            }
 
             if let Err(err) = self.apply_event(event).await {
                 warn!(target: "secrets", "failed to apply secret gossip event: {err:#}");
@@ -78,10 +60,5 @@ impl SecretReplicator {
             }
         }
         Ok(())
-    }
-
-    async fn record_gossip_id(&self, id: Uuid) -> bool {
-        let mut guard = self.seen_ids.lock().await;
-        guard.record(id)
     }
 }

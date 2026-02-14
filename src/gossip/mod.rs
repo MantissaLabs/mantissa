@@ -6,6 +6,7 @@
 //!
 
 use crate::cluster::{ClusterViewId, ClusterViewState};
+use crate::dedupe::BoundedSeenCache;
 use crate::network::service::{read_network_event, write_network_event};
 use crate::network::types::NetworkEvent;
 use crate::secrets::service::{read_secret_event, write_secret_event};
@@ -27,7 +28,9 @@ use rand::rng;
 use rand::seq::IndexedRandom;
 use std::convert::TryFrom;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use topology::PeerHandle;
 use tracing::{debug, error};
 use uuid::Uuid;
@@ -76,11 +79,57 @@ impl Message {
 }
 
 pub const DEFAULT_FANOUT: usize = 5;
+/// Maximum number of gossip identifiers retained for ingress deduplication.
+const GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
+/// Time window used to suppress duplicate gossip identifiers.
+const GOSSIP_DEDUPE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Shared handle type used by ingress and outbound gossip loops for deduplication.
+pub(crate) type DedupeStateHandle = Arc<AsyncMutex<GossipDedupeState>>;
+
+/// Process-local gossip dedupe state tied to the currently active cluster view.
+#[derive(Debug)]
+pub(crate) struct GossipDedupeState {
+    last_active_view: ClusterViewId,
+    seen: BoundedSeenCache,
+}
+
+impl GossipDedupeState {
+    /// Builds one dedupe state initialized for the provided active cluster view.
+    fn new(active_view: ClusterViewId) -> Self {
+        Self {
+            last_active_view: active_view,
+            seen: BoundedSeenCache::new(GOSSIP_DEDUPE_MAX_ENTRIES, GOSSIP_DEDUPE_TTL),
+        }
+    }
+
+    /// Rotates the dedupe cache whenever the active cluster view changes.
+    fn rotate_if_view_changed(&mut self, active_view: ClusterViewId) {
+        if self.last_active_view == active_view {
+            return;
+        }
+        self.last_active_view = active_view;
+        self.seen = BoundedSeenCache::new(GOSSIP_DEDUPE_MAX_ENTRIES, GOSSIP_DEDUPE_TTL);
+    }
+
+    /// Records one inbound gossip identifier and returns true only when it is new.
+    fn record_inbound(&mut self, active_view: ClusterViewId, id: Uuid) -> bool {
+        self.rotate_if_view_changed(active_view);
+        self.seen.record(id)
+    }
+
+    /// Records one locally-originated identifier so echoed copies are suppressed.
+    fn record_outbound(&mut self, active_view: ClusterViewId, id: Uuid) {
+        self.rotate_if_view_changed(active_view);
+        let _ = self.seen.record(id);
+    }
+}
 
 /// Represents the gossip server.
 pub struct Gossip {
     pub chans: Channels,
     pub cluster_view: ClusterViewState,
+    dedupe_state: DedupeStateHandle,
 }
 
 pub struct Channels {
@@ -90,6 +139,23 @@ pub struct Channels {
     pub network_events: Sender<Message>,
     pub secret_events: Sender<Message>,
     // scheduling_events: Sender<SchedulingEvent>,
+}
+
+impl Gossip {
+    /// Creates a gossip server with one shared dedupe state for ingress and egress loops.
+    pub fn new(chans: Channels, cluster_view: ClusterViewState) -> Self {
+        let active_view = cluster_view.active_view();
+        Self {
+            chans,
+            cluster_view,
+            dedupe_state: Arc::new(AsyncMutex::new(GossipDedupeState::new(active_view))),
+        }
+    }
+
+    /// Returns the dedupe state handle so the outbound loop can pre-register local ids.
+    pub(crate) fn dedupe_state_handle(&self) -> DedupeStateHandle {
+        self.dedupe_state.clone()
+    }
 }
 
 impl gossip::Server for Gossip {
@@ -162,6 +228,18 @@ impl gossip::Server for Gossip {
                     "dropping gossip message for non-active cluster view"
                 );
                 continue;
+            }
+            {
+                let mut dedupe = self.dedupe_state.lock().await;
+                if !dedupe.record_inbound(active_view, id) {
+                    debug!(
+                        target: "gossip",
+                        gossip_id = %id,
+                        view = %active_view,
+                        "dropping duplicate gossip message"
+                    );
+                    continue;
+                }
             }
             debug!(
                 target: "gossip",
@@ -241,9 +319,10 @@ impl gossip::Server for Gossip {
 }
 
 // This method receives messages to gossip to neighbors in the network.
-pub async fn start<C>(
+pub(crate) async fn start<C>(
     event_rx: Receiver<Message>,
     context: C,
+    dedupe_state: DedupeStateHandle,
     fanout: Option<usize>,
     tick: Duration,
 ) where
@@ -308,6 +387,9 @@ pub async fn start<C>(
             }
 
             Ok(msg) = event_rx.recv() => {
+                let active_view = context.active_cluster_view();
+                let mut dedupe = dedupe_state.lock().await;
+                dedupe.record_outbound(active_view, msg.id());
                 buffer.push(msg);
             }
 
@@ -416,4 +498,46 @@ where
 
     let mut rng = rng();
     peers.choose_multiple(&mut rng, fanout).cloned().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GossipDedupeState;
+    use crate::cluster::{ClusterId, ClusterViewId};
+    use uuid::Uuid;
+
+    /// Duplicate message ids should be rejected while the active view is unchanged.
+    #[test]
+    fn dedupe_state_rejects_duplicate_in_same_view() {
+        let view = ClusterViewId::legacy_default();
+        let id = Uuid::new_v4();
+        let mut dedupe = GossipDedupeState::new(view);
+
+        assert!(dedupe.record_inbound(view, id));
+        assert!(!dedupe.record_inbound(view, id));
+    }
+
+    /// Outbound ids should be pre-registered so echoed inbound copies are dropped.
+    #[test]
+    fn dedupe_state_preseeds_outbound_ids() {
+        let view = ClusterViewId::legacy_default();
+        let id = Uuid::new_v4();
+        let mut dedupe = GossipDedupeState::new(view);
+
+        dedupe.record_outbound(view, id);
+        assert!(!dedupe.record_inbound(view, id));
+    }
+
+    /// Switching active views should rotate the cache and accept ids again in the new view.
+    #[test]
+    fn dedupe_state_rotates_on_view_change() {
+        let legacy_view = ClusterViewId::legacy_default();
+        let next_view = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 1);
+        let id = Uuid::new_v4();
+        let mut dedupe = GossipDedupeState::new(legacy_view);
+
+        assert!(dedupe.record_inbound(legacy_view, id));
+        assert!(!dedupe.record_inbound(legacy_view, id));
+        assert!(dedupe.record_inbound(next_view, id));
+    }
 }

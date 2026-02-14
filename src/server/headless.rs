@@ -145,7 +145,7 @@ impl HeadlessNode {
             node_client,
         );
         let stores: Stores = Bootstrap::open_stores(&ctx).await?;
-        let (comps, gossip_rx) = Bootstrap::build_components(&ctx, &stores).await?;
+        let (comps, gossip_rx, gossip_dedupe) = Bootstrap::build_components(&ctx, &stores).await?;
         if let Some(d) = sync_tick {
             comps.topology.set_sync_interval(d);
         }
@@ -165,7 +165,8 @@ impl HeadlessNode {
         // Finish wiring and spawn background tasks (gossip loop, topology loop, etc.)
         Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
         let fanout = gossip_fanout.unwrap_or(DEFAULT_FANOUT);
-        Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps, gossip_rx, fanout).await;
+        Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps, gossip_rx, gossip_dedupe, fanout)
+            .await;
 
         // Cap’n Proto Server capability
         let server_client: protocol::server::server::Client = capnp_rpc::new_client(server.clone());

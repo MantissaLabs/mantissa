@@ -1,6 +1,5 @@
 use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::config;
-use crate::dedupe::BoundedSeenCache;
 use crate::gossip::{GossipContext, Message};
 use crate::node::Node;
 use crate::node::address::compute_advertise_ip;
@@ -72,10 +71,6 @@ const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Default number of peers sampled per anti-entropy sync tick.
 const DEFAULT_SYNC_FANOUT: usize = 8;
-/// Maximum number of topology gossip message identifiers retained for deduplication.
-const TOPOLOGY_GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
-/// Time window used to suppress duplicate topology gossip messages.
-const TOPOLOGY_GOSSIP_DEDUPE_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Bundles the store handles required to construct a `Topology`.
 #[derive(Clone)]
@@ -152,8 +147,6 @@ struct GossipState {
     receiver: Receiver<Message>,
     /// Outbound channel used to fan out topology events.
     sender: Sender<Message>,
-    /// Deduplication set so we do not re-handle identical gossip messages.
-    seen_ids: Arc<AsyncMutex<BoundedSeenCache>>,
     /// Configurable interval used by the outer gossip loop for scheduling.
     interval: Arc<Mutex<Duration>>,
 }
@@ -163,10 +156,6 @@ impl GossipState {
         Self {
             receiver,
             sender,
-            seen_ids: Arc::new(AsyncMutex::new(BoundedSeenCache::new(
-                TOPOLOGY_GOSSIP_DEDUPE_MAX_ENTRIES,
-                TOPOLOGY_GOSSIP_DEDUPE_TTL,
-            ))),
             interval: Arc::new(Mutex::new(Duration::from_secs(1))),
         }
     }
@@ -180,11 +169,6 @@ impl GossipState {
             .send(message)
             .await
             .map_err(|e| capnp::Error::failed(format!("failed to queue gossip event: {e}")))
-    }
-
-    async fn record(&self, id: Uuid) -> bool {
-        let mut guard = self.seen_ids.lock().await;
-        guard.record(id)
     }
 
     fn set_interval(&self, d: Duration) {
@@ -461,7 +445,6 @@ impl Topology {
 
     pub async fn gossip_topology_event(&self, event: TopologyEvent) -> Result<(), capnp::Error> {
         let id = Uuid::new_v4();
-        let _ = self.gossip.record(id).await;
         self.gossip.send(Message::Topology { id, event }).await
     }
 
@@ -792,10 +775,6 @@ impl Topology {
                     // Keepalive message; nothing to process for topology state.
                 }
                 Ok(Message::Topology { id, event }) => {
-                    if !self.gossip.record(id).await {
-                        continue;
-                    }
-
                     match event {
                         TopologyEvent::Join {
                             id,
