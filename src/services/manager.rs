@@ -1105,7 +1105,6 @@ impl ServiceController {
     /// Runs the local stop workflow for a service that originated on this node.
     async fn execute_stop(self, mut spec: ServiceSpecValue) -> anyhow::Result<()> {
         let service_name = spec.service_name.clone();
-        self.stop_tasks(&spec).await;
         spec.set_status(ServiceStatus::Stopped);
         self.apply_upsert(spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(spec)).await?;
@@ -1178,6 +1177,9 @@ impl ServiceController {
                 continue;
             };
             if task.node_id != self.local_node_id {
+                continue;
+            }
+            if matches!(task.state, ContainerState::Stopping) {
                 continue;
             }
             match self.task_manager.stop_task(task_id).await {
@@ -1943,13 +1945,14 @@ fn should_stop_tasks(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecV
         return false;
     }
 
+    // Trigger a single drain wave at stop/failure start; re-triggering on
+    // `Stopping -> Stopped` causes duplicate stop attempts and gossip fanout.
     matches!(
         (current_spec.status(), incoming.status()),
         (Running, Stopping)
             | (Deploying, Stopping)
             | (Running, Stopped)
             | (Deploying, Stopped)
-            | (Stopping, Stopped)
             | (Running, ServiceStatus::Failed)
             | (Deploying, ServiceStatus::Failed)
             | (Stopping, ServiceStatus::Failed)
@@ -2221,5 +2224,48 @@ mod tests {
         assert_eq!(counts.get(&node_a).copied().unwrap_or(0), 1);
         assert_eq!(counts.get(&node_b).copied().unwrap_or(0), 1);
         assert_eq!(counts.get(&node_c).copied().unwrap_or(0), 1);
+    }
+
+    /// Ensure service stop progression does not launch duplicate local stop waves.
+    #[test]
+    fn should_not_stop_again_when_progressing_stopping_to_stopped() {
+        let manifest_id = Uuid::new_v4();
+        let tasks = vec![ServiceTaskSpecValue {
+            name: "api".into(),
+            image: "ghcr.io/demo/api:latest".into(),
+            command: Vec::new(),
+            replicas: 1,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            restart_policy: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            networks: Vec::new(),
+            health_port: None,
+            health_command: None,
+            public_port: None,
+            public_protocol: None,
+        }];
+
+        let mut current = ServiceSpecValue::new(
+            manifest_id,
+            "manifest",
+            "demo-service",
+            tasks.clone(),
+            vec![Uuid::new_v4()],
+        );
+        current.set_status(ServiceStatus::Stopping);
+
+        let mut incoming = ServiceSpecValue::new(
+            manifest_id,
+            "manifest",
+            "demo-service",
+            tasks,
+            vec![Uuid::new_v4()],
+        );
+        incoming.set_status(ServiceStatus::Stopped);
+
+        assert!(!should_stop_tasks(Some(&current), &incoming));
     }
 }
