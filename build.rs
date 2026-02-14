@@ -9,7 +9,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
 };
@@ -119,10 +119,8 @@ fn build_ebpf_without_warnings<'a>(
             .ok_or_else(|| anyhow!("missing stderr from eBPF build command"))?;
         let stderr_handle = thread::spawn(move || {
             let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    eprintln!("{line}");
-                }
+            for line in reader.lines().map_while(std::result::Result::ok) {
+                eprintln!("{line}");
             }
         });
 
@@ -179,7 +177,7 @@ fn build_ebpf_without_warnings<'a>(
 
 #[cfg(target_os = "linux")]
 /// Register the eBPF source inputs so Cargo only reruns this build script when they change.
-fn track_ebpf_inputs(root_dir: &PathBuf) -> Result<()> {
+fn track_ebpf_inputs(root_dir: &Path) -> Result<()> {
     let paths = [
         root_dir.join("Cargo.toml"),
         root_dir.join("src"),
@@ -195,7 +193,7 @@ fn track_ebpf_inputs(root_dir: &PathBuf) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 /// Recursively emit rerun directives for files under an input path, skipping target artifacts.
-fn track_ebpf_path(path: &PathBuf) -> Result<()> {
+fn track_ebpf_path(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }

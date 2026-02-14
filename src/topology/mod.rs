@@ -8,6 +8,7 @@ use crate::node::id::set_node_id;
 use crate::registry::Registry;
 use crate::secrets::crypto::SecretKeyring;
 use crate::store::cluster_operation_store::ClusterOperationStore;
+use crate::store::cluster_view_store::ClusterViewStore;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
@@ -78,6 +79,7 @@ pub struct TopologyStores {
     pub sessions: LocalSessionStore,
     pub peers: PeersStore,
     pub cluster_operations: ClusterOperationStore,
+    pub cluster_view: ClusterViewStore,
     pub token_store: TokenStore,
     pub secret_master_store: SecretMasterStore,
     pub tasks: TaskStore,
@@ -284,6 +286,7 @@ pub struct Topology {
     /// Persistent peer store backing the CRDT state published cluster-wide.
     peers: PeersStore,
     cluster_operations: ClusterOperationStore,
+    cluster_view_store: ClusterViewStore,
     tasks: TaskStore,
     services: ServiceStore,
     secrets: SecretStore,
@@ -364,6 +367,7 @@ impl Topology {
             sessions,
             peers,
             cluster_operations,
+            cluster_view: cluster_view_store,
             token_store,
             secret_master_store,
             tasks,
@@ -387,6 +391,7 @@ impl Topology {
             gossip: GossipState::new(gossip_receiver, gossip_sender),
             peers,
             cluster_operations,
+            cluster_view_store,
             tasks,
             services,
             secrets,

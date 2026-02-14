@@ -6,9 +6,10 @@ use mantissa::cluster::ClusterViewId;
 use mantissa::node::id::set_node_id;
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 use mantissa::store::cluster_operation_store::ClusterOperationStore;
+use mantissa::store::cluster_view_store::ClusterViewStore;
 use mantissa::topology::operation::{
     ClusterOperationKind as StoredOperationKind, ClusterOperationRecord,
-    ClusterOperationStage as StoredOperationStage,
+    ClusterOperationStage as StoredOperationStage, SplitNodeAssignment,
 };
 use net::noise::NoiseKeys;
 use protocol::topology::{ClusterOperationKind, ClusterOperationStage};
@@ -982,6 +983,255 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
         "dry-run startup records must not change active view"
     );
 });
+
+// Validates startup restores the persisted active view even when durable operations are finalized.
+local_test!(cluster_view_startup_restores_persisted_active_view, {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+    let view_store = ClusterViewStore::new(db.clone()).expect("open cluster view store");
+
+    let source_view = ClusterViewId::legacy_default();
+    let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 17);
+    let operation = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Merge,
+        stage: StoredOperationStage::Finalized,
+        dry_run: false,
+        source_views: vec![source_view],
+        target_views: vec![target_view],
+        split_assignments: Vec::new(),
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
+        details: "finalized startup restore operation".to_string(),
+    };
+
+    let payload = bincode::serialize(&operation).expect("serialize operation");
+    operation_store
+        .put(operation.id, &payload)
+        .expect("persist finalized operation");
+    view_store
+        .write_active_view(target_view)
+        .expect("persist active cluster view");
+
+    let node = HeadlessNode::new_with(
+        db,
+        Uuid::new_v4(),
+        HeadlessKeys::new(
+            Arc::new(NoiseKeys::from_private_bytes([0x71; 32])),
+            ed25519_dalek::SigningKey::from_bytes(&[0x81; 32]),
+        ),
+        HeadlessConfig::default(),
+    )
+    .await
+    .expect("start restore node");
+
+    let view_resp = node
+        .topology_client
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let view = view_resp
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    let active_view = ClusterViewId::from_capnp(view).expect("decode active view");
+    assert_eq!(
+        active_view, target_view,
+        "startup must restore persisted active cluster view for finalized operations"
+    );
+});
+
+// Validates startup restores a persisted split target view after a finalized split operation.
+local_test!(cluster_view_startup_restores_persisted_split_view, {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+    let view_store = ClusterViewStore::new(db.clone()).expect("open cluster view store");
+
+    let node_id = Uuid::new_v4();
+    let source_view = ClusterViewId::legacy_default();
+    let split_target_a = ClusterViewId::new(
+        mantissa::cluster::ClusterId::from_uuid(Uuid::new_v4()),
+        source_view.epoch + 1,
+    );
+    let split_target_b = ClusterViewId::new(
+        mantissa::cluster::ClusterId::from_uuid(Uuid::new_v4()),
+        source_view.epoch + 1,
+    );
+    let operation = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Split,
+        stage: StoredOperationStage::Finalized,
+        dry_run: false,
+        source_views: vec![source_view],
+        target_views: vec![split_target_a, split_target_b],
+        split_assignments: vec![SplitNodeAssignment {
+            node_id,
+            target_index: 1,
+        }],
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
+        details: "finalized split startup restore operation".to_string(),
+    };
+
+    operation_store
+        .put(
+            operation.id,
+            &bincode::serialize(&operation).expect("serialize split operation"),
+        )
+        .expect("persist finalized split operation");
+    view_store
+        .write_active_view(split_target_b)
+        .expect("persist split active cluster view");
+
+    let node = HeadlessNode::new_with(
+        db,
+        node_id,
+        HeadlessKeys::new(
+            Arc::new(NoiseKeys::from_private_bytes([0xB1; 32])),
+            ed25519_dalek::SigningKey::from_bytes(&[0xC1; 32]),
+        ),
+        HeadlessConfig::default(),
+    )
+    .await
+    .expect("start split restore node");
+
+    let view_resp = node
+        .topology_client
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let view = view_resp
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    let active_view = ClusterViewId::from_capnp(view).expect("decode active split view");
+    assert_eq!(
+        active_view, split_target_b,
+        "startup must restore persisted split target view"
+    );
+});
+
+// Validates stale prepared operations abort when commit preconditions no longer match active view.
+local_test!(
+    cluster_view_startup_replay_aborts_stale_prepared_operation,
+    {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("state.redb");
+        let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+        let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+        let view_store = ClusterViewStore::new(db.clone()).expect("open cluster view store");
+
+        let source_view = ClusterViewId::legacy_default();
+        view_store
+            .write_active_view(source_view)
+            .expect("persist initial active view");
+
+        let first_target = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 1);
+        let second_target = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 2);
+        let first_operation = ClusterOperationRecord {
+            id: Uuid::from_u128(1),
+            kind: StoredOperationKind::Merge,
+            stage: StoredOperationStage::Prepared,
+            dry_run: false,
+            source_views: vec![source_view],
+            target_views: vec![first_target],
+            split_assignments: Vec::new(),
+            split_service_policy: Default::default(),
+            split_network_policy: Default::default(),
+            merge_service_policy: Default::default(),
+            details: "first prepared merge".to_string(),
+        };
+        let second_operation = ClusterOperationRecord {
+            id: Uuid::from_u128(2),
+            kind: StoredOperationKind::Merge,
+            stage: StoredOperationStage::Prepared,
+            dry_run: false,
+            source_views: vec![source_view],
+            target_views: vec![second_target],
+            split_assignments: Vec::new(),
+            split_service_policy: Default::default(),
+            split_network_policy: Default::default(),
+            merge_service_policy: Default::default(),
+            details: "second prepared merge".to_string(),
+        };
+
+        operation_store
+            .put(
+                first_operation.id,
+                &bincode::serialize(&first_operation).expect("serialize first operation"),
+            )
+            .expect("persist first operation");
+        operation_store
+            .put(
+                second_operation.id,
+                &bincode::serialize(&second_operation).expect("serialize second operation"),
+            )
+            .expect("persist second operation");
+
+        let node = HeadlessNode::new_with(
+            db,
+            Uuid::new_v4(),
+            HeadlessKeys::new(
+                Arc::new(NoiseKeys::from_private_bytes([0x91; 32])),
+                ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]),
+            ),
+            HeadlessConfig::default(),
+        )
+        .await
+        .expect("start stale-precondition node");
+
+        wait_for_operation_stage(
+            &node.topology_client,
+            first_operation.id.as_bytes(),
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_operation_stage(
+            &node.topology_client,
+            second_operation.id.as_bytes(),
+            ClusterOperationStage::Aborted,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_cluster_view(&node.topology_client, first_target, Duration::from_secs(5)).await;
+
+        let mut get_second = node.topology_client.get_cluster_operation_request();
+        get_second.get().set_id(second_operation.id.as_bytes());
+        let second_resp = get_second
+            .send()
+            .promise
+            .await
+            .expect("get second operation send");
+        let second_record = second_resp
+            .get()
+            .expect("get second operation get")
+            .get_op()
+            .expect("second operation payload");
+        let second_details = second_record
+            .get_details()
+            .expect("second operation details")
+            .to_string()
+            .expect("second details text");
+        assert!(
+            second_details.contains("stale_precondition"),
+            "aborted stale operation should include stale precondition detail, got: {}",
+            second_details
+        );
+    }
+);
 
 // Validates cluster view listing exposes the local active row and a non-zero member count.
 local_test!(cluster_view_lists_local_active_row, {

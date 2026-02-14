@@ -1,4 +1,4 @@
-use crate::cluster::ClusterViewState;
+use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::gossip::{DEFAULT_FANOUT, Message};
 use crate::network::controller::NetworkController;
@@ -17,6 +17,7 @@ use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerStores};
 use crate::services::{ServiceController, ServiceRegistry, ServicesRPC};
 use crate::store::cluster_operation_store::ClusterOperationStore;
+use crate::store::cluster_view_store::ClusterViewStore;
 use crate::store::local::load_or_create_node_id;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
@@ -105,6 +106,7 @@ pub(crate) struct Bootstrap {
 pub(crate) struct Stores {
     pub peers: PeersStore,
     pub cluster_operations: ClusterOperationStore,
+    pub cluster_view: ClusterViewStore,
     pub session_auth: AuthStore,           // server-side issued tickets
     pub local_sessions: LocalSessionStore, // client-side resume tickets (encrypted)
     pub local_creds: LocalCredentialStore, // short-lived cluster creds
@@ -208,6 +210,7 @@ impl Bootstrap {
         let peers: PeersStore = open_peers_store(ctx.db.clone(), ctx.self_id)?;
         peers.rebuild_mst_from_disk().await?;
         let cluster_operations = ClusterOperationStore::new(ctx.db.clone())?;
+        let cluster_view = ClusterViewStore::new(ctx.db.clone())?;
 
         // Server-side session ticket store (anchor issues)
         let session_auth = crate::server::auth::AuthStore::new(ctx.db.clone())?;
@@ -258,6 +261,7 @@ impl Bootstrap {
         Ok(Stores {
             peers,
             cluster_operations,
+            cluster_view,
             session_auth,
             local_sessions,
             local_creds,
@@ -290,7 +294,20 @@ impl Bootstrap {
             async_channel::bounded(128);
         let (secret_tx, secret_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(128);
-        let cluster_view = ClusterViewState::legacy_default();
+        // Restore the last committed active view first; fallback to legacy view when absent.
+        let persisted_active_view = stores
+            .cluster_view
+            .read_active_view()
+            .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
+        let active_view = persisted_active_view.unwrap_or_else(ClusterViewId::legacy_default);
+        let cluster_view = ClusterViewState::new(active_view);
+        if persisted_active_view.is_some() {
+            info!(
+                target: "cluster_view",
+                active_view = %active_view,
+                "restored persisted active cluster view during startup"
+            );
+        }
 
         // gossip capability
         let gossip = crate::gossip::Gossip {
@@ -315,6 +332,7 @@ impl Bootstrap {
             sessions: stores.local_sessions.clone(),
             peers: stores.peers.clone(),
             cluster_operations: stores.cluster_operations.clone(),
+            cluster_view: stores.cluster_view.clone(),
             token_store: stores.token_store.clone(),
             secret_master_store: stores.secret_master_store.clone(),
             tasks: stores.tasks.clone(),

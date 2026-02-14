@@ -42,12 +42,12 @@ The system needs to be:
 ## Testing Guidelines
 
 - Framework: Tokio (`#[tokio::test]`) with helpers in `tests/common/testkit.rs` and `local_test!` macro.
-- Add new integration tests under `tests/` (e.g., `tests/<area>_*.rs`). Keep tests deterministic; avoid arbitrary sleeps—use helpers like `wait_roots_equal` and `assert_cluster_size`.
+- Add new integration tests under `tests/` (e.g., `tests/<area>_*.rs`). Keep tests deterministic; avoid arbitrary sleeps: use helpers like `wait_roots_equal` and `assert_cluster_size` to check convergence.
 - Scope tests by name: `cargo test register_node_tcp`.
 
 ## Commit & Pull Request Guidelines
 
-- Commit style: `<area>: <summary>` (examples: `topology: fix leave`, `store: refactor MST`, `tests: add testkit`). Keep messages imperative and concise.
+- Commit style: `<area>: <summary>` (examples: `topology: fix leave`, `store: refactor MST`, `tests: add testkit`). Keep messages imperative and concise. Lines should not exceed 80 characters.
 - PRs: include a clear description, motivation, and risks; link issues; add logs/screenshots if output changes. Run `cargo fmt`, `cargo clippy`, and `cargo test` before submitting. Note protocol/schema changes explicitly.
 
 ## Security & Configuration Tips

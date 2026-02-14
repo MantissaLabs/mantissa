@@ -35,6 +35,9 @@ use std::rc::Rc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Prefix used when commit-time active-view precondition checks reject stale operations.
+const COMMIT_PRECONDITION_FAILURE_PREFIX: &str = "cluster operation commit precondition failed";
+
 #[derive(Clone)]
 struct JoinPayload {
     id: Uuid,
@@ -1314,6 +1317,58 @@ impl Topology {
         }
     }
 
+    /// Resolves the active-view set accepted for commit-time side effects on this operation.
+    fn commit_precondition_views(
+        operation: &ClusterOperationRecord,
+    ) -> Result<Vec<ClusterViewId>, capnp::Error> {
+        let source_view = operation.source_views.first().copied().ok_or_else(|| {
+            capnp::Error::failed(format!("operation {} missing source view", operation.id))
+        })?;
+        let mut allowed_views = vec![source_view];
+        if operation.kind == ClusterOperationKind::Merge {
+            for target in operation.target_views.iter().copied() {
+                if !allowed_views.contains(&target) {
+                    allowed_views.push(target);
+                }
+            }
+        }
+        Ok(allowed_views)
+    }
+
+    /// Validates the operation still matches the current local active view before commit effects.
+    fn ensure_commit_precondition(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<(), capnp::Error> {
+        let active_view = self.active_cluster_view();
+        let allowed_views = Self::commit_precondition_views(operation)?;
+        if allowed_views.iter().any(|view| *view == active_view) {
+            return Ok(());
+        }
+
+        let allowed_render = allowed_views
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(capnp::Error::failed(format!(
+            "{COMMIT_PRECONDITION_FAILURE_PREFIX}: operation={} kind={:?} active_view={} allowed_views=[{}]",
+            operation.id, operation.kind, active_view, allowed_render
+        )))
+    }
+
+    /// Persists the active cluster view durably so finalized operations survive process restarts.
+    fn persist_active_cluster_view(&self, view: ClusterViewId) -> Result<(), capnp::Error> {
+        self.cluster_view_store
+            .write_active_view(view)
+            .map_err(|err| capnp::Error::failed(err.to_string()))
+    }
+
+    /// Returns true when an error represents a stale commit precondition mismatch.
+    fn is_commit_precondition_failure(err: &capnp::Error) -> bool {
+        err.to_string().contains(COMMIT_PRECONDITION_FAILURE_PREFIX)
+    }
+
     /// Persists a cluster operation record in the local durable operation store.
     fn persist_cluster_operation(&self, op: &ClusterOperationRecord) -> Result<(), capnp::Error> {
         let encoded = bincode::serialize(op).map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -1401,6 +1456,8 @@ impl Topology {
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
+        self.ensure_commit_precondition(operation)?;
+
         let transition = self.transition_for_operation(operation)?;
         let reports = self.run_transition_commit_hooks(&transition).await?;
         for report in reports {
@@ -1413,6 +1470,7 @@ impl Topology {
             );
         }
 
+        self.persist_active_cluster_view(transition.local_target_view)?;
         let previous = self.set_active_cluster_view(transition.local_target_view);
         self.registry.clear().await;
         info!(
@@ -1459,32 +1517,70 @@ impl Topology {
                     ClusterOperationStage::Prepared,
                     "prepared",
                 )?;
-                self.apply_committed_operation_side_effects(&operation)
-                    .await?;
-                self.update_cluster_operation_stage(
-                    &mut operation,
-                    ClusterOperationStage::Committed,
-                    &format!("committed active_view={}", self.active_cluster_view()),
-                )?;
-                self.update_cluster_operation_stage(
-                    &mut operation,
-                    ClusterOperationStage::Finalized,
-                    "finalized",
-                )?;
+                if let Err(err) = self
+                    .apply_committed_operation_side_effects(&operation)
+                    .await
+                {
+                    if Self::is_commit_precondition_failure(&err) {
+                        self.update_cluster_operation_stage(
+                            &mut operation,
+                            ClusterOperationStage::Aborted,
+                            &format!("aborted stale_precondition: {err}"),
+                        )?;
+                        warn!(
+                            target: "cluster_view",
+                            operation_id = %operation.id,
+                            stage = ?operation.stage,
+                            "aborted cluster operation due to commit precondition mismatch: {err}"
+                        );
+                    } else {
+                        return Err(err);
+                    }
+                } else {
+                    self.update_cluster_operation_stage(
+                        &mut operation,
+                        ClusterOperationStage::Committed,
+                        &format!("committed active_view={}", self.active_cluster_view()),
+                    )?;
+                    self.update_cluster_operation_stage(
+                        &mut operation,
+                        ClusterOperationStage::Finalized,
+                        "finalized",
+                    )?;
+                }
             }
             ClusterOperationStage::Prepared => {
-                self.apply_committed_operation_side_effects(&operation)
-                    .await?;
-                self.update_cluster_operation_stage(
-                    &mut operation,
-                    ClusterOperationStage::Committed,
-                    &format!("committed active_view={}", self.active_cluster_view()),
-                )?;
-                self.update_cluster_operation_stage(
-                    &mut operation,
-                    ClusterOperationStage::Finalized,
-                    "finalized",
-                )?;
+                if let Err(err) = self
+                    .apply_committed_operation_side_effects(&operation)
+                    .await
+                {
+                    if Self::is_commit_precondition_failure(&err) {
+                        self.update_cluster_operation_stage(
+                            &mut operation,
+                            ClusterOperationStage::Aborted,
+                            &format!("aborted stale_precondition: {err}"),
+                        )?;
+                        warn!(
+                            target: "cluster_view",
+                            operation_id = %operation.id,
+                            stage = ?operation.stage,
+                            "aborted cluster operation due to commit precondition mismatch: {err}"
+                        );
+                    } else {
+                        return Err(err);
+                    }
+                } else {
+                    self.update_cluster_operation_stage(
+                        &mut operation,
+                        ClusterOperationStage::Committed,
+                        &format!("committed active_view={}", self.active_cluster_view()),
+                    )?;
+                    self.update_cluster_operation_stage(
+                        &mut operation,
+                        ClusterOperationStage::Finalized,
+                        "finalized",
+                    )?;
+                }
             }
             ClusterOperationStage::Committed => {
                 self.update_cluster_operation_stage(
@@ -2100,7 +2196,17 @@ impl topology::Server for Topology {
                 if merged.kind == ClusterOperationKind::Merge
                     || self.active_cluster_view() != target
                 {
-                    self.apply_committed_operation_side_effects(&merged).await?;
+                    if let Err(err) = self.apply_committed_operation_side_effects(&merged).await {
+                        if Self::is_commit_precondition_failure(&err) {
+                            warn!(
+                                target: "cluster_view",
+                                operation_id = %merged.id,
+                                "skipped finalized operation side effects due to commit precondition mismatch: {err}"
+                            );
+                        } else {
+                            return Err(err);
+                        }
+                    }
                 }
             }
             ClusterOperationStage::Aborted => {}

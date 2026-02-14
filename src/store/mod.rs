@@ -1,4 +1,5 @@
 pub mod cluster_operation_store;
+pub mod cluster_view_store;
 pub mod local;
 pub mod local_credential_store;
 pub mod local_session_store;
