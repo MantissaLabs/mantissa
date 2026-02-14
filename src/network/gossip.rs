@@ -1,14 +1,20 @@
+use crate::dedupe::BoundedSeenCache;
 use crate::gossip::Message;
 use crate::network::controller::NetworkController;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::NetworkEvent;
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
-use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 use uuid::Uuid;
+
+/// Maximum number of network gossip identifiers retained for deduplication.
+const NETWORK_GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
+/// Time window used to suppress duplicate network gossip messages.
+const NETWORK_GOSSIP_DEDUPE_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Handles dissemination and application of network specification gossip events.
 #[derive(Clone)]
@@ -17,7 +23,7 @@ pub struct NetworkGossiper {
     controller: NetworkController,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
-    seen_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
+    seen_ids: Arc<AsyncMutex<BoundedSeenCache>>,
 }
 
 impl NetworkGossiper {
@@ -33,7 +39,10 @@ impl NetworkGossiper {
             controller,
             gossip_tx,
             gossip_rx,
-            seen_ids: Arc::new(AsyncMutex::new(HashSet::new())),
+            seen_ids: Arc::new(AsyncMutex::new(BoundedSeenCache::new(
+                NETWORK_GOSSIP_DEDUPE_MAX_ENTRIES,
+                NETWORK_GOSSIP_DEDUPE_TTL,
+            ))),
         }
     }
 
@@ -65,7 +74,7 @@ impl NetworkGossiper {
 
     async fn record_gossip_id(&self, id: Uuid) -> bool {
         let mut guard = self.seen_ids.lock().await;
-        guard.insert(id)
+        guard.record(id)
     }
 
     async fn apply_event(&self, event: NetworkEvent) -> Result<()> {

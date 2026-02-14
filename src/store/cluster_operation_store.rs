@@ -64,4 +64,24 @@ impl ClusterOperationStore {
 
         Ok(out)
     }
+
+    /// Deletes multiple operation payloads atomically and returns how many rows were removed.
+    pub fn delete_many(&self, ids: &[Uuid]) -> io::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let w = self.db.begin_write().map_err(ioerr)?;
+        let mut removed = 0usize;
+        {
+            let mut table = w.open_table(T_CLUSTER_OPERATIONS).map_err(ioerr)?;
+            for id in ids.iter().copied() {
+                if table.remove(*id.as_bytes()).map_err(ioerr)?.is_some() {
+                    removed = removed.saturating_add(1);
+                }
+            }
+        }
+        w.commit().map_err(ioerr)?;
+        Ok(removed)
+    }
 }

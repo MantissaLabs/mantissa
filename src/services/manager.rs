@@ -1,3 +1,4 @@
+use crate::dedupe::BoundedSeenCache;
 use crate::gossip::Message;
 use crate::registry::Registry;
 use crate::services::reconcile::{
@@ -42,6 +43,10 @@ const SERVICE_SLOT_MISSING_GRACE_SECS: u64 = 6;
 const SERVICE_REBALANCE_MIN_AGE_SECS: i64 = 20;
 /// Cooldown window between rebalance attempts for the same slot.
 const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
+/// Maximum number of service gossip identifiers retained for deduplication.
+const SERVICE_GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
+/// Time window used to suppress duplicate service gossip messages.
+const SERVICE_GOSSIP_DEDUPE_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone)]
 pub struct ServiceController {
@@ -50,7 +55,7 @@ pub struct ServiceController {
     cluster_registry: Registry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
-    seen_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
+    seen_ids: Arc<AsyncMutex<BoundedSeenCache>>,
     local_node_id: Uuid,
     health_monitor: Arc<HealthMonitor>,
     inflight_slots: Arc<AsyncMutex<HashSet<SlotKey>>>,
@@ -75,7 +80,10 @@ impl ServiceController {
             cluster_registry,
             gossip_tx,
             gossip_rx,
-            seen_ids: Arc::new(AsyncMutex::new(HashSet::new())),
+            seen_ids: Arc::new(AsyncMutex::new(BoundedSeenCache::new(
+                SERVICE_GOSSIP_DEDUPE_MAX_ENTRIES,
+                SERVICE_GOSSIP_DEDUPE_TTL,
+            ))),
             local_node_id,
             health_monitor,
             inflight_slots: Arc::new(AsyncMutex::new(HashSet::new())),
@@ -295,7 +303,7 @@ impl ServiceController {
 
     async fn record_gossip_id(&self, id: Uuid) -> bool {
         let mut guard = self.seen_ids.lock().await;
-        guard.insert(id)
+        guard.record(id)
     }
 
     /// Periodically checks services against task health to reschedule missing replicas.

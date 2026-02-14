@@ -9,6 +9,7 @@ pub mod cli;
 pub mod cluster;
 pub mod config;
 pub mod crypto;
+mod dedupe;
 pub mod gossip;
 pub mod gpu;
 pub mod logger;

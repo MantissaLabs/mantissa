@@ -855,6 +855,7 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),
         merge_service_policy: Default::default(),
+        updated_at_unix_ms: 1,
         details: "replay test operation".to_string(),
     };
 
@@ -923,6 +924,7 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),
         merge_service_policy: Default::default(),
+        updated_at_unix_ms: 1,
         details: "dry-run replay test operation".to_string(),
     };
 
@@ -1005,6 +1007,7 @@ local_test!(cluster_view_startup_restores_persisted_active_view, {
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),
         merge_service_policy: Default::default(),
+        updated_at_unix_ms: 17,
         details: "finalized startup restore operation".to_string(),
     };
 
@@ -1079,6 +1082,7 @@ local_test!(cluster_view_startup_restores_persisted_split_view, {
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),
         merge_service_policy: Default::default(),
+        updated_at_unix_ms: 22,
         details: "finalized split startup restore operation".to_string(),
     };
 
@@ -1151,6 +1155,7 @@ local_test!(
             split_service_policy: Default::default(),
             split_network_policy: Default::default(),
             merge_service_policy: Default::default(),
+            updated_at_unix_ms: 1,
             details: "first prepared merge".to_string(),
         };
         let second_operation = ClusterOperationRecord {
@@ -1164,6 +1169,7 @@ local_test!(
             split_service_policy: Default::default(),
             split_network_policy: Default::default(),
             merge_service_policy: Default::default(),
+            updated_at_unix_ms: 2,
             details: "second prepared merge".to_string(),
         };
 
@@ -1232,6 +1238,77 @@ local_test!(
         );
     }
 );
+
+// Validates startup retention GC prunes old terminal operation rows and keeps the newest subset.
+local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+    let source_view = ClusterViewId::legacy_default();
+    let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 1);
+    let total = 640usize;
+    let retained = 512usize;
+
+    for index in 0..total {
+        let operation = ClusterOperationRecord {
+            id: Uuid::new_v4(),
+            kind: StoredOperationKind::Merge,
+            stage: StoredOperationStage::Finalized,
+            dry_run: false,
+            source_views: vec![source_view],
+            target_views: vec![target_view],
+            split_assignments: Vec::new(),
+            split_service_policy: Default::default(),
+            split_network_policy: Default::default(),
+            merge_service_policy: Default::default(),
+            updated_at_unix_ms: (index as u64).saturating_add(1),
+            details: format!("gc finalized operation {index}"),
+        };
+        operation_store
+            .put(
+                operation.id,
+                &bincode::serialize(&operation).expect("serialize gc operation"),
+            )
+            .expect("persist gc operation");
+    }
+
+    let _node = HeadlessNode::new_with(
+        db,
+        Uuid::new_v4(),
+        HeadlessKeys::new(
+            Arc::new(NoiseKeys::from_private_bytes([0xD1; 32])),
+            ed25519_dalek::SigningKey::from_bytes(&[0xE1; 32]),
+        ),
+        HeadlessConfig::default(),
+    )
+    .await
+    .expect("start gc node");
+
+    sleep(Duration::from_millis(200)).await;
+
+    let persisted = operation_store
+        .list()
+        .expect("list operations after startup gc");
+    assert_eq!(
+        persisted.len(),
+        retained,
+        "startup GC should retain only the newest terminal operation rows"
+    );
+
+    let mut min_updated_at = u64::MAX;
+    for (_, payload) in persisted {
+        let operation: ClusterOperationRecord =
+            bincode::deserialize(&payload).expect("decode gc-retained operation");
+        min_updated_at = min_updated_at.min(operation.updated_at_unix_ms);
+    }
+
+    assert_eq!(
+        min_updated_at,
+        (total - retained + 1) as u64,
+        "startup GC should keep the newest finalized operations by update timestamp"
+    );
+});
 
 // Validates cluster view listing exposes the local active row and a non-zero member count.
 local_test!(cluster_view_lists_local_active_row, {

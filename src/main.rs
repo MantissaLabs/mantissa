@@ -8,6 +8,7 @@ mod cli;
 mod cluster;
 mod config;
 mod crypto;
+mod dedupe;
 mod gossip;
 mod gpu;
 mod logger;

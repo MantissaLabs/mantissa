@@ -32,11 +32,14 @@ use protocol::topology::{topology, topology_event};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Prefix used when commit-time active-view precondition checks reject stale operations.
 const COMMIT_PRECONDITION_FAILURE_PREFIX: &str = "cluster operation commit precondition failed";
+/// Number of finalized/aborted operation rows retained durably before old rows are garbage-collected.
+const CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT: usize = 512;
 
 #[derive(Clone)]
 struct JoinPayload {
@@ -1317,6 +1320,14 @@ impl Topology {
         }
     }
 
+    /// Returns the current UNIX timestamp in milliseconds for durable operation metadata updates.
+    fn now_unix_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or_default()
+    }
+
     /// Resolves the active-view set accepted for commit-time side effects on this operation.
     fn commit_precondition_views(
         operation: &ClusterOperationRecord,
@@ -1445,10 +1456,56 @@ impl Topology {
         detail: &str,
     ) -> Result<(), capnp::Error> {
         operation.stage = stage;
+        operation.updated_at_unix_ms = Self::now_unix_ms();
         if !detail.is_empty() {
             operation.details = format!("{} | {}", operation.details, detail);
         }
         self.persist_cluster_operation(operation)
+    }
+
+    /// Removes old terminal operations so the durable operation table stays bounded over long runtimes.
+    fn garbage_collect_cluster_operations(&self) -> Result<usize, capnp::Error> {
+        let mut terminal = self
+            .load_cluster_operations()?
+            .into_iter()
+            .filter(|operation| {
+                matches!(
+                    operation.stage,
+                    ClusterOperationStage::Finalized | ClusterOperationStage::Aborted
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if terminal.len() <= CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT {
+            return Ok(0);
+        }
+
+        terminal.sort_by(|left, right| {
+            right
+                .updated_at_unix_ms
+                .cmp(&left.updated_at_unix_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+
+        let to_delete = terminal
+            .into_iter()
+            .skip(CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT)
+            .map(|operation| operation.id)
+            .collect::<Vec<_>>();
+        let removed = self
+            .cluster_operations
+            .delete_many(&to_delete)
+            .map_err(|err| capnp::Error::failed(err.to_string()))?;
+        if removed > 0 {
+            info!(
+                target: "cluster_view",
+                removed,
+                retained = CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT,
+                "garbage-collected terminal cluster operations"
+            );
+        }
+
+        Ok(removed)
     }
 
     /// Applies local side effects for a committed operation, including active view switch.
@@ -1592,6 +1649,7 @@ impl Topology {
             ClusterOperationStage::Finalized | ClusterOperationStage::Aborted => {}
         }
 
+        let _ = self.garbage_collect_cluster_operations()?;
         drop(_guard);
 
         if !operation.dry_run {
@@ -1635,6 +1693,8 @@ impl Topology {
             replayed,
             "cluster operation startup replay complete"
         );
+
+        let _ = self.garbage_collect_cluster_operations()?;
 
         Ok(replayed)
     }
@@ -1974,6 +2034,7 @@ impl topology::Server for Topology {
             split_service_policy: SplitServicePolicy::default(),
             split_network_policy: SplitNetworkPolicy::default(),
             merge_service_policy,
+            updated_at_unix_ms: Self::now_unix_ms(),
             details: format!(
                 "merge proposed: source={source_view}, destination={destination_view}, dry_run={dry_run}, service_policy={merge_service_policy:?}"
             ),
@@ -2123,6 +2184,7 @@ impl topology::Server for Topology {
             split_service_policy,
             split_network_policy,
             merge_service_policy: MergeServicePolicy::default(),
+            updated_at_unix_ms: Self::now_unix_ms(),
             details: format!(
                 "split proposed: source={source_view}, dry_run={dry_run}, service_policy={split_service_policy:?}, network_policy={split_network_policy:?}, targets=[{}], assignments=[{}]",
                 detail_targets.join(", "),
@@ -2160,8 +2222,11 @@ impl topology::Server for Topology {
         let reader = params.get()?;
         let operation_id = Self::operation_id_from_data(reader.get_id()?)?;
         let payload = reader.get_payload()?;
-        let incoming: ClusterOperationRecord =
+        let mut incoming: ClusterOperationRecord =
             bincode::deserialize(payload).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        if incoming.updated_at_unix_ms == 0 {
+            incoming.updated_at_unix_ms = Self::now_unix_ms();
+        }
         if incoming.id != operation_id {
             return Err(capnp::Error::failed(format!(
                 "relayed operation id mismatch: envelope={operation_id}, payload={}",
@@ -2211,6 +2276,8 @@ impl topology::Server for Topology {
             }
             ClusterOperationStage::Aborted => {}
         }
+
+        let _ = self.garbage_collect_cluster_operations()?;
 
         Ok(())
     }

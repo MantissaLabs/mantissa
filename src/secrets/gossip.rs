@@ -1,13 +1,19 @@
+use crate::dedupe::BoundedSeenCache;
 use crate::gossip::Message;
 use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::SecretEvent;
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
-use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 use uuid::Uuid;
+
+/// Maximum number of secret gossip identifiers retained for deduplication.
+const SECRET_GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
+/// Time window used to suppress duplicate secret gossip messages.
+const SECRET_GOSSIP_DEDUPE_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Handles broadcasting and applying secret registry gossip events.
 #[derive(Clone)]
@@ -15,7 +21,7 @@ pub struct SecretReplicator {
     registry: SecretRegistry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
-    seen_ids: Arc<AsyncMutex<HashSet<Uuid>>>,
+    seen_ids: Arc<AsyncMutex<BoundedSeenCache>>,
 }
 
 impl SecretReplicator {
@@ -29,7 +35,10 @@ impl SecretReplicator {
             registry,
             gossip_tx,
             gossip_rx,
-            seen_ids: Arc::new(AsyncMutex::new(HashSet::new())),
+            seen_ids: Arc::new(AsyncMutex::new(BoundedSeenCache::new(
+                SECRET_GOSSIP_DEDUPE_MAX_ENTRIES,
+                SECRET_GOSSIP_DEDUPE_TTL,
+            ))),
         }
     }
 
@@ -73,6 +82,6 @@ impl SecretReplicator {
 
     async fn record_gossip_id(&self, id: Uuid) -> bool {
         let mut guard = self.seen_ids.lock().await;
-        guard.insert(id)
+        guard.record(id)
     }
 }

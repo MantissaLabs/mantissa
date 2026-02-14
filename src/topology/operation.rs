@@ -97,6 +97,9 @@ pub struct ClusterOperationRecord {
     pub split_network_policy: SplitNetworkPolicy,
     #[serde(default)]
     pub merge_service_policy: MergeServicePolicy,
+    /// Last mutation timestamp used for retention ordering and stale-row eviction.
+    #[serde(default)]
+    pub updated_at_unix_ms: u64,
     pub details: String,
 }
 
