@@ -64,6 +64,14 @@ impl SecretsService {
     fn replicator(&self) -> SecretReplicator {
         self.replicator.clone()
     }
+
+    /// Rejects secret mutations while split/merge topology operations are in progress.
+    fn ensure_mutation_allowed(&self, action: &str) -> Result<(), Error> {
+        if let Some(topology) = self.topology() {
+            topology.ensure_no_active_cluster_operation(action)?;
+        }
+        Ok(())
+    }
 }
 
 fn metadata_from_entries(
@@ -285,6 +293,8 @@ impl secrets::Server for SecretsService {
         params: secrets::CreateParams,
         mut results: secrets::CreateResults,
     ) -> Result<(), Error> {
+        self.ensure_mutation_allowed("create secrets")?;
+
         let registry = self.registry();
         let keyring = self.keyring();
 
@@ -352,6 +362,8 @@ impl secrets::Server for SecretsService {
         params: secrets::UpdateParams,
         mut results: secrets::UpdateResults,
     ) -> Result<(), Error> {
+        self.ensure_mutation_allowed("update secrets")?;
+
         let registry = self.registry();
         let keyring = self.keyring();
 
@@ -417,6 +429,8 @@ impl secrets::Server for SecretsService {
         params: secrets::DeleteParams,
         _results: secrets::DeleteResults,
     ) -> Result<(), Error> {
+        self.ensure_mutation_allowed("delete secrets")?;
+
         let registry = self.registry();
 
         let names = params.get()?.get_names()?;
@@ -514,6 +528,8 @@ impl secrets::Server for SecretsService {
         _params: secrets::RotateMasterKeyParams,
         mut results: secrets::RotateMasterKeyResults,
     ) -> Result<(), Error> {
+        self.ensure_mutation_allowed("rotate master key")?;
+
         let registry = self.registry();
         let keyring_handle = self.keyring();
         let master_store = self.master_store();

@@ -1368,6 +1368,65 @@ impl Topology {
         )))
     }
 
+    /// Returns the most recently updated non-finalized cluster operation, if any.
+    pub(crate) fn active_cluster_operation(
+        &self,
+    ) -> Result<Option<ClusterOperationRecord>, capnp::Error> {
+        let mut active = self
+            .load_cluster_operations()?
+            .into_iter()
+            .filter(|operation| {
+                !operation.dry_run
+                    && matches!(
+                        operation.stage,
+                        ClusterOperationStage::Proposed
+                            | ClusterOperationStage::Prepared
+                            | ClusterOperationStage::Committed
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        active.sort_by(|left, right| {
+            right
+                .updated_at_unix_ms
+                .cmp(&left.updated_at_unix_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+
+        Ok(active.into_iter().next())
+    }
+
+    /// Rejects one mutating action while a split/merge operation is still in progress.
+    pub(crate) fn ensure_no_active_cluster_operation(
+        &self,
+        action: &str,
+    ) -> Result<(), capnp::Error> {
+        let Some(operation) = self.active_cluster_operation()? else {
+            return Ok(());
+        };
+
+        Err(capnp::Error::failed(format!(
+            "cannot {action} while cluster operation {} ({:?}/{:?}) is in progress",
+            operation.id, operation.kind, operation.stage
+        )))
+    }
+
+    /// Rejects peer joins during active split operations to avoid assignment ambiguity.
+    pub(crate) fn ensure_join_allowed(&self) -> Result<(), capnp::Error> {
+        let Some(operation) = self.active_cluster_operation()? else {
+            return Ok(());
+        };
+
+        if operation.kind == ClusterOperationKind::Split {
+            return Err(capnp::Error::failed(format!(
+                "cannot register peer while split operation {} ({:?}) is in progress",
+                operation.id, operation.stage
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Persists the active cluster view durably so finalized operations survive process restarts.
     fn persist_active_cluster_view(&self, view: ClusterViewId) -> Result<(), capnp::Error> {
         self.cluster_view_store
@@ -2003,6 +2062,8 @@ impl topology::Server for Topology {
         params: topology::MergeClustersParams,
         mut results: topology::MergeClustersResults,
     ) -> Result<(), capnp::Error> {
+        self.ensure_no_active_cluster_operation("start merge operation")?;
+
         let req = params.get()?.get_req()?;
         let source_view =
             ClusterViewId::from_capnp(req.get_source_view()?).map_err(capnp::Error::failed)?;
@@ -2066,6 +2127,8 @@ impl topology::Server for Topology {
         params: topology::SplitClusterParams,
         mut results: topology::SplitClusterResults,
     ) -> Result<(), capnp::Error> {
+        self.ensure_no_active_cluster_operation("start split operation")?;
+
         let req = params.get()?.get_req()?;
         let source_view =
             ClusterViewId::from_capnp(req.get_source_view()?).map_err(capnp::Error::failed)?;
@@ -2232,6 +2295,14 @@ impl topology::Server for Topology {
                 "relayed operation id mismatch: envelope={operation_id}, payload={}",
                 incoming.id
             )));
+        }
+        if let Some(active) = self.active_cluster_operation()? {
+            if active.id != operation_id {
+                return Err(capnp::Error::failed(format!(
+                    "cannot accept operation {operation_id} while operation {} ({:?}/{:?}) is in progress",
+                    active.id, active.kind, active.stage
+                )));
+            }
         }
 
         let merged = match self.load_cluster_operation(operation_id)? {

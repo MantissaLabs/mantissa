@@ -4,6 +4,7 @@ use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSecretFile,
     TaskSecretReference, TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStateKind,
 };
+use crate::topology::Topology;
 use capnp::Error;
 use capnp::struct_list;
 use protocol::gossip::gossip_message;
@@ -390,11 +391,12 @@ fn read_id_from_data(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
 #[derive(Clone)]
 pub struct TaskService {
     manager: TaskManager,
+    topology: Topology,
 }
 
 impl TaskService {
-    pub fn new(manager: TaskManager) -> Self {
-        Self { manager }
+    pub fn new(manager: TaskManager, topology: Topology) -> Self {
+        Self { manager, topology }
     }
 }
 
@@ -404,6 +406,9 @@ impl task::Server for TaskService {
         params: task::StartParams,
         mut results: task::StartResults,
     ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("start tasks")?;
+
         let req = params.get()?.get_request()?;
         let name = req.get_name()?.to_str()?.to_string();
         let image = req.get_image()?.to_str()?.to_string();
@@ -480,6 +485,9 @@ impl task::Server for TaskService {
         params: task::StartManyParams,
         mut results: task::StartManyResults,
     ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("start tasks")?;
+
         let list = params.get()?.get_requests()?;
         let mut requests = Vec::with_capacity(list.len() as usize);
 
@@ -574,6 +582,9 @@ impl task::Server for TaskService {
         params: task::StopParams,
         mut results: task::StopResults,
     ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("stop tasks")?;
+
         let req = params.get()?.get_request()?;
         let id = read_id_from_data(req.get_id()?)?;
 

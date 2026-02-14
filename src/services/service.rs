@@ -6,6 +6,7 @@ use crate::services::types::{
     ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
 };
 use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
+use crate::topology::Topology;
 use capnp::Error;
 use capnp::struct_list;
 use protocol::services::{service_event, service_spec, services, task_template};
@@ -17,11 +18,12 @@ use uuid::Uuid;
 
 pub struct ServicesRPC {
     manager: ServiceController,
+    topology: Topology,
 }
 
 impl ServicesRPC {
-    pub fn new(manager: ServiceController) -> Self {
-        Self { manager }
+    pub fn new(manager: ServiceController, topology: Topology) -> Self {
+        Self { manager, topology }
     }
 }
 
@@ -125,6 +127,9 @@ impl services::Server for ServicesRPC {
         params: services::DeployParams,
         mut results: services::DeployResults,
     ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("deploy services")?;
+
         let request = params.get()?;
         let spec = request.get_spec()?;
 
@@ -171,6 +176,9 @@ impl services::Server for ServicesRPC {
         params: services::DeleteParams,
         _results: services::DeleteResults,
     ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("delete services")?;
+
         let ids = params.get()?.get_ids()?;
         for entry in ids.iter() {
             let id = read_uuid(entry?)?;

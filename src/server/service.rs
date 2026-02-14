@@ -27,6 +27,8 @@ impl protocol::server::Server for Server {
             return Err(capnp::Error::failed("invalid join token".to_string()));
         }
 
+        self.topology.ensure_join_allowed()?;
+
         let joiner_id = id::read_node_id(info.get_id()?)?;
         if joiner_id == self.id {
             return Err(capnp::Error::failed("cannot join self".to_string()));

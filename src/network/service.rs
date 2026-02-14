@@ -6,6 +6,7 @@ use crate::network::types::{
     NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecUpdate, NetworkSpecValue, NetworkStatus,
     compute_network_id,
 };
+use crate::topology::Topology;
 use capnp::Error;
 use protocol::network::{
     network_attachment_spec, network_create_spec, network_event, network_peer_status, network_spec,
@@ -21,6 +22,7 @@ pub struct NetworksRpc {
     registry: NetworkRegistry,
     gossiper: NetworkGossiper,
     controller: NetworkController,
+    topology: Topology,
 }
 
 impl NetworksRpc {
@@ -29,11 +31,13 @@ impl NetworksRpc {
         registry: NetworkRegistry,
         gossiper: NetworkGossiper,
         controller: NetworkController,
+        topology: Topology,
     ) -> Self {
         Self {
             registry,
             gossiper,
             controller,
+            topology,
         }
     }
 
@@ -303,6 +307,9 @@ impl networks::Server for NetworksRpc {
         params: networks::CreateParams,
         mut results: networks::CreateResults,
     ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("create or update networks")?;
+
         let request = params.get()?;
         let spec_reader = request.get_spec()?;
 
@@ -384,6 +391,9 @@ impl networks::Server for NetworksRpc {
         params: networks::DeleteParams,
         _results: networks::DeleteResults,
     ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("delete networks")?;
+
         let ids_reader = params.get()?.get_ids()?;
         for entry in ids_reader.iter() {
             let uuid = read_uuid(entry?)?;

@@ -496,13 +496,14 @@ impl Bootstrap {
             ctx.self_id,
             health_monitor.clone(),
         );
-        let services_service = ServicesRPC::new(service_controller.clone());
+        let services_service = ServicesRPC::new(service_controller.clone(), topology.clone());
         let services_client_cap = capnp_rpc::new_client(services_service);
 
         let networks_service = NetworksRpc::new(
             network_registry.clone(),
             network_gossiper.clone(),
             network_controller.clone(),
+            topology.clone(),
         );
         let networks_client_cap: NetworksClient = capnp_rpc::new_client(networks_service);
 
@@ -549,9 +550,10 @@ impl Bootstrap {
     pub(crate) fn build_server(ctx: &Bootstrap, stores: &Stores, comps: &Components) -> Server {
         let mut config = Config::new();
         let config = config.with_listen_addr(ctx.listen_addr.clone()).build();
+        let topology = comps.topology.clone();
 
         let task_manager = comps.task_manager.clone();
-        let task_service = TaskService::new(task_manager.clone());
+        let task_service = TaskService::new(task_manager.clone(), topology.clone());
         let task_client = capnp_rpc::new_client(task_service);
 
         let clients = ServerClients {
@@ -571,8 +573,6 @@ impl Bootstrap {
             session_store: stores.session_auth.clone(),
             secret_keyring: stores.secret_keyring.clone(),
         };
-
-        let topology = comps.topology.clone();
 
         Server::new(
             ctx.self_id,

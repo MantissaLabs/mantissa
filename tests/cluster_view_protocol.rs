@@ -85,6 +85,38 @@ async fn wait_for_cluster_view(
     }
 }
 
+async fn current_cluster_view(
+    topology: &mantissa::topology_capnp::topology::Client,
+) -> ClusterViewId {
+    let response = topology
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let view = response
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    ClusterViewId::from_capnp(view).expect("decode current view")
+}
+
+async fn submit_cluster_operation_record(
+    topology: &mantissa::topology_capnp::topology::Client,
+    operation: &ClusterOperationRecord,
+) {
+    let payload = bincode::serialize(operation).expect("serialize cluster operation");
+    let mut request = topology.submit_cluster_operation_request();
+    request.get().set_id(operation.id.as_bytes());
+    request.get().set_payload(&payload);
+    request
+        .send()
+        .promise
+        .await
+        .expect("submitClusterOperation send");
+}
+
 // Validates strict view-scoped protocol behavior for sync and topology.
 local_test!(cluster_view_protocol_strict_inproc, {
     let node = TestNode::new_with_tick_ms(100).await;
@@ -1863,4 +1895,108 @@ local_test!(cluster_view_split_selector_with_fallback_target, {
 
     wait_for_cluster_view(&joiner.topology(), selected_view, Duration::from_secs(5)).await;
     wait_for_cluster_view(&anchor.topology(), fallback_view, Duration::from_secs(5)).await;
+});
+
+// Validates the topology API rejects concurrent merge/split submissions while one operation is active.
+local_test!(cluster_view_rejects_concurrent_operation_submission, {
+    let node = TestNode::new_with_tick_ms(100).await;
+    let source_view = current_cluster_view(&node.topology()).await;
+
+    // Intentionally malformed split operation: missing split assignments keeps it stuck in Prepared.
+    let active_operation = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Split,
+        stage: StoredOperationStage::Proposed,
+        dry_run: false,
+        source_views: vec![source_view],
+        target_views: vec![ClusterViewId::new(
+            source_view.cluster_id,
+            source_view.epoch.saturating_add(1),
+        )],
+        split_assignments: Vec::new(),
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
+        updated_at_unix_ms: 1,
+        details: "malformed split operation for fence validation".to_string(),
+    };
+    submit_cluster_operation_record(&node.topology(), &active_operation).await;
+
+    wait_for_operation_stage(
+        &node.topology(),
+        active_operation.id.as_bytes(),
+        ClusterOperationStage::Prepared,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let mut merge_req = node.topology().merge_clusters_request();
+    {
+        let mut req = merge_req.get().init_req();
+        source_view.write_capnp(req.reborrow().init_source_view());
+        ClusterViewId::new(source_view.cluster_id, source_view.epoch.saturating_add(2))
+            .write_capnp(req.reborrow().init_destination_view());
+        req.set_dry_run(true);
+    }
+
+    let merge_err = match merge_req.send().promise.await {
+        Ok(_) => panic!("merge should be fenced by active operation"),
+        Err(err) => err,
+    };
+    let merge_msg = merge_err.to_string();
+    assert!(
+        merge_msg.contains("cannot start merge operation"),
+        "unexpected concurrent merge rejection: {merge_msg}"
+    );
+});
+
+// Validates join admission is rejected while an active split operation is in progress.
+local_test!(cluster_view_rejects_join_while_split_in_progress, {
+    let anchor = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner = TestNode::new_tcp_with_tick_ms(100).await;
+    let source_view = current_cluster_view(&anchor.topology()).await;
+
+    // Intentionally malformed split operation: missing split assignments keeps it stuck in Prepared.
+    let active_split = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Split,
+        stage: StoredOperationStage::Proposed,
+        dry_run: false,
+        source_views: vec![source_view],
+        target_views: vec![ClusterViewId::new(
+            source_view.cluster_id,
+            source_view.epoch.saturating_add(1),
+        )],
+        split_assignments: Vec::new(),
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
+        updated_at_unix_ms: 1,
+        details: "malformed split operation for join admission fence validation".to_string(),
+    };
+    submit_cluster_operation_record(&anchor.topology(), &active_split).await;
+
+    wait_for_operation_stage(
+        &anchor.topology(),
+        active_split.id.as_bytes(),
+        ClusterOperationStage::Prepared,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let token = anchor
+        .node
+        .current_join_token()
+        .await
+        .expect("fetch join token");
+    let err = joiner
+        .node
+        .join_anchor_addr(&anchor.addr(), &token)
+        .await
+        .expect_err("join should be rejected while split is active");
+    let message = err.to_string();
+    assert!(
+        message.contains("cannot register peer while split operation"),
+        "unexpected join rejection message: {message}"
+    );
 });
