@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ContainerState {
     Pending,
+    Pulling,
     Creating,
     Running,
     Paused,

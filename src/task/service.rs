@@ -18,6 +18,7 @@ use uuid::Uuid;
 fn state_to_str(state: &ContainerState) -> String {
     match state {
         ContainerState::Pending => "pending".to_string(),
+        ContainerState::Pulling => "pulling".to_string(),
         ContainerState::Creating => "creating".to_string(),
         ContainerState::Running => "running".to_string(),
         ContainerState::Paused => "paused".to_string(),
@@ -32,6 +33,7 @@ fn state_to_str(state: &ContainerState) -> String {
 fn state_from_str(input: &str) -> ContainerState {
     match input {
         "pending" => ContainerState::Pending,
+        "pulling" => ContainerState::Pulling,
         "creating" => ContainerState::Creating,
         "running" => ContainerState::Running,
         "paused" => ContainerState::Paused,
@@ -171,6 +173,8 @@ pub fn add_event(
             spec_builder.set_state("unknown");
             spec_builder.set_created_at("");
             spec_builder.set_updated_at("");
+            spec_builder.set_phase_reason("");
+            spec_builder.set_phase_progress("");
             spec_builder.set_node_id(&[0u8; 16]);
             spec_builder.set_node_name("");
             spec_builder.reborrow().init_slot_ids(0);
@@ -209,6 +213,8 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     builder.set_state(state_to_str(&spec.state));
     builder.set_created_at(&spec.created_at);
     builder.set_updated_at(&spec.updated_at);
+    builder.set_phase_reason(spec.phase_reason.as_deref().unwrap_or(""));
+    builder.set_phase_progress(spec.phase_progress.as_deref().unwrap_or(""));
     builder.set_node_id(spec.node_id.as_bytes());
     builder.set_node_name(&spec.node_name);
 
@@ -279,6 +285,8 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     let state = reader.get_state()?.to_str()?;
     let created_at = reader.get_created_at()?.to_str()?.to_string();
     let updated_at = reader.get_updated_at()?.to_str()?.to_string();
+    let phase_reason = reader.get_phase_reason()?.to_str()?.to_string();
+    let phase_progress = reader.get_phase_progress()?.to_str()?.to_string();
     let node_bytes = reader.get_node_id()?.to_owned();
     let node_slice: [u8; 16] = node_bytes
         .as_slice()
@@ -351,6 +359,16 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         name,
         image,
         state: state_from_str(state),
+        phase_reason: if phase_reason.is_empty() {
+            None
+        } else {
+            Some(phase_reason)
+        },
+        phase_progress: if phase_progress.is_empty() {
+            None
+        } else {
+            Some(phase_progress)
+        },
         created_at,
         updated_at,
         command,

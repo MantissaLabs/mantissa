@@ -5,6 +5,8 @@ use anyhow::{Context, anyhow};
 use async_channel::Sender;
 use chrono::Utc;
 use crdt_store::uuid_key::UuidKey;
+use rand::Rng;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -34,6 +36,17 @@ struct RuntimeInventory {
     container_ids: HashSet<String>,
 }
 
+/// Per-attempt timeout applied to one image pull request.
+const IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Maximum number of pull attempts before failing task startup.
+const IMAGE_PULL_MAX_ATTEMPTS: usize = 3;
+/// Base delay for pull retry backoff.
+const IMAGE_PULL_RETRY_BASE_MS: u64 = 250;
+/// Maximum bounded delay for pull retry backoff.
+const IMAGE_PULL_RETRY_MAX_MS: u64 = 5_000;
+/// Random jitter added to each pull retry delay.
+const IMAGE_PULL_RETRY_JITTER_MS: u64 = 250;
+
 impl TaskManager {
     /// Persists a task snapshot in the backing store.
     pub(super) async fn persist_spec(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
@@ -42,6 +55,8 @@ impl TaskManager {
             name: spec.name.clone(),
             image: spec.image.clone(),
             state: spec.state.clone(),
+            phase_reason: spec.phase_reason.clone(),
+            phase_progress: spec.phase_progress.clone(),
             created_at: spec.created_at.clone(),
             updated_at: spec.updated_at.clone(),
             command: spec.command.clone(),
@@ -73,6 +88,92 @@ impl TaskManager {
             .await
             .map_err(|e| anyhow::anyhow!("task remove failed: {e}"))?;
         Ok(())
+    }
+
+    /// Updates one task lifecycle state/phase snapshot and gossips it when changed.
+    pub(super) async fn update_task_phase(
+        &self,
+        task_id: Uuid,
+        state: ContainerState,
+        phase_reason: Option<String>,
+        phase_progress: Option<String>,
+    ) -> Result<TaskSpec, anyhow::Error> {
+        let mut spec = self.load_spec(task_id).await?;
+        let next_reason = phase_reason.filter(|value| !value.trim().is_empty());
+        let next_progress = phase_progress.filter(|value| !value.trim().is_empty());
+
+        if spec.state == state
+            && spec.phase_reason == next_reason
+            && spec.phase_progress == next_progress
+        {
+            return Ok(spec);
+        }
+
+        spec.state = state;
+        spec.phase_reason = next_reason;
+        spec.phase_progress = next_progress;
+        spec.updated_at = Utc::now().to_rfc3339();
+        self.persist_spec(&spec).await?;
+        self.enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+            .await?;
+        Ok(spec)
+    }
+
+    /// Pulls one image with timeout, bounded node-local concurrency, and jittered retries.
+    pub(super) async fn pull_image_for_task(
+        &self,
+        task_id: Uuid,
+        image: &str,
+    ) -> Result<(), anyhow::Error> {
+        let _permit = self
+            .pull_limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("image pull limiter closed"))?;
+
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for attempt in 1..=IMAGE_PULL_MAX_ATTEMPTS {
+            let _ = self
+                .update_task_phase(
+                    task_id,
+                    ContainerState::Pulling,
+                    Some("pulling image".to_string()),
+                    Some(format!("{attempt}/{IMAGE_PULL_MAX_ATTEMPTS}")),
+                )
+                .await;
+
+            match timeout(IMAGE_PULL_TIMEOUT, self.container_manager.pull_image(image)).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(err)) => {
+                    last_error = Some(anyhow::Error::new(err));
+                }
+                Err(elapsed) => {
+                    last_error = Some(anyhow!(
+                        "image pull timeout after {:?}: {elapsed}",
+                        IMAGE_PULL_TIMEOUT
+                    ));
+                }
+            }
+
+            if attempt < IMAGE_PULL_MAX_ATTEMPTS {
+                let backoff = image_pull_retry_backoff(attempt);
+                let _ = self
+                    .update_task_phase(
+                        task_id,
+                        ContainerState::Pulling,
+                        Some("pull retry backoff".to_string()),
+                        Some(format!("{attempt}/{IMAGE_PULL_MAX_ATTEMPTS}")),
+                    )
+                    .await;
+                sleep(backoff).await;
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow!("image pull failed without detailed error"))
+            .context(format!("docker pull failed for image {image}")))
     }
 
     fn tx(&self) -> Sender<Message> {
@@ -293,6 +394,8 @@ impl TaskManager {
         let mut updated = spec.clone();
         if !matches!(spec.state, ContainerState::Stopping) {
             updated.state = ContainerState::Stopping;
+            updated.phase_reason = None;
+            updated.phase_progress = None;
             updated.updated_at = Utc::now().to_rfc3339();
             self.persist_spec(&updated).await?;
             self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
@@ -358,6 +461,8 @@ impl TaskManager {
         }
 
         updated.state = ContainerState::Stopped;
+        updated.phase_reason = None;
+        updated.phase_progress = None;
         updated.updated_at = Utc::now().to_rfc3339();
         if !spec.slot_ids.is_empty() {
             for slot_id in &spec.slot_ids {
@@ -437,6 +542,8 @@ impl TaskManager {
         }
 
         spec.state = ContainerState::Failed;
+        spec.phase_reason = None;
+        spec.phase_progress = None;
         spec.updated_at = Utc::now().to_rfc3339();
 
         if let Err(err) = self.persist_spec(&spec).await {
@@ -600,6 +707,8 @@ impl TaskManager {
                         "running task container missing locally; restarting task runtime"
                     );
                     working.state = ContainerState::Pending;
+                    working.phase_reason = None;
+                    working.phase_progress = None;
                     working.updated_at = Utc::now().to_rfc3339();
                     self.persist_spec(&working).await?;
                     if let Err(err) = self
@@ -637,9 +746,26 @@ impl TaskManager {
             ));
         }
 
-        // Drive a single state transition to `Creating` so peers observe progress exactly once.
-        if !matches!(working.state, ContainerState::Creating) {
+        if let Err(err) = self.pull_image_for_task(working.id, &working.image).await {
+            let err = self.mark_task_failed(working, err).await;
+            return Err(err);
+        }
+
+        // Drive a single state transition to `Creating` once image pull has completed.
+        working = self.load_spec(working.id).await.unwrap_or(working);
+        if matches!(
+            working.state,
+            ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
+        ) {
+            return Ok(());
+        }
+        if !matches!(working.state, ContainerState::Creating)
+            || working.phase_reason.is_some()
+            || working.phase_progress.is_some()
+        {
             working.state = ContainerState::Creating;
+            working.phase_reason = None;
+            working.phase_progress = None;
             working.updated_at = Utc::now().to_rfc3339();
             self.persist_spec(&working).await?;
             if let Err(err) = self
@@ -652,16 +778,6 @@ impl TaskManager {
                     working.id
                 );
             }
-        }
-
-        if let Err(err) = self
-            .container_manager
-            .pull_image(&working.image)
-            .await
-            .with_context(|| format!("docker pull failed for image {}", working.image))
-        {
-            let err = self.mark_task_failed(working, err).await;
-            return Err(err);
         }
 
         let restart_policy = working
@@ -918,6 +1034,8 @@ impl TaskManager {
         }
 
         working.state = ContainerState::Running;
+        working.phase_reason = None;
+        working.phase_progress = None;
         working.created_at = Utc::now().to_rfc3339();
         working.updated_at = Utc::now().to_rfc3339();
         working.node_id = self.local_node_id;
@@ -1093,6 +1211,8 @@ impl TaskManager {
         if matches!(working.state, ContainerState::Stopped) {
             // Force a stop pass even if the persisted state already says "stopped".
             working.state = ContainerState::Stopping;
+            working.phase_reason = None;
+            working.phase_progress = None;
         }
         let _ = self.perform_local_stop(working).await?;
         Ok(())
@@ -1101,7 +1221,7 @@ impl TaskManager {
     /// Reconciles the desired state of a locally owned task with the actual container state.
     pub(super) async fn reconcile_local_task(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
         match spec.state {
-            ContainerState::Pending | ContainerState::Creating => {
+            ContainerState::Pending | ContainerState::Pulling | ContainerState::Creating => {
                 self.ensure_task_running(spec).await
             }
             ContainerState::Running => self.ensure_task_running(spec).await,
@@ -1733,11 +1853,22 @@ fn task_requires_slots(state: &ContainerState) -> bool {
     matches!(
         state,
         ContainerState::Pending
+            | ContainerState::Pulling
             | ContainerState::Creating
             | ContainerState::Running
             | ContainerState::Paused
             | ContainerState::Stopping
     )
+}
+
+/// Computes bounded exponential backoff with jitter for image pull retries.
+fn image_pull_retry_backoff(attempt: usize) -> Duration {
+    let exp = attempt.saturating_sub(1).min(5) as u32;
+    let factor = 1u64 << exp;
+    let base = (IMAGE_PULL_RETRY_BASE_MS * factor).min(IMAGE_PULL_RETRY_MAX_MS);
+    let mut rng = rand::rng();
+    let jitter = rng.random_range(0..=IMAGE_PULL_RETRY_JITTER_MS);
+    Duration::from_millis(base + jitter)
 }
 
 /// Extract a stable revision timestamp to compare attachment freshness.

@@ -47,6 +47,9 @@ struct MockContainerManager {
     inspect: Arc<AsyncMutex<HashMap<String, bollard::service::ContainerInspectResponse>>>,
     inspect_calls: Arc<AsyncMutex<Vec<String>>>,
     listed: Arc<AsyncMutex<Vec<crate::task::docker::ContainerInfo>>>,
+    pull_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
+    pull_calls: Arc<AsyncMutex<Vec<String>>>,
+    pull_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
 }
 
 #[async_trait]
@@ -138,7 +141,15 @@ impl ContainerManager for MockContainerManager {
             .ok_or_else(|| crate::task::docker::ContainerError::NotFound(container_id.into()))
     }
 
-    async fn pull_image(&self, _image: &str) -> crate::task::docker::ContainerResult<()> {
+    async fn pull_image(&self, image: &str) -> crate::task::docker::ContainerResult<()> {
+        self.pull_calls.lock().await.push(image.to_string());
+        let delay = *self.pull_delay.lock().await;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if let Some(err) = self.pull_errors.lock().await.pop_front() {
+            return Err(err);
+        }
         Ok(())
     }
 }
@@ -434,6 +445,66 @@ async fn start_container_reserves_slot_and_records_resources() {
 }
 
 #[tokio::test]
+async fn pull_image_for_task_retries_and_tracks_phase_progress() {
+    let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let spec = TaskSpec {
+        id: Uuid::new_v4(),
+        name: "pull-retry".into(),
+        image: "img".into(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: Vec::new(),
+        node_id: manager.local_node_id,
+        node_name: "local-node".into(),
+        slot_ids: vec![1],
+        slot_id: Some(1),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+    };
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    {
+        let mut errors = mock_cm.pull_errors.lock().await;
+        errors.push_back(crate::task::docker::ContainerError::OperationFailed(
+            "temporary pull failure #1".into(),
+        ));
+        errors.push_back(crate::task::docker::ContainerError::OperationFailed(
+            "temporary pull failure #2".into(),
+        ));
+    }
+
+    manager
+        .pull_image_for_task(spec.id, &spec.image)
+        .await
+        .expect("pull should succeed after retries");
+
+    let pull_calls = mock_cm.pull_calls.lock().await.clone();
+    assert_eq!(pull_calls.len(), 3, "pull should retry twice then succeed");
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load refreshed task");
+    assert!(
+        matches!(refreshed.state, ContainerState::Pulling),
+        "task should remain in pulling phase until create starts"
+    );
+    assert_eq!(refreshed.phase_progress.as_deref(), Some("3/3"));
+    assert_eq!(refreshed.phase_reason.as_deref(), Some("pulling image"));
+}
+
+#[tokio::test]
 async fn reconcile_rejects_missing_slot_assignments() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
@@ -442,6 +513,8 @@ async fn reconcile_rejects_missing_slot_assignments() {
         name: "orphan".into(),
         image: "img".into(),
         state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: Vec::new(),
@@ -1162,6 +1235,8 @@ async fn task_owned_locally_detects_remote_entries() {
         name: "remote".to_string(),
         image: "img".to_string(),
         state: ContainerState::Running,
+        phase_reason: None,
+        phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: vec![],
@@ -1573,6 +1648,8 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
         name: "remote-task".to_string(),
         image: "img".to_string(),
         state: ContainerState::Running,
+        phase_reason: None,
+        phase_progress: None,
         created_at: now.clone(),
         updated_at: now.clone(),
         command: vec![],

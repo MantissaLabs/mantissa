@@ -25,7 +25,7 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc::UnboundedSender};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore, mpsc::UnboundedSender};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -44,6 +44,9 @@ use self::planner::{RemoteStartPlan, SchedulingError};
 use self::reservation::{ExecutionError, RemoteReservation, ReservedResources};
 use self::secrets::TaskSecretArtifacts;
 
+/// Maximum number of concurrent image pulls executed per node.
+const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
+
 #[derive(Clone)]
 pub struct TaskManager {
     store: TaskStore,
@@ -55,6 +58,7 @@ pub struct TaskManager {
     container_manager: Arc<dyn ContainerManager + Send + Sync>,
     local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
     inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
+    pull_limiter: Arc<Semaphore>,
     registry: Registry,
     secret_registry: SecretRegistry,
     secret_keyring: Arc<RwLock<SecretKeyring>>,
@@ -145,6 +149,7 @@ impl TaskManager {
             container_manager,
             local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
             inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
+            pull_limiter: Arc::new(Semaphore::new(IMAGE_PULL_MAX_CONCURRENCY)),
             registry,
             network_registry,
             secret_registry,
@@ -451,6 +456,8 @@ impl TaskManager {
 
         let mut updated = spec.clone();
         updated.state = ContainerState::Stopping;
+        updated.phase_reason = None;
+        updated.phase_progress = None;
         updated.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(&updated).await?;
         self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
@@ -739,6 +746,7 @@ fn task_state_rank(state: &ContainerState) -> u8 {
     match state {
         ContainerState::Running => 6,
         ContainerState::Creating => 5,
+        ContainerState::Pulling => 5,
         ContainerState::Pending => 4,
         ContainerState::Stopping => 3,
         ContainerState::Stopped => 2,
@@ -790,6 +798,8 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         name: value.name,
         image: value.image,
         state: value.state,
+        phase_reason: value.phase_reason,
+        phase_progress: value.phase_progress,
         created_at: value.created_at,
         updated_at: value.updated_at,
         command: value.command,

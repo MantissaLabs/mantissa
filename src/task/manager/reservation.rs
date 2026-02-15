@@ -537,6 +537,8 @@ impl TaskManager {
                 name: plan.name.clone(),
                 image: plan.image.clone(),
                 state: ContainerState::Pending,
+                phase_reason: None,
+                phase_progress: None,
                 created_at: Utc::now().to_rfc3339(),
                 updated_at: Utc::now().to_rfc3339(),
                 command: plan.command.clone(),

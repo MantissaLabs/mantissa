@@ -87,6 +87,12 @@ struct TaskSpec {
 
   gpuDeviceIds @18 :List(Text);
   # Allocated GPU device identifiers (UUIDs preferred).
+
+  phaseReason @19 :Text;
+  # Optional current lifecycle phase reason (for example image pull retry/backoff details).
+
+  phaseProgress @20 :Text;
+  # Optional current lifecycle phase progress marker.
 }
 
 struct ServiceMetadata {

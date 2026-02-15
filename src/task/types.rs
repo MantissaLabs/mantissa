@@ -10,6 +10,10 @@ pub struct TaskSpec {
     pub name: String,
     pub image: String,
     pub state: ContainerState,
+    #[serde(default)]
+    pub phase_reason: Option<String>,
+    #[serde(default)]
+    pub phase_progress: Option<String>,
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
@@ -63,6 +67,8 @@ impl TaskStateKind {
     pub fn from_container(state: &ContainerState) -> Self {
         match state {
             ContainerState::Pending => TaskStateKind::Pending,
+            // Pulling is an in-flight launch phase and should be grouped with creating filters.
+            ContainerState::Pulling => TaskStateKind::Creating,
             ContainerState::Creating => TaskStateKind::Creating,
             ContainerState::Running => TaskStateKind::Running,
             ContainerState::Paused => TaskStateKind::Paused,
@@ -132,6 +138,10 @@ pub struct TaskValue {
     pub name: String,
     pub image: String,
     pub state: ContainerState,
+    #[serde(default)]
+    pub phase_reason: Option<String>,
+    #[serde(default)]
+    pub phase_progress: Option<String>,
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
@@ -166,6 +176,8 @@ pub struct TaskValueDraft {
     pub name: String,
     pub image: String,
     pub state: ContainerState,
+    pub phase_reason: Option<String>,
+    pub phase_progress: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub command: Vec<String>,
@@ -190,6 +202,8 @@ impl TaskValue {
             name: draft.name,
             image: draft.image,
             state: draft.state,
+            phase_reason: draft.phase_reason,
+            phase_progress: draft.phase_progress,
             created_at: draft.created_at,
             updated_at: draft.updated_at,
             command: draft.command,

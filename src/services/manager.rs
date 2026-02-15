@@ -1455,7 +1455,10 @@ fn task_state_healthy(state: &ContainerState) -> bool {
     // Pending/creating are still converging, so we avoid spawning duplicates.
     matches!(
         state,
-        ContainerState::Pending | ContainerState::Creating | ContainerState::Running
+        ContainerState::Pending
+            | ContainerState::Pulling
+            | ContainerState::Creating
+            | ContainerState::Running
     )
 }
 
@@ -1648,7 +1651,10 @@ async fn poll_service_attempt(
                 for (_, state) in &states {
                     match state {
                         Some(ContainerState::Running) => {}
-                        Some(ContainerState::Pending) | Some(ContainerState::Creating) | None => {
+                        Some(ContainerState::Pending)
+                        | Some(ContainerState::Pulling)
+                        | Some(ContainerState::Creating)
+                        | None => {
                             any_pending = true;
                             all_running = false;
                         }
@@ -1970,6 +1976,7 @@ fn format_task_state_summary(states: &[(Uuid, Option<ContainerState>)]) -> Strin
         let label = match state {
             None => "missing".to_string(),
             Some(ContainerState::Pending) => "pending".to_string(),
+            Some(ContainerState::Pulling) => "pulling".to_string(),
             Some(ContainerState::Creating) => "creating".to_string(),
             Some(ContainerState::Running) => "running".to_string(),
             Some(ContainerState::Paused) => "paused".to_string(),
@@ -2005,6 +2012,8 @@ mod tests {
             name: format!("{service_name}-{template}-1-test"),
             image: "ghcr.io/demo/app:latest".to_string(),
             state,
+            phase_reason: None,
+            phase_progress: None,
             created_at: Utc::now().to_rfc3339(),
             updated_at: Utc::now().to_rfc3339(),
             command: Vec::new(),

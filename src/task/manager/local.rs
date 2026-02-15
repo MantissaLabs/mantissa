@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 use chrono::Utc;
 use tracing::{debug, warn};
 
@@ -83,6 +83,8 @@ impl TaskManager {
                 name: plan.name.clone(),
                 image: plan.image.clone(),
                 state: ContainerState::Pending,
+                phase_reason: None,
+                phase_progress: None,
                 created_at: Utc::now().to_rfc3339(),
                 updated_at: Utc::now().to_rfc3339(),
                 command: plan.command.clone(),
@@ -148,10 +150,9 @@ impl TaskManager {
         plans: &mut [BatchStartPlan],
     ) -> Result<(), anyhow::Error> {
         for plan in plans.iter_mut() {
-            self.container_manager
-                .pull_image(&plan.image)
-                .await
-                .with_context(|| format!("docker pull failed for image {}", plan.image))?;
+            self.pull_image_for_task(plan.id, &plan.image).await?;
+            self.update_task_phase(plan.id, ContainerState::Creating, None, None)
+                .await?;
 
             let restart_policy = plan
                 .restart_policy
@@ -419,6 +420,8 @@ impl TaskManager {
                 name: plan.name.clone(),
                 image: plan.image.clone(),
                 state: ContainerState::Running,
+                phase_reason: None,
+                phase_progress: None,
                 created_at: plan.created_at.to_rfc3339(),
                 updated_at: Utc::now().to_rfc3339(),
                 command: plan.command.clone(),

@@ -1350,6 +1350,8 @@ fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
         name: spec.name.clone(),
         image: spec.image.clone(),
         state: spec.state.clone(),
+        phase_reason: spec.phase_reason.clone(),
+        phase_progress: spec.phase_progress.clone(),
         created_at: spec.created_at.clone(),
         updated_at: spec.updated_at.clone(),
         command: spec.command.clone(),
