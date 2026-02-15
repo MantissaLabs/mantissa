@@ -241,14 +241,24 @@ impl gossip::Server for Gossip {
                     continue;
                 }
             }
+            let which = msg.reborrow().which().expect("failed to read variant");
+            let message_type = match &which {
+                Void(_) => "void",
+                Topology(_) => "topology",
+                Task(_) => "task",
+                Service(_) => "service",
+                Network(_) => "network",
+                Secret(_) => "secret",
+            };
             debug!(
                 target: "gossip",
                 gossip_id = %id,
                 view = %message_view,
+                message_type = message_type,
                 "received gossip message"
             );
 
-            match msg.reborrow().which().expect("failed to read variant") {
+            match which {
                 Void(_) => {
                     let _ = topo_tx.send(Message::Void { id }).await;
                 }
