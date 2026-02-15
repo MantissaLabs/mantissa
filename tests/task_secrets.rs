@@ -38,7 +38,8 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::fs;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
-use tokio::time::Duration;
+use tokio::task::spawn_local;
+use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -426,10 +427,25 @@ local_test!(task_manager_stages_secret_env_and_files, {
         "staged path should contain node id"
     );
 
+    let mut runtime_manager = manager.clone();
+    let runtime_handle = spawn_local(async move {
+        runtime_manager.run().await;
+    });
+
     manager
-        .stop_task(spec.id)
+        .request_task_stop(spec.id)
         .await
-        .expect("stop task to cleanup secrets");
+        .expect("request stop task to cleanup secrets");
+
+    for _ in 0..40 {
+        if fs::metadata(&host_path).await.is_err() {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    runtime_handle.abort();
+
     assert!(
         fs::metadata(&host_path).await.is_err(),
         "secret staging file should be removed after stop"

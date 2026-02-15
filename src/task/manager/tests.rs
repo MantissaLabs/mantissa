@@ -727,7 +727,7 @@ async fn start_container_reserves_multiple_slots_when_needed() {
 }
 
 #[tokio::test]
-async fn stop_task_releases_slot_and_clears_resources() {
+async fn request_task_stop_releases_slot_and_clears_resources() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -741,9 +741,16 @@ async fn stop_task_releases_slot_and_clears_resources() {
         .await
         .expect("start container");
 
-    let stopped = manager.stop_task(spec.id).await.expect("stop task");
-    assert!(matches!(stopped.state, ContainerState::Stopped));
-    assert!(stopped.slot_ids.is_empty());
+    let requested = manager
+        .request_task_stop(spec.id)
+        .await
+        .expect("request stop");
+    assert!(matches!(requested.state, ContainerState::Stopping));
+
+    manager
+        .reconcile_local_task(requested)
+        .await
+        .expect("reconcile requested stop");
 
     assert!(manager.inspect_task(spec.id).await.is_err());
 
@@ -754,7 +761,7 @@ async fn stop_task_releases_slot_and_clears_resources() {
 }
 
 #[tokio::test]
-async fn stop_task_uses_container_name_when_cache_missing() {
+async fn request_task_stop_uses_container_name_when_cache_missing() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -773,12 +780,19 @@ async fn stop_task_uses_container_name_when_cache_missing() {
     spec.state = ContainerState::Running;
     manager.persist_spec(&spec).await.expect("persist update");
 
-    let stopped = manager.stop_task(spec.id).await.expect("stop task");
-    assert!(matches!(stopped.state, ContainerState::Stopped));
+    let requested = manager
+        .request_task_stop(spec.id)
+        .await
+        .expect("request stop");
+    assert!(matches!(requested.state, ContainerState::Stopping));
+    manager
+        .reconcile_local_task(requested)
+        .await
+        .expect("reconcile requested stop");
 }
 
 #[tokio::test]
-async fn stop_task_is_idempotent_while_stopping() {
+async fn request_task_stop_is_idempotent_while_stopping() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -801,7 +815,10 @@ async fn stop_task_is_idempotent_while_stopping() {
 
     mock_cm.stopped.lock().await.clear();
 
-    let current = manager.stop_task(spec.id).await.expect("idempotent stop");
+    let current = manager
+        .request_task_stop(spec.id)
+        .await
+        .expect("idempotent stop");
     assert!(matches!(current.state, ContainerState::Stopping));
     assert!(
         mock_cm.stopped.lock().await.is_empty(),
@@ -967,7 +984,14 @@ async fn list_tasks_respects_filters() {
         .await
         .expect("start running");
 
-    manager.stop_task(running.id).await.expect("stop running");
+    let requested = manager
+        .request_task_stop(running.id)
+        .await
+        .expect("request stop running");
+    manager
+        .reconcile_local_task(requested)
+        .await
+        .expect("reconcile stop running");
 
     let filter_running = TaskStateFilter::new([TaskStateKind::Running]);
     let running_tasks = manager
@@ -1321,11 +1345,14 @@ async fn runtime_attachments_created_and_removed_on_stop() {
 
     assert_eq!(mock_cm.created.lock().await.len(), 1);
 
-    let stopped = manager
-        .stop_task(task_spec.id)
+    let requested = manager
+        .request_task_stop(task_spec.id)
         .await
-        .expect("stop networked task");
-    assert!(matches!(stopped.state, ContainerState::Stopped));
+        .expect("request stop networked task");
+    manager
+        .reconcile_local_task(requested)
+        .await
+        .expect("reconcile stop networked task");
 
     let attachments_after = network_registry
         .list_attachments_for_task(task_spec.id)
@@ -1336,7 +1363,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
 }
 
 #[tokio::test]
-async fn stop_task_cleans_up_after_teardown_failure() {
+async fn request_task_stop_cleans_up_after_teardown_failure() {
     let attachment: Arc<dyn AttachmentProvisionerApi> =
         Arc::new(FlakyAttachmentProvisioner::default());
     let (manager, scheduler, _mock_cm, network_registry) =
@@ -1402,9 +1429,17 @@ async fn stop_task_cleans_up_after_teardown_failure() {
     let task_spec = specs.remove(0);
 
     manager
-        .stop_task(task_spec.id)
+        .request_task_stop(task_spec.id)
         .await
-        .expect("stop flaky networked task");
+        .expect("request stop flaky networked task");
+    let stopping = manager
+        .load_spec(task_spec.id)
+        .await
+        .expect("load stopping task");
+    manager
+        .reconcile_local_task(stopping)
+        .await
+        .expect("reconcile stop flaky networked task");
 
     let attachments_after = network_registry
         .list_attachments(Some(spec.id))
@@ -1878,9 +1913,12 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
     assert_eq!(attachment.network_id, spec.id);
     assert_eq!(attachment.state, NetworkAttachmentState::Ready);
 
-    let stopped = manager
-        .stop_task(task_spec.id)
+    let requested = manager
+        .request_task_stop(task_spec.id)
         .await
-        .expect("stop real networked task");
-    assert!(matches!(stopped.state, ContainerState::Stopped));
+        .expect("request stop real networked task");
+    manager
+        .reconcile_local_task(requested)
+        .await
+        .expect("reconcile stop real networked task");
 }

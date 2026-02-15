@@ -425,34 +425,6 @@ impl TaskManager {
         Ok(spec.node_id == self.local_node_id)
     }
 
-    /// Stops a task by identifier, delegating to the owning node when it is remote.
-    #[allow(dead_code)]
-    pub async fn stop_task(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
-        let spec = self.load_spec(id).await?;
-
-        if spec.node_id != self.local_node_id {
-            if matches!(
-                spec.state,
-                ContainerState::Stopping | ContainerState::Stopped
-            ) {
-                return Ok(spec);
-            }
-
-            return self.stop_remote_task(&spec).await;
-        }
-
-        if matches!(spec.state, ContainerState::Stopping) {
-            return Ok(spec);
-        }
-
-        if matches!(spec.state, ContainerState::Stopped) {
-            self.ensure_task_stopped(spec.clone()).await?;
-            return Ok(spec);
-        }
-
-        self.perform_local_stop(spec).await
-    }
-
     /// Requests a task transition into `Stopping` and broadcasts the desired state.
     ///
     /// Local tasks are transitioned declaratively and drained by reconciliation. Remote tasks are
