@@ -11,8 +11,8 @@ use crate::task::container::ContainerState;
 use crate::task::docker::ContainerError;
 use crate::task::docker::ContainerManager;
 use crate::task::types::{
-    TaskEnvironmentVariable, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata, TaskSpec,
-    TaskStateFilter, TaskValue,
+    TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata,
+    TaskSpec, TaskStateFilter, TaskValue,
 };
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
@@ -450,6 +450,34 @@ impl TaskManager {
         }
 
         self.perform_local_stop(spec).await
+    }
+
+    /// Requests a local task transition into `Stopping` and broadcasts the desired state.
+    ///
+    /// This is the declarative stop entry point used by higher-level controllers so runtime
+    /// teardown is driven by reconciliation from replicated task state rather than immediate
+    /// imperative container operations.
+    pub async fn request_task_stop(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
+        let spec = self.load_spec(id).await?;
+
+        if spec.node_id != self.local_node_id {
+            return Ok(spec);
+        }
+
+        if matches!(
+            spec.state,
+            ContainerState::Stopping | ContainerState::Stopped
+        ) {
+            return Ok(spec);
+        }
+
+        let mut updated = spec.clone();
+        updated.state = ContainerState::Stopping;
+        updated.updated_at = Utc::now().to_rfc3339();
+        self.persist_spec(&updated).await?;
+        self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
+            .await?;
+        Ok(updated)
     }
 
     async fn ensure_remote_secret_availability(

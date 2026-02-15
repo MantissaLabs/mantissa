@@ -1180,7 +1180,7 @@ impl ServiceController {
             ) {
                 continue;
             }
-            match self.task_manager.stop_task(task_id).await {
+            match self.task_manager.request_task_stop(task_id).await {
                 Ok(_) => {}
                 Err(err) => {
                     let message = err.to_string();

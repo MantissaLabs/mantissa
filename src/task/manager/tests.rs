@@ -810,6 +810,37 @@ async fn stop_task_is_idempotent_while_stopping() {
 }
 
 #[tokio::test]
+async fn request_task_stop_only_updates_replicated_state() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    mock_cm.stopped.lock().await.clear();
+
+    let requested = manager
+        .request_task_stop(spec.id)
+        .await
+        .expect("request stop transition");
+    assert!(matches!(requested.state, ContainerState::Stopping));
+    assert!(
+        mock_cm.stopped.lock().await.is_empty(),
+        "request_task_stop should not invoke runtime stop directly"
+    );
+
+    let persisted = manager.load_spec(spec.id).await.expect("load spec");
+    assert!(matches!(persisted.state, ContainerState::Stopping));
+}
+
+#[tokio::test]
 async fn reconcile_stopping_task_debounces_recent_stop_attempts() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
