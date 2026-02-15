@@ -271,7 +271,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 cfg.cluster = args.cluster.clone();
                 let states: Vec<client::tasks::TasksListState> =
                     args.states.iter().copied().map(Into::into).collect();
-                local.run_until(client::tasks::list(&cfg, &states)).await?;
+                local
+                    .run_until(client::tasks::list(
+                        &cfg,
+                        &states,
+                        client::tasks::TasksListOptions {
+                            output: args.output.into(),
+                            no_trunc: args.no_trunc,
+                        },
+                    ))
+                    .await?;
             }
             TasksCommand::Start(args) => {
                 local

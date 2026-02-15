@@ -1,6 +1,6 @@
 // src/cli.rs
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use client::tasks::TasksListState;
+use client::tasks::{TasksListOutput, TasksListState};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -224,6 +224,20 @@ pub struct TasksListArgs {
     #[arg(index = 1)]
     pub cluster: Option<String>,
 
+    /// Output format (`table` is compact, `wide` includes command and created timestamp)
+    #[arg(
+        short = 'o',
+        long = "output",
+        value_enum,
+        default_value_t = TasksListOutputOpt::Table,
+        value_name = "FORMAT"
+    )]
+    pub output: TasksListOutputOpt,
+
+    /// Disable compact truncation for long columns
+    #[arg(long = "no-trunc", action = ArgAction::SetTrue)]
+    pub no_trunc: bool,
+
     /// Filter tasks by lifecycle state (repeat flag to combine)
     #[arg(
         long = "state",
@@ -284,6 +298,22 @@ pub enum TasksListStateOpt {
     Failed,
     Exited,
     Unknown,
+}
+
+/// CLI representation of the `tasks list` output presets.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum TasksListOutputOpt {
+    Table,
+    Wide,
+}
+
+impl From<TasksListOutputOpt> for TasksListOutput {
+    fn from(value: TasksListOutputOpt) -> Self {
+        match value {
+            TasksListOutputOpt::Table => TasksListOutput::Table,
+            TasksListOutputOpt::Wide => TasksListOutput::Wide,
+        }
+    }
 }
 
 impl From<TasksListStateOpt> for TasksListState {
