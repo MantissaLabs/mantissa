@@ -913,6 +913,114 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
     );
 });
 
+local_test!(services_stop_propagates_and_drains_three_nodes, {
+    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
+
+    let service_name = "stop-propagation-three-nodes";
+    let templates = vec![demo_backend_task_template("backend", 3)];
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+        .await
+        .expect("submit deployment");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "anchor should observe running status before stop"
+    );
+
+    // Ensure replicas are distributed so stop propagation exercises remote nodes as well.
+    let distribution_deadline = Instant::now() + Duration::from_secs(12);
+    let mut distributed = false;
+    while Instant::now() < distribution_deadline {
+        let mut all_have_local_replica = true;
+        for node in &cluster {
+            let local_count =
+                list_local_active_service_tasks(&node.node.task_manager, service_name, node.id())
+                    .await
+                    .len();
+            if local_count == 0 {
+                all_have_local_replica = false;
+                break;
+            }
+        }
+
+        if all_have_local_replica {
+            distributed = true;
+            break;
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        distributed,
+        "deployment should place at least one local replica on every node before stop"
+    );
+
+    cluster[0]
+        .node
+        .service_controller
+        .submit_stop(service_id)
+        .await
+        .expect("submit stop");
+
+    for node in &cluster {
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Stopped
+            )
+            .await,
+            "node {} should observe stopped status",
+            node.id()
+        );
+    }
+
+    for node in &cluster {
+        let local_drain_deadline = Instant::now() + Duration::from_secs(12);
+        let mut local_drained = false;
+        while Instant::now() < local_drain_deadline {
+            let local_count =
+                list_local_active_service_tasks(&node.node.task_manager, service_name, node.id())
+                    .await
+                    .len();
+            if local_count == 0 {
+                local_drained = true;
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            local_drained,
+            "node {} should drain locally owned service tasks after stop",
+            node.id()
+        );
+
+        assert!(
+            wait_for_reserved_slots(node, 0, Duration::from_secs(12)).await,
+            "node {} should release all reserved slots after stop",
+            node.id()
+        );
+    }
+});
+
 local_test!(services_sync_recovers_missing_entries, {
     let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
 
@@ -1287,6 +1395,19 @@ async fn list_active_service_tasks(manager: &TaskManager, service_name: &str) ->
                 .map(|meta| meta.service_name == service_name)
                 .unwrap_or(false)
         })
+        .collect()
+}
+
+/// Lists active tasks for one service that are assigned to a specific node id.
+async fn list_local_active_service_tasks(
+    manager: &TaskManager,
+    service_name: &str,
+    node_id: Uuid,
+) -> Vec<TaskSpec> {
+    list_active_service_tasks(manager, service_name)
+        .await
+        .into_iter()
+        .filter(|task| task.node_id == node_id)
         .collect()
 }
 
