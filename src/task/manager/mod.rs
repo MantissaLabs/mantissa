@@ -426,6 +426,7 @@ impl TaskManager {
     }
 
     /// Stops a task by identifier, delegating to the owning node when it is remote.
+    #[allow(dead_code)]
     pub async fn stop_task(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
         let spec = self.load_spec(id).await?;
 
@@ -452,16 +453,21 @@ impl TaskManager {
         self.perform_local_stop(spec).await
     }
 
-    /// Requests a local task transition into `Stopping` and broadcasts the desired state.
+    /// Requests a task transition into `Stopping` and broadcasts the desired state.
     ///
-    /// This is the declarative stop entry point used by higher-level controllers so runtime
-    /// teardown is driven by reconciliation from replicated task state rather than immediate
-    /// imperative container operations.
+    /// Local tasks are transitioned declaratively and drained by reconciliation. Remote tasks are
+    /// delegated to the owning node so the owner records the stop intent and gossips it.
     pub async fn request_task_stop(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
         let spec = self.load_spec(id).await?;
 
         if spec.node_id != self.local_node_id {
-            return Ok(spec);
+            if matches!(
+                spec.state,
+                ContainerState::Stopping | ContainerState::Stopped
+            ) {
+                return Ok(spec);
+            }
+            return self.stop_remote_task(&spec).await;
         }
 
         if matches!(

@@ -590,7 +590,7 @@ impl task::Server for TaskService {
 
         let spec = self
             .manager
-            .stop_task(id)
+            .request_task_stop(id)
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 
