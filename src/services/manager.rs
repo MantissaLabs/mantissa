@@ -28,12 +28,12 @@ use uuid::Uuid;
 /// Interval between readiness polls when waiting for service tasks to acknowledge their state.
 const SERVICE_READY_POLL_INTERVAL_MS: u64 = 200;
 
-/// Maximum duration to wait for all service tasks to report their terminal state.
+/// Maximum duration for a single readiness probe window before control returns to the outer loop.
 const SERVICE_READY_TIMEOUT_SECS: u64 = 60;
 /// Base delay (in milliseconds) for exponential backoff between deployment retries.
 const SERVICE_READY_BACKOFF_BASE_MS: u64 = 500;
-/// Maximum number of deployment attempts (initial + retries) before marking the service failed.
-const SERVICE_DEPLOYMENT_MAX_ATTEMPTS: u32 = 3;
+/// Maximum consecutive unhealthy readiness probe results before marking the service failed.
+const SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES: u32 = 3;
 /// Interval used by the rescheduler loop to evaluate service replica health.
 const SERVICE_RESCHEDULE_TICK_SECS: u64 = 2;
 /// Minimum delay before a missing replica is rescheduled to avoid transient gossip gaps.
@@ -1026,18 +1026,22 @@ impl ServiceController {
         assignments
     }
 
-    /// Waits until every task created for a deployment reports a terminal state. Retries failed
-    /// attempts with exponential backoff and ultimately marks the service as failed when
-    /// convergence never happens.
+    /// Waits until a deployment converges or repeatedly reports terminal unhealthy states.
+    ///
+    /// Pending launch phases (`pending`, `pulling`, `creating`) do not consume the failure
+    /// budget, which prevents slow image pulls from being marked failed by readiness timing
+    /// alone.
     async fn await_service_readiness(self, initial_spec: ServiceSpecValue) {
         let service_name = initial_spec.service_name.clone();
         let service_id = initial_spec.id;
         let manifest_id = initial_spec.manifest_id;
 
-        let mut attempt: u32 = 1;
+        let mut probes: u32 = 0;
+        let mut failure_streak: u32 = 0;
         let mut last_observed_states: Vec<(Uuid, Option<ContainerState>)> = Vec::new();
 
         loop {
+            probes = probes.saturating_add(1);
             match poll_service_attempt(&self, service_id, manifest_id, &mut last_observed_states)
                 .await
             {
@@ -1058,7 +1062,7 @@ impl ServiceController {
                             } else {
                                 tracing::info!(
                                     target: "services",
-                                    "service '{}' deployment acknowledged after {attempt} attempt(s)",
+                                    "service '{}' deployment acknowledged after {probes} readiness probe(s)",
                                     service_name
                                 );
                             }
@@ -1073,23 +1077,33 @@ impl ServiceController {
                     }
                     break;
                 }
-                ReadinessOutcome::Retry(snapshot) => {
-                    if attempt >= SERVICE_DEPLOYMENT_MAX_ATTEMPTS {
+                ReadinessOutcome::Pending => {
+                    if failure_streak != 0 {
+                        tracing::debug!(
+                            target: "services",
+                            "service '{}' readiness recovered to in-flight state; resetting failure streak",
+                            service_name
+                        );
+                        failure_streak = 0;
+                    }
+                }
+                ReadinessOutcome::Failure(snapshot) => {
+                    failure_streak = failure_streak.saturating_add(1);
+                    if failure_streak >= SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES {
                         mark_service_failed(&self, snapshot.clone(), &last_observed_states).await;
                         break;
                     }
 
-                    let next_attempt = attempt + 1;
-                    let backoff = readiness_backoff(next_attempt);
+                    let backoff = readiness_backoff(failure_streak + 1);
                     let summary = format_task_state_summary(&last_observed_states);
                     tracing::warn!(
                         target: "services",
-                        "service '{}' deployment attempt {} did not converge yet; retrying readiness probe in {:?} ({summary})",
+                        "service '{}' reported unhealthy readiness state ({}/{}); retrying in {:?} ({summary})",
                         service_name,
-                        attempt,
+                        failure_streak,
+                        SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES,
                         backoff
                     );
-                    attempt = next_attempt;
                     sleep(backoff).await;
                 }
                 ReadinessOutcome::Abort => break,
@@ -1574,8 +1588,46 @@ struct ServiceRedeploymentJob {
 
 enum ReadinessOutcome {
     Success(ServiceSpecValue),
-    Retry(ServiceSpecValue),
+    Pending,
+    Failure(ServiceSpecValue),
     Abort,
+}
+
+/// Classifies task states into readiness categories consumed by deployment convergence logic.
+fn classify_readiness_states(states: &[(Uuid, Option<ContainerState>)]) -> ReadinessClass {
+    let mut all_running = true;
+    let mut any_inflight = false;
+
+    for (_, state) in states {
+        match state {
+            Some(ContainerState::Running) => {}
+            Some(ContainerState::Pending)
+            | Some(ContainerState::Pulling)
+            | Some(ContainerState::Creating)
+            | None => {
+                all_running = false;
+                any_inflight = true;
+            }
+            _ => {
+                all_running = false;
+            }
+        }
+    }
+
+    if all_running {
+        ReadinessClass::AllRunning
+    } else if any_inflight {
+        ReadinessClass::Inflight
+    } else {
+        ReadinessClass::Unhealthy
+    }
+}
+
+/// Compact readiness classifier used by `classify_readiness_states`.
+enum ReadinessClass {
+    AllRunning,
+    Inflight,
+    Unhealthy,
 }
 
 /// Observes deployment progress for the provided service until it either converges, requires a
@@ -1631,10 +1683,10 @@ async fn poll_service_attempt(
             } else {
                 tracing::debug!(
                     target: "services",
-                    "service '{}' has no task instances yet; scheduling retry",
+                    "service '{}' has no task instances yet despite non-empty manifest; treating as unhealthy launch",
                     current.service_name
                 );
-                return ReadinessOutcome::Retry(current);
+                return ReadinessOutcome::Failure(current);
             }
         }
 
@@ -1645,37 +1697,18 @@ async fn poll_service_attempt(
         {
             Ok(states) => {
                 *last_states = states.clone();
-
-                let mut all_running = true;
-                let mut any_pending = false;
-                for (_, state) in &states {
-                    match state {
-                        Some(ContainerState::Running) => {}
-                        Some(ContainerState::Pending)
-                        | Some(ContainerState::Pulling)
-                        | Some(ContainerState::Creating)
-                        | None => {
-                            any_pending = true;
-                            all_running = false;
-                        }
-                        _ => {
-                            all_running = false;
-                        }
+                match classify_readiness_states(last_states) {
+                    ReadinessClass::AllRunning => return ReadinessOutcome::Success(current),
+                    ReadinessClass::Inflight => {}
+                    ReadinessClass::Unhealthy => {
+                        tracing::debug!(
+                            target: "services",
+                            "service '{}' tasks entered terminal states before running: {}",
+                            current.service_name,
+                            format_task_state_summary(last_states)
+                        );
+                        return ReadinessOutcome::Failure(current);
                     }
-                }
-
-                if all_running {
-                    return ReadinessOutcome::Success(current);
-                }
-
-                if !any_pending {
-                    tracing::debug!(
-                        target: "services",
-                        "service '{}' tasks entered terminal states before running: {}",
-                        current.service_name,
-                        format_task_state_summary(last_states)
-                    );
-                    return ReadinessOutcome::Retry(current);
                 }
             }
             Err(err) => {
@@ -1684,18 +1717,32 @@ async fn poll_service_attempt(
                     "failed to load task states for '{}': {err}",
                     current.service_name
                 );
-                return ReadinessOutcome::Retry(current);
+                return ReadinessOutcome::Pending;
             }
         }
 
         if Instant::now() >= deadline {
-            tracing::debug!(
-                target: "services",
-                "timed out waiting for '{}' tasks; summary: {}",
-                current.service_name,
-                format_task_state_summary(last_states)
-            );
-            return ReadinessOutcome::Retry(current);
+            match classify_readiness_states(last_states) {
+                ReadinessClass::AllRunning => return ReadinessOutcome::Success(current),
+                ReadinessClass::Inflight => {
+                    tracing::debug!(
+                        target: "services",
+                        "timed out waiting for '{}' tasks while still in-flight; continuing probe: {}",
+                        current.service_name,
+                        format_task_state_summary(last_states)
+                    );
+                    return ReadinessOutcome::Pending;
+                }
+                ReadinessClass::Unhealthy => {
+                    tracing::debug!(
+                        target: "services",
+                        "timed out waiting for '{}' tasks with unhealthy states: {}",
+                        current.service_name,
+                        format_task_state_summary(last_states)
+                    );
+                    return ReadinessOutcome::Failure(current);
+                }
+            }
         }
 
         sleep(Duration::from_millis(SERVICE_READY_POLL_INTERVAL_MS)).await;
@@ -1710,7 +1757,7 @@ async fn mark_service_failed(
     let summary = format_task_state_summary(states);
     tracing::error!(
         target: "services",
-        "service '{}' deployment failed after repeated retries: {}",
+        "service '{}' deployment failed after repeated unhealthy readiness probes: {}",
         spec.service_name,
         summary
     );
@@ -2274,5 +2321,44 @@ mod tests {
         incoming.set_status(ServiceStatus::Stopped);
 
         assert!(!should_stop_tasks(Some(&current), &incoming));
+    }
+
+    /// Ensures pulling tasks are treated as in-flight deployment work.
+    #[test]
+    fn classify_readiness_treats_pulling_as_inflight() {
+        let states = vec![(Uuid::new_v4(), Some(ContainerState::Pulling))];
+
+        assert!(matches!(
+            classify_readiness_states(&states),
+            ReadinessClass::Inflight
+        ));
+    }
+
+    /// Ensures fully running replicas are considered converged for readiness.
+    #[test]
+    fn classify_readiness_treats_all_running_as_success() {
+        let states = vec![
+            (Uuid::new_v4(), Some(ContainerState::Running)),
+            (Uuid::new_v4(), Some(ContainerState::Running)),
+        ];
+
+        assert!(matches!(
+            classify_readiness_states(&states),
+            ReadinessClass::AllRunning
+        ));
+    }
+
+    /// Ensures terminal states consume the unhealthy readiness budget.
+    #[test]
+    fn classify_readiness_treats_terminal_states_as_unhealthy() {
+        let states = vec![
+            (Uuid::new_v4(), Some(ContainerState::Running)),
+            (Uuid::new_v4(), Some(ContainerState::Failed)),
+        ];
+
+        assert!(matches!(
+            classify_readiness_states(&states),
+            ReadinessClass::Unhealthy
+        ));
     }
 }
