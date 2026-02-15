@@ -54,6 +54,7 @@ pub struct TaskManager {
     scheduler: Rc<Scheduler>,
     container_manager: Arc<dyn ContainerManager + Send + Sync>,
     local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
+    inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
     registry: Registry,
     secret_registry: SecretRegistry,
     secret_keyring: Arc<RwLock<SecretKeyring>>,
@@ -143,6 +144,7 @@ impl TaskManager {
             scheduler,
             container_manager,
             local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
+            inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
             registry,
             network_registry,
             secret_registry,
@@ -152,6 +154,19 @@ impl TaskManager {
             attachment_provisioner,
             forwarding_events,
         }
+    }
+
+    /// Claims a local in-flight marker so only one stop workflow executes per task at a time.
+    async fn try_begin_stop(&self, task_id: Uuid) -> Option<StopTaskGuard> {
+        let mut guard = self.inflight_stops.lock().await;
+        if guard.contains(&task_id) {
+            return None;
+        }
+        guard.insert(task_id);
+        Some(StopTaskGuard {
+            task_id,
+            inflight: self.inflight_stops.clone(),
+        })
     }
 
     #[allow(dead_code)]
@@ -641,6 +656,25 @@ fn container_remove_in_progress(err: &ContainerError) -> bool {
         ContainerError::DockerAPI(BollardError::DockerResponseServerError { status_code, .. })
             if *status_code == 409
     )
+}
+
+/// Local guard that clears the in-flight stop marker for a task when dropped.
+struct StopTaskGuard {
+    task_id: Uuid,
+    inflight: Arc<AsyncMutex<HashSet<Uuid>>>,
+}
+
+impl Drop for StopTaskGuard {
+    /// Releases the in-flight stop marker after the stop workflow returns.
+    fn drop(&mut self) {
+        let inflight = self.inflight.clone();
+        let task_id = self.task_id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                inflight.lock().await.remove(&task_id);
+            });
+        }
+    }
 }
 
 /// Select the most relevant task value from concurrent CRDT versions for scheduling decisions.

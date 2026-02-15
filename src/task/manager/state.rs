@@ -272,6 +272,14 @@ impl TaskManager {
         }
 
         let id = spec.id;
+        let Some(_stop_guard) = self.try_begin_stop(id).await else {
+            debug!(
+                target: "task",
+                task = %id,
+                "stop workflow already in progress; skipping duplicate stop attempt"
+            );
+            return Ok(spec);
+        };
         let identifier_entry = {
             let mut guard = self.local_containers.lock().await;
             guard.remove(&id)
@@ -1025,7 +1033,7 @@ impl TaskManager {
 
     /// Ensures that a locally tracked task has completely stopped and released resources.
     pub(super) async fn ensure_task_stopped(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
-        const STOPPING_RETRY_GRACE_SECS: i64 = 3;
+        const STOPPING_RETRY_GRACE_SECS: i64 = 15;
 
         let mut has_container = {
             let guard = self.local_containers.lock().await;
@@ -1087,8 +1095,8 @@ impl TaskManager {
             && task_spec_recent(&spec, STOPPING_RETRY_GRACE_SECS)
         {
             // A recent transition to `Stopping` means another path already initiated teardown.
-            // Avoid issuing duplicate stop/remove calls in the same second; periodic reconcile
-            // will retry if the task remains in `Stopping` beyond this grace window.
+            // Avoid issuing duplicate stop/remove calls while the initial Docker stop timeout
+            // window is still in progress; periodic reconcile retries beyond this grace window.
             return Ok(());
         }
 

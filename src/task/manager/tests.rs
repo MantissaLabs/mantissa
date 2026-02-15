@@ -42,6 +42,7 @@ struct MockContainerManager {
     created: Arc<AsyncMutex<Vec<String>>>,
     create_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
     stopped: Arc<AsyncMutex<Vec<String>>>,
+    stop_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
     limits: Arc<AsyncMutex<Vec<crate::task::docker::ResourceLimits>>>,
     inspect: Arc<AsyncMutex<HashMap<String, bollard::service::ContainerInspectResponse>>>,
     inspect_calls: Arc<AsyncMutex<Vec<String>>>,
@@ -90,6 +91,10 @@ impl ContainerManager for MockContainerManager {
         container_id: &str,
         _timeout: Option<std::time::Duration>,
     ) -> crate::task::docker::ContainerResult<()> {
+        let delay = *self.stop_delay.lock().await;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.stopped.lock().await.push(container_id.to_string());
         Ok(())
     }
@@ -854,7 +859,7 @@ async fn reconcile_stopping_task_retries_after_grace_window() {
         .expect("start container");
 
     spec.state = ContainerState::Stopping;
-    spec.updated_at = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+    spec.updated_at = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
     manager
         .persist_spec(&spec)
         .await
@@ -870,6 +875,48 @@ async fn reconcile_stopping_task_retries_after_grace_window() {
         mock_cm.stopped.lock().await.len(),
         1,
         "reconcile should retry stop once stopping state is stale"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_stopping_task_serializes_duplicate_stop_attempts() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    spec.state = ContainerState::Stopping;
+    spec.updated_at = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist stopping state");
+
+    {
+        let mut delay = mock_cm.stop_delay.lock().await;
+        *delay = Some(std::time::Duration::from_millis(200));
+    }
+    mock_cm.stopped.lock().await.clear();
+
+    let (first, second) = tokio::join!(
+        manager.reconcile_local_task(spec.clone()),
+        manager.reconcile_local_task(spec.clone())
+    );
+    first.expect("first reconcile stop attempt");
+    second.expect("second reconcile stop attempt");
+
+    assert_eq!(
+        mock_cm.stopped.lock().await.len(),
+        1,
+        "duplicate stop attempts should collapse into a single runtime stop call"
     );
 }
 

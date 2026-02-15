@@ -631,10 +631,10 @@ impl ContainerManager for DockerContainerManager {
             let Some(action) = event.action.as_deref() else {
                 continue;
             };
-            if !matches!(
-                action,
-                "start" | "stop" | "die" | "kill" | "destroy" | "rename"
-            ) {
+            // Only forward lifecycle edges that materially change convergence state.
+            // `kill`/`stop` can fire repeatedly while a stop is already in progress and would
+            // amplify reconcile churn without adding useful state information.
+            if !matches!(action, "start" | "die" | "destroy" | "rename") {
                 continue;
             }
 
