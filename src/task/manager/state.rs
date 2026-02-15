@@ -1033,8 +1033,6 @@ impl TaskManager {
 
     /// Ensures that a locally tracked task has completely stopped and released resources.
     pub(super) async fn ensure_task_stopped(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
-        const STOPPING_RETRY_GRACE_SECS: i64 = 15;
-
         let mut has_container = {
             let guard = self.local_containers.lock().await;
             guard.contains_key(&spec.id)
@@ -1088,15 +1086,6 @@ impl TaskManager {
                     "failed to run orphaned attachment cleanup for containerless task: {err}"
                 );
             }
-            return Ok(());
-        }
-
-        if matches!(spec.state, ContainerState::Stopping)
-            && task_spec_recent(&spec, STOPPING_RETRY_GRACE_SECS)
-        {
-            // A recent transition to `Stopping` means another path already initiated teardown.
-            // Avoid issuing duplicate stop/remove calls while the initial Docker stop timeout
-            // window is still in progress; periodic reconcile retries beyond this grace window.
             return Ok(());
         }
 
@@ -1729,20 +1718,6 @@ impl TaskManager {
 fn task_value_recent(value: &TaskValue, grace_secs: i64) -> bool {
     let anchor = chrono::DateTime::parse_from_rfc3339(&value.updated_at)
         .or_else(|_| chrono::DateTime::parse_from_rfc3339(&value.created_at));
-
-    match anchor {
-        Ok(anchor) => {
-            let anchor = anchor.with_timezone(&Utc);
-            Utc::now().signed_duration_since(anchor) < chrono::Duration::seconds(grace_secs)
-        }
-        Err(_) => false,
-    }
-}
-
-/// Returns true when a task spec has been updated within the provided grace window.
-fn task_spec_recent(spec: &TaskSpec, grace_secs: i64) -> bool {
-    let anchor = chrono::DateTime::parse_from_rfc3339(&spec.updated_at)
-        .or_else(|_| chrono::DateTime::parse_from_rfc3339(&spec.created_at));
 
     match anchor {
         Ok(anchor) => {

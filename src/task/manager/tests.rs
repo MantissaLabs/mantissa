@@ -841,7 +841,7 @@ async fn request_task_stop_only_updates_replicated_state() {
 }
 
 #[tokio::test]
-async fn reconcile_stopping_task_debounces_recent_stop_attempts() {
+async fn reconcile_stopping_task_stops_immediately() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -868,9 +868,10 @@ async fn reconcile_stopping_task_debounces_recent_stop_attempts() {
         .reconcile_local_task(spec.clone())
         .await
         .expect("reconcile stopping task");
-    assert!(
-        mock_cm.stopped.lock().await.is_empty(),
-        "reconcile should not re-issue stop immediately after entering stopping"
+    assert_eq!(
+        mock_cm.stopped.lock().await.len(),
+        1,
+        "reconcile should execute stop immediately for stopping tasks"
     );
 }
 
