@@ -468,7 +468,7 @@ impl ServiceController {
                 continue;
             }
 
-            if let Err(err) = self.task_manager.stop_task(task.id).await {
+            if let Err(err) = self.task_manager.request_task_stop(task.id).await {
                 tracing::warn!(
                     target: "services",
                     "failed to stop excess task {} for '{}': {err}",
@@ -975,7 +975,7 @@ impl ServiceController {
             let controller = self.clone();
             tokio::task::spawn_local(async move {
                 for task_id in retire {
-                    if let Err(err) = controller.task_manager.stop_task(task_id).await {
+                    if let Err(err) = controller.task_manager.request_task_stop(task_id).await {
                         tracing::warn!(
                             target: "services",
                             "failed to stop retired task {task_id}: {err}"
