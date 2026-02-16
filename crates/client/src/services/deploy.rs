@@ -39,7 +39,7 @@ async fn ensure_manifest_networks(cfg: &ClientConfig, manifest: &ServiceManifest
         return Ok(());
     }
 
-    let existing = networks::list(cfg).await?;
+    let existing = networks::list_raw(cfg).await?;
     let existing_names: HashSet<String> = existing.into_iter().map(|net| net.name).collect();
 
     for name in required {
@@ -48,13 +48,13 @@ async fn ensure_manifest_networks(cfg: &ClientConfig, manifest: &ServiceManifest
         }
 
         let request = networks::default_network_create_request(name.clone());
-        match networks::create(cfg, &request).await {
+        match networks::create_raw(cfg, &request).await {
             Ok(network_id) => {
                 println!("network '{name}' created with id {network_id} (auto-provisioned)");
             }
             Err(err) => {
                 // Re-list to handle races where another actor created the network concurrently.
-                let fallback = networks::list(cfg).await?;
+                let fallback = networks::list_raw(cfg).await?;
                 if fallback.iter().any(|net| net.name == name) {
                     eprintln!(
                         "warning: auto-provision for network '{name}' failed but it already exists: {err}"

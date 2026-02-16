@@ -1,11 +1,14 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::output;
 use anyhow::{Context, Result};
+use std::io::Write;
+use tabwriter::TabWriter;
 
-use super::{SecretSummary, parse_secret_spec};
+use super::parse_secret_spec;
 
-/// List secrets registered in the cluster by querying the secrets management service.
-pub async fn list(cfg: &ClientConfig) -> Result<Vec<SecretSummary>> {
+/// List secrets registered in the cluster and render them in tabular form.
+pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let session = connection::get_local_session(cfg).await?;
     let request = session.get_secrets_request();
     let secrets_client = request.send().pipeline.get_secrets();
@@ -21,5 +24,26 @@ pub async fn list(cfg: &ClientConfig) -> Result<Vec<SecretSummary>> {
     for spec in reader.iter() {
         summaries.push(parse_secret_spec(spec)?);
     }
-    Ok(summaries)
+
+    if summaries.is_empty() {
+        output::emit_line("no secrets found");
+        return Ok(());
+    }
+
+    let mut tw = TabWriter::new(Vec::new());
+    writeln!(&mut tw, "NAME\tVERSION\tUPDATED\tDESCRIPTION")?;
+    for summary in summaries {
+        writeln!(
+            &mut tw,
+            "{}\t{}\t{}\t{}",
+            summary.name,
+            summary.version_id,
+            summary.updated_at,
+            summary.description.unwrap_or_default()
+        )?;
+    }
+    tw.flush()?;
+    let rendered = String::from_utf8(tw.into_inner()?)?;
+    output::emit_block(rendered);
+    Ok(())
 }

@@ -1,11 +1,40 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::output;
 use anyhow::{Context, Result};
 
-use super::{SecretSummary, normalize_labels, parse_secret_spec, set_metadata};
+use super::{
+    SecretSummary, normalize_labels, parse_secret_labels, parse_secret_spec,
+    resolve_secret_plaintext, set_metadata,
+};
 
-/// Create a brand new secret and persist it through the distributed secrets service.
+/// Create a brand new secret from CLI inputs and persist it through the secrets service.
 pub async fn create(
+    cfg: &ClientConfig,
+    name: &str,
+    value: Option<String>,
+    description: Option<String>,
+    labels: &[String],
+) -> Result<()> {
+    let plaintext = resolve_secret_plaintext(value)?;
+    let parsed_labels = parse_secret_labels(labels)?;
+    let summary = submit_create(
+        cfg,
+        name,
+        &plaintext,
+        description.as_deref(),
+        &parsed_labels,
+    )
+    .await?;
+    output::emit_line(format!(
+        "secret '{}' created (version {})",
+        summary.name, summary.version_id
+    ));
+    Ok(())
+}
+
+/// Submit the create request and decode the resulting persisted secret summary.
+async fn submit_create(
     cfg: &ClientConfig,
     name: &str,
     plaintext: &[u8],

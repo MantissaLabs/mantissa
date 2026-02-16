@@ -3,7 +3,8 @@ use anyhow::{Context, Result, anyhow};
 
 use super::list::{list_cluster_views, resolve_view_from_summaries};
 use super::operations::{
-    ClusterOperationSummary, ClusterViewSpec, parse_cluster_id, topology_capability,
+    ClusterOperationSummary, ClusterViewSpec, emit_operation_summary, parse_cluster_id,
+    topology_capability,
 };
 
 /// Merge-time service behavior policy exposed by the CLI.
@@ -32,7 +33,7 @@ pub async fn merge_by_cluster_id(
     destination_cluster_id: &str,
     dry_run: bool,
     service_policy: MergeServicePolicy,
-) -> Result<ClusterOperationSummary> {
+) -> Result<()> {
     let source_cluster = parse_cluster_id(source_cluster_id, "source cluster id")?;
     let destination_cluster = parse_cluster_id(destination_cluster_id, "destination cluster id")?;
     if source_cluster == destination_cluster {
@@ -44,7 +45,10 @@ pub async fn merge_by_cluster_id(
     let summaries = list_cluster_views(cfg).await?;
     let source_view = resolve_view_from_summaries(&summaries, source_cluster)?;
     let destination_view = resolve_view_from_summaries(&summaries, destination_cluster)?;
-    submit_merge_request(cfg, source_view, destination_view, dry_run, service_policy).await
+    let summary =
+        submit_merge_request(cfg, source_view, destination_view, dry_run, service_policy).await?;
+    emit_operation_summary(&summary);
+    Ok(())
 }
 
 /// Sends a merge request to topology using resolved source and destination views.

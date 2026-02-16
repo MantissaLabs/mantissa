@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use super::list::{active_cluster_view, resolve_cluster_view_by_cluster_id};
 use super::operations::{
-    ClusterOperationSummary, ClusterViewSpec, parse_cluster_id, topology_capability,
+    ClusterOperationSummary, ClusterViewSpec, emit_operation_summary, parse_cluster_id,
+    topology_capability,
 };
 
 /// Operator-friendly split filters supported by the simplified CLI.
@@ -218,7 +219,7 @@ pub async fn split_by_filter(
     dry_run: bool,
     service_policy: SplitServicePolicy,
     network_policy: SplitNetworkPolicy,
-) -> Result<ClusterOperationSummary> {
+) -> Result<()> {
     let source_view = resolve_source_view(cfg, source_cluster_id).await?;
     let selector_key = filter.selector_key();
     let value_list = normalize_split_values(values, filter.expects_numeric_value())?;
@@ -257,7 +258,7 @@ pub async fn split_by_filter(
         explicit_nodes: Vec::new(),
     });
 
-    submit_split_request(
+    let summary = submit_split_request(
         cfg,
         source_view,
         &targets,
@@ -265,7 +266,9 @@ pub async fn split_by_filter(
         service_policy,
         network_policy,
     )
-    .await
+    .await?;
+    emit_operation_summary(&summary);
+    Ok(())
 }
 
 /// Submits a split request from explicit per-node assignments selected by interactive tooling.
@@ -279,7 +282,7 @@ pub async fn split_by_explicit_nodes(
     dry_run: bool,
     service_policy: SplitServicePolicy,
     network_policy: SplitNetworkPolicy,
-) -> Result<ClusterOperationSummary> {
+) -> Result<()> {
     let source_view = resolve_source_view(cfg, source_cluster_id).await?;
     let left_name = left_name.trim();
     let right_name = right_name.trim();
@@ -336,7 +339,7 @@ pub async fn split_by_explicit_nodes(
         },
     ];
 
-    submit_split_request(
+    let summary = submit_split_request(
         cfg,
         source_view,
         &targets,
@@ -344,7 +347,9 @@ pub async fn split_by_explicit_nodes(
         service_policy,
         network_policy,
     )
-    .await
+    .await?;
+    emit_operation_summary(&summary);
+    Ok(())
 }
 
 /// Sends a split request to topology using resolved source view and expanded targets.

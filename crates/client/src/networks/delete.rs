@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::output;
 use anyhow::{Context, Result, anyhow};
 use uuid::Uuid;
 
@@ -32,5 +33,6 @@ pub async fn delete(cfg: &ClientConfig, ids: &[String]) -> Result<()> {
         .promise
         .await
         .context("network delete request failed")?;
+    output::emit_line(format!("requested deletion of {} network(s)", ids.len()));
     Ok(())
 }

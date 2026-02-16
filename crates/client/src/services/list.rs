@@ -214,7 +214,7 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
         return;
     }
 
-    let network_list = match networks::list(cfg).await {
+    let network_list = match networks::list_raw(cfg).await {
         Ok(list) => list,
         Err(err) => {
             eprintln!("warning: failed to list networks for public endpoints: {err}");
@@ -255,7 +255,9 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
             let attachments = match attachments_cache.get(&network.id) {
                 Some(existing) => existing,
                 None => {
-                    let fetched = match networks::attachments(cfg, &network.id.to_string()).await {
+                    let fetched = match networks::attachments_raw(cfg, &network.id.to_string())
+                        .await
+                    {
                         Ok(list) => list,
                         Err(err) => {
                             eprintln!(

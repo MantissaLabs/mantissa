@@ -29,18 +29,14 @@ mod ui;
 use clap::Parser;
 use protocol::{info_capnp, node_capnp, topology_capnp};
 
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use anyhow::{Result, anyhow};
 use std::error::Error;
-use std::io::{self, Read, Write};
 use std::path::Path;
-use tabwriter::TabWriter;
 use tokio::task::LocalSet;
 
 use crate::cli::*;
 use crate::server::RunMode;
 use client::config::ClientConfig;
-use client::output;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -80,28 +76,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         Command::Clusters { cmd } => match cmd {
             ClustersCommand::List => {
-                let summaries = local
+                local
                     .run_until(client::clusters::list_clusters(&cfg))
                     .await?;
-                if summaries.is_empty() {
-                    println!("no clusters known");
-                } else {
-                    let mut tw = TabWriter::new(Vec::new());
-                    writeln!(&mut tw, "CLUSTER_ID\tEPOCH\tNODES\tACTIVE_ON_THIS_NODE")?;
-                    for summary in summaries {
-                        writeln!(
-                            &mut tw,
-                            "{}\t{}\t{}\t{}",
-                            summary.cluster_id,
-                            summary.epoch,
-                            summary.node_count,
-                            if summary.local_active { "yes" } else { "no" }
-                        )?;
-                    }
-                    tw.flush()?;
-                    let output = String::from_utf8(tw.into_inner()?)?;
-                    output::emit_block(output);
-                }
             }
             ClustersCommand::Merge(m) => {
                 let service_policy = match m.services {
@@ -112,7 +89,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         client::clusters::MergeServicePolicy::Preserve
                     }
                 };
-                let summary = local
+                local
                     .run_until(client::clusters::merge_by_cluster_id(
                         &cfg,
                         &m.source_cluster_id,
@@ -121,26 +98,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         service_policy,
                     ))
                     .await?;
-                println!("operation {}", summary.id);
-                println!("kind: {}", summary.kind);
-                println!("stage: {}", summary.stage);
-                if !summary.source_views.is_empty() {
-                    let source_views: Vec<String> = summary
-                        .source_views
-                        .iter()
-                        .map(|view| view.to_string())
-                        .collect();
-                    println!("source views: {}", source_views.join(", "));
-                }
-                if !summary.target_views.is_empty() {
-                    let target_views: Vec<String> = summary
-                        .target_views
-                        .iter()
-                        .map(|view| view.to_string())
-                        .collect();
-                    println!("target views: {}", target_views.join(", "));
-                }
-                println!("details: {}", summary.details);
             }
             ClustersCommand::Split(s) => {
                 let service_policy = match s.services {
@@ -157,7 +114,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         client::clusters::SplitNetworkPolicy::Preserve
                     }
                 };
-                let summary = if s.interactive {
+                if s.interactive {
                     let payload = local
                         .run_until(client::clusters::list_split_candidates(
                             &cfg,
@@ -192,7 +149,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             service_policy,
                             network_policy,
                         ))
-                        .await?
+                        .await?;
                 } else {
                     let (filter, values) = if !s.filter_per_gpu.is_empty() {
                         (
@@ -235,29 +192,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             service_policy,
                             network_policy,
                         ))
-                        .await?
-                };
-
-                println!("operation {}", summary.id);
-                println!("kind: {}", summary.kind);
-                println!("stage: {}", summary.stage);
-                if !summary.source_views.is_empty() {
-                    let source_views: Vec<String> = summary
-                        .source_views
-                        .iter()
-                        .map(|view| view.to_string())
-                        .collect();
-                    println!("source views: {}", source_views.join(", "));
+                        .await?;
                 }
-                if !summary.target_views.is_empty() {
-                    let target_views: Vec<String> = summary
-                        .target_views
-                        .iter()
-                        .map(|view| view.to_string())
-                        .collect();
-                    println!("target views: {}", target_views.join(", "));
-                }
-                println!("details: {}", summary.details);
             }
         },
 
@@ -366,21 +302,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     description,
                     labels,
                 } = args;
-                let plaintext = resolve_secret_plaintext(value)?;
-                let label_pairs = parse_secret_labels(&labels)?;
-                let summary = local
+                local
                     .run_until(client::secrets::create(
                         &cfg,
                         &name,
-                        &plaintext,
-                        description.as_deref(),
-                        &label_pairs,
+                        value,
+                        description,
+                        &labels,
                     ))
                     .await?;
-                println!(
-                    "secret '{}' created (version {})",
-                    summary.name, summary.version_id
-                );
             }
             SecretsCommand::Update(args) => {
                 let SecretsCreateArgs {
@@ -389,77 +319,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     description,
                     labels,
                 } = args;
-                let plaintext = resolve_secret_plaintext(value)?;
-                let label_pairs = parse_secret_labels(&labels)?;
-                let summary = local
+                local
                     .run_until(client::secrets::update(
                         &cfg,
                         &name,
-                        &plaintext,
-                        description.as_deref(),
-                        &label_pairs,
+                        value,
+                        description,
+                        &labels,
                     ))
                     .await?;
-                println!(
-                    "secret '{}' updated (version {})",
-                    summary.name, summary.version_id
-                );
             }
             SecretsCommand::List => {
-                let summaries = local.run_until(client::secrets::list(&cfg)).await?;
-                if summaries.is_empty() {
-                    println!("no secrets found");
-                } else {
-                    let mut tw = TabWriter::new(Vec::new());
-                    writeln!(&mut tw, "NAME\tVERSION\tUPDATED\tDESCRIPTION")?;
-                    for summary in summaries {
-                        writeln!(
-                            &mut tw,
-                            "{}\t{}\t{}\t{}",
-                            summary.name,
-                            summary.version_id,
-                            summary.updated_at,
-                            summary.description.unwrap_or_default()
-                        )?;
-                    }
-                    tw.flush()?;
-                    let output = String::from_utf8(tw.into_inner()?)?;
-                    output::emit_block(output);
-                }
+                local.run_until(client::secrets::list(&cfg)).await?;
             }
             SecretsCommand::Delete(args) => {
                 local
                     .run_until(client::secrets::delete(&cfg, &args.names))
                     .await?;
-                println!("deleted {} secret(s)", args.names.len());
             }
             SecretsCommand::RotateMasterKey => {
-                let version = local
+                local
                     .run_until(client::secrets::rotate_master_key(&cfg))
                     .await?;
-                println!("rotated secret master key to version {version}");
             }
             SecretsCommand::Show(args) => {
-                let detail = local
+                local
                     .run_until(client::secrets::show(&cfg, &args.name, args.version))
                     .await?;
-
-                println!("Name: {}", detail.summary.name);
-                println!("Version: {}", detail.summary.version_id);
-                println!("Updated: {}", detail.summary.updated_at);
-                if let Some(desc) = detail.summary.description.as_ref() {
-                    println!("Description: {desc}");
-                }
-                if !detail.summary.labels.is_empty() {
-                    let labels: Vec<String> = detail
-                        .summary
-                        .labels
-                        .iter()
-                        .map(|(k, v)| format!("{k}={v}"))
-                        .collect();
-                    println!("Labels: {}", labels.join(", "));
-                }
-                println!("Plaintext: {}", display_secret_plaintext(&detail.plaintext));
             }
         },
 
@@ -480,49 +366,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     sealed: args.sealed,
                 };
 
-                let network_id = local
+                local
                     .run_until(client::networks::create(&cfg, &request))
                     .await?;
-                println!("network '{}' created with id {}", request.name, network_id);
             }
             NetworksCommand::Delete(args) => {
-                let count = args.ids.len();
                 local
                     .run_until(client::networks::delete(&cfg, &args.ids))
                     .await?;
-                println!("requested deletion of {count} network(s)");
             }
             NetworksCommand::List(_) => {
-                let mut rows = local.run_until(client::networks::list(&cfg)).await?;
-                if rows.is_empty() {
-                    println!("no networks registered");
-                } else {
-                    rows.sort_by(|a, b| a.name.cmp(&b.name));
-
-                    let mut tw = TabWriter::new(Vec::new());
-                    writeln!(
-                        &mut tw,
-                        "ID\tNAME\tDRIVER\tSTATUS\tVNI\tPEERS\tREADY\tSUBNET\tUPDATED"
-                    )?;
-                    for row in rows {
-                        writeln!(
-                            &mut tw,
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                            row.id,
-                            row.name,
-                            row.driver,
-                            row.status,
-                            row.vni,
-                            row.peer_count,
-                            row.ready_peers,
-                            row.subnet_cidr,
-                            row.updated_at,
-                        )?;
-                    }
-                    tw.flush()?;
-                    let output = String::from_utf8(tw.into_inner()?)?;
-                    output::emit_block(output);
-                }
+                local.run_until(client::networks::list(&cfg)).await?;
             }
             NetworksCommand::Inspect(args) => {
                 local
@@ -530,69 +384,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .await?;
             }
             NetworksCommand::Status(args) => {
-                let peers = local
+                local
                     .run_until(client::networks::peer_status(&cfg, &args.id))
                     .await?;
-                if peers.is_empty() {
-                    println!("no peer status reported yet");
-                } else {
-                    let mut tw = TabWriter::new(Vec::new());
-                    writeln!(&mut tw, "PEER\tID\tSTATE\tUPDATED\tERROR")?;
-                    for peer in peers {
-                        let error = peer.error.unwrap_or_default();
-                        writeln!(
-                            &mut tw,
-                            "{}\t{}\t{}\t{}\t{}",
-                            peer.peer_name, peer.peer_id, peer.state, peer.updated_at, error
-                        )?;
-                    }
-                    tw.flush()?;
-                    let output = String::from_utf8(tw.into_inner()?)?;
-                    output::emit_block(output);
-                }
             }
             NetworksCommand::Attachments(args) => {
-                let mut attachments = local
+                local
                     .run_until(client::networks::attachments(&cfg, &args.id))
                     .await?;
-
-                if attachments.is_empty() {
-                    println!("no network attachments registered");
-                } else {
-                    attachments.sort_by(|a, b| {
-                        a.node_id
-                            .cmp(&b.node_id)
-                            .then(a.task_id.cmp(&b.task_id))
-                            .then(a.attachment_id.cmp(&b.attachment_id))
-                    });
-
-                    let mut tw = TabWriter::new(Vec::new());
-                    writeln!(
-                        &mut tw,
-                        "ATTACHMENT\tTASK\tNODE\tCONTAINER\tIP\tMAC\tSTATE\tUPDATED\tERROR"
-                    )?;
-                    for attachment in attachments {
-                        let ip = attachment.assigned_ip.unwrap_or_else(|| "-".to_string());
-                        let mac = attachment.mac.unwrap_or_else(|| "-".to_string());
-                        let error = attachment.error.unwrap_or_default();
-                        writeln!(
-                            &mut tw,
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                            attachment.attachment_id,
-                            attachment.task_id,
-                            attachment.node_id,
-                            attachment.container_id,
-                            ip,
-                            mac,
-                            attachment.state,
-                            attachment.updated_at,
-                            error
-                        )?;
-                    }
-                    tw.flush()?;
-                    let output = String::from_utf8(tw.into_inner()?)?;
-                    output::emit_block(output);
-                }
             }
         },
 
@@ -612,54 +411,4 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
-}
-
-fn parse_secret_labels(labels: &[String]) -> Result<Vec<(String, String)>> {
-    let mut pairs = Vec::with_capacity(labels.len());
-    for raw in labels {
-        let mut parts = raw.splitn(2, '=');
-        let key = parts.next().unwrap_or_default().trim().to_string();
-        let value = parts
-            .next()
-            .ok_or_else(|| anyhow!("invalid label '{}': expected KEY=VALUE", raw))?
-            .trim()
-            .to_string();
-
-        if key.is_empty() {
-            return Err(anyhow!("label key cannot be empty in '{}'", raw));
-        }
-
-        pairs.push((key, value));
-    }
-    Ok(pairs)
-}
-
-fn resolve_secret_plaintext(value: Option<String>) -> Result<Vec<u8>> {
-    if let Some(val) = value {
-        return Ok(val.into_bytes());
-    }
-
-    let mut buffer = Vec::new();
-    io::stdin()
-        .read_to_end(&mut buffer)
-        .context("failed to read secret value from stdin")?;
-
-    while buffer.ends_with(b"\n") || buffer.ends_with(b"\r") {
-        buffer.pop();
-    }
-
-    if buffer.is_empty() {
-        Err(anyhow!(
-            "secret value is empty; pass --value or provide data on stdin"
-        ))
-    } else {
-        Ok(buffer)
-    }
-}
-
-fn display_secret_plaintext(data: &[u8]) -> String {
-    match std::str::from_utf8(data) {
-        Ok(text) => text.to_string(),
-        Err(_) => format!("base64:{}", BASE64_STANDARD.encode(data)),
-    }
 }

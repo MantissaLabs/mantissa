@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::output;
 use anyhow::{Context, Result};
 
 /// Delete the provided secrets by issuing a request to the secrets service.
@@ -24,5 +25,6 @@ pub async fn delete(cfg: &ClientConfig, names: &[String]) -> Result<()> {
         .promise
         .await
         .context("secrets delete request failed")?;
+    output::emit_line(format!("deleted {} secret(s)", names.len()));
     Ok(())
 }
