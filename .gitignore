@@ -1,2 +1,4 @@
 /target
+/target-clippy
+/tmp
 .DS_Store
