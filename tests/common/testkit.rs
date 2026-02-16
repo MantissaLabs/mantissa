@@ -7,6 +7,7 @@ use mantissa::task::docker::{
     ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager,
     clear_container_manager_override, container_manager_override, set_container_manager_override,
 };
+use mantissa::task::manager::TaskRuntimeConfig;
 use mantissa::topology_capnp::topology;
 use mantissa::{node, server::headless::HeadlessNode};
 use once_cell::sync::Lazy;
@@ -554,11 +555,27 @@ impl TestNode {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct ClusterConfig {
     pub sync_tick_ms: Option<u64>,
     pub gossip_tick_ms: Option<u64>,
     pub gossip_fanout: Option<usize>,
+    pub task_reconcile_tick_ms: Option<u64>,
+    pub task_repair_tick_ms: Option<u64>,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            sync_tick_ms: None,
+            gossip_tick_ms: None,
+            gossip_fanout: None,
+            // Faster task loops in tests reduce eventual-consistency flakes while preserving
+            // production defaults in the main binary.
+            task_reconcile_tick_ms: Some(500),
+            task_repair_tick_ms: Some(500),
+        }
+    }
 }
 
 impl ClusterConfig {
@@ -566,14 +583,34 @@ impl ClusterConfig {
         let sync_tick = self.sync_tick_ms.map(std::time::Duration::from_millis);
         (sync_tick, self.gossip_fanout)
     }
+
+    /// Converts the optional tick overrides into a task runtime loop configuration.
+    fn task_runtime_config(&self) -> Option<TaskRuntimeConfig> {
+        let mut config = TaskRuntimeConfig::default();
+        let mut overridden = false;
+        if let Some(ms) = self.task_reconcile_tick_ms {
+            config.reconcile_tick = Duration::from_millis(ms);
+            overridden = true;
+        }
+        if let Some(ms) = self.task_repair_tick_ms {
+            config.repair_tick = Duration::from_millis(ms);
+            overridden = true;
+        }
+        if overridden { Some(config) } else { None }
+    }
 }
 
 async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
     let (sync_tick, fanout) = cfg.as_options();
     let gossip_tick = cfg.gossip_tick_ms.map(std::time::Duration::from_millis);
-    HeadlessNode::new_inproc_custom(sync_tick, gossip_tick, fanout)
-        .await
-        .expect("headless inproc node (custom)")
+    HeadlessNode::new_inproc_custom_with_task_runtime(
+        sync_tick,
+        gossip_tick,
+        fanout,
+        cfg.task_runtime_config(),
+    )
+    .await
+    .expect("headless inproc node (custom)")
 }
 
 impl TestNode {

@@ -403,6 +403,7 @@ async fn setup_manager_with_forwarding(
         secret_keyring: secret_keyring.clone(),
         forwarding_events,
         attachment_override: Some(attachment),
+        runtime_config: None,
     });
 
     (manager, scheduler, mock_cm, network_registry)

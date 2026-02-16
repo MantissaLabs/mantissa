@@ -13,7 +13,7 @@ use crate::{
         bootstrap::{Bootstrap, Stores},
     },
     services::ServiceController,
-    task::manager::TaskManager,
+    task::manager::{TaskManager, TaskRuntimeConfig},
 };
 use net::noise::NoiseKeys;
 use protocol::secrets::secrets;
@@ -40,6 +40,7 @@ pub struct HeadlessConfig {
     pub sync_fanout: Option<usize>,
     pub gossip_tick: Option<Duration>,
     pub gossip_fanout: Option<usize>,
+    pub task_runtime: Option<TaskRuntimeConfig>,
 }
 
 impl Default for HeadlessConfig {
@@ -51,6 +52,7 @@ impl Default for HeadlessConfig {
             sync_fanout: None,
             gossip_tick: None,
             gossip_fanout: None,
+            task_runtime: None,
         }
     }
 }
@@ -127,6 +129,7 @@ impl HeadlessNode {
             sync_fanout,
             gossip_tick,
             gossip_fanout,
+            task_runtime,
         } = cfg;
         // Local Node + client
         let mut node_obj = node::Node::new();
@@ -145,7 +148,8 @@ impl HeadlessNode {
             node_client,
         );
         let stores: Stores = Bootstrap::open_stores(&ctx).await?;
-        let (comps, gossip_rx, gossip_dedupe) = Bootstrap::build_components(&ctx, &stores).await?;
+        let (comps, gossip_rx, gossip_dedupe) =
+            Bootstrap::build_components(&ctx, &stores, task_runtime).await?;
         if let Some(d) = sync_tick {
             comps.topology.set_sync_interval(d);
         }
@@ -410,6 +414,16 @@ impl HeadlessNode {
         gossip_tick: Option<Duration>,
         fanout: Option<usize>,
     ) -> io::Result<Self> {
+        Self::new_inproc_custom_with_task_runtime(sync_tick, gossip_tick, fanout, None).await
+    }
+
+    /// Quick-start **in-process** node with custom sync/gossip and task runtime loop cadence.
+    pub async fn new_inproc_custom_with_task_runtime(
+        sync_tick: Option<Duration>,
+        gossip_tick: Option<Duration>,
+        fanout: Option<usize>,
+        task_runtime: Option<TaskRuntimeConfig>,
+    ) -> io::Result<Self> {
         let state = self_contained_state()?;
         let mut node = Self::new_with(
             state.db,
@@ -422,6 +436,7 @@ impl HeadlessNode {
                 sync_fanout: None,
                 gossip_tick,
                 gossip_fanout: fanout,
+                task_runtime,
             },
         )
         .await

@@ -14,6 +14,7 @@ local_test!(gossip_spreads_join_with_limited_fanout, {
         sync_tick_ms: Some(100),
         gossip_tick_ms: Some(200),
         gossip_fanout: Some(FANOUT),
+        ..ClusterConfig::default()
     };
 
     let cluster = TestNode::new_cluster_inproc_with_config(NODE_COUNT, cfg)

@@ -47,6 +47,25 @@ use self::secrets::TaskSecretArtifacts;
 /// Maximum number of concurrent image pulls executed per node.
 const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
 
+/// Runtime loop cadence configuration for the task manager reconciliation workers.
+#[derive(Clone, Copy, Debug)]
+pub struct TaskRuntimeConfig {
+    pub repair_tick: Duration,
+    pub reconcile_tick: Duration,
+    pub runtime_event_debounce: Duration,
+}
+
+impl Default for TaskRuntimeConfig {
+    /// Builds production defaults that balance reconciliation latency and background overhead.
+    fn default() -> Self {
+        Self {
+            repair_tick: Duration::from_secs(5),
+            reconcile_tick: Duration::from_secs(5),
+            runtime_event_debounce: Duration::from_millis(500),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TaskManager {
     store: TaskStore,
@@ -67,6 +86,7 @@ pub struct TaskManager {
     network_registry: NetworkRegistry,
     attachment_provisioner: Arc<dyn AttachmentProvisionerApi>,
     forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
+    runtime_config: TaskRuntimeConfig,
 }
 
 #[derive(Clone)]
@@ -104,6 +124,7 @@ pub struct TaskManagerConfig {
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
     pub forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
     pub attachment_override: Option<Arc<dyn AttachmentProvisionerApi>>,
+    pub runtime_config: Option<TaskRuntimeConfig>,
 }
 
 impl TaskManager {
@@ -122,6 +143,7 @@ impl TaskManager {
             secret_keyring,
             forwarding_events,
             attachment_override,
+            runtime_config,
         } = config;
         let secret_runtime_root = resolve_secret_runtime_root(local_node_id);
 
@@ -158,6 +180,7 @@ impl TaskManager {
             secret_runtime_root,
             attachment_provisioner,
             forwarding_events,
+            runtime_config: runtime_config.unwrap_or_default(),
         }
     }
 

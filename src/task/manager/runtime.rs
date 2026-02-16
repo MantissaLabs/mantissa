@@ -281,9 +281,9 @@ impl TaskManager {
 
     /// Main gossip processing loop for the task manager.
     pub async fn run(&mut self) {
-        let mut repair_tick = interval(Duration::from_secs(5));
-        let mut reconcile_tick = interval(Duration::from_secs(5));
-        let mut runtime_event_tick = interval(Duration::from_millis(500));
+        let mut repair_tick = interval(self.runtime_config.repair_tick);
+        let mut reconcile_tick = interval(self.runtime_config.reconcile_tick);
+        let mut runtime_event_tick = interval(self.runtime_config.runtime_event_debounce);
         runtime_event_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut runtime_reconcile_pending = false;
         let (runtime_events_tx, mut runtime_events_rx) = unbounded_channel();

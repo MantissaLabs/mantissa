@@ -438,6 +438,7 @@ local_test!(services_placement_startup_avoids_over_replication, {
         sync_tick_ms: Some(100),
         gossip_tick_ms: Some(100),
         gossip_fanout: Some(2),
+        ..ClusterConfig::default()
     };
     let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
         .await
@@ -515,6 +516,7 @@ local_test!(
             sync_tick_ms: Some(100),
             gossip_tick_ms: Some(100),
             gossip_fanout: Some(2),
+            ..ClusterConfig::default()
         };
         let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
             .await
@@ -656,6 +658,7 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
         sync_tick_ms: Some(100),
         gossip_tick_ms: Some(100),
         gossip_fanout: Some(2),
+        ..ClusterConfig::default()
     };
     let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
         .await
@@ -920,6 +923,7 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
         sync_tick_ms: Some(100),
         gossip_tick_ms: Some(100),
         gossip_fanout: Some(2),
+        ..ClusterConfig::default()
     };
     let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
         .await
@@ -1028,6 +1032,7 @@ local_test!(services_sync_recovers_missing_entries, {
         sync_tick_ms: Some(100),
         gossip_tick_ms: Some(100),
         gossip_fanout: Some(2),
+        ..ClusterConfig::default()
     };
 
     let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)

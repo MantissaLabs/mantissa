@@ -271,6 +271,7 @@ async fn setup_task_manager() -> TestHarness {
         secret_keyring: secret_keyring_arc.clone(),
         forwarding_events: None,
         attachment_override: None,
+        runtime_config: None,
     });
 
     TestHarness {

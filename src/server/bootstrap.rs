@@ -34,7 +34,7 @@ use crate::store::service_store::{ServiceStore, open_service_store};
 use crate::store::task_store::{TaskStore, open_task_store};
 use crate::sync::SyncService;
 use crate::task::docker::{self, ContainerManager, DockerContainerManager};
-use crate::task::manager::{TaskManager, TaskManagerConfig};
+use crate::task::manager::{TaskManager, TaskManagerConfig, TaskRuntimeConfig};
 use crate::task::service::TaskService;
 use crate::token::TokenStore;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyStores};
@@ -72,7 +72,8 @@ pub async fn start(
     let stores = Bootstrap::open_stores(&ctx).await?;
 
     // Build runtime components (gossip, topology, sync) and their clients
-    let (comps, gossip_rx, gossip_dedupe) = Bootstrap::build_components(&ctx, &stores).await?;
+    let (comps, gossip_rx, gossip_dedupe) =
+        Bootstrap::build_components(&ctx, &stores, None).await?;
 
     // Wire up ServerImpl and spawn listeners
     let server = Bootstrap::build_server(&ctx, &stores, &comps);
@@ -290,6 +291,7 @@ impl Bootstrap {
     pub(crate) async fn build_components(
         ctx: &Bootstrap,
         stores: &Stores,
+        task_runtime_config: Option<TaskRuntimeConfig>,
     ) -> Result<(Components, Receiver<Message>, DedupeStateHandle), Box<dyn std::error::Error>>
     {
         // gossip channels: topology -> gossip sender, gossip -> topology sender
@@ -485,6 +487,7 @@ impl Bootstrap {
             secret_keyring: stores.secret_keyring.clone(),
             forwarding_events: Some(forwarding_tx),
             attachment_override: None,
+            runtime_config: task_runtime_config,
         });
 
         let service_controller = ServiceController::new(
