@@ -525,44 +525,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             NetworksCommand::Inspect(args) => {
-                let info = local
+                local
                     .run_until(client::networks::inspect(&cfg, &args.id))
                     .await?;
-                println!("network {} ({})", info.spec.name, info.spec.id);
-                println!("  status: {}", info.spec.status);
-                println!(
-                    "  driver: {} vni={} mtu={}",
-                    info.spec.driver, info.spec.vni, info.spec.mtu
-                );
-                println!("  subnet: {}", info.spec.subnet_cidr);
-                if !info.spec.description.is_empty() {
-                    println!("  description: {}", info.spec.description);
-                }
-                if info.spec.sealed {
-                    println!("  sealed: true");
-                }
-                if !info.spec.bpf_programs.is_empty() {
-                    println!("  bpf programs: {}", info.spec.bpf_programs.join(", "));
-                }
-                println!("  created: {}", info.spec.created_at);
-                println!("  updated: {}", info.spec.updated_at);
-                println!("  attachments: {}", info.attachment_count);
-
-                if info.peers.is_empty() {
-                    println!("  no peer status available");
-                } else {
-                    println!("  peers:");
-                    for peer in info.peers {
-                        if let Some(err) = peer.error {
-                            println!(
-                                "    {} ({}) - {} [{}]",
-                                peer.peer_name, peer.peer_id, peer.state, err
-                            );
-                        } else {
-                            println!("    {} ({}) - {}", peer.peer_name, peer.peer_id, peer.state);
-                        }
-                    }
-                }
             }
             NetworksCommand::Status(args) => {
                 let peers = local
