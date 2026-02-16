@@ -702,6 +702,62 @@ pub enum SplitNetworkPolicyOpt {
     Preserve,
 }
 
+impl From<SplitFilterOpt> for client::clusters::SplitFilterKind {
+    /// Convert CLI split-filter selectors to client split-filter selectors.
+    fn from(value: SplitFilterOpt) -> Self {
+        match value {
+            SplitFilterOpt::GpuVendor => client::clusters::SplitFilterKind::GpuVendor,
+            SplitFilterOpt::GpuModel => client::clusters::SplitFilterKind::GpuModel,
+            SplitFilterOpt::CpuVendor => client::clusters::SplitFilterKind::CpuVendor,
+            SplitFilterOpt::CpuBrand => client::clusters::SplitFilterKind::CpuBrand,
+            SplitFilterOpt::GpuCount => client::clusters::SplitFilterKind::GpuCount,
+            SplitFilterOpt::CpuCores => client::clusters::SplitFilterKind::CpuCores,
+            SplitFilterOpt::CpuLogical => client::clusters::SplitFilterKind::CpuLogical,
+            SplitFilterOpt::MemoryTotalKb => client::clusters::SplitFilterKind::MemoryTotalKb,
+            SplitFilterOpt::MemoryTotalBytes => client::clusters::SplitFilterKind::MemoryTotalBytes,
+        }
+    }
+}
+
+impl From<SplitServicePolicyOpt> for client::clusters::SplitServicePolicy {
+    /// Convert CLI split service-policy options to client split service-policy values.
+    fn from(value: SplitServicePolicyOpt) -> Self {
+        match value {
+            SplitServicePolicyOpt::Partitioned => client::clusters::SplitServicePolicy::Partitioned,
+            SplitServicePolicyOpt::Preserve => client::clusters::SplitServicePolicy::Preserve,
+        }
+    }
+}
+
+impl From<SplitNetworkPolicyOpt> for client::clusters::SplitNetworkPolicy {
+    /// Convert CLI split network-policy options to client split network-policy values.
+    fn from(value: SplitNetworkPolicyOpt) -> Self {
+        match value {
+            SplitNetworkPolicyOpt::Isolate => client::clusters::SplitNetworkPolicy::Isolate,
+            SplitNetworkPolicyOpt::Preserve => client::clusters::SplitNetworkPolicy::Preserve,
+        }
+    }
+}
+
+impl From<SplitArgs> for client::clusters::SplitCommandRequest {
+    /// Convert split CLI arguments into the client request consumed by split orchestration.
+    fn from(value: SplitArgs) -> Self {
+        Self {
+            source_cluster_id: value.cluster,
+            interactive: value.interactive,
+            filter_per_gpu: value.filter_per_gpu,
+            filter: value.by.map(Into::into),
+            values: value.values,
+            remainder_name: value.remainder_name,
+            left_name: value.left_name,
+            right_name: value.right_name,
+            dry_run: value.dry_run,
+            service_policy: value.services.into(),
+            network_policy: value.networks.into(),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum MergeServicePolicyOpt {
     Rebalance,

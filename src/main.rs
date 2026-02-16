@@ -24,12 +24,11 @@ mod sync;
 mod task;
 mod token;
 mod topology;
-mod ui;
 
 use clap::Parser;
 use protocol::{info_capnp, node_capnp, topology_capnp};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::error::Error;
 use std::path::Path;
 use tokio::task::LocalSet;
@@ -100,100 +99,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .await?;
             }
             ClustersCommand::Split(s) => {
-                let service_policy = match s.services {
-                    SplitServicePolicyOpt::Partitioned => {
-                        client::clusters::SplitServicePolicy::Partitioned
-                    }
-                    SplitServicePolicyOpt::Preserve => {
-                        client::clusters::SplitServicePolicy::Preserve
-                    }
-                };
-                let network_policy = match s.networks {
-                    SplitNetworkPolicyOpt::Isolate => client::clusters::SplitNetworkPolicy::Isolate,
-                    SplitNetworkPolicyOpt::Preserve => {
-                        client::clusters::SplitNetworkPolicy::Preserve
-                    }
-                };
-                if s.interactive {
-                    let payload = local
-                        .run_until(client::clusters::list_split_candidates(
-                            &cfg,
-                            s.cluster.as_deref(),
-                        ))
-                        .await?;
-                    if payload.candidates.is_empty() {
-                        return Err(
-                            anyhow!("no split candidates found in the selected cluster").into()
-                        );
-                    }
-
-                    let selection = ui::split_interactive::run_split_planner(
-                        payload,
-                        &s.left_name,
-                        &s.right_name,
-                    )?;
-                    if selection.cancelled {
-                        println!("split cancelled");
-                        return Ok(());
-                    }
-
-                    local
-                        .run_until(client::clusters::split_by_explicit_nodes(
-                            &cfg,
-                            s.cluster.as_deref(),
-                            &selection.left_name,
-                            &selection.right_name,
-                            &selection.left_nodes,
-                            &selection.right_nodes,
-                            s.dry_run,
-                            service_policy,
-                            network_policy,
-                        ))
-                        .await?;
-                } else {
-                    let (filter, values) = if !s.filter_per_gpu.is_empty() {
-                        (
-                            client::clusters::SplitFilterKind::GpuVendor,
-                            s.filter_per_gpu.clone(),
-                        )
-                    } else {
-                        let filter = match s.by.ok_or_else(|| anyhow!("--by is required"))? {
-                            SplitFilterOpt::GpuVendor => {
-                                client::clusters::SplitFilterKind::GpuVendor
-                            }
-                            SplitFilterOpt::GpuModel => client::clusters::SplitFilterKind::GpuModel,
-                            SplitFilterOpt::CpuVendor => {
-                                client::clusters::SplitFilterKind::CpuVendor
-                            }
-                            SplitFilterOpt::CpuBrand => client::clusters::SplitFilterKind::CpuBrand,
-                            SplitFilterOpt::GpuCount => client::clusters::SplitFilterKind::GpuCount,
-                            SplitFilterOpt::CpuCores => client::clusters::SplitFilterKind::CpuCores,
-                            SplitFilterOpt::CpuLogical => {
-                                client::clusters::SplitFilterKind::CpuLogical
-                            }
-                            SplitFilterOpt::MemoryTotalKb => {
-                                client::clusters::SplitFilterKind::MemoryTotalKb
-                            }
-                            SplitFilterOpt::MemoryTotalBytes => {
-                                client::clusters::SplitFilterKind::MemoryTotalBytes
-                            }
-                        };
-                        (filter, s.values.clone())
-                    };
-
-                    local
-                        .run_until(client::clusters::split_by_filter(
-                            &cfg,
-                            s.cluster.as_deref(),
-                            filter,
-                            &values,
-                            &s.remainder_name,
-                            s.dry_run,
-                            service_policy,
-                            network_policy,
-                        ))
-                        .await?;
-                }
+                let request: client::clusters::SplitCommandRequest = s.into();
+                local
+                    .run_until(client::clusters::split(&cfg, &request))
+                    .await?;
             }
         },
 

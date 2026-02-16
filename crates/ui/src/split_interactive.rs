@@ -1,5 +1,4 @@
 use anyhow::Result;
-use client::clusters::{ClusterViewSpec, SplitCandidate, SplitCandidateList};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, MouseButton,
@@ -16,6 +15,32 @@ use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::time::Duration;
 use uuid::Uuid;
+
+/// Candidate node details consumed by the interactive split planner.
+#[derive(Clone, Debug)]
+pub struct SplitCandidate {
+    pub node_id: Uuid,
+    pub hostname: String,
+    pub address: String,
+    pub health: String,
+    pub active_view: String,
+    pub cpu_vendor: Option<String>,
+    pub cpu_brand: Option<String>,
+    pub cpu_logical: Option<u64>,
+    pub cpu_cores: Option<u64>,
+    pub memory_total_kb: Option<u64>,
+    pub gpu_vendor: Option<String>,
+    pub gpu_count: Option<u64>,
+    pub gpu_models: Vec<String>,
+    pub wireguard_enabled: bool,
+}
+
+/// Payload rendered by the split planner UI.
+#[derive(Clone, Debug)]
+pub struct SplitCandidateList {
+    pub source_view: String,
+    pub candidates: Vec<SplitCandidate>,
+}
 
 /// One side of the interactive split planner assignment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,7 +71,7 @@ pub struct InteractiveSplitSelection {
 
 /// Mutable UI state used by the split planner event loop.
 struct SplitPlannerApp {
-    source_view: ClusterViewSpec,
+    source_view: String,
     candidates: Vec<SplitCandidate>,
     left_name: String,
     right_name: String,
@@ -349,10 +374,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut SplitPlannerApp) {
         .split(chunks[0]);
 
     let list_block = Block::default()
-        .title(format!(
-            "Split Planner {} ({})",
-            app.source_view.cluster_id, app.source_view.epoch
-        ))
+        .title(format!("Split Planner {}", app.source_view))
         .borders(Borders::ALL);
     let list_inner = list_block.inner(top_chunks[0]);
 

@@ -1,10 +1,18 @@
 use crate::config::ClientConfig;
+use crate::output;
 use anyhow::{Context, Result, anyhow};
 use protocol::topology::split_selector_clause::Operator as SplitOperator;
 use std::collections::HashSet;
+use ui::split_interactive::{
+    SplitCandidate as UiSplitCandidate, SplitCandidateList as UiSplitCandidateList,
+    run_split_planner,
+};
 use uuid::Uuid;
 
-use super::list::{active_cluster_view, resolve_cluster_view_by_cluster_id};
+use super::list::{
+    SplitCandidate as ClientSplitCandidate, SplitCandidateList as ClientSplitCandidateList,
+    active_cluster_view, list_split_candidates, resolve_cluster_view_by_cluster_id,
+};
 use super::operations::{
     ClusterOperationSummary, ClusterViewSpec, emit_operation_summary, parse_cluster_id,
     topology_capability,
@@ -104,6 +112,22 @@ impl SplitNetworkPolicy {
             Self::Preserve => protocol::topology::SplitNetworkPolicy::Preserve,
         }
     }
+}
+
+/// Input payload for `split` so callers can delegate interactive/filtered split orchestration.
+#[derive(Clone, Debug)]
+pub struct SplitCommandRequest {
+    pub source_cluster_id: Option<String>,
+    pub interactive: bool,
+    pub filter_per_gpu: Vec<String>,
+    pub filter: Option<SplitFilterKind>,
+    pub values: Vec<String>,
+    pub remainder_name: String,
+    pub left_name: String,
+    pub right_name: String,
+    pub dry_run: bool,
+    pub service_policy: SplitServicePolicy,
+    pub network_policy: SplitNetworkPolicy,
 }
 
 /// Expanded split selector clause used to populate topology split targets.
@@ -207,6 +231,95 @@ fn normalize_split_values(values: &[String], expects_numeric: bool) -> Result<Ve
     }
 
     Ok(normalized)
+}
+
+/// Convert one client split candidate into a UI-facing candidate without coupling crates.
+fn to_ui_candidate(candidate: ClientSplitCandidate) -> UiSplitCandidate {
+    UiSplitCandidate {
+        node_id: candidate.node_id,
+        hostname: candidate.hostname,
+        address: candidate.address,
+        health: candidate.health,
+        active_view: candidate.active_view.to_string(),
+        cpu_vendor: candidate.cpu_vendor,
+        cpu_brand: candidate.cpu_brand,
+        cpu_logical: candidate.cpu_logical,
+        cpu_cores: candidate.cpu_cores,
+        memory_total_kb: candidate.memory_total_kb,
+        gpu_vendor: candidate.gpu_vendor,
+        gpu_count: candidate.gpu_count,
+        gpu_models: candidate.gpu_models,
+        wireguard_enabled: candidate.wireguard_enabled,
+    }
+}
+
+/// Convert one split-candidate payload from client types to UI-local types.
+fn to_ui_payload(payload: ClientSplitCandidateList) -> UiSplitCandidateList {
+    let source_view = format!(
+        "{} ({})",
+        payload.source_view.cluster_id, payload.source_view.epoch
+    );
+    let candidates = payload
+        .candidates
+        .into_iter()
+        .map(to_ui_candidate)
+        .collect();
+    UiSplitCandidateList {
+        source_view,
+        candidates,
+    }
+}
+
+/// Resolve split mode and execute either interactive-node assignment or filter-based splitting.
+pub async fn split(cfg: &ClientConfig, request: &SplitCommandRequest) -> Result<()> {
+    if request.interactive {
+        let payload = list_split_candidates(cfg, request.source_cluster_id.as_deref()).await?;
+        if payload.candidates.is_empty() {
+            return Err(anyhow!("no split candidates found in the selected cluster"));
+        }
+
+        let selection = run_split_planner(
+            to_ui_payload(payload),
+            &request.left_name,
+            &request.right_name,
+        )?;
+        if selection.cancelled {
+            output::emit_line("split cancelled");
+            return Ok(());
+        }
+
+        return split_by_explicit_nodes(
+            cfg,
+            request.source_cluster_id.as_deref(),
+            &selection.left_name,
+            &selection.right_name,
+            &selection.left_nodes,
+            &selection.right_nodes,
+            request.dry_run,
+            request.service_policy,
+            request.network_policy,
+        )
+        .await;
+    }
+
+    let (filter, values) = if !request.filter_per_gpu.is_empty() {
+        (SplitFilterKind::GpuVendor, request.filter_per_gpu.clone())
+    } else {
+        let filter = request.filter.ok_or_else(|| anyhow!("--by is required"))?;
+        (filter, request.values.clone())
+    };
+
+    split_by_filter(
+        cfg,
+        request.source_cluster_id.as_deref(),
+        filter,
+        &values,
+        &request.remainder_name,
+        request.dry_run,
+        request.service_policy,
+        request.network_policy,
+    )
+    .await
 }
 
 /// Submits a split request derived from a simple filter and value list.

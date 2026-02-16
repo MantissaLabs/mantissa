@@ -14,6 +14,7 @@ capnp-futures = "0.23"
 futures = "0.3.31"
 protocol = { path = "../protocol" }
 net = { path = "../net" }
+ui = { path = "../ui" }
 tabwriter = "1"
 tokio = { version = "1", features = ["net", "rt"] }
 tokio-util = { version = "0.7", features = ["compat"] }
