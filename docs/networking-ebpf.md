@@ -185,7 +185,7 @@ Shared structs are defined in `crates/network-ebpf/src/lib.rs` under the `lb` mo
 - `LB_BACKENDS` (`HashMap<VipBackendKey, Backend>`)
   - Key: `VipBackendKey { vip: u32, slot: u32 }` where `slot` is `0..backend_count-1`
   - Value: `Backend { ip: u32, mac: [u8;6], ... }`
-  - Max backends per VIP: `MAX_BACKENDS = 255`
+  - Max backends per VIP: `MAX_BACKENDS_PER_VIP = 1024`
 - `LB_FWD` / `LB_REV` (`LruHashMap<Flow4, NatEntry>`, 1024 entries each)
   - `Flow4` is the normalized 5‑tuple.
   - `NatEntry` contains VIP and backend IP/MAC for rewrites.
@@ -307,5 +307,5 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
 - IPv4-only VIP/NAT datapath; IPv6 is not load-balanced.
 - NAT currently handles TCP/UDP and skips fragmented IPv4.
 - Public endpoints are “host reachable” via `mnhost-*` and VIPs inside the overlay subnet; they are not automatically Internet-exposed.
-- Static sizing: `MAX_VIPS = 4096`, `MAX_BACKENDS = 255`, and 1024-entry LRU flow caches in each direction.
+- Static sizing: `MAX_VIPS = 4096`, `MAX_BACKENDS_PER_VIP = 1024`, and 1024-entry LRU flow caches in each direction.
 - Security hardening (policy enforcement, deeper conntrack validation) is not yet part of the datapath; XDP programs mainly perform sanity filtering.

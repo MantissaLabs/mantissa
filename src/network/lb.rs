@@ -48,6 +48,7 @@ mod platform {
     use std::net::Ipv4Addr;
     use std::os::fd::{AsFd, AsRawFd};
     use std::path::Path;
+    use tracing::warn;
     use uuid::Uuid;
 
     #[derive(Clone, Default)]
@@ -60,14 +61,27 @@ mod platform {
 
         pub fn sync_vip(
             &self,
-            _network_id: Uuid,
+            network_id: Uuid,
             vip: Ipv4Addr,
             vip_mac: [u8; 6],
             backends: &[BackendAddress],
         ) -> Result<()> {
-            let base = map_pin_dir(_network_id)?;
+            let base = map_pin_dir(network_id)?;
             let vip_map = open_map(&base, "LB_VIPS").context("open LB_VIPS map")?;
             let backend_map = open_map(&base, "LB_BACKENDS").context("open LB_BACKENDS map")?;
+            let programmed_backends = backends.len().min(MAX_BACKENDS_PER_VIP);
+
+            if backends.len() > MAX_BACKENDS_PER_VIP {
+                warn!(
+                    target: "network",
+                    network_id = %network_id,
+                    vip = %vip,
+                    requested_backends = backends.len(),
+                    programmed_backends,
+                    cap = MAX_BACKENDS_PER_VIP,
+                    "service backend fanout exceeds LB dataplane cap; truncating backend set"
+                );
+            }
 
             let entry = build_vip_entry(vip_mac, backends);
             let key = VipKey {
@@ -99,7 +113,7 @@ mod platform {
                 backend_map.fd().as_fd().as_raw_fd(),
                 key.vip,
                 backends,
-                MAX_BACKENDS,
+                MAX_BACKENDS_PER_VIP,
             )
             .context("program backends")?;
 
@@ -110,7 +124,10 @@ mod platform {
         }
     }
 
-    const MAX_BACKENDS: usize = 255;
+    /// Maximum backends programmed per VIP in eBPF maps.
+    ///
+    /// Keep this in sync with `network_ebpf::lb::MAX_BACKENDS_PER_VIP`.
+    const MAX_BACKENDS_PER_VIP: usize = 1024;
     const BPF_MAP_UPDATE_ELEM: libc::c_uint = 2;
     const BPF_MAP_DELETE_ELEM: libc::c_uint = 3;
     const BPF_MAP_GET_NEXT_KEY: libc::c_uint = 4;
@@ -167,8 +184,8 @@ mod platform {
     #[derive(Clone, Copy, Default)]
     struct VipEntry {
         vip_mac: [u8; 6],
-        backend_count: u8,
-        _pad: [u8; 3],
+        backend_count: u16,
+        _pad: [u8; 2],
     }
     unsafe impl Pod for VipEntry {}
 
@@ -191,7 +208,7 @@ mod platform {
             return Ok(false);
         }
 
-        let expected_count = backends.len().min(MAX_BACKENDS);
+        let expected_count = backends.len().min(MAX_BACKENDS_PER_VIP);
         if existing.backend_count as usize != expected_count {
             return Ok(false);
         }
@@ -218,7 +235,7 @@ mod platform {
     fn build_vip_entry(vip_mac: [u8; 6], backends: &[BackendAddress]) -> VipEntry {
         VipEntry {
             vip_mac,
-            backend_count: backends.len().min(MAX_BACKENDS) as u8,
+            backend_count: backends.len().min(MAX_BACKENDS_PER_VIP) as u16,
             ..VipEntry::default()
         }
     }

@@ -211,7 +211,7 @@ pub mod net {
 
 pub mod lb {
     /// Maximum number of backend targets tracked per VIP entry.
-    pub const MAX_BACKENDS: usize = 255;
+    pub const MAX_BACKENDS_PER_VIP: usize = 1024;
     /// Maximum number of VIPs tracked in LB maps.
     pub const MAX_VIPS: usize = 4096;
 
@@ -236,8 +236,8 @@ pub mod lb {
     #[derive(Clone, Copy)]
     pub struct VipEntry {
         pub vip_mac: [u8; 6],
-        pub backend_count: u8,
-        pub _pad: [u8; 3],
+        pub backend_count: u16,
+        pub _pad: [u8; 2],
     }
 
     /// Composite key used to isolate backend slots per VIP inside a flat hash map so the backend

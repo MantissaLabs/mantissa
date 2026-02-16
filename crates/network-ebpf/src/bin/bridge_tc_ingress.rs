@@ -9,7 +9,9 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use network_ebpf::{
-    lb::{Backend, Flow4, NatEntry, VipBackendKey, VipEntry, VipKey, MAX_BACKENDS, MAX_VIPS},
+    lb::{
+        Backend, Flow4, NatEntry, VipBackendKey, VipEntry, VipKey, MAX_BACKENDS_PER_VIP, MAX_VIPS,
+    },
     net::{self, EthernetHeader, Ipv4Header, UdpHeader},
     stats::{self, PacketStats},
 };
@@ -45,7 +47,7 @@ static mut LB_VIPS: HashMap<VipKey, VipEntry> = HashMap::pinned(MAX_VIPS as u32,
 
 #[map(name = "LB_BACKENDS")]
 static mut LB_BACKENDS: HashMap<VipBackendKey, Backend> =
-    HashMap::pinned((MAX_BACKENDS * MAX_VIPS) as u32, 0);
+    HashMap::pinned((MAX_BACKENDS_PER_VIP * MAX_VIPS) as u32, 0);
 
 #[map(name = "LB_FWD")]
 static mut LB_FWD: LruHashMap<Flow4, NatEntry> = LruHashMap::pinned(1024, 0);
@@ -215,7 +217,7 @@ fn select_backend(flow: &Flow4, vip: u32) -> Option<NatEntry> {
     let vip_key = VipKey { vip };
     let config = unsafe { LB_VIPS.get(&vip_key)?.clone() };
     let count = config.backend_count as usize;
-    if count == 0 || count > MAX_BACKENDS {
+    if count == 0 || count > MAX_BACKENDS_PER_VIP {
         return None;
     }
 
@@ -224,7 +226,7 @@ fn select_backend(flow: &Flow4, vip: u32) -> Option<NatEntry> {
     let mut chosen: Option<Backend> = None;
 
     let mut idx: usize = 0;
-    while idx < count && idx < MAX_BACKENDS {
+    while idx < count && idx < MAX_BACKENDS_PER_VIP {
         let key = VipBackendKey {
             vip,
             slot: idx as u32,
