@@ -180,12 +180,14 @@ Shared structs are defined in `crates/network-ebpf/src/lib.rs` under the `lb` mo
 
 - `LB_VIPS` (`HashMap<VipKey, VipEntry>`)
   - Key: `VipKey { vip: u32 }`
-  - Value: `VipEntry { vip_mac, backend_count, ... }`
+  - Value: `VipEntry { vip_mac, backend_count, ... }` where `backend_count` is the number of
+    precomputed lookup slots for the VIP.
   - Max VIPs: `MAX_VIPS = 4096`
 - `LB_BACKENDS` (`HashMap<VipBackendKey, Backend>`)
   - Key: `VipBackendKey { vip: u32, slot: u32 }` where `slot` is `0..backend_count-1`
   - Value: `Backend { ip: u32, mac: [u8;6], ... }`
-  - Max backends per VIP: `MAX_BACKENDS_PER_VIP = 1024`
+  - Slots are precomputed in userspace as a deterministic backend ring.
+  - Max slots per VIP: `MAX_BACKENDS_PER_VIP = 1024`
 - `LB_FWD` / `LB_REV` (`LruHashMap<Flow4, NatEntry>`, 1024 entries each)
   - `Flow4` is the normalized 5‑tuple.
   - `NatEntry` contains VIP and backend IP/MAC for rewrites.
@@ -206,7 +208,8 @@ Both ingress/egress programs explicitly set the padding to zero when constructin
 
 1. Accepts only IPv4, non-fragmented, TCP/UDP packets.
 2. Builds a `Flow4` key from the pre-NAT 5‑tuple and looks in `LB_FWD`.
-3. On cache miss, selects a backend using rendezvous hashing over the backend slots for the VIP.
+3. On cache miss, hashes the flow into the precomputed per-VIP backend ring and performs one map
+   lookup.
 4. Applies DNAT:
    - `eth.dst = backend_mac`
    - `ip.dst = backend_ip`

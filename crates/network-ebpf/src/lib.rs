@@ -231,17 +231,17 @@ pub mod lb {
         pub _pad: u16,
     }
 
-    /// VIP metadata used when selecting a target; actual backends are stored separately.
+    /// VIP metadata used when selecting a target; actual backends are stored in slot maps.
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct VipEntry {
         pub vip_mac: [u8; 6],
+        /// Number of precomputed backend lookup slots for this VIP.
         pub backend_count: u16,
         pub _pad: [u8; 2],
     }
 
-    /// Composite key used to isolate backend slots per VIP inside a flat hash map so the backend
-    /// table can grow without a small fixed slot limit.
+    /// Composite key used to isolate backend lookup slots per VIP inside a flat hash map.
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct VipBackendKey {

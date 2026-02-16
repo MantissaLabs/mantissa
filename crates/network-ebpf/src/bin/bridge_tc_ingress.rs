@@ -211,8 +211,7 @@ fn handle_arp(
     Ok(TC_ACT_OK)
 }
 
-/// Select a backend for the provided VIP using a stable hash while allowing an unbounded number of
-/// VIPs and a larger per-VIP backend set by storing entries in a flat hash map keyed by VIP.
+/// Select a backend for the provided VIP in O(1) by hashing into a precomputed backend ring.
 fn select_backend(flow: &Flow4, vip: u32) -> Option<NatEntry> {
     let vip_key = VipKey { vip };
     let config = unsafe { LB_VIPS.get(&vip_key)?.clone() };
@@ -221,29 +220,12 @@ fn select_backend(flow: &Flow4, vip: u32) -> Option<NatEntry> {
         return None;
     }
 
-    let flow_hash = hash_flow(flow, vip);
-    let mut best_score: u64 = 0;
-    let mut chosen: Option<Backend> = None;
-
-    let mut idx: usize = 0;
-    while idx < count && idx < MAX_BACKENDS_PER_VIP {
-        let key = VipBackendKey {
-            vip,
-            slot: idx as u32,
-        };
-
-        if let Some(backend) = unsafe { LB_BACKENDS.get(&key) } {
-            let score = mix64(flow_hash ^ (idx as u64));
-            if chosen.is_none() || score > best_score {
-                best_score = score;
-                chosen = Some(backend.clone());
-            }
-        }
-
-        idx += 1;
-    }
-
-    let backend = chosen?;
+    let ring_slot = (hash_flow(flow, vip) % (count as u64)) as u32;
+    let key = VipBackendKey {
+        vip,
+        slot: ring_slot,
+    };
+    let backend = unsafe { LB_BACKENDS.get(&key)?.clone() };
 
     Some(NatEntry {
         vip,

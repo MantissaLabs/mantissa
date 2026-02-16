@@ -69,21 +69,21 @@ mod platform {
             let base = map_pin_dir(network_id)?;
             let vip_map = open_map(&base, "LB_VIPS").context("open LB_VIPS map")?;
             let backend_map = open_map(&base, "LB_BACKENDS").context("open LB_BACKENDS map")?;
-            let programmed_backends = backends.len().min(MAX_BACKENDS_PER_VIP);
+            let requested_backends = backends.len();
+            let admitted_backends = requested_backends.min(MAX_BACKENDS_PER_VIP);
 
-            if backends.len() > MAX_BACKENDS_PER_VIP {
+            if requested_backends > MAX_BACKENDS_PER_VIP {
                 warn!(
                     target: "network",
                     network_id = %network_id,
                     vip = %vip,
-                    requested_backends = backends.len(),
-                    programmed_backends,
+                    requested_backends,
+                    admitted_backends,
                     cap = MAX_BACKENDS_PER_VIP,
                     "service backend fanout exceeds LB dataplane cap; truncating backend set"
                 );
             }
 
-            let entry = build_vip_entry(vip_mac, backends);
             let key = VipKey {
                 // The eBPF programs read IPv4 fields directly from packet memory without endian
                 // conversion, meaning the stored `u32` value must match the host-native
@@ -91,31 +91,41 @@ mod platform {
                 // representation consistent for lookups and for rewriting packet headers.
                 vip: u32::from_ne_bytes(vip.octets()),
             };
+            let desired_ring = build_backend_lookup_ring(backends, MAX_BACKENDS_PER_VIP);
+            let programmed_slots = desired_ring.len();
+            let existing_entry =
+                lookup_elem::<VipKey, VipEntry>(vip_map.fd().as_fd().as_raw_fd(), &key)
+                    .context("lookup existing VIP metadata")?;
+            let previous_slots = existing_entry
+                .map(|entry| entry.backend_count as usize)
+                .unwrap_or(0);
 
-            let mut clear_flows = backends.is_empty();
-            if !clear_flows {
+            let mut clear_flows = programmed_slots == 0 && previous_slots > 0;
+            if programmed_slots > 0 {
                 clear_flows = match backend_state_matches(
-                    vip_map.fd().as_fd().as_raw_fd(),
                     backend_map.fd().as_fd().as_raw_fd(),
                     &key,
+                    existing_entry,
                     vip_mac,
-                    backends,
+                    &desired_ring,
                 ) {
                     Ok(matches) => !matches,
                     Err(_) => true,
                 };
             }
 
+            program_backends(backend_map.fd().as_fd().as_raw_fd(), key.vip, &desired_ring)
+                .context("program backends")?;
+            let entry = build_vip_entry(vip_mac, programmed_slots);
             update_elem(vip_map.fd().as_fd().as_raw_fd(), &key, &entry)
                 .context("update VIP metadata")?;
-
-            program_backends(
+            trim_vip_backends(
                 backend_map.fd().as_fd().as_raw_fd(),
                 key.vip,
-                backends,
-                MAX_BACKENDS_PER_VIP,
+                programmed_slots,
+                previous_slots,
             )
-            .context("program backends")?;
+            .context("trim stale backend slots")?;
 
             if clear_flows {
                 let _ = clear_vip_flows(&base, key.vip);
@@ -149,7 +159,7 @@ mod platform {
     unsafe impl Pod for VipBackendKey {}
 
     #[repr(C)]
-    #[derive(Clone, Copy, Default)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct Backend {
         ip: u32,
         mac: [u8; 6],
@@ -194,13 +204,13 @@ mod platform {
     /// This lets us avoid clearing flow state on every refresh, which would otherwise disrupt
     /// stable connections even when the backend set is unchanged.
     fn backend_state_matches(
-        vip_fd: std::os::fd::RawFd,
         backend_fd: std::os::fd::RawFd,
         vip_key: &VipKey,
+        existing_entry: Option<VipEntry>,
         vip_mac: [u8; 6],
-        backends: &[BackendAddress],
+        backends: &[Backend],
     ) -> Result<bool> {
-        let Some(existing) = lookup_elem::<VipKey, VipEntry>(vip_fd, vip_key)? else {
+        let Some(existing) = existing_entry else {
             return Ok(false);
         };
 
@@ -208,12 +218,12 @@ mod platform {
             return Ok(false);
         }
 
-        let expected_count = backends.len().min(MAX_BACKENDS_PER_VIP);
+        let expected_count = backends.len();
         if existing.backend_count as usize != expected_count {
             return Ok(false);
         }
 
-        for (idx, backend) in backends.iter().take(expected_count).enumerate() {
+        for (idx, backend) in backends.iter().enumerate() {
             let key = VipBackendKey {
                 vip: vip_key.vip,
                 slot: idx as u32,
@@ -222,9 +232,7 @@ mod platform {
             else {
                 return Ok(false);
             };
-            if existing_backend.ip != u32::from_ne_bytes(backend.ip.octets())
-                || existing_backend.mac != backend.mac
-            {
+            if existing_backend != *backend {
                 return Ok(false);
             }
         }
@@ -232,36 +240,134 @@ mod platform {
         Ok(true)
     }
 
-    fn build_vip_entry(vip_mac: [u8; 6], backends: &[BackendAddress]) -> VipEntry {
+    /// Build the VIP metadata record written to `LB_VIPS`.
+    fn build_vip_entry(vip_mac: [u8; 6], programmed_slots: usize) -> VipEntry {
         VipEntry {
             vip_mac,
-            backend_count: backends.len().min(MAX_BACKENDS_PER_VIP) as u16,
+            backend_count: programmed_slots as u16,
             ..VipEntry::default()
         }
     }
 
-    fn program_backends(
-        fd: std::os::fd::RawFd,
-        vip: u32,
-        backends: &[BackendAddress],
-        max: usize,
-    ) -> Result<()> {
-        clear_vip_backends(fd, vip)?;
+    /// Precompute a per-VIP backend lookup ring so dataplane selection is O(1) on cache miss.
+    fn build_backend_lookup_ring(backends: &[BackendAddress], max_slots: usize) -> Vec<Backend> {
+        let candidates: Vec<Backend> = backends
+            .iter()
+            .take(max_slots)
+            .map(backend_to_map_value)
+            .collect();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
 
-        for (idx, backend) in backends.iter().take(max).enumerate() {
+        let slot_count = desired_lookup_slots(candidates.len(), max_slots);
+        let backend_seeds: Vec<u64> = candidates
+            .iter()
+            .enumerate()
+            .map(|(idx, backend)| backend_seed(backend, idx as u64))
+            .collect();
+
+        let mut ring = Vec::with_capacity(slot_count);
+        for slot in 0..slot_count {
+            let slot_seed = mix64(slot as u64);
+            let mut best_idx: usize = 0;
+            let mut best_score: u64 = 0;
+            let mut initialized = false;
+
+            for (idx, backend_seed) in backend_seeds.iter().enumerate() {
+                let score = mix64(*backend_seed ^ slot_seed);
+                if !initialized || score > best_score {
+                    initialized = true;
+                    best_score = score;
+                    best_idx = idx;
+                }
+            }
+
+            ring.push(candidates[best_idx]);
+        }
+
+        ring
+    }
+
+    /// Convert high-level backend coordinates into the raw value programmed into eBPF maps.
+    fn backend_to_map_value(backend: &BackendAddress) -> Backend {
+        Backend {
+            // Keep the backend IP representation consistent with how the eBPF programs read
+            // and write IPv4 header fields (native-endian `u32` matching network bytes).
+            ip: u32::from_ne_bytes(backend.ip.octets()),
+            mac: backend.mac,
+            _pad: 0,
+        }
+    }
+
+    /// Determine the number of ring slots to precompute for the provided backend cardinality.
+    fn desired_lookup_slots(backend_count: usize, max_slots: usize) -> usize {
+        if backend_count == 0 || max_slots == 0 {
+            return 0;
+        }
+
+        let scaled = backend_count.saturating_mul(8);
+        let mut slots = scaled.next_power_of_two();
+        if slots > max_slots {
+            slots = max_slots;
+        }
+        if slots < backend_count {
+            slots = backend_count;
+        }
+        slots
+    }
+
+    /// Build a stable seed per backend so ring construction is deterministic across refreshes.
+    fn backend_seed(backend: &Backend, ordinal: u64) -> u64 {
+        let mut mac_bits = 0u64;
+        for byte in backend.mac {
+            mac_bits = (mac_bits << 8) | (byte as u64);
+        }
+        mix64((backend.ip as u64) ^ (mac_bits << 7) ^ (ordinal << 33))
+    }
+
+    /// Apply a lightweight 64-bit mix for rendezvous-style slot scoring.
+    fn mix64(mut x: u64) -> u64 {
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51afd7ed558ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+        x ^= x >> 33;
+        x
+    }
+
+    fn program_backends(fd: std::os::fd::RawFd, vip: u32, backends: &[Backend]) -> Result<()> {
+        for (idx, backend) in backends.iter().enumerate() {
             let key = VipBackendKey {
                 vip,
                 slot: idx as u32,
             };
-            let value = Backend {
-                // Keep the backend IP representation consistent with how the eBPF programs read
-                // and write IPv4 header fields (native-endian `u32` matching network bytes).
-                ip: u32::from_ne_bytes(backend.ip.octets()),
-                mac: backend.mac,
-                _pad: 0,
-            };
-            update_elem(fd, &key, &value)
+            update_elem(fd, &key, backend)
                 .with_context(|| format!("update backend slot {} for vip {:08x}", idx, vip))?;
+        }
+
+        Ok(())
+    }
+
+    /// Remove stale backend slots that were part of a previous ring generation.
+    fn trim_vip_backends(
+        fd: std::os::fd::RawFd,
+        vip: u32,
+        keep_slots: usize,
+        previous_slots: usize,
+    ) -> Result<()> {
+        if previous_slots <= keep_slots {
+            return Ok(());
+        }
+
+        for idx in keep_slots..previous_slots {
+            let key = VipBackendKey {
+                vip,
+                slot: idx as u32,
+            };
+            delete_elem(fd, &key).with_context(|| {
+                format!("delete stale backend slot {} for vip {:08x}", idx, vip)
+            })?;
         }
 
         Ok(())
@@ -363,68 +469,6 @@ mod platform {
 
             if matches_vip {
                 let _ = delete_elem(fd, &next);
-                cursor = None;
-            } else {
-                cursor = Some(next);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn clear_vip_backends(fd: std::os::fd::RawFd, vip: u32) -> Result<()> {
-        #[repr(C)]
-        struct BpfAttrKeyIter {
-            map_fd: u32,
-            _pad: u32,
-            key: u64,
-            next_key: u64,
-        }
-
-        #[repr(C)]
-        struct BpfAttrDelete {
-            map_fd: u32,
-            _pad: u32,
-            key: u64,
-        }
-
-        let mut cursor: Option<VipBackendKey> = None;
-        loop {
-            let mut next: VipBackendKey = VipBackendKey::default();
-            let mut iter = BpfAttrKeyIter {
-                map_fd: fd as u32,
-                _pad: 0,
-                key: cursor.as_ref().map(|k| k as *const _ as u64).unwrap_or(0),
-                next_key: &mut next as *mut _ as u64,
-            };
-
-            let ret = unsafe {
-                libc::syscall(
-                    libc::SYS_bpf,
-                    BPF_MAP_GET_NEXT_KEY,
-                    &mut iter as *mut _,
-                    mem::size_of::<BpfAttrKeyIter>(),
-                )
-            };
-
-            if ret < 0 {
-                break;
-            }
-
-            if next.vip == vip {
-                let mut del = BpfAttrDelete {
-                    map_fd: fd as u32,
-                    _pad: 0,
-                    key: &next as *const _ as u64,
-                };
-                let _ = unsafe {
-                    libc::syscall(
-                        libc::SYS_bpf,
-                        BPF_MAP_DELETE_ELEM,
-                        &mut del as *mut _,
-                        mem::size_of::<BpfAttrDelete>(),
-                    )
-                };
                 cursor = None;
             } else {
                 cursor = Some(next);
@@ -591,6 +635,65 @@ mod platform {
     /// Lightweight check to see if a path is a bpffs mount.
     fn is_bpffs(path: &Path) -> bool {
         matches!(statfs(path), Ok(stat) if stat.filesystem_type() == BPF_FS_MAGIC)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::BTreeSet;
+        use std::net::Ipv4Addr;
+
+        /// Build a synthetic backend value for deterministic ring-construction tests.
+        fn synthetic_backend(index: usize) -> BackendAddress {
+            BackendAddress {
+                ip: Ipv4Addr::from(0x0a00_0001u32 + (index as u32)),
+                mac: [
+                    0x02,
+                    ((index >> 16) & 0xff) as u8,
+                    ((index >> 8) & 0xff) as u8,
+                    (index & 0xff) as u8,
+                    0xaa,
+                    0x55,
+                ],
+            }
+        }
+
+        /// Ensure ring precomputation is stable when inputs are unchanged.
+        #[test]
+        fn backend_lookup_ring_is_deterministic() {
+            let backends: Vec<BackendAddress> = (0..16).map(synthetic_backend).collect();
+            let ring_a = build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP);
+            let ring_b = build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP);
+            assert_eq!(ring_a, ring_b);
+            assert!(!ring_a.is_empty());
+        }
+
+        /// Ensure ring precomputation never exceeds the per-VIP programming cap.
+        #[test]
+        fn backend_lookup_ring_respects_cap() {
+            let over_cap = MAX_BACKENDS_PER_VIP + 128;
+            let backends: Vec<BackendAddress> = (0..over_cap).map(synthetic_backend).collect();
+            let ring = build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP);
+            assert!(ring.len() <= MAX_BACKENDS_PER_VIP);
+        }
+
+        /// Ensure all ring slots map to one of the admitted backend candidates.
+        #[test]
+        fn backend_lookup_ring_uses_only_admitted_backends() {
+            let backends: Vec<BackendAddress> = (0..12).map(synthetic_backend).collect();
+            let ring = build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP);
+            let admitted: BTreeSet<(u32, [u8; 6])> = backends
+                .iter()
+                .map(backend_to_map_value)
+                .map(|backend| (backend.ip, backend.mac))
+                .collect();
+
+            assert!(!ring.is_empty());
+            assert!(
+                ring.iter()
+                    .all(|backend| { admitted.contains(&(backend.ip, backend.mac)) })
+            );
+        }
     }
 }
 
