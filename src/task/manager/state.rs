@@ -48,6 +48,53 @@ const IMAGE_PULL_RETRY_MAX_MS: u64 = 5_000;
 const IMAGE_PULL_RETRY_JITTER_MS: u64 = 250;
 
 impl TaskManager {
+    /// Validates a task marked as running and synchronizes local runtime cache state.
+    ///
+    /// Returns `Ok(true)` when the task is already healthy and no further start work is needed.
+    /// Returns `Ok(false)` when reconciliation should continue (for example if runtime restart
+    /// is required because the running container is missing).
+    async fn reconcile_recorded_running_task(
+        &self,
+        working: &mut TaskSpec,
+    ) -> Result<bool, anyhow::Error> {
+        if !matches!(working.state, ContainerState::Running) {
+            return Ok(false);
+        }
+
+        match self.resolve_live_container_id_for_task(working).await {
+            Ok(Some(container_id)) => {
+                let mut guard = self.local_containers.lock().await;
+                guard.insert(working.id, container_id);
+                Ok(true)
+            }
+            Ok(None) => {
+                warn!(
+                    target: "task",
+                    task = %working.id,
+                    "running task container missing locally; restarting task runtime"
+                );
+                working.state = ContainerState::Pending;
+                working.phase_reason = None;
+                working.phase_progress = None;
+                working.updated_at = Utc::now().to_rfc3339();
+                self.persist_spec(working).await?;
+                if let Err(err) = self
+                    .enqueue_gossip(TaskEvent::Upsert(Box::new(working.clone())))
+                    .await
+                {
+                    warn!(
+                        target: "task",
+                        task = %working.id,
+                        "failed to broadcast pending restart state: {err}"
+                    );
+                }
+                Ok(false)
+            }
+            Err(err) => Err(anyhow::Error::from(err)
+                .context(format!("inspect running container for task {}", working.id))),
+        }
+    }
+
     /// Ensures the provided task has non-empty slot assignments and that each slot is reserved
     /// for this local task before container launch continues.
     ///
@@ -196,6 +243,19 @@ impl TaskManager {
         let mut spec = self.load_spec(task_id).await?;
         let next_reason = phase_reason.filter(|value| !value.trim().is_empty());
         let next_progress = phase_progress.filter(|value| !value.trim().is_empty());
+
+        // Ignore stale provisioning updates once the task has advanced to running/teardown states.
+        // This prevents out-of-order pull retries from overriding a newer Running snapshot.
+        if is_stale_phase_regression(&spec.state, &state) {
+            debug!(
+                target: "task",
+                task = %task_id,
+                current = ?spec.state,
+                requested = ?state,
+                "ignoring stale task phase regression"
+            );
+            return Ok(spec);
+        }
 
         if spec.state == state
             && spec.phase_reason == next_reason
@@ -785,48 +845,13 @@ impl TaskManager {
 
     /// Starts or reuses a container so the task transitions into running state locally.
     pub(super) async fn ensure_task_running(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
-        let mut working = spec.clone();
+        let mut working = self.load_spec(spec.id).await.unwrap_or(spec);
         let task_name = working.name.clone();
 
-        if matches!(working.state, ContainerState::Running) {
-            match self.resolve_live_container_id_for_task(&working).await {
-                Ok(Some(container_id)) => {
-                    let mut guard = self.local_containers.lock().await;
-                    guard.insert(working.id, container_id);
-                    return Ok(());
-                }
-                Ok(None) => {
-                    warn!(
-                        target: "task",
-                        task = %working.id,
-                        "running task container missing locally; restarting task runtime"
-                    );
-                    working.state = ContainerState::Pending;
-                    working.phase_reason = None;
-                    working.phase_progress = None;
-                    working.updated_at = Utc::now().to_rfc3339();
-                    self.persist_spec(&working).await?;
-                    if let Err(err) = self
-                        .enqueue_gossip(TaskEvent::Upsert(Box::new(working.clone())))
-                        .await
-                    {
-                        warn!(
-                            target: "task",
-                            task = %working.id,
-                            "failed to broadcast pending restart state: {err}"
-                        );
-                    }
-                }
-                Err(err) => {
-                    return Err(anyhow::Error::from(err)
-                        .context(format!("inspect running container for task {}", working.id)));
-                }
-            }
+        if self.reconcile_recorded_running_task(&mut working).await? {
+            return Ok(());
         }
 
-        // Always reconcile from the freshest persisted task view because gossip or local stop
-        // transitions may have advanced while this handler was queued.
-        working = self.load_spec(working.id).await.unwrap_or(working);
         if matches!(
             working.state,
             ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
@@ -845,6 +870,9 @@ impl TaskManager {
 
         // Drive a single state transition to `Creating` once image pull has completed.
         working = self.load_spec(working.id).await.unwrap_or(working);
+        if self.reconcile_recorded_running_task(&mut working).await? {
+            return Ok(());
+        }
         if matches!(
             working.state,
             ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
@@ -1953,6 +1981,23 @@ fn task_requires_slots(state: &ContainerState) -> bool {
             | ContainerState::Running
             | ContainerState::Paused
             | ContainerState::Stopping
+    )
+}
+
+/// Returns true when a requested phase update would regress lifecycle state due to stale work.
+fn is_stale_phase_regression(current: &ContainerState, requested: &ContainerState) -> bool {
+    matches!(
+        requested,
+        ContainerState::Pending | ContainerState::Pulling | ContainerState::Creating
+    ) && matches!(
+        current,
+        ContainerState::Running
+            | ContainerState::Paused
+            | ContainerState::Stopping
+            | ContainerState::Stopped
+            | ContainerState::Failed
+            | ContainerState::Exited(_)
+            | ContainerState::Unknown
     )
 }
 

@@ -673,6 +673,104 @@ async fn reconcile_uses_latest_persisted_slot_assignment() {
 }
 
 #[tokio::test]
+async fn update_task_phase_ignores_stale_regression_from_running() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("phase-guard", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    assert!(matches!(spec.state, ContainerState::Running));
+
+    let updated = manager
+        .update_task_phase(
+            spec.id,
+            ContainerState::Pulling,
+            Some("pulling image".to_string()),
+            Some("1/3".to_string()),
+        )
+        .await
+        .expect("update phase should not fail");
+    assert!(
+        matches!(updated.state, ContainerState::Running),
+        "running state should not regress to pulling"
+    );
+    assert_eq!(
+        updated.phase_reason, spec.phase_reason,
+        "stale pulling phase should be ignored"
+    );
+    assert_eq!(
+        updated.phase_progress, spec.phase_progress,
+        "stale pulling progress should be ignored"
+    );
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load refreshed task");
+    assert!(matches!(refreshed.state, ContainerState::Running));
+    assert_eq!(mock_cm.created.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn reconcile_stale_pending_input_does_not_repull_running_task() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let running = manager
+        .start_container(
+            "stale-reconcile",
+            "img",
+            vec![],
+            200,
+            64 * 1_024 * 1_024,
+            None,
+        )
+        .await
+        .expect("start container");
+    assert!(matches!(running.state, ContainerState::Running));
+
+    let pulls_before = mock_cm.pull_calls.lock().await.len();
+
+    // Emulate a delayed reconcile worker spawned from an older Pending snapshot.
+    let mut stale = running.clone();
+    stale.state = ContainerState::Pending;
+    stale.phase_reason = None;
+    stale.phase_progress = None;
+
+    manager
+        .reconcile_local_task(stale)
+        .await
+        .expect("stale reconcile should short-circuit on running state");
+
+    let pulls_after = mock_cm.pull_calls.lock().await.len();
+    assert_eq!(
+        pulls_after, pulls_before,
+        "stale pending reconcile should not trigger another image pull"
+    );
+
+    let refreshed = manager
+        .load_spec(running.id)
+        .await
+        .expect("load refreshed task");
+    assert!(
+        matches!(refreshed.state, ContainerState::Running),
+        "task should remain running after stale reconcile input"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_running_task_restarts_when_container_is_missing() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
