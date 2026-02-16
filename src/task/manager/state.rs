@@ -48,6 +48,101 @@ const IMAGE_PULL_RETRY_MAX_MS: u64 = 5_000;
 const IMAGE_PULL_RETRY_JITTER_MS: u64 = 250;
 
 impl TaskManager {
+    /// Ensures the provided task has non-empty slot assignments and that each slot is reserved
+    /// for this local task before container launch continues.
+    ///
+    /// This closes races where reconciliation starts from a slot-assigned snapshot but later
+    /// reads a newer CRDT value with missing or mismatched scheduler ownership.
+    async fn ensure_task_slot_reservations(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
+        if spec.slot_ids.is_empty() {
+            return Err(anyhow!(
+                "task {} ({}) missing scheduler slot assignments",
+                spec.name,
+                spec.id
+            ));
+        }
+
+        let mut unique_slots = HashSet::with_capacity(spec.slot_ids.len());
+        for slot_id in &spec.slot_ids {
+            if !unique_slots.insert(*slot_id) {
+                return Err(anyhow!(
+                    "task {} ({}) has duplicate scheduler slot assignment {}",
+                    spec.name,
+                    spec.id,
+                    slot_id
+                ));
+            }
+        }
+
+        const MAX_ATTEMPTS: usize = 10;
+        for _ in 0..MAX_ATTEMPTS {
+            let snapshot = self
+                .scheduler
+                .snapshot()
+                .await
+                .ok_or_else(|| anyhow!("scheduler snapshot unavailable"))?;
+
+            let mut requests = Vec::new();
+            for slot_id in &spec.slot_ids {
+                let slot = snapshot
+                    .slots
+                    .iter()
+                    .find(|slot| slot.slot_id == *slot_id)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "task {} ({}) references unknown scheduler slot {}",
+                            spec.name,
+                            spec.id,
+                            slot_id
+                        )
+                    })?;
+
+                match &slot.state {
+                    SlotState::Reserved(reservation)
+                        if reservation.owner == self.local_node_id
+                            && reservation.task_id == Some(spec.id) => {}
+                    SlotState::Free => requests.push(SlotReservationRequest {
+                        slot_id: *slot_id,
+                        owner: self.local_node_id,
+                        task_id: Some(spec.id),
+                    }),
+                    SlotState::Reserved(reservation) => {
+                        return Err(anyhow!(
+                            "task {} ({}) requires slot {} but it is reserved by {} ({:?})",
+                            spec.name,
+                            spec.id,
+                            slot_id,
+                            reservation.owner,
+                            reservation.task_id
+                        ));
+                    }
+                }
+            }
+
+            if requests.is_empty() {
+                return Ok(());
+            }
+
+            match self
+                .scheduler
+                .reserve_resources(snapshot.version, requests, Vec::new())
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(SchedulerError::SnapshotMismatch { .. })
+                | Err(SchedulerError::SlotsUnavailable { .. })
+                | Err(SchedulerError::UnknownSlots { .. }) => continue,
+                Err(err) => return Err(anyhow::anyhow!(err)),
+            }
+        }
+
+        Err(anyhow!(
+            "failed to ensure scheduler slot reservations for task {} ({}) after retries",
+            spec.name,
+            spec.id
+        ))
+    }
+
     /// Persists a task snapshot in the backing store.
     pub(super) async fn persist_spec(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
         let mut value = TaskValue::new(TaskValueDraft {
@@ -729,22 +824,19 @@ impl TaskManager {
             }
         }
 
+        // Always reconcile from the freshest persisted task view because gossip or local stop
+        // transitions may have advanced while this handler was queued.
+        working = self.load_spec(working.id).await.unwrap_or(working);
         if matches!(
-            spec.state,
+            working.state,
             ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
         ) {
             return Ok(());
         }
 
-        // Never attempt to launch a container unless the scheduler assignment is visible:
-        // otherwise we would leak reservations and confuse remote capability negotiations.
-        if spec.slot_ids.is_empty() {
-            return Err(anyhow!(
-                "task {} ({}) missing scheduler slot assignments",
-                spec.name,
-                spec.id
-            ));
-        }
+        // Guard launch with scheduler ownership so local start never proceeds without concrete
+        // reservations for this task.
+        self.ensure_task_slot_reservations(&working).await?;
 
         if let Err(err) = self.pull_image_for_task(working.id, &working.image).await {
             let err = self.mark_task_failed(working, err).await;
@@ -759,6 +851,9 @@ impl TaskManager {
         ) {
             return Ok(());
         }
+        // Re-check after pull because phase updates and concurrent CRDT writes may have changed
+        // the persisted assignment while the image was downloading.
+        self.ensure_task_slot_reservations(&working).await?;
         if !matches!(working.state, ContainerState::Creating)
             || working.phase_reason.is_some()
             || working.phase_progress.is_some()

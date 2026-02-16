@@ -545,6 +545,134 @@ async fn reconcile_rejects_missing_slot_assignments() {
 }
 
 #[tokio::test]
+async fn reconcile_pending_task_reserves_assigned_slots_before_launch() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec.clone()])
+        .await
+        .expect("init slots");
+
+    let spec = TaskSpec {
+        id: Uuid::new_v4(),
+        name: "slot-guard".into(),
+        image: "img".into(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: Vec::new(),
+        node_id: manager.local_node_id,
+        node_name: "local-node".into(),
+        slot_ids: vec![slot_spec.slot_id],
+        slot_id: Some(slot_spec.slot_id),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+    };
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("reconcile pending task");
+
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    let slot = snapshot
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == slot_spec.slot_id)
+        .expect("slot present");
+    match &slot.state {
+        SlotState::Reserved(reservation) => {
+            assert_eq!(reservation.owner, manager.local_node_id);
+            assert_eq!(reservation.task_id, Some(spec.id));
+        }
+        SlotState::Free => panic!("slot should be reserved for reconciled task"),
+    }
+
+    assert_eq!(mock_cm.created.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn reconcile_uses_latest_persisted_slot_assignment() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec.clone()])
+        .await
+        .expect("init slots");
+
+    let mut stale_argument = TaskSpec {
+        id: Uuid::new_v4(),
+        name: "stale-assignment".into(),
+        image: "img".into(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: Vec::new(),
+        node_id: manager.local_node_id,
+        node_name: "local-node".into(),
+        slot_ids: vec![slot_spec.slot_id],
+        slot_id: Some(slot_spec.slot_id),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+    };
+
+    // Persist a fresher snapshot with missing assignments to emulate a concurrent CRDT update
+    // landing after this reconcile request was queued.
+    stale_argument.updated_at = Utc::now().to_rfc3339();
+    let mut persisted = stale_argument.clone();
+    persisted.slot_ids.clear();
+    persisted.slot_id = None;
+    manager
+        .persist_spec(&persisted)
+        .await
+        .expect("persist latest view");
+
+    let err = manager
+        .reconcile_local_task(stale_argument)
+        .await
+        .expect_err("reconcile should reject missing persisted assignments");
+    assert!(
+        err.to_string()
+            .contains("missing scheduler slot assignments"),
+        "unexpected error: {err}"
+    );
+
+    assert_eq!(mock_cm.created.lock().await.len(), 0);
+
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    let slot = snapshot
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == slot_spec.slot_id)
+        .expect("slot present");
+    assert!(
+        matches!(slot.state, SlotState::Free),
+        "slot should remain free when reconcile aborts on stale assignments"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_running_task_restarts_when_container_is_missing() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
