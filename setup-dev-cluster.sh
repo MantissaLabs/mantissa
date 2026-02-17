@@ -10,6 +10,8 @@ MEM="16GiB"
 DISK="100GiB"
 SSH_BASE=7200
 IMAGE_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2"
+CREATED_COUNT=0
+SKIPPED_COUNT=0
 
 usage() {
   cat >&2 <<USAGE
@@ -48,8 +50,24 @@ if [[ ! -d "$REPO" ]]; then
   exit 1
 fi
 
+# Returns success when the Lima instance directory is already present.
+# This keeps cluster setup idempotent when rerunning with a higher node count.
+vm_exists() {
+  local NAME="$1"
+  [[ -d "${HOME}/.lima/${NAME}" ]]
+}
+
+# Creates and provisions a single Lima VM for cluster use.
+# Existing instances are skipped so we only create missing nodes.
 start_vm() {
   local NAME="$1" SSHPORT="$2" TMPYAML
+
+  if vm_exists "${NAME}"; then
+    echo "Skipping ${NAME}: instance already exists."
+    SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+    return 0
+  fi
+
   TMPYAML="$(mktemp -t "${NAME}.yaml.XXXXXX")"
 
   {
@@ -191,6 +209,7 @@ PROVISION_1
 
   echo "Starting ${NAME} (SSH port ${SSHPORT})…"
   limactl start --name="${NAME}" "${TMPYAML}"
+  CREATED_COUNT=$((CREATED_COUNT + 1))
   rm -f "${TMPYAML}"
 
   # Ensure any pre-existing SSH ControlMaster session is closed so future shells
@@ -201,7 +220,7 @@ PROVISION_1
   fi
 }
 
-# Create and start N VMs
+# Ensure the first N VM slots exist; create only missing instances.
 for i in $(seq 1 "${COUNT}"); do
   NAME="mantissa-${i}"
   SSHPORT=$((SSH_BASE + i))
@@ -209,7 +228,7 @@ for i in $(seq 1 "${COUNT}"); do
 done
 
 echo
-echo "✅ ${COUNT} VM(s) up with shared network (user-v2)."
+echo "✅ Requested ${COUNT} VM(s): created ${CREATED_COUNT}, already present ${SKIPPED_COUNT}."
 echo
 echo "SSH from host:"
 for i in $(seq 1 "${COUNT}"); do
