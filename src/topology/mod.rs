@@ -1117,7 +1117,7 @@ impl Topology {
     }
 
     /// Probe a small random sample of peers via Health RPC and update the monitor on success.
-    pub async fn health_probe_tick(&self, fanout: usize) {
+    pub async fn health_probe_tick(&self, fanout: usize, timeout: Duration) {
         let snapshot = match self.peer_snapshot().await {
             Some(s) => s,
             None => return,
@@ -1168,7 +1168,7 @@ impl Topology {
                 req.send().promise.await
             };
 
-            match tokio::time::timeout(std::time::Duration::from_secs(1), ping).await {
+            match tokio::time::timeout(timeout, ping).await {
                 Ok(Ok(_)) => {
                     self.mark_seen(peer_id);
                 }

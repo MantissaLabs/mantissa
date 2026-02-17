@@ -46,6 +46,16 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
             health_port: 30080,
         ),
     ),
+    health: (
+        probe_fanout: 2,
+        probe_interval_ms: 1000,
+        probe_timeout_ms: 1000,
+        self_observe_interval_ms: 1000,
+        monitor_tick_ms: 250,
+        suspect_after_ms: 2000,
+        down_after_ms: 6000,
+        degrade_grace_ms: 3000,
+    ),
     docker: (
         host: "unix:///var/run/docker.sock",
     ),
@@ -66,5 +76,13 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `network.nodeport.iface` (legacy: `MANTISSA_NODEPORT_IFACE`)
 - `network.nodeport.ip` (legacy: `MANTISSA_NODEPORT_IP`)
 - `network.discovery.health_port` (legacy: `MANTISSA_LB_HEALTH_PORT`)
+- `health.probe_fanout`
+- `health.probe_interval_ms`
+- `health.probe_timeout_ms`
+- `health.self_observe_interval_ms`
+- `health.monitor_tick_ms`
+- `health.suspect_after_ms`
+- `health.down_after_ms`
+- `health.degrade_grace_ms`
 - `docker.host` (legacy: `MANTISSA_DOCKER_HOST`, still falls back to `DOCKER_HOST`)
 - `gpu.device_overrides` (legacy: `MANTISSA_GPU_DEVICE_OVERRIDES`)

@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
+    pub health: HealthConfig,
+    #[serde(default)]
     pub docker: DockerConfig,
     #[serde(default)]
     pub gpu: GpuConfig,
@@ -123,6 +125,80 @@ impl Default for NodePortConfig {
 pub struct DiscoveryConfig {
     #[serde(default)]
     pub health_port: Option<u16>,
+}
+
+/// # Description:
+///
+/// Cluster peer-health probing and liveness threshold configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct HealthConfig {
+    #[serde(default = "default_health_probe_fanout")]
+    pub probe_fanout: usize,
+    #[serde(default = "default_health_probe_interval_ms")]
+    pub probe_interval_ms: u64,
+    #[serde(default = "default_health_probe_timeout_ms")]
+    pub probe_timeout_ms: u64,
+    #[serde(default = "default_health_self_observe_interval_ms")]
+    pub self_observe_interval_ms: u64,
+    #[serde(default = "default_health_monitor_tick_ms")]
+    pub monitor_tick_ms: u64,
+    #[serde(default = "default_health_suspect_after_ms")]
+    pub suspect_after_ms: u64,
+    #[serde(default = "default_health_down_after_ms")]
+    pub down_after_ms: u64,
+    #[serde(default = "default_health_degrade_grace_ms")]
+    pub degrade_grace_ms: u64,
+}
+
+impl Default for HealthConfig {
+    /// # Description:
+    ///
+    /// Returns baseline peer health settings tuned for small cluster defaults.
+    fn default() -> Self {
+        Self {
+            probe_fanout: default_health_probe_fanout(),
+            probe_interval_ms: default_health_probe_interval_ms(),
+            probe_timeout_ms: default_health_probe_timeout_ms(),
+            self_observe_interval_ms: default_health_self_observe_interval_ms(),
+            monitor_tick_ms: default_health_monitor_tick_ms(),
+            suspect_after_ms: default_health_suspect_after_ms(),
+            down_after_ms: default_health_down_after_ms(),
+            degrade_grace_ms: default_health_degrade_grace_ms(),
+        }
+    }
+}
+
+/// # Description:
+///
+/// Runtime-friendly health settings after converting persisted millisecond values to durations.
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeHealthConfig {
+    pub probe_fanout: usize,
+    pub probe_interval: Duration,
+    pub probe_timeout: Duration,
+    pub self_observe_interval: Duration,
+    pub monitor_tick: Duration,
+    pub suspect_after: Duration,
+    pub down_after: Duration,
+    pub degrade_grace: Duration,
+}
+
+impl HealthConfig {
+    /// # Description:
+    ///
+    /// Converts persisted scalar health settings into strongly typed runtime durations.
+    fn as_runtime(&self) -> RuntimeHealthConfig {
+        RuntimeHealthConfig {
+            probe_fanout: self.probe_fanout,
+            probe_interval: Duration::from_millis(self.probe_interval_ms),
+            probe_timeout: Duration::from_millis(self.probe_timeout_ms),
+            self_observe_interval: Duration::from_millis(self.self_observe_interval_ms),
+            monitor_tick: Duration::from_millis(self.monitor_tick_ms),
+            suspect_after: Duration::from_millis(self.suspect_after_ms),
+            down_after: Duration::from_millis(self.down_after_ms),
+            degrade_grace: Duration::from_millis(self.degrade_grace_ms),
+        }
+    }
 }
 
 /// # Description:
@@ -263,6 +339,13 @@ pub fn discovery_health_port() -> Option<u16> {
 
 /// # Description:
 ///
+/// Resolve the peer-health runtime configuration used by liveness probing loops.
+pub fn health_runtime_config() -> RuntimeHealthConfig {
+    global_config().health.as_runtime()
+}
+
+/// # Description:
+///
 /// Resolve whether WireGuard underlay is enabled on this node.
 pub fn wireguard_enabled() -> bool {
     global_config().network.wireguard.enabled
@@ -318,6 +401,62 @@ pub fn spawn_config_watcher() -> Option<std::thread::JoinHandle<()>> {
 /// Return a default true value for serde defaults.
 fn default_true() -> bool {
     true
+}
+
+/// # Description:
+///
+/// Returns the default peer-health active probe fanout.
+fn default_health_probe_fanout() -> usize {
+    2
+}
+
+/// # Description:
+///
+/// Returns the default interval between peer-health active probe passes.
+fn default_health_probe_interval_ms() -> u64 {
+    1_000
+}
+
+/// # Description:
+///
+/// Returns the default timeout budget for one active health ping.
+fn default_health_probe_timeout_ms() -> u64 {
+    1_000
+}
+
+/// # Description:
+///
+/// Returns the default interval used to refresh local self health.
+fn default_health_self_observe_interval_ms() -> u64 {
+    1_000
+}
+
+/// # Description:
+///
+/// Returns the default recomputation cadence for peer liveness state transitions.
+fn default_health_monitor_tick_ms() -> u64 {
+    250
+}
+
+/// # Description:
+///
+/// Returns the default suspect threshold when no peer observation arrives.
+fn default_health_suspect_after_ms() -> u64 {
+    2_000
+}
+
+/// # Description:
+///
+/// Returns the default down threshold when no peer observation arrives.
+fn default_health_down_after_ms() -> u64 {
+    6_000
+}
+
+/// # Description:
+///
+/// Returns the default grace window used by degraded liveness handling.
+fn default_health_degrade_grace_ms() -> u64 {
+    3_000
 }
 
 /// # Description:
@@ -508,6 +647,42 @@ impl Config {
             }
         }
 
+        if self.health.probe_fanout == 0 {
+            anyhow::bail!("health.probe_fanout must be greater than zero");
+        }
+
+        if self.health.probe_interval_ms == 0 {
+            anyhow::bail!("health.probe_interval_ms must be greater than zero");
+        }
+
+        if self.health.probe_timeout_ms == 0 {
+            anyhow::bail!("health.probe_timeout_ms must be greater than zero");
+        }
+
+        if self.health.self_observe_interval_ms == 0 {
+            anyhow::bail!("health.self_observe_interval_ms must be greater than zero");
+        }
+
+        if self.health.monitor_tick_ms == 0 {
+            anyhow::bail!("health.monitor_tick_ms must be greater than zero");
+        }
+
+        if self.health.suspect_after_ms == 0 {
+            anyhow::bail!("health.suspect_after_ms must be greater than zero");
+        }
+
+        if self.health.down_after_ms == 0 {
+            anyhow::bail!("health.down_after_ms must be greater than zero");
+        }
+
+        if self.health.down_after_ms <= self.health.suspect_after_ms {
+            anyhow::bail!("health.down_after_ms must be greater than health.suspect_after_ms");
+        }
+
+        if self.health.degrade_grace_ms == 0 {
+            anyhow::bail!("health.degrade_grace_ms must be greater than zero");
+        }
+
         if self.network.nodeport.enabled && !self.network.bpf.attach {
             anyhow::bail!("network.nodeport.enabled requires network.bpf.attach to be true");
         }
@@ -633,6 +808,38 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("network.wireguard.port".to_string());
     }
 
+    if old.health.probe_fanout != new.health.probe_fanout {
+        changes.push("health.probe_fanout".to_string());
+    }
+
+    if old.health.probe_interval_ms != new.health.probe_interval_ms {
+        changes.push("health.probe_interval_ms".to_string());
+    }
+
+    if old.health.probe_timeout_ms != new.health.probe_timeout_ms {
+        changes.push("health.probe_timeout_ms".to_string());
+    }
+
+    if old.health.self_observe_interval_ms != new.health.self_observe_interval_ms {
+        changes.push("health.self_observe_interval_ms".to_string());
+    }
+
+    if old.health.monitor_tick_ms != new.health.monitor_tick_ms {
+        changes.push("health.monitor_tick_ms".to_string());
+    }
+
+    if old.health.suspect_after_ms != new.health.suspect_after_ms {
+        changes.push("health.suspect_after_ms".to_string());
+    }
+
+    if old.health.down_after_ms != new.health.down_after_ms {
+        changes.push("health.down_after_ms".to_string());
+    }
+
+    if old.health.degrade_grace_ms != new.health.degrade_grace_ms {
+        changes.push("health.degrade_grace_ms".to_string());
+    }
+
     changes
 }
 
@@ -672,6 +879,21 @@ mod tests {
         let mut config = Config::default();
         config.network.nodeport.enabled = true;
         config.network.bpf.attach = false;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_health_probe_fanout() {
+        let mut config = Config::default();
+        config.health.probe_fanout = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_health_threshold_ordering() {
+        let mut config = Config::default();
+        config.health.suspect_after_ms = 2_000;
+        config.health.down_after_ms = 2_000;
         assert!(config.validate().is_err());
     }
 

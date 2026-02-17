@@ -38,7 +38,7 @@ use crate::task::manager::{TaskManager, TaskManagerConfig, TaskRuntimeConfig};
 use crate::task::service::TaskService;
 use crate::token::TokenStore;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyStores};
-use crate::{node, server};
+use crate::{config, node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::network::networks::Client as NetworksClient;
@@ -137,6 +137,7 @@ pub(crate) struct Components {
     pub topology_client: TopologyClient,
     pub sync_client: protocol::sync::sync::Client,
     pub health_monitor: std::sync::Arc<health::HealthMonitor>,
+    pub runtime_health: config::RuntimeHealthConfig,
     pub task_manager: TaskManager,
     pub service_controller: ServiceController,
     pub scheduler: Rc<Scheduler>,
@@ -335,8 +336,14 @@ impl Bootstrap {
         let gossip_client = capnp_rpc::new_client(gossip);
 
         // topology object + client
-        // Health monitor (phase 1: passive observation only)
-        let health_cfg = health::Config::default();
+        // Health monitor settings are read from the node config to avoid hardcoded fanout/timers.
+        let runtime_health = config::health_runtime_config();
+        let health_cfg = health::Config {
+            tick: runtime_health.monitor_tick,
+            suspect_after: runtime_health.suspect_after,
+            down_after: runtime_health.down_after,
+            degrade_grace: runtime_health.degrade_grace,
+        };
         let health_monitor = health::HealthMonitor::new(health_cfg);
 
         let topology_stores = TopologyStores {
@@ -530,6 +537,7 @@ impl Bootstrap {
                 topology_client,
                 sync_client,
                 health_monitor,
+                runtime_health,
                 task_manager,
                 service_controller,
                 scheduler,
@@ -632,6 +640,7 @@ impl Bootstrap {
     ) {
         // Start health monitor loop inside the local task set.
         comps.health_monitor.start();
+        let runtime_health = comps.runtime_health;
 
         let mut topology_runner = comps.topology.clone();
         let topology_sync = comps.topology.clone();
@@ -692,13 +701,15 @@ impl Bootstrap {
             }
         });
 
-        // Health active pinger loop (low fanout).
+        // Health active pinger loop.
         let topo_for_health = comps.topology.clone();
         tokio::task::spawn_local(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut ticker = tokio::time::interval(runtime_health.probe_interval);
             loop {
                 ticker.tick().await;
-                topo_for_health.health_probe_tick(2).await;
+                topo_for_health
+                    .health_probe_tick(runtime_health.probe_fanout, runtime_health.probe_timeout)
+                    .await;
             }
         });
 
@@ -706,7 +717,7 @@ impl Bootstrap {
         let hm_self = comps.health_monitor.clone();
         let self_id = ctx.self_id;
         tokio::task::spawn_local(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut ticker = tokio::time::interval(runtime_health.self_observe_interval);
             loop {
                 ticker.tick().await;
                 hm_self.observe_seen(self_id);
