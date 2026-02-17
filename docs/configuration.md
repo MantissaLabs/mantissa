@@ -50,11 +50,10 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
         probe_fanout: 5,
         probe_interval_ms: 1000,
         probe_timeout_ms: 1000,
-        self_observe_interval_ms: 1000,
-        monitor_tick_ms: 250,
         suspect_after_ms: 2000,
         down_after_ms: 6000,
-        degrade_grace_ms: 3000,
+        indirect_fanout_min: 3,
+        indirect_fanout_max: 32,
     ),
     docker: (
         host: "unix:///var/run/docker.sock",
@@ -79,10 +78,9 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `health.probe_fanout`
 - `health.probe_interval_ms`
 - `health.probe_timeout_ms`
-- `health.self_observe_interval_ms`
-- `health.monitor_tick_ms`
 - `health.suspect_after_ms`
 - `health.down_after_ms`
-- `health.degrade_grace_ms`
+- `health.indirect_fanout_min`
+- `health.indirect_fanout_max`
 - `docker.host` (legacy: `MANTISSA_DOCKER_HOST`, still falls back to `DOCKER_HOST`)
 - `gpu.device_overrides` (legacy: `MANTISSA_GPU_DEVICE_OVERRIDES`)

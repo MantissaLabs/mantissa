@@ -23,7 +23,7 @@ use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
 use crate::task::types::{TaskStateKind, TaskValue, TaskValueDraft};
-use ::health::{Config as HealthConfig, HealthMonitor};
+use ::health::HealthMonitor;
 use anyhow::{Result, anyhow};
 use async_channel::bounded;
 use async_trait::async_trait;
@@ -372,7 +372,7 @@ async fn setup_manager_with_forwarding(
         signing_key,
         noise_keys.clone(),
         actor,
-        HealthMonitor::new(HealthConfig::default()),
+        HealthMonitor::new(),
     );
 
     let scheduler = Rc::new(

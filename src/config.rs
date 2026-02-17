@@ -129,7 +129,7 @@ pub struct DiscoveryConfig {
 
 /// # Description:
 ///
-/// Cluster peer-health probing and liveness threshold configuration.
+/// Cluster SWIM probing and liveness threshold configuration.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct HealthConfig {
     #[serde(default = "default_health_probe_fanout")]
@@ -138,16 +138,14 @@ pub struct HealthConfig {
     pub probe_interval_ms: u64,
     #[serde(default = "default_health_probe_timeout_ms")]
     pub probe_timeout_ms: u64,
-    #[serde(default = "default_health_self_observe_interval_ms")]
-    pub self_observe_interval_ms: u64,
-    #[serde(default = "default_health_monitor_tick_ms")]
-    pub monitor_tick_ms: u64,
     #[serde(default = "default_health_suspect_after_ms")]
     pub suspect_after_ms: u64,
     #[serde(default = "default_health_down_after_ms")]
     pub down_after_ms: u64,
-    #[serde(default = "default_health_degrade_grace_ms")]
-    pub degrade_grace_ms: u64,
+    #[serde(default = "default_health_indirect_fanout_min")]
+    pub indirect_fanout_min: usize,
+    #[serde(default = "default_health_indirect_fanout_max")]
+    pub indirect_fanout_max: usize,
 }
 
 impl Default for HealthConfig {
@@ -159,11 +157,10 @@ impl Default for HealthConfig {
             probe_fanout: default_health_probe_fanout(),
             probe_interval_ms: default_health_probe_interval_ms(),
             probe_timeout_ms: default_health_probe_timeout_ms(),
-            self_observe_interval_ms: default_health_self_observe_interval_ms(),
-            monitor_tick_ms: default_health_monitor_tick_ms(),
             suspect_after_ms: default_health_suspect_after_ms(),
             down_after_ms: default_health_down_after_ms(),
-            degrade_grace_ms: default_health_degrade_grace_ms(),
+            indirect_fanout_min: default_health_indirect_fanout_min(),
+            indirect_fanout_max: default_health_indirect_fanout_max(),
         }
     }
 }
@@ -176,11 +173,10 @@ pub struct RuntimeHealthConfig {
     pub probe_fanout: usize,
     pub probe_interval: Duration,
     pub probe_timeout: Duration,
-    pub self_observe_interval: Duration,
-    pub monitor_tick: Duration,
     pub suspect_after: Duration,
     pub down_after: Duration,
-    pub degrade_grace: Duration,
+    pub indirect_fanout_min: usize,
+    pub indirect_fanout_max: usize,
 }
 
 impl HealthConfig {
@@ -192,11 +188,10 @@ impl HealthConfig {
             probe_fanout: self.probe_fanout,
             probe_interval: Duration::from_millis(self.probe_interval_ms),
             probe_timeout: Duration::from_millis(self.probe_timeout_ms),
-            self_observe_interval: Duration::from_millis(self.self_observe_interval_ms),
-            monitor_tick: Duration::from_millis(self.monitor_tick_ms),
             suspect_after: Duration::from_millis(self.suspect_after_ms),
             down_after: Duration::from_millis(self.down_after_ms),
-            degrade_grace: Duration::from_millis(self.degrade_grace_ms),
+            indirect_fanout_min: self.indirect_fanout_min,
+            indirect_fanout_max: self.indirect_fanout_max,
         }
     }
 }
@@ -405,58 +400,51 @@ fn default_true() -> bool {
 
 /// # Description:
 ///
-/// Returns the default peer-health active probe fanout.
+/// Returns the default SWIM operator floor for indirect helper fanout.
 fn default_health_probe_fanout() -> usize {
     5
 }
 
 /// # Description:
 ///
-/// Returns the default interval between peer-health active probe passes.
+/// Returns the default interval between SWIM probe passes.
 fn default_health_probe_interval_ms() -> u64 {
     1_000
 }
 
 /// # Description:
 ///
-/// Returns the default timeout budget for one active health ping.
+/// Returns the default timeout budget for one SWIM ping.
 fn default_health_probe_timeout_ms() -> u64 {
     1_000
 }
 
 /// # Description:
 ///
-/// Returns the default interval used to refresh local self health.
-fn default_health_self_observe_interval_ms() -> u64 {
-    1_000
-}
-
-/// # Description:
-///
-/// Returns the default recomputation cadence for peer liveness state transitions.
-fn default_health_monitor_tick_ms() -> u64 {
-    250
-}
-
-/// # Description:
-///
-/// Returns the default suspect threshold when no peer observation arrives.
+/// Returns the default suspect threshold before SWIM escalates to suspect.
 fn default_health_suspect_after_ms() -> u64 {
     2_000
 }
 
 /// # Description:
 ///
-/// Returns the default down threshold when no peer observation arrives.
+/// Returns the default down threshold after SWIM suspicion is raised.
 fn default_health_down_after_ms() -> u64 {
     6_000
 }
 
 /// # Description:
 ///
-/// Returns the default grace window used by degraded liveness handling.
-fn default_health_degrade_grace_ms() -> u64 {
-    3_000
+/// Returns the minimum adaptive helper fanout for SWIM indirect probes.
+fn default_health_indirect_fanout_min() -> usize {
+    3
+}
+
+/// # Description:
+///
+/// Returns the maximum adaptive helper fanout for SWIM indirect probes.
+fn default_health_indirect_fanout_max() -> usize {
+    32
 }
 
 /// # Description:
@@ -659,14 +647,6 @@ impl Config {
             anyhow::bail!("health.probe_timeout_ms must be greater than zero");
         }
 
-        if self.health.self_observe_interval_ms == 0 {
-            anyhow::bail!("health.self_observe_interval_ms must be greater than zero");
-        }
-
-        if self.health.monitor_tick_ms == 0 {
-            anyhow::bail!("health.monitor_tick_ms must be greater than zero");
-        }
-
         if self.health.suspect_after_ms == 0 {
             anyhow::bail!("health.suspect_after_ms must be greater than zero");
         }
@@ -679,8 +659,18 @@ impl Config {
             anyhow::bail!("health.down_after_ms must be greater than health.suspect_after_ms");
         }
 
-        if self.health.degrade_grace_ms == 0 {
-            anyhow::bail!("health.degrade_grace_ms must be greater than zero");
+        if self.health.indirect_fanout_min == 0 {
+            anyhow::bail!("health.indirect_fanout_min must be greater than zero");
+        }
+
+        if self.health.indirect_fanout_max == 0 {
+            anyhow::bail!("health.indirect_fanout_max must be greater than zero");
+        }
+
+        if self.health.indirect_fanout_max < self.health.indirect_fanout_min {
+            anyhow::bail!(
+                "health.indirect_fanout_max must be greater than or equal to health.indirect_fanout_min"
+            );
         }
 
         if self.network.nodeport.enabled && !self.network.bpf.attach {
@@ -820,14 +810,6 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("health.probe_timeout_ms".to_string());
     }
 
-    if old.health.self_observe_interval_ms != new.health.self_observe_interval_ms {
-        changes.push("health.self_observe_interval_ms".to_string());
-    }
-
-    if old.health.monitor_tick_ms != new.health.monitor_tick_ms {
-        changes.push("health.monitor_tick_ms".to_string());
-    }
-
     if old.health.suspect_after_ms != new.health.suspect_after_ms {
         changes.push("health.suspect_after_ms".to_string());
     }
@@ -836,8 +818,12 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("health.down_after_ms".to_string());
     }
 
-    if old.health.degrade_grace_ms != new.health.degrade_grace_ms {
-        changes.push("health.degrade_grace_ms".to_string());
+    if old.health.indirect_fanout_min != new.health.indirect_fanout_min {
+        changes.push("health.indirect_fanout_min".to_string());
+    }
+
+    if old.health.indirect_fanout_max != new.health.indirect_fanout_max {
+        changes.push("health.indirect_fanout_max".to_string());
     }
 
     changes
@@ -894,6 +880,14 @@ mod tests {
         let mut config = Config::default();
         config.health.suspect_after_ms = 2_000;
         config.health.down_after_ms = 2_000;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_health_indirect_fanout_ordering() {
+        let mut config = Config::default();
+        config.health.indirect_fanout_min = 8;
+        config.health.indirect_fanout_max = 4;
         assert!(config.validate().is_err());
     }
 

@@ -2,8 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::task::JoinHandle;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -16,27 +14,7 @@ pub enum Status {
     Degraded,
 }
 
-#[derive(Clone, Debug)]
-pub struct Config {
-    pub tick: Duration,
-    pub suspect_after: Duration,
-    pub down_after: Duration,
-    pub degrade_grace: Duration,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            tick: Duration::from_millis(250),
-            suspect_after: Duration::from_secs(2),
-            down_after: Duration::from_secs(6),
-            degrade_grace: Duration::from_secs(3),
-        }
-    }
-}
-
 pub struct HealthMonitor {
-    cfg: Config,
     status: Mutex<HashMap<Uuid, Status>>,
 }
 
@@ -51,20 +29,9 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGu
 }
 
 impl HealthMonitor {
-    pub fn new(cfg: Config) -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            cfg,
             status: Mutex::new(HashMap::new()),
-        })
-    }
-
-    pub fn start(self: &Arc<Self>) -> JoinHandle<()> {
-        let me = self.clone();
-        tokio::task::spawn_local(async move {
-            let mut ticker = tokio::time::interval(me.cfg.tick);
-            loop {
-                ticker.tick().await;
-            }
         })
     }
 

@@ -1087,7 +1087,7 @@ mod tests {
     use crate::store::local_session_store::LocalSessionStore;
     use crate::store::peer_store::open_peers_store;
     use crate::store::scheduler_store::open_scheduler_store;
-    use ::health::{Config as HealthConfig, HealthMonitor};
+    use ::health::HealthMonitor;
     use ed25519_dalek::SigningKey;
     use net::noise::NoiseKeys;
     use tempfile::tempdir;
@@ -1116,7 +1116,7 @@ mod tests {
         let session_store =
             LocalSessionStore::open(db.clone(), &noise_keys).expect("open local session store");
 
-        let health_monitor = HealthMonitor::new(HealthConfig::default());
+        let health_monitor = HealthMonitor::new();
 
         let registry = Registry::new(
             peers_store,

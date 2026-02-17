@@ -136,7 +136,6 @@ pub(crate) struct Components {
     pub topology: Topology,
     pub topology_client: TopologyClient,
     pub sync_client: protocol::sync::sync::Client,
-    pub health_monitor: std::sync::Arc<health::HealthMonitor>,
     pub runtime_health: config::RuntimeHealthConfig,
     pub task_manager: TaskManager,
     pub service_controller: ServiceController,
@@ -336,15 +335,9 @@ impl Bootstrap {
         let gossip_client = capnp_rpc::new_client(gossip);
 
         // topology object + client
-        // Health monitor settings are read from the node config to avoid hardcoded fanout/timers.
+        // Health settings are read once and passed into SWIM runtime loops.
         let runtime_health = config::health_runtime_config();
-        let health_cfg = health::Config {
-            tick: runtime_health.monitor_tick,
-            suspect_after: runtime_health.suspect_after,
-            down_after: runtime_health.down_after,
-            degrade_grace: runtime_health.degrade_grace,
-        };
-        let health_monitor = health::HealthMonitor::new(health_cfg);
+        let health_monitor = health::HealthMonitor::new();
 
         let topology_stores = TopologyStores {
             credentials: stores.local_creds.clone(),
@@ -537,7 +530,6 @@ impl Bootstrap {
                 topology,
                 topology_client,
                 sync_client,
-                health_monitor,
                 runtime_health,
                 task_manager,
                 service_controller,
@@ -639,8 +631,6 @@ impl Bootstrap {
         gossip_dedupe: DedupeStateHandle,
         gossip_fanout: usize,
     ) {
-        // Start health monitor loop inside the local task set.
-        comps.health_monitor.start();
         let runtime_health = comps.runtime_health;
 
         let mut topology_runner = comps.topology.clone();
@@ -709,17 +699,6 @@ impl Bootstrap {
             loop {
                 ticker.tick().await;
                 topo_for_health.health_probe_tick().await;
-            }
-        });
-
-        // Keep self marked as Alive by recording a periodic self observation.
-        let hm_self = comps.health_monitor.clone();
-        let self_id = ctx.self_id;
-        tokio::task::spawn_local(async move {
-            let mut ticker = tokio::time::interval(runtime_health.self_observe_interval);
-            loop {
-                ticker.tick().await;
-                hm_self.observe_seen(self_id);
             }
         });
     }

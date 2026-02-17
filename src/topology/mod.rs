@@ -1482,13 +1482,17 @@ impl Topology {
         }
 
         // Lifeguard-style scaling: grow helper fanout logarithmically with membership while
-        // keeping an operator-provided floor via `health.probe_fanout`.
+        // keeping an operator-provided floor via `health.probe_fanout` and configured bounds.
         let adaptive_floor = (helper_population.max(1)).ilog2() as usize + 1;
-        let adaptive_floor = adaptive_floor.clamp(3, 32);
+        let adaptive_floor = adaptive_floor.clamp(
+            self.runtime_health.indirect_fanout_min,
+            self.runtime_health.indirect_fanout_max,
+        );
         let helper_budget = self
             .runtime_health
             .probe_fanout
             .max(adaptive_floor)
+            .min(self.runtime_health.indirect_fanout_max)
             .min(helper_population);
 
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
