@@ -596,22 +596,12 @@ impl Registry {
             }
             Err(err) => {
                 self.invalidate_peer(peer_id, &entry).await;
-
-                let Some(session) = self
-                    .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
-                    .await
-                else {
-                    return Err(err);
-                };
-                if !Self::session_matches_view(&session, expected_view).await? {
-                    self.invalidate_peer(peer_id, &entry).await;
-                    return Ok(None);
-                }
-
-                let sync_cap = Self::fetch_sync_from_session(&session).await?;
-                let mut state = entry.lock().await;
-                state.sync = Some(sync_cap.clone());
-                Ok(Some(sync_cap))
+                debug!(
+                    target: "sync",
+                    peer = %peer_id,
+                    "fetch_sync_from_session failed, deferring retry: {err}"
+                );
+                Ok(None)
             }
         }
     }
@@ -667,22 +657,12 @@ impl Registry {
             }
             Err(err) => {
                 self.invalidate_peer(peer_id, &entry).await;
-
-                let Some(session) = self
-                    .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
-                    .await
-                else {
-                    return Err(err);
-                };
-                if !Self::session_matches_view(&session, expected_view).await? {
-                    self.invalidate_peer(peer_id, &entry).await;
-                    return Ok(None);
-                }
-
-                let health_cap = Self::fetch_health_from_session(&session).await?;
-                let mut state = entry.lock().await;
-                state.health = Some(health_cap.clone());
-                Ok(Some(health_cap))
+                debug!(
+                    target: "health",
+                    peer = %peer_id,
+                    "fetch_health_from_session failed, deferring retry: {err}"
+                );
+                Ok(None)
             }
         }
     }
@@ -738,22 +718,12 @@ impl Registry {
             }
             Err(err) => {
                 self.invalidate_peer(peer_id, &entry).await;
-
-                let Some(session) = self
-                    .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
-                    .await
-                else {
-                    return Err(err);
-                };
-                if !Self::session_matches_view(&session, expected_view).await? {
-                    self.invalidate_peer(peer_id, &entry).await;
-                    return Ok(None);
-                }
-
-                let gossip_cap = Self::fetch_gossip_from_session(&session).await?;
-                let mut state = entry.lock().await;
-                state.gossip = Some(gossip_cap.clone());
-                Ok(Some(gossip_cap))
+                debug!(
+                    target: "gossip",
+                    peer = %peer_id,
+                    "fetch_gossip_from_session failed, deferring retry: {err}"
+                );
+                Ok(None)
             }
         }
     }
