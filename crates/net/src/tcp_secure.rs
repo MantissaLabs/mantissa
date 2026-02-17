@@ -166,102 +166,107 @@ async fn accept_loop(
         let invalid_token_limiter = invalid_token_limiter.clone();
 
         tokio::task::spawn_local(async move {
-            let _permit = permit;
-            let psk = match psk_provider.psk().await {
-                Ok(psk) => psk,
-                Err(e) => {
-                    error!(target: "server", "Noise PSK derivation failed: {e}");
-                    return;
-                }
-            };
+            // Keep the handshake permit only for expensive handshake steps.
+            let mut handshake = {
+                let _permit = permit;
+                let psk = match psk_provider.psk().await {
+                    Ok(psk) => psk,
+                    Err(e) => {
+                        error!(target: "server", "Noise PSK derivation failed: {e}");
+                        return;
+                    }
+                };
 
-            let (mut rd, wr) = stream.into_split();
-            let mut first = vec![0u8; 65535];
-            let nread = match crate::noise::read_framed_len(&mut rd, &mut first).await {
-                Ok(n) => n,
-                Err(e) => {
-                    error!(target: "server", "Noise handshake read failed: {e}");
-                    return;
-                }
-            };
+                let (mut rd, wr) = stream.into_split();
+                let mut first = vec![0u8; 65535];
+                let nread = match crate::noise::read_framed_len(&mut rd, &mut first).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!(target: "server", "Noise handshake read failed: {e}");
+                        return;
+                    }
+                };
 
-            match crate::noise::server_handshake_select(
-                rd,
-                wr,
-                &keys,
-                &psk,
-                &first[..nread],
-                peer_verifier,
-            )
-            .await
-            {
-                Ok(mut handshake) => {
-                    if matches!(handshake.kind, HandshakeKind::Join) {
+                match crate::noise::server_handshake_select(
+                    rd,
+                    wr,
+                    &keys,
+                    &psk,
+                    &first[..nread],
+                    peer_verifier,
+                )
+                .await
+                {
+                    Ok(handshake) => handshake,
+                    Err(crate::noise::ServerHandshakeError::UnknownPeer) => {
                         let allowed = rate_limiter.lock().await.allow(peer_ip, Instant::now());
                         if !allowed {
                             warn!(
                                 target: "server",
-                                "rate-limited join attempt from {peer_ip}"
+                                "rate-limited unknown peer from {peer_ip}"
                             );
                             return;
                         }
-                    }
-
-                    if matches!(handshake.kind, HandshakeKind::Join) && handshake.join_probe {
-                        if let Err(e) = crate::noise::join_probe_server(&mut handshake.stream).await
-                        {
-                            warn!(target: "server", "Noise join probe failed: {e}");
-                            return;
-                        }
-                    }
-
-                    let (reader, writer) =
-                        tokio_util::compat::TokioAsyncReadCompatExt::compat(handshake.stream)
-                            .split();
-
-                    let network = twoparty::VatNetwork::new(
-                        futures::io::BufReader::new(reader),
-                        futures::io::BufWriter::new(writer),
-                        rpc_twoparty_capnp::Side::Server,
-                        Default::default(),
-                    );
-
-                    let rpc_system =
-                        RpcSystem::new(Box::new(network), Some(server_handle_clone.client));
-
-                    if let Err(e) = rpc_system.await {
-                        error!(target: "server", "TCP secure RPC error: {e}");
-                    }
-                }
-                Err(crate::noise::ServerHandshakeError::UnknownPeer) => {
-                    let allowed = rate_limiter.lock().await.allow(peer_ip, Instant::now());
-                    if !allowed {
-                        warn!(
-                            target: "server",
-                            "rate-limited unknown peer from {peer_ip}"
-                        );
+                        warn!(target: "server", "Noise peer rejected: unknown static key");
                         return;
                     }
-                    warn!(target: "server", "Noise peer rejected: unknown static key");
-                }
-                Err(crate::noise::ServerHandshakeError::Io(e)) => {
-                    if e.to_string() == "invalid join token" {
-                        let allowed = invalid_token_limiter
-                            .lock()
-                            .await
-                            .allow(peer_ip, Instant::now());
-                        if !allowed {
+                    Err(crate::noise::ServerHandshakeError::Io(e)) => {
+                        if e.to_string() == "invalid join token" {
+                            let allowed = invalid_token_limiter
+                                .lock()
+                                .await
+                                .allow(peer_ip, Instant::now());
+                            if !allowed {
+                                warn!(
+                                    target: "server",
+                                    "rate-limited invalid join token from {peer_ip}"
+                                );
+                                return;
+                            }
                             warn!(
                                 target: "server",
-                                "rate-limited invalid join token from {peer_ip}"
+                                "Noise join handshake failed: invalid join token"
                             );
-                            return;
+                        } else {
+                            error!(target: "server", "Noise handshake failed: {e}");
                         }
-                        warn!(target: "server", "Noise join handshake failed: invalid join token");
-                    } else {
-                        error!(target: "server", "Noise handshake failed: {e}");
+                        return;
                     }
                 }
+            };
+
+            if matches!(handshake.kind, HandshakeKind::Join) {
+                let allowed = rate_limiter.lock().await.allow(peer_ip, Instant::now());
+                if !allowed {
+                    warn!(
+                        target: "server",
+                        "rate-limited join attempt from {peer_ip}"
+                    );
+                    return;
+                }
+            }
+
+            if matches!(handshake.kind, HandshakeKind::Join) && handshake.join_probe {
+                if let Err(e) = crate::noise::join_probe_server(&mut handshake.stream).await {
+                    warn!(target: "server", "Noise join probe failed: {e}");
+                    return;
+                }
+            }
+
+            let (reader, writer) =
+                tokio_util::compat::TokioAsyncReadCompatExt::compat(handshake.stream).split();
+
+            let network = twoparty::VatNetwork::new(
+                futures::io::BufReader::new(reader),
+                futures::io::BufWriter::new(writer),
+                rpc_twoparty_capnp::Side::Server,
+                Default::default(),
+            );
+
+            let rpc_system = RpcSystem::new(Box::new(network), Some(server_handle_clone.client));
+
+            if let Err(e) = rpc_system.await {
+                error!(target: "server", "TCP secure RPC error: {e}");
             }
         });
     }
