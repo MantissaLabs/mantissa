@@ -9,8 +9,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::{error, info, warn};
 
-// Global cap on concurrent handshakes to keep CPU usage predictable during floods.
-const MAX_HANDSHAKES: usize = 64;
+// Global default cap on concurrent handshakes to keep CPU usage predictable.
+const DEFAULT_MAX_HANDSHAKES: usize = 256;
+// Optional environment override for the handshake concurrency limiter.
+const HANDSHAKE_LIMIT_ENV: &str = "MANTISSA_HANDSHAKE_LIMIT";
 // Per-IP token bucket settings for unauthenticated join/unknown attempts.
 const RATE_LIMIT_BURST: f32 = 20.0;
 const RATE_LIMIT_REFILL_PER_SEC: f32 = 5.0;
@@ -117,7 +119,13 @@ async fn accept_loop(
     psk_provider: Arc<dyn NoisePskProvider>,
     peer_verifier: Arc<dyn NoisePeerVerifier>,
 ) {
-    let handshake_semaphore = Arc::new(Semaphore::new(MAX_HANDSHAKES));
+    let handshake_limit = resolve_handshake_limit();
+    let handshake_semaphore = Arc::new(Semaphore::new(handshake_limit));
+    info!(
+        target: "server",
+        handshake_limit,
+        "configured secure listener handshake concurrency limit"
+    );
     let rate_limiter = Arc::new(AsyncMutex::new(RateLimiter::new(
         RATE_LIMIT_MAX_ENTRIES,
         RATE_LIMIT_BURST,
@@ -269,6 +277,26 @@ async fn accept_loop(
                 error!(target: "server", "TCP secure RPC error: {e}");
             }
         });
+    }
+}
+
+/// Resolve the secure listener handshake concurrency limit from environment.
+fn resolve_handshake_limit() -> usize {
+    match std::env::var(HANDSHAKE_LIMIT_ENV) {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                warn!(
+                    target: "server",
+                    env = HANDSHAKE_LIMIT_ENV,
+                    value = raw.trim(),
+                    fallback = DEFAULT_MAX_HANDSHAKES,
+                    "invalid handshake limit override, using default"
+                );
+                DEFAULT_MAX_HANDSHAKES
+            }
+        },
+        Err(_) => DEFAULT_MAX_HANDSHAKES,
     }
 }
 
