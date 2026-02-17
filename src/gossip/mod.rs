@@ -79,6 +79,8 @@ impl Message {
 }
 
 pub const DEFAULT_FANOUT: usize = 5;
+/// Max number of gossip messages sent in a single RPC request.
+const MAX_GOSSIP_BATCH_MESSAGES: usize = 32;
 /// Maximum number of gossip identifiers retained for ingress deduplication.
 const GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
 /// Time window used to suppress duplicate gossip identifiers.
@@ -370,25 +372,37 @@ pub(crate) async fn start<C>(
                     "gossip tick dispatch"
                 );
 
-                for peer in peers.iter() {
-                    if peer.id == self_id {
-                        continue;
-                    }
+                let total_batches = pending.len().div_ceil(MAX_GOSSIP_BATCH_MESSAGES);
+                for (batch_idx, batch) in pending.chunks(MAX_GOSSIP_BATCH_MESSAGES).enumerate() {
+                    debug!(
+                        target: "gossip",
+                        cluster_view = %cluster_view,
+                        batch = batch_idx + 1,
+                        total_batches,
+                        message_count = batch.len(),
+                        "gossip chunk dispatch"
+                    );
 
-                    // Filter out messages that describe the peer itself so we never
-                    // hand its exported capability back to the same connection.
-                    let outbound: Vec<Message> = pending
-                        .iter()
-                        .filter(|msg| !message_targets_peer(msg, peer.id))
-                        .cloned()
-                        .collect();
+                    for peer in peers.iter() {
+                        if peer.id == self_id {
+                            continue;
+                        }
 
-                    if outbound.is_empty() {
-                        continue;
-                    }
+                        // Filter out messages that describe the peer itself so we never
+                        // hand its exported capability back to the same connection.
+                        let outbound: Vec<Message> = batch
+                            .iter()
+                            .filter(|msg| !message_targets_peer(msg, peer.id))
+                            .cloned()
+                            .collect();
 
-                    if let Err(e) = send_gossip(&outbound, peer, &context).await {
-                        error!("Gossip to {} failed: {:?}", peer.address, e);
+                        if outbound.is_empty() {
+                            continue;
+                        }
+
+                        if let Err(e) = send_gossip(&outbound, peer, &context).await {
+                            error!("Gossip to {} failed: {:?}", peer.address, e);
+                        }
                     }
                 }
 
