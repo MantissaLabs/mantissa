@@ -13,12 +13,24 @@ use protocol::server::{self, cluster_session};
 use protocol::sync;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
-use tracing::error;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 type PeerEntry = Arc<AsyncMutex<PeerState>>;
 type CapabilityMap = Arc<RwLock<HashMap<Uuid, PeerEntry>>>;
+type ReconnectGateMap = Arc<AsyncMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>;
+type ReconnectStateMap = Arc<AsyncMutex<HashMap<Uuid, PeerReconnectState>>>;
+
+/// Initial reconnect backoff delay for one failed peer dial attempt.
+const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
+/// Hard upper bound used by reconnect backoff escalation.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(8);
+/// Max random jitter added to each reconnect backoff window.
+const RECONNECT_BACKOFF_JITTER_MAX_MS: u64 = 250;
+/// Short success window used to deduplicate concurrent forced refresh requests.
+const RECONNECT_SUCCESS_REUSE_WINDOW: Duration = Duration::from_millis(750);
 
 #[derive(Default)]
 struct PeerState {
@@ -50,16 +62,13 @@ impl PeerState {
         self.session = Some(session);
         self.clear_capabilities();
     }
-
-    fn clear_all(&mut self) {
-        self.server = None;
-        self.clear_session();
-    }
 }
 
 #[derive(Clone)]
 pub struct Registry {
     cache: CapabilityMap,
+    reconnect_gates: ReconnectGateMap,
+    reconnect_state: ReconnectStateMap,
     sessions: LocalSessionStore,
     peers: PeersStore,
     signing_key: Arc<AsyncMutex<SigningKey>>,
@@ -75,6 +84,50 @@ enum SessionStrategy {
     TicketThenCredential,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PeerReconnectState {
+    consecutive_failures: u32,
+    next_attempt_at: Instant,
+}
+
+impl PeerReconnectState {
+    /// # Description:
+    ///
+    /// Builds reconnect state for a peer after one successful connection refresh.
+    fn on_success(now: Instant) -> Self {
+        Self {
+            consecutive_failures: 0,
+            next_attempt_at: now + RECONNECT_SUCCESS_REUSE_WINDOW,
+        }
+    }
+
+    /// # Description:
+    ///
+    /// Builds reconnect state for a peer after one failed connection refresh.
+    fn on_failure(previous: Option<Self>, now: Instant) -> (Self, Duration) {
+        let failures = previous
+            .map(|state| state.consecutive_failures)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let shift = failures.saturating_sub(1).min(6);
+        let factor = 1u32 << shift;
+        let bounded = RECONNECT_BACKOFF_BASE
+            .saturating_mul(factor)
+            .min(RECONNECT_BACKOFF_MAX);
+        use ::rand::Rng as _;
+        let mut rng = ::rand::rng();
+        let jitter_ms = rng.random_range(0..=RECONNECT_BACKOFF_JITTER_MAX_MS);
+        let delay = bounded.saturating_add(Duration::from_millis(jitter_ms));
+        (
+            Self {
+                consecutive_failures: failures,
+                next_attempt_at: now + delay,
+            },
+            delay,
+        )
+    }
+}
+
 impl Registry {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(
@@ -87,6 +140,8 @@ impl Registry {
     ) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
+            reconnect_gates: Arc::new(AsyncMutex::new(HashMap::new())),
+            reconnect_state: Arc::new(AsyncMutex::new(HashMap::new())),
             sessions,
             peers,
             signing_key: Arc::new(AsyncMutex::new(signing_key)),
@@ -115,10 +170,14 @@ impl Registry {
 
     pub async fn remove_peer(&self, id: Uuid) {
         self.cache.write().await.remove(&id);
+        self.reconnect_gates.lock().await.remove(&id);
+        self.reconnect_state.lock().await.remove(&id);
     }
 
     pub async fn clear(&self) {
         self.cache.write().await.clear();
+        self.reconnect_gates.lock().await.clear();
+        self.reconnect_state.lock().await.clear();
     }
 
     /// Clears any cached capabilities for `peer_id`, forcing a full refresh on next access.
@@ -163,16 +222,43 @@ impl Registry {
             self.peer_latest_value(peer_id)?
         };
         let addr = peer.address.clone();
+        let gate = self.reconnect_gate(peer_id).await;
+        let _guard = gate.lock().await;
+        let now = Instant::now();
+
+        if let Some(reuse) = self.reconnect_reuse_server(peer_id, now).await {
+            return Some(reuse);
+        }
+
+        if !self.reconnect_attempt_allowed(peer_id, now).await {
+            debug!(
+                target: "connect",
+                peer = %peer_id,
+                addr = %addr,
+                "reconnect suppressed by backoff"
+            );
+            return None;
+        }
 
         match self.connect_to_peer(&addr, &peer.noise_static_pub).await {
             Ok(client) => {
                 let entry = self.ensure_entry(peer_id).await;
                 let mut state = entry.lock().await;
                 state.replace_server(client.clone());
+                drop(state);
+                self.record_reconnect_success(peer_id, now).await;
                 Some(client)
             }
             Err(e) => {
+                let delay = self.record_reconnect_failure(peer_id, now).await;
                 error!(target: "connect", "reconnect {addr} failed: {e}");
+                debug!(
+                    target: "connect",
+                    peer = %peer_id,
+                    addr = %addr,
+                    delay_ms = delay.as_millis() as u64,
+                    "scheduled reconnect backoff"
+                );
                 None
             }
         }
@@ -721,6 +807,9 @@ impl Registry {
                 state.replace_session(session.clone());
                 return Some(session);
             }
+
+            let mut state = entry.lock().await;
+            state.server = None;
         }
 
         let refreshed = self.refresh_peer_handle(peer_id).await?;
@@ -753,6 +842,9 @@ impl Registry {
                 state.replace_session(session.clone());
                 return Some(session);
             }
+
+            let mut state = entry.lock().await;
+            state.server = None;
         }
 
         let refreshed = self.refresh_peer_handle_unscoped(peer_id).await?;
@@ -768,7 +860,62 @@ impl Registry {
     /// Clears the cached capability tree for the peer so the next call rebuilds it from scratch.
     async fn invalidate_peer(&self, _peer_id: Uuid, entry: &PeerEntry) {
         let mut state = entry.lock().await;
-        state.clear_all();
+        state.clear_session();
+    }
+
+    /// # Description:
+    ///
+    /// Returns the per-peer reconnect serialization gate, creating it lazily when needed.
+    async fn reconnect_gate(&self, peer_id: Uuid) -> Arc<AsyncMutex<()>> {
+        let mut gates = self.reconnect_gates.lock().await;
+        gates
+            .entry(peer_id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// # Description:
+    ///
+    /// Returns a cached server handle when reconnect state indicates a recent successful refresh.
+    async fn reconnect_reuse_server(&self, peer_id: Uuid, now: Instant) -> Option<server::Client> {
+        let state = self.reconnect_state.lock().await.get(&peer_id).copied()?;
+        if state.consecutive_failures != 0 || now >= state.next_attempt_at {
+            return None;
+        }
+        let entry = self.entry_if_present(peer_id).await?;
+        let state = entry.lock().await;
+        state.server.clone()
+    }
+
+    /// # Description:
+    ///
+    /// Returns whether reconnect attempts are currently allowed for `peer_id`.
+    async fn reconnect_attempt_allowed(&self, peer_id: Uuid, now: Instant) -> bool {
+        let state = self.reconnect_state.lock().await.get(&peer_id).copied();
+        state
+            .map(|value| now >= value.next_attempt_at)
+            .unwrap_or(true)
+    }
+
+    /// # Description:
+    ///
+    /// Records one successful peer reconnect and clears any failure backoff budget.
+    async fn record_reconnect_success(&self, peer_id: Uuid, now: Instant) {
+        self.reconnect_state
+            .lock()
+            .await
+            .insert(peer_id, PeerReconnectState::on_success(now));
+    }
+
+    /// # Description:
+    ///
+    /// Records one failed reconnect attempt and returns the next delay budget.
+    async fn record_reconnect_failure(&self, peer_id: Uuid, now: Instant) -> Duration {
+        let mut states = self.reconnect_state.lock().await;
+        let previous = states.get(&peer_id).copied();
+        let (next_state, delay) = PeerReconnectState::on_failure(previous, now);
+        states.insert(peer_id, next_state);
+        delay
     }
 
     /// Fetches the Sync capability from an existing session.
