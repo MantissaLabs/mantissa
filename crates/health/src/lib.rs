@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::warn;
 use uuid::Uuid;
@@ -37,7 +37,6 @@ impl Default for Config {
 
 pub struct HealthMonitor {
     cfg: Config,
-    last_seen: Mutex<HashMap<Uuid, Instant>>,
     status: Mutex<HashMap<Uuid, Status>>,
 }
 
@@ -55,7 +54,6 @@ impl HealthMonitor {
     pub fn new(cfg: Config) -> Arc<Self> {
         Arc::new(Self {
             cfg,
-            last_seen: Mutex::new(HashMap::new()),
             status: Mutex::new(HashMap::new()),
         })
     }
@@ -66,14 +64,11 @@ impl HealthMonitor {
             let mut ticker = tokio::time::interval(me.cfg.tick);
             loop {
                 ticker.tick().await;
-                me.recompute();
             }
         })
     }
 
     pub fn observe_seen(&self, id: Uuid) {
-        let now = Instant::now();
-        lock_or_recover(&self.last_seen, "health.last_seen").insert(id, now);
         lock_or_recover(&self.status, "health.status").insert(id, Status::Alive);
     }
 
@@ -95,23 +90,5 @@ impl HealthMonitor {
 
     pub fn snapshot(&self) -> HashMap<Uuid, Status> {
         lock_or_recover(&self.status, "health.status").clone()
-    }
-
-    fn recompute(&self) {
-        let now = Instant::now();
-        let mut status = lock_or_recover(&self.status, "health.status");
-        let seen = lock_or_recover(&self.last_seen, "health.last_seen");
-
-        for (id, last) in seen.iter() {
-            let elapsed = now.saturating_duration_since(*last);
-            let next = if elapsed <= self.cfg.suspect_after {
-                Status::Alive
-            } else if elapsed <= self.cfg.down_after {
-                Status::Suspect
-            } else {
-                Status::Down
-            };
-            status.insert(*id, next);
-        }
     }
 }

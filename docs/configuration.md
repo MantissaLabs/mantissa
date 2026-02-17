@@ -47,7 +47,7 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
         ),
     ),
     health: (
-        probe_fanout: 2,
+        probe_fanout: 5,
         probe_interval_ms: 1000,
         probe_timeout_ms: 1000,
         self_observe_interval_ms: 1000,

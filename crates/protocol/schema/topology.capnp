@@ -52,7 +52,7 @@ interface Topology {
 
 struct TopologyEvent {
   # A TopologyEvent to be performed on remote peers, it is
-  # gossiped to other nodes to add, remove or suspect members.
+  # gossiped to other nodes to add, remove or update member liveness.
 
   event @0 :EventType;
   # Type of event performed on the topology for a given node.
@@ -66,6 +66,8 @@ struct TopologyEvent {
       add @0;
       remove @1;
       suspect @2;
+      alive @3;
+      down @4;
   }
 }
 
@@ -131,6 +133,9 @@ struct NodeInfo {
 
   activeClusterView @13 :ClusterViewId;
   # Active cluster view currently used by this node for control-plane operations.
+
+  incarnation @14 :UInt64;
+  # SWIM-style incarnation number for liveness conflict resolution.
 }
 
 struct NodeList {

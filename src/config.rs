@@ -407,7 +407,7 @@ fn default_true() -> bool {
 ///
 /// Returns the default peer-health active probe fanout.
 fn default_health_probe_fanout() -> usize {
-    2
+    5
 }
 
 /// # Description:

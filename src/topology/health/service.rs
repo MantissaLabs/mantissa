@@ -1,6 +1,7 @@
 use super::Health;
 use protocol::health::health;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 impl health::Server for Health {
     async fn ping(
@@ -22,6 +23,23 @@ impl health::Server for Health {
         out.set_now(now);
         out.set_root_digest(&digest);
 
+        Ok(())
+    }
+
+    async fn indirect_ping(
+        self: std::rc::Rc<Self>,
+        params: health::IndirectPingParams,
+        mut results: health::IndirectPingResults,
+    ) -> Result<(), capnp::Error> {
+        let topo = self.clone_topology();
+        let request = params.get()?;
+        let target_id = request.get_target_id()?;
+        let target = Uuid::from_slice(target_id)
+            .map_err(|err| capnp::Error::failed(format!("invalid target id: {err}")))?;
+        let timeout_ms = request.get_timeout_ms();
+        let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+        let ok = topo.health_indirect_ping(target, timeout).await;
+        results.get().set_ok(ok);
         Ok(())
     }
 }

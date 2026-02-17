@@ -403,6 +403,7 @@ impl Bootstrap {
             crypto: keys,
             registry: registry.clone(),
             health_monitor: health_monitor.clone(),
+            runtime_health,
         })?;
 
         let replayed = topology.replay_cluster_operations_on_startup().await?;
@@ -707,9 +708,7 @@ impl Bootstrap {
             let mut ticker = tokio::time::interval(runtime_health.probe_interval);
             loop {
                 ticker.tick().await;
-                topo_for_health
-                    .health_probe_tick(runtime_health.probe_fanout, runtime_health.probe_timeout)
-                    .await;
+                topo_for_health.health_probe_tick().await;
             }
         });
 

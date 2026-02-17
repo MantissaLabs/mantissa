@@ -41,6 +41,7 @@ pub enum TopologyEvent {
         hostname: String,
         address: String,
         root_hash: String,
+        incarnation: u64,
         /// Server capability exported by the node that originated the gossip message.
         /// We keep this optional so downstream peers can drop handles they cannot re-export
         /// safely (re-exporting an imported capability over the same connection causes capnp
@@ -54,7 +55,16 @@ pub enum TopologyEvent {
     Leave {
         id: Uuid,
     },
+    Alive {
+        id: Uuid,
+        incarnation: u64,
+    },
     Suspect {
         id: Uuid,
+        incarnation: u64,
+    },
+    Down {
+        id: Uuid,
+        incarnation: u64,
     },
 }

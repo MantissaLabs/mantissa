@@ -46,6 +46,7 @@ struct JoinPayload {
     id: Uuid,
     hostname: String,
     advertise_addr: String,
+    incarnation: u64,
     server_handle: server::Client,
     public_key: [u8; 32],
     signing_key: [u8; 32],
@@ -77,6 +78,7 @@ impl JoinInputs {
 struct JoinResponse {
     peer_id: Uuid,
     peer_value: PeerValue,
+    peer_incarnation: u64,
     ticket: Vec<u8>,
     credential: Vec<u8>,
     session: cluster_session::Client,
@@ -366,6 +368,7 @@ impl Topology {
             id: self.node.id,
             hostname,
             advertise_addr,
+            incarnation: self.swim_local_incarnation(),
             server_handle,
             public_key: self.public_key.to_bytes(),
             signing_key: self.signing_key.verifying_key().to_bytes(),
@@ -396,6 +399,7 @@ impl Topology {
         info.set_public_key(&payload.public_key);
         info.set_signing_key(&payload.signing_key);
         info.set_identity_sig(&payload.identity_sig);
+        info.set_incarnation(payload.incarnation);
         if let Some(wg) = payload.wireguard.as_ref() {
             info.set_wireguard_public_key(&wg.public_key);
             info.set_wireguard_port(wg.port);
@@ -412,11 +416,13 @@ impl Topology {
         let credential = resp.get_credential()?.to_vec();
         let node_info = resp.get_node_info()?;
         let peer_id = read_node_id(node_info.get_id()?)?;
+        let peer_incarnation = node_info.get_incarnation();
         let peer_value = PeerValue::from_node_info(peer_id, node_info)?;
 
         Ok(JoinResponse {
             peer_id,
             peer_value,
+            peer_incarnation,
             ticket,
             credential,
             session,
@@ -1808,6 +1814,7 @@ impl topology::Server for Topology {
         let JoinResponse {
             peer_id,
             peer_value,
+            peer_incarnation,
             ticket,
             credential,
             session,
@@ -1828,7 +1835,7 @@ impl topology::Server for Topology {
 
         ClusterCredential::from_bytes_verified(&credential).map_err(Error::failed)?;
 
-        self.mark_seen(peer_id);
+        self.swim_note_join(peer_id, peer_incarnation).await;
 
         self.attach_handle_only(peer_id, anchor_handle).await;
 
@@ -2493,40 +2500,40 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
 
     let node = reader.get_node()?;
     let id = read_node_id(node.get_id()?)?;
-    let pubkey = pubkey_from_slice(node.get_public_key()?).expect("Failed to parse public key");
-    let signing_pub = verifying_key_from_data(node.get_signing_key()?)?;
-    let identity_sig = node.get_identity_sig()?;
-    if identity_sig.is_empty() {
-        return Err(capnp::Error::failed(
-            "identitySig must be set for peer identity verification".into(),
-        ));
-    }
-    if identity_sig.len() != 64 {
-        return Err(capnp::Error::failed(
-            "identitySig must be exactly 64 bytes".into(),
-        ));
-    }
-    let wg_pk_bytes = node.get_wireguard_public_key()?;
-    let wireguard = if wg_pk_bytes.is_empty() {
-        None
-    } else {
-        if wg_pk_bytes.len() != 32 {
-            return Err(capnp::Error::failed(
-                "wireguardPublicKey must be exactly 32 bytes".into(),
-            ));
-        }
-        let mut public_key = [0u8; 32];
-        public_key.copy_from_slice(wg_pk_bytes);
-
-        Some(WireGuardPeerValue {
-            public_key,
-            port: node.get_wireguard_port(),
-            enabled: node.get_wireguard_enabled(),
-        })
-    };
-
     let event = match reader.get_event()? {
         EventType::Add => {
+            let pubkey =
+                pubkey_from_slice(node.get_public_key()?).expect("Failed to parse public key");
+            let signing_pub = verifying_key_from_data(node.get_signing_key()?)?;
+            let identity_sig = node.get_identity_sig()?;
+            if identity_sig.is_empty() {
+                return Err(capnp::Error::failed(
+                    "identitySig must be set for peer identity verification".into(),
+                ));
+            }
+            if identity_sig.len() != 64 {
+                return Err(capnp::Error::failed(
+                    "identitySig must be exactly 64 bytes".into(),
+                ));
+            }
+            let wg_pk_bytes = node.get_wireguard_public_key()?;
+            let wireguard = if wg_pk_bytes.is_empty() {
+                None
+            } else {
+                if wg_pk_bytes.len() != 32 {
+                    return Err(capnp::Error::failed(
+                        "wireguardPublicKey must be exactly 32 bytes".into(),
+                    ));
+                }
+                let mut public_key = [0u8; 32];
+                public_key.copy_from_slice(wg_pk_bytes);
+
+                Some(WireGuardPeerValue {
+                    public_key,
+                    port: node.get_wireguard_port(),
+                    enabled: node.get_wireguard_enabled(),
+                })
+            };
             let client = if node.has_handle() {
                 Some(node.get_handle()?)
             } else {
@@ -2538,6 +2545,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 hostname: node.get_hostname()?.to_str()?.to_string(),
                 address: node.get_addr()?.to_str()?.to_string(),
                 root_hash: node.get_root_hash()?.to_str()?.to_string(),
+                incarnation: node.get_incarnation(),
                 client,
                 noise_static_pub: pubkey,
                 signing_pub: Box::new(signing_pub),
@@ -2546,7 +2554,18 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             }
         }
         EventType::Remove => TopologyEvent::Leave { id },
-        EventType::Suspect => TopologyEvent::Suspect { id },
+        EventType::Alive => TopologyEvent::Alive {
+            id,
+            incarnation: node.get_incarnation(),
+        },
+        EventType::Suspect => TopologyEvent::Suspect {
+            id,
+            incarnation: node.get_incarnation(),
+        },
+        EventType::Down => TopologyEvent::Down {
+            id,
+            incarnation: node.get_incarnation(),
+        },
     };
 
     Ok(event)
@@ -2566,6 +2585,7 @@ pub fn add_event(
             hostname,
             address,
             root_hash,
+            incarnation,
             client,
             noise_static_pub,
             signing_pub,
@@ -2585,6 +2605,7 @@ pub fn add_event(
             node.set_public_key(&noise_static_pub.to_bytes());
             node.set_signing_key(&signing_pub.to_bytes());
             node.set_identity_sig(identity_sig);
+            node.set_incarnation(*incarnation);
             if let Some(wg) = wireguard.as_ref() {
                 node.set_wireguard_public_key(&wg.public_key);
                 node.set_wireguard_port(wg.port);
@@ -2607,12 +2628,31 @@ pub fn add_event(
             cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
         }
 
-        TopologyEvent::Suspect { id } => {
+        TopologyEvent::Alive { id, incarnation } => {
+            let mut topo = msg.init_topology();
+            topo.set_event(topology_event::EventType::Alive);
+            let mut node = topo.init_node();
+            set_node_id(node.reborrow().init_id(), id);
+            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
+            node.set_incarnation(*incarnation);
+        }
+
+        TopologyEvent::Suspect { id, incarnation } => {
             let mut topo = msg.init_topology();
             topo.set_event(topology_event::EventType::Suspect);
             let mut node = topo.init_node();
             set_node_id(node.reborrow().init_id(), id);
             cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
+            node.set_incarnation(*incarnation);
+        }
+
+        TopologyEvent::Down { id, incarnation } => {
+            let mut topo = msg.init_topology();
+            topo.set_event(topology_event::EventType::Down);
+            let mut node = topo.init_node();
+            set_node_id(node.reborrow().init_id(), id);
+            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
+            node.set_incarnation(*incarnation);
         }
     }
 }

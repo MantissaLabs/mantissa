@@ -30,11 +30,11 @@ use net::noise::NoisePeerVerifier;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::server::{self, ServerClient};
 use std::cell::{OnceCell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
@@ -247,6 +247,74 @@ impl SyncState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SwimPeerState {
+    /// Highest incarnation observed for this peer.
+    incarnation: u64,
+    /// Locally selected health status for this peer.
+    status: ::health::Status,
+    /// Timestamp of the first consecutive probe failure for suspicion gating.
+    first_failed_at: Option<std::time::Instant>,
+    /// Deadline at which suspect should transition to down if no refutation arrives.
+    suspect_deadline: Option<std::time::Instant>,
+}
+
+impl Default for SwimPeerState {
+    /// # Description:
+    ///
+    /// Creates the baseline SWIM state for a peer before any liveness signal is observed.
+    fn default() -> Self {
+        Self {
+            incarnation: 0,
+            status: ::health::Status::Unknown,
+            first_failed_at: None,
+            suspect_deadline: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SwimState {
+    /// Per-peer SWIM liveness state keyed by node identifier.
+    peers: Arc<AsyncMutex<HashMap<Uuid, SwimPeerState>>>,
+    /// Round-robin cursor used to select one probe target per tick.
+    probe_cursor: Arc<Mutex<usize>>,
+    /// Local node incarnation used to refute remote suspect/down rumors.
+    local_incarnation: Arc<AtomicU64>,
+}
+
+impl SwimState {
+    /// # Description:
+    ///
+    /// Creates SWIM runtime state and seeds the local incarnation counter.
+    fn new(local_id: Uuid) -> Self {
+        let bytes = local_id.as_u128() as usize;
+        let boot_incarnation = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(1)
+            .max(1);
+        Self {
+            peers: Arc::new(AsyncMutex::new(HashMap::new())),
+            probe_cursor: Arc::new(Mutex::new(bytes)),
+            local_incarnation: Arc::new(AtomicU64::new(boot_incarnation)),
+        }
+    }
+}
+
+/// # Description:
+///
+/// Computes an ordering rank for SWIM statuses when incarnation numbers are equal.
+fn swim_status_rank(status: ::health::Status) -> u8 {
+    match status {
+        ::health::Status::Unknown => 0,
+        ::health::Status::Alive => 1,
+        ::health::Status::Degraded => 1,
+        ::health::Status::Suspect => 2,
+        ::health::Status::Down => 3,
+    }
+}
+
 #[derive(Clone)]
 struct ClusterOperationState {
     /// Gate used to serialize local operation progression and active-view commits.
@@ -327,6 +395,12 @@ pub struct Topology {
 
     /// Shared health monitor tracking peer liveness observations.
     health_monitor: Arc<HealthMonitor>,
+
+    /// Runtime health tuning used by SWIM-style probing loops.
+    runtime_health: config::RuntimeHealthConfig,
+
+    /// SWIM failure detector state tracking incarnation and suspect/down transitions.
+    swim: SwimState,
 }
 
 pub struct TopologyConfig {
@@ -339,6 +413,7 @@ pub struct TopologyConfig {
     pub crypto: Keys,
     pub registry: Registry,
     pub health_monitor: Arc<HealthMonitor>,
+    pub runtime_health: config::RuntimeHealthConfig,
 }
 
 impl Topology {
@@ -353,6 +428,7 @@ impl Topology {
             crypto,
             registry,
             health_monitor,
+            runtime_health,
         } = config;
         let TopologyStores {
             credentials,
@@ -375,6 +451,7 @@ impl Topology {
             noise_public_key,
             signing_key,
         } = crypto;
+        let local_id = node.id;
 
         let topology = Self {
             node,
@@ -404,6 +481,8 @@ impl Topology {
             secret_master_store,
             secret_keyring,
             health_monitor,
+            runtime_health,
+            swim: SwimState::new(local_id),
         };
 
         info!(
@@ -472,6 +551,8 @@ impl Topology {
         let public_key = self.public_key;
         let verifying_key = self.signing_key.verifying_key();
         let health = self.health_monitor.clone();
+        let swim_peers = self.swim.peers.clone();
+        let local_incarnation = self.swim_local_incarnation();
         // Precompute the identity signature so the async task doesn't capture `self`.
         let identity_sig = crate::node::identity::sign_peer_identity(
             &self.signing_key,
@@ -558,6 +639,15 @@ impl Topology {
                 log::warn!("failed to upsert self peer: {e}");
             }
 
+            {
+                let mut states = swim_peers.lock().await;
+                let state = states.entry(local_id).or_default();
+                state.incarnation = state.incarnation.max(local_incarnation);
+                state.status = ::health::Status::Alive;
+                state.first_failed_at = None;
+                state.suspect_deadline = None;
+            }
+
             // mark self as alive in health (passive observation)
             health.observe_seen(local_id);
         });
@@ -614,9 +704,25 @@ impl Topology {
         self.server_handle.get().cloned()
     }
 
-    /// Mark `id` as recently seen (Alive) in the health monitor.
-    pub fn mark_seen(&self, id: Uuid) {
-        self.health_monitor.observe_seen(id);
+    /// # Description:
+    ///
+    /// Returns the local SWIM incarnation used when refuting stale suspect/down rumors.
+    pub fn swim_local_incarnation(&self) -> u64 {
+        self.swim.local_incarnation.load(Ordering::SeqCst)
+    }
+
+    /// # Description:
+    ///
+    /// Records that a peer joined the membership and seeds SWIM state as alive.
+    pub async fn swim_note_join(&self, id: Uuid, incarnation: u64) {
+        let mut states = self.swim.peers.lock().await;
+        let state = states.entry(id).or_default();
+        state.incarnation = state.incarnation.max(incarnation);
+        state.status = ::health::Status::Alive;
+        state.first_failed_at = None;
+        state.suspect_deadline = None;
+        drop(states);
+        self.health_monitor.set_status(id, ::health::Status::Alive);
     }
 
     /// Return true if we have a stored ticket for `peer_id` in local sessions.
@@ -690,6 +796,7 @@ impl Topology {
         info.set_public_key(&noise_pub);
         info.set_signing_key(&signing_pub);
         info.set_identity_sig(&identity_sig);
+        info.set_incarnation(self.swim_local_incarnation());
 
         // WireGuard underlay advertisement (best-effort).
         //
@@ -781,6 +888,7 @@ impl Topology {
                             ref address,
                             ref hostname,
                             root_hash: _,
+                            incarnation,
                             ref client,
                             ref noise_static_pub,
                             ref signing_pub,
@@ -815,6 +923,7 @@ impl Topology {
                                 error!("Failed to register peer: {e}");
                                 continue;
                             }
+                            self.swim_note_join(id, incarnation).await;
                         }
 
                         TopologyEvent::Leave { id } => {
@@ -826,9 +935,16 @@ impl Topology {
                             }
                         }
 
-                        TopologyEvent::Suspect { id } => {
-                            info!(target: "topology", "Heartbeat from: {id}");
-                            // update heartbeat timestamp if tracking
+                        TopologyEvent::Alive { id, incarnation } => {
+                            self.handle_alive_event(id, incarnation).await;
+                        }
+
+                        TopologyEvent::Suspect { id, incarnation } => {
+                            self.handle_suspect_event(id, incarnation).await;
+                        }
+
+                        TopologyEvent::Down { id, incarnation } => {
+                            self.handle_down_event(id, incarnation).await;
                         }
                     }
 
@@ -838,6 +954,7 @@ impl Topology {
                             hostname,
                             address,
                             root_hash,
+                            incarnation,
                             client,
                             noise_static_pub,
                             signing_pub,
@@ -853,6 +970,7 @@ impl Topology {
                                 hostname,
                                 address,
                                 root_hash,
+                                incarnation,
                                 client,
                                 noise_static_pub,
                                 signing_pub,
@@ -886,6 +1004,112 @@ impl Topology {
                 }
             }
         }
+    }
+
+    /// # Description:
+    ///
+    /// Applies an `alive` SWIM update and refreshes local status/metadata for the subject peer.
+    async fn handle_alive_event(&self, id: Uuid, incarnation: u64) {
+        if id == self.node.id {
+            if incarnation > self.swim_local_incarnation() {
+                self.swim
+                    .local_incarnation
+                    .store(incarnation, Ordering::SeqCst);
+            }
+            self.swim_note_join(id, self.swim_local_incarnation()).await;
+            return;
+        }
+        self.apply_remote_swim_update(id, incarnation, ::health::Status::Alive)
+            .await;
+    }
+
+    /// # Description:
+    ///
+    /// Applies a `suspect` SWIM update, or emits an immediate alive refutation when we are the target.
+    async fn handle_suspect_event(&self, id: Uuid, incarnation: u64) {
+        if id == self.node.id {
+            if let Some(next) = self.refute_self_suspicion(incarnation).await {
+                let _ = self
+                    .gossip_topology_event(TopologyEvent::Alive {
+                        id: self.node.id,
+                        incarnation: next,
+                    })
+                    .await;
+            }
+            return;
+        }
+        self.apply_remote_swim_update(id, incarnation, ::health::Status::Suspect)
+            .await;
+    }
+
+    /// # Description:
+    ///
+    /// Applies a `down` SWIM update, or emits an immediate alive refutation when we are the target.
+    async fn handle_down_event(&self, id: Uuid, incarnation: u64) {
+        if id == self.node.id {
+            if let Some(next) = self.refute_self_suspicion(incarnation).await {
+                let _ = self
+                    .gossip_topology_event(TopologyEvent::Alive {
+                        id: self.node.id,
+                        incarnation: next,
+                    })
+                    .await;
+            }
+            return;
+        }
+        self.apply_remote_swim_update(id, incarnation, ::health::Status::Down)
+            .await;
+    }
+
+    /// # Description:
+    ///
+    /// Applies one remote SWIM status update with incarnation ordering and same-incarnation precedence.
+    async fn apply_remote_swim_update(&self, id: Uuid, incarnation: u64, status: ::health::Status) {
+        let now = std::time::Instant::now();
+        let mut states = self.swim.peers.lock().await;
+        let state = states.entry(id).or_default();
+        if incarnation < state.incarnation {
+            return;
+        }
+
+        let should_apply = if incarnation > state.incarnation {
+            true
+        } else {
+            swim_status_rank(status) > swim_status_rank(state.status)
+        };
+
+        if !should_apply {
+            return;
+        }
+
+        state.incarnation = incarnation;
+        state.status = status;
+        state.first_failed_at = None;
+        state.suspect_deadline = if matches!(status, ::health::Status::Suspect) {
+            Some(now + self.runtime_health.down_after)
+        } else {
+            None
+        };
+        drop(states);
+
+        self.health_monitor.set_status(id, status);
+        if matches!(status, ::health::Status::Down) {
+            self.registry.invalidate_peer_capabilities(id).await;
+        }
+    }
+
+    /// # Description:
+    ///
+    /// Increments local incarnation when a remote suspect/down rumor targets this node.
+    async fn refute_self_suspicion(&self, observed_incarnation: u64) -> Option<u64> {
+        let current = self.swim_local_incarnation();
+        if observed_incarnation < current {
+            return None;
+        }
+        let next = observed_incarnation.saturating_add(1);
+        self.swim.local_incarnation.store(next, Ordering::SeqCst);
+        self.swim_note_join(self.node.id, next).await;
+        Some(next)
     }
 
     #[allow(dead_code)]
@@ -923,6 +1147,9 @@ impl Topology {
             eprintln!("Could not remove peer: {e}");
         }
         self.registry.remove_peer(id).await;
+        self.health_monitor
+            .set_status(id, ::health::Status::Unknown);
+        self.swim.peers.lock().await.remove(&id);
         Ok(())
     }
 
@@ -1116,72 +1343,328 @@ impl Topology {
         }
     }
 
-    /// Probe a small random sample of peers via Health RPC and update the monitor on success.
-    pub async fn health_probe_tick(&self, fanout: usize, timeout: Duration) {
-        let snapshot = match self.peer_snapshot().await {
-            Some(s) => s,
-            None => return,
-        };
-        let cluster_view = self.active_cluster_view();
-        let excluded_peers = self.excluded_peers_snapshot().await;
-
-        // Build list of peers excluding self
-        let mut candidates: Vec<(uuid::Uuid, String)> = Vec::new();
-        let peers = snapshot.entries.clone();
-        for entry in peers.iter() {
-            if entry.peer_id == self.node.id {
-                continue;
-            }
-            if excluded_peers.contains(&entry.peer_id) {
-                continue;
-            }
-            let value = entry.value.as_ref();
-            candidates.push((entry.peer_id, value.address.clone()));
-        }
+    /// # Description:
+    ///
+    /// Executes one SWIM probe cycle:
+    ///  - picks one target peer,
+    ///  - performs direct ping and optional indirect probes,
+    ///  - transitions local suspicion/down state, and
+    ///  - gossips liveness transitions.
+    pub async fn health_probe_tick(&self) {
+        let candidates = self.swim_probe_candidates().await;
         if candidates.is_empty() {
             return;
         }
 
-        // Randomly pick up to `fanout`
+        let cluster_view = self.active_cluster_view();
+        let timeout = self.runtime_health.probe_timeout;
+        let target = {
+            let mut cursor = lock_or_recover(&self.swim.probe_cursor, "topology.swim_probe_cursor");
+            let idx = *cursor % candidates.len();
+            *cursor = (*cursor + 1) % candidates.len();
+            candidates[idx]
+        };
+
+        let direct_ok = self
+            .probe_peer_direct(target, cluster_view, timeout)
+            .await
+            .unwrap_or(false);
+        let indirect_ok = if direct_ok {
+            true
+        } else {
+            self.probe_peer_indirect(target, &candidates, cluster_view, timeout)
+                .await
+        };
+
+        if indirect_ok {
+            if let Some(incarnation) = self.swim_note_probe_success(target).await {
+                let _ = self
+                    .gossip_topology_event(TopologyEvent::Alive {
+                        id: target,
+                        incarnation,
+                    })
+                    .await;
+            }
+        } else if let Some(event) = self.swim_note_probe_failure(target).await {
+            let _ = self.gossip_topology_event(event).await;
+        }
+
+        for event in self.swim_expire_suspicions().await {
+            let _ = self.gossip_topology_event(event).await;
+        }
+    }
+
+    /// # Description:
+    ///
+    /// Returns probe-eligible peers, excluding the local node and view-scoped excluded peers.
+    async fn swim_probe_candidates(&self) -> Vec<Uuid> {
+        let snapshot = match self.peer_snapshot().await {
+            Some(snapshot) => snapshot,
+            None => return Vec::new(),
+        };
+        let excluded = self.excluded_peers_snapshot().await;
+
+        snapshot
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                if entry.peer_id == self.node.id || excluded.contains(&entry.peer_id) {
+                    None
+                } else {
+                    Some(entry.peer_id)
+                }
+            })
+            .collect()
+    }
+
+    /// # Description:
+    ///
+    /// Performs a direct health ping to `peer_id` within `timeout`.
+    async fn probe_peer_direct(
+        &self,
+        peer_id: Uuid,
+        cluster_view: ClusterViewId,
+        timeout: Duration,
+    ) -> Result<bool, capnp::Error> {
+        let Some(health_cap) = self
+            .registry
+            .fetch_health_capability(peer_id, cluster_view)
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        let ping = async {
+            let req = health_cap.ping_request();
+            req.send().promise.await
+        };
+
+        match tokio::time::timeout(timeout, ping).await {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(err)) => {
+                debug!(target: "health", peer = %peer_id, "direct ping failed: {err}");
+                self.registry.invalidate_peer_capabilities(peer_id).await;
+                Ok(false)
+            }
+            Err(_) => {
+                debug!(target: "health", peer = %peer_id, "direct ping timed out");
+                self.registry.invalidate_peer_capabilities(peer_id).await;
+                Ok(false)
+            }
+        }
+    }
+
+    /// # Description:
+    ///
+    /// Executes one direct health probe for another node, used by remote indirect probe requests.
+    pub async fn health_indirect_ping(&self, target_id: Uuid, timeout: Duration) -> bool {
+        self.probe_peer_direct(target_id, self.active_cluster_view(), timeout)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// # Description:
+    ///
+    /// Executes SWIM indirect probing by asking helper peers to ping the target on our behalf.
+    async fn probe_peer_indirect(
+        &self,
+        target_id: Uuid,
+        candidates: &[Uuid],
+        cluster_view: ClusterViewId,
+        timeout: Duration,
+    ) -> bool {
+        let helper_population = candidates
+            .iter()
+            .filter(|peer_id| **peer_id != target_id)
+            .count();
+        if helper_population == 0 {
+            return false;
+        }
+
+        // Lifeguard-style scaling: grow helper fanout logarithmically with membership while
+        // keeping an operator-provided floor via `health.probe_fanout`.
+        let adaptive_floor = (helper_population.max(1)).ilog2() as usize + 1;
+        let adaptive_floor = adaptive_floor.clamp(3, 32);
+        let helper_budget = self
+            .runtime_health
+            .probe_fanout
+            .max(adaptive_floor)
+            .min(helper_population);
+
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        let mut helpers = candidates
+            .iter()
+            .copied()
+            .filter(|peer_id| *peer_id != target_id)
+            .collect::<Vec<_>>();
         use ::rand::prelude::SliceRandom;
         let mut rng = ::rand::rng();
-        candidates.shuffle(&mut rng);
-        let sample = candidates.into_iter().take(fanout);
+        helpers.shuffle(&mut rng);
 
-        for (peer_id, addr) in sample {
-            let health_cap = match self
+        for helper_id in helpers.into_iter().take(helper_budget) {
+            let helper_cap = match self
                 .registry
-                .fetch_health_capability(peer_id, cluster_view)
+                .fetch_health_capability(helper_id, cluster_view)
                 .await
             {
-                Ok(Some(h)) => h,
+                Ok(Some(cap)) => cap,
                 Ok(None) => continue,
-                Err(e) => {
-                    error!(target: "health", "get health cap failed for {addr}: {e}");
+                Err(err) => {
+                    debug!(target: "health", helper = %helper_id, "indirect helper unavailable: {err}");
                     continue;
                 }
             };
 
-            // Ping with timeout
-            let ping = async {
-                let req = health_cap.ping_request();
-                req.send().promise.await
+            let probe = async {
+                let mut req = helper_cap.indirect_ping_request();
+                {
+                    let mut payload = req.get();
+                    payload.set_target_id(target_id.as_bytes());
+                    payload.set_timeout_ms(timeout_ms);
+                }
+                let resp = req.send().promise.await?;
+                let reader = resp.get()?;
+                Ok::<bool, capnp::Error>(reader.get_ok())
             };
 
-            match tokio::time::timeout(timeout, ping).await {
-                Ok(Ok(_)) => {
-                    self.mark_seen(peer_id);
-                }
-                Ok(Err(e)) => {
-                    error!(target: "health", "ping failed for {addr}: {e}");
-                    self.registry.invalidate_peer_capabilities(peer_id).await;
+            match tokio::time::timeout(timeout, probe).await {
+                Ok(Ok(true)) => return true,
+                Ok(Ok(false)) => {}
+                Ok(Err(err)) => {
+                    debug!(target: "health", helper = %helper_id, "indirect ping failed: {err}");
                 }
                 Err(_) => {
-                    error!(target: "health", "ping timed out for {addr}");
-                    self.registry.invalidate_peer_capabilities(peer_id).await;
+                    debug!(target: "health", helper = %helper_id, "indirect ping timed out");
                 }
             }
         }
+
+        false
+    }
+
+    /// # Description:
+    ///
+    /// Clears local failure counters after a successful probe and returns incarnation when
+    /// an alive transition should be gossiped.
+    async fn swim_note_probe_success(&self, peer_id: Uuid) -> Option<u64> {
+        let mut states = self.swim.peers.lock().await;
+        let state = states.entry(peer_id).or_default();
+        let previous = state.status;
+        if state.incarnation == 0 {
+            state.incarnation = 1;
+        }
+        state.status = ::health::Status::Alive;
+        state.first_failed_at = None;
+        state.suspect_deadline = None;
+        let incarnation = state.incarnation;
+        drop(states);
+
+        self.health_monitor
+            .set_status(peer_id, ::health::Status::Alive);
+        if previous != ::health::Status::Alive {
+            Some(incarnation)
+        } else {
+            None
+        }
+    }
+
+    /// # Description:
+    ///
+    /// Records one failed probe and emits suspect/down gossip events when thresholds are crossed.
+    async fn swim_note_probe_failure(&self, peer_id: Uuid) -> Option<TopologyEvent> {
+        let now = std::time::Instant::now();
+        let mut states = self.swim.peers.lock().await;
+        let state = states.entry(peer_id).or_default();
+        if state.incarnation == 0 {
+            state.incarnation = 1;
+        }
+        if state.status == ::health::Status::Down {
+            return None;
+        }
+
+        if state.first_failed_at.is_none() {
+            state.first_failed_at = Some(now);
+            return None;
+        }
+
+        if now.duration_since(state.first_failed_at.unwrap_or(now))
+            < self.runtime_health.suspect_after
+        {
+            return None;
+        }
+
+        if state.status != ::health::Status::Suspect {
+            state.status = ::health::Status::Suspect;
+            state.suspect_deadline = Some(now + self.runtime_health.down_after);
+            let incarnation = state.incarnation;
+            drop(states);
+            self.health_monitor
+                .set_status(peer_id, ::health::Status::Suspect);
+            return Some(TopologyEvent::Suspect {
+                id: peer_id,
+                incarnation,
+            });
+        }
+
+        if state
+            .suspect_deadline
+            .map(|deadline| now >= deadline)
+            .unwrap_or(false)
+        {
+            state.status = ::health::Status::Down;
+            state.first_failed_at = None;
+            state.suspect_deadline = None;
+            let incarnation = state.incarnation;
+            drop(states);
+            self.health_monitor
+                .set_status(peer_id, ::health::Status::Down);
+            self.registry.invalidate_peer_capabilities(peer_id).await;
+            return Some(TopologyEvent::Down {
+                id: peer_id,
+                incarnation,
+            });
+        }
+
+        None
+    }
+
+    /// # Description:
+    ///
+    /// Converts expired suspect entries to down and returns the gossip events to disseminate.
+    async fn swim_expire_suspicions(&self) -> Vec<TopologyEvent> {
+        let now = std::time::Instant::now();
+        let mut to_down = Vec::new();
+        {
+            let mut states = self.swim.peers.lock().await;
+            for (peer_id, state) in states.iter_mut() {
+                if state.status != ::health::Status::Suspect {
+                    continue;
+                }
+                if state
+                    .suspect_deadline
+                    .map(|deadline| now >= deadline)
+                    .unwrap_or(false)
+                {
+                    state.status = ::health::Status::Down;
+                    state.first_failed_at = None;
+                    state.suspect_deadline = None;
+                    state.incarnation = state.incarnation.max(1);
+                    to_down.push((*peer_id, state.incarnation));
+                }
+            }
+        }
+
+        let mut events = Vec::with_capacity(to_down.len());
+        for (peer_id, incarnation) in to_down {
+            self.health_monitor
+                .set_status(peer_id, ::health::Status::Down);
+            self.registry.invalidate_peer_capabilities(peer_id).await;
+            events.push(TopologyEvent::Down {
+                id: peer_id,
+                incarnation,
+            });
+        }
+        events
     }
 
     /// Return the stored ed25519 verifying key for `peer_id` if we have it locally.
