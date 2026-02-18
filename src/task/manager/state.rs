@@ -1609,9 +1609,13 @@ impl TaskManager {
             {
                 continue;
             }
+            let Some(reconcile_guard) = self.try_begin_reconcile(spec.id).await else {
+                continue;
+            };
             let manager = self.clone();
             let spec_for_reconcile = spec.clone();
             tokio::task::spawn_local(async move {
+                let _reconcile_guard = reconcile_guard;
                 if let Err(err) = manager
                     .reconcile_local_task(spec_for_reconcile.clone())
                     .await

@@ -356,6 +356,20 @@ impl ServiceController {
             return Ok(());
         }
 
+        // During initial deployment submission, the service spec is broadcast as Deploying with
+        // templates populated but task_ids still empty while launch is in-flight. Running the
+        // normal cleanup/slot loops at that point causes false "excess task" stops and churn.
+        if deploying_assignment_incomplete(&spec) {
+            tracing::debug!(
+                target: "services",
+                service = %spec.service_name,
+                expected_slots = expected_task_id_count(&spec),
+                assigned_slots = spec.task_ids.len(),
+                "skipping deploy reconciliation until task ids are fully assigned"
+            );
+            return Ok(());
+        }
+
         let slots = build_replica_slots(&spec);
         let slot_targets = compute_slot_targets(spec.id, &spec.tasks, eligible_nodes);
         let desired_ids: HashSet<Uuid> = slots.iter().filter_map(|slot| slot.task_id).collect();
@@ -530,6 +544,12 @@ impl ServiceController {
         let Some(task) = task else {
             return Ok(());
         };
+
+        // Deployment reconciliation should heal missing/failed slots, but avoid proactive
+        // rebalancing until the service is fully running to prevent startup churn.
+        if spec.status() != ServiceStatus::Running {
+            return Ok(());
+        }
 
         if slot.template.replicas <= 1 {
             return Ok(());
@@ -1566,6 +1586,19 @@ fn task_state_terminal_for_restart(state: &ContainerState) -> bool {
     )
 }
 
+/// Returns the expected task id count implied by the manifest templates.
+fn expected_task_id_count(spec: &ServiceSpecValue) -> usize {
+    spec.tasks
+        .iter()
+        .map(|template| template.replicas as usize)
+        .sum()
+}
+
+/// Returns true when deployment has not yet assigned task ids for every desired replica.
+fn deploying_assignment_incomplete(spec: &ServiceSpecValue) -> bool {
+    spec.status() == ServiceStatus::Deploying && spec.task_ids.len() < expected_task_id_count(spec)
+}
+
 /// Selects the deterministic owner node for a replica slot so rescheduling is distributed.
 fn select_slot_owner(
     service_id: Uuid,
@@ -2547,5 +2580,53 @@ mod tests {
                 ContainerState::Failed
             ))
         ));
+    }
+
+    /// Ensures deploy-time reconciliation waits for full task-id assignment.
+    #[test]
+    fn deploying_assignment_incomplete_detected() {
+        let manifest_id = Uuid::new_v4();
+        let tasks = vec![ServiceTaskSpecValue {
+            name: "api".into(),
+            image: "ghcr.io/demo/api:latest".into(),
+            command: Vec::new(),
+            replicas: 3,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            restart_policy: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            networks: Vec::new(),
+            health_port: None,
+            health_command: None,
+            public_port: None,
+            public_protocol: None,
+        }];
+
+        let mut deploying = ServiceSpecValue::new(
+            manifest_id,
+            "manifest",
+            "demo-service",
+            tasks.clone(),
+            vec![Uuid::new_v4()],
+        );
+        deploying.set_status(ServiceStatus::Deploying);
+        assert!(deploying_assignment_incomplete(&deploying));
+        assert_eq!(expected_task_id_count(&deploying), 3);
+
+        let mut complete = ServiceSpecValue::new(
+            manifest_id,
+            "manifest",
+            "demo-service",
+            tasks.clone(),
+            vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()],
+        );
+        complete.set_status(ServiceStatus::Deploying);
+        assert!(!deploying_assignment_incomplete(&complete));
+
+        let mut running = complete.clone();
+        running.set_status(ServiceStatus::Running);
+        assert!(!deploying_assignment_incomplete(&running));
     }
 }

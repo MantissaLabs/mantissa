@@ -77,6 +77,7 @@ pub struct TaskManager {
     container_manager: Arc<dyn ContainerManager + Send + Sync>,
     local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
     inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
+    inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
     pull_limiter: Arc<Semaphore>,
     registry: Registry,
     secret_registry: SecretRegistry,
@@ -171,6 +172,7 @@ impl TaskManager {
             container_manager,
             local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
             inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
+            inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
             pull_limiter: Arc::new(Semaphore::new(IMAGE_PULL_MAX_CONCURRENCY)),
             registry,
             network_registry,
@@ -194,6 +196,19 @@ impl TaskManager {
         Some(StopTaskGuard {
             task_id,
             inflight: self.inflight_stops.clone(),
+        })
+    }
+
+    /// Claims a local in-flight marker so only one reconcile workflow executes per task at a time.
+    async fn try_begin_reconcile(&self, task_id: Uuid) -> Option<ReconcileTaskGuard> {
+        let mut guard = self.inflight_reconciles.lock().await;
+        if guard.contains(&task_id) {
+            return None;
+        }
+        guard.insert(task_id);
+        Some(ReconcileTaskGuard {
+            task_id,
+            inflight: self.inflight_reconciles.clone(),
         })
     }
 
@@ -702,6 +717,25 @@ struct StopTaskGuard {
 
 impl Drop for StopTaskGuard {
     /// Releases the in-flight stop marker after the stop workflow returns.
+    fn drop(&mut self) {
+        let inflight = self.inflight.clone();
+        let task_id = self.task_id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                inflight.lock().await.remove(&task_id);
+            });
+        }
+    }
+}
+
+/// Local guard that clears the in-flight reconcile marker for a task when dropped.
+struct ReconcileTaskGuard {
+    task_id: Uuid,
+    inflight: Arc<AsyncMutex<HashSet<Uuid>>>,
+}
+
+impl Drop for ReconcileTaskGuard {
+    /// Releases the in-flight reconcile marker after the reconcile workflow returns.
     fn drop(&mut self) {
         let inflight = self.inflight.clone();
         let task_id = self.task_id;

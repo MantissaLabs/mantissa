@@ -390,9 +390,13 @@ impl TaskManager {
                 self.persist_spec(&spec).await?;
 
                 if belongs {
+                    let Some(reconcile_guard) = self.try_begin_reconcile(spec.id).await else {
+                        return Ok(());
+                    };
                     let manager = self.clone();
                     let spec_for_reconcile = spec.clone();
                     tokio::task::spawn_local(async move {
+                        let _reconcile_guard = reconcile_guard;
                         if let Err(err) = manager
                             .reconcile_local_task(spec_for_reconcile.clone())
                             .await
@@ -988,6 +992,8 @@ fn is_retryable_attachment_provision_error(err: &anyhow::Error) -> bool {
         && text.contains("no such file or directory"))
         || (text.contains("enter container network namespace") && text.contains("no such process"))
         || (text.contains("failed to move") && text.contains("no such process"))
+        || (text.contains("failed to create veth") && text.contains("file exists"))
+        || (text.contains("failed to set mtu") && text.contains("no such device"))
         || text.contains("container interface missing after namespace move")
 }
 
