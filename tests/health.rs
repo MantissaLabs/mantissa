@@ -5,6 +5,27 @@ mod common;
 
 use common::testkit::{ContainerManagerOverrideGuard, TestNode};
 use protocol::health::NodeStatus;
+use std::time::Duration;
+
+/// # Description:
+///
+/// Computes a deterministic timeout budget for SWIM down transitions in tests.
+///
+/// The transition can consume:
+/// - one probe interval before the first failed observation is recorded,
+/// - `suspect_after` before escalating to Suspect,
+/// - `down_after` before promoting to Down,
+/// - one probe timeout for an in-flight ping,
+/// - and a small scheduler/polling margin.
+fn down_transition_timeout() -> Duration {
+    let health = mantissa::config::health_runtime_config();
+    health
+        .probe_interval
+        .saturating_add(health.suspect_after)
+        .saturating_add(health.down_after)
+        .saturating_add(health.probe_timeout)
+        .saturating_add(Duration::from_millis(2_000))
+}
 
 local_test!(health_alive_then_down_inproc, {
     let _guard = ContainerManagerOverrideGuard::install_default();
@@ -35,7 +56,7 @@ local_test!(health_alive_then_down_inproc, {
         .wait_status_of(
             joiner.id(),
             NodeStatus::Down,
-            std::time::Duration::from_millis(10000),
+            down_transition_timeout(),
         )
         .await
         .expect("Node should be marked as down");
@@ -97,7 +118,7 @@ local_test!(health_alive_then_down_tcp, {
         .wait_status_of(
             joiner.id(),
             NodeStatus::Down,
-            std::time::Duration::from_millis(10000),
+            down_transition_timeout(),
         )
         .await
         .expect("Node should be marked as down");

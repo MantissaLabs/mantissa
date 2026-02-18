@@ -1214,7 +1214,9 @@ impl Topology {
             return Some(self.active_cluster_view());
         }
 
-        let session = self.registry.session_for_peer(peer_id).await?;
+        // Keep list/split introspection side-effect free: do not force session bootstrap
+        // from read-only view probes.
+        let session = self.registry.cached_session_for(peer_id).await?;
         Self::session_cluster_view(&session).await.ok()
     }
 
@@ -2418,13 +2420,14 @@ impl topology::Server for Topology {
                 continue;
             }
 
-            if let Some(view) = self.best_known_peer_view(peer_id).await {
-                if retired_views.contains(&view) {
-                    continue;
-                }
-                let entry = counts.entry(view).or_insert(0);
-                *entry = entry.saturating_add(1);
+            // When no cached session is available yet, treat the peer as part of the
+            // local active view until a concrete remote view is observed.
+            let view = self.best_known_peer_view(peer_id).await.unwrap_or(local_view);
+            if retired_views.contains(&view) {
+                continue;
             }
+            let entry = counts.entry(view).or_insert(0);
+            *entry = entry.saturating_add(1);
         }
 
         // Preserve split sibling discoverability even after peer pruning removes direct sessions.

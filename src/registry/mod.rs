@@ -390,6 +390,16 @@ impl Registry {
             .await
     }
 
+    /// Returns the currently cached session for a peer without triggering reconnects or
+    /// credential bootstrap flows.
+    pub async fn cached_session_for(&self, peer_id: Uuid) -> Option<cluster_session::Client> {
+        if self.peer_is_excluded(peer_id) {
+            return None;
+        }
+        let entry = self.entry_if_present(peer_id).await?;
+        self.cached_session(&entry).await
+    }
+
     /// Returns a session for a peer while ignoring split-time exclusion scope.
     ///
     /// This is reserved for topology operation relay flows (for example merge handoff) where
