@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use crdt_store::uuid_key::UuidKey;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use tokio::time::{Duration, MissedTickBehavior, interval};
+use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -25,6 +25,13 @@ use crate::task::types::{TaskEvent, TaskServiceMetadata};
 
 use super::TaskManager;
 use super::select_best_task_value;
+
+/// Maximum attempts when provisioning one runtime attachment.
+const ATTACHMENT_PROVISION_MAX_ATTEMPTS: usize = 4;
+/// Base backoff used between transient attachment provisioning retries.
+const ATTACHMENT_PROVISION_RETRY_BASE_MS: u64 = 50;
+/// Upper bound for attachment provisioning retry backoff.
+const ATTACHMENT_PROVISION_RETRY_MAX_MS: u64 = 800;
 
 impl TaskManager {
     /// Periodically re-attach networks to running containers whose attachment interfaces vanished
@@ -462,34 +469,12 @@ impl TaskManager {
             return Ok(());
         }
 
-        let inspect = self
-            .container_manager
-            .inspect_container(container_id)
-            .await
-            .with_context(|| {
-                format!("inspect container {container_id} for network attachment provisioning")
-            })?;
-
-        let state = inspect.state.as_ref();
-        let pid = state.and_then(|s| s.pid).unwrap_or(0);
-
-        // Treat unknown running state as true for compatibility with older Docker/mocks, but
-        // require a non-zero PID.
-        let running = state.and_then(|s| s.running).unwrap_or(true);
-        if pid == 0 || !running {
-            tracing::trace!(
-                target: "task",
-                task = %task_id,
-                container = %container_id,
-                pid,
-                running,
-                "skipping attachment provisioning; container not running yet"
-            );
+        let Some(mut container_pid) = self
+            .attachment_container_pid_for_runtime(task_id, container_id)
+            .await?
+        else {
             return Ok(());
-        }
-
-        let container_pid = i32::try_from(pid)
-            .context("container pid exceeds 32-bit range for attachment provisioning")?;
+        };
 
         let desired: HashSet<Uuid> = network_ids.iter().copied().collect();
         let existing_list = self
@@ -639,19 +624,19 @@ impl TaskManager {
                     .await
                     .context("persist configuring attachment state")?;
 
-                let provisioning = AttachmentProvisioningRequest {
-                    bridge_name: &bridge,
-                    mtu,
-                    attachment_id: attachment.id,
-                    container_pid,
-                    assigned_ip: &allocation.assigned_ip,
-                    prefix,
-                    mac: &allocation.mac_address,
-                };
-
                 if let Err(err) = self
-                    .attachment_provisioner
-                    .ensure_attachment(&provisioning)
+                    .ensure_runtime_attachment_with_retry(
+                        task_id,
+                        container_id,
+                        &spec.id,
+                        &attachment.id,
+                        &bridge,
+                        mtu,
+                        &allocation.assigned_ip,
+                        prefix,
+                        &allocation.mac_address,
+                        &mut container_pid,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -708,6 +693,129 @@ impl TaskManager {
 
         self.teardown_runtime_attachments(task_id, desired, false)
             .await
+    }
+
+    /// # Description:
+    ///
+    /// Resolves the live container PID used by network attachment provisioning and returns
+    /// `None` when the container is not running yet.
+    async fn attachment_container_pid_for_runtime(
+        &self,
+        task_id: Uuid,
+        container_id: &str,
+    ) -> Result<Option<i32>> {
+        let inspect = self
+            .container_manager
+            .inspect_container(container_id)
+            .await
+            .with_context(|| {
+                format!("inspect container {container_id} for network attachment provisioning")
+            })?;
+
+        let state = inspect.state.as_ref();
+        let pid = state.and_then(|s| s.pid).unwrap_or(0);
+
+        // Treat unknown running state as true for compatibility with older Docker/mocks, but
+        // require a non-zero PID.
+        let running = state.and_then(|s| s.running).unwrap_or(true);
+        if pid == 0 || !running {
+            tracing::trace!(
+                target: "task",
+                task = %task_id,
+                container = %container_id,
+                pid,
+                running,
+                "skipping attachment provisioning; container not running yet"
+            );
+            return Ok(None);
+        }
+
+        let container_pid = i32::try_from(pid)
+            .context("container pid exceeds 32-bit range for attachment provisioning")?;
+        Ok(Some(container_pid))
+    }
+
+    /// # Description:
+    ///
+    /// Provisions one runtime attachment and retries transient container lifecycle races by
+    /// refreshing the target PID before each retry.
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_runtime_attachment_with_retry(
+        &self,
+        task_id: Uuid,
+        container_id: &str,
+        network_id: &Uuid,
+        attachment_id: &Uuid,
+        bridge: &str,
+        mtu: u32,
+        assigned_ip: &str,
+        prefix: u8,
+        mac: &str,
+        container_pid: &mut i32,
+    ) -> Result<()> {
+        for attempt in 1..=ATTACHMENT_PROVISION_MAX_ATTEMPTS {
+            let provisioning = AttachmentProvisioningRequest {
+                bridge_name: bridge,
+                mtu,
+                attachment_id: *attachment_id,
+                container_pid: *container_pid,
+                assigned_ip,
+                prefix,
+                mac,
+            };
+
+            match self
+                .attachment_provisioner
+                .ensure_attachment(&provisioning)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    let retryable = is_retryable_attachment_provision_error(&err);
+                    if !retryable || attempt >= ATTACHMENT_PROVISION_MAX_ATTEMPTS {
+                        return Err(err);
+                    }
+
+                    let backoff = attachment_provision_retry_backoff(attempt);
+                    tracing::warn!(
+                        target: "task",
+                        task_id = %task_id,
+                        network_id = %network_id,
+                        attachment = %attachment_id,
+                        bridge = %bridge,
+                        container = %container_id,
+                        pid = *container_pid,
+                        attempt,
+                        max_attempts = ATTACHMENT_PROVISION_MAX_ATTEMPTS,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = ?err,
+                        "runtime attachment provisioning hit transient container race; retrying"
+                    );
+                    sleep(backoff).await;
+
+                    match self
+                        .attachment_container_pid_for_runtime(task_id, container_id)
+                        .await
+                    {
+                        Ok(Some(refreshed_pid)) => {
+                            *container_pid = refreshed_pid;
+                        }
+                        Ok(None) => {
+                            return Err(err.context(
+                                "container stopped before runtime attachment retry could continue",
+                            ));
+                        }
+                        Err(refresh_err) => {
+                            return Err(err.context(format!(
+                                "failed to refresh container pid for attachment retry: {refresh_err:#}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub(super) async fn cleanup_orphaned_local_attachments(&self) -> Result<()> {
@@ -868,6 +976,28 @@ impl TaskManager {
 
         Ok(())
     }
+}
+
+/// # Description:
+///
+/// Classifies runtime attachment provisioning errors that are typically caused by transient
+/// container lifecycle races (namespace/pid changes during setup) and are safe to retry.
+fn is_retryable_attachment_provision_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    (text.contains("open container network namespace")
+        && text.contains("no such file or directory"))
+        || (text.contains("enter container network namespace") && text.contains("no such process"))
+        || (text.contains("failed to move") && text.contains("no such process"))
+        || text.contains("container interface missing after namespace move")
+}
+
+/// # Description:
+///
+/// Computes retry backoff used by transient runtime attachment provisioning failures.
+fn attachment_provision_retry_backoff(attempt: usize) -> Duration {
+    let exp = attempt.saturating_sub(1).min(4) as u32;
+    let raw = ATTACHMENT_PROVISION_RETRY_BASE_MS.saturating_mul(1u64 << exp);
+    Duration::from_millis(raw.min(ATTACHMENT_PROVISION_RETRY_MAX_MS))
 }
 
 /// Returns true when an attachment has not been updated within the provided grace window.

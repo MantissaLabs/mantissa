@@ -272,6 +272,83 @@ impl AttachmentProvisionerApi for FlakyAttachmentProvisioner {
     }
 }
 
+struct RetryingAttachmentProvisioner {
+    attachments: AsyncMutex<HashSet<Uuid>>,
+    fail_remaining: AsyncMutex<usize>,
+    ensure_calls: AsyncMutex<Vec<i32>>,
+}
+
+impl RetryingAttachmentProvisioner {
+    fn new(failures: usize) -> Self {
+        Self {
+            attachments: AsyncMutex::new(HashSet::new()),
+            fail_remaining: AsyncMutex::new(failures),
+            ensure_calls: AsyncMutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl AttachmentProvisionerApi for RetryingAttachmentProvisioner {
+    async fn attachment_exists(&self, attachment_id: Uuid) -> Result<bool> {
+        let guard = self.attachments.lock().await;
+        Ok(guard.contains(&attachment_id))
+    }
+
+    async fn ensure_attachment(&self, request: &AttachmentProvisioningRequest<'_>) -> Result<()> {
+        self.ensure_calls.lock().await.push(request.container_pid);
+        let mut remaining = self.fail_remaining.lock().await;
+        if *remaining > 0 {
+            *remaining -= 1;
+            return Err(anyhow!(
+                "failed to move mntc-test to pid {}\n\nCaused by:\n    Received a netlink error message No such process (os error 3)",
+                request.container_pid
+            ));
+        }
+        drop(remaining);
+
+        let mut guard = self.attachments.lock().await;
+        guard.insert(request.attachment_id);
+        Ok(())
+    }
+
+    async fn teardown_attachment(&self, attachment_id: Uuid) -> Result<()> {
+        let mut guard = self.attachments.lock().await;
+        guard.remove(&attachment_id);
+        Ok(())
+    }
+
+    async fn ensure_remote_fdb(
+        &self,
+        _vxlan_name: &str,
+        _mac: &str,
+        _dst: std::net::IpAddr,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn remove_remote_fdb(
+        &self,
+        _vxlan_name: &str,
+        _mac: &str,
+        _dst: std::net::IpAddr,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn ensure_flood_entry(&self, _vxlan_name: &str, _dst: std::net::IpAddr) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn remove_flood_entry(&self, _vxlan_name: &str, _dst: std::net::IpAddr) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list_remote_fdb(&self, _vxlan_name: &str) -> Result<Vec<(String, std::net::IpAddr)>> {
+        Ok(Vec::new())
+    }
+}
+
 fn temp_db(prefix: &str) -> (Arc<redb::Database>, tempfile::TempDir) {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join(format!("{prefix}-{}.redb", Uuid::new_v4()));
@@ -2120,6 +2197,92 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
     assert_eq!(reconciled.len(), 1);
     assert_eq!(reconciled[0].network_id, spec_a.id);
     assert_eq!(reconciled[0].state, NetworkAttachmentState::Ready);
+}
+
+#[tokio::test]
+async fn runtime_attachments_retry_transient_provision_errors() {
+    let provisioner = Arc::new(RetryingAttachmentProvisioner::new(1));
+    let attachment_override: Arc<dyn AttachmentProvisionerApi> = provisioner.clone();
+    let (manager, scheduler, mock_cm, network_registry) =
+        setup_manager_with_forwarding(None, Some(attachment_override)).await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let spec = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "retry-net".to_string(),
+        description: "retry network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.47.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
+    network_registry
+        .upsert_spec(spec.clone())
+        .await
+        .expect("upsert network spec");
+
+    let peer_state = NetworkPeerStateValue::new(
+        spec.id,
+        manager.local_node_id,
+        "local-node",
+        NetworkPeerState::Ready,
+        None,
+    );
+    network_registry
+        .upsert_peer_state(peer_state)
+        .await
+        .expect("upsert peer state");
+
+    let request = TaskStartRequest {
+        name: "retry-net-task".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 200,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        id: None,
+        slot_ids: Vec::new(),
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: vec![spec.id],
+        service_metadata: None,
+        target_node: None,
+    };
+
+    let specs = manager
+        .start_tasks_batch(vec![request])
+        .await
+        .expect("task should converge after transient attachment race");
+    assert_eq!(specs.len(), 1);
+
+    let task_spec = &specs[0];
+    let attachments = network_registry
+        .list_attachments_for_task(task_spec.id)
+        .expect("list attachments");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].state, NetworkAttachmentState::Ready);
+
+    let ensure_calls = provisioner.ensure_calls.lock().await.clone();
+    assert!(
+        ensure_calls.len() >= 2,
+        "expected one retry after transient attachment failure"
+    );
+
+    let inspect_calls = mock_cm.inspect_calls.lock().await.clone();
+    assert!(
+        inspect_calls.len() >= 2,
+        "expected inspect refresh while retrying transient attachment provisioning"
+    );
 }
 
 #[cfg(target_os = "linux")]
