@@ -33,7 +33,10 @@ const SERVICE_READY_TIMEOUT_SECS: u64 = 60;
 /// Base delay (in milliseconds) for exponential backoff between deployment retries.
 const SERVICE_READY_BACKOFF_BASE_MS: u64 = 500;
 /// Maximum consecutive unhealthy readiness probe results before marking the service failed.
-const SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES: u32 = 3;
+///
+/// A slightly wider budget gives the periodic slot reconciler enough time to restart replicas
+/// that fail transiently during deployment before the whole service is marked failed.
+const SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES: u32 = 5;
 /// Interval used by the rescheduler loop to evaluate service replica health.
 const SERVICE_RESCHEDULE_TICK_SECS: u64 = 2;
 /// Minimum delay before a missing replica is rescheduled to avoid transient gossip gaps.
@@ -300,7 +303,7 @@ impl ServiceController {
         let eligible_nodes = Arc::new(self.collect_eligible_nodes());
 
         for spec in specs {
-            if spec.status() == ServiceStatus::Running {
+            if should_reconcile_status(spec.status()) {
                 let controller = self.clone();
                 let inventory = inventory.clone();
                 let health_snapshot = health_snapshot.clone();
@@ -509,7 +512,8 @@ impl ServiceController {
         };
 
         if missing {
-            if self.slot_missing_elapsed(key).await {
+            let restart_immediately = should_restart_missing_slot_immediately(spec.status(), task);
+            if restart_immediately || self.slot_missing_elapsed(key).await {
                 self.start_slot_task(spec, slot, task_id, preferred_node, key)
                     .await?;
             }
@@ -1508,6 +1512,32 @@ fn node_is_down(node_id: Uuid, health_snapshot: &HashMap<Uuid, HealthStatus>) ->
     matches!(health_snapshot.get(&node_id), Some(HealthStatus::Down))
 }
 
+/// Returns true when the service status should participate in slot reconciliation.
+fn should_reconcile_status(status: ServiceStatus) -> bool {
+    matches!(status, ServiceStatus::Running | ServiceStatus::Deploying)
+}
+
+/// Returns true when deployment should bypass missing-slot grace and restart immediately.
+///
+/// We only fast-track restarts for terminal container states during deployment; unknown/missing
+/// observations still respect grace to avoid reacting to temporary gossip lag.
+fn should_restart_missing_slot_immediately(status: ServiceStatus, task: Option<&TaskSpec>) -> bool {
+    if status != ServiceStatus::Deploying {
+        return false;
+    }
+
+    task.map(|task| task_state_terminal_for_restart(&task.state))
+        .unwrap_or(false)
+}
+
+/// Returns true when a task state is terminal enough to justify an immediate deployment restart.
+fn task_state_terminal_for_restart(state: &ContainerState) -> bool {
+    matches!(
+        state,
+        ContainerState::Failed | ContainerState::Stopped | ContainerState::Exited(_)
+    )
+}
+
 /// Selects the deterministic owner node for a replica slot so rescheduling is distributed.
 fn select_slot_owner(
     service_id: Uuid,
@@ -2359,6 +2389,97 @@ mod tests {
         assert!(matches!(
             classify_readiness_states(&states),
             ReadinessClass::Unhealthy
+        ));
+    }
+
+    /// Ensures deploying services are included in slot reconciliation.
+    #[test]
+    fn reconcile_status_includes_deploying() {
+        assert!(should_reconcile_status(ServiceStatus::Deploying));
+        assert!(should_reconcile_status(ServiceStatus::Running));
+        assert!(!should_reconcile_status(ServiceStatus::Stopping));
+        assert!(!should_reconcile_status(ServiceStatus::Stopped));
+        assert!(!should_reconcile_status(ServiceStatus::Failed));
+    }
+
+    /// Ensures deployment fast-tracks restarts for terminal task states.
+    #[test]
+    fn deployment_restarts_terminal_missing_slots_immediately() {
+        let failed = make_task(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "demo",
+            "api",
+            ContainerState::Failed,
+        );
+        let exited = make_task(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "demo",
+            "api",
+            ContainerState::Exited(1),
+        );
+        let stopped = make_task(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "demo",
+            "api",
+            ContainerState::Stopped,
+        );
+
+        assert!(should_restart_missing_slot_immediately(
+            ServiceStatus::Deploying,
+            Some(&failed)
+        ));
+        assert!(should_restart_missing_slot_immediately(
+            ServiceStatus::Deploying,
+            Some(&exited)
+        ));
+        assert!(should_restart_missing_slot_immediately(
+            ServiceStatus::Deploying,
+            Some(&stopped)
+        ));
+    }
+
+    /// Ensures non-terminal deployment states keep grace to avoid duplicate launches.
+    #[test]
+    fn deployment_keeps_missing_slot_grace_for_non_terminal_states() {
+        let running = make_task(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "demo",
+            "api",
+            ContainerState::Running,
+        );
+        let pending = make_task(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "demo",
+            "api",
+            ContainerState::Pending,
+        );
+
+        assert!(!should_restart_missing_slot_immediately(
+            ServiceStatus::Deploying,
+            Some(&running)
+        ));
+        assert!(!should_restart_missing_slot_immediately(
+            ServiceStatus::Deploying,
+            Some(&pending)
+        ));
+        assert!(!should_restart_missing_slot_immediately(
+            ServiceStatus::Deploying,
+            None
+        ));
+        assert!(!should_restart_missing_slot_immediately(
+            ServiceStatus::Running,
+            Some(&make_task(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "demo",
+                "api",
+                ContainerState::Failed
+            ))
         ));
     }
 }
