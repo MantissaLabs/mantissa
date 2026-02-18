@@ -37,6 +37,11 @@ const SERVICE_READY_BACKOFF_BASE_MS: u64 = 500;
 /// A slightly wider budget gives the periodic slot reconciler enough time to restart replicas
 /// that fail transiently during deployment before the whole service is marked failed.
 const SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES: u32 = 5;
+/// Maximum consecutive degraded readiness probe results before marking the service failed.
+///
+/// Degraded means at least one replica is terminal while others are still running. This budget
+/// allows reconciliation to restart transiently failed replicas without stalling forever.
+const SERVICE_DEPLOYMENT_MAX_DEGRADED_PROBES: u32 = 6;
 /// Interval used by the rescheduler loop to evaluate service replica health.
 const SERVICE_RESCHEDULE_TICK_SECS: u64 = 2;
 /// Minimum delay before a missing replica is rescheduled to avoid transient gossip gaps.
@@ -1042,6 +1047,7 @@ impl ServiceController {
 
         let mut probes: u32 = 0;
         let mut failure_streak: u32 = 0;
+        let mut degraded_streak: u32 = 0;
         let mut last_observed_states: Vec<(Uuid, Option<ContainerState>)> = Vec::new();
 
         loop {
@@ -1082,17 +1088,39 @@ impl ServiceController {
                     break;
                 }
                 ReadinessOutcome::Pending => {
-                    if failure_streak != 0 {
+                    if failure_streak != 0 || degraded_streak != 0 {
                         tracing::debug!(
                             target: "services",
-                            "service '{}' readiness recovered to in-flight state; resetting failure streak",
+                            "service '{}' readiness recovered to in-flight state; resetting failure/degraded streaks",
                             service_name
                         );
                         failure_streak = 0;
+                        degraded_streak = 0;
                     }
+                }
+                ReadinessOutcome::Degraded(snapshot) => {
+                    degraded_streak = degraded_streak.saturating_add(1);
+                    failure_streak = 0;
+                    if degraded_streak >= SERVICE_DEPLOYMENT_MAX_DEGRADED_PROBES {
+                        mark_service_failed(&self, snapshot.clone(), &last_observed_states).await;
+                        break;
+                    }
+
+                    let backoff = readiness_backoff(degraded_streak + 1);
+                    let summary = format_task_state_summary(&last_observed_states);
+                    tracing::warn!(
+                        target: "services",
+                        "service '{}' reported degraded readiness ({}/{}); retrying in {:?} ({summary})",
+                        service_name,
+                        degraded_streak,
+                        SERVICE_DEPLOYMENT_MAX_DEGRADED_PROBES,
+                        backoff
+                    );
+                    sleep(backoff).await;
                 }
                 ReadinessOutcome::Failure(snapshot) => {
                     failure_streak = failure_streak.saturating_add(1);
+                    degraded_streak = 0;
                     if failure_streak >= SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES {
                         mark_service_failed(&self, snapshot.clone(), &last_observed_states).await;
                         break;
@@ -1619,35 +1647,40 @@ struct ServiceRedeploymentJob {
 enum ReadinessOutcome {
     Success(ServiceSpecValue),
     Pending,
+    Degraded(ServiceSpecValue),
     Failure(ServiceSpecValue),
     Abort,
 }
 
 /// Classifies task states into readiness categories consumed by deployment convergence logic.
 fn classify_readiness_states(states: &[(Uuid, Option<ContainerState>)]) -> ReadinessClass {
-    let mut all_running = true;
+    let mut running = 0usize;
     let mut any_inflight = false;
+    let mut any_terminal = false;
 
     for (_, state) in states {
         match state {
-            Some(ContainerState::Running) => {}
+            Some(ContainerState::Running) => {
+                running += 1;
+            }
             Some(ContainerState::Pending)
             | Some(ContainerState::Pulling)
             | Some(ContainerState::Creating)
             | None => {
-                all_running = false;
                 any_inflight = true;
             }
             _ => {
-                all_running = false;
+                any_terminal = true;
             }
         }
     }
 
-    if all_running {
+    if running == states.len() {
         ReadinessClass::AllRunning
     } else if any_inflight {
         ReadinessClass::Inflight
+    } else if any_terminal && running > 0 {
+        ReadinessClass::Degraded
     } else {
         ReadinessClass::Unhealthy
     }
@@ -1657,6 +1690,7 @@ fn classify_readiness_states(states: &[(Uuid, Option<ContainerState>)]) -> Readi
 enum ReadinessClass {
     AllRunning,
     Inflight,
+    Degraded,
     Unhealthy,
 }
 
@@ -1730,6 +1764,15 @@ async fn poll_service_attempt(
                 match classify_readiness_states(last_states) {
                     ReadinessClass::AllRunning => return ReadinessOutcome::Success(current),
                     ReadinessClass::Inflight => {}
+                    ReadinessClass::Degraded => {
+                        tracing::debug!(
+                            target: "services",
+                            "service '{}' tasks entered mixed running/terminal states before convergence: {}",
+                            current.service_name,
+                            format_task_state_summary(last_states)
+                        );
+                        return ReadinessOutcome::Degraded(current);
+                    }
                     ReadinessClass::Unhealthy => {
                         tracing::debug!(
                             target: "services",
@@ -1762,6 +1805,15 @@ async fn poll_service_attempt(
                         format_task_state_summary(last_states)
                     );
                     return ReadinessOutcome::Pending;
+                }
+                ReadinessClass::Degraded => {
+                    tracing::debug!(
+                        target: "services",
+                        "timed out waiting for '{}' tasks with mixed running/terminal states: {}",
+                        current.service_name,
+                        format_task_state_summary(last_states)
+                    );
+                    return ReadinessOutcome::Degraded(current);
                 }
                 ReadinessClass::Unhealthy => {
                     tracing::debug!(
@@ -2378,12 +2430,26 @@ mod tests {
         ));
     }
 
-    /// Ensures terminal states consume the unhealthy readiness budget.
+    /// Ensures mixed running/terminal states are treated as degraded.
     #[test]
-    fn classify_readiness_treats_terminal_states_as_unhealthy() {
+    fn classify_readiness_treats_mixed_terminal_states_as_degraded() {
         let states = vec![
             (Uuid::new_v4(), Some(ContainerState::Running)),
             (Uuid::new_v4(), Some(ContainerState::Failed)),
+        ];
+
+        assert!(matches!(
+            classify_readiness_states(&states),
+            ReadinessClass::Degraded
+        ));
+    }
+
+    /// Ensures all-terminal states still consume the unhealthy readiness budget.
+    #[test]
+    fn classify_readiness_treats_all_terminal_states_as_unhealthy() {
+        let states = vec![
+            (Uuid::new_v4(), Some(ContainerState::Failed)),
+            (Uuid::new_v4(), Some(ContainerState::Stopped)),
         ];
 
         assert!(matches!(
