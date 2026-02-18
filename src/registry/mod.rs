@@ -12,16 +12,19 @@ use protocol::health;
 use protocol::server::{self, cluster_session};
 use protocol::sync;
 use std::collections::{HashMap, HashSet};
+use std::panic::Location;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 type PeerEntry = Arc<AsyncMutex<PeerState>>;
 type CapabilityMap = Arc<RwLock<HashMap<Uuid, PeerEntry>>>;
 type ReconnectGateMap = Arc<AsyncMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>;
 type ReconnectStateMap = Arc<AsyncMutex<HashMap<Uuid, PeerReconnectState>>>;
+type InvalidationStatsMap = Arc<AsyncMutex<HashMap<(Uuid, String), u64>>>;
+type SessionFailureStatsMap = Arc<AsyncMutex<HashMap<(Uuid, String), u64>>>;
 
 /// Initial reconnect backoff delay for one failed peer dial attempt.
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
@@ -69,6 +72,8 @@ pub struct Registry {
     cache: CapabilityMap,
     reconnect_gates: ReconnectGateMap,
     reconnect_state: ReconnectStateMap,
+    invalidation_stats: InvalidationStatsMap,
+    session_failure_stats: SessionFailureStatsMap,
     sessions: LocalSessionStore,
     peers: PeersStore,
     signing_key: Arc<AsyncMutex<SigningKey>>,
@@ -142,6 +147,8 @@ impl Registry {
             cache: Arc::new(RwLock::new(HashMap::new())),
             reconnect_gates: Arc::new(AsyncMutex::new(HashMap::new())),
             reconnect_state: Arc::new(AsyncMutex::new(HashMap::new())),
+            invalidation_stats: Arc::new(AsyncMutex::new(HashMap::new())),
+            session_failure_stats: Arc::new(AsyncMutex::new(HashMap::new())),
             sessions,
             peers,
             signing_key: Arc::new(AsyncMutex::new(signing_key)),
@@ -172,19 +179,39 @@ impl Registry {
         self.cache.write().await.remove(&id);
         self.reconnect_gates.lock().await.remove(&id);
         self.reconnect_state.lock().await.remove(&id);
+        self.invalidation_stats
+            .lock()
+            .await
+            .retain(|(peer, _), _| *peer != id);
+        self.session_failure_stats
+            .lock()
+            .await
+            .retain(|(peer, _), _| *peer != id);
     }
 
     pub async fn clear(&self) {
         self.cache.write().await.clear();
         self.reconnect_gates.lock().await.clear();
         self.reconnect_state.lock().await.clear();
+        self.invalidation_stats.lock().await.clear();
+        self.session_failure_stats.lock().await.clear();
     }
 
     /// Clears any cached capabilities for `peer_id`, forcing a full refresh on next access.
     pub async fn invalidate_peer_capabilities(&self, peer_id: Uuid) {
+        let caller = Self::invalidation_caller();
+        self.record_invalidation_telemetry(peer_id, caller).await;
         if let Some(entry) = self.entry_if_present(peer_id).await {
             self.invalidate_peer(peer_id, &entry).await;
         }
+    }
+
+    /// # Description:
+    ///
+    /// Captures one callsite location for capability invalidation telemetry.
+    #[track_caller]
+    fn invalidation_caller() -> &'static Location<'static> {
+        Location::caller()
     }
 
     pub async fn server_handle_for(&self, peer_id: Uuid) -> Option<server::Client> {
@@ -250,7 +277,7 @@ impl Registry {
                 Some(client)
             }
             Err(e) => {
-                let delay = self.record_reconnect_failure(peer_id, now).await;
+                let (delay, streak) = self.record_reconnect_failure(peer_id, now).await;
                 error!(target: "connect", "reconnect {addr} failed: {e}");
                 debug!(
                     target: "connect",
@@ -259,6 +286,17 @@ impl Registry {
                     delay_ms = delay.as_millis() as u64,
                     "scheduled reconnect backoff"
                 );
+                if Self::should_emit_diag_sample(streak as u64) {
+                    warn!(
+                        target: "diag.connect.reconnect",
+                        peer = %peer_id,
+                        addr = %addr,
+                        streak,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %e,
+                        "peer reconnect failure"
+                    );
+                }
                 None
             }
         }
@@ -889,13 +927,14 @@ impl Registry {
 
     /// # Description:
     ///
-    /// Records one failed reconnect attempt and returns the next delay budget.
-    async fn record_reconnect_failure(&self, peer_id: Uuid, now: Instant) -> Duration {
+    /// Records one failed reconnect attempt and returns the next delay budget and failure streak.
+    async fn record_reconnect_failure(&self, peer_id: Uuid, now: Instant) -> (Duration, u32) {
         let mut states = self.reconnect_state.lock().await;
         let previous = states.get(&peer_id).copied();
         let (next_state, delay) = PeerReconnectState::on_failure(previous, now);
+        let streak = next_state.consecutive_failures;
         states.insert(peer_id, next_state);
-        delay
+        (delay, streak)
     }
 
     /// Fetches the Sync capability from an existing session.
@@ -970,11 +1009,19 @@ impl Registry {
                 Ok(r) => r.get_session().ok(),
                 Err(e) => {
                     error!(target: "sync", "get_session response error: {e}");
+                    self.record_session_failure_telemetry(
+                        peer_id,
+                        "ticket.response",
+                        &e.to_string(),
+                    )
+                    .await;
                     None
                 }
             },
             Err(e) => {
                 error!(target: "sync", "get_session failed: {e}");
+                self.record_session_failure_telemetry(peer_id, "ticket.send", &e.to_string())
+                    .await;
                 None
             }
         }
@@ -1011,6 +1058,12 @@ impl Registry {
                     Ok(r) => r,
                     Err(e) => {
                         error!(target: "sync", "getWithCredential response error: {e}");
+                        self.record_session_failure_telemetry(
+                            peer_id,
+                            "credential.response",
+                            &e.to_string(),
+                        )
+                        .await;
                         return None;
                     }
                 };
@@ -1035,9 +1088,85 @@ impl Registry {
             }
             Err(e) => {
                 error!(target: "sync", "getWithCredential failed: {e}");
+                self.record_session_failure_telemetry(peer_id, "credential.send", &e.to_string())
+                    .await;
                 None
             }
         }
+    }
+
+    /// # Description:
+    ///
+    /// Returns true when one telemetry counter sample should emit a diagnostic log.
+    fn should_emit_diag_sample(count: u64) -> bool {
+        count <= 3 || count.is_power_of_two() || count % 100 == 0
+    }
+
+    /// # Description:
+    ///
+    /// Records a per-peer invalidation counter grouped by caller location and emits sparse
+    /// diagnostic logs so invalidation storms can be tied to their source.
+    async fn record_invalidation_telemetry(
+        &self,
+        peer_id: Uuid,
+        caller: &'static Location<'static>,
+    ) {
+        let caller_key = format!("{}:{}", caller.file(), caller.line());
+        let count = {
+            let mut stats = self.invalidation_stats.lock().await;
+            let entry = stats.entry((peer_id, caller_key.clone())).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+
+        if !Self::should_emit_diag_sample(count) {
+            return;
+        }
+
+        let addr = self
+            .peer_address(peer_id)
+            .unwrap_or_else(|| "<unknown>".to_string());
+        warn!(
+            target: "diag.session.invalidate",
+            peer = %peer_id,
+            addr = %addr,
+            caller = %caller_key,
+            count,
+            "capability invalidation sampled"
+        );
+    }
+
+    /// # Description:
+    ///
+    /// Records one session bootstrap failure so operators can correlate repeated ticket/credential
+    /// failures with the same peer and phase.
+    async fn record_session_failure_telemetry(&self, peer_id: Uuid, phase: &str, error: &str) {
+        let phase_key = phase.to_string();
+        let count = {
+            let mut stats = self.session_failure_stats.lock().await;
+            let entry = stats.entry((peer_id, phase_key.clone())).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+
+        if !Self::should_emit_diag_sample(count) {
+            return;
+        }
+
+        let disconnected = error.contains("Disconnected") || error.contains("disconnected");
+        let addr = self
+            .peer_address(peer_id)
+            .unwrap_or_else(|| "<unknown>".to_string());
+        warn!(
+            target: "diag.session.bootstrap",
+            peer = %peer_id,
+            addr = %addr,
+            phase = %phase_key,
+            count,
+            disconnected,
+            error = %error,
+            "session bootstrap failure sampled"
+        );
     }
 
     /// Select the "best" peer value from an MVReg snapshot.

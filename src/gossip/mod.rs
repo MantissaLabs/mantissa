@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use topology::PeerHandle;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 #[async_trait(?Send)]
@@ -402,6 +402,16 @@ pub(crate) async fn start<C>(
 
                         if let Err(e) = send_gossip(&outbound, peer, &context).await {
                             error!("Gossip to {} failed: {:?}", peer.address, e);
+                            warn!(
+                                target: "diag.gossip.send",
+                                cluster_view = %cluster_view,
+                                peer = %peer.id,
+                                addr = %peer.address,
+                                message_count = outbound.len(),
+                                disconnected = is_disconnected_capnp(&e),
+                                error = %e,
+                                "gossip send failed"
+                            );
                         }
                     }
                 }
@@ -491,6 +501,14 @@ where
             Err(err)
         }
     }
+}
+
+/// # Description:
+///
+/// Returns true when one Cap'n Proto error corresponds to a remote disconnect.
+fn is_disconnected_capnp(error: &capnp::Error) -> bool {
+    let text = error.to_string();
+    text.contains("Disconnected") || text.contains("disconnected")
 }
 
 // Return true when the gossip message is about the provided peer identifier.

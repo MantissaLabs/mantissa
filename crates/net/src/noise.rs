@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::{fs, io};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{Duration, timeout};
+use tracing::{debug, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct NoiseKeys {
@@ -42,6 +43,9 @@ impl NoiseKeys {
 const NOISE_PARAMS_JOIN: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
 const NOISE_PARAMS_PEER: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const MAX_FRAME: usize = 64 * 1024;
+const MAX_WIRE_FRAME: usize = u16::MAX as usize;
+const NOISE_TRANSPORT_OVERHEAD: usize = 16;
+const MAX_TRANSPORT_PLAINTEXT_FRAME: usize = MAX_WIRE_FRAME - NOISE_TRANSPORT_OVERHEAD;
 const TOKEN_PSK_SALT: &[u8] = b"mantissa/noise-psk-salt/v1";
 const TOKEN_PSK_INFO: &[u8] = b"mantissa/noise-psk-info/v1";
 const TOKEN_PSK_LOCATION: u8 = 3;
@@ -549,7 +553,8 @@ fn spawn_noise_io_bridge(
 
         loop {
             // Read the 2-byte length prefix.
-            if tcp_reader.read_exact(&mut len_prefix).await.is_err() {
+            if let Err(e) = tcp_reader.read_exact(&mut len_prefix).await {
+                log_transport_io("bridge.read.len_prefix", "read", &e);
                 let _ = noise_writer.shutdown().await;
                 break;
             }
@@ -559,11 +564,8 @@ fn spawn_noise_io_bridge(
             if cipher_buf.len() < clen {
                 cipher_buf.resize(clen, 0);
             }
-            if tcp_reader
-                .read_exact(&mut cipher_buf[..clen])
-                .await
-                .is_err()
-            {
+            if let Err(e) = tcp_reader.read_exact(&mut cipher_buf[..clen]).await {
+                log_transport_io("bridge.read.frame", "read", &e);
                 let _ = noise_writer.shutdown().await;
                 break;
             }
@@ -576,7 +578,15 @@ fn spawn_noise_io_bridge(
                 let mut t = transport_for_read.lock().await;
                 match t.read_message(&cipher_buf[..clen], &mut plain_buf) {
                     Ok(n) => n,
-                    Err(_) => {
+                    Err(e) => {
+                        warn!(
+                            target: "diag.transport",
+                            direction = "read",
+                            stage = "bridge.decrypt",
+                            frame_len = clen,
+                            error = %e,
+                            "noise decrypt failed"
+                        );
                         let _ = noise_writer.shutdown().await;
                         break;
                     }
@@ -584,7 +594,8 @@ fn spawn_noise_io_bridge(
             };
 
             // Forward plaintext to the application side.
-            if noise_writer.write_all(&plain_buf[..n_plain]).await.is_err() {
+            if let Err(e) = noise_writer.write_all(&plain_buf[..n_plain]).await {
+                log_transport_io("bridge.write.app_plaintext", "write", &e);
                 let _ = noise_writer.shutdown().await;
                 break;
             }
@@ -602,45 +613,130 @@ fn spawn_noise_io_bridge(
         loop {
             // Read plaintext from the application side.
             let n_plain = match noise_reader.read(&mut plain_buf).await {
-                Ok(0) | Err(_) => {
+                Ok(0) => {
+                    debug!(
+                        target: "diag.transport",
+                        direction = "read",
+                        stage = "bridge.read.app_plaintext",
+                        "noise app side closed"
+                    );
+                    let _ = tcp_writer.shutdown().await;
+                    break;
+                }
+                Err(e) => {
+                    log_transport_io("bridge.read.app_plaintext", "read", &e);
                     let _ = tcp_writer.shutdown().await;
                     break;
                 }
                 Ok(n) => n,
             };
-            let plain = &plain_buf[..n_plain];
 
-            // Encrypt with Noise.
-            if cipher_buf.len() < plain.len() + 16 {
-                cipher_buf.resize(plain.len() + 16, 0);
-            }
-            let clen = {
-                let mut t = transport_for_write.lock().await;
-                match t.write_message(plain, &mut cipher_buf) {
-                    Ok(n) => n,
-                    Err(_) => {
-                        let _ = tcp_writer.shutdown().await;
-                        break;
-                    }
+            // One application read can exceed one Noise frame budget. Chunk it so each
+            // write_message call stays inside the transport frame limit.
+            let mut offset = 0usize;
+            while offset < n_plain {
+                let end = (offset + MAX_TRANSPORT_PLAINTEXT_FRAME).min(n_plain);
+                let plain = &plain_buf[offset..end];
+
+                // Encrypt with Noise.
+                if cipher_buf.len() < plain.len() + NOISE_TRANSPORT_OVERHEAD {
+                    cipher_buf.resize(plain.len() + NOISE_TRANSPORT_OVERHEAD, 0);
                 }
-            };
+                let clen = {
+                    let mut t = transport_for_write.lock().await;
+                    match t.write_message(plain, &mut cipher_buf) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            warn!(
+                                target: "diag.transport",
+                                direction = "write",
+                                stage = "bridge.encrypt",
+                                plain_len = plain.len(),
+                                error = %e,
+                                "noise encrypt failed"
+                            );
+                            let _ = tcp_writer.shutdown().await;
+                            return;
+                        }
+                    }
+                };
 
-            // Write length prefix + ciphertext to the wire.
-            let len_bytes = (clen as u16).to_be_bytes();
-            if tcp_writer.write_all(&len_bytes).await.is_err() {
-                break;
-            }
-            if tcp_writer.write_all(&cipher_buf[..clen]).await.is_err() {
-                break;
-            }
-            if tcp_writer.flush().await.is_err() {
-                break;
+                if clen > MAX_WIRE_FRAME {
+                    warn!(
+                        target: "diag.transport",
+                        direction = "write",
+                        stage = "bridge.encrypt.frame_too_large",
+                        plain_len = plain.len(),
+                        cipher_len = clen,
+                        max_wire_frame = MAX_WIRE_FRAME,
+                        "noise ciphertext exceeds wire frame limit"
+                    );
+                    let _ = tcp_writer.shutdown().await;
+                    return;
+                }
+
+                // Write length prefix + ciphertext to the wire.
+                let len_bytes = (clen as u16).to_be_bytes();
+                if let Err(e) = tcp_writer.write_all(&len_bytes).await {
+                    log_transport_io("bridge.write.len_prefix", "write", &e);
+                    return;
+                }
+                if let Err(e) = tcp_writer.write_all(&cipher_buf[..clen]).await {
+                    log_transport_io("bridge.write.frame", "write", &e);
+                    return;
+                }
+                if let Err(e) = tcp_writer.flush().await {
+                    log_transport_io("bridge.flush", "write", &e);
+                    return;
+                }
+
+                offset = end;
             }
         }
     });
 
     // The application uses this end (plaintext in both directions).
     app_end
+}
+
+/// # Description:
+///
+/// Returns true when one I/O error kind maps to an expected disconnect condition.
+fn is_expected_disconnect(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
+}
+
+/// # Description:
+///
+/// Emits one transport diagnostic log with consistent fields so disconnect patterns can be
+/// extracted from large cluster logs with target-based filters.
+fn log_transport_io(stage: &'static str, direction: &'static str, err: &io::Error) {
+    if is_expected_disconnect(err.kind()) {
+        debug!(
+            target: "diag.transport",
+            direction = direction,
+            stage = stage,
+            error_kind = ?err.kind(),
+            error = %err,
+            "noise transport disconnected"
+        );
+    } else {
+        warn!(
+            target: "diag.transport",
+            direction = direction,
+            stage = stage,
+            error_kind = ?err.kind(),
+            error = %err,
+            "noise transport I/O error"
+        );
+    }
 }
 
 /// Prefer `/var/lib/mantissa` when privileged, otherwise fallback to `~/.mantissa`.
@@ -694,10 +790,21 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut len = [0u8; 2];
-    rd.read_exact(&mut len).await?;
+    if let Err(e) = rd.read_exact(&mut len).await {
+        log_transport_io("handshake.read.len_prefix", "read", &e);
+        return Err(e);
+    }
     let n = u16::from_be_bytes(len) as usize;
 
     if n > MAX_FRAME {
+        warn!(
+            target: "diag.transport",
+            direction = "read",
+            stage = "handshake.read.frame_too_large",
+            frame_len = n,
+            max_frame = MAX_FRAME,
+            "noise framed payload exceeded MAX_FRAME"
+        );
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "handshake frame too large",
@@ -707,7 +814,10 @@ where
     if buf.len() < n {
         buf.resize(n, 0);
     }
-    rd.read_exact(&mut buf[..n]).await?;
+    if let Err(e) = rd.read_exact(&mut buf[..n]).await {
+        log_transport_io("handshake.read.frame", "read", &e);
+        return Err(e);
+    }
     Ok(n)
 }
 
@@ -716,13 +826,31 @@ where
     W: AsyncWrite + Unpin,
 {
     if data.len() > u16::MAX as usize {
+        warn!(
+            target: "diag.transport",
+            direction = "write",
+            stage = "handshake.write.frame_too_large",
+            frame_len = data.len(),
+            max_frame = u16::MAX as usize,
+            "noise framed payload exceeded u16::MAX"
+        );
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "frame too large",
         ));
     }
     let len = (data.len() as u16).to_be_bytes();
-    wr.write_all(&len).await?;
-    wr.write_all(data).await?;
-    wr.flush().await
+    if let Err(e) = wr.write_all(&len).await {
+        log_transport_io("handshake.write.len_prefix", "write", &e);
+        return Err(e);
+    }
+    if let Err(e) = wr.write_all(data).await {
+        log_transport_io("handshake.write.frame", "write", &e);
+        return Err(e);
+    }
+    if let Err(e) = wr.flush().await {
+        log_transport_io("handshake.flush", "write", &e);
+        return Err(e);
+    }
+    Ok(())
 }

@@ -13,7 +13,7 @@ use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::store::secret_master_store::MasterKeyRecord;
-use crate::sync::delta::{SyncStores, sync_all_domains};
+use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains};
 use crate::topology::health::status_to_node_status;
 use crate::topology::operation::{
     ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
@@ -1857,11 +1857,13 @@ impl topology::Server for Topology {
             network_attachments: self.network_attachments.clone(),
         };
 
+        let sync_trace = SyncTraceContext::peer(peer_id, peer_value.address.clone(), "join");
         tokio::task::spawn_local({
             let stores = sync_stores;
             let cluster_view = self.active_cluster_view();
+            let trace = sync_trace;
             async move {
-                sync_all_domains(stores, sync_cap, cluster_view).await;
+                sync_all_domains(stores, sync_cap, cluster_view, Some(trace)).await;
             }
         });
 
@@ -2422,7 +2424,10 @@ impl topology::Server for Topology {
 
             // When no cached session is available yet, treat the peer as part of the
             // local active view until a concrete remote view is observed.
-            let view = self.best_known_peer_view(peer_id).await.unwrap_or(local_view);
+            let view = self
+                .best_known_peer_view(peer_id)
+                .await
+                .unwrap_or(local_view);
             if retired_views.contains(&view) {
                 continue;
             }

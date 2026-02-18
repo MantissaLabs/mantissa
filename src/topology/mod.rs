@@ -17,7 +17,7 @@ use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
-use crate::sync::delta::{SyncStores, sync_all_domains};
+use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains};
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
 use ::health::HealthMonitor;
@@ -1323,7 +1323,8 @@ impl Topology {
             network_attachments: self.network_attachments.clone(),
         };
 
-        sync_all_domains(stores, sync_cap, cluster_view).await;
+        let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic");
+        sync_all_domains(stores, sync_cap, cluster_view, Some(trace)).await;
     }
 
     /// Kick a one-shot sync pass immediately (no waiting for the next interval).

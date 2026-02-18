@@ -34,6 +34,27 @@ pub struct SyncStores {
     pub network_attachments: NetworkAttachmentStore,
 }
 
+/// Carries one peer-scoped context for anti-entropy diagnostics.
+#[derive(Clone, Debug)]
+pub struct SyncTraceContext {
+    pub peer_id: uuid::Uuid,
+    pub peer_addr: String,
+    pub reason: &'static str,
+}
+
+impl SyncTraceContext {
+    /// # Description:
+    ///
+    /// Builds one peer-scoped trace context used by sync diagnostics.
+    pub fn peer(peer_id: uuid::Uuid, peer_addr: impl Into<String>, reason: &'static str) -> Self {
+        Self {
+            peer_id,
+            peer_addr: peer_addr.into(),
+            reason,
+        }
+    }
+}
+
 impl SyncStores {
     async fn root_hex(&self, domain: Domain) -> String {
         match domain {
@@ -300,6 +321,7 @@ pub async fn sync_all_domains(
     stores: SyncStores,
     sync_cap: sync::Client,
     cluster_view: ClusterViewId,
+    trace: Option<SyncTraceContext>,
 ) {
     let res: Result<(), capnp::Error> = async {
         let domains = [
@@ -426,5 +448,25 @@ pub async fn sync_all_domains(
             cluster_view = %cluster_view,
             "sync_all_domains error: {e}"
         );
+        if let Some(ctx) = trace.as_ref() {
+            warn!(
+                target: "diag.sync.peer",
+                cluster_view = %cluster_view,
+                peer = %ctx.peer_id,
+                addr = %ctx.peer_addr,
+                reason = %ctx.reason,
+                disconnected = is_disconnected_capnp(&e),
+                error = %e,
+                "peer-scoped sync_all_domains failure"
+            );
+        }
     }
+}
+
+/// # Description:
+///
+/// Returns true when one Cap'n Proto error corresponds to a disconnected transport path.
+fn is_disconnected_capnp(error: &capnp::Error) -> bool {
+    let text = error.to_string();
+    text.contains("Disconnected") || text.contains("disconnected")
 }

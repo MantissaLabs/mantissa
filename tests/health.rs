@@ -53,11 +53,7 @@ local_test!(health_alive_then_down_inproc, {
     joiner.stop().await.unwrap();
 
     anchor
-        .wait_status_of(
-            joiner.id(),
-            NodeStatus::Down,
-            down_transition_timeout(),
-        )
+        .wait_status_of(joiner.id(), NodeStatus::Down, down_transition_timeout())
         .await
         .expect("Node should be marked as down");
 
@@ -115,11 +111,7 @@ local_test!(health_alive_then_down_tcp, {
     joiner.stop().await.unwrap();
 
     anchor
-        .wait_status_of(
-            joiner.id(),
-            NodeStatus::Down,
-            down_transition_timeout(),
-        )
+        .wait_status_of(joiner.id(), NodeStatus::Down, down_transition_timeout())
         .await
         .expect("Node should be marked as down");
 
