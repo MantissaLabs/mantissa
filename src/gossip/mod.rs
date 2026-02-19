@@ -13,19 +13,23 @@ use crate::secrets::service::{read_secret_event, write_secret_event};
 use crate::secrets::types::SecretEvent;
 use crate::services::service::{read_service_event, write_service_event};
 use crate::services::types::ServiceEvent;
+use crate::task::container::ContainerState;
 use crate::task::service as task_service;
-use crate::task::types::TaskEvent;
+use crate::task::types::{TaskEvent, TaskSpec};
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 use capnp::Error;
+use chrono::{DateTime, Utc};
 use protocol::gossip;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::gossip::gossip_message::Which::*;
 use rand::rng;
 use rand::seq::IndexedRandom;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -85,6 +89,138 @@ const MAX_GOSSIP_BATCH_MESSAGES: usize = 32;
 const GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
 /// Time window used to suppress duplicate gossip identifiers.
 const GOSSIP_DEDUPE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Coalesces one pending outbound gossip batch by task identifier.
+///
+/// This keeps at most one task lifecycle update per task id for each flush tick, selecting the
+/// causally newest state so we reduce launch-phase chatter and avoid propagating stale transitions.
+fn coalesce_pending_messages(pending: Vec<Message>) -> (Vec<Message>, usize) {
+    let mut coalesced = Vec::with_capacity(pending.len());
+    let mut task_positions: HashMap<Uuid, usize> = HashMap::new();
+    let mut dropped = 0usize;
+
+    for message in pending {
+        let Some(task_id) = task_message_task_id(&message) else {
+            coalesced.push(message);
+            continue;
+        };
+
+        if let Some(position) = task_positions.get(&task_id).copied() {
+            if should_replace_task_message(&coalesced[position], &message) {
+                coalesced[position] = message;
+            }
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
+
+        task_positions.insert(task_id, coalesced.len());
+        coalesced.push(message);
+    }
+
+    (coalesced, dropped)
+}
+
+/// Returns the logical task identifier for one gossip message when it carries a task event.
+fn task_message_task_id(message: &Message) -> Option<Uuid> {
+    match message {
+        Message::Task { event, .. } => Some(match event {
+            TaskEvent::Upsert(spec) => spec.id,
+            TaskEvent::Remove { id } => *id,
+        }),
+        _ => None,
+    }
+}
+
+/// Returns true when the candidate task message should replace the currently retained one.
+fn should_replace_task_message(current: &Message, candidate: &Message) -> bool {
+    let (
+        Message::Task {
+            event: current_event,
+            ..
+        },
+        Message::Task {
+            event: candidate_event,
+            ..
+        },
+    ) = (current, candidate)
+    else {
+        return false;
+    };
+
+    match (current_event, candidate_event) {
+        (TaskEvent::Remove { .. }, TaskEvent::Upsert(_)) => false,
+        (_, TaskEvent::Remove { .. }) => true,
+        (TaskEvent::Upsert(current_spec), TaskEvent::Upsert(candidate_spec)) => {
+            should_accept_task_spec(current_spec, candidate_spec)
+        }
+    }
+}
+
+/// Returns true when one candidate task specification is causally newer than the current one.
+fn should_accept_task_spec(current: &TaskSpec, candidate: &TaskSpec) -> bool {
+    compare_task_spec_causality(current, candidate).is_gt()
+}
+
+/// Compares two task specifications by causal ordering used for outbound gossip coalescing.
+fn compare_task_spec_causality(current: &TaskSpec, candidate: &TaskSpec) -> Ordering {
+    match candidate.task_epoch.cmp(&current.task_epoch) {
+        Ordering::Equal => {}
+        order => return order,
+    }
+    match candidate.phase_version.cmp(&current.phase_version) {
+        Ordering::Equal => {}
+        order => return order,
+    }
+
+    match (
+        parse_task_timestamp(&current.updated_at, &current.created_at),
+        parse_task_timestamp(&candidate.updated_at, &candidate.created_at),
+    ) {
+        (Some(current_ts), Some(candidate_ts)) => {
+            if candidate_ts > current_ts {
+                return Ordering::Greater;
+            } else if candidate_ts < current_ts {
+                return Ordering::Less;
+            }
+        }
+        (None, Some(_)) => return Ordering::Greater,
+        (Some(_), None) => return Ordering::Less,
+        (None, None) => {}
+    }
+
+    let current_rank = task_state_rank(&current.state);
+    let candidate_rank = task_state_rank(&candidate.state);
+    match candidate_rank.cmp(&current_rank) {
+        Ordering::Equal => candidate.node_id.cmp(&current.node_id),
+        order => order,
+    }
+}
+
+/// Parses the freshest available timestamp from one task spec for causal comparisons.
+fn parse_task_timestamp(updated_at: &str, created_at: &str) -> Option<DateTime<Utc>> {
+    parse_timestamp(updated_at).or_else(|| parse_timestamp(created_at))
+}
+
+/// Parses one RFC3339 timestamp into UTC.
+fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+}
+
+/// Ranks task states by lifecycle progression when epoch/version/timestamp are tied.
+fn task_state_rank(state: &ContainerState) -> u8 {
+    match state {
+        ContainerState::Running => 6,
+        ContainerState::Creating => 5,
+        ContainerState::Pulling => 5,
+        ContainerState::Pending => 4,
+        ContainerState::Stopping => 3,
+        ContainerState::Stopped => 2,
+        ContainerState::Paused => 1,
+        ContainerState::Failed | ContainerState::Exited(_) | ContainerState::Unknown => 0,
+    }
+}
 
 /// Shared handle type used by ingress and outbound gossip loops for deduplication.
 pub(crate) type DedupeStateHandle = Arc<AsyncMutex<GossipDedupeState>>;
@@ -347,7 +483,7 @@ pub(crate) async fn start<C>(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let mut pending = std::mem::take(&mut buffer);
+                let pending = std::mem::take(&mut buffer);
 
                 if pending.is_empty() {
                     // Idle ticks no longer emit synthetic void gossip messages. Health probing
@@ -355,6 +491,18 @@ pub(crate) async fn start<C>(
                     // convergence without per-tick heartbeat payloads.
                     buffer = pending;
                     continue;
+                }
+
+                let before_count = pending.len();
+                let (mut pending, coalesced_task_updates) = coalesce_pending_messages(pending);
+                if coalesced_task_updates > 0 {
+                    debug!(
+                        target: "diag.gossip.coalesce",
+                        before_count,
+                        after_count = pending.len(),
+                        coalesced_task_updates,
+                        "coalesced outbound task gossip updates"
+                    );
                 }
 
                 let peers = match fanout {
@@ -546,8 +694,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::GossipDedupeState;
+    use super::{GossipDedupeState, Message, coalesce_pending_messages};
     use crate::cluster::{ClusterId, ClusterViewId};
+    use crate::task::container::ContainerState;
+    use crate::task::types::{TaskEvent, TaskSpec};
+    use chrono::{Duration as ChronoDuration, Utc};
     use uuid::Uuid;
 
     /// Duplicate message ids should be rejected while the active view is unchanged.
@@ -583,5 +734,147 @@ mod tests {
         assert!(dedupe.record_inbound(legacy_view, id));
         assert!(!dedupe.record_inbound(legacy_view, id));
         assert!(dedupe.record_inbound(next_view, id));
+    }
+
+    /// Task coalescing should keep the causally newest upsert and drop stale updates.
+    #[test]
+    fn coalesce_pending_messages_keeps_newest_task_upsert() {
+        let task_id = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let newer = TaskSpec {
+            id: task_id,
+            name: "task".to_string(),
+            image: "img".to_string(),
+            state: ContainerState::Running,
+            phase_reason: None,
+            phase_progress: None,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+            command: Vec::new(),
+            node_id,
+            node_name: "node".to_string(),
+            slot_ids: vec![1],
+            slot_id: Some(1),
+            cpu_millis: 100,
+            memory_bytes: 64 * 1024 * 1024,
+            gpu_count: 0,
+            gpu_device_ids: Vec::new(),
+            restart_policy: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            networks: Vec::new(),
+            service_metadata: None,
+            task_epoch: 4,
+            phase_version: 7,
+        };
+
+        let stale = TaskSpec {
+            id: task_id,
+            name: "task".to_string(),
+            image: "img".to_string(),
+            state: ContainerState::Pending,
+            phase_reason: None,
+            phase_progress: None,
+            created_at: now.to_rfc3339(),
+            updated_at: (now + ChronoDuration::seconds(60)).to_rfc3339(),
+            command: Vec::new(),
+            node_id,
+            node_name: "node".to_string(),
+            slot_ids: vec![1],
+            slot_id: Some(1),
+            cpu_millis: 100,
+            memory_bytes: 64 * 1024 * 1024,
+            gpu_count: 0,
+            gpu_device_ids: Vec::new(),
+            restart_policy: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            networks: Vec::new(),
+            service_metadata: None,
+            task_epoch: 4,
+            phase_version: 6,
+        };
+
+        let pending = vec![
+            Message::Task {
+                id: Uuid::new_v4(),
+                event: TaskEvent::Upsert(Box::new(newer.clone())),
+            },
+            Message::Task {
+                id: Uuid::new_v4(),
+                event: TaskEvent::Upsert(Box::new(stale)),
+            },
+        ];
+
+        let (coalesced, dropped) = coalesce_pending_messages(pending);
+        assert_eq!(dropped, 1);
+        assert_eq!(coalesced.len(), 1);
+        match &coalesced[0] {
+            Message::Task {
+                event: TaskEvent::Upsert(spec),
+                ..
+            } => {
+                assert_eq!(spec.state, ContainerState::Running);
+                assert_eq!(spec.phase_version, 7);
+            }
+            _ => panic!("unexpected coalesced message variant"),
+        }
+    }
+
+    /// Task coalescing should keep one remove event for a task and drop intermediate upserts.
+    #[test]
+    fn coalesce_pending_messages_prefers_task_remove() {
+        let task_id = Uuid::new_v4();
+        let now = Utc::now();
+        let upsert = TaskSpec {
+            id: task_id,
+            name: "task".to_string(),
+            image: "img".to_string(),
+            state: ContainerState::Stopping,
+            phase_reason: None,
+            phase_progress: None,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+            command: Vec::new(),
+            node_id: Uuid::new_v4(),
+            node_name: "node".to_string(),
+            slot_ids: vec![1],
+            slot_id: Some(1),
+            cpu_millis: 100,
+            memory_bytes: 64 * 1024 * 1024,
+            gpu_count: 0,
+            gpu_device_ids: Vec::new(),
+            restart_policy: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            networks: Vec::new(),
+            service_metadata: None,
+            task_epoch: 2,
+            phase_version: 9,
+        };
+
+        let pending = vec![
+            Message::Task {
+                id: Uuid::new_v4(),
+                event: TaskEvent::Upsert(Box::new(upsert)),
+            },
+            Message::Task {
+                id: Uuid::new_v4(),
+                event: TaskEvent::Remove { id: task_id },
+            },
+        ];
+
+        let (coalesced, dropped) = coalesce_pending_messages(pending);
+        assert_eq!(dropped, 1);
+        assert_eq!(coalesced.len(), 1);
+        assert!(matches!(
+            coalesced[0],
+            Message::Task {
+                event: TaskEvent::Remove { .. },
+                ..
+            }
+        ));
     }
 }
