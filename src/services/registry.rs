@@ -107,17 +107,44 @@ fn should_prefer_candidate(current: &ServiceSpecValue, candidate: &ServiceSpecVa
             }
             Ordering::Greater => return true,
         }
-    } else if current.status != crate::services::types::ServiceStatus::Stopped {
-        if let (Some(current_ts), Some(candidate_ts)) = (
-            parse_timestamp(&current.updated_at),
-            parse_timestamp(&candidate.updated_at),
-        ) {
-            return candidate_ts > current_ts;
-        }
+    } else {
+        return should_prefer_manifest_mismatch(current, candidate);
+    }
+}
+
+/// Resolves selection when concurrent values carry different deployment manifests.
+///
+/// This mirrors service-controller gating so stale cross-generation updates cannot resurrect a
+/// stopped service unless they represent a fresh Deploying bootstrap.
+fn should_prefer_manifest_mismatch(
+    current: &ServiceSpecValue,
+    candidate: &ServiceSpecValue,
+) -> bool {
+    let (Some(current_ts), Some(candidate_ts)) = (
+        parse_timestamp(&current.updated_at),
+        parse_timestamp(&candidate.updated_at),
+    ) else {
+        return false;
+    };
+
+    if candidate_ts <= current_ts {
         return false;
     }
 
-    true
+    use crate::services::types::ServiceStatus;
+
+    match current.status {
+        ServiceStatus::Stopping => false,
+        ServiceStatus::Stopped | ServiceStatus::Failed => {
+            candidate.status == ServiceStatus::Deploying && candidate.task_ids.is_empty()
+        }
+        ServiceStatus::Deploying | ServiceStatus::Running => {
+            matches!(
+                candidate.status,
+                ServiceStatus::Deploying | ServiceStatus::Running
+            )
+        }
+    }
 }
 
 /// Parses RFC3339 timestamps for service state comparisons.
@@ -141,8 +168,10 @@ fn status_rank(status: crate::services::types::ServiceStatus) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::types::ServiceStatus;
     use crate::services::types::ServiceTaskSpecValue;
     use crate::store::service_store::open_service_store;
+    use chrono::Duration as ChronoDuration;
     use redb::Database;
     use tempfile::tempdir;
 
@@ -225,5 +254,81 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].tasks[0].image, "ghcr.io/demo/web:v2");
         assert_eq!(listed[0].tasks[0].replicas, 3);
+    }
+
+    /// Builds a service value with explicit lifecycle metadata for preference tests.
+    fn build_service_value(
+        manifest_id: Uuid,
+        status: ServiceStatus,
+        updated_at: DateTime<Utc>,
+        task_ids: Vec<Uuid>,
+    ) -> ServiceSpecValue {
+        let tasks = vec![ServiceTaskSpecValue {
+            name: "api".into(),
+            image: "ghcr.io/demo/api:latest".into(),
+            command: Vec::new(),
+            replicas: 1,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            restart_policy: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            networks: Vec::new(),
+            health_port: None,
+            health_command: None,
+            public_port: None,
+            public_protocol: None,
+        }];
+
+        let mut value = ServiceSpecValue::new(manifest_id, "manifest", "svc", tasks, task_ids);
+        value.status = status;
+        value.updated_at = updated_at.to_rfc3339();
+        value
+    }
+
+    /// Ensures stopped services do not prefer stale cross-manifest running candidates.
+    #[test]
+    fn stopped_rejects_manifest_mismatch_running_candidate() {
+        let now = Utc::now();
+        let current = build_service_value(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
+        let candidate = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Running,
+            now + ChronoDuration::seconds(3),
+            vec![Uuid::new_v4()],
+        );
+
+        assert!(!should_prefer_candidate(&current, &candidate));
+    }
+
+    /// Ensures stopped services only accept manifest-mismatch Deploying bootstrap candidates.
+    #[test]
+    fn stopped_accepts_manifest_mismatch_deploying_bootstrap_candidate() {
+        let now = Utc::now();
+        let current = build_service_value(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
+        let candidate = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Deploying,
+            now + ChronoDuration::seconds(3),
+            Vec::new(),
+        );
+
+        assert!(should_prefer_candidate(&current, &candidate));
+    }
+
+    /// Ensures stopped services reject manifest-mismatch Deploying candidates with task ids.
+    #[test]
+    fn stopped_rejects_manifest_mismatch_deploying_prefilled_candidate() {
+        let now = Utc::now();
+        let current = build_service_value(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
+        let candidate = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Deploying,
+            now + ChronoDuration::seconds(3),
+            vec![Uuid::new_v4()],
+        );
+
+        assert!(!should_prefer_candidate(&current, &candidate));
     }
 }

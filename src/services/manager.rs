@@ -216,6 +216,9 @@ impl ServiceController {
             pending_spec.manifest_id = manifest_id;
             pending_spec.manifest_name = manifest_name.clone();
             pending_spec.tasks = tasks.clone();
+            // A new deployment generation must start from an empty assignment set so peers can
+            // observe a clean Deploying bootstrap before task ids are repopulated.
+            pending_spec.task_ids.clear();
             pending_spec.set_status(ServiceStatus::Deploying);
 
             tracing::info!(
@@ -2089,21 +2092,45 @@ fn should_accept_update(current: Option<&ServiceSpecValue>, incoming: &ServiceSp
                 }
                 Ordering::Greater => {}
             }
-        } else if current.status() != ServiceStatus::Stopped {
-            if let (Some(current_ts), Some(incoming_ts)) = (
-                parse_timestamp(&current.updated_at),
-                parse_timestamp(&incoming.updated_at),
-            ) {
-                if incoming_ts <= current_ts {
-                    return false;
-                }
-            } else {
-                return false;
-            }
+        } else {
+            return should_accept_manifest_mismatch(current, incoming);
         }
     }
 
     true
+}
+
+/// Validates updates that carry a different deployment manifest id.
+///
+/// Manifest mismatches are sensitive because stale cross-generation updates can resurrect
+/// services after stop. We only allow mismatches that represent a fresh deployment bootstrap.
+fn should_accept_manifest_mismatch(
+    current: &ServiceSpecValue,
+    incoming: &ServiceSpecValue,
+) -> bool {
+    let (Some(current_ts), Some(incoming_ts)) = (
+        parse_timestamp(&current.updated_at),
+        parse_timestamp(&incoming.updated_at),
+    ) else {
+        return false;
+    };
+
+    if incoming_ts <= current_ts {
+        return false;
+    }
+
+    match current.status() {
+        ServiceStatus::Stopping => false,
+        ServiceStatus::Stopped | ServiceStatus::Failed => {
+            incoming.status() == ServiceStatus::Deploying && incoming.task_ids.is_empty()
+        }
+        ServiceStatus::Deploying | ServiceStatus::Running => {
+            matches!(
+                incoming.status(),
+                ServiceStatus::Deploying | ServiceStatus::Running
+            )
+        }
+    }
 }
 
 fn should_stop_tasks(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecValue) -> bool {
@@ -2447,6 +2474,86 @@ mod tests {
         incoming.set_status(ServiceStatus::Stopped);
 
         assert!(!should_stop_tasks(Some(&current), &incoming));
+    }
+
+    /// Builds a service spec with explicit status/timestamp for update-order tests.
+    fn build_service_spec_with_status(
+        manifest_id: Uuid,
+        status: ServiceStatus,
+        updated_at: DateTime<Utc>,
+        task_ids: Vec<Uuid>,
+    ) -> ServiceSpecValue {
+        let tasks = vec![ServiceTaskSpecValue {
+            name: "api".into(),
+            image: "ghcr.io/demo/api:latest".into(),
+            command: Vec::new(),
+            replicas: 1,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            restart_policy: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            networks: Vec::new(),
+            health_port: None,
+            health_command: None,
+            public_port: None,
+            public_protocol: None,
+        }];
+
+        let mut spec =
+            ServiceSpecValue::new(manifest_id, "manifest", "demo-service", tasks, task_ids);
+        spec.status = status;
+        spec.updated_at = updated_at.to_rfc3339();
+        spec
+    }
+
+    /// Ensures stopped services reject stale cross-manifest running resurrection updates.
+    #[test]
+    fn stopped_rejects_manifest_mismatch_running_update() {
+        let now = Utc::now();
+        let current =
+            build_service_spec_with_status(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
+        let incoming = build_service_spec_with_status(
+            Uuid::new_v4(),
+            ServiceStatus::Running,
+            now + chrono::Duration::seconds(5),
+            vec![Uuid::new_v4()],
+        );
+
+        assert!(!should_accept_update(Some(&current), &incoming));
+    }
+
+    /// Ensures only fresh Deploying bootstrap updates can reactivate a stopped service.
+    #[test]
+    fn stopped_accepts_manifest_mismatch_deploying_bootstrap() {
+        let now = Utc::now();
+        let current =
+            build_service_spec_with_status(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
+        let incoming = build_service_spec_with_status(
+            Uuid::new_v4(),
+            ServiceStatus::Deploying,
+            now + chrono::Duration::seconds(5),
+            Vec::new(),
+        );
+
+        assert!(should_accept_update(Some(&current), &incoming));
+    }
+
+    /// Ensures stopped services reject manifest-mismatch deploy updates with prefilled task ids.
+    #[test]
+    fn stopped_rejects_manifest_mismatch_deploying_with_task_ids() {
+        let now = Utc::now();
+        let current =
+            build_service_spec_with_status(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
+        let incoming = build_service_spec_with_status(
+            Uuid::new_v4(),
+            ServiceStatus::Deploying,
+            now + chrono::Duration::seconds(5),
+            vec![Uuid::new_v4()],
+        );
+
+        assert!(!should_accept_update(Some(&current), &incoming));
     }
 
     /// Ensures pulling tasks are treated as in-flight deployment work.
