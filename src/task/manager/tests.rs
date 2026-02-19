@@ -2182,6 +2182,164 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_fresher_version() 
     assert_eq!(after_fresh[0].id, fresh.id);
 }
 
+/// Builds a remote-owned task specification for ordering and sync/gossip conflict tests.
+fn build_remote_task_spec(
+    id: Uuid,
+    node_id: Uuid,
+    state: ContainerState,
+    task_epoch: u64,
+    phase_version: u64,
+    updated_at: String,
+) -> TaskSpec {
+    TaskSpec {
+        id,
+        name: "remote-task".to_string(),
+        image: "img".to_string(),
+        state,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: updated_at.clone(),
+        updated_at,
+        command: Vec::new(),
+        node_id,
+        node_name: "remote-node".to_string(),
+        slot_ids: vec![1],
+        slot_id: Some(1),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        task_epoch,
+        phase_version,
+    }
+}
+
+#[tokio::test]
+async fn out_of_order_task_upsert_keeps_newer_running_state() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let remote_node = Uuid::new_v4();
+    let now = Utc::now();
+
+    let running = build_remote_task_spec(
+        task_id,
+        remote_node,
+        ContainerState::Running,
+        3,
+        9,
+        now.to_rfc3339(),
+    );
+    manager
+        .handle_event(TaskEvent::Upsert(Box::new(running.clone())))
+        .await
+        .expect("apply running upsert");
+
+    let delayed_pending = build_remote_task_spec(
+        task_id,
+        remote_node,
+        ContainerState::Pending,
+        running.task_epoch,
+        running.phase_version.saturating_sub(1),
+        (now + chrono::Duration::seconds(60)).to_rfc3339(),
+    );
+    manager
+        .handle_event(TaskEvent::Upsert(Box::new(delayed_pending)))
+        .await
+        .expect("apply delayed stale pending upsert");
+
+    let resolved = manager
+        .load_spec(task_id)
+        .await
+        .expect("load causally resolved task");
+    assert_eq!(resolved.state, ContainerState::Running);
+    assert_eq!(resolved.task_epoch, running.task_epoch);
+    assert_eq!(resolved.phase_version, running.phase_version);
+}
+
+#[tokio::test]
+async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let remote_node = Uuid::new_v4();
+    let now = Utc::now();
+
+    let gossip_running = build_remote_task_spec(
+        task_id,
+        remote_node,
+        ContainerState::Running,
+        5,
+        11,
+        now.to_rfc3339(),
+    );
+    manager
+        .handle_event(TaskEvent::Upsert(Box::new(gossip_running.clone())))
+        .await
+        .expect("apply newer gossip upsert");
+
+    let stale_delta = TaskValue::new(TaskValueDraft {
+        id: task_id,
+        name: "remote-task".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.to_rfc3339(),
+        updated_at: (now + chrono::Duration::seconds(120)).to_rfc3339(),
+        command: Vec::new(),
+        node_id: remote_node,
+        node_name: "remote-node".to_string(),
+        slot_ids: vec![1],
+        networks: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        service_metadata: None,
+        task_epoch: gossip_running.task_epoch,
+        phase_version: gossip_running.phase_version.saturating_sub(1),
+    });
+    let (remote_db, _remote_dir) = temp_db("tasks-sync-delta");
+    let remote_store = open_task_store(remote_db, Uuid::new_v4()).expect("open remote task store");
+    remote_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild remote task store");
+    remote_store
+        .upsert(&UuidKey::from(task_id), stale_delta)
+        .await
+        .expect("write stale value to remote store");
+
+    let remote_ranges = remote_store
+        .page_range_summary()
+        .await
+        .expect("remote page ranges");
+    let (regs, tombs) = remote_store
+        .export_page_ranges_delta(&remote_ranges)
+        .expect("export remote delta");
+    manager
+        .store
+        .apply_delta_chunk_update_mst(regs, tombs)
+        .await
+        .expect("apply stale delta to local store");
+
+    let resolved = manager
+        .load_spec(task_id)
+        .await
+        .expect("load causally resolved task");
+    assert_eq!(resolved.state, ContainerState::Running);
+    assert_eq!(resolved.task_epoch, gossip_running.task_epoch);
+    assert_eq!(resolved.phase_version, gossip_running.phase_version);
+}
+
 #[tokio::test]
 async fn teardown_local_attachment_records_preserves_remote_rows() {
     let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;

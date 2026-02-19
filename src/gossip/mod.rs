@@ -899,4 +899,76 @@ mod tests {
             }
         ));
     }
+
+    /// Burst task lifecycle chatter should collapse to one causally newest task update.
+    #[test]
+    fn coalesce_pending_messages_collapses_many_task_phase_updates() {
+        let task_id = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+        let now = Utc::now();
+        let mut pending = Vec::new();
+
+        for phase_version in 1..=16u64 {
+            let state = if phase_version >= 16 {
+                ContainerState::Running
+            } else if phase_version >= 11 {
+                ContainerState::Creating
+            } else if phase_version >= 6 {
+                ContainerState::Pulling
+            } else {
+                ContainerState::Pending
+            };
+
+            let spec = TaskSpec {
+                id: task_id,
+                name: "task".to_string(),
+                image: "img".to_string(),
+                state,
+                phase_reason: None,
+                phase_progress: None,
+                created_at: now.to_rfc3339(),
+                updated_at: (now + ChronoDuration::seconds(phase_version as i64)).to_rfc3339(),
+                command: Vec::new(),
+                node_id,
+                node_name: "node".to_string(),
+                slot_ids: vec![1],
+                slot_id: Some(1),
+                cpu_millis: 100,
+                memory_bytes: 64 * 1024 * 1024,
+                gpu_count: 0,
+                gpu_device_ids: Vec::new(),
+                restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                networks: Vec::new(),
+                service_metadata: None,
+                task_epoch: 2,
+                phase_version,
+            };
+            pending.push(Message::Task {
+                id: Uuid::new_v4(),
+                event: TaskEvent::Upsert(Box::new(spec)),
+            });
+        }
+
+        pending.push(Message::Void { id: Uuid::new_v4() });
+
+        let (coalesced, dropped) = coalesce_pending_messages(pending);
+        assert_eq!(dropped, 15);
+        assert_eq!(coalesced.len(), 2);
+
+        let newest_task = coalesced
+            .iter()
+            .find_map(|message| match message {
+                Message::Task {
+                    event: TaskEvent::Upsert(spec),
+                    ..
+                } => Some(spec),
+                _ => None,
+            })
+            .expect("coalesced batch should keep one task upsert");
+
+        assert_eq!(newest_task.phase_version, 16);
+        assert_eq!(newest_task.state, ContainerState::Running);
+    }
 }

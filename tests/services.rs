@@ -786,6 +786,93 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
     );
 });
 
+local_test!(services_large_deployment_converges_within_bound, {
+    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(5, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 5, "cluster should stabilise to five nodes").await;
+
+    let service_name = "placement-large-converge";
+    let expected_replicas = 24usize;
+    let templates = vec![demo_backend_task_template(
+        "backend",
+        expected_replicas as u16,
+    )];
+
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+        .await
+        .expect("submit large deployment");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut running_seen = false;
+    let mut stable_rounds = 0u32;
+    while Instant::now() < deadline {
+        if let Ok(Some(spec)) = cluster[0]
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            && spec.status() == ServiceStatus::Running
+        {
+            running_seen = true;
+        }
+
+        if running_seen
+            && all_nodes_have_service_task_count(&cluster, service_name, expected_replicas).await
+        {
+            stable_rounds += 1;
+            if stable_rounds >= 5 {
+                break;
+            }
+        } else {
+            stable_rounds = 0;
+        }
+
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(
+        running_seen,
+        "large deployment should reach running within the convergence bound"
+    );
+    assert!(
+        stable_rounds >= 5,
+        "large deployment did not stabilise to {expected_replicas} replicas on all nodes"
+    );
+
+    for node in &cluster {
+        let tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
+        assert_eq!(
+            tasks.len(),
+            expected_replicas,
+            "node {} should report {expected_replicas} active replicas",
+            node.id()
+        );
+        let non_running: Vec<String> = tasks
+            .iter()
+            .filter(|task| !matches!(task.state, ContainerState::Running))
+            .map(|task| format!("{}:{:?}", task.id, task.state))
+            .collect();
+        assert!(
+            non_running.is_empty(),
+            "node {} still has non-running replicas after convergence: {}",
+            node.id(),
+            non_running.join(", ")
+        );
+    }
+});
+
 local_test!(services_stop_drains_stale_tasks_and_slots, {
     let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
     let node = TestNode::new().await;
@@ -1500,6 +1587,8 @@ fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
                 service_name: meta.service_name.clone(),
                 template: meta.template.clone(),
             }),
+        task_epoch: spec.task_epoch,
+        phase_version: spec.phase_version,
     }
 }
 
