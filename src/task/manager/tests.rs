@@ -2215,7 +2215,7 @@ async fn remove_event_purges_remote_attachment_without_local_spec() {
 }
 
 #[tokio::test]
-async fn stale_upsert_after_remove_watermark_is_ignored_until_fresher_version() {
+async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -2254,6 +2254,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_fresher_version() 
     let mut fresh = original.clone();
     fresh.state = ContainerState::Running;
     fresh.updated_at = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+    fresh.task_epoch = fresh.task_epoch.saturating_add(1);
 
     manager
         .handle_event(TaskEvent::Upsert(Box::new(fresh.clone())))
@@ -2266,7 +2267,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_fresher_version() 
     assert_eq!(
         after_fresh.len(),
         1,
-        "fresher upsert should recreate the row"
+        "newer-epoch upsert should recreate the row"
     );
     assert_eq!(after_fresh[0].id, fresh.id);
 }

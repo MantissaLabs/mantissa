@@ -230,19 +230,25 @@ impl TaskManager {
     /// Removes a task snapshot from the store.
     pub(super) async fn remove_spec(&self, id: Uuid) -> Result<(), anyhow::Error> {
         let key = UuidKey::from(id);
-        let watermark = self
+        let (watermark, max_epoch) = self
             .store
             .get_snapshot(&key)
             .map_err(|e| anyhow::anyhow!("task lookup failed before remove: {e}"))?
             .and_then(|snapshot| select_best_task_value(snapshot.as_slice()))
-            .and_then(|value| super::parse_task_timestamp(&value.updated_at, &value.created_at))
-            .unwrap_or_else(Utc::now);
+            .map(|value| {
+                (
+                    super::parse_task_timestamp(&value.updated_at, &value.created_at)
+                        .unwrap_or_else(Utc::now),
+                    value.task_epoch,
+                )
+            })
+            .unwrap_or_else(|| (Utc::now(), 0));
 
         self.store
             .remove(&key)
             .await
             .map_err(|e| anyhow::anyhow!("task remove failed: {e}"))?;
-        self.record_remove_watermark(id, watermark).await;
+        self.record_remove_watermark(id, watermark, max_epoch).await;
         self.clear_task_diag_stats(id).await;
         Ok(())
     }

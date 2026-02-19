@@ -49,6 +49,13 @@ const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
 /// Retention window for remove watermarks used to suppress stale upsert replay.
 const REMOVE_WATERMARK_RETENTION_SECS: i64 = 30 * 60;
 
+/// Remove tombstone metadata used to suppress stale task upsert replay.
+#[derive(Clone)]
+struct RemoveTombstone {
+    watermark: DateTime<Utc>,
+    max_epoch: u64,
+}
+
 /// Runtime loop cadence configuration for the task manager reconciliation workers.
 #[derive(Clone, Copy, Debug)]
 pub struct TaskRuntimeConfig {
@@ -80,7 +87,7 @@ pub struct TaskManager {
     local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
     inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
     inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
-    removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, DateTime<Utc>>>>,
+    removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, RemoveTombstone>>>,
     stale_upsert_drop_stats: Arc<AsyncMutex<HashMap<Uuid, u64>>>,
     causal_conflict_stats: Arc<AsyncMutex<HashMap<Uuid, u64>>>,
     pull_limiter: Arc<Semaphore>,
@@ -220,19 +227,31 @@ impl TaskManager {
         })
     }
 
-    /// Records the latest remove watermark used to suppress stale remote task upserts.
-    async fn record_remove_watermark(&self, task_id: Uuid, watermark: DateTime<Utc>) {
+    /// Records the latest remove watermark and epoch used to suppress stale remote task upserts.
+    async fn record_remove_watermark(
+        &self,
+        task_id: Uuid,
+        watermark: DateTime<Utc>,
+        max_epoch: u64,
+    ) {
         let mut guard = self.removed_task_watermarks.lock().await;
         let cutoff = Utc::now() - chrono::Duration::seconds(REMOVE_WATERMARK_RETENTION_SECS);
-        guard.retain(|_, ts| *ts >= cutoff);
+        guard.retain(|_, tombstone| tombstone.watermark >= cutoff);
         match guard.get_mut(&task_id) {
             Some(current) => {
-                if watermark > *current {
-                    *current = watermark;
+                if watermark > current.watermark {
+                    current.watermark = watermark;
                 }
+                current.max_epoch = current.max_epoch.max(max_epoch);
             }
             None => {
-                guard.insert(task_id, watermark);
+                guard.insert(
+                    task_id,
+                    RemoveTombstone {
+                        watermark,
+                        max_epoch,
+                    },
+                );
             }
         }
     }
@@ -244,23 +263,25 @@ impl TaskManager {
 
     /// Returns true when an inbound upsert should be ignored because it predates a known remove.
     async fn should_ignore_removed_upsert(&self, spec: &TaskSpec) -> bool {
-        let watermark = {
+        let tombstone = {
             let guard = self.removed_task_watermarks.lock().await;
             guard.get(&spec.id).cloned()
         };
 
-        let Some(watermark) = watermark else {
+        let Some(tombstone) = tombstone else {
             return false;
         };
 
-        let incoming_ts = parse_task_timestamp(&spec.updated_at, &spec.created_at);
-        match incoming_ts {
-            Some(incoming_ts) if incoming_ts > watermark => {
-                self.clear_remove_watermark(spec.id).await;
-                false
-            }
-            _ => true,
+        if spec.task_epoch > tombstone.max_epoch {
+            self.clear_remove_watermark(spec.id).await;
+            return false;
         }
+
+        if spec.task_epoch < tombstone.max_epoch {
+            return true;
+        }
+
+        true
     }
 
     /// Returns true when one telemetry counter sample should emit a diagnostic log.
