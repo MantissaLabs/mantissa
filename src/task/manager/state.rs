@@ -21,13 +21,13 @@ use crate::task::docker::{
     RestartPolicyType,
 };
 use crate::task::types::{
-    TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskValue, TaskValueDraft,
+    TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskValue,
 };
 
 use super::{
     TaskManager, container_already_running, container_remove_in_progress, is_name_conflict,
-    select_best_task_value, value_to_spec, wrap_create_error, wrap_existing_inspect_error,
-    wrap_start_error,
+    select_best_task_value, spec_to_value, value_to_spec, wrap_create_error,
+    wrap_existing_inspect_error, wrap_start_error,
 };
 
 /// Snapshot of containers currently known by the local runtime.
@@ -73,6 +73,7 @@ impl TaskManager {
                     task = %working.id,
                     "running task container missing locally; restarting task runtime"
                 );
+                working.phase_version = working.phase_version.saturating_add(1);
                 working.state = ContainerState::Pending;
                 working.phase_reason = None;
                 working.phase_progress = None;
@@ -192,35 +193,38 @@ impl TaskManager {
 
     /// Persists a task snapshot in the backing store.
     pub(super) async fn persist_spec(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
-        let mut value = TaskValue::new(TaskValueDraft {
-            id: spec.id,
-            name: spec.name.clone(),
-            image: spec.image.clone(),
-            state: spec.state.clone(),
-            phase_reason: spec.phase_reason.clone(),
-            phase_progress: spec.phase_progress.clone(),
-            created_at: spec.created_at.clone(),
-            updated_at: spec.updated_at.clone(),
-            command: spec.command.clone(),
-            node_id: spec.node_id,
-            node_name: spec.node_name.clone(),
-            slot_ids: spec.slot_ids.clone(),
-            networks: spec.networks.clone(),
-            cpu_millis: spec.cpu_millis,
-            memory_bytes: spec.memory_bytes,
-            gpu_count: spec.gpu_count,
-            gpu_device_ids: spec.gpu_device_ids.clone(),
-            env: spec.env.clone(),
-            secret_files: spec.secret_files.clone(),
-            service_metadata: spec.service_metadata.clone(),
-        });
-
-        value.restart_policy = spec.restart_policy.clone();
+        let value = spec_to_value(spec);
 
         self.store
             .upsert(&UuidKey::from(spec.id), value)
             .await
             .map_err(|e| anyhow::anyhow!("task upsert failed: {e}"))
+    }
+
+    /// Computes the next task assignment epoch for the provided ownership/slot tuple.
+    pub(super) async fn next_task_epoch_for_assignment(
+        &self,
+        id: Uuid,
+        node_id: Uuid,
+        slot_ids: &[SlotId],
+    ) -> Result<u64, anyhow::Error> {
+        let snapshot = self
+            .store
+            .get_snapshot(&UuidKey::from(id))
+            .map_err(|e| anyhow::anyhow!("task lookup failed for assignment epoch: {e}"))?;
+
+        let Some(snapshot) = snapshot else {
+            return Ok(0);
+        };
+        let Some(current) = select_best_task_value(snapshot.as_slice()) else {
+            return Ok(0);
+        };
+
+        if current.node_id != node_id || current.slot_ids.as_slice() != slot_ids {
+            Ok(current.task_epoch.saturating_add(1))
+        } else {
+            Ok(current.task_epoch)
+        }
     }
 
     /// Removes a task snapshot from the store.
@@ -274,6 +278,9 @@ impl TaskManager {
             return Ok(spec);
         }
 
+        if spec.state != state {
+            spec.phase_version = spec.phase_version.saturating_add(1);
+        }
         spec.state = state;
         spec.phase_reason = next_reason;
         spec.phase_progress = next_progress;
@@ -558,6 +565,7 @@ impl TaskManager {
 
         let mut updated = spec.clone();
         if !matches!(spec.state, ContainerState::Stopping) {
+            updated.phase_version = updated.phase_version.saturating_add(1);
             updated.state = ContainerState::Stopping;
             updated.phase_reason = None;
             updated.phase_progress = None;
@@ -625,6 +633,9 @@ impl TaskManager {
             );
         }
 
+        if !matches!(updated.state, ContainerState::Stopped) {
+            updated.phase_version = updated.phase_version.saturating_add(1);
+        }
         updated.state = ContainerState::Stopped;
         updated.phase_reason = None;
         updated.phase_progress = None;
@@ -706,6 +717,9 @@ impl TaskManager {
             spec.slot_id = None;
         }
 
+        if !matches!(spec.state, ContainerState::Failed) {
+            spec.phase_version = spec.phase_version.saturating_add(1);
+        }
         spec.state = ContainerState::Failed;
         spec.phase_reason = None;
         spec.phase_progress = None;
@@ -898,6 +912,9 @@ impl TaskManager {
             || working.phase_reason.is_some()
             || working.phase_progress.is_some()
         {
+            if !matches!(working.state, ContainerState::Creating) {
+                working.phase_version = working.phase_version.saturating_add(1);
+            }
             working.state = ContainerState::Creating;
             working.phase_reason = None;
             working.phase_progress = None;
@@ -1189,6 +1206,9 @@ impl TaskManager {
             }
         }
 
+        if !matches!(working.state, ContainerState::Running) {
+            working.phase_version = working.phase_version.saturating_add(1);
+        }
         working.state = ContainerState::Running;
         working.phase_reason = None;
         working.phase_progress = None;

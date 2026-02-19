@@ -2192,6 +2192,8 @@ mod tests {
             secret_files: Vec::new(),
             networks: Vec::new(),
             service_metadata: Some(TaskServiceMetadata::new(service_name, template)),
+            task_epoch: 0,
+            phase_version: 0,
         }
     }
 

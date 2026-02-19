@@ -531,6 +531,10 @@ impl TaskManager {
                 .registry
                 .peer_hostname(plan.peer_id)
                 .unwrap_or_else(|| plan.peer_id.to_string());
+            let task_epoch = self
+                .next_task_epoch_for_assignment(plan.id, plan.peer_id, &slot_ids)
+                .await
+                .map_err(ExecutionError::Fatal)?;
 
             let spec = TaskSpec {
                 id: plan.id,
@@ -555,6 +559,8 @@ impl TaskManager {
                 secret_files: plan.secret_files.clone(),
                 networks: plan.networks.clone(),
                 service_metadata: plan.service_metadata.clone(),
+                task_epoch,
+                phase_version: 0,
             };
 
             if let Err(err) = self.persist_spec(&spec).await {

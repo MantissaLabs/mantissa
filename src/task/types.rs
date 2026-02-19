@@ -40,6 +40,10 @@ pub struct TaskSpec {
     pub networks: Vec<Uuid>,
     #[serde(default)]
     pub service_metadata: Option<TaskServiceMetadata>,
+    #[serde(default)]
+    pub task_epoch: u64,
+    #[serde(default)]
+    pub phase_version: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -168,6 +172,10 @@ pub struct TaskValue {
     pub networks: Vec<Uuid>,
     #[serde(default)]
     pub service_metadata: Option<TaskServiceMetadata>,
+    #[serde(default)]
+    pub task_epoch: u64,
+    #[serde(default)]
+    pub phase_version: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +200,8 @@ pub struct TaskValueDraft {
     pub env: Vec<TaskEnvironmentVariable>,
     pub secret_files: Vec<TaskSecretFile>,
     pub service_metadata: Option<TaskServiceMetadata>,
+    pub task_epoch: u64,
+    pub phase_version: u64,
 }
 
 impl TaskValue {
@@ -220,6 +230,8 @@ impl TaskValue {
             env: draft.env,
             secret_files: draft.secret_files,
             service_metadata: draft.service_metadata,
+            task_epoch: draft.task_epoch,
+            phase_version: draft.phase_version,
         }
     }
 }

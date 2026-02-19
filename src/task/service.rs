@@ -175,6 +175,8 @@ pub fn add_event(
             spec_builder.set_updated_at("");
             spec_builder.set_phase_reason("");
             spec_builder.set_phase_progress("");
+            spec_builder.set_task_epoch(0);
+            spec_builder.set_phase_version(0);
             spec_builder.set_node_id(&[0u8; 16]);
             spec_builder.set_node_name("");
             spec_builder.reborrow().init_slot_ids(0);
@@ -215,6 +217,8 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     builder.set_updated_at(&spec.updated_at);
     builder.set_phase_reason(spec.phase_reason.as_deref().unwrap_or(""));
     builder.set_phase_progress(spec.phase_progress.as_deref().unwrap_or(""));
+    builder.set_task_epoch(spec.task_epoch);
+    builder.set_phase_version(spec.phase_version);
     builder.set_node_id(spec.node_id.as_bytes());
     builder.set_node_name(&spec.node_name);
 
@@ -287,6 +291,8 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     let updated_at = reader.get_updated_at()?.to_str()?.to_string();
     let phase_reason = reader.get_phase_reason()?.to_str()?.to_string();
     let phase_progress = reader.get_phase_progress()?.to_str()?.to_string();
+    let task_epoch = reader.get_task_epoch();
+    let phase_version = reader.get_phase_version();
     let node_bytes = reader.get_node_id()?.to_owned();
     let node_slice: [u8; 16] = node_bytes
         .as_slice()
@@ -385,6 +391,8 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         secret_files,
         networks,
         service_metadata,
+        task_epoch,
+        phase_version,
     })
 }
 

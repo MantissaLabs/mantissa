@@ -93,6 +93,12 @@ struct TaskSpec {
 
   phaseProgress @20 :Text;
   # Optional current lifecycle phase progress marker.
+
+  taskEpoch @21 :UInt64;
+  # Assignment generation for this task identity. Increments when ownership/placement changes.
+
+  phaseVersion @22 :UInt64;
+  # Monotonic lifecycle version incremented on each task state transition.
 }
 
 struct ServiceMetadata {

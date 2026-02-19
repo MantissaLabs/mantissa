@@ -24,7 +24,7 @@ use crate::task::docker::ContainerRuntimeEvent;
 use crate::task::types::{TaskEvent, TaskServiceMetadata};
 
 use super::TaskManager;
-use super::select_best_task_value;
+use super::{select_best_task_value, should_accept_incoming_task_value, spec_to_value};
 
 /// Maximum attempts when provisioning one runtime attachment.
 const ATTACHMENT_PROVISION_MAX_ATTEMPTS: usize = 4;
@@ -394,6 +394,29 @@ impl TaskManager {
                         "ignoring stale task upsert after remove watermark"
                     );
                     return Ok(());
+                }
+                let incoming = spec_to_value(&spec);
+                if let Some(snapshot) = self
+                    .store
+                    .get_snapshot(&UuidKey::from(spec.id))
+                    .map_err(|e| anyhow::anyhow!("task lookup failed before upsert apply: {e}"))?
+                {
+                    if let Some(current) = select_best_task_value(snapshot.as_slice()) {
+                        if !should_accept_incoming_task_value(&current, &incoming) {
+                            debug!(
+                                target: "task",
+                                task = %spec.id,
+                                current_epoch = current.task_epoch,
+                                current_phase_version = current.phase_version,
+                                incoming_epoch = incoming.task_epoch,
+                                incoming_phase_version = incoming.phase_version,
+                                current_state = ?current.state,
+                                incoming_state = ?incoming.state,
+                                "ignoring stale or duplicate task upsert by causal ordering"
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
                 let belongs = spec.node_id == self.local_node_id;
                 self.persist_spec(&spec).await?;

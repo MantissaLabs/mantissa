@@ -549,6 +549,8 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
         secret_files: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
     };
     manager.persist_spec(&spec).await.expect("persist task");
 
@@ -609,6 +611,8 @@ async fn reconcile_rejects_missing_slot_assignments() {
         secret_files: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
     };
 
     let err = manager
@@ -655,6 +659,8 @@ async fn reconcile_pending_task_reserves_assigned_slots_before_launch() {
         secret_files: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
     };
     manager.persist_spec(&spec).await.expect("persist task");
 
@@ -713,6 +719,8 @@ async fn reconcile_uses_latest_persisted_slot_assignment() {
         secret_files: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
     };
 
     // Persist a fresher snapshot with missing assignments to emulate a concurrent CRDT update
@@ -794,6 +802,192 @@ async fn update_task_phase_ignores_stale_regression_from_running() {
         .expect("load refreshed task");
     assert!(matches!(refreshed.state, ContainerState::Running));
     assert_eq!(mock_cm.created.lock().await.len(), 1);
+}
+
+#[test]
+fn compare_task_causality_prefers_epoch_then_phase_version() {
+    let now = Utc::now();
+    let id = Uuid::new_v4();
+    let node_a = Uuid::new_v4();
+    let node_b = Uuid::new_v4();
+
+    let current = TaskValue::new(TaskValueDraft {
+        id,
+        name: "task".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.to_rfc3339(),
+        updated_at: now.to_rfc3339(),
+        command: Vec::new(),
+        node_id: node_a,
+        node_name: "node-a".to_string(),
+        slot_ids: vec![1],
+        networks: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        service_metadata: None,
+        task_epoch: 2,
+        phase_version: 7,
+    });
+
+    let lower_epoch = TaskValue::new(TaskValueDraft {
+        id,
+        name: "task".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.to_rfc3339(),
+        updated_at: (now + chrono::Duration::seconds(30)).to_rfc3339(),
+        command: Vec::new(),
+        node_id: node_b,
+        node_name: "node-b".to_string(),
+        slot_ids: vec![2],
+        networks: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        service_metadata: None,
+        task_epoch: 1,
+        phase_version: 99,
+    });
+    assert!(
+        !should_accept_incoming_task_value(&current, &lower_epoch),
+        "lower epoch must not override current assignment"
+    );
+
+    let same_epoch_lower_phase = TaskValue::new(TaskValueDraft {
+        id,
+        name: "task".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.to_rfc3339(),
+        updated_at: (now + chrono::Duration::seconds(30)).to_rfc3339(),
+        command: Vec::new(),
+        node_id: node_b,
+        node_name: "node-b".to_string(),
+        slot_ids: vec![2],
+        networks: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        service_metadata: None,
+        task_epoch: 2,
+        phase_version: 6,
+    });
+    assert!(
+        !should_accept_incoming_task_value(&current, &same_epoch_lower_phase),
+        "lower phase version must not override newer lifecycle state"
+    );
+
+    let higher_epoch = TaskValue::new(TaskValueDraft {
+        id,
+        name: "task".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.to_rfc3339(),
+        updated_at: now.to_rfc3339(),
+        command: Vec::new(),
+        node_id: node_b,
+        node_name: "node-b".to_string(),
+        slot_ids: vec![2],
+        networks: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        service_metadata: None,
+        task_epoch: 3,
+        phase_version: 0,
+    });
+    assert!(
+        should_accept_incoming_task_value(&current, &higher_epoch),
+        "higher assignment epoch should win regardless of state rank"
+    );
+}
+
+#[test]
+fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
+    let now = Utc::now();
+    let id = Uuid::new_v4();
+    let node = Uuid::new_v4();
+
+    let running_newer_phase = TaskValue::new(TaskValueDraft {
+        id,
+        name: "task".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.to_rfc3339(),
+        updated_at: now.to_rfc3339(),
+        command: Vec::new(),
+        node_id: node,
+        node_name: "node".to_string(),
+        slot_ids: vec![1],
+        networks: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 4,
+    });
+
+    let stale_pending_later_timestamp = TaskValue::new(TaskValueDraft {
+        id,
+        name: "task".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.to_rfc3339(),
+        updated_at: (now + chrono::Duration::seconds(45)).to_rfc3339(),
+        command: Vec::new(),
+        node_id: node,
+        node_name: "node".to_string(),
+        slot_ids: vec![1],
+        networks: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 3,
+    });
+
+    let chosen = select_best_task_value(&[
+        stale_pending_later_timestamp.clone(),
+        running_newer_phase.clone(),
+    ])
+    .expect("best value");
+
+    assert_eq!(chosen.state, ContainerState::Running);
+    assert_eq!(chosen.phase_version, 4);
 }
 
 #[tokio::test]
@@ -1607,6 +1801,8 @@ async fn task_owned_locally_detects_remote_entries() {
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
     });
 
     let store = manager.store.clone();
@@ -2077,6 +2273,8 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
     });
     manager
         .store

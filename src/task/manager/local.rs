@@ -78,6 +78,9 @@ impl TaskManager {
 
             let slot_ids = plan.slot_ids();
             let slot_id = slot_ids.first().copied();
+            let task_epoch = self
+                .next_task_epoch_for_assignment(plan.id, self.local_node_id, &slot_ids)
+                .await?;
             let spec = TaskSpec {
                 id: plan.id,
                 name: plan.name.clone(),
@@ -101,6 +104,8 @@ impl TaskManager {
                 secret_files: plan.secret_files.clone(),
                 networks: plan.networks.clone(),
                 service_metadata: plan.service_metadata.clone(),
+                task_epoch,
+                phase_version: 0,
             };
 
             if let Err(err) = self.persist_spec(&spec).await {
@@ -415,6 +420,17 @@ impl TaskManager {
 
             let slot_ids = plan.slot_ids();
             let slot_id = slot_ids.first().copied();
+            let (task_epoch, phase_version) = match self.load_spec(plan.id).await {
+                Ok(current) => (
+                    current.task_epoch,
+                    if matches!(current.state, ContainerState::Running) {
+                        current.phase_version
+                    } else {
+                        current.phase_version.saturating_add(1)
+                    },
+                ),
+                Err(_) => (0, 1),
+            };
             let spec = TaskSpec {
                 id: plan.id,
                 name: plan.name.clone(),
@@ -438,6 +454,8 @@ impl TaskManager {
                 secret_files: plan.secret_files.clone(),
                 networks: plan.networks.clone(),
                 service_metadata: plan.service_metadata.clone(),
+                task_epoch,
+                phase_version,
             };
 
             if let Err(err) = self.persist_spec(&spec).await {

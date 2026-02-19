@@ -12,7 +12,7 @@ use crate::task::docker::ContainerError;
 use crate::task::docker::ContainerManager;
 use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata,
-    TaskSpec, TaskStateFilter, TaskValue,
+    TaskSpec, TaskStateFilter, TaskValue, TaskValueDraft,
 };
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
@@ -540,6 +540,7 @@ impl TaskManager {
         }
 
         let mut updated = spec.clone();
+        updated.phase_version = updated.phase_version.saturating_add(1);
         updated.state = ContainerState::Stopping;
         updated.phase_reason = None;
         updated.phase_progress = None;
@@ -810,30 +811,56 @@ pub(crate) fn select_best_task_value(values: &[TaskValue]) -> Option<TaskValue> 
     best.cloned()
 }
 
+/// Returns `true` when the incoming task value should replace the currently selected value.
+pub(crate) fn should_accept_incoming_task_value(current: &TaskValue, incoming: &TaskValue) -> bool {
+    compare_task_causality(current, incoming).is_gt()
+}
+
 fn should_prefer_task_value(current: &TaskValue, candidate: &TaskValue) -> bool {
+    if should_accept_incoming_task_value(current, candidate) {
+        return true;
+    }
+    if should_accept_incoming_task_value(candidate, current) {
+        return false;
+    }
+
+    candidate.node_id > current.node_id
+}
+
+/// Compares two task values by their causal ordering tuple.
+///
+/// The tuple is `(task_epoch, phase_version, timestamp, state_rank)` where larger is newer.
+pub(crate) fn compare_task_causality(
+    current: &TaskValue,
+    candidate: &TaskValue,
+) -> std::cmp::Ordering {
+    match candidate.task_epoch.cmp(&current.task_epoch) {
+        std::cmp::Ordering::Equal => {}
+        order => return order,
+    }
+    match candidate.phase_version.cmp(&current.phase_version) {
+        std::cmp::Ordering::Equal => {}
+        order => return order,
+    }
     match (
         parse_task_timestamp(&current.updated_at, &current.created_at),
         parse_task_timestamp(&candidate.updated_at, &candidate.created_at),
     ) {
         (Some(current_ts), Some(candidate_ts)) => {
             if candidate_ts > current_ts {
-                return true;
+                return std::cmp::Ordering::Greater;
             } else if candidate_ts < current_ts {
-                return false;
+                return std::cmp::Ordering::Less;
             }
         }
-        (None, Some(_)) => return true,
-        (Some(_), None) => return false,
+        (None, Some(_)) => return std::cmp::Ordering::Greater,
+        (Some(_), None) => return std::cmp::Ordering::Less,
         (None, None) => {}
     }
 
     let current_rank = task_state_rank(&current.state);
     let candidate_rank = task_state_rank(&candidate.state);
-    match candidate_rank.cmp(&current_rank) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => candidate.node_id > current.node_id,
-    }
+    candidate_rank.cmp(&current_rank)
 }
 
 fn parse_task_timestamp(updated_at: &str, created_at: &str) -> Option<DateTime<Utc>> {
@@ -920,5 +947,38 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         secret_files: value.secret_files,
         networks: value.networks,
         service_metadata: value.service_metadata,
+        task_epoch: value.task_epoch,
+        phase_version: value.phase_version,
     }
+}
+
+/// Converts one task specification into its persisted CRDT value representation.
+pub(crate) fn spec_to_value(spec: &TaskSpec) -> TaskValue {
+    let mut value = TaskValue::new(TaskValueDraft {
+        id: spec.id,
+        name: spec.name.clone(),
+        image: spec.image.clone(),
+        state: spec.state.clone(),
+        phase_reason: spec.phase_reason.clone(),
+        phase_progress: spec.phase_progress.clone(),
+        created_at: spec.created_at.clone(),
+        updated_at: spec.updated_at.clone(),
+        command: spec.command.clone(),
+        node_id: spec.node_id,
+        node_name: spec.node_name.clone(),
+        slot_ids: spec.slot_ids.clone(),
+        networks: spec.networks.clone(),
+        cpu_millis: spec.cpu_millis,
+        memory_bytes: spec.memory_bytes,
+        gpu_count: spec.gpu_count,
+        gpu_device_ids: spec.gpu_device_ids.clone(),
+        env: spec.env.clone(),
+        secret_files: spec.secret_files.clone(),
+        service_metadata: spec.service_metadata.clone(),
+        task_epoch: spec.task_epoch,
+        phase_version: spec.phase_version,
+    });
+
+    value.restart_policy = spec.restart_policy.clone();
+    value
 }
