@@ -1326,6 +1326,95 @@ async fn reconcile_local_slot_reservations_releases_stale_local_slots() {
 }
 
 #[tokio::test]
+async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let winner = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start winner container");
+    let contested_slot = winner.slot_ids[0];
+
+    let now = Utc::now().to_rfc3339();
+    let loser_id = Uuid::new_v4();
+    let loser = TaskSpec {
+        id: loser_id,
+        name: "svc-loser".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.clone(),
+        updated_at: now,
+        command: Vec::new(),
+        node_id: manager.local_node_id,
+        node_name: "node".to_string(),
+        slot_ids: vec![contested_slot],
+        slot_id: Some(contested_slot),
+        cpu_millis: 200,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 3,
+    };
+    manager.persist_spec(&loser).await.expect("persist loser");
+
+    manager
+        .reconcile_local_slot_reservations()
+        .await
+        .expect("reconcile local slot reservations");
+
+    if let Ok(updated_loser) = manager.load_spec(loser_id).await {
+        assert!(
+            matches!(
+                updated_loser.state,
+                ContainerState::Stopping | ContainerState::Stopped
+            ),
+            "conflicting local task should be demoted for draining"
+        );
+        assert!(
+            updated_loser.slot_ids.is_empty(),
+            "demoted conflicting task should no longer claim scheduler slots"
+        );
+        assert!(
+            updated_loser.gpu_device_ids.is_empty(),
+            "demoted conflicting task should no longer claim scheduler gpus"
+        );
+    }
+
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    let state = snapshot
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == contested_slot)
+        .map(|slot| slot.state.clone())
+        .expect("contested slot present");
+    match state {
+        SlotState::Reserved(reservation) => {
+            assert_eq!(reservation.owner, manager.local_node_id);
+            assert_eq!(
+                reservation.task_id,
+                Some(winner.id),
+                "slot reservation should remain attached to deterministic winner"
+            );
+        }
+        SlotState::Free => panic!("conflicted slot should remain reserved by winner"),
+    }
+}
+
+#[tokio::test]
 async fn start_container_reserves_multiple_slots_when_needed() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 

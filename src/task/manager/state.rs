@@ -1811,9 +1811,40 @@ impl TaskManager {
                 .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
 
             let mut desired: HashMap<SlotId, Uuid> = HashMap::new();
-            let mut conflicts: HashSet<SlotId> = HashSet::new();
             let mut desired_gpus: HashMap<String, Uuid> = HashMap::new();
-            let mut gpu_conflicts: HashSet<String> = HashSet::new();
+
+            // Keep the currently reserved local owner as a deterministic tie-breaker for
+            // conflicting local task claims so reconciliation converges to one winner.
+            let current_slot_owner: HashMap<SlotId, Uuid> = snapshot
+                .slots
+                .iter()
+                .filter_map(|slot| match &slot.state {
+                    SlotState::Reserved(reservation)
+                        if reservation.owner == self.local_node_id
+                            && reservation.task_id.is_some() =>
+                    {
+                        reservation.task_id.map(|task_id| (slot.slot_id, task_id))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let current_gpu_owner: HashMap<String, Uuid> = snapshot
+                .gpu_devices
+                .iter()
+                .filter_map(|device| match &device.state {
+                    crate::scheduler::GpuDeviceState::Reserved(reservation)
+                        if reservation.owner == self.local_node_id
+                            && reservation.task_id.is_some() =>
+                    {
+                        reservation
+                            .task_id
+                            .map(|task_id| (device.device_id.clone(), task_id))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            let mut local_tasks: HashMap<Uuid, TaskValue> = HashMap::new();
 
             for (key, values) in actives {
                 let Some(value) = select_best_task_value(values.as_slice()) else {
@@ -1830,43 +1861,86 @@ impl TaskManager {
                 }
 
                 let task_id = key.to_uuid();
+                local_tasks.insert(task_id, value);
+            }
+
+            let mut task_ids: Vec<Uuid> = local_tasks.keys().copied().collect();
+            task_ids.sort_unstable();
+
+            let mut conflicting_tasks: HashSet<Uuid> = HashSet::new();
+            for task_id in task_ids {
+                let Some(value) = local_tasks.get(&task_id) else {
+                    continue;
+                };
+
                 for slot_id in &value.slot_ids {
-                    if conflicts.contains(slot_id) {
+                    let Some(existing) = desired.get(slot_id).copied() else {
+                        desired.insert(*slot_id, task_id);
+                        continue;
+                    };
+
+                    if existing == task_id {
                         continue;
                     }
-                    if let Some(existing) = desired.insert(*slot_id, task_id) {
-                        conflicts.insert(*slot_id);
-                        desired.remove(slot_id);
-                        warn!(
-                            target: "task",
-                            slot_id = *slot_id,
-                            task_a = %existing,
-                            task_b = %task_id,
-                            "slot conflict detected while reconciling reservations"
-                        );
-                    }
-                }
 
-                if value.gpu_device_ids.is_empty() {
-                    continue;
+                    let reserved = current_slot_owner.get(slot_id).copied();
+                    let winner =
+                        pick_conflict_task_winner(existing, task_id, &local_tasks, reserved);
+                    let loser = if winner == existing {
+                        task_id
+                    } else {
+                        existing
+                    };
+                    desired.insert(*slot_id, winner);
+                    conflicting_tasks.insert(loser);
+                    warn!(
+                        target: "task",
+                        slot_id = *slot_id,
+                        task_a = %existing,
+                        task_b = %task_id,
+                        winner = %winner,
+                        loser = %loser,
+                        "slot conflict detected while reconciling reservations"
+                    );
                 }
 
                 for device_id in &value.gpu_device_ids {
-                    if gpu_conflicts.contains(device_id) {
+                    let Some(existing) = desired_gpus.get(device_id).copied() else {
+                        desired_gpus.insert(device_id.clone(), task_id);
+                        continue;
+                    };
+
+                    if existing == task_id {
                         continue;
                     }
-                    if let Some(existing) = desired_gpus.insert(device_id.clone(), task_id) {
-                        gpu_conflicts.insert(device_id.clone());
-                        desired_gpus.remove(device_id);
-                        warn!(
-                            target: "task",
-                            device_id = device_id.as_str(),
-                            task_a = %existing,
-                            task_b = %task_id,
-                            "gpu device conflict detected while reconciling reservations"
-                        );
-                    }
+
+                    let reserved = current_gpu_owner.get(device_id).copied();
+                    let winner =
+                        pick_conflict_task_winner(existing, task_id, &local_tasks, reserved);
+                    let loser = if winner == existing {
+                        task_id
+                    } else {
+                        existing
+                    };
+                    desired_gpus.insert(device_id.clone(), winner);
+                    conflicting_tasks.insert(loser);
+                    warn!(
+                        target: "task",
+                        device_id = device_id.as_str(),
+                        task_a = %existing,
+                        task_b = %task_id,
+                        winner = %winner,
+                        loser = %loser,
+                        "gpu device conflict detected while reconciling reservations"
+                    );
                 }
+            }
+
+            if !conflicting_tasks.is_empty() {
+                // Resolve local duplicate claimers eagerly so they stop re-contending on every
+                // periodic reconcile tick.
+                self.demote_conflicting_local_tasks(&local_tasks, &conflicting_tasks)
+                    .await;
             }
 
             let mut release_slots = Vec::new();
@@ -2021,6 +2095,94 @@ impl TaskManager {
             }
         }
     }
+
+    /// Demotes local tasks that lost deterministic slot/GPU conflict resolution so they stop
+    /// asserting stale resource claims and can be drained by the normal stop reconciliation path.
+    async fn demote_conflicting_local_tasks(
+        &self,
+        local_tasks: &HashMap<Uuid, TaskValue>,
+        conflicting_tasks: &HashSet<Uuid>,
+    ) {
+        let mut task_ids: Vec<Uuid> = conflicting_tasks.iter().copied().collect();
+        task_ids.sort_unstable();
+
+        for task_id in task_ids {
+            let Some(value) = local_tasks.get(&task_id) else {
+                continue;
+            };
+            if value.node_id != self.local_node_id {
+                continue;
+            }
+
+            let mut spec = value_to_spec(task_id, value.clone());
+            let mut changed = false;
+
+            if !matches!(
+                spec.state,
+                ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
+            ) {
+                spec.phase_version = spec.phase_version.saturating_add(1);
+                spec.state = ContainerState::Stopping;
+                spec.phase_reason =
+                    Some("superseded by local slot conflict resolution".to_string());
+                spec.phase_progress = None;
+                changed = true;
+            }
+
+            if !spec.slot_ids.is_empty() || spec.slot_id.is_some() {
+                spec.slot_ids.clear();
+                spec.slot_id = None;
+                changed = true;
+            }
+
+            if !spec.gpu_device_ids.is_empty() {
+                spec.gpu_device_ids.clear();
+                changed = true;
+            }
+
+            if !changed {
+                continue;
+            }
+
+            spec.updated_at = Utc::now().to_rfc3339();
+            if let Err(err) = self.persist_spec(&spec).await {
+                warn!(
+                    target: "task",
+                    task = %task_id,
+                    "failed to persist conflict demotion for local task: {err}"
+                );
+                continue;
+            }
+            if let Err(err) = self
+                .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    task = %task_id,
+                    "failed to gossip conflict demotion for local task: {err}"
+                );
+            }
+
+            if let Some(reconcile_guard) = self.try_begin_reconcile(spec.id).await {
+                let manager = self.clone();
+                let spec_for_reconcile = spec.clone();
+                tokio::task::spawn_local(async move {
+                    let _reconcile_guard = reconcile_guard;
+                    if let Err(err) = manager
+                        .reconcile_local_task(spec_for_reconcile.clone())
+                        .await
+                    {
+                        warn!(
+                            target: "task",
+                            task = %spec_for_reconcile.id,
+                            "failed to reconcile demoted conflicting task: {err}"
+                        );
+                    }
+                });
+            }
+        }
+    }
 }
 
 /// Returns true when a task value has been updated within the provided grace window.
@@ -2065,6 +2227,51 @@ fn is_stale_phase_regression(current: &ContainerState, requested: &ContainerStat
             | ContainerState::Exited(_)
             | ContainerState::Unknown
     )
+}
+
+/// Selects one deterministic winner between two local tasks that currently claim the same
+/// scheduler slot/GPU, preferring the already reserved owner when available.
+fn pick_conflict_task_winner(
+    current: Uuid,
+    candidate: Uuid,
+    tasks: &HashMap<Uuid, TaskValue>,
+    reserved_owner: Option<Uuid>,
+) -> Uuid {
+    if let Some(owner) = reserved_owner {
+        if owner == current || owner == candidate {
+            return owner;
+        }
+    }
+
+    let Some(current_value) = tasks.get(&current) else {
+        return current.min(candidate);
+    };
+    let Some(candidate_value) = tasks.get(&candidate) else {
+        return current.min(candidate);
+    };
+
+    let current_rank = conflict_state_rank(&current_value.state);
+    let candidate_rank = conflict_state_rank(&candidate_value.state);
+    match candidate_rank.cmp(&current_rank) {
+        std::cmp::Ordering::Greater => candidate,
+        std::cmp::Ordering::Less => current,
+        std::cmp::Ordering::Equal => current.min(candidate),
+    }
+}
+
+/// Produces a local conflict-resolution priority where actively serving states outrank
+/// provisioning and teardown states.
+fn conflict_state_rank(state: &ContainerState) -> u8 {
+    match state {
+        ContainerState::Running | ContainerState::Paused => 4,
+        ContainerState::Creating | ContainerState::Pulling => 3,
+        ContainerState::Pending => 2,
+        ContainerState::Stopping => 1,
+        ContainerState::Stopped
+        | ContainerState::Failed
+        | ContainerState::Exited(_)
+        | ContainerState::Unknown => 0,
+    }
 }
 
 /// Computes bounded exponential backoff with jitter for image pull retries.

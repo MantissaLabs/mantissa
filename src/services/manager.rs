@@ -50,6 +50,11 @@ const SERVICE_SLOT_MISSING_GRACE_SECS: u64 = 6;
 const SERVICE_REBALANCE_MIN_AGE_SECS: i64 = 20;
 /// Cooldown window between rebalance attempts for the same slot.
 const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
+/// Proactive post-deploy rebalancing is disabled by default to keep placement stable once healthy.
+///
+/// Slots should converge deterministically at deployment/startup time; running replicas are only
+/// replaced on health or ownership faults, not for opportunistic migration.
+const SERVICE_ENABLE_PROACTIVE_REBALANCE: bool = false;
 #[derive(Clone)]
 pub struct ServiceController {
     registry: ServiceRegistry,
@@ -548,6 +553,10 @@ impl ServiceController {
         // Deployment reconciliation should heal missing/failed slots, but avoid proactive
         // rebalancing until the service is fully running to prevent startup churn.
         if spec.status() != ServiceStatus::Running {
+            return Ok(());
+        }
+
+        if !SERVICE_ENABLE_PROACTIVE_REBALANCE {
             return Ok(());
         }
 
