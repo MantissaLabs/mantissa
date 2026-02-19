@@ -21,6 +21,8 @@ pub type TaskStoreInner =
 pub type TaskStore = Arc<TaskStoreInner>;
 
 pub fn open_task_store(db: Arc<redb::Database>, actor: Uuid) -> std::io::Result<TaskStore> {
-    let inner = TaskStoreInner::open(db, actor)?;
+    let inner = TaskStoreInner::builder(db, actor)
+        .with_preserve_local_tombs(true)
+        .build()?;
     Ok(Arc::new(inner))
 }

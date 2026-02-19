@@ -268,20 +268,24 @@ impl TaskManager {
             guard.get(&spec.id).cloned()
         };
 
-        let Some(tombstone) = tombstone else {
-            return false;
-        };
+        if let Some(tombstone) = tombstone {
+            if spec.task_epoch > tombstone.max_epoch {
+                self.clear_remove_watermark(spec.id).await;
+                return false;
+            }
 
-        if spec.task_epoch > tombstone.max_epoch {
-            self.clear_remove_watermark(spec.id).await;
-            return false;
-        }
-
-        if spec.task_epoch < tombstone.max_epoch {
             return true;
         }
 
-        true
+        let key = UuidKey::from(spec.id);
+        self.store.has_tombstone(&key).unwrap_or_else(|err| {
+            warn!(
+                target: "task",
+                task = %spec.id,
+                "failed to check task tombstone while filtering upsert: {err}"
+            );
+            false
+        })
     }
 
     /// Returns true when one telemetry counter sample should emit a diagnostic log.

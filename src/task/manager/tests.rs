@@ -2272,6 +2272,126 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
     assert_eq!(after_fresh[0].id, fresh.id);
 }
 
+#[tokio::test]
+async fn stale_upsert_after_remove_without_watermark_is_ignored_by_durable_tombstone() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut original = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    manager
+        .remove_spec(original.id)
+        .await
+        .expect("remove task spec");
+    manager.clear_remove_watermark(original.id).await;
+
+    original.node_id = Uuid::new_v4();
+    original.node_name = "remote-node".to_string();
+    original.state = ContainerState::Stopping;
+
+    manager
+        .handle_event(TaskEvent::Upsert(Box::new(original.clone())))
+        .await
+        .expect("stale upsert should be handled");
+    let after_stale = manager
+        .list_tasks(&TaskStateFilter::all())
+        .await
+        .expect("list after stale upsert");
+    assert!(
+        after_stale.is_empty(),
+        "durable tombstone should block stale upsert replay without in-memory watermark"
+    );
+}
+
+#[tokio::test]
+async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let original = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    manager
+        .remove_spec(original.id)
+        .await
+        .expect("remove task spec");
+    manager.clear_remove_watermark(original.id).await;
+
+    let remote_node = Uuid::new_v4();
+    let stale_delta = TaskValue::new(TaskValueDraft {
+        id: original.id,
+        name: original.name.clone(),
+        image: original.image.clone(),
+        state: ContainerState::Stopping,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: original.created_at.clone(),
+        updated_at: (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339(),
+        command: original.command.clone(),
+        node_id: remote_node,
+        node_name: "remote-node".to_string(),
+        slot_ids: vec![1],
+        networks: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        service_metadata: None,
+        task_epoch: original.task_epoch,
+        phase_version: original.phase_version,
+    });
+
+    let (remote_db, _remote_dir) = temp_db("tasks-sync-tomb");
+    let remote_store = open_task_store(remote_db, Uuid::new_v4()).expect("open remote task store");
+    remote_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild remote task store");
+    remote_store
+        .upsert(&UuidKey::from(original.id), stale_delta)
+        .await
+        .expect("write stale value to remote store");
+
+    let remote_ranges = remote_store
+        .page_range_summary()
+        .await
+        .expect("remote page ranges");
+    let (regs, tombs) = remote_store
+        .export_page_ranges_delta(&remote_ranges)
+        .expect("export remote delta");
+    manager
+        .store
+        .apply_delta_chunk_update_mst(regs, tombs)
+        .await
+        .expect("apply stale delta to local store");
+
+    let after_stale = manager
+        .list_tasks(&TaskStateFilter::all())
+        .await
+        .expect("list after stale delta");
+    assert!(
+        after_stale.is_empty(),
+        "local tombstone should block stale delta replay for removed task rows"
+    );
+}
+
 /// Builds a remote-owned task specification for ordering and sync/gossip conflict tests.
 fn build_remote_task_spec(
     id: Uuid,

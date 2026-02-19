@@ -242,7 +242,9 @@ impl TaskManager {
                     value.task_epoch,
                 )
             })
-            .unwrap_or_else(|| (Utc::now(), 0));
+            // If we did not observe a register value, treat the remove as authoritative for all
+            // epochs so late stale upserts cannot resurrect an unknown/deleted row.
+            .unwrap_or_else(|| (Utc::now(), u64::MAX));
 
         self.store
             .remove(&key)

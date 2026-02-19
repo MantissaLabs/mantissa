@@ -157,6 +157,15 @@ where
             .is_some())
     }
 
+    /// Return whether a tombstone currently exists for key `k`.
+    pub fn has_tombstone(&self, k: &C::Key) -> crate::Result<bool> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let t = r.open_table(T::tombs()).map_err(into_err)?;
+        Ok(t.get(Self::encode_key(k).as_slice())
+            .map_err(into_err)?
+            .is_some())
+    }
+
     #[inline]
     fn encode_reg(r: &C::Reg) -> crate::Result<Vec<u8>> {
         bincode::serialize(r).map_err(into_err)
