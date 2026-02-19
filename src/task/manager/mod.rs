@@ -433,8 +433,6 @@ impl TaskManager {
                         .map(|spec| spec.expect("missing task spec after execution"))
                         .collect();
 
-                    self.broadcast_remote_specs(&specs).await;
-
                     return Ok(specs);
                 }
                 Err(err) => {

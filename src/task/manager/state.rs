@@ -352,27 +352,6 @@ impl TaskManager {
         self.tx.clone()
     }
 
-    /// Broadcasts specs originating from remote peers to the local gossip loop.
-    pub(super) async fn broadcast_remote_specs(&self, specs: &[TaskSpec]) {
-        for spec in specs {
-            if spec.node_id == self.local_node_id {
-                continue;
-            }
-
-            if let Err(err) = self
-                .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to relay task {} from node {}: {err}",
-                    spec.name,
-                    spec.node_id
-                );
-            }
-        }
-    }
-
     /// Ensures that slots that no longer correspond to running containers are released.
     pub(super) async fn cleanup_orphaned_slots(&self) {
         const MAX_ATTEMPTS: usize = 5;
