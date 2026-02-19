@@ -2173,21 +2173,14 @@ impl TaskManager {
             }
 
             if let Some(reconcile_guard) = self.try_begin_reconcile(spec.id).await {
-                let manager = self.clone();
-                let spec_for_reconcile = spec.clone();
-                tokio::task::spawn_local(async move {
-                    let _reconcile_guard = reconcile_guard;
-                    if let Err(err) = manager
-                        .reconcile_local_task(spec_for_reconcile.clone())
-                        .await
-                    {
-                        warn!(
-                            target: "task",
-                            task = %spec_for_reconcile.id,
-                            "failed to reconcile demoted conflicting task: {err}"
-                        );
-                    }
-                });
+                let _reconcile_guard = reconcile_guard;
+                if let Err(err) = self.reconcile_local_task(spec.clone()).await {
+                    warn!(
+                        target: "task",
+                        task = %spec.id,
+                        "failed to reconcile demoted conflicting task: {err}"
+                    );
+                }
             }
         }
     }
