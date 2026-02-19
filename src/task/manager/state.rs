@@ -225,10 +225,20 @@ impl TaskManager {
 
     /// Removes a task snapshot from the store.
     pub(super) async fn remove_spec(&self, id: Uuid) -> Result<(), anyhow::Error> {
+        let key = UuidKey::from(id);
+        let watermark = self
+            .store
+            .get_snapshot(&key)
+            .map_err(|e| anyhow::anyhow!("task lookup failed before remove: {e}"))?
+            .and_then(|snapshot| select_best_task_value(snapshot.as_slice()))
+            .and_then(|value| super::parse_task_timestamp(&value.updated_at, &value.created_at))
+            .unwrap_or_else(Utc::now);
+
         self.store
-            .remove(&UuidKey::from(id))
+            .remove(&key)
             .await
             .map_err(|e| anyhow::anyhow!("task remove failed: {e}"))?;
+        self.record_remove_watermark(id, watermark).await;
         Ok(())
     }
 
@@ -834,11 +844,13 @@ impl TaskManager {
                     .await
                 {
                     Ok(info) => Ok(resolve_id(desired_name, info)),
-                    Err(ContainerError::NotFound(_)) => Ok(None),
+                    Err(ContainerError::NotFound(_)) => {
+                        self.find_container_id_by_name(&desired_name).await
+                    }
                     Err(err) => Err(err),
                 }
             }
-            Err(ContainerError::NotFound(_)) => Ok(None),
+            Err(ContainerError::NotFound(_)) => self.find_container_id_by_name(&desired_name).await,
             Err(err) => Err(err),
         }
     }
@@ -1156,6 +1168,27 @@ impl TaskManager {
             return Err(err);
         }
 
+        // Stop-path updates may race with launch while create/start/attach is in-flight.
+        // Re-read desired state before committing Running so stop/remove intent always wins.
+        match self.load_spec(working.id).await {
+            Ok(latest) => {
+                if matches!(
+                    latest.state,
+                    ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
+                ) {
+                    self.abort_launched_container(working.id, &container_id)
+                        .await;
+                    return Ok(());
+                }
+                working = latest;
+            }
+            Err(_) => {
+                self.abort_launched_container(working.id, &container_id)
+                    .await;
+                return Ok(());
+            }
+        }
+
         working.state = ContainerState::Running;
         working.phase_reason = None;
         working.phase_progress = None;
@@ -1225,6 +1258,35 @@ impl TaskManager {
         }
 
         Ok(())
+    }
+
+    /// Best-effort rollback when startup raced with a newer stop/remove intent.
+    async fn abort_launched_container(&self, task_id: Uuid, container_id: &str) {
+        self.local_containers.lock().await.remove(&task_id);
+        if let Err(err) = self
+            .container_manager
+            .stop_container(container_id, Some(Duration::from_secs(10)))
+            .await
+        {
+            warn!(
+                target: "task",
+                task = %task_id,
+                container = %container_id,
+                "failed to stop container while aborting launch: {err}"
+            );
+        }
+        if let Err(err) = self
+            .container_manager
+            .remove_container(container_id, true, true)
+            .await
+        {
+            warn!(
+                target: "task",
+                task = %task_id,
+                container = %container_id,
+                "failed to remove container while aborting launch: {err}"
+            );
+        }
     }
 
     /// Resolves an existing container identifier when a create call hit a name conflict.

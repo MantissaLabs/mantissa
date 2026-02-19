@@ -46,6 +46,8 @@ use self::secrets::TaskSecretArtifacts;
 
 /// Maximum number of concurrent image pulls executed per node.
 const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
+/// Retention window for remove watermarks used to suppress stale upsert replay.
+const REMOVE_WATERMARK_RETENTION_SECS: i64 = 30 * 60;
 
 /// Runtime loop cadence configuration for the task manager reconciliation workers.
 #[derive(Clone, Copy, Debug)]
@@ -78,6 +80,7 @@ pub struct TaskManager {
     local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
     inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
     inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
+    removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, DateTime<Utc>>>>,
     pull_limiter: Arc<Semaphore>,
     registry: Registry,
     secret_registry: SecretRegistry,
@@ -173,6 +176,7 @@ impl TaskManager {
             local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
             inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
             inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
+            removed_task_watermarks: Arc::new(AsyncMutex::new(HashMap::new())),
             pull_limiter: Arc::new(Semaphore::new(IMAGE_PULL_MAX_CONCURRENCY)),
             registry,
             network_registry,
@@ -210,6 +214,49 @@ impl TaskManager {
             task_id,
             inflight: self.inflight_reconciles.clone(),
         })
+    }
+
+    /// Records the latest remove watermark used to suppress stale remote task upserts.
+    async fn record_remove_watermark(&self, task_id: Uuid, watermark: DateTime<Utc>) {
+        let mut guard = self.removed_task_watermarks.lock().await;
+        let cutoff = Utc::now() - chrono::Duration::seconds(REMOVE_WATERMARK_RETENTION_SECS);
+        guard.retain(|_, ts| *ts >= cutoff);
+        match guard.get_mut(&task_id) {
+            Some(current) => {
+                if watermark > *current {
+                    *current = watermark;
+                }
+            }
+            None => {
+                guard.insert(task_id, watermark);
+            }
+        }
+    }
+
+    /// Clears the remove watermark once a fresh task incarnation has been accepted.
+    async fn clear_remove_watermark(&self, task_id: Uuid) {
+        self.removed_task_watermarks.lock().await.remove(&task_id);
+    }
+
+    /// Returns true when an inbound upsert should be ignored because it predates a known remove.
+    async fn should_ignore_removed_upsert(&self, spec: &TaskSpec) -> bool {
+        let watermark = {
+            let guard = self.removed_task_watermarks.lock().await;
+            guard.get(&spec.id).cloned()
+        };
+
+        let Some(watermark) = watermark else {
+            return false;
+        };
+
+        let incoming_ts = parse_task_timestamp(&spec.updated_at, &spec.created_at);
+        match incoming_ts {
+            Some(incoming_ts) if incoming_ts > watermark => {
+                self.clear_remove_watermark(spec.id).await;
+                false
+            }
+            _ => true,
+        }
     }
 
     #[allow(dead_code)]

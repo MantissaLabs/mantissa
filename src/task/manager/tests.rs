@@ -889,6 +889,58 @@ async fn reconcile_running_task_restarts_when_container_is_missing() {
 }
 
 #[tokio::test]
+async fn reconcile_running_task_keeps_running_when_list_finds_container() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    assert!(matches!(spec.state, ContainerState::Running));
+    assert_eq!(mock_cm.created.lock().await.len(), 1);
+
+    {
+        let mut inspect = mock_cm.inspect.lock().await;
+        inspect.clear();
+    }
+    {
+        let mut listed = mock_cm.listed.lock().await;
+        listed.clear();
+        listed.push(crate::task::docker::ContainerInfo {
+            id: "container-0".to_string(),
+            name: format!("mantissa-{}", spec.id),
+            image: "img".to_string(),
+            status: "Up".to_string(),
+            state: "running".to_string(),
+            created: 1,
+        });
+    }
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("reconcile should keep running task");
+
+    let created = mock_cm.created.lock().await.clone();
+    assert_eq!(created.len(), 1, "task runtime should not be recreated");
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load refreshed spec");
+    assert!(
+        matches!(refreshed.state, ContainerState::Running),
+        "task should remain running when runtime listing confirms container"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_running_task_retries_create_after_stale_name_conflict() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
@@ -1875,6 +1927,63 @@ async fn remove_event_purges_remote_attachment_without_local_spec() {
             .is_empty(),
         "remove event should purge stale replicated attachment rows even without a local spec"
     );
+}
+
+#[tokio::test]
+async fn stale_upsert_after_remove_watermark_is_ignored_until_fresher_version() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut original = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    manager
+        .remove_spec(original.id)
+        .await
+        .expect("remove task spec");
+
+    original.node_id = Uuid::new_v4();
+    original.node_name = "remote-node".to_string();
+    original.state = ContainerState::Stopping;
+
+    manager
+        .handle_event(TaskEvent::Upsert(Box::new(original.clone())))
+        .await
+        .expect("stale upsert should be handled");
+    let after_stale = manager
+        .list_tasks(&TaskStateFilter::all())
+        .await
+        .expect("list after stale upsert");
+    assert!(
+        after_stale.is_empty(),
+        "stale upsert should not recreate removed task rows"
+    );
+
+    let mut fresh = original.clone();
+    fresh.state = ContainerState::Running;
+    fresh.updated_at = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+
+    manager
+        .handle_event(TaskEvent::Upsert(Box::new(fresh.clone())))
+        .await
+        .expect("fresh upsert should be accepted");
+    let after_fresh = manager
+        .list_tasks(&TaskStateFilter::all())
+        .await
+        .expect("list after fresh upsert");
+    assert_eq!(
+        after_fresh.len(),
+        1,
+        "fresher upsert should recreate the row"
+    );
+    assert_eq!(after_fresh[0].id, fresh.id);
 }
 
 #[tokio::test]

@@ -5,7 +5,7 @@ use chrono::Utc;
 use crdt_store::uuid_key::UuidKey;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::config;
@@ -382,10 +382,19 @@ impl TaskManager {
     }
 
     /// Handles a gossip event by updating local state and reconciling as needed.
-    async fn handle_event(&self, event: TaskEvent) -> Result<(), anyhow::Error> {
+    pub(super) async fn handle_event(&self, event: TaskEvent) -> Result<(), anyhow::Error> {
         match event {
             TaskEvent::Upsert(spec_box) => {
                 let spec = *spec_box;
+                if self.should_ignore_removed_upsert(&spec).await {
+                    debug!(
+                        target: "task",
+                        task = %spec.id,
+                        state = ?spec.state,
+                        "ignoring stale task upsert after remove watermark"
+                    );
+                    return Ok(());
+                }
                 let belongs = spec.node_id == self.local_node_id;
                 self.persist_spec(&spec).await?;
 
