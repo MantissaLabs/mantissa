@@ -243,6 +243,7 @@ impl TaskManager {
             .await
             .map_err(|e| anyhow::anyhow!("task remove failed: {e}"))?;
         self.record_remove_watermark(id, watermark).await;
+        self.clear_task_diag_stats(id).await;
         Ok(())
     }
 

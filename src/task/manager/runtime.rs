@@ -24,7 +24,7 @@ use crate::task::docker::ContainerRuntimeEvent;
 use crate::task::types::{TaskEvent, TaskServiceMetadata};
 
 use super::TaskManager;
-use super::{select_best_task_value, should_accept_incoming_task_value, spec_to_value};
+use super::{compare_task_causality, select_best_task_value, spec_to_value};
 
 /// Maximum attempts when provisioning one runtime attachment.
 const ATTACHMENT_PROVISION_MAX_ATTEMPTS: usize = 4;
@@ -387,6 +387,8 @@ impl TaskManager {
             TaskEvent::Upsert(spec_box) => {
                 let spec = *spec_box;
                 if self.should_ignore_removed_upsert(&spec).await {
+                    self.record_stale_upsert_drop_telemetry(&spec, "remove_watermark")
+                        .await;
                     debug!(
                         target: "task",
                         task = %spec.id,
@@ -402,7 +404,10 @@ impl TaskManager {
                     .map_err(|e| anyhow::anyhow!("task lookup failed before upsert apply: {e}"))?
                 {
                     if let Some(current) = select_best_task_value(snapshot.as_slice()) {
-                        if !should_accept_incoming_task_value(&current, &incoming) {
+                        let ordering = compare_task_causality(&current, &incoming);
+                        if !ordering.is_gt() {
+                            self.record_causal_conflict_telemetry(&current, &incoming, ordering)
+                                .await;
                             debug!(
                                 target: "task",
                                 task = %spec.id,
@@ -412,6 +417,7 @@ impl TaskManager {
                                 incoming_phase_version = incoming.phase_version,
                                 current_state = ?current.state,
                                 incoming_state = ?incoming.state,
+                                relation = %Self::causal_order_label(ordering),
                                 "ignoring stale or duplicate task upsert by causal ordering"
                             );
                             return Ok(());

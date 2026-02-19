@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use topology::PeerHandle;
@@ -89,6 +90,8 @@ const MAX_GOSSIP_BATCH_MESSAGES: usize = 32;
 const GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
 /// Time window used to suppress duplicate gossip identifiers.
 const GOSSIP_DEDUPE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Process-wide counter tracking how many outbound task gossip updates were coalesced.
+static GOSSIP_COALESCED_TASK_UPDATES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Coalesces one pending outbound gossip batch by task identifier.
 ///
@@ -496,13 +499,27 @@ pub(crate) async fn start<C>(
                 let before_count = pending.len();
                 let (mut pending, coalesced_task_updates) = coalesce_pending_messages(pending);
                 if coalesced_task_updates > 0 {
+                    let total_coalesced_task_updates = GOSSIP_COALESCED_TASK_UPDATES_TOTAL
+                        .fetch_add(coalesced_task_updates as u64, AtomicOrdering::Relaxed)
+                        + coalesced_task_updates as u64;
                     debug!(
                         target: "diag.gossip.coalesce",
                         before_count,
                         after_count = pending.len(),
                         coalesced_task_updates,
+                        total_coalesced_task_updates,
                         "coalesced outbound task gossip updates"
                     );
+                    if should_emit_diag_sample(total_coalesced_task_updates) {
+                        warn!(
+                            target: "diag.gossip.coalesce",
+                            before_count,
+                            after_count = pending.len(),
+                            coalesced_task_updates,
+                            total_coalesced_task_updates,
+                            "coalesced outbound task gossip updates sampled"
+                        );
+                    }
                 }
 
                 let peers = match fanout {
@@ -657,6 +674,11 @@ where
 fn is_disconnected_capnp(error: &capnp::Error) -> bool {
     let text = error.to_string();
     text.contains("Disconnected") || text.contains("disconnected")
+}
+
+/// Returns true when one telemetry counter sample should emit a diagnostic log.
+fn should_emit_diag_sample(count: u64) -> bool {
+    count <= 3 || count.is_power_of_two() || count % 100 == 0
 }
 
 // Return true when the gossip message is about the provided peer identifier.
