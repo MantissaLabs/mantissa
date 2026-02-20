@@ -1728,7 +1728,16 @@ async fn list_tasks_respects_filters() {
 
 #[tokio::test]
 async fn start_container_fails_when_no_matching_slot() {
-    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    // Seed an initialized scheduler snapshot whose slot capacity cannot satisfy the request.
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(100, 32 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
 
     let result = manager
         .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
