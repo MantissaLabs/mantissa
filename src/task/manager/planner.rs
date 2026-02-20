@@ -19,9 +19,11 @@ use crate::task::types::{
 
 use super::{TaskManager, TaskStartRequest};
 
-/// Scheduling failures that indicate network readiness is blocking placement decisions.
+/// Scheduling failures that indicate transient prerequisites are blocking placement decisions.
 #[derive(Error, Debug)]
 pub(super) enum SchedulingError {
+    #[error("scheduler snapshot unavailable")]
+    SnapshotUnavailable,
     #[error("scheduler reservation failed: networks {networks:?} unavailable on any candidate")]
     NetworksUnavailable { networks: Vec<Uuid> },
     #[error("local node lacks required networks for task '{task}'")]
@@ -384,7 +386,7 @@ impl TaskManager {
             .scheduler
             .snapshot()
             .await
-            .ok_or_else(|| anyhow::anyhow!("scheduler snapshot unavailable"))?;
+            .ok_or(SchedulingError::SnapshotUnavailable)?;
 
         let local_version = snapshot.version;
         let readiness_map = self.collect_network_readiness()?;

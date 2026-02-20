@@ -414,26 +414,26 @@ impl TaskManager {
         let intents = Self::build_start_intents(requests)?;
 
         const MAX_ATTEMPTS: usize = 5;
-        const NETWORK_READINESS_MAX_ATTEMPTS: usize = 30;
+        const SCHEDULING_RETRY_MAX_ATTEMPTS: usize = 30;
         let mut attempt = 0usize;
-        let mut network_attempts = 0usize;
+        let mut scheduling_retry_attempts = 0usize;
 
         while attempt < MAX_ATTEMPTS {
             let assignment = match self.compute_assignment(&intents).await {
                 Ok(plan) => {
-                    network_attempts = 0;
+                    scheduling_retry_attempts = 0;
                     plan
                 }
                 Err(err) => {
-                    if is_network_readiness_error(&err) {
-                        network_attempts += 1;
-                        if network_attempts >= NETWORK_READINESS_MAX_ATTEMPTS {
+                    if is_retryable_scheduling_error(&err) {
+                        scheduling_retry_attempts += 1;
+                        if scheduling_retry_attempts >= SCHEDULING_RETRY_MAX_ATTEMPTS {
                             return Err(err.context("failed to compute scheduling plan"));
                         }
-                        let backoff = network_readiness_backoff(network_attempts);
+                        let backoff = scheduling_retry_backoff(scheduling_retry_attempts);
                         debug!(
                             target: "task",
-                            "network readiness blocked scheduling attempt {network_attempts}; retrying in {backoff:?}: {err}"
+                            "scheduling blocked on transient prerequisites (attempt {scheduling_retry_attempts}); retrying in {backoff:?}: {err}"
                         );
                         sleep(backoff).await;
                         continue;
@@ -750,13 +750,13 @@ impl TaskManager {
     }
 }
 
-/// Identify scheduling errors that indicate network readiness is delaying placement decisions.
-fn is_network_readiness_error(err: &anyhow::Error) -> bool {
+/// Identify scheduling errors that should be retried because prerequisites are still converging.
+fn is_retryable_scheduling_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| cause.is::<SchedulingError>())
 }
 
-/// Compute the retry backoff used when networks are still converging before scheduling tasks.
-fn network_readiness_backoff(attempt: usize) -> Duration {
+/// Compute the retry backoff used while scheduling prerequisites are still converging.
+fn scheduling_retry_backoff(attempt: usize) -> Duration {
     const BASE_MS: u64 = 200;
     const MAX_MS: u64 = 2_000;
 
