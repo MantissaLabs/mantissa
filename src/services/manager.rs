@@ -818,7 +818,7 @@ impl ServiceController {
             Err(err) => {
                 tracing::warn!(
                     target: "services",
-                    "initial task launch for service '{}' failed: {err}",
+                    "initial task launch for service '{}' failed: {err:#}",
                     service_name
                 );
 
@@ -1288,7 +1288,7 @@ impl ServiceController {
             Err(err) if has_targets => {
                 tracing::warn!(
                     target: "services",
-                    "pinned placement failed for {context}; retrying without targets: {err}"
+                    "pinned placement failed for {context}; retrying without targets: {err:#}"
                 );
                 for request in &mut requests {
                     request.target_node = None;

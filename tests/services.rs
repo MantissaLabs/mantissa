@@ -36,7 +36,8 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 local_test!(services_gossip_propagates_across_peers, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
 
     const SERVICE_NAME: &str = "demo-service";
     const MANIFEST_NAME: &str = "demo-manifest";
@@ -158,7 +159,8 @@ local_test!(services_gossip_propagates_across_peers, {
 });
 
 local_test!(services_submit_deployment_waits_for_task_ack, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
     let node = TestNode::new().await;
 
     let manifest_id = Uuid::new_v4();
@@ -240,7 +242,8 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
 });
 
 local_test!(services_deployment_exhausts_retries_and_fails, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
     let node = TestNode::new().await;
 
     let manifest_id = Uuid::new_v4();
@@ -319,7 +322,8 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
 });
 
 local_test!(services_deployment_replicates_across_cluster, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
 
     let cluster = match TestNode::new_cluster_tcp_with_tick(3, 100).await {
         Ok(cluster) => cluster,
@@ -432,7 +436,8 @@ local_test!(services_deployment_replicates_across_cluster, {
 });
 
 local_test!(services_placement_startup_avoids_over_replication, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -510,7 +515,8 @@ local_test!(services_placement_startup_avoids_over_replication, {
 local_test!(
     services_placement_balances_replicas_and_slot_reservations,
     {
-        let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+        let _guard =
+            ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
 
         let cfg = ClusterConfig {
             sync_tick_ms: Some(100),
@@ -652,7 +658,8 @@ local_test!(
 );
 
 local_test!(services_scale_out_balances_without_excess_replicas, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -787,7 +794,8 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
 });
 
 local_test!(services_large_deployment_converges_within_bound, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -874,7 +882,8 @@ local_test!(services_large_deployment_converges_within_bound, {
 });
 
 local_test!(services_stop_drains_stale_tasks_and_slots, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
     let node = TestNode::new().await;
 
     let service_name = "stop-drain";
@@ -1004,7 +1013,8 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
 });
 
 local_test!(services_stop_propagates_and_drains_three_nodes, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -1113,7 +1123,8 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
 });
 
 local_test!(services_sync_recovers_missing_entries, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -1219,7 +1230,8 @@ local_test!(services_sync_recovers_missing_entries, {
 });
 
 local_test!(services_redeploy_scales_replicas, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
     let node = TestNode::new().await;
 
     let service_name = "redeploy-scale";
@@ -1329,7 +1341,8 @@ local_test!(services_redeploy_scales_replicas, {
 });
 
 local_test!(services_redeploy_updates_resources, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager));
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
     let node = TestNode::new().await;
 
     let service_name = "redeploy-resources";

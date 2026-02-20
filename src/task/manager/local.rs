@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use chrono::Utc;
 use tracing::{debug, warn};
 
@@ -66,7 +66,6 @@ impl TaskManager {
         plans: &[BatchStartPlan],
     ) -> Result<Vec<TaskSpec>, anyhow::Error> {
         let mut specs = Vec::with_capacity(plans.len());
-        let mut persisted: Vec<TaskSpec> = Vec::new();
 
         for plan in plans {
             if plan.slots.is_empty() {
@@ -107,31 +106,34 @@ impl TaskManager {
                 task_epoch,
                 phase_version: 0,
             };
-
-            if let Err(err) = self.persist_spec(&spec).await {
-                for rollback in &persisted {
-                    let _ = self.remove_spec(rollback.id).await;
-                }
-                return Err(
-                    err.context(format!("failed to persist pending task spec {}", spec.name))
-                );
-            }
-
-            persisted.push(spec.clone());
             specs.push(spec);
         }
 
+        self.persist_specs_batch(&specs)
+            .await
+            .context("failed to persist pending task specs before launch")?;
+
+        let mut dropped = 0usize;
         for spec in &specs {
-            if let Err(err) = self
-                .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to enqueue pending task gossip for {}: {err}",
-                    spec.name
-                );
+            match self.enqueue_gossip_best_effort(TaskEvent::Upsert(Box::new(spec.clone()))) {
+                Ok(true) => {}
+                Ok(false) => dropped += 1,
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        "failed to enqueue pending task gossip for {}: {err}",
+                        spec.name
+                    );
+                }
             }
+        }
+        if dropped > 0 {
+            debug!(
+                target: "task",
+                dropped,
+                total = specs.len(),
+                "dropped pending task gossip updates due full queue; anti-entropy will reconcile"
+            );
         }
 
         Ok(specs)
@@ -408,7 +410,6 @@ impl TaskManager {
 
     async fn commit_batch(&self, plans: &[BatchStartPlan]) -> Result<Vec<TaskSpec>, anyhow::Error> {
         let mut specs = Vec::with_capacity(plans.len());
-        let mut persisted: Vec<TaskSpec> = Vec::new();
 
         for plan in plans {
             if plan.slots.is_empty() {
@@ -457,29 +458,34 @@ impl TaskManager {
                 task_epoch,
                 phase_version,
             };
-
-            if let Err(err) = self.persist_spec(&spec).await {
-                for rollback in &persisted {
-                    let _ = self.remove_spec(rollback.id).await;
-                }
-                return Err(err.context(format!("failed to persist task spec {}", spec.name)));
-            }
-
-            persisted.push(spec.clone());
             specs.push(spec);
         }
 
+        self.persist_specs_batch(&specs)
+            .await
+            .context("failed to persist committed task specs")?;
+
+        let mut dropped = 0usize;
         for spec in &specs {
-            if let Err(err) = self
-                .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to enqueue task gossip for {}: {err}",
-                    spec.name
-                );
+            match self.enqueue_gossip_best_effort(TaskEvent::Upsert(Box::new(spec.clone()))) {
+                Ok(true) => {}
+                Ok(false) => dropped += 1,
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        "failed to enqueue task gossip for {}: {err}",
+                        spec.name
+                    );
+                }
             }
+        }
+        if dropped > 0 {
+            debug!(
+                target: "task",
+                dropped,
+                total = specs.len(),
+                "dropped committed task gossip updates due full queue; anti-entropy will reconcile"
+            );
         }
 
         for plan in plans {

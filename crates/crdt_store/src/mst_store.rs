@@ -313,6 +313,68 @@ where
         Ok(())
     }
 
+    /// Inserts or updates a batch of key/value pairs in a single durable transaction.
+    ///
+    /// The last value for a duplicated key in the provided iterator wins.
+    pub async fn upsert_many<I>(&self, entries: I) -> crate::Result<()>
+    where
+        I: IntoIterator<Item = (C::Key, C::Value)>,
+    {
+        let mut requested: HashMap<C::Key, C::Value> = HashMap::new();
+        for (key, value) in entries {
+            requested.insert(key, value);
+        }
+        if requested.is_empty() {
+            return Ok(());
+        }
+
+        let mut merged: Vec<(C::Key, C::Reg)> = Vec::with_capacity(requested.len());
+        {
+            let r = self.db.begin_read().map_err(into_err)?;
+            let values = r.open_table(T::values()).map_err(into_err)?;
+
+            for (key, value) in requested {
+                let current = match values
+                    .get(Self::encode_key(&key).as_slice())
+                    .map_err(into_err)?
+                {
+                    Some(row) => Some(Self::decode_reg(row.value())?),
+                    None => None,
+                };
+
+                let next = C::upsert_reg(current, &self.actor, value);
+                merged.push((key, next));
+            }
+        }
+
+        let w = self.db.begin_write().map_err(into_err)?;
+        {
+            let mut values = w.open_table(T::values()).map_err(into_err)?;
+            let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
+            for (key, reg) in &merged {
+                values
+                    .insert(
+                        Self::encode_key(key).as_slice(),
+                        Self::encode_reg(reg)?.as_slice(),
+                    )
+                    .map_err(into_err)?;
+                let _ = tombs
+                    .remove(Self::encode_key(key).as_slice())
+                    .map_err(into_err)?;
+            }
+        }
+        w.commit().map_err(into_err)?;
+
+        let mut tree = self.mst.write().await;
+        for (key, reg) in &merged {
+            let snap = C::snapshot_reg(reg);
+            tree.upsert(key.clone(), &Entry::Active(snap));
+        }
+
+        self.bump_change_clock();
+        Ok(())
+    }
+
     /// Remove key and persist a tombstone with a monotonic sequence.
     pub async fn remove(&self, k: &C::Key) -> crate::Result<u64> {
         // First check if tomb already exists; if so, do NOT allocate a new seq.

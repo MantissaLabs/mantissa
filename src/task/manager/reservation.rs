@@ -517,7 +517,6 @@ impl TaskManager {
         }
 
         let mut results: Vec<(usize, TaskSpec)> = Vec::new();
-        let mut persisted: Vec<TaskSpec> = Vec::new();
 
         for plan in plans {
             let slot_ids: Vec<SlotId> = plan.slots.iter().map(|slot| slot.slot_id).collect();
@@ -562,39 +561,37 @@ impl TaskManager {
                 task_epoch,
                 phase_version: 0,
             };
-
-            if let Err(err) = self.persist_spec(&spec).await {
-                for rollback in &persisted {
-                    if let Err(cleanup) = self.remove_spec(rollback.id).await {
-                        warn!(
-                            target: "task",
-                            "failed to rollback remote task {} after error: {cleanup}",
-                            rollback.id
-                        );
-                    }
-                }
-                let err = err.context(format!(
-                    "failed to persist remote task spec {} ({})",
-                    spec.name, spec.id
-                ));
-                return Err(ExecutionError::Fatal(err));
-            }
-
-            persisted.push(spec.clone());
             results.push((plan.index, spec));
         }
 
+        let specs: Vec<TaskSpec> = results.iter().map(|(_, spec)| spec.clone()).collect();
+        if let Err(err) = self.persist_specs_batch(&specs).await {
+            return Err(ExecutionError::Fatal(
+                err.context("failed to persist remote task specs for batch"),
+            ));
+        }
+
+        let mut dropped = 0usize;
         for (_, spec) in &results {
-            if let Err(err) = self
-                .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to enqueue task gossip for {}: {err}",
-                    spec.name
-                );
+            match self.enqueue_gossip_best_effort(TaskEvent::Upsert(Box::new(spec.clone()))) {
+                Ok(true) => {}
+                Ok(false) => dropped += 1,
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        "failed to enqueue task gossip for {}: {err}",
+                        spec.name
+                    );
+                }
             }
+        }
+        if dropped > 0 {
+            warn!(
+                target: "task",
+                dropped,
+                total = results.len(),
+                "dropped remote task gossip updates due full queue; anti-entropy will reconcile"
+            );
         }
 
         Ok(results)

@@ -27,7 +27,7 @@ use log::{debug, info, trace, warn};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{Mutex as AsyncMutex, mpsc::UnboundedSender};
 
 /// Errors that can occur during container operations
 #[derive(Error, Debug)]
@@ -296,6 +296,202 @@ pub fn clear_container_manager_override() {
         .lock()
         .expect("container manager override mutex poisoned")
         .take();
+}
+
+/// Returns true when tests request the in-memory runtime through environment configuration.
+pub fn use_in_memory_container_manager_from_env() -> bool {
+    std::env::var_os("MANTISSA_TEST_INMEMORY_CONTAINER_MANAGER").is_some()
+}
+
+#[derive(Default)]
+struct InMemoryContainerManager {
+    containers: AsyncMutex<HashMap<String, InMemoryContainerEntry>>,
+    names: AsyncMutex<HashMap<String, String>>,
+}
+
+#[derive(Clone)]
+struct InMemoryContainerEntry {
+    id: String,
+    name: String,
+    image: String,
+    running: bool,
+}
+
+impl InMemoryContainerManager {
+    fn not_found(container_id: &str) -> ContainerError {
+        ContainerError::NotFound(container_id.to_string())
+    }
+
+    fn name_conflict(name: &str) -> ContainerError {
+        ContainerError::DockerAPI(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message: format!("container name '{name}' already in use"),
+        })
+    }
+
+    async fn resolve_container_id(&self, key: &str) -> Option<String> {
+        {
+            let containers = self.containers.lock().await;
+            if containers.contains_key(key) {
+                return Some(key.to_string());
+            }
+        }
+
+        let names = self.names.lock().await;
+        names.get(key).cloned()
+    }
+}
+
+/// Creates an in-memory container runtime used by stress tests that spawn daemon subprocesses.
+pub fn new_in_memory_container_manager() -> Arc<dyn ContainerManager + Send + Sync> {
+    Arc::new(InMemoryContainerManager::default())
+}
+
+#[async_trait]
+impl ContainerManager for InMemoryContainerManager {
+    async fn create_container(&self, request: ContainerCreateRequest) -> ContainerResult<String> {
+        {
+            let names = self.names.lock().await;
+            if names.contains_key(&request.name) {
+                return Err(Self::name_conflict(&request.name));
+            }
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let entry = InMemoryContainerEntry {
+            id: id.clone(),
+            name: request.name.clone(),
+            image: request.image,
+            running: false,
+        };
+
+        self.containers.lock().await.insert(id.clone(), entry);
+        self.names.lock().await.insert(request.name, id.clone());
+
+        Ok(id)
+    }
+
+    async fn start_container(&self, container_id: &str) -> ContainerResult<()> {
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let mut containers = self.containers.lock().await;
+        let Some(container) = containers.get_mut(&id) else {
+            return Err(Self::not_found(container_id));
+        };
+        container.running = true;
+        Ok(())
+    }
+
+    async fn stop_container(
+        &self,
+        container_id: &str,
+        _timeout: Option<Duration>,
+    ) -> ContainerResult<()> {
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let mut containers = self.containers.lock().await;
+        let Some(container) = containers.get_mut(&id) else {
+            return Err(Self::not_found(container_id));
+        };
+        container.running = false;
+        Ok(())
+    }
+
+    async fn restart_container(
+        &self,
+        container_id: &str,
+        _timeout: Option<Duration>,
+    ) -> ContainerResult<()> {
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let mut containers = self.containers.lock().await;
+        let Some(container) = containers.get_mut(&id) else {
+            return Err(Self::not_found(container_id));
+        };
+        container.running = true;
+        Ok(())
+    }
+
+    async fn remove_container(
+        &self,
+        container_id: &str,
+        _force: bool,
+        _remove_volumes: bool,
+    ) -> ContainerResult<()> {
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Ok(());
+        };
+
+        let removed = self.containers.lock().await.remove(&id);
+        if let Some(entry) = removed {
+            self.names.lock().await.remove(&entry.name);
+        }
+        Ok(())
+    }
+
+    async fn list_containers(
+        &self,
+        _filters: Option<HashMap<String, Vec<String>>>,
+    ) -> ContainerResult<Vec<ContainerInfo>> {
+        let containers = self.containers.lock().await;
+        let mut out = Vec::with_capacity(containers.len());
+        for entry in containers.values() {
+            out.push(ContainerInfo {
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                image: entry.image.clone(),
+                status: if entry.running {
+                    "running".to_string()
+                } else {
+                    "stopped".to_string()
+                },
+                state: if entry.running {
+                    "running".to_string()
+                } else {
+                    "exited".to_string()
+                },
+                created: 0,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn inspect_container(
+        &self,
+        container_id: &str,
+    ) -> ContainerResult<ContainerInspectResponse> {
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let containers = self.containers.lock().await;
+        let Some(entry) = containers.get(&id) else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let state = bollard::models::ContainerState {
+            running: Some(entry.running),
+            pid: Some(if entry.running { 1000 } else { 0 }),
+            ..Default::default()
+        };
+
+        Ok(bollard::service::ContainerInspectResponse {
+            id: Some(entry.id.clone()),
+            name: Some(format!("/{}", entry.name)),
+            state: Some(state),
+            ..Default::default()
+        })
+    }
+
+    async fn pull_image(&self, _image: &str) -> ContainerResult<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]

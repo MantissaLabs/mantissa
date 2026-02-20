@@ -40,6 +40,7 @@ pub struct HeadlessConfig {
     pub sync_fanout: Option<usize>,
     pub gossip_tick: Option<Duration>,
     pub gossip_fanout: Option<usize>,
+    pub gossip_channel_capacity: Option<usize>,
     pub task_runtime: Option<TaskRuntimeConfig>,
 }
 
@@ -52,6 +53,7 @@ impl Default for HeadlessConfig {
             sync_fanout: None,
             gossip_tick: None,
             gossip_fanout: None,
+            gossip_channel_capacity: None,
             task_runtime: None,
         }
     }
@@ -129,6 +131,7 @@ impl HeadlessNode {
             sync_fanout,
             gossip_tick,
             gossip_fanout,
+            gossip_channel_capacity,
             task_runtime,
         } = cfg;
         // Local Node + client
@@ -148,8 +151,10 @@ impl HeadlessNode {
             node_client,
         );
         let stores: Stores = Bootstrap::open_stores(&ctx).await?;
+        let gossip_channel_capacity = gossip_channel_capacity.unwrap_or(128);
         let (comps, gossip_rx, gossip_dedupe) =
-            Bootstrap::build_components(&ctx, &stores, task_runtime).await?;
+            Bootstrap::build_components(&ctx, &stores, task_runtime, gossip_channel_capacity)
+                .await?;
         if let Some(d) = sync_tick {
             comps.topology.set_sync_interval(d);
         }
@@ -414,7 +419,7 @@ impl HeadlessNode {
         gossip_tick: Option<Duration>,
         fanout: Option<usize>,
     ) -> io::Result<Self> {
-        Self::new_inproc_custom_with_task_runtime(sync_tick, gossip_tick, fanout, None).await
+        Self::new_inproc_custom_with_task_runtime(sync_tick, gossip_tick, fanout, None, None).await
     }
 
     /// Quick-start **in-process** node with custom sync/gossip and task runtime loop cadence.
@@ -422,6 +427,7 @@ impl HeadlessNode {
         sync_tick: Option<Duration>,
         gossip_tick: Option<Duration>,
         fanout: Option<usize>,
+        gossip_channel_capacity: Option<usize>,
         task_runtime: Option<TaskRuntimeConfig>,
     ) -> io::Result<Self> {
         let state = self_contained_state()?;
@@ -436,6 +442,7 @@ impl HeadlessNode {
                 sync_fanout: None,
                 gossip_tick,
                 gossip_fanout: fanout,
+                gossip_channel_capacity,
                 task_runtime,
             },
         )

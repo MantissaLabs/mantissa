@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::LocalSet;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
@@ -29,43 +30,132 @@ where
 }
 
 #[derive(Default)]
-pub struct InMemoryContainerManager;
+pub struct InMemoryContainerManager {
+    containers: AsyncMutex<HashMap<String, InMemoryContainerEntry>>,
+    names: AsyncMutex<HashMap<String, String>>,
+}
+
+#[derive(Clone)]
+struct InMemoryContainerEntry {
+    id: String,
+    name: String,
+    image: String,
+    running: bool,
+}
+
+impl InMemoryContainerManager {
+    fn not_found(container_id: &str) -> ContainerError {
+        ContainerError::NotFound(container_id.to_string())
+    }
+
+    fn name_conflict(name: &str) -> ContainerError {
+        ContainerError::DockerAPI(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message: format!("container name '{name}' already in use"),
+        })
+    }
+
+    async fn resolve_container_id(&self, key: &str) -> Option<String> {
+        {
+            let containers = self.containers.lock().await;
+            if containers.contains_key(key) {
+                return Some(key.to_string());
+            }
+        }
+
+        let names = self.names.lock().await;
+        names.get(key).cloned()
+    }
+}
 
 #[async_trait]
 impl ContainerManager for InMemoryContainerManager {
     async fn create_container(
         &self,
-        _request: ContainerCreateRequest,
+        request: ContainerCreateRequest,
     ) -> Result<String, ContainerError> {
-        Ok(Uuid::new_v4().to_string())
+        {
+            let names = self.names.lock().await;
+            if names.contains_key(&request.name) {
+                return Err(Self::name_conflict(&request.name));
+            }
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let entry = InMemoryContainerEntry {
+            id: id.clone(),
+            name: request.name.clone(),
+            image: request.image,
+            running: false,
+        };
+
+        self.containers.lock().await.insert(id.clone(), entry);
+        self.names.lock().await.insert(request.name, id.clone());
+
+        Ok(id)
     }
 
-    async fn start_container(&self, _container_id: &str) -> Result<(), ContainerError> {
+    async fn start_container(&self, container_id: &str) -> Result<(), ContainerError> {
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let mut containers = self.containers.lock().await;
+        let Some(container) = containers.get_mut(&id) else {
+            return Err(Self::not_found(container_id));
+        };
+        container.running = true;
         Ok(())
     }
 
     async fn stop_container(
         &self,
-        _container_id: &str,
+        container_id: &str,
         _timeout: Option<Duration>,
     ) -> Result<(), ContainerError> {
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let mut containers = self.containers.lock().await;
+        let Some(container) = containers.get_mut(&id) else {
+            return Err(Self::not_found(container_id));
+        };
+        container.running = false;
         Ok(())
     }
 
     async fn restart_container(
         &self,
-        _container_id: &str,
+        container_id: &str,
         _timeout: Option<Duration>,
     ) -> Result<(), ContainerError> {
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let mut containers = self.containers.lock().await;
+        let Some(container) = containers.get_mut(&id) else {
+            return Err(Self::not_found(container_id));
+        };
+        container.running = true;
         Ok(())
     }
 
     async fn remove_container(
         &self,
-        _container_id: &str,
+        container_id: &str,
         _force: bool,
         _remove_volumes: bool,
     ) -> Result<(), ContainerError> {
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Ok(());
+        };
+
+        let removed = self.containers.lock().await.remove(&id);
+        if let Some(entry) = removed {
+            self.names.lock().await.remove(&entry.name);
+        }
         Ok(())
     }
 
@@ -73,16 +163,54 @@ impl ContainerManager for InMemoryContainerManager {
         &self,
         _filters: Option<HashMap<String, Vec<String>>>,
     ) -> Result<Vec<ContainerInfo>, ContainerError> {
-        Ok(Vec::new())
+        let containers = self.containers.lock().await;
+        let mut out = Vec::with_capacity(containers.len());
+        for entry in containers.values() {
+            out.push(ContainerInfo {
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                image: entry.image.clone(),
+                status: if entry.running {
+                    "running".to_string()
+                } else {
+                    "stopped".to_string()
+                },
+                state: if entry.running {
+                    "running".to_string()
+                } else {
+                    "exited".to_string()
+                },
+                created: 0,
+            });
+        }
+        Ok(out)
     }
 
     async fn inspect_container(
         &self,
-        _container_id: &str,
+        container_id: &str,
     ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
-        Err(ContainerError::OperationFailed(
-            "inspect unsupported in test container manager".into(),
-        ))
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let containers = self.containers.lock().await;
+        let Some(entry) = containers.get(&id) else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let state = bollard::models::ContainerState {
+            running: Some(entry.running),
+            pid: Some(if entry.running { 1000 } else { 0 }),
+            ..Default::default()
+        };
+
+        Ok(bollard::service::ContainerInspectResponse {
+            id: Some(entry.id.clone()),
+            name: Some(format!("/{}", entry.name)),
+            state: Some(state),
+            ..Default::default()
+        })
     }
 
     async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
@@ -91,7 +219,7 @@ impl ContainerManager for InMemoryContainerManager {
 }
 
 fn default_container_manager() -> Arc<dyn ContainerManager + Send + Sync> {
-    Arc::new(InMemoryContainerManager)
+    Arc::new(InMemoryContainerManager::default())
 }
 
 static TEST_CONTAINER_MANAGER: Lazy<()> = Lazy::new(|| {
@@ -110,7 +238,7 @@ impl ContainerManagerOverrideGuard {
     }
 
     pub fn install_default() -> Self {
-        Self::install(Arc::new(InMemoryContainerManager))
+        Self::install(Arc::new(InMemoryContainerManager::default()))
     }
 }
 
@@ -532,6 +660,21 @@ impl TestNode {
         Ok(None)
     }
 
+    /// Return all peer statuses as seen by this node via one Topology.list call.
+    pub async fn list_all_statuses(&self) -> Result<HashMap<Uuid, NodeStatus>, capnp::Error> {
+        let topo = self.topology();
+        let req = topo.list_request();
+        let resp = req.send().promise.await?;
+        let list = resp.get()?.get_nodes()?;
+        let mut out = HashMap::new();
+        for n in list.get_nodes()?.iter() {
+            let id_bytes = n.get_id()?.get_bytes()?;
+            let id = uuid::Uuid::from_slice(id_bytes).unwrap();
+            out.insert(id, n.get_health()?);
+        }
+        Ok(out)
+    }
+
     /// Wait until this node reports `expect` for `target` via Topology.list or timeouts.
     pub async fn wait_status_of(
         &self,
@@ -560,6 +703,7 @@ pub struct ClusterConfig {
     pub sync_tick_ms: Option<u64>,
     pub gossip_tick_ms: Option<u64>,
     pub gossip_fanout: Option<usize>,
+    pub gossip_channel_capacity: Option<usize>,
     pub task_reconcile_tick_ms: Option<u64>,
     pub task_repair_tick_ms: Option<u64>,
 }
@@ -570,6 +714,7 @@ impl Default for ClusterConfig {
             sync_tick_ms: None,
             gossip_tick_ms: None,
             gossip_fanout: None,
+            gossip_channel_capacity: None,
             // Faster task loops in tests reduce eventual-consistency flakes while preserving
             // production defaults in the main binary.
             task_reconcile_tick_ms: Some(500),
@@ -601,12 +746,20 @@ impl ClusterConfig {
 }
 
 async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
+    // Each test node must get an isolated fake runtime. Sharing one in-memory manager across
+    // the cluster causes nodes to "see" and stop each other's containers, which stalls
+    // reconciliation in large multi-node stress runs.
+    let _container_guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+
     let (sync_tick, fanout) = cfg.as_options();
     let gossip_tick = cfg.gossip_tick_ms.map(std::time::Duration::from_millis);
+    let gossip_channel_capacity = cfg.gossip_channel_capacity;
     HeadlessNode::new_inproc_custom_with_task_runtime(
         sync_tick,
         gossip_tick,
         fanout,
+        gossip_channel_capacity,
         cfg.task_runtime_config(),
     )
     .await

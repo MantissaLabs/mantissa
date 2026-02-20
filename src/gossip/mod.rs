@@ -86,6 +86,8 @@ impl Message {
 pub const DEFAULT_FANOUT: usize = 5;
 /// Max number of gossip messages sent in a single RPC request.
 const MAX_GOSSIP_BATCH_MESSAGES: usize = 32;
+/// Default max message count per outbound gossip RPC call.
+const DEFAULT_GOSSIP_RPC_BATCH_MAX: usize = MAX_GOSSIP_BATCH_MESSAGES;
 /// Maximum number of gossip identifiers retained for ingress deduplication.
 const GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
 /// Time window used to suppress duplicate gossip identifiers.
@@ -223,6 +225,15 @@ fn task_state_rank(state: &ContainerState) -> u8 {
         ContainerState::Paused => 1,
         ContainerState::Failed | ContainerState::Exited(_) | ContainerState::Unknown => 0,
     }
+}
+
+/// Reads the optional outbound gossip RPC batch cap from the environment.
+fn gossip_rpc_batch_max_from_env(default: usize) -> usize {
+    std::env::var("MANTISSA_GOSSIP_RPC_BATCH_MAX")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 /// Shared handle type used by ingress and outbound gossip loops for deduplication.
@@ -482,6 +493,7 @@ pub(crate) async fn start<C>(
     use tokio::time::interval;
     let mut ticker = interval(tick);
     let mut buffer: Vec<Message> = Vec::new();
+    let rpc_batch_max = gossip_rpc_batch_max_from_env(DEFAULT_GOSSIP_RPC_BATCH_MAX);
 
     loop {
         tokio::select! {
@@ -565,18 +577,21 @@ pub(crate) async fn start<C>(
                             continue;
                         }
 
-                        if let Err(e) = send_gossip(&outbound, peer, &context).await {
-                            error!("Gossip to {} failed: {:?}", peer.address, e);
-                            warn!(
-                                target: "diag.gossip.send",
-                                cluster_view = %cluster_view,
-                                peer = %peer.id,
-                                addr = %peer.address,
-                                message_count = outbound.len(),
-                                disconnected = is_disconnected_capnp(&e),
-                                error = %e,
-                                "gossip send failed"
-                            );
+                        for outbound_batch in outbound.chunks(rpc_batch_max) {
+                            if let Err(e) = send_gossip(outbound_batch, peer, &context).await {
+                                error!("Gossip to {} failed: {:?}", peer.address, e);
+                                warn!(
+                                    target: "diag.gossip.send",
+                                    cluster_view = %cluster_view,
+                                    peer = %peer.id,
+                                    addr = %peer.address,
+                                    message_count = outbound_batch.len(),
+                                    disconnected = is_disconnected_capnp(&e),
+                                    error = %e,
+                                    "gossip send failed"
+                                );
+                                break;
+                            }
                         }
                     }
                 }

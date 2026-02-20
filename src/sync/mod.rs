@@ -17,8 +17,19 @@ pub mod ranges;
 type EncodedRegister = (Vec<u8>, Vec<u8>);
 type EncodedRegisters = Vec<EncodedRegister>;
 
-// Chunk size used when streaming delta from server to client. Adjust as needed.
-pub const DELTA_CHUNK_MAX: usize = 1024;
+// Default chunk size used when streaming delta from server to client.
+pub const DEFAULT_DELTA_CHUNK_MAX: usize = 1024;
+
+/// Reads the max register/tombstone entries per streamed delta chunk.
+///
+/// Keeping this configurable helps scale anti-entropy payload sizing without rebuilding.
+fn delta_chunk_max() -> usize {
+    std::env::var("MANTISSA_SYNC_DELTA_CHUNK_MAX")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DELTA_CHUNK_MAX)
+}
 
 #[derive(Clone)]
 pub struct SyncService {
@@ -537,6 +548,7 @@ where
 {
     let regs_wire = encode_registers(regs)?;
     let tombs_wire = encode_tombstones(tombs);
+    let chunk_max = delta_chunk_max();
 
     if regs_wire.is_empty() && tombs_wire.is_empty() {
         return Ok(false);
@@ -546,18 +558,36 @@ where
     let mut tombs_slice = tombs_wire.as_slice();
 
     while !regs_slice.is_empty() || !tombs_slice.is_empty() {
-        let (regs_chunk, rest_regs) = if regs_slice.len() > DELTA_CHUNK_MAX {
-            regs_slice.split_at(DELTA_CHUNK_MAX)
+        let (regs_chunk, rest_regs) = if regs_slice.len() > chunk_max {
+            regs_slice.split_at(chunk_max)
         } else {
             (regs_slice, &[][..])
         };
 
-        let remaining = DELTA_CHUNK_MAX.saturating_sub(regs_chunk.len());
+        let remaining = chunk_max.saturating_sub(regs_chunk.len());
         let (tombs_chunk, rest_tombs) = if tombs_slice.len() > remaining {
             tombs_slice.split_at(remaining)
         } else {
             (tombs_slice, &[][..])
         };
+
+        let regs_payload_bytes: usize = regs_chunk
+            .iter()
+            .map(|(key, reg)| key.len().saturating_add(reg.len()))
+            .sum();
+        let tombs_payload_bytes: usize = tombs_chunk
+            .iter()
+            .map(|(key, _)| key.len().saturating_add(std::mem::size_of::<u64>()))
+            .sum();
+        debug!(
+            target: "delta",
+            ?domain,
+            regs = regs_chunk.len(),
+            tombs = tombs_chunk.len(),
+            chunk_max,
+            approx_payload_bytes = regs_payload_bytes.saturating_add(tombs_payload_bytes),
+            "sending delta chunk"
+        );
 
         let mut req = sink.push_chunk_request();
         {

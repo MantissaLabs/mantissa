@@ -54,8 +54,43 @@ use async_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info};
 use uuid::Uuid;
+
+/// Parses one positive `u64` value from the environment.
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+}
+
+/// Parses one positive duration in milliseconds from the environment.
+fn env_duration_ms(name: &str) -> Option<Duration> {
+    env_u64(name).map(Duration::from_millis)
+}
+
+/// Resolves gossip fanout from environment overrides.
+fn gossip_fanout_from_env(default: usize) -> usize {
+    std::env::var("MANTISSA_GOSSIP_FANOUT")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+/// Resolves gossip queue channel capacity from environment overrides.
+fn gossip_channel_capacity_from_env(default: usize) -> usize {
+    env_u64("MANTISSA_GOSSIP_CHANNEL_CAPACITY")
+        .map(|value| value as usize)
+        .unwrap_or(default)
+        .max(1)
+}
+
+/// Resolves gossip dispatch tick interval from environment overrides.
+fn gossip_tick_from_env(default: Duration) -> Duration {
+    env_duration_ms("MANTISSA_GOSSIP_TICK_MS").unwrap_or(default)
+}
 
 /// Starts the daemon and its subsystems, picking a run mode and whether to enable unix socket or not.
 /// - `RunMode::Blocking` will not return until listeners stop.
@@ -72,20 +107,24 @@ pub async fn start(
     let stores = Bootstrap::open_stores(&ctx).await?;
 
     // Build runtime components (gossip, topology, sync) and their clients
+    let gossip_channel_capacity = gossip_channel_capacity_from_env(128);
     let (comps, gossip_rx, gossip_dedupe) =
-        Bootstrap::build_components(&ctx, &stores, None).await?;
+        Bootstrap::build_components(&ctx, &stores, None, gossip_channel_capacity).await?;
+    let gossip_tick = gossip_tick_from_env(comps.topology.gossip_interval());
+    comps.topology.set_gossip_interval(gossip_tick);
 
     // Wire up ServerImpl and spawn listeners
     let server = Bootstrap::build_server(&ctx, &stores, &comps);
 
     // Fire background tasks: gossip loop, topology loop, best-effort reconnect
+    let gossip_fanout = gossip_fanout_from_env(DEFAULT_FANOUT);
     Bootstrap::spawn_runtime_tasks(
         &ctx,
         &stores,
         &comps,
         gossip_rx,
         gossip_dedupe,
-        DEFAULT_FANOUT,
+        gossip_fanout,
     )
     .await;
 
@@ -292,19 +331,22 @@ impl Bootstrap {
         ctx: &Bootstrap,
         stores: &Stores,
         task_runtime_config: Option<TaskRuntimeConfig>,
+        gossip_channel_capacity: usize,
     ) -> Result<(Components, Receiver<Message>, DedupeStateHandle), Box<dyn std::error::Error>>
     {
+        let channel_capacity = gossip_channel_capacity.max(1);
         // gossip channels: topology -> gossip sender, gossip -> topology sender
         let (gossip_tx, gossip_rx): (Sender<Message>, Receiver<Message>) =
-            async_channel::bounded(128);
-        let (topology_tx, topology_rx) = async_channel::bounded(128);
-        let (task_tx, task_rx): (Sender<Message>, Receiver<Message>) = async_channel::bounded(128);
+            async_channel::bounded(channel_capacity);
+        let (topology_tx, topology_rx) = async_channel::bounded(channel_capacity);
+        let (task_tx, task_rx): (Sender<Message>, Receiver<Message>) =
+            async_channel::bounded(channel_capacity);
         let (service_tx, service_rx): (Sender<Message>, Receiver<Message>) =
-            async_channel::bounded(128);
+            async_channel::bounded(channel_capacity);
         let (network_tx, network_rx): (Sender<Message>, Receiver<Message>) =
-            async_channel::bounded(128);
+            async_channel::bounded(channel_capacity);
         let (secret_tx, secret_rx): (Sender<Message>, Receiver<Message>) =
-            async_channel::bounded(128);
+            async_channel::bounded(channel_capacity);
         // Restore the last committed active view first; fallback to legacy view when absent.
         let persisted_active_view = stores
             .cluster_view
@@ -438,6 +480,12 @@ impl Bootstrap {
         let container_manager: Arc<dyn ContainerManager + Send + Sync> =
             if let Some(manager) = docker::container_manager_override() {
                 manager
+            } else if docker::use_in_memory_container_manager_from_env() {
+                info!(
+                    target: "task",
+                    "using in-memory container runtime from env override"
+                );
+                docker::new_in_memory_container_manager()
             } else {
                 Arc::new(
                     DockerContainerManager::new()

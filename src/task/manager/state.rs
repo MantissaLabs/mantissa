@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use async_channel::Sender;
+use async_channel::{Sender, TrySendError};
 use chrono::Utc;
 use crdt_store::uuid_key::UuidKey;
 use rand::Rng;
@@ -191,7 +191,7 @@ impl TaskManager {
         ))
     }
 
-    /// Persists a task snapshot in the backing store.
+    /// Persists one task snapshot in the backing store.
     pub(super) async fn persist_spec(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
         let value = spec_to_value(spec);
 
@@ -225,6 +225,26 @@ impl TaskManager {
         } else {
             Ok(current.task_epoch)
         }
+    }
+
+    /// Persists a batch of task snapshots in one durable transaction.
+    pub(super) async fn persist_specs_batch(
+        &self,
+        specs: &[TaskSpec],
+    ) -> Result<(), anyhow::Error> {
+        if specs.is_empty() {
+            return Ok(());
+        }
+
+        let entries: Vec<_> = specs
+            .iter()
+            .map(|spec| (UuidKey::from(spec.id), spec_to_value(spec)))
+            .collect();
+
+        self.store
+            .upsert_many(entries)
+            .await
+            .map_err(|e| anyhow::anyhow!("task batch upsert failed: {e}"))
     }
 
     /// Removes a task snapshot from the store.
@@ -295,8 +315,23 @@ impl TaskManager {
         spec.phase_progress = next_progress;
         spec.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(&spec).await?;
-        self.enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
-            .await?;
+        match self.enqueue_gossip_best_effort(TaskEvent::Upsert(Box::new(spec.clone()))) {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    target: "task",
+                    task = %task_id,
+                    "dropping task phase gossip due full queue; anti-entropy will reconcile"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    target: "task",
+                    task = %task_id,
+                    "failed to enqueue task phase gossip: {err}"
+                );
+            }
+        }
         Ok(spec)
     }
 
@@ -521,6 +556,25 @@ impl TaskManager {
             .send(message)
             .await
             .map_err(|e| anyhow::anyhow!("failed to enqueue task gossip: {e}"))
+    }
+
+    /// Attempts to enqueue a task gossip event without waiting when the queue is full.
+    ///
+    /// Returns `Ok(true)` when enqueued, `Ok(false)` when dropped due a full queue, and an
+    /// error only when the queue is closed.
+    pub(super) fn enqueue_gossip_best_effort(
+        &self,
+        event: TaskEvent,
+    ) -> Result<bool, anyhow::Error> {
+        let id = Uuid::new_v4();
+        let message = Message::Task { id, event };
+        match self.tx().try_send(message) {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Closed(_)) => Err(anyhow::anyhow!(
+                "failed to enqueue task gossip: queue closed"
+            )),
+        }
     }
 
     /// Performs a graceful stop of a locally owned task and tears down its container.
