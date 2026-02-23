@@ -19,15 +19,14 @@ use crate::task::types::{TaskEvent, TaskSpec};
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, TrySendError};
 use async_trait::async_trait;
 use capnp::Error;
 use chrono::{DateTime, Utc};
+use futures::stream::{FuturesUnordered, StreamExt};
 use protocol::gossip;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::gossip::gossip_message::Which::*;
-use rand::rng;
-use rand::seq::IndexedRandom;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -88,6 +87,8 @@ pub const DEFAULT_FANOUT: usize = 5;
 const MAX_GOSSIP_BATCH_MESSAGES: usize = 32;
 /// Default max message count per outbound gossip RPC call.
 const DEFAULT_GOSSIP_RPC_BATCH_MAX: usize = MAX_GOSSIP_BATCH_MESSAGES;
+/// Default number of peer sends allowed concurrently within one outbound dispatch batch.
+const DEFAULT_GOSSIP_SEND_PARALLELISM: usize = 1;
 /// Maximum number of gossip identifiers retained for ingress deduplication.
 const GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
 /// Time window used to suppress duplicate gossip identifiers.
@@ -236,6 +237,47 @@ fn gossip_rpc_batch_max_from_env(default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Reads the optional maximum concurrent gossip send count from the environment.
+fn gossip_send_parallelism_from_env(default: usize) -> usize {
+    std::env::var("MANTISSA_GOSSIP_SEND_PARALLELISM")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+/// Reads the optional per-peer gossip send timeout (milliseconds) from the environment.
+fn gossip_send_timeout_from_env() -> Option<Duration> {
+    std::env::var("MANTISSA_GOSSIP_SEND_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+}
+
+/// Reads whether inbound gossip should be relayed into the outbound queue.
+///
+/// Disabled by default to avoid amplifying high-volume task update streams.
+fn gossip_relay_inbound_from_env() -> bool {
+    std::env::var("MANTISSA_GOSSIP_RELAY_INBOUND")
+        .ok()
+        .map(|raw| matches!(raw.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+/// Derives one deterministic cursor seed from the local peer id.
+///
+/// This de-correlates rotating fanout windows across nodes so they do not all target
+/// the same peer subset on each gossip tick.
+fn fanout_cursor_seed(peer_id: Uuid) -> usize {
+    let bytes = peer_id.as_bytes();
+    let mut lower = [0u8; 8];
+    lower.copy_from_slice(&bytes[..8]);
+    let mut upper = [0u8; 8];
+    upper.copy_from_slice(&bytes[8..]);
+    (u64::from_le_bytes(lower) ^ u64::from_le_bytes(upper)) as usize
+}
+
 /// Shared handle type used by ingress and outbound gossip loops for deduplication.
 pub(crate) type DedupeStateHandle = Arc<AsyncMutex<GossipDedupeState>>;
 
@@ -290,6 +332,8 @@ pub struct Channels {
     pub service_events: Sender<Message>,
     pub network_events: Sender<Message>,
     pub secret_events: Sender<Message>,
+    /// Shared outbound queue so newly received gossip can be forwarded to additional peers.
+    pub outbound_events: Sender<Message>,
     // scheduling_events: Sender<SchedulingEvent>,
 }
 
@@ -321,6 +365,8 @@ impl gossip::Server for Gossip {
         let service_tx = self.chans.service_events.clone();
         let network_tx = self.chans.network_events.clone();
         let secret_tx = self.chans.secret_events.clone();
+        let outbound_tx = self.chans.outbound_events.clone();
+        let relay_inbound = gossip_relay_inbound_from_env();
 
         let params_reader = params
             .get()
@@ -412,11 +458,18 @@ impl gossip::Server for Gossip {
 
             match which {
                 Void(_) => {
-                    let _ = topo_tx.send(Message::Void { id }).await;
+                    let message = Message::Void { id };
+                    if relay_inbound {
+                        forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
+                    }
+                    let _ = topo_tx.send(message).await;
                 }
                 Topology(Ok(reader)) => match topology::read_topology_event(reader) {
                     Ok(event) => {
                         let message = Message::Topology { id, event };
+                        if relay_inbound {
+                            forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
+                        }
                         topo_tx.send(message).await.map_err(|e| {
                             capnp::Error::failed(format!("Couldn't sent event to topology: {e}"))
                         })?;
@@ -429,6 +482,9 @@ impl gossip::Server for Gossip {
                 Task(Ok(reader)) => match task_service::read_event(reader) {
                     Ok(event) => {
                         let message = Message::Task { id, event };
+                        if relay_inbound {
+                            forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
+                        }
                         task_tx.send(message).await.map_err(|e| {
                             capnp::Error::failed(format!("Couldn't send event to task: {e}"))
                         })?;
@@ -441,6 +497,9 @@ impl gossip::Server for Gossip {
                 Service(Ok(reader)) => match read_service_event(reader) {
                     Ok(event) => {
                         let message = Message::Service { id, event };
+                        if relay_inbound {
+                            forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
+                        }
                         service_tx.send(message).await.map_err(|e| {
                             capnp::Error::failed(format!("Couldn't send event to services: {e}"))
                         })?;
@@ -453,6 +512,9 @@ impl gossip::Server for Gossip {
                 Network(Ok(reader)) => match read_network_event(reader) {
                     Ok(event) => {
                         let message = Message::Network { id, event };
+                        if relay_inbound {
+                            forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
+                        }
                         network_tx.send(message).await.map_err(|e| {
                             capnp::Error::failed(format!("Couldn't send event to networks: {e}"))
                         })?;
@@ -465,6 +527,9 @@ impl gossip::Server for Gossip {
                 Secret(Ok(reader)) => match read_secret_event(reader) {
                     Ok(event) => {
                         let message = Message::Secret { id, event };
+                        if relay_inbound {
+                            forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
+                        }
                         secret_tx.send(message).await.map_err(|e| {
                             capnp::Error::failed(format!("Couldn't send event to secrets: {e}"))
                         })?;
@@ -494,6 +559,9 @@ pub(crate) async fn start<C>(
     let mut ticker = interval(tick);
     let mut buffer: Vec<Message> = Vec::new();
     let rpc_batch_max = gossip_rpc_batch_max_from_env(DEFAULT_GOSSIP_RPC_BATCH_MAX);
+    let send_parallelism = gossip_send_parallelism_from_env(DEFAULT_GOSSIP_SEND_PARALLELISM);
+    let send_timeout = gossip_send_timeout_from_env();
+    let mut fanout_cursor = fanout_cursor_seed(context.local_peer_id());
 
     loop {
         tokio::select! {
@@ -536,8 +604,8 @@ pub(crate) async fn start<C>(
 
                 let peers = match fanout {
                     Some(0) => context.get_peers().await,
-                    Some(n) => fanout_sample(&context, n).await,
-                    None => fanout_sample(&context, DEFAULT_FANOUT).await,
+                    Some(n) => fanout_sample(&context, n, &mut fanout_cursor).await,
+                    None => fanout_sample(&context, DEFAULT_FANOUT, &mut fanout_cursor).await,
                 };
                 let self_id = context.local_peer_id();
                 let cluster_view = context.active_cluster_view();
@@ -560,6 +628,7 @@ pub(crate) async fn start<C>(
                         "gossip chunk dispatch"
                     );
 
+                    let mut inflight = FuturesUnordered::new();
                     for peer in peers.iter() {
                         if peer.id == self_id {
                             continue;
@@ -576,24 +645,19 @@ pub(crate) async fn start<C>(
                         if outbound.is_empty() {
                             continue;
                         }
-
-                        for outbound_batch in outbound.chunks(rpc_batch_max) {
-                            if let Err(e) = send_gossip(outbound_batch, peer, &context).await {
-                                error!("Gossip to {} failed: {:?}", peer.address, e);
-                                warn!(
-                                    target: "diag.gossip.send",
-                                    cluster_view = %cluster_view,
-                                    peer = %peer.id,
-                                    addr = %peer.address,
-                                    message_count = outbound_batch.len(),
-                                    disconnected = is_disconnected_capnp(&e),
-                                    error = %e,
-                                    "gossip send failed"
-                                );
-                                break;
-                            }
+                        inflight.push(send_gossip_to_peer(
+                            outbound,
+                            peer,
+                            &context,
+                            rpc_batch_max,
+                            send_timeout,
+                            cluster_view,
+                        ));
+                        if inflight.len() >= send_parallelism {
+                            let _ = inflight.next().await;
                         }
                     }
+                    while inflight.next().await.is_some() {}
                 }
 
                 pending.clear();
@@ -609,6 +673,132 @@ pub(crate) async fn start<C>(
 
             // channel closed
             else => break,
+        }
+    }
+}
+
+/// Best-effort forwards one newly received gossip message into the outbound queue.
+///
+/// This converts the gossip path into bounded epidemic forwarding while preserving
+/// backpressure safety: when the queue is saturated we drop the relay and rely on sync.
+fn forward_inbound_message(outbound_tx: &Sender<Message>, message: Option<Message>) {
+    let Some(message) = message else {
+        return;
+    };
+    let message_id = message.id();
+    match outbound_tx.try_send(message) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            debug!(
+                target: "gossip",
+                gossip_id = %message_id,
+                "dropping inbound gossip relay due full outbound queue"
+            );
+        }
+        Err(TrySendError::Closed(_)) => {
+            warn!(
+                target: "gossip",
+                gossip_id = %message_id,
+                "failed to relay inbound gossip because outbound queue is closed"
+            );
+        }
+    }
+}
+
+/// Returns the message shape that should be forwarded to peers for one inbound gossip event.
+///
+/// Topology join events intentionally drop imported `client` capabilities before relay to avoid
+/// re-exporting non-local Cap'n Proto handles through intermediate peers.
+fn message_for_forwarding(message: &Message) -> Option<Message> {
+    match message {
+        Message::Void { .. } => None,
+        Message::Topology { id, event } => {
+            let forwarded_event = match event {
+                TopologyEvent::Join {
+                    id: peer_id,
+                    hostname,
+                    address,
+                    root_hash,
+                    incarnation,
+                    client: _,
+                    noise_static_pub,
+                    signing_pub,
+                    identity_sig,
+                    wireguard,
+                } => TopologyEvent::Join {
+                    id: *peer_id,
+                    hostname: hostname.clone(),
+                    address: address.clone(),
+                    root_hash: root_hash.clone(),
+                    incarnation: *incarnation,
+                    client: None,
+                    noise_static_pub: *noise_static_pub,
+                    signing_pub: signing_pub.clone(),
+                    identity_sig: identity_sig.clone(),
+                    wireguard: wireguard.clone(),
+                },
+                other => other.clone(),
+            };
+            Some(Message::Topology {
+                id: *id,
+                event: forwarded_event,
+            })
+        }
+        _ => Some(message.clone()),
+    }
+}
+
+/// Sends one outbound gossip payload to one peer with RPC chunking and timeout guards.
+///
+/// The timeout is applied per RPC chunk so one stalled peer cannot indefinitely delay
+/// the dispatch loop for the rest of the selected fanout peers.
+async fn send_gossip_to_peer<C>(
+    outbound: Vec<Message>,
+    peer: &PeerHandle,
+    context: &C,
+    rpc_batch_max: usize,
+    send_timeout: Option<Duration>,
+    cluster_view: ClusterViewId,
+) where
+    C: GossipContext + ?Sized,
+{
+    for outbound_batch in outbound.chunks(rpc_batch_max) {
+        let send_result = if let Some(timeout) = send_timeout {
+            match tokio::time::timeout(timeout, send_gossip(outbound_batch, peer, context)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        target: "diag.gossip.send",
+                        cluster_view = %cluster_view,
+                        peer = %peer.id,
+                        addr = %peer.address,
+                        message_count = outbound_batch.len(),
+                        timeout_ms = timeout.as_millis() as u64,
+                        "gossip send timed out"
+                    );
+                    break;
+                }
+            }
+        } else {
+            send_gossip(outbound_batch, peer, context).await
+        };
+
+        match send_result {
+            Ok(()) => {}
+            Err(e) => {
+                error!("Gossip to {} failed: {:?}", peer.address, e);
+                warn!(
+                    target: "diag.gossip.send",
+                    cluster_view = %cluster_view,
+                    peer = %peer.id,
+                    addr = %peer.address,
+                    message_count = outbound_batch.len(),
+                    disconnected = is_disconnected_capnp(&e),
+                    error = %e,
+                    "gossip send failed"
+                );
+                break;
+            }
         }
     }
 }
@@ -715,28 +905,71 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
     }
 }
 
-pub async fn fanout_sample<P>(provider: &P, fanout: usize) -> Vec<PeerHandle>
+/// Selects a deterministic fanout window from known peers using one rotating cursor.
+///
+/// This keeps fanout low while guaranteeing eventual coverage of all peers without relying
+/// on random sampling luck.
+pub async fn fanout_sample<P>(provider: &P, fanout: usize, cursor: &mut usize) -> Vec<PeerHandle>
 where
     P: PeerProvider + ?Sized,
 {
-    let peers = provider.get_peers().await;
-
-    if fanout == 0 || fanout >= peers.len() {
+    let mut peers = provider.get_peers().await;
+    if peers.is_empty() {
+        *cursor = 0;
         return peers;
     }
 
-    let mut rng = rng();
-    peers.choose_multiple(&mut rng, fanout).cloned().collect()
+    peers.sort_by(|a, b| a.id.cmp(&b.id));
+    let target = if fanout == 0 {
+        peers.len()
+    } else {
+        fanout.min(peers.len())
+    };
+
+    if target >= peers.len() {
+        *cursor = 0;
+        return peers;
+    }
+
+    let start = *cursor % peers.len();
+    let mut selected = Vec::with_capacity(target);
+    for offset in 0..target {
+        selected.push(peers[(start + offset) % peers.len()].clone());
+    }
+    *cursor = (start + target) % peers.len();
+    selected
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GossipDedupeState, Message, coalesce_pending_messages};
+    use super::{
+        GossipDedupeState, Message, coalesce_pending_messages, fanout_sample,
+        message_for_forwarding,
+    };
     use crate::cluster::{ClusterId, ClusterViewId};
     use crate::task::container::ContainerState;
     use crate::task::types::{TaskEvent, TaskSpec};
+    use crate::topology::PeerHandle;
+    use crate::topology::TopologyEvent;
+    use crate::topology::peer_provider::PeerProvider;
+    use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
+    use std::collections::HashSet;
     use uuid::Uuid;
+    use x25519_dalek::PublicKey;
+
+    #[derive(Clone)]
+    struct StaticPeerProvider {
+        peers: Vec<PeerHandle>,
+    }
+
+    #[async_trait(?Send)]
+    impl PeerProvider for StaticPeerProvider {
+        /// Returns one fixed peer list for deterministic fanout sampling tests.
+        async fn get_peers(&self) -> Vec<PeerHandle> {
+            self.peers.clone()
+        }
+    }
 
     /// Duplicate message ids should be rejected while the active view is unchanged.
     #[test]
@@ -771,6 +1004,67 @@ mod tests {
         assert!(dedupe.record_inbound(legacy_view, id));
         assert!(!dedupe.record_inbound(legacy_view, id));
         assert!(dedupe.record_inbound(next_view, id));
+    }
+
+    /// Rotating fanout sampling should cover all peers over successive ticks.
+    #[tokio::test]
+    async fn fanout_sample_rotates_across_population() {
+        let mut expected = HashSet::new();
+        let mut peers = Vec::new();
+        for idx in 0..5 {
+            let id = Uuid::new_v4();
+            expected.insert(id);
+            peers.push(PeerHandle {
+                id,
+                hostname: format!("peer-{idx}"),
+                address: format!("127.0.0.1:{}", 5000 + idx),
+                root_hash: String::new(),
+                noise_static_pub: PublicKey::from([idx as u8; 32]),
+            });
+        }
+        let provider = StaticPeerProvider { peers };
+
+        let mut cursor = 0usize;
+        let mut seen = HashSet::new();
+        for _ in 0..3 {
+            let selected = fanout_sample(&provider, 2, &mut cursor).await;
+            for peer in selected {
+                seen.insert(peer.id);
+            }
+        }
+
+        assert_eq!(seen, expected);
+    }
+
+    /// Relayed topology join events should never carry imported server capabilities.
+    #[test]
+    fn message_for_forwarding_strips_join_client_capability() {
+        let message = Message::Topology {
+            id: Uuid::new_v4(),
+            event: TopologyEvent::Join {
+                id: Uuid::new_v4(),
+                hostname: "peer-a".to_string(),
+                address: "127.0.0.1:1234".to_string(),
+                root_hash: String::new(),
+                incarnation: 1,
+                client: None,
+                noise_static_pub: PublicKey::from([7u8; 32]),
+                signing_pub: Box::new(
+                    ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key(),
+                ),
+                identity_sig: vec![0u8; 64],
+                wireguard: None,
+            },
+        };
+
+        let forwarded = message_for_forwarding(&message).expect("forwarded message");
+        match forwarded {
+            Message::Topology {
+                event: TopologyEvent::Join { client, .. },
+                ..
+            } => assert!(client.is_none()),
+            _ => panic!("unexpected forwarded message variant"),
+        }
     }
 
     /// Task coalescing should keep the causally newest upsert and drop stale updates.

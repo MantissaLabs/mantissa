@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use capnp::Error;
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use futures::stream::{FuturesUnordered, StreamExt};
 use net::noise::NoisePeerVerifier;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::server::{self, ServerClient};
@@ -71,6 +72,17 @@ const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Default number of peers sampled per anti-entropy sync tick.
 const DEFAULT_SYNC_FANOUT: usize = 8;
+/// Default maximum number of peers synchronized concurrently within one tick.
+const DEFAULT_SYNC_PARALLELISM: usize = 1;
+
+/// Reads the optional per-tick sync parallelism override from the environment.
+fn sync_parallelism_from_env(default: usize) -> usize {
+    std::env::var("MANTISSA_SYNC_PARALLELISM")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
 
 /// Bundles the store handles required to construct a `Topology`.
 #[derive(Clone)]
@@ -1276,12 +1288,18 @@ impl Topology {
         );
 
         let selected_entries = self.select_sync_peers(entries, sync_fanout);
+        let sync_parallelism = sync_parallelism_from_env(DEFAULT_SYNC_PARALLELISM);
+        let mut inflight = FuturesUnordered::new();
         for entry in selected_entries {
             if excluded_peers.contains(&entry.peer_id) {
                 continue;
             }
-            self.sync_with_peer(entry, cluster_view).await;
+            inflight.push(self.sync_with_peer(entry, cluster_view));
+            if inflight.len() >= sync_parallelism {
+                let _ = inflight.next().await;
+            }
         }
+        while inflight.next().await.is_some() {}
     }
 
     /// Select peers to target during one anti-entropy tick.

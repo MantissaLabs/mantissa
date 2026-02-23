@@ -370,6 +370,7 @@ impl Bootstrap {
                 service_events: service_tx.clone(),
                 network_events: network_tx.clone(),
                 secret_events: secret_tx.clone(),
+                outbound_events: gossip_tx.clone(),
             },
             cluster_view.clone(),
         );
