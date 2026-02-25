@@ -17,7 +17,7 @@ use crate::scheduler::{
 };
 use crate::task::container::ContainerState;
 use crate::task::docker::{ContainerError, ContainerInfo};
-use crate::task::types::{TaskEvent, TaskSpec, TaskValue};
+use crate::task::types::{TaskEvent, TaskServiceMetadata, TaskSpec, TaskValue};
 
 use super::{
     TaskManager, container_remove_in_progress, launch::ContainerLaunchRequest,
@@ -986,50 +986,15 @@ impl TaskManager {
         }
 
         if let Err(err) = self
-            .ensure_runtime_attachments(
+            .ensure_runtime_attachments_or_rollback(
                 working.id,
+                &working.name,
                 &container_id,
                 &working.networks,
                 working.service_metadata.as_ref(),
             )
             .await
         {
-            let err = err.context(format!(
-                "failed to configure runtime network attachments for task {}",
-                working.name
-            ));
-            if let Err(teardown_err) = self
-                .teardown_runtime_attachments(working.id, HashSet::new(), false)
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to cleanup partial attachments for task {}: {teardown_err}",
-                    working.id
-                );
-            }
-            if let Err(stop_err) = self
-                .container_manager
-                .stop_container(&container_id, Some(Duration::from_secs(10)))
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to stop container {} after attachment setup failure: {stop_err}",
-                    container_id
-                );
-            }
-            if let Err(remove_err) = self
-                .container_manager
-                .remove_container(&container_id, true, true)
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to remove container {} after attachment setup failure: {remove_err}",
-                    container_id
-                );
-            }
             let err = self.mark_task_failed(working, err).await;
             return Err(err);
         }
@@ -1072,28 +1037,8 @@ impl TaskManager {
                 "failed to persist running state for task {}: {err}",
                 working.id
             );
-            if let Err(stop_err) = self
-                .container_manager
-                .stop_container(&container_id, Some(Duration::from_secs(10)))
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to stop container {} during rollback: {stop_err}",
-                    container_id
-                );
-            }
-            if let Err(remove_err) = self
-                .container_manager
-                .remove_container(&container_id, true, true)
-                .await
-            {
-                warn!(
-                    target: "task",
-                    "failed to remove container {} during rollback: {remove_err}",
-                    container_id
-                );
-            }
+            self.rollback_container_launch(&container_id, "commit rollback")
+                .await;
             let err = err.context("task state commit failed after container launch");
             let err = self.mark_task_failed(working, err).await;
             return Err(err);
@@ -1129,33 +1074,74 @@ impl TaskManager {
         Ok(())
     }
 
-    /// Best-effort rollback when startup raced with a newer stop/remove intent.
-    async fn abort_launched_container(&self, task_id: Uuid, container_id: &str) {
-        self.local_containers.lock().await.remove(&task_id);
+    /// Ensures runtime attachments exist for one launched task or rolls back container runtime.
+    pub(super) async fn ensure_runtime_attachments_or_rollback(
+        &self,
+        task_id: Uuid,
+        task_name: &str,
+        container_id: &str,
+        networks: &[Uuid],
+        service_meta: Option<&TaskServiceMetadata>,
+    ) -> Result<(), anyhow::Error> {
         if let Err(err) = self
+            .ensure_runtime_attachments(task_id, container_id, networks, service_meta)
+            .await
+        {
+            let err = err.context(format!(
+                "failed to configure runtime network attachments for task {}",
+                task_name
+            ));
+            if let Err(teardown_err) = self
+                .teardown_runtime_attachments(task_id, HashSet::new(), false)
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to cleanup partial attachments for task {}: {teardown_err}",
+                    task_id
+                );
+            }
+            self.rollback_container_launch(container_id, "attachment setup failure")
+                .await;
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    /// Stops and removes a launched container best-effort when one launch stage must roll back.
+    pub(super) async fn rollback_container_launch(&self, container_id: &str, reason: &str) {
+        if let Err(stop_err) = self
             .container_manager
             .stop_container(container_id, Some(Duration::from_secs(10)))
             .await
         {
             warn!(
                 target: "task",
-                task = %task_id,
                 container = %container_id,
-                "failed to stop container while aborting launch: {err}"
+                reason,
+                "failed to stop container during launch rollback: {stop_err}"
             );
         }
-        if let Err(err) = self
+        if let Err(remove_err) = self
             .container_manager
             .remove_container(container_id, true, true)
             .await
         {
             warn!(
                 target: "task",
-                task = %task_id,
                 container = %container_id,
-                "failed to remove container while aborting launch: {err}"
+                reason,
+                "failed to remove container during launch rollback: {remove_err}"
             );
         }
+    }
+
+    /// Best-effort rollback when startup raced with a newer stop/remove intent.
+    async fn abort_launched_container(&self, task_id: Uuid, container_id: &str) {
+        self.local_containers.lock().await.remove(&task_id);
+        self.rollback_container_launch(container_id, "launch aborted")
+            .await;
     }
 
     /// Resolves an existing container identifier when a create call hit a name conflict.
