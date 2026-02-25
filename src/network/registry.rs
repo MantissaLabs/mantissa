@@ -8,7 +8,38 @@ use chrono::{DateTime, Utc};
 use crdt_store::uuid_key::UuidKey;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
+
+/// Cached projections over network peer/attachment stores keyed by store generation.
+struct NetworkRegistryCache {
+    attachment_generation: u64,
+    attachments_all: Vec<NetworkAttachmentValue>,
+    attachments_by_network: HashMap<Uuid, Vec<NetworkAttachmentValue>>,
+    attachments_by_task: HashMap<Uuid, Vec<NetworkAttachmentValue>>,
+    attachment_counts: HashMap<Uuid, usize>,
+    peer_generation: u64,
+    peer_states_all: Vec<NetworkPeerStateValue>,
+    peer_states_by_network: HashMap<Uuid, Vec<NetworkPeerStateValue>>,
+    peer_counts: HashMap<Uuid, (u32, u32)>,
+}
+
+impl NetworkRegistryCache {
+    /// Build an empty cache before any store reads are requested.
+    fn new() -> Self {
+        Self {
+            attachment_generation: 0,
+            attachments_all: Vec::new(),
+            attachments_by_network: HashMap::new(),
+            attachments_by_task: HashMap::new(),
+            attachment_counts: HashMap::new(),
+            peer_generation: 0,
+            peer_states_all: Vec::new(),
+            peer_states_by_network: HashMap::new(),
+            peer_counts: HashMap::new(),
+        }
+    }
+}
 
 /// Registry providing ergonomic accessors around replicated network state.
 #[derive(Clone)]
@@ -16,6 +47,7 @@ pub struct NetworkRegistry {
     specs: NetworkSpecStore,
     peers: NetworkPeerStore,
     attachments: NetworkAttachmentStore,
+    cache: Arc<RwLock<NetworkRegistryCache>>,
 }
 
 impl NetworkRegistry {
@@ -29,7 +61,137 @@ impl NetworkRegistry {
             specs,
             peers,
             attachments,
+            cache: Arc::new(RwLock::new(NetworkRegistryCache::new())),
         }
+    }
+
+    /// Acquire a read guard for cached derived views, recovering from poisoning if needed.
+    fn cache_read(&self) -> RwLockReadGuard<'_, NetworkRegistryCache> {
+        match self.cache.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Acquire a write guard for cached derived views, recovering from poisoning if needed.
+    fn cache_write(&self) -> RwLockWriteGuard<'_, NetworkRegistryCache> {
+        match self.cache.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Refresh cached peer-state projections when the underlying store generation advanced.
+    fn refresh_peer_cache_if_needed(&self) -> Result<()> {
+        let generation = self.peers.change_clock();
+        {
+            let cache = self.cache_read();
+            if cache.peer_generation == generation {
+                return Ok(());
+            }
+        }
+
+        let mut cache = self.cache_write();
+        if cache.peer_generation == generation {
+            return Ok(());
+        }
+
+        let (entries, _) = self
+            .peers
+            .load_all()
+            .map_err(|e| anyhow!("network peer state load_all failed: {e}"))?;
+
+        let mut states = Vec::with_capacity(entries.len());
+        for (_key, snapshot) in entries {
+            if let Some(value) = Self::select_latest_peer_state(snapshot.as_slice()) {
+                states.push(value);
+            }
+        }
+
+        states.sort_by(|a, b| {
+            a.network_id
+                .cmp(&b.network_id)
+                .then(a.peer_name.cmp(&b.peer_name))
+        });
+
+        let mut by_network: HashMap<Uuid, Vec<NetworkPeerStateValue>> = HashMap::new();
+        let mut counts: HashMap<Uuid, (u32, u32)> = HashMap::new();
+        for state in &states {
+            by_network
+                .entry(state.network_id)
+                .or_default()
+                .push(state.clone());
+            let entry = counts.entry(state.network_id).or_insert((0u32, 0u32));
+            entry.0 += 1;
+            if state.state.is_ready() {
+                entry.1 += 1;
+            }
+        }
+
+        cache.peer_generation = generation;
+        cache.peer_states_all = states;
+        cache.peer_states_by_network = by_network;
+        cache.peer_counts = counts;
+
+        Ok(())
+    }
+
+    /// Refresh cached attachment projections when the underlying store generation advanced.
+    fn refresh_attachment_cache_if_needed(&self) -> Result<()> {
+        let generation = self.attachments.change_clock();
+        {
+            let cache = self.cache_read();
+            if cache.attachment_generation == generation {
+                return Ok(());
+            }
+        }
+
+        let mut cache = self.cache_write();
+        if cache.attachment_generation == generation {
+            return Ok(());
+        }
+
+        let (entries, _) = self
+            .attachments
+            .load_all()
+            .map_err(|e| anyhow!("network attachment load_all failed: {e}"))?;
+
+        let mut list = Vec::with_capacity(entries.len());
+        for (_key, snapshot) in entries {
+            if let Some(value) = select_best_attachment_value(snapshot.as_slice()) {
+                list.push(value);
+            }
+        }
+
+        list.sort_by(|a, b| {
+            a.network_id
+                .cmp(&b.network_id)
+                .then(a.task_id.cmp(&b.task_id))
+                .then(a.created_at.cmp(&b.created_at))
+        });
+
+        let mut by_network: HashMap<Uuid, Vec<NetworkAttachmentValue>> = HashMap::new();
+        let mut by_task: HashMap<Uuid, Vec<NetworkAttachmentValue>> = HashMap::new();
+        let mut counts: HashMap<Uuid, usize> = HashMap::new();
+        for attachment in &list {
+            by_network
+                .entry(attachment.network_id)
+                .or_default()
+                .push(attachment.clone());
+            by_task
+                .entry(attachment.task_id)
+                .or_default()
+                .push(attachment.clone());
+            *counts.entry(attachment.network_id).or_insert(0) += 1;
+        }
+
+        cache.attachment_generation = generation;
+        cache.attachments_all = list;
+        cache.attachments_by_network = by_network;
+        cache.attachments_by_task = by_task;
+        cache.attachment_counts = counts;
+
+        Ok(())
     }
 
     /// Upsert a network specification into the replicated store.
@@ -135,29 +297,16 @@ impl NetworkRegistry {
         &self,
         network_filter: Option<Uuid>,
     ) -> Result<Vec<NetworkPeerStateValue>> {
-        let (entries, _) = self
-            .peers
-            .load_all()
-            .map_err(|e| anyhow!("network peer state load_all failed: {e}"))?;
-
-        let mut states = Vec::with_capacity(entries.len());
-        for (_key, snapshot) in entries {
-            if let Some(value) = Self::select_latest_peer_state(snapshot.as_slice()) {
-                if let Some(filter) = network_filter {
-                    if value.network_id != filter {
-                        continue;
-                    }
-                }
-                states.push(value);
-            }
-        }
-
-        states.sort_by(|a, b| {
-            a.network_id
-                .cmp(&b.network_id)
-                .then(a.peer_name.cmp(&b.peer_name))
-        });
-        Ok(states)
+        self.refresh_peer_cache_if_needed()?;
+        let cache = self.cache_read();
+        Ok(match network_filter {
+            Some(network_id) => cache
+                .peer_states_by_network
+                .get(&network_id)
+                .cloned()
+                .unwrap_or_default(),
+            None => cache.peer_states_all.clone(),
+        })
     }
 
     /// Upsert an attachment record into the replicated store.
@@ -197,63 +346,41 @@ impl NetworkRegistry {
         &self,
         network_filter: Option<Uuid>,
     ) -> Result<Vec<NetworkAttachmentValue>> {
-        let (entries, _) = self
-            .attachments
-            .load_all()
-            .map_err(|e| anyhow!("network attachment load_all failed: {e}"))?;
-
-        let mut list = Vec::with_capacity(entries.len());
-        for (_key, snapshot) in entries {
-            if let Some(value) = select_best_attachment_value(snapshot.as_slice()) {
-                if let Some(network_id) = network_filter {
-                    if value.network_id != network_id {
-                        continue;
-                    }
-                }
-                list.push(value);
-            }
-        }
-
-        list.sort_by(|a, b| {
-            a.network_id
-                .cmp(&b.network_id)
-                .then(a.task_id.cmp(&b.task_id))
-                .then(a.created_at.cmp(&b.created_at))
-        });
-        Ok(list)
+        self.refresh_attachment_cache_if_needed()?;
+        let cache = self.cache_read();
+        Ok(match network_filter {
+            Some(network_id) => cache
+                .attachments_by_network
+                .get(&network_id)
+                .cloned()
+                .unwrap_or_default(),
+            None => cache.attachments_all.clone(),
+        })
     }
 
     /// List attachments bound to a specific task identifier.
     pub fn list_attachments_for_task(&self, task_id: Uuid) -> Result<Vec<NetworkAttachmentValue>> {
-        let mut attachments = Vec::new();
-        for attachment in self.list_attachments(None)? {
-            if attachment.task_id == task_id {
-                attachments.push(attachment);
-            }
-        }
-        Ok(attachments)
+        self.refresh_attachment_cache_if_needed()?;
+        let cache = self.cache_read();
+        Ok(cache
+            .attachments_by_task
+            .get(&task_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// Compute attachment counts grouped by network identifier.
     pub fn attachment_counts(&self) -> Result<HashMap<Uuid, usize>> {
-        let mut counts = HashMap::new();
-        for attachment in self.list_attachments(None)? {
-            *counts.entry(attachment.network_id).or_insert(0) += 1;
-        }
-        Ok(counts)
+        self.refresh_attachment_cache_if_needed()?;
+        let cache = self.cache_read();
+        Ok(cache.attachment_counts.clone())
     }
 
     /// Compute aggregated peer readiness counts for every network.
     pub fn peer_counts(&self) -> Result<HashMap<Uuid, (u32, u32)>> {
-        let mut counts = HashMap::new();
-        for state in self.list_peer_states(None)? {
-            let entry = counts.entry(state.network_id).or_insert((0u32, 0u32));
-            entry.0 += 1;
-            if state.state.is_ready() {
-                entry.1 += 1;
-            }
-        }
-        Ok(counts)
+        self.refresh_peer_cache_if_needed()?;
+        let cache = self.cache_read();
+        Ok(cache.peer_counts.clone())
     }
 
     /// Ensure an idempotent peer state identifier exists for the provided network + peer combo.
