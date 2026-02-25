@@ -253,17 +253,12 @@ impl TaskManager {
             .context("failed to persist committed task specs")?;
 
         let mut dropped = 0usize;
-        for spec in &specs {
-            match self.enqueue_gossip_best_effort(TaskEvent::Upsert(Box::new(spec.clone()))) {
-                Ok(true) => {}
-                Ok(false) => dropped += 1,
-                Err(err) => {
-                    warn!(
-                        target: "task",
-                        "failed to enqueue task gossip for {}: {err}",
-                        spec.name
-                    );
-                }
+        for (plan, spec) in plans.iter().zip(specs.iter()) {
+            if self
+                .finalize_running_task_post_commit(spec, plan.container_id.as_deref(), true, true)
+                .await
+            {
+                dropped += 1;
             }
         }
         if dropped > 0 {
@@ -273,36 +268,6 @@ impl TaskManager {
                 total = specs.len(),
                 "dropped committed task gossip updates due full queue; anti-entropy will reconcile"
             );
-        }
-
-        for plan in plans {
-            let Some(container_id) = plan.container_id.as_ref() else {
-                continue;
-            };
-            if let Err(err) = self
-                .ensure_runtime_attachments(
-                    plan.id,
-                    container_id,
-                    &plan.networks,
-                    plan.service_metadata.as_ref(),
-                )
-                .await
-            {
-                warn!(
-                    target: "task",
-                    task = %plan.id,
-                    "failed to refresh attachments after commit: {err:#}"
-                );
-            }
-        }
-
-        {
-            let mut guard = self.local_containers.lock().await;
-            for plan in plans {
-                if let Some(container_id) = plan.container_id.as_ref() {
-                    guard.insert(plan.id, container_id.clone());
-                }
-            }
         }
 
         Ok(specs)

@@ -1044,34 +1044,72 @@ impl TaskManager {
             return Err(err);
         }
 
-        if let Err(err) = self
-            .enqueue_gossip(TaskEvent::Upsert(Box::new(working.clone())))
+        let _ = self
+            .finalize_running_task_post_commit(&working, Some(&container_id), false, false)
+            .await;
+
+        Ok(())
+    }
+
+    /// Publishes one committed running task update and refreshes runtime networking metadata.
+    ///
+    /// The batch and single-task launch paths both call this helper so gossip behavior and
+    /// post-commit attachment refresh cannot drift across code paths.
+    pub(super) async fn finalize_running_task_post_commit(
+        &self,
+        spec: &TaskSpec,
+        container_id: Option<&str>,
+        best_effort_gossip: bool,
+        update_container_cache: bool,
+    ) -> bool {
+        let mut dropped = false;
+        if best_effort_gossip {
+            match self.enqueue_gossip_best_effort(TaskEvent::Upsert(Box::new(spec.clone()))) {
+                Ok(true) => {}
+                Ok(false) => dropped = true,
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        "failed to enqueue task gossip for {}: {err}",
+                        spec.name
+                    );
+                }
+            }
+        } else if let Err(err) = self
+            .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
             .await
         {
             warn!(
                 target: "task",
                 "failed to enqueue task gossip for {}: {err}",
-                working.name
+                spec.name
             );
         }
 
-        if let Err(err) = self
-            .ensure_runtime_attachments(
-                working.id,
-                &container_id,
-                &working.networks,
-                working.service_metadata.as_ref(),
-            )
-            .await
-        {
-            warn!(
-                target: "task",
-                task = %working.id,
-                "failed to refresh attachments after running commit: {err:#}"
-            );
+        if let Some(container_id) = container_id {
+            if let Err(err) = self
+                .ensure_runtime_attachments(
+                    spec.id,
+                    container_id,
+                    &spec.networks,
+                    spec.service_metadata.as_ref(),
+                )
+                .await
+            {
+                warn!(
+                    target: "task",
+                    task = %spec.id,
+                    "failed to refresh attachments after running commit: {err:#}"
+                );
+            }
+
+            if update_container_cache {
+                let mut guard = self.local_containers.lock().await;
+                guard.insert(spec.id, container_id.to_string());
+            }
         }
 
-        Ok(())
+        dropped
     }
 
     /// Ensures runtime attachments exist for one launched task or rolls back container runtime.
