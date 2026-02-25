@@ -30,6 +30,7 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+mod launch;
 mod local;
 mod planner;
 mod reservation;

@@ -7,12 +7,10 @@ use tracing::{debug, warn};
 
 use crate::gpu::gpu_runtime_status;
 use crate::task::container::ContainerState;
-use crate::task::docker::{
-    ContainerCreateRequest, ResourceLimits, RestartPolicyConfig, RestartPolicyType,
-};
-use crate::task::types::{TaskEvent, TaskRestartPolicyKind, TaskSpec};
+use crate::task::types::{TaskEvent, TaskSpec};
 
 use super::TaskManager;
+use super::launch::ContainerLaunchRequest;
 use super::planner::BatchStartPlan;
 
 impl TaskManager {
@@ -161,206 +159,26 @@ impl TaskManager {
             self.update_task_phase(plan.id, ContainerState::Creating, None, None)
                 .await?;
 
-            let restart_policy = plan
-                .restart_policy
-                .as_ref()
-                .map(|policy| RestartPolicyConfig {
-                    name: match policy.name {
-                        TaskRestartPolicyKind::No => RestartPolicyType::No,
-                        TaskRestartPolicyKind::Always => RestartPolicyType::Always,
-                        TaskRestartPolicyKind::OnFailure => RestartPolicyType::OnFailure,
-                        TaskRestartPolicyKind::UnlessStopped => RestartPolicyType::UnlessStopped,
-                    },
-                    max_retry_count: policy.max_retry_count,
-                });
-
-            let resource_limits = ResourceLimits::from_requests(
-                plan.requested_cpu_millis,
-                plan.requested_memory_bytes,
-            );
-
-            let dns_servers: Vec<String> = self.resolve_dns_servers(&plan.networks).await?;
-            let dns_servers = if dns_servers.is_empty() {
-                None
-            } else {
-                Some(dns_servers)
-            };
-
-            debug!(
-                target: "task",
-                task = %plan.id,
-                container = %plan.container_name,
-                networks = ?plan.networks,
-                "launching container with networks"
-            );
-
-            let mut resolved = self
-                .resolve_runtime_secrets(plan.id, &plan.env, &plan.secret_files)
+            let container_id = self
+                .launch_task_container(&ContainerLaunchRequest {
+                    task_id: plan.id,
+                    task_name: &plan.name,
+                    container_name: &plan.container_name,
+                    image: &plan.image,
+                    command: &plan.command,
+                    cpu_millis: plan.requested_cpu_millis,
+                    memory_bytes: plan.requested_memory_bytes,
+                    gpu_count: plan.requested_gpu_count,
+                    gpu_device_ids: &plan.gpu_device_ids,
+                    truncate_gpu_device_ids: false,
+                    restart_policy: plan.restart_policy.as_ref(),
+                    env: &plan.env,
+                    secret_files: &plan.secret_files,
+                    networks: &plan.networks,
+                })
                 .await?;
-            let mut env_vars = if resolved.env.is_empty() {
-                None
-            } else {
-                Some(resolved.env.clone())
-            };
-            let volumes = if resolved.mounts.is_empty() {
-                None
-            } else {
-                Some(resolved.mounts.clone())
-            };
-
-            let gpu_device_ids = if plan.requested_gpu_count > 0 {
-                if plan.gpu_device_ids.len() < plan.requested_gpu_count as usize {
-                    return Err(anyhow!(
-                        "task {} requested {} GPU(s) but only {} GPU device(s) were reserved",
-                        plan.name,
-                        plan.requested_gpu_count,
-                        plan.gpu_device_ids.len()
-                    ));
-                }
-                Some(plan.gpu_device_ids.clone())
-            } else {
-                None
-            };
-
-            if let Some(device_ids) = gpu_device_ids.as_ref() {
-                self.ensure_gpu_runtime_ready(device_ids).await?;
-                super::append_nvidia_visible_devices(&mut env_vars, device_ids);
-            }
-
-            let create_request = ContainerCreateRequest {
-                name: plan.container_name.clone(),
-                image: plan.image.clone(),
-                command: if plan.command.is_empty() {
-                    None
-                } else {
-                    Some(plan.command.clone())
-                },
-                env_vars,
-                ports: None,
-                volumes,
-                restart_policy,
-                resource_limits,
-                dns_servers,
-                gpu_device_ids,
-            };
-            let retry_create_request = create_request.clone();
-
-            let create_result = self
-                .container_manager
-                .create_container(create_request)
-                .await;
-
-            let (container_id, created_fresh) = match create_result {
-                Ok(id) => (id, true),
-                Err(err) => {
-                    if super::is_name_conflict(&err) {
-                        match self
-                            .resolve_existing_container_id(&plan.container_name)
-                            .await
-                        {
-                            Ok(Some(existing_id)) => (existing_id, false),
-                            Ok(None) => {
-                                debug!(
-                                    target: "task",
-                                    task = %plan.id,
-                                    container = %plan.container_name,
-                                    "name conflict had no resolvable existing container; retrying create once"
-                                );
-                                match self
-                                    .container_manager
-                                    .create_container(retry_create_request)
-                                    .await
-                                {
-                                    Ok(id) => (id, true),
-                                    Err(retry_err) => {
-                                        if let Some(artifacts) = resolved.artifacts.take() {
-                                            if let Err(clean_err) = artifacts.cleanup().await {
-                                                warn!(
-                                                    target: "task",
-                                                    "failed to cleanup staged secrets after missing container {}: {clean_err}",
-                                                    plan.id
-                                                );
-                                            }
-                                        }
-                                        let err = anyhow::Error::from(retry_err).context(format!(
-                                            "docker create failed for task {}",
-                                            plan.name
-                                        ));
-                                        return Err(err);
-                                    }
-                                }
-                            }
-                            Err(inspect_err) => {
-                                if let Some(artifacts) = resolved.artifacts.take() {
-                                    if let Err(clean_err) = artifacts.cleanup().await {
-                                        warn!(
-                                            target: "task",
-                                            "failed to cleanup staged secrets after inspect error for task {}: {clean_err}",
-                                            plan.id
-                                        );
-                                    }
-                                }
-                                let err = anyhow::Error::from(inspect_err).context(format!(
-                                    "failed to inspect existing container after name conflict for task {}",
-                                    plan.name
-                                ));
-                                return Err(err);
-                            }
-                        }
-                    } else {
-                        if let Some(artifacts) = resolved.artifacts.take() {
-                            if let Err(clean_err) = artifacts.cleanup().await {
-                                warn!(
-                                    target: "task",
-                                    "failed to cleanup staged secrets after create error for task {}: {clean_err}",
-                                    plan.id
-                                );
-                            }
-                        }
-                        let err = anyhow::Error::from(err)
-                            .context(format!("docker create failed for task {}", plan.name));
-                        return Err(err);
-                    }
-                }
-            };
-
-            if let Some(artifacts) = resolved.artifacts.take() {
-                let mut guard = self.secret_artifacts.lock().await;
-                guard.insert(plan.id, artifacts);
-            }
 
             plan.container_id = Some(container_id.clone());
-
-            match self.container_manager.start_container(&container_id).await {
-                Ok(_) => {}
-                Err(err) => {
-                    if super::container_already_running(&err) {
-                        debug!(
-                            target: "task",
-                            "container {} already running while starting task {}",
-                            container_id,
-                            plan.id
-                        );
-                    } else {
-                        if created_fresh {
-                            if let Err(remove_err) = self
-                                .container_manager
-                                .remove_container(&container_id, true, true)
-                                .await
-                            {
-                                warn!(
-                                    target: "task",
-                                    "failed to remove container {} after start failure: {remove_err}",
-                                    container_id
-                                );
-                            }
-                        }
-                        let err = anyhow::Error::from(err)
-                            .context(format!("docker start failed for task {}", plan.name));
-                        return Err(err);
-                    }
-                }
-            }
 
             if let Err(err) = self
                 .ensure_runtime_attachments(

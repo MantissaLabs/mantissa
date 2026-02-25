@@ -1,0 +1,243 @@
+use anyhow::anyhow;
+use tracing::{debug, warn};
+use uuid::Uuid;
+
+use crate::task::docker::{
+    ContainerCreateRequest, ResourceLimits, RestartPolicyConfig, RestartPolicyType,
+};
+use crate::task::types::{
+    TaskEnvironmentVariable, TaskRestartPolicy, TaskRestartPolicyKind, TaskSecretFile,
+};
+
+use super::secrets::ResolvedTaskSecrets;
+use super::{
+    TaskManager, container_already_running, is_name_conflict, wrap_create_error,
+    wrap_existing_inspect_error, wrap_start_error,
+};
+
+/// Shared launch inputs used by single-task and batch local startup paths.
+pub(super) struct ContainerLaunchRequest<'a> {
+    pub task_id: Uuid,
+    pub task_name: &'a str,
+    pub container_name: &'a str,
+    pub image: &'a str,
+    pub command: &'a [String],
+    pub cpu_millis: u64,
+    pub memory_bytes: u64,
+    pub gpu_count: u32,
+    pub gpu_device_ids: &'a [String],
+    pub truncate_gpu_device_ids: bool,
+    pub restart_policy: Option<&'a TaskRestartPolicy>,
+    pub env: &'a [TaskEnvironmentVariable],
+    pub secret_files: &'a [TaskSecretFile],
+    pub networks: &'a [Uuid],
+}
+
+impl TaskManager {
+    /// Builds one container launch request and guarantees the runtime process is started.
+    ///
+    /// Both single-task and batch startup paths call this helper so create/start behavior cannot
+    /// drift between the two code paths.
+    pub(super) async fn launch_task_container(
+        &self,
+        request: &ContainerLaunchRequest<'_>,
+    ) -> Result<String, anyhow::Error> {
+        let restart_policy = request.restart_policy.map(restart_policy_to_config);
+        let resource_limits =
+            ResourceLimits::from_requests(request.cpu_millis, request.memory_bytes);
+
+        debug!(
+            target: "task",
+            task = %request.task_id,
+            container = %request.container_name,
+            networks = ?request.networks,
+            "launching container with networks"
+        );
+
+        let dns_servers = self.resolve_dns_servers(request.networks).await?;
+        let dns_servers = if dns_servers.is_empty() {
+            None
+        } else {
+            Some(dns_servers)
+        };
+
+        let mut resolved = self
+            .resolve_runtime_secrets(request.task_id, request.env, request.secret_files)
+            .await?;
+        let mut env_vars = if resolved.env.is_empty() {
+            None
+        } else {
+            Some(resolved.env.clone())
+        };
+        let volumes = if resolved.mounts.is_empty() {
+            None
+        } else {
+            Some(resolved.mounts.clone())
+        };
+
+        let gpu_device_ids = if request.gpu_count > 0 {
+            let mut ids = request.gpu_device_ids.to_vec();
+            if ids.len() < request.gpu_count as usize {
+                cleanup_launch_artifacts(request.task_id, &mut resolved, "insufficient gpus").await;
+                return Err(anyhow!(
+                    "task {} requested {} GPU(s) but only {} GPU device(s) were reserved",
+                    request.task_name,
+                    request.gpu_count,
+                    ids.len()
+                ));
+            }
+            if request.truncate_gpu_device_ids && ids.len() > request.gpu_count as usize {
+                ids.truncate(request.gpu_count as usize);
+            }
+            Some(ids)
+        } else {
+            None
+        };
+
+        if let Some(device_ids) = gpu_device_ids.as_ref() {
+            if let Err(err) = self.ensure_gpu_runtime_ready(device_ids).await {
+                cleanup_launch_artifacts(request.task_id, &mut resolved, "gpu runtime check").await;
+                return Err(err);
+            }
+            super::append_nvidia_visible_devices(&mut env_vars, device_ids);
+        }
+
+        let create_request = ContainerCreateRequest {
+            name: request.container_name.to_string(),
+            image: request.image.to_string(),
+            command: if request.command.is_empty() {
+                None
+            } else {
+                Some(request.command.to_vec())
+            },
+            env_vars,
+            ports: None,
+            volumes,
+            restart_policy,
+            resource_limits,
+            dns_servers,
+            gpu_device_ids,
+        };
+        let retry_create_request = create_request.clone();
+
+        let (container_id, created_fresh) = match self
+            .container_manager
+            .create_container(create_request)
+            .await
+        {
+            Ok(id) => (id, true),
+            Err(err) => {
+                if is_name_conflict(&err) {
+                    match self
+                        .resolve_existing_container_id(request.container_name)
+                        .await
+                    {
+                        Ok(Some(existing_id)) => (existing_id, false),
+                        Ok(None) => {
+                            debug!(
+                                target: "task",
+                                task = %request.task_id,
+                                container = %request.container_name,
+                                "name conflict had no resolvable existing container; retrying create once"
+                            );
+                            match self
+                                .container_manager
+                                .create_container(retry_create_request)
+                                .await
+                            {
+                                Ok(id) => (id, true),
+                                Err(retry_err) => {
+                                    cleanup_launch_artifacts(
+                                        request.task_id,
+                                        &mut resolved,
+                                        "create retry failed",
+                                    )
+                                    .await;
+                                    return Err(wrap_create_error(request.task_name, retry_err));
+                                }
+                            }
+                        }
+                        Err(inspect_err) => {
+                            cleanup_launch_artifacts(
+                                request.task_id,
+                                &mut resolved,
+                                "inspect existing after name conflict",
+                            )
+                            .await;
+                            return Err(wrap_existing_inspect_error(
+                                request.task_name,
+                                inspect_err,
+                            ));
+                        }
+                    }
+                } else {
+                    cleanup_launch_artifacts(request.task_id, &mut resolved, "create failed").await;
+                    return Err(wrap_create_error(request.task_name, err));
+                }
+            }
+        };
+
+        if let Some(artifacts) = resolved.artifacts.take() {
+            let mut guard = self.secret_artifacts.lock().await;
+            guard.insert(request.task_id, artifacts);
+        }
+
+        match self.container_manager.start_container(&container_id).await {
+            Ok(_) => {}
+            Err(err) => {
+                if container_already_running(&err) {
+                    debug!(
+                        target: "task",
+                        "container {} already running while starting task {}",
+                        container_id,
+                        request.task_id
+                    );
+                } else {
+                    if created_fresh {
+                        if let Err(remove_err) = self
+                            .container_manager
+                            .remove_container(&container_id, true, true)
+                            .await
+                        {
+                            warn!(
+                                target: "task",
+                                "failed to remove container {} after start failure: {remove_err}",
+                                container_id
+                            );
+                        }
+                    }
+                    return Err(wrap_start_error(request.task_name, err));
+                }
+            }
+        }
+
+        Ok(container_id)
+    }
+}
+
+/// Maps a task restart policy into the docker restart policy payload.
+fn restart_policy_to_config(policy: &TaskRestartPolicy) -> RestartPolicyConfig {
+    RestartPolicyConfig {
+        name: match policy.name {
+            TaskRestartPolicyKind::No => RestartPolicyType::No,
+            TaskRestartPolicyKind::Always => RestartPolicyType::Always,
+            TaskRestartPolicyKind::OnFailure => RestartPolicyType::OnFailure,
+            TaskRestartPolicyKind::UnlessStopped => RestartPolicyType::UnlessStopped,
+        },
+        max_retry_count: policy.max_retry_count,
+    }
+}
+
+/// Removes staged secret artifacts produced during one failed launch attempt.
+async fn cleanup_launch_artifacts(task_id: Uuid, resolved: &mut ResolvedTaskSecrets, phase: &str) {
+    if let Some(artifacts) = resolved.artifacts.take() {
+        if let Err(clean_err) = artifacts.cleanup().await {
+            warn!(
+                target: "task",
+                task = %task_id,
+                phase,
+                "failed to cleanup staged secrets after launch failure: {clean_err}"
+            );
+        }
+    }
+}

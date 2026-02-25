@@ -16,18 +16,12 @@ use crate::scheduler::{
     GpuReservationRequest, SchedulerError, SlotId, SlotReservationRequest, SlotState,
 };
 use crate::task::container::ContainerState;
-use crate::task::docker::{
-    ContainerCreateRequest, ContainerError, ContainerInfo, ResourceLimits, RestartPolicyConfig,
-    RestartPolicyType,
-};
-use crate::task::types::{
-    TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskSpec, TaskValue,
-};
+use crate::task::docker::{ContainerError, ContainerInfo};
+use crate::task::types::{TaskEvent, TaskSpec, TaskValue};
 
 use super::{
-    TaskManager, container_already_running, container_remove_in_progress, is_name_conflict,
-    select_best_task_value, spec_to_value, value_to_spec, wrap_create_error,
-    wrap_existing_inspect_error, wrap_start_error,
+    TaskManager, container_remove_in_progress, launch::ContainerLaunchRequest,
+    select_best_task_value, spec_to_value, value_to_spec,
 };
 
 /// Snapshot of containers currently known by the local runtime.
@@ -844,19 +838,6 @@ impl TaskManager {
         Ok(servers)
     }
 
-    /// Maps a task restart policy into the Docker restart policy configuration.
-    pub(super) fn restart_policy_to_config(policy: &TaskRestartPolicy) -> RestartPolicyConfig {
-        RestartPolicyConfig {
-            name: match policy.name {
-                TaskRestartPolicyKind::No => RestartPolicyType::No,
-                TaskRestartPolicyKind::Always => RestartPolicyType::Always,
-                TaskRestartPolicyKind::OnFailure => RestartPolicyType::OnFailure,
-                TaskRestartPolicyKind::UnlessStopped => RestartPolicyType::UnlessStopped,
-            },
-            max_retry_count: policy.max_retry_count,
-        }
-    }
-
     /// Resolves the live container identifier for a task from cache and deterministic name.
     ///
     /// This keeps running-task reconciliation resilient when local in-memory tracking drifts
@@ -914,8 +895,6 @@ impl TaskManager {
     /// Starts or reuses a container so the task transitions into running state locally.
     pub(super) async fn ensure_task_running(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
         let mut working = self.load_spec(spec.id).await.unwrap_or(spec);
-        let task_name = working.name.clone();
-
         if self.reconcile_recorded_running_task(&mut working).await? {
             return Ok(());
         }
@@ -974,204 +953,32 @@ impl TaskManager {
             }
         }
 
-        let restart_policy = working
-            .restart_policy
-            .as_ref()
-            .map(Self::restart_policy_to_config);
-
-        let resource_limits =
-            ResourceLimits::from_requests(working.cpu_millis, working.memory_bytes);
-
-        let mut resolved = self
-            .resolve_runtime_secrets(working.id, &working.env, &working.secret_files)
-            .await?;
-        let mut env_vars = if resolved.env.is_empty() {
-            None
-        } else {
-            Some(resolved.env.clone())
-        };
-        let volumes = if resolved.mounts.is_empty() {
-            None
-        } else {
-            Some(resolved.mounts.clone())
-        };
-
         let container_name = format!("mantissa-{}", working.id);
-
-        debug!(
-            target: "task",
-            task = %working.id,
-            container = %container_name,
-            networks = ?working.networks,
-            "resolving dns servers for task"
-        );
-        let dns_servers = self.resolve_dns_servers(&working.networks).await?;
-        let dns_servers = if dns_servers.is_empty() {
-            None
-        } else {
-            Some(dns_servers)
-        };
-
-        let gpu_device_ids = if working.gpu_count > 0 {
-            let mut ids = working.gpu_device_ids.clone();
-            if ids.len() < working.gpu_count as usize {
-                let err = anyhow!(
-                    "task {} requested {} GPU(s) but only {} GPU device(s) were reserved",
-                    working.name,
-                    working.gpu_count,
-                    ids.len()
-                );
+        let container_id = match self
+            .launch_task_container(&ContainerLaunchRequest {
+                task_id: working.id,
+                task_name: &working.name,
+                container_name: &container_name,
+                image: &working.image,
+                command: &working.command,
+                cpu_millis: working.cpu_millis,
+                memory_bytes: working.memory_bytes,
+                gpu_count: working.gpu_count,
+                gpu_device_ids: &working.gpu_device_ids,
+                truncate_gpu_device_ids: true,
+                restart_policy: working.restart_policy.as_ref(),
+                env: &working.env,
+                secret_files: &working.secret_files,
+                networks: &working.networks,
+            })
+            .await
+        {
+            Ok(container_id) => container_id,
+            Err(err) => {
                 let err = self.mark_task_failed(working, err).await;
                 return Err(err);
             }
-            if ids.len() > working.gpu_count as usize {
-                ids.truncate(working.gpu_count as usize);
-            }
-            Some(ids)
-        } else {
-            None
         };
-
-        if let Some(device_ids) = gpu_device_ids.as_ref() {
-            self.ensure_gpu_runtime_ready(device_ids).await?;
-            super::append_nvidia_visible_devices(&mut env_vars, device_ids);
-        }
-
-        let create_request = ContainerCreateRequest {
-            name: container_name.clone(),
-            image: working.image.clone(),
-            command: if working.command.is_empty() {
-                None
-            } else {
-                Some(working.command.clone())
-            },
-            env_vars,
-            ports: None,
-            volumes,
-            restart_policy,
-            resource_limits,
-            dns_servers,
-            gpu_device_ids,
-        };
-        let retry_create_request = create_request.clone();
-
-        let create_outcome = self
-            .container_manager
-            .create_container(create_request)
-            .await;
-
-        let (container_id, created_fresh): (String, bool) = match create_outcome {
-            Ok(id) => (id, true),
-            Err(err) => {
-                if is_name_conflict(&err) {
-                    match self.resolve_existing_container_id(&container_name).await {
-                        Ok(Some(existing_id)) => (existing_id, false),
-                        Ok(None) => {
-                            debug!(
-                                target: "task",
-                                task = %working.id,
-                                container = %container_name,
-                                "name conflict had no resolvable existing container; retrying create once"
-                            );
-                            match self
-                                .container_manager
-                                .create_container(retry_create_request)
-                                .await
-                            {
-                                Ok(id) => (id, true),
-                                Err(retry_err) => {
-                                    if let Some(artifacts) = resolved.artifacts.take() {
-                                        if let Err(clean_err) = artifacts.cleanup().await {
-                                            warn!(
-                                                target: "task",
-                                                "failed to cleanup staged secrets after missing container {}: {clean_err}",
-                                                working.id
-                                            );
-                                        }
-                                    }
-                                    let err = self
-                                        .mark_task_failed(
-                                            working,
-                                            wrap_create_error(&task_name, retry_err),
-                                        )
-                                        .await;
-                                    return Err(err);
-                                }
-                            }
-                        }
-                        Err(inspect_err) => {
-                            if let Some(artifacts) = resolved.artifacts.take() {
-                                if let Err(clean_err) = artifacts.cleanup().await {
-                                    warn!(
-                                        target: "task",
-                                        "failed to cleanup staged secrets after inspect error for {}: {clean_err}",
-                                        working.id
-                                    );
-                                }
-                            }
-                            let err = self
-                                .mark_task_failed(
-                                    working,
-                                    wrap_existing_inspect_error(&task_name, inspect_err),
-                                )
-                                .await;
-                            return Err(err);
-                        }
-                    }
-                } else {
-                    if let Some(artifacts) = resolved.artifacts.take() {
-                        if let Err(clean_err) = artifacts.cleanup().await {
-                            warn!(
-                                target: "task",
-                                "failed to cleanup staged secrets after create error for {}: {clean_err}",
-                                working.id
-                            );
-                        }
-                    }
-                    let err = self
-                        .mark_task_failed(working, wrap_create_error(&task_name, err))
-                        .await;
-                    return Err(err);
-                }
-            }
-        };
-
-        if let Some(artifacts) = resolved.artifacts.take() {
-            let mut guard = self.secret_artifacts.lock().await;
-            guard.insert(working.id, artifacts);
-        }
-
-        match self.container_manager.start_container(&container_id).await {
-            Ok(_) => {}
-            Err(err) => {
-                if container_already_running(&err) {
-                    debug!(
-                        target: "task",
-                        "container {} already running while starting task {}",
-                        container_id,
-                        working.id
-                    );
-                } else {
-                    if created_fresh {
-                        if let Err(remove_err) = self
-                            .container_manager
-                            .remove_container(&container_id, true, true)
-                            .await
-                        {
-                            warn!(
-                                target: "task",
-                                "failed to remove container {} after start failure: {remove_err}",
-                                container_id
-                            );
-                        }
-                    }
-                    let err = self
-                        .mark_task_failed(working, wrap_start_error(&task_name, err))
-                        .await;
-                    return Err(err);
-                }
-            }
-        }
 
         {
             let mut guard = self.local_containers.lock().await;
