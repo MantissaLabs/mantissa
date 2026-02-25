@@ -202,13 +202,26 @@ impl TaskManager {
         node_id: Uuid,
         slot_ids: &[SlotId],
     ) -> Result<u64, anyhow::Error> {
+        let key = UuidKey::from(id);
         let snapshot = self
             .store
-            .get_snapshot(&UuidKey::from(id))
+            .get_snapshot(&key)
             .map_err(|e| anyhow::anyhow!("task lookup failed for assignment epoch: {e}"))?;
 
         let Some(snapshot) = snapshot else {
-            return Ok(0);
+            if let Some(max_epoch) = self
+                .removed_task_watermarks
+                .lock()
+                .await
+                .get(&id)
+                .map(|tombstone| tombstone.max_epoch)
+            {
+                return Ok(max_epoch.saturating_add(1));
+            }
+            let has_tombstone = self.store.has_tombstone(&key).map_err(|e| {
+                anyhow::anyhow!("task tombstone lookup failed for assignment epoch: {e}")
+            })?;
+            return Ok(if has_tombstone { 1 } else { 0 });
         };
         let Some(current) = select_best_task_value(snapshot.as_slice()) else {
             return Ok(0);
@@ -244,6 +257,10 @@ impl TaskManager {
     /// Removes a task snapshot from the store.
     pub(super) async fn remove_spec(&self, id: Uuid) -> Result<(), anyhow::Error> {
         let key = UuidKey::from(id);
+        let prior_max_epoch = {
+            let guard = self.removed_task_watermarks.lock().await;
+            guard.get(&id).map(|tombstone| tombstone.max_epoch)
+        };
         let (watermark, max_epoch) = self
             .store
             .get_snapshot(&key)
@@ -256,9 +273,9 @@ impl TaskManager {
                     value.task_epoch,
                 )
             })
-            // If we did not observe a register value, treat the remove as authoritative for all
-            // epochs so late stale upserts cannot resurrect an unknown/deleted row.
-            .unwrap_or_else(|| (Utc::now(), u64::MAX));
+            // Duplicate remove events can arrive after the row is already gone. Reuse the
+            // existing watermark epoch instead of poisoning the id with an unbounded epoch.
+            .unwrap_or_else(|| (Utc::now(), prior_max_epoch.unwrap_or(0)));
 
         self.store
             .remove(&key)

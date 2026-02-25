@@ -453,6 +453,28 @@ impl TaskManager {
                 Ok(())
             }
             TaskEvent::Remove { id } => {
+                let current = self.load_spec(id).await.ok();
+                if let Some(spec) = current.as_ref() {
+                    let active_local = spec.node_id == self.local_node_id
+                        && matches!(
+                            spec.state,
+                            ContainerState::Pending
+                                | ContainerState::Pulling
+                                | ContainerState::Creating
+                                | ContainerState::Running
+                                | ContainerState::Stopping
+                        );
+                    if active_local {
+                        debug!(
+                            target: "task",
+                            task = %id,
+                            state = ?spec.state,
+                            "ignoring stale remove event for active local task"
+                        );
+                        return Ok(());
+                    }
+                }
+
                 self.local_containers.lock().await.remove(&id);
                 if let Err(err) = self
                     .teardown_runtime_attachments(id, HashSet::new(), true)
@@ -464,7 +486,11 @@ impl TaskManager {
                     );
                 }
                 self.cleanup_secret_artifacts(id).await;
-                self.remove_spec(id).await
+                if current.is_some() {
+                    self.remove_spec(id).await
+                } else {
+                    Ok(())
+                }
             }
         }
     }

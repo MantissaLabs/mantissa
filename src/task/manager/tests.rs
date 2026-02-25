@@ -2224,6 +2224,145 @@ async fn remove_event_purges_remote_attachment_without_local_spec() {
 }
 
 #[tokio::test]
+async fn duplicate_remove_event_does_not_poison_future_epoch_upsert() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let original = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    manager
+        .remove_spec(original.id)
+        .await
+        .expect("remove task spec");
+    manager
+        .handle_event(TaskEvent::Remove { id: original.id })
+        .await
+        .expect("apply duplicate remove event");
+
+    let mut replacement = original.clone();
+    replacement.node_id = Uuid::new_v4();
+    replacement.node_name = "remote-node".to_string();
+    replacement.state = ContainerState::Running;
+    replacement.updated_at = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+    replacement.task_epoch = replacement.task_epoch.saturating_add(1);
+    replacement.phase_version = replacement.phase_version.saturating_add(1);
+
+    manager
+        .handle_event(TaskEvent::Upsert(Box::new(replacement.clone())))
+        .await
+        .expect("apply replacement upsert");
+
+    let tasks = manager
+        .list_tasks(&TaskStateFilter::all())
+        .await
+        .expect("list tasks after replacement");
+    assert_eq!(
+        tasks.len(),
+        1,
+        "replacement should be accepted after duplicate remove"
+    );
+    assert_eq!(tasks[0].id, replacement.id);
+    assert_eq!(tasks[0].task_epoch, replacement.task_epoch);
+}
+
+#[tokio::test]
+async fn next_epoch_after_remove_uses_watermark_increment() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let started = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    manager
+        .remove_spec(started.id)
+        .await
+        .expect("remove task spec");
+
+    let next = manager
+        .next_task_epoch_for_assignment(started.id, manager.local_node_id, &[1])
+        .await
+        .expect("next epoch");
+    assert_eq!(
+        next,
+        started.task_epoch.saturating_add(1),
+        "removed task should restart on a newer epoch"
+    );
+}
+
+#[tokio::test]
+async fn next_epoch_after_remove_without_watermark_uses_tombstone_floor() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let started = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    manager
+        .remove_spec(started.id)
+        .await
+        .expect("remove task spec");
+    manager.clear_remove_watermark(started.id).await;
+
+    let next = manager
+        .next_task_epoch_for_assignment(started.id, manager.local_node_id, &[1])
+        .await
+        .expect("next epoch");
+    assert_eq!(
+        next, 1,
+        "durable tombstone should force a non-zero restart epoch"
+    );
+}
+
+#[tokio::test]
+async fn stale_remove_event_does_not_delete_active_local_task() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let running = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    manager
+        .handle_event(TaskEvent::Remove { id: running.id })
+        .await
+        .expect("handle stale remove");
+
+    let persisted = manager
+        .load_spec(running.id)
+        .await
+        .expect("running task should remain persisted");
+    assert_eq!(persisted.id, running.id);
+    assert_eq!(persisted.node_id, manager.local_node_id);
+    assert_eq!(persisted.state, ContainerState::Running);
+}
+
+#[tokio::test]
 async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 

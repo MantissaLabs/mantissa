@@ -1110,8 +1110,10 @@ impl Topology {
                 continue;
             }
 
+            // Split pruning is view-scoped, not a global delete. Purge locally so merge/sync
+            // can repopulate rows from the other partition.
             self.tasks
-                .remove(&UuidKey::from(key.to_uuid()))
+                .purge_local(&UuidKey::from(key.to_uuid()))
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
             removed = removed.saturating_add(1);
@@ -1138,8 +1140,9 @@ impl Topology {
                 continue;
             }
 
+            // Keep split prune reversible: do not leave durable tombstones that block merge replay.
             self.network_peers
-                .remove(&UuidKey::from(key.to_uuid()))
+                .purge_local(&UuidKey::from(key.to_uuid()))
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
             removed_peer_states = removed_peer_states.saturating_add(1);
@@ -1158,8 +1161,9 @@ impl Topology {
                 continue;
             }
 
+            // Keep split prune reversible: do not leave durable tombstones that block merge replay.
             self.network_attachments
-                .remove(&UuidKey::from(key.to_uuid()))
+                .purge_local(&UuidKey::from(key.to_uuid()))
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
             removed_attachments = removed_attachments.saturating_add(1);
