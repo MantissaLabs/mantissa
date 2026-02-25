@@ -13,7 +13,10 @@ use protocol::server::{self, cluster_session};
 use protocol::sync;
 use std::collections::{HashMap, HashSet};
 use std::panic::Location;
-use std::sync::Arc;
+use std::sync::{
+    Arc, RwLock as StdRwLock, RwLockReadGuard as StdRwLockReadGuard,
+    RwLockWriteGuard as StdRwLockWriteGuard,
+};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, error, warn};
@@ -25,6 +28,28 @@ type ReconnectGateMap = Arc<AsyncMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>;
 type ReconnectStateMap = Arc<AsyncMutex<HashMap<Uuid, PeerReconnectState>>>;
 type InvalidationStatsMap = Arc<AsyncMutex<HashMap<(Uuid, String), u64>>>;
 type SessionFailureStatsMap = Arc<AsyncMutex<HashMap<(Uuid, String), u64>>>;
+
+/// Cached projections over the peer store keyed by store generation.
+struct PeerStoreSnapshotCache {
+    generation: u64,
+    active_peer_ids: Vec<Uuid>,
+    peer_values: Vec<(Uuid, PeerValue)>,
+    values_by_peer: HashMap<Uuid, PeerValue>,
+}
+
+impl PeerStoreSnapshotCache {
+    /// # Description:
+    ///
+    /// Builds an empty peer snapshot cache for lazy first-use hydration.
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            active_peer_ids: Vec::new(),
+            peer_values: Vec::new(),
+            values_by_peer: HashMap::new(),
+        }
+    }
+}
 
 /// Initial reconnect backoff delay for one failed peer dial attempt.
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(200);
@@ -81,6 +106,7 @@ pub struct Registry {
     node_id: Uuid,
     health_monitor: Arc<HealthMonitor>,
     excluded_peers: Arc<std::sync::RwLock<HashSet<Uuid>>>,
+    peer_snapshot_cache: Arc<StdRwLock<PeerStoreSnapshotCache>>,
 }
 
 #[derive(Clone, Copy)]
@@ -156,6 +182,7 @@ impl Registry {
             node_id,
             health_monitor,
             excluded_peers: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            peer_snapshot_cache: Arc::new(StdRwLock::new(PeerStoreSnapshotCache::new())),
         }
     }
 
@@ -303,24 +330,17 @@ impl Registry {
     }
 
     pub fn known_peers(&self) -> AnyResult<Vec<Uuid>> {
-        let (actives, _) = self
-            .peers
-            .load_all()
-            .map_err(|e| anyhow!("failed to load peer store: {e}"))?;
-
-        let mut ids = Vec::new();
-        for (key, snapshot) in actives {
-            let peer_id = key.to_uuid();
-            if peer_id == self.node_id {
+        self.refresh_peer_snapshot_cache_if_needed()?;
+        let cache = self.peer_snapshot_cache_read();
+        let mut ids = Vec::with_capacity(cache.active_peer_ids.len());
+        for peer_id in &cache.active_peer_ids {
+            if *peer_id == self.node_id {
                 continue;
             }
-            if self.peer_is_excluded(peer_id) {
+            if self.peer_is_excluded(*peer_id) {
                 continue;
             }
-
-            if snapshot.as_slice().last().is_some() {
-                ids.push(peer_id);
-            }
+            ids.push(*peer_id);
         }
 
         Ok(ids)
@@ -379,24 +399,84 @@ impl Registry {
         }
     }
 
-    /// Returns a best-effort snapshot of the latest `PeerValue` for every active peer.
+    /// # Description:
     ///
-    /// This is used by subsystems (like networking) that need to reconcile state based on peer
-    /// metadata without repeatedly scanning the store for each individual peer.
-    pub fn peer_values_snapshot(&self) -> AnyResult<Vec<(Uuid, PeerValue)>> {
+    /// Acquires a read guard for peer store projections while recovering from poisoning.
+    fn peer_snapshot_cache_read(&self) -> StdRwLockReadGuard<'_, PeerStoreSnapshotCache> {
+        match self.peer_snapshot_cache.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// # Description:
+    ///
+    /// Acquires a write guard for peer store projections while recovering from poisoning.
+    fn peer_snapshot_cache_write(&self) -> StdRwLockWriteGuard<'_, PeerStoreSnapshotCache> {
+        match self.peer_snapshot_cache.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// # Description:
+    ///
+    /// Rebuilds cached peer projections when the peer store generation has advanced.
+    fn refresh_peer_snapshot_cache_if_needed(&self) -> AnyResult<()> {
+        let generation = self.peers.change_clock();
+        {
+            let cache = self.peer_snapshot_cache_read();
+            if cache.generation == generation {
+                return Ok(());
+            }
+        }
+
+        let mut cache = self.peer_snapshot_cache_write();
+        if cache.generation == generation {
+            return Ok(());
+        }
+
         let (actives, _) = self
             .peers
             .load_all()
             .map_err(|e| anyhow!("failed to load peer store: {e}"))?;
 
-        let mut out = Vec::with_capacity(actives.len());
+        let mut active_peer_ids = Vec::with_capacity(actives.len());
+        let mut peer_values = Vec::with_capacity(actives.len());
+        let mut values_by_peer = HashMap::with_capacity(actives.len());
         for (key, snapshot) in actives {
-            if self.peer_is_excluded(key.to_uuid()) {
-                continue;
+            let peer_id = key.to_uuid();
+            if snapshot.as_slice().last().is_some() {
+                active_peer_ids.push(peer_id);
             }
             if let Some(value) = Self::select_peer_value(snapshot.as_slice()) {
-                out.push((key.to_uuid(), value));
+                values_by_peer.insert(peer_id, value.clone());
+                peer_values.push((peer_id, value));
             }
+        }
+
+        cache.generation = generation;
+        cache.active_peer_ids = active_peer_ids;
+        cache.peer_values = peer_values;
+        cache.values_by_peer = values_by_peer;
+
+        Ok(())
+    }
+
+    /// Returns a best-effort snapshot of the latest `PeerValue` for every active peer.
+    ///
+    /// This is used by subsystems (like networking) that need to reconcile state based on peer
+    /// metadata without repeatedly scanning the store for each individual peer.
+    pub fn peer_values_snapshot(&self) -> AnyResult<Vec<(Uuid, PeerValue)>> {
+        self.refresh_peer_snapshot_cache_if_needed()?;
+        let cache = self.peer_snapshot_cache_read();
+
+        let mut out = Vec::with_capacity(cache.peer_values.len());
+        for (peer_id, value) in &cache.peer_values {
+            if self.peer_is_excluded(*peer_id) {
+                continue;
+            }
+            out.push((*peer_id, value.clone()));
         }
         Ok(out)
     }
@@ -1265,11 +1345,9 @@ impl Registry {
     }
 
     fn peer_latest_value_unscoped(&self, peer_id: Uuid) -> Option<PeerValue> {
-        let (actives, _) = self.peers.load_all().ok()?;
-        actives
-            .into_iter()
-            .find(|(k, _)| k.to_uuid() == peer_id)
-            .and_then(|(_, snap)| Self::select_peer_value(snap.as_slice()))
+        self.refresh_peer_snapshot_cache_if_needed().ok()?;
+        let cache = self.peer_snapshot_cache_read();
+        cache.values_by_peer.get(&peer_id).cloned()
     }
 
     /// Dial a peer over authenticated Noise using the current join token.
