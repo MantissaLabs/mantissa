@@ -2421,7 +2421,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
 }
 
 #[tokio::test]
-async fn stale_upsert_after_remove_without_watermark_is_ignored_by_durable_tombstone() {
+async fn upsert_after_remove_without_watermark_is_accepted_for_reconvergence() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -2448,15 +2448,17 @@ async fn stale_upsert_after_remove_without_watermark_is_ignored_by_durable_tombs
     manager
         .handle_event(TaskEvent::Upsert(Box::new(original.clone())))
         .await
-        .expect("stale upsert should be handled");
-    let after_stale = manager
+        .expect("upsert should be handled");
+    let after_upsert = manager
         .list_tasks(&TaskStateFilter::all())
         .await
-        .expect("list after stale upsert");
+        .expect("list after upsert");
     assert!(
-        after_stale.is_empty(),
-        "durable tombstone should block stale upsert replay without in-memory watermark"
+        !after_upsert.is_empty(),
+        "upsert should be accepted once remove watermark is no longer present"
     );
+    assert_eq!(after_upsert[0].id, original.id);
+    assert_eq!(after_upsert[0].node_id, original.node_id);
 }
 
 #[tokio::test]

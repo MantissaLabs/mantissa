@@ -278,15 +278,10 @@ impl TaskManager {
             return true;
         }
 
-        let key = UuidKey::from(spec.id);
-        self.store.has_tombstone(&key).unwrap_or_else(|err| {
-            warn!(
-                target: "task",
-                task = %spec.id,
-                "failed to check task tombstone while filtering upsert: {err}"
-            );
-            false
-        })
+        // Durable tombstones outlive the in-memory remove watermark and do not carry enough
+        // causal detail to safely reject one future incarnation forever. Once the watermark
+        // window elapses we must allow upserts again so split/merge convergence can recover.
+        false
     }
 
     /// Returns true when one telemetry counter sample should emit a diagnostic log.

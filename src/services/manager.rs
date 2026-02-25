@@ -50,11 +50,11 @@ const SERVICE_SLOT_MISSING_GRACE_SECS: u64 = 6;
 const SERVICE_REBALANCE_MIN_AGE_SECS: i64 = 20;
 /// Cooldown window between rebalance attempts for the same slot.
 const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
-/// Proactive post-deploy rebalancing is disabled by default to keep placement stable once healthy.
+/// Proactive slot rebalance keeps long-lived running services aligned with deterministic ownership.
 ///
-/// Slots should converge deterministically at deployment/startup time; running replicas are only
-/// replaced on health or ownership faults, not for opportunistic migration.
-const SERVICE_ENABLE_PROACTIVE_REBALANCE: bool = false;
+/// This is required for split/merge convergence so replicas migrate off overloaded partitions once
+/// the unified cluster view is restored.
+const SERVICE_ENABLE_PROACTIVE_REBALANCE: bool = true;
 #[derive(Clone)]
 pub struct ServiceController {
     registry: ServiceRegistry,
