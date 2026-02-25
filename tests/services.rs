@@ -11,6 +11,8 @@ use common::testkit::{
     ClusterConfig, ContainerManagerOverrideGuard, InMemoryContainerManager, TestNode,
 };
 use crdt_store::uuid_key::UuidKey;
+use mantissa::cluster::ClusterViewId;
+use mantissa::node::id::set_node_id;
 use mantissa::scheduler::SlotReservationRequest;
 use mantissa::scheduler::SlotState;
 use mantissa::services::ServiceController;
@@ -26,6 +28,7 @@ use mantissa::task::types::{
 };
 use protocol::secrets::secrets;
 use protocol::services::services;
+use protocol::topology::ClusterOperationStage;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::Path,
@@ -1122,6 +1125,181 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
     }
 });
 
+local_test!(
+    services_split_merge_rebalance_preserves_replica_convergence,
+    {
+        let _guard =
+            ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(4, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 4, "cluster should stabilise to four nodes")
+            .await;
+
+        let service_name = "split-merge-rebalance";
+        let templates = vec![demo_backend_task_template("backend", 8)];
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+            .await
+            .expect("submit deployment");
+
+        assert!(
+            wait_for_service_status(
+                &cluster[0].node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "anchor should observe running service before split"
+        );
+        assert!(
+            wait_for_service_task_count_all(&cluster, service_name, 8, Duration::from_secs(20))
+                .await,
+            "all nodes should converge on eight active tasks before split"
+        );
+
+        let left_a = &cluster[0];
+        let left_b = &cluster[1];
+        let right_a = &cluster[2];
+        let right_b = &cluster[3];
+
+        let source_view = current_cluster_view(&left_a.topology()).await;
+        let mut split_req = left_a.topology().split_cluster_request();
+        {
+            let mut req = split_req.get().init_req();
+            source_view.write_capnp(req.reborrow().init_source_view());
+
+            let mut targets = req.reborrow().init_targets(2);
+            let mut left = targets.reborrow().get(0);
+            left.set_name("left");
+            let mut left_selector = left.reborrow().init_selector();
+            left_selector.reborrow().init_clauses(0);
+            let mut left_nodes = left_selector.reborrow().init_explicit_nodes(2);
+            set_node_id(left_nodes.reborrow().get(0), &left_a.id());
+            set_node_id(left_nodes.reborrow().get(1), &left_b.id());
+
+            let mut right = targets.reborrow().get(1);
+            right.set_name("right");
+            let mut right_selector = right.reborrow().init_selector();
+            right_selector.reborrow().init_clauses(0);
+            let mut right_nodes = right_selector.reborrow().init_explicit_nodes(2);
+            set_node_id(right_nodes.reborrow().get(0), &right_a.id());
+            set_node_id(right_nodes.reborrow().get(1), &right_b.id());
+
+            req.set_dry_run(false);
+        }
+
+        let split_resp = split_req.send().promise.await.expect("splitCluster send");
+        let split_op = split_resp
+            .get()
+            .expect("splitCluster get")
+            .get_op()
+            .expect("split operation");
+        let split_targets = split_op.get_target_views().expect("split target views");
+        assert_eq!(
+            split_targets.len(),
+            2,
+            "split should expose two target views"
+        );
+        let left_view = ClusterViewId::from_capnp(split_targets.get(0)).expect("left split view");
+        let right_view = ClusterViewId::from_capnp(split_targets.get(1)).expect("right split view");
+        let split_id = split_op.get_id().expect("split operation id").to_vec();
+
+        wait_for_operation_stage(
+            &left_a.topology(),
+            &split_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(15),
+        )
+        .await;
+        wait_for_cluster_view(&left_a.topology(), left_view, Duration::from_secs(15)).await;
+        wait_for_cluster_view(&left_b.topology(), left_view, Duration::from_secs(15)).await;
+        wait_for_cluster_view(&right_a.topology(), right_view, Duration::from_secs(15)).await;
+        wait_for_cluster_view(&right_b.topology(), right_view, Duration::from_secs(15)).await;
+
+        assert!(
+            wait_for_service_task_count_all(&cluster, service_name, 8, Duration::from_secs(20))
+                .await,
+            "each partition should converge on eight active tasks after split"
+        );
+        assert!(
+            wait_for_exact_local_service_task_count(
+                &[left_a, left_b],
+                service_name,
+                4,
+                Duration::from_secs(20)
+            )
+            .await,
+            "left partition should converge to four local tasks per node"
+        );
+        assert!(
+            wait_for_exact_local_service_task_count(
+                &[right_a, right_b],
+                service_name,
+                4,
+                Duration::from_secs(20)
+            )
+            .await,
+            "right partition should converge to four local tasks per node"
+        );
+
+        let mut merge_req = left_a.topology().merge_clusters_request();
+        {
+            let mut req = merge_req.get().init_req();
+            left_view.write_capnp(req.reborrow().init_source_view());
+            right_view.write_capnp(req.reborrow().init_destination_view());
+            req.set_dry_run(false);
+        }
+
+        let merge_resp = merge_req.send().promise.await.expect("mergeClusters send");
+        let merge_op = merge_resp
+            .get()
+            .expect("mergeClusters get")
+            .get_op()
+            .expect("merge operation");
+        let merge_id = merge_op.get_id().expect("merge operation id").to_vec();
+
+        wait_for_operation_stage(
+            &left_a.topology(),
+            &merge_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(15),
+        )
+        .await;
+        TestNode::assert_cluster_size_all(
+            &cluster,
+            4,
+            "cluster should reconnect all nodes after merge",
+        )
+        .await;
+
+        assert!(
+            wait_for_service_task_count_all(&cluster, service_name, 8, Duration::from_secs(30))
+                .await,
+            "merged cluster should converge to eight active tasks"
+        );
+        assert!(
+            wait_for_min_local_service_task_count(
+                &cluster,
+                service_name,
+                1,
+                Duration::from_secs(30)
+            )
+            .await,
+            "merged cluster should keep at least one local task per node"
+        );
+    }
+);
+
 local_test!(services_sync_recovers_missing_entries, {
     let _guard =
         ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
@@ -1548,6 +1726,148 @@ async fn wait_for_service_task_count_all(
         sleep(Duration::from_millis(100)).await;
     }
     false
+}
+
+/// Waits until each provided node converges on the expected count of locally owned active tasks.
+async fn wait_for_exact_local_service_task_count(
+    cluster: &[&TestNode],
+    service_name: &str,
+    expected: usize,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut all_match = true;
+        for node in cluster {
+            let count =
+                list_local_active_service_tasks(&node.node.task_manager, service_name, node.id())
+                    .await
+                    .len();
+            if count != expected {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match {
+            return true;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Waits until each provided node owns at least `min_expected` active tasks for the service.
+async fn wait_for_min_local_service_task_count(
+    cluster: &[TestNode],
+    service_name: &str,
+    min_expected: usize,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut all_match = true;
+        for node in cluster {
+            let count =
+                list_local_active_service_tasks(&node.node.task_manager, service_name, node.id())
+                    .await
+                    .len();
+            if count < min_expected {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match {
+            return true;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Wait until one operation reaches the expected stage in topology operation storage.
+async fn wait_for_operation_stage(
+    topology: &mantissa::topology_capnp::topology::Client,
+    operation_id: &[u8],
+    expected: ClusterOperationStage,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut request = topology.get_cluster_operation_request();
+        request.get().set_id(operation_id);
+        let response = request
+            .send()
+            .promise
+            .await
+            .expect("getClusterOperation send");
+        let operation = response
+            .get()
+            .expect("getClusterOperation get")
+            .get_op()
+            .expect("operation payload");
+        let stage = operation.get_stage().expect("operation stage");
+        if stage == expected {
+            return;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "operation did not reach expected stage {:?}, current stage {:?}",
+            expected,
+            stage
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Wait until topology reports the expected active cluster view.
+async fn wait_for_cluster_view(
+    topology: &mantissa::topology_capnp::topology::Client,
+    expected: ClusterViewId,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let response = topology
+            .get_cluster_view_request()
+            .send()
+            .promise
+            .await
+            .expect("getClusterView send");
+        let view = response
+            .get()
+            .expect("getClusterView get")
+            .get_view()
+            .expect("view payload");
+        let current = ClusterViewId::from_capnp(view).expect("decode view");
+        if current == expected {
+            return;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "cluster view did not converge to expected {}, current {}",
+            expected,
+            current
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Returns the current active cluster view observed via topology.
+async fn current_cluster_view(
+    topology: &mantissa::topology_capnp::topology::Client,
+) -> ClusterViewId {
+    let response = topology
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let view = response
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    ClusterViewId::from_capnp(view).expect("decode current view")
 }
 
 /// Waits until the local scheduler reports the expected reserved slot count.
