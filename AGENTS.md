@@ -11,6 +11,14 @@ The system needs to be:
 - _Fault-tolerant_ (any node could fail without impacting the rest of the system)
 - _Storage efficient_ (distributed garbage collection of stale values)
 
+## General Guidelines
+
+- Avoid overly verbose and complex solutions, focus on simple solutions that could scale.
+- If a problem requires a complex implementation/solution, first work on proper abstractions before implementing it and ask for validation.
+- Always refactor your own code if there is a better way. Consider the runtime complexity of your solution and improve it if possible (example: you use an O(n) approach while an O(log(n)) or constant time approach is possible).
+- Use a hard cutover approach and never implement backward compatibility. If a new feature overlaps or make another part of the code completely obsolete, clean-up the obsolete part.
+- More code = more cpu cycles and memory used/wasted. We need to stay lean and to the point if we want to reach our ambitious scaling goals.
+
 ## Project Structure & Module Organization
 
 - `src/`: Rust sources. Entrypoint in `src/main.rs`; public modules in `src/lib.rs` (client, server, node, topology, store, crypto, gossip, task, etc.).
@@ -26,7 +34,6 @@ The system needs to be:
 - Build: `cargo build` (requires Cap’n Proto tooling: `capnp`, `libcapnp-dev`).
 - Run CLI: `cargo run -- init` | `cargo run -- nodes list` | `cargo run -- link --anchor 127.0.0.1:6578 --join-token <TOKEN>`
 - Tests: `cargo test` (verbose logs: `RUST_LOG=debug cargo test -- --nocapture`).
-- Dev cluster (optional): `./setup-dev-cluster.sh -n 2 -r $(pwd)` (needs Lima installed).
 
 ## Coding Style & Naming Conventions
 
@@ -38,6 +45,7 @@ The system needs to be:
 - Code needs to be well-structured and maintainable, following best practices for Rust programming.
 - Lines that are ambiguous need to be commented profusely to avoid later confusion.
 - Use variables directly inside print statements, ie. instead of `print!("{}", output);` use `print!("{output}");`.
+- unwrap() is allowed only in tests. Never use in production code.
 
 ## Testing Guidelines
 
@@ -47,11 +55,11 @@ The system needs to be:
 
 ## Commit & Pull Request Guidelines
 
-- Commit style: `<area>: <summary>` (examples: `topology: fix leave`, `store: refactor MST`, `tests: add testkit`). Keep messages imperative and concise. Lines should not exceed 80 characters.
-- PRs: include a clear description, motivation, and risks; link issues; add logs/screenshots if output changes. Run `cargo fmt`, `cargo clippy`, and `cargo test` before submitting. Note protocol/schema changes explicitly.
+- Run `cargo fmt`, `cargo clippy`, and `cargo test` before marking work as complete. Note protocol/schema changes explicitly.
+- Commit style: `<area>: <summary>` (examples: `topology: fix leave`, `store: refactor MST`, `tests: add testkit`). After and beneath the commit title, add a complete description of the changes made and why it was necessary. Lines should not exceed 80 characters. Use paragraphs and do not abuse bullet points. Explain the change assuming this will be read by humans, figuring out the reasons and context behind it.
+- Never commit yourself, simply output the commit at the end of each atomic change or step and let the user commit.
 
 ## Security & Configuration Tips
 
 - Join tokens are secrets: never commit or paste them in PRs; rotate with `cargo run -- token rotate`.
 - Prefer localhost or private networks for TCP tests; avoid exposing ports publicly.
-- Ensure Cap’n Proto is installed prior to builds (`apt install capnproto libcapnp-dev` on Debian/Ubuntu).
