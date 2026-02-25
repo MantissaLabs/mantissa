@@ -994,6 +994,7 @@ impl NetworkController {
 
         let mut desired: HashMap<String, IpAddr> = HashMap::new();
         let mut flood_targets: HashMap<IpAddr, usize> = HashMap::new();
+        let mut peer_ip_cache: HashMap<Uuid, Option<IpAddr>> = HashMap::new();
 
         for attachment in attachments {
             if attachment.node_id == self.inner.node_id {
@@ -1009,7 +1010,10 @@ impl NetworkController {
                 _ => continue,
             };
 
-            let peer_ip = match self.peer_ip_for_node(attachment.node_id).await {
+            let peer_ip = match self
+                .peer_ip_for_node_cached(attachment.node_id, &mut peer_ip_cache)
+                .await
+            {
                 Some(ip) => ip,
                 None => continue,
             };
@@ -1034,7 +1038,10 @@ impl NetworkController {
                     continue;
                 }
 
-                let peer_ip = match self.peer_ip_for_node(state.peer_id).await {
+                let peer_ip = match self
+                    .peer_ip_for_node_cached(state.peer_id, &mut peer_ip_cache)
+                    .await
+                {
                     Some(ip) => ip,
                     None => continue,
                 };
@@ -1190,6 +1197,24 @@ impl NetworkController {
         }
 
         Ok(())
+    }
+
+    /// Resolve and memoize one peer underlay destination during a reconcile pass.
+    ///
+    /// Reconciliation loops frequently reference the same peer across attachment and host-access
+    /// paths; caching avoids repeated registry lookups and address parsing within one pass.
+    async fn peer_ip_for_node_cached(
+        &self,
+        peer_id: Uuid,
+        cache: &mut HashMap<Uuid, Option<IpAddr>>,
+    ) -> Option<IpAddr> {
+        if let Some(cached) = cache.get(&peer_id) {
+            return *cached;
+        }
+
+        let resolved = self.peer_ip_for_node(peer_id).await;
+        cache.insert(peer_id, resolved);
+        resolved
     }
 
     /// Resolve the VXLAN underlay destination address to reach `peer_id`.
