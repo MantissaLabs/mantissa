@@ -16,6 +16,18 @@ pub mod ranges;
 
 type EncodedRegister = (Vec<u8>, Vec<u8>);
 type EncodedRegisters = Vec<EncodedRegister>;
+type EncodedTombstone = (Vec<u8>, u64);
+type EncodedTombstones = Vec<EncodedTombstone>;
+
+const ALL_DOMAINS: [Domain; 7] = [
+    Domain::Peers,
+    Domain::Tasks,
+    Domain::Services,
+    Domain::Secrets,
+    Domain::Networks,
+    Domain::NetworkPeers,
+    Domain::NetworkAttachments,
+];
 
 // Default chunk size used when streaming delta from server to client.
 pub const DEFAULT_DELTA_CHUNK_MAX: usize = 1024;
@@ -84,6 +96,146 @@ impl SyncService {
         }
         Ok(active)
     }
+
+    /// Resolves a sync domain to its backing replicated store handle.
+    fn domain_store(&self, domain: Domain) -> DomainStoreRef<'_> {
+        match domain {
+            Domain::Peers => DomainStoreRef::Peers(&self.peers),
+            Domain::Tasks => DomainStoreRef::Tasks(&self.tasks),
+            Domain::Services => DomainStoreRef::Services(&self.services),
+            Domain::Secrets => DomainStoreRef::Secrets(&self.secrets),
+            Domain::Networks => DomainStoreRef::Networks(&self.networks),
+            Domain::NetworkPeers => DomainStoreRef::NetworkPeers(&self.network_peers),
+            Domain::NetworkAttachments => {
+                DomainStoreRef::NetworkAttachments(&self.network_attachments)
+            }
+        }
+    }
+}
+
+/// Typed reference to one sync domain's replicated store and diagnostics labels.
+enum DomainStoreRef<'a> {
+    Peers(&'a PeersStore),
+    Tasks(&'a TaskStore),
+    Services(&'a ServiceStore),
+    Secrets(&'a SecretStore),
+    Networks(&'a NetworkSpecStore),
+    NetworkPeers(&'a NetworkPeerStore),
+    NetworkAttachments(&'a NetworkAttachmentStore),
+}
+
+macro_rules! with_domain_store {
+    ($domain_store:expr, |$store:ident| $body:block) => {
+        match $domain_store {
+            DomainStoreRef::Peers($store) => $body,
+            DomainStoreRef::Tasks($store) => $body,
+            DomainStoreRef::Services($store) => $body,
+            DomainStoreRef::Secrets($store) => $body,
+            DomainStoreRef::Networks($store) => $body,
+            DomainStoreRef::NetworkPeers($store) => $body,
+            DomainStoreRef::NetworkAttachments($store) => $body,
+        }
+    };
+}
+
+impl DomainStoreRef<'_> {
+    /// Returns the protocol domain represented by this store reference.
+    fn domain(&self) -> Domain {
+        match self {
+            Self::Peers(_) => Domain::Peers,
+            Self::Tasks(_) => Domain::Tasks,
+            Self::Services(_) => Domain::Services,
+            Self::Secrets(_) => Domain::Secrets,
+            Self::Networks(_) => Domain::Networks,
+            Self::NetworkPeers(_) => Domain::NetworkPeers,
+            Self::NetworkAttachments(_) => Domain::NetworkAttachments,
+        }
+    }
+
+    /// Returns the human-readable label used in sync debug logs.
+    fn log_label(&self) -> &'static str {
+        match self {
+            Self::Peers(_) => "peers",
+            Self::Tasks(_) => "tasks",
+            Self::Services(_) => "services",
+            Self::Secrets(_) => "secrets",
+            Self::Networks(_) => "networks",
+            Self::NetworkPeers(_) => "network peers",
+            Self::NetworkAttachments(_) => "network attachments",
+        }
+    }
+
+    /// Returns the label used when dumping MST state before range responses.
+    fn ranges_dump_label(&self) -> &'static str {
+        match self {
+            Self::Peers(_) => "server.before.get_ranges",
+            Self::Tasks(_) => "server.before.get_ranges.tasks",
+            Self::Services(_) => "server.before.get_ranges.services",
+            Self::Secrets(_) => "server.before.get_ranges.secrets",
+            Self::Networks(_) => "server.before.get_ranges.networks",
+            Self::NetworkPeers(_) => "server.before.get_ranges.network_peers",
+            Self::NetworkAttachments(_) => "server.before.get_ranges.network_attachments",
+        }
+    }
+
+    /// Returns the label used when dumping MST state before delta responses.
+    fn delta_dump_label(&self) -> &'static str {
+        match self {
+            Self::Peers(_) => "server.before.open_delta",
+            Self::Tasks(_) => "server.before.open_delta.tasks",
+            Self::Services(_) => "server.before.open_delta.services",
+            Self::Secrets(_) => "server.before.open_delta.secrets",
+            Self::Networks(_) => "server.before.open_delta.networks",
+            Self::NetworkPeers(_) => "server.before.open_delta.network_peers",
+            Self::NetworkAttachments(_) => "server.before.open_delta.network_attachments",
+        }
+    }
+
+    /// Reads the current MST root hash for this domain.
+    async fn root_hex(&self) -> String {
+        with_domain_store!(self, |store| { store.root_hex().await })
+    }
+
+    /// Produces digest ranges for anti-entropy while emitting domain diagnostics.
+    async fn page_range_summary(&self) -> Result<Vec<crdt_store::PageDigestRange>, capnp::Error> {
+        debug!("getRangesForView: received ({})", self.log_label());
+        let dump_label = self.ranges_dump_label();
+        with_domain_store!(self, |store| {
+            store.debug_dump_root(dump_label).await;
+            store.debug_dump_ranges(dump_label, 5).await;
+            store
+                .page_range_summary()
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))
+        })
+    }
+
+    /// Exports and encodes delta payloads for the requested ranges.
+    fn export_delta_encoded(
+        &self,
+        want_ranges: &[crdt_store::PageDigestRange],
+    ) -> Result<(EncodedRegisters, EncodedTombstones), capnp::Error> {
+        with_domain_store!(self, |store| {
+            let (regs, tombs) = store
+                .export_page_ranges_delta(want_ranges)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            Ok((encode_registers(regs)?, encode_tombstones(tombs)))
+        })
+    }
+
+    /// Dumps domain-specific diagnostics for an incoming delta request.
+    async fn debug_dump_delta_state(&self) {
+        debug!(
+            target: "delta",
+            "open_delta_for_view: received ({})",
+            self.log_label()
+        );
+        let dump_label = self.delta_dump_label();
+        with_domain_store!(self, |store| {
+            store.debug_dump_root(dump_label).await;
+            store.debug_dump_ranges(dump_label, 5).await;
+        })
+    }
 }
 
 impl sync::Server for SyncService {
@@ -128,37 +280,11 @@ impl sync::Server for SyncService {
             "get_roots_for_view request received"
         );
 
-        let peers = &self.peers;
-        let tasks = &self.tasks;
-        let services = &self.services;
-        let secrets = &self.secrets;
-        let networks = &self.networks;
-        let network_peers = &self.network_peers;
-        let network_attachments = &self.network_attachments;
-
-        const DOMAINS: [Domain; 7] = [
-            Domain::Peers,
-            Domain::Tasks,
-            Domain::Services,
-            Domain::Secrets,
-            Domain::Networks,
-            Domain::NetworkPeers,
-            Domain::NetworkAttachments,
-        ];
-
-        let mut list = results.get().init_roots(DOMAINS.len() as u32);
-        for (idx, domain) in DOMAINS.iter().enumerate() {
-            let root_hex = match domain {
-                Domain::Peers => peers.root_hex().await,
-                Domain::Tasks => tasks.root_hex().await,
-                Domain::Services => services.root_hex().await,
-                Domain::Secrets => secrets.root_hex().await,
-                Domain::Networks => networks.root_hex().await,
-                Domain::NetworkPeers => network_peers.root_hex().await,
-                Domain::NetworkAttachments => network_attachments.root_hex().await,
-            };
+        let mut list = results.get().init_roots(ALL_DOMAINS.len() as u32);
+        for (idx, domain) in ALL_DOMAINS.iter().copied().enumerate() {
+            let root_hex = self.domain_store(domain).root_hex().await;
             let mut entry = list.reborrow().get(idx as u32);
-            entry.set_domain(*domain);
+            entry.set_domain(domain);
             entry.set_root_hex(&root_hex);
             active_view.write_capnp(entry.reborrow().init_view());
         }
@@ -183,26 +309,10 @@ impl sync::Server for SyncService {
             "get_ranges_for_view request received"
         );
 
-        let peers = &self.peers;
-        let tasks = &self.tasks;
-        let services = &self.services;
-        let secrets = &self.secrets;
-        let networks = &self.networks;
-        let network_peers = &self.network_peers;
-        let network_attachments = &self.network_attachments;
-
         let requested_domains: Vec<Domain> = {
             let domains_reader = req.get_domains()?;
             if domains_reader.is_empty() {
-                vec![
-                    Domain::Peers,
-                    Domain::Tasks,
-                    Domain::Services,
-                    Domain::Secrets,
-                    Domain::Networks,
-                    Domain::NetworkPeers,
-                    Domain::NetworkAttachments,
-                ]
+                ALL_DOMAINS.to_vec()
             } else {
                 let mut out = Vec::with_capacity(domains_reader.len() as usize);
                 for domain in domains_reader.iter() {
@@ -213,131 +323,14 @@ impl sync::Server for SyncService {
         };
 
         let mut list = results.get().init_ranges(requested_domains.len() as u32);
-        for (idx, domain) in requested_domains.iter().enumerate() {
-            match domain {
-                Domain::Peers => {
-                    debug!("getRangesForView: received (peers)");
-                    peers.debug_dump_root("server.before.get_ranges").await;
-                    peers.debug_dump_ranges("server.before.get_ranges", 5).await;
-                    let ranges = peers
-                        .page_range_summary()
-                        .await
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    let mut entry = list.reborrow().get(idx as u32);
-                    entry.set_domain(Domain::Peers);
-                    let summary = entry.reborrow().init_summary();
-                    capnp_fill_ranges(&ranges, summary)?;
-                    active_view.write_capnp(entry.reborrow().init_view());
-                }
-                Domain::Tasks => {
-                    debug!("getRangesForView: received (tasks)");
-                    tasks
-                        .debug_dump_root("server.before.get_ranges.tasks")
-                        .await;
-                    tasks
-                        .debug_dump_ranges("server.before.get_ranges.tasks", 5)
-                        .await;
-                    let ranges = tasks
-                        .page_range_summary()
-                        .await
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    let mut entry = list.reborrow().get(idx as u32);
-                    entry.set_domain(Domain::Tasks);
-                    let summary = entry.reborrow().init_summary();
-                    capnp_fill_ranges(&ranges, summary)?;
-                    active_view.write_capnp(entry.reborrow().init_view());
-                }
-                Domain::Services => {
-                    debug!("getRangesForView: received (services)");
-                    services
-                        .debug_dump_root("server.before.get_ranges.services")
-                        .await;
-                    services
-                        .debug_dump_ranges("server.before.get_ranges.services", 5)
-                        .await;
-                    let ranges = services
-                        .page_range_summary()
-                        .await
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    let mut entry = list.reborrow().get(idx as u32);
-                    entry.set_domain(Domain::Services);
-                    let summary = entry.reborrow().init_summary();
-                    capnp_fill_ranges(&ranges, summary)?;
-                    active_view.write_capnp(entry.reborrow().init_view());
-                }
-                Domain::Secrets => {
-                    debug!("getRangesForView: received (secrets)");
-                    secrets
-                        .debug_dump_root("server.before.get_ranges.secrets")
-                        .await;
-                    secrets
-                        .debug_dump_ranges("server.before.get_ranges.secrets", 5)
-                        .await;
-                    let ranges = secrets
-                        .page_range_summary()
-                        .await
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    let mut entry = list.reborrow().get(idx as u32);
-                    entry.set_domain(Domain::Secrets);
-                    let summary = entry.reborrow().init_summary();
-                    capnp_fill_ranges(&ranges, summary)?;
-                    active_view.write_capnp(entry.reborrow().init_view());
-                }
-                Domain::Networks => {
-                    debug!("getRangesForView: received (networks)");
-                    networks
-                        .debug_dump_root("server.before.get_ranges.networks")
-                        .await;
-                    networks
-                        .debug_dump_ranges("server.before.get_ranges.networks", 5)
-                        .await;
-                    let ranges = networks
-                        .page_range_summary()
-                        .await
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    let mut entry = list.reborrow().get(idx as u32);
-                    entry.set_domain(Domain::Networks);
-                    let summary = entry.reborrow().init_summary();
-                    capnp_fill_ranges(&ranges, summary)?;
-                    active_view.write_capnp(entry.reborrow().init_view());
-                }
-                Domain::NetworkPeers => {
-                    debug!("getRangesForView: received (network peers)");
-                    network_peers
-                        .debug_dump_root("server.before.get_ranges.network_peers")
-                        .await;
-                    network_peers
-                        .debug_dump_ranges("server.before.get_ranges.network_peers", 5)
-                        .await;
-                    let ranges = network_peers
-                        .page_range_summary()
-                        .await
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    let mut entry = list.reborrow().get(idx as u32);
-                    entry.set_domain(Domain::NetworkPeers);
-                    let summary = entry.reborrow().init_summary();
-                    capnp_fill_ranges(&ranges, summary)?;
-                    active_view.write_capnp(entry.reborrow().init_view());
-                }
-                Domain::NetworkAttachments => {
-                    debug!("getRangesForView: received (network attachments)");
-                    network_attachments
-                        .debug_dump_root("server.before.get_ranges.network_attachments")
-                        .await;
-                    network_attachments
-                        .debug_dump_ranges("server.before.get_ranges.network_attachments", 5)
-                        .await;
-                    let ranges = network_attachments
-                        .page_range_summary()
-                        .await
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    let mut entry = list.reborrow().get(idx as u32);
-                    entry.set_domain(Domain::NetworkAttachments);
-                    let summary = entry.reborrow().init_summary();
-                    capnp_fill_ranges(&ranges, summary)?;
-                    active_view.write_capnp(entry.reborrow().init_view());
-                }
-            }
+        for (idx, domain) in requested_domains.iter().copied().enumerate() {
+            let store = self.domain_store(domain);
+            let ranges = store.page_range_summary().await?;
+            let mut entry = list.reborrow().get(idx as u32);
+            entry.set_domain(store.domain());
+            let summary = entry.reborrow().init_summary();
+            capnp_fill_ranges(&ranges, summary)?;
+            active_view.write_capnp(entry.reborrow().init_view());
         }
 
         Ok(())
@@ -359,14 +352,6 @@ impl sync::Server for SyncService {
             active_view = %active_view,
             "open_delta_for_view request received"
         );
-
-        let peers = &self.peers;
-        let tasks = &self.tasks;
-        let services = &self.services;
-        let secrets = &self.secrets;
-        let networks = &self.networks;
-        let network_peers = &self.network_peers;
-        let network_attachments = &self.network_attachments;
 
         let wants_reader = req.get_wants()?;
         let sink = req.get_sink()?;
@@ -396,114 +381,11 @@ impl sync::Server for SyncService {
                 continue;
             }
 
-            match domain {
-                Domain::Peers => {
-                    debug!(target: "delta", "open_delta_for_view: received (peers)");
-                    peers.debug_dump_root("server.before.open_delta").await;
-                    peers.debug_dump_ranges("server.before.open_delta", 5).await;
-                    let (regs, tombs) = peers
-                        .export_page_ranges_delta(&want_ranges)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
-                        sent_chunks = true;
-                    }
-                }
-                Domain::Tasks => {
-                    debug!(target: "delta", "open_delta_for_view: received (tasks)");
-                    tasks
-                        .debug_dump_root("server.before.open_delta.tasks")
-                        .await;
-                    tasks
-                        .debug_dump_ranges("server.before.open_delta.tasks", 5)
-                        .await;
-                    let (regs, tombs) = tasks
-                        .export_page_ranges_delta(&want_ranges)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
-                        sent_chunks = true;
-                    }
-                }
-                Domain::Services => {
-                    debug!(target: "delta", "open_delta_for_view: received (services)");
-                    services
-                        .debug_dump_root("server.before.open_delta.services")
-                        .await;
-                    services
-                        .debug_dump_ranges("server.before.open_delta.services", 5)
-                        .await;
-                    let (regs, tombs) = services
-                        .export_page_ranges_delta(&want_ranges)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
-                        sent_chunks = true;
-                    }
-                }
-                Domain::Secrets => {
-                    debug!(target: "delta", "open_delta_for_view: received (secrets)");
-                    secrets
-                        .debug_dump_root("server.before.open_delta.secrets")
-                        .await;
-                    secrets
-                        .debug_dump_ranges("server.before.open_delta.secrets", 5)
-                        .await;
-                    let (regs, tombs) = secrets
-                        .export_page_ranges_delta(&want_ranges)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
-                        sent_chunks = true;
-                    }
-                }
-                Domain::Networks => {
-                    debug!(target: "delta", "open_delta_for_view: received (networks)");
-                    networks
-                        .debug_dump_root("server.before.open_delta.networks")
-                        .await;
-                    networks
-                        .debug_dump_ranges("server.before.open_delta.networks", 5)
-                        .await;
-                    let (regs, tombs) = networks
-                        .export_page_ranges_delta(&want_ranges)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
-                        sent_chunks = true;
-                    }
-                }
-                Domain::NetworkPeers => {
-                    debug!(
-                        target: "delta",
-                        "open_delta_for_view: received (network peers)"
-                    );
-                    network_peers
-                        .debug_dump_root("server.before.open_delta.network_peers")
-                        .await;
-                    network_peers
-                        .debug_dump_ranges("server.before.open_delta.network_peers", 5)
-                        .await;
-                    let (regs, tombs) = network_peers
-                        .export_page_ranges_delta(&want_ranges)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
-                        sent_chunks = true;
-                    }
-                }
-                Domain::NetworkAttachments => {
-                    debug!(
-                        target: "delta",
-                        "open_delta_for_view: received (network attachments)"
-                    );
-                    network_attachments
-                        .debug_dump_root("server.before.open_delta.network_attachments")
-                        .await;
-                    network_attachments
-                        .debug_dump_ranges("server.before.open_delta.network_attachments", 5)
-                        .await;
-                    let (regs, tombs) = network_attachments
-                        .export_page_ranges_delta(&want_ranges)
-                        .map_err(|e| capnp::Error::failed(e.to_string()))?;
-                    if send_chunks(domain, regs, tombs, active_view, &sink).await? {
-                        sent_chunks = true;
-                    }
-                }
+            let store = self.domain_store(domain);
+            store.debug_dump_delta_state().await;
+            let (regs, tombs) = store.export_delta_encoded(&want_ranges)?;
+            if send_chunks(domain, regs, tombs, active_view, &sink).await? {
+                sent_chunks = true;
             }
         }
 
@@ -529,25 +411,20 @@ where
     Ok(out)
 }
 
-fn encode_tombstones(tombs: Tombstones<UuidKey>) -> Vec<(Vec<u8>, u64)> {
+fn encode_tombstones(tombs: Tombstones<UuidKey>) -> EncodedTombstones {
     tombs
         .into_iter()
         .map(|(k, ts)| (k.as_ref().to_vec(), ts))
         .collect()
 }
 
-async fn send_chunks<R>(
+async fn send_chunks(
     domain: Domain,
-    regs: Registers<UuidKey, R>,
-    tombs: Tombstones<UuidKey>,
+    regs_wire: EncodedRegisters,
+    tombs_wire: EncodedTombstones,
     cluster_view: ClusterViewId,
     sink: &delta_sink::Client,
-) -> Result<bool, capnp::Error>
-where
-    R: serde::Serialize,
-{
-    let regs_wire = encode_registers(regs)?;
-    let tombs_wire = encode_tombstones(tombs);
+) -> Result<bool, capnp::Error> {
     let chunk_max = delta_chunk_max();
 
     if regs_wire.is_empty() && tombs_wire.is_empty() {
