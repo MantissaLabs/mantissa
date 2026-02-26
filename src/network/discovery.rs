@@ -52,6 +52,7 @@ pub struct ServiceDiscovery {
     servers: Arc<AsyncMutex<HashMap<Uuid, DnsServerHandle>>>,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
+    dns_port: u16,
     health_port: Option<u16>,
     health_timeout: Duration,
     bpf_lb: BpfLoadBalancer,
@@ -89,12 +90,27 @@ struct ServiceBackendCatalogEntry {
 }
 
 impl ServiceDiscovery {
+    /// Build service discovery with the default DNS bind port (53).
     pub fn new(
         registry: NetworkRegistry,
         tasks: TaskStore,
         services: ServiceRegistry,
         bpf: NetworkBpfManager,
         health_monitor: Arc<HealthMonitor>,
+    ) -> Self {
+        Self::new_with_dns_port(registry, tasks, services, bpf, health_monitor, 53)
+    }
+
+    /// Build service discovery with an explicit DNS bind port.
+    ///
+    /// Tests use this to run DNS flows unprivileged on high ports while production keeps 53.
+    pub fn new_with_dns_port(
+        registry: NetworkRegistry,
+        tasks: TaskStore,
+        services: ServiceRegistry,
+        bpf: NetworkBpfManager,
+        health_monitor: Arc<HealthMonitor>,
+        dns_port: u16,
     ) -> Self {
         let health_port = config::discovery_health_port();
         Self {
@@ -106,6 +122,7 @@ impl ServiceDiscovery {
             servers: Arc::new(AsyncMutex::new(HashMap::new())),
             load_balancer: Arc::new(AsyncMutex::new(ServiceLoadBalancer::default())),
             health: Arc::new(AsyncMutex::new(BackendHealth::default())),
+            dns_port,
             health_port,
             health_timeout: Duration::from_millis(300),
             bpf_lb: BpfLoadBalancer::new(),
@@ -145,6 +162,7 @@ impl ServiceDiscovery {
             resolver_ip,
             self.load_balancer.clone(),
             self.health.clone(),
+            self.dns_port,
             self.health_port,
             self.health_timeout,
             self.bpf_lb.clone(),
@@ -203,6 +221,7 @@ async fn spawn_dns_server(
     resolver_ip: Ipv4Addr,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
+    dns_port: u16,
     health_port: Option<u16>,
     health_timeout: Duration,
     bpf_lb: BpfLoadBalancer,
@@ -210,7 +229,7 @@ async fn spawn_dns_server(
     missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
     health_monitor: Arc<HealthMonitor>,
 ) -> Result<DnsServerHandle> {
-    let bind_addr = SocketAddr::new(IpAddr::V4(resolver_ip), 53);
+    let bind_addr = SocketAddr::new(IpAddr::V4(resolver_ip), dns_port);
     let socket = UdpSocket::bind(bind_addr)
         .await
         .with_context(|| format!("bind resolver socket {bind_addr}"))?;
@@ -1893,6 +1912,25 @@ fn default_bpf_programs() -> Vec<BpfProgramSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::registry::NetworkRegistry;
+    use crate::network::types::{
+        NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver,
+        NetworkSpecDraft, NetworkSpecValue,
+    };
+    use crate::services::registry::ServiceRegistry;
+    use crate::services::types::{
+        ServiceSpecValue, ServiceTaskNetworkRequirement, ServiceTaskSpecValue,
+    };
+    use crate::store::network_store::{
+        open_network_attachment_store, open_network_peer_store, open_network_spec_store,
+    };
+    use crate::store::service_store::open_service_store;
+    use crate::store::task_store::{TaskStore, open_task_store};
+    use crate::task::container::ContainerState;
+    use crate::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
+    use crdt_store::uuid_key::UuidKey;
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     fn backend(ip: [u8; 4], mac: [u8; 6]) -> BackendAddress {
         BackendAddress {
@@ -1957,5 +1995,304 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].ip, unhealthy_ip);
+    }
+
+    struct CatalogHarness {
+        registry: NetworkRegistry,
+        tasks: TaskStore,
+        services: ServiceRegistry,
+        network: NetworkSpecValue,
+    }
+
+    /// Creates isolated stores backing one discovery catalog test harness.
+    async fn setup_catalog_harness() -> CatalogHarness {
+        let actor = Uuid::new_v4();
+
+        let network_dir = tempdir().expect("network tempdir");
+        let network_path = network_dir
+            .path()
+            .join(format!("network-{}.redb", Uuid::new_v4()));
+        let network_db = Arc::new(redb::Database::create(network_path).expect("create network db"));
+        let spec_store =
+            open_network_spec_store(network_db.clone(), actor).expect("open network spec store");
+        spec_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild network spec store");
+        let peer_store =
+            open_network_peer_store(network_db.clone(), actor).expect("open network peer store");
+        peer_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild network peer store");
+        let attachment_store = open_network_attachment_store(network_db, actor)
+            .expect("open network attachment store");
+        attachment_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild network attachment store");
+        let registry = NetworkRegistry::new(spec_store, peer_store, attachment_store);
+
+        let task_dir = tempdir().expect("task tempdir");
+        let task_path = task_dir
+            .path()
+            .join(format!("task-{}.redb", Uuid::new_v4()));
+        let task_db = Arc::new(redb::Database::create(task_path).expect("create task db"));
+        let tasks = open_task_store(task_db, actor).expect("open task store");
+        tasks
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild task store");
+
+        let service_dir = tempdir().expect("service tempdir");
+        let service_path = service_dir
+            .path()
+            .join(format!("service-{}.redb", Uuid::new_v4()));
+        let service_db = Arc::new(redb::Database::create(service_path).expect("create service db"));
+        let service_store = open_service_store(service_db, actor).expect("open service store");
+        service_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild service store");
+        let services = ServiceRegistry::new(service_store);
+
+        let network = NetworkSpecValue::new(NetworkSpecDraft {
+            name: format!("catalog-net-{}", Uuid::new_v4()),
+            description: "discovery catalog test".to_string(),
+            driver: NetworkDriver::Vxlan,
+            subnet_cidr: "10.88.0.0/16".to_string(),
+            vni: 4242,
+            mtu: 1350,
+            sealed: false,
+            bpf_programs: Vec::new(),
+        });
+        registry
+            .upsert_spec(network.clone())
+            .await
+            .expect("upsert network spec");
+
+        CatalogHarness {
+            registry,
+            tasks,
+            services,
+            network,
+        }
+    }
+
+    /// Builds one running task value used by catalog invalidation tests.
+    fn catalog_task(
+        task_id: Uuid,
+        node_id: Uuid,
+        service_name: &str,
+        network_id: Uuid,
+    ) -> TaskValue {
+        let now = chrono::Utc::now().to_rfc3339();
+        TaskValue::new(TaskValueDraft {
+            id: task_id,
+            name: "backend".to_string(),
+            image: "hashicorp/http-echo:1.0.0".to_string(),
+            state: ContainerState::Running,
+            phase_reason: None,
+            phase_progress: None,
+            created_at: now.clone(),
+            updated_at: now,
+            command: Vec::new(),
+            node_id,
+            node_name: format!("node-{node_id}"),
+            slot_ids: vec![1, 2],
+            networks: vec![network_id],
+            cpu_millis: 100,
+            memory_bytes: 64 * 1024 * 1024,
+            gpu_count: 0,
+            gpu_device_ids: Vec::new(),
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            service_metadata: Some(TaskServiceMetadata::new(service_name, "backend")),
+            task_epoch: 0,
+            phase_version: 0,
+        })
+    }
+
+    /// Builds one ready attachment row for the provided task/backend pair.
+    fn catalog_attachment(
+        task_id: Uuid,
+        node_id: Uuid,
+        network_id: Uuid,
+        backend_ip: Ipv4Addr,
+        service_name: &str,
+    ) -> NetworkAttachmentValue {
+        NetworkAttachmentValue::new(NetworkAttachmentDraft {
+            id: crate::network::types::compute_network_attachment_id(task_id, network_id),
+            task_id,
+            node_id,
+            container_id: format!("container-{task_id}"),
+            network_id,
+            task_updated_at: Some(chrono::Utc::now().to_rfc3339()),
+            requested_ip: Some(backend_ip.to_string()),
+            assigned_ip: Some(backend_ip.to_string()),
+            mac: Some("02:aa:bb:cc:dd:01".to_string()),
+            state: NetworkAttachmentState::Ready,
+            error: None,
+            service_name: Some(service_name.to_string()),
+            template_name: Some("backend".to_string()),
+        })
+    }
+
+    /// Writes one service template that maps the backend name to the provided network.
+    async fn upsert_catalog_service(
+        services: &ServiceRegistry,
+        service_name: &str,
+        network_id: Uuid,
+        task_ids: Vec<Uuid>,
+    ) {
+        let service = ServiceSpecValue::new(
+            Uuid::new_v4(),
+            "catalog-test-manifest",
+            service_name,
+            vec![ServiceTaskSpecValue {
+                name: "backend".to_string(),
+                image: "hashicorp/http-echo:1.0.0".to_string(),
+                command: Vec::new(),
+                replicas: task_ids.len() as u16,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1024 * 1024,
+                gpu_count: 0,
+                restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
+                health_port: None,
+                health_command: None,
+                public_port: None,
+                public_protocol: None,
+            }],
+            task_ids,
+        );
+        services
+            .upsert(service)
+            .await
+            .expect("upsert catalog service");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_catalog_refresh_invalidates_on_task_change_clock() {
+        let harness = setup_catalog_harness().await;
+        let service_name = "backend-service";
+        let node_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        upsert_catalog_service(
+            &harness.services,
+            service_name,
+            harness.network.id,
+            vec![task_id],
+        )
+        .await;
+
+        harness
+            .tasks
+            .upsert(
+                &UuidKey::from(task_id),
+                catalog_task(task_id, node_id, service_name, harness.network.id),
+            )
+            .await
+            .expect("upsert running task");
+        harness
+            .registry
+            .upsert_attachment(catalog_attachment(
+                task_id,
+                node_id,
+                harness.network.id,
+                Ipv4Addr::new(10, 88, 1, 10),
+                service_name,
+            ))
+            .await
+            .expect("upsert ready attachment");
+
+        let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
+        let mut health = HashMap::new();
+        health.insert(node_id, HealthStatus::Alive);
+        refresh_backend_catalog_if_needed(
+            &catalog,
+            &harness.registry,
+            &harness.tasks,
+            &harness.services,
+            harness.network.id,
+            &health,
+            None,
+        )
+        .await
+        .expect("initial catalog refresh");
+        let initial_task_generation = { catalog.lock().await.task_generation };
+        let initial_candidates = {
+            let guard = catalog.lock().await;
+            guard
+                .services
+                .get("backend")
+                .map(|entry| entry.candidates.len())
+                .unwrap_or_default()
+        };
+        assert_eq!(initial_candidates, 1);
+
+        let mut stopped = catalog_task(task_id, node_id, service_name, harness.network.id);
+        stopped.state = ContainerState::Stopped;
+        stopped.updated_at = chrono::Utc::now().to_rfc3339();
+        harness
+            .tasks
+            .upsert(&UuidKey::from(task_id), stopped)
+            .await
+            .expect("upsert stopped task");
+
+        refresh_backend_catalog_if_needed(
+            &catalog,
+            &harness.registry,
+            &harness.tasks,
+            &harness.services,
+            harness.network.id,
+            &health,
+            None,
+        )
+        .await
+        .expect("refresh after task change");
+
+        let guard = catalog.lock().await;
+        assert!(
+            guard.task_generation > initial_task_generation,
+            "task generation must advance after task upsert"
+        );
+        assert_eq!(
+            guard
+                .services
+                .get("backend")
+                .map(|entry| entry.candidates.len())
+                .unwrap_or_default(),
+            0
+        );
+    }
+
+    #[test]
+    fn health_snapshot_fingerprint_is_order_stable_and_status_sensitive() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        let mut first = HashMap::new();
+        first.insert(a, HealthStatus::Alive);
+        first.insert(b, HealthStatus::Down);
+
+        let mut reordered = HashMap::new();
+        reordered.insert(b, HealthStatus::Down);
+        reordered.insert(a, HealthStatus::Alive);
+
+        assert_eq!(
+            health_snapshot_fingerprint(&first),
+            health_snapshot_fingerprint(&reordered),
+            "fingerprint must not depend on insertion order"
+        );
+
+        reordered.insert(a, HealthStatus::Suspect);
+        assert_ne!(
+            health_snapshot_fingerprint(&first),
+            health_snapshot_fingerprint(&reordered),
+            "fingerprint must change when peer health changes"
+        );
     }
 }
