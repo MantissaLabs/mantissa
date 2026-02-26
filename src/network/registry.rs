@@ -65,6 +65,11 @@ impl NetworkRegistry {
         }
     }
 
+    /// Returns the current attachment-store change clock used to invalidate derived projections.
+    pub fn attachment_change_clock(&self) -> u64 {
+        self.attachments.change_clock()
+    }
+
     /// Acquire a read guard for cached derived views, recovering from poisoning if needed.
     fn cache_read(&self) -> RwLockReadGuard<'_, NetworkRegistryCache> {
         match self.cache.read() {

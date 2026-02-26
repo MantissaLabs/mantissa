@@ -65,6 +65,29 @@ struct DnsServerHandle {
     task: JoinHandle<()>,
 }
 
+/// Cached backend-resolution metadata for one network, invalidated by store generations and
+/// health state changes.
+#[derive(Default)]
+struct NetworkBackendCatalog {
+    attachment_generation: u64,
+    task_generation: u64,
+    service_generation: u64,
+    health_fingerprint: u64,
+    services: HashMap<String, ServiceBackendCatalogEntry>,
+}
+
+/// One service entry in the backend catalog.
+#[derive(Clone)]
+struct ServiceBackendCatalogEntry {
+    service_name: String,
+    candidates: Vec<BackendAddress>,
+    health_port: Option<u16>,
+    health_path: Option<String>,
+    expose_to_host: bool,
+    public_port: Option<u16>,
+    public_protocols: Vec<NodePortProtocol>,
+}
+
 impl ServiceDiscovery {
     pub fn new(
         registry: NetworkRegistry,
@@ -201,6 +224,7 @@ async fn spawn_dns_server(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let task_registry = registry.clone();
     let service_registry = services.clone();
+    let backend_catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
     let lb_manager = bpf_lb.clone();
     let bpf_manager = bpf.clone();
     let lb_missing = missing_lb_maps.clone();
@@ -218,6 +242,7 @@ async fn spawn_dns_server(
         &nodeport,
         &lb_missing,
         &refresh_health_monitor,
+        &backend_catalog,
     )
     .await
     {
@@ -237,6 +262,7 @@ async fn spawn_dns_server(
     let refresh_nodeport = nodeport.clone();
     let refresh_lb_missing = lb_missing.clone();
     let refresh_health_monitor = health_monitor.clone();
+    let refresh_backend_catalog = backend_catalog.clone();
     let refresh_task = tokio::spawn(async move {
         let mut refresh = time::interval(REFRESH_INTERVAL);
         loop {
@@ -260,6 +286,7 @@ async fn spawn_dns_server(
                         &refresh_nodeport,
                         &refresh_lb_missing,
                         &refresh_health_monitor,
+                        &refresh_backend_catalog,
                     ).await {
                         warn!(
                             target: "network",
@@ -282,6 +309,7 @@ async fn spawn_dns_server(
     let dns_lb_manager = lb_manager.clone();
     let dns_lb_missing = lb_missing.clone();
     let dns_health_monitor = health_monitor.clone();
+    let dns_backend_catalog = backend_catalog.clone();
     let dns_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         loop {
@@ -307,10 +335,10 @@ async fn spawn_dns_server(
                                 &dns_load_balancer,
                                 &dns_health,
                                 health_port,
-                                health_timeout,
                                 &dns_lb_manager,
                                 &dns_lb_missing,
                                 &dns_health_monitor,
+                                &dns_backend_catalog,
                             ).await {
                                 warn!(
                                     target: "network",
@@ -363,10 +391,10 @@ async fn handle_datagram(
     load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: &Arc<AsyncMutex<BackendHealth>>,
     health_port: Option<u16>,
-    health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
     health_monitor: &Arc<HealthMonitor>,
+    backend_catalog: &Arc<AsyncMutex<NetworkBackendCatalog>>,
 ) -> Result<()> {
     let request = match Message::from_vec(payload) {
         Ok(message) => message,
@@ -411,37 +439,37 @@ async fn handle_datagram(
     let mut saw_nodata = false;
     let mut saw_notimp = false;
 
-    let service_specs = match services.list() {
-        Ok(specs) => specs,
-        Err(err) => {
-            warn!(
-                target: "network",
-                network = %network_id,
-                "failed to load service registry while answering dns query: {err}"
-            );
-            Vec::new()
-        }
-    };
-    let template_index = build_task_template_index(&service_specs);
     let health_snapshot = health_monitor.snapshot();
+    if let Err(err) = refresh_backend_catalog_if_needed(
+        backend_catalog,
+        registry,
+        tasks,
+        services,
+        network_id,
+        &health_snapshot,
+        health_port,
+    )
+    .await
+    {
+        warn!(
+            target: "network",
+            network = %network_id,
+            "failed to refresh backend catalog while answering dns query: {err:#}"
+        );
+    }
 
     for query in request.queries() {
         match answer_query(
             query,
             registry,
             bpf,
-            tasks,
-            &service_specs,
-            &template_index,
             network_id,
             network_name,
             load_balancer,
             health,
-            health_port,
-            health_timeout,
             bpf_lb,
             lb_missing,
-            &health_snapshot,
+            backend_catalog,
         )
         .await?
         {
@@ -497,21 +525,14 @@ async fn answer_query(
     query: &Query,
     registry: &NetworkRegistry,
     bpf: &NetworkBpfManager,
-    tasks: &TaskStore,
-    service_specs: &[ServiceSpecValue],
-    template_index: &HashMap<Uuid, (String, String)>,
     network_id: Uuid,
     network_name: &str,
     load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: &Arc<AsyncMutex<BackendHealth>>,
-    health_port: Option<u16>,
-    health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
-    health_snapshot: &HashMap<Uuid, HealthStatus>,
+    backend_catalog: &Arc<AsyncMutex<NetworkBackendCatalog>>,
 ) -> Result<LookupOutcome> {
-    // DNS path is cache-only; probes happen in the refresh loop.
-    let _ = health_timeout;
     if query.query_type() == RecordType::AAAA {
         return Ok(LookupOutcome::NoData);
     }
@@ -523,19 +544,19 @@ async fn answer_query(
         return Ok(LookupOutcome::NxDomain);
     };
 
-    let candidates = resolve_service_backends(
-        registry,
-        tasks,
-        template_index,
-        network_id,
-        &service_name,
-        health_snapshot,
-    )
-    .await?;
-    let service_port = health_port
-        .or_else(|| service_health_port(service_specs, &service_name))
-        .and_then(|port| if port == 0 { None } else { Some(port) });
-    let mut backends = if service_port.is_some() {
+    let catalog_entry = {
+        let guard = backend_catalog.lock().await;
+        guard
+            .services
+            .get(&service_name.to_ascii_lowercase())
+            .cloned()
+    };
+    let Some(catalog_entry) = catalog_entry else {
+        return Ok(LookupOutcome::NxDomain);
+    };
+
+    let candidates = catalog_entry.candidates.clone();
+    let mut backends = if catalog_entry.health_port.is_some() {
         let guard = health.lock().await;
         filter_cached_backends(&guard, network_id, &service_name, candidates.clone())
     } else {
@@ -549,7 +570,7 @@ async fn answer_query(
         healthy_backends = backends.len(),
         "post-health backends"
     );
-    if backends.is_empty() && !candidates.is_empty() && service_port.is_none() {
+    if backends.is_empty() && !candidates.is_empty() && catalog_entry.health_port.is_none() {
         warn!(
             target: "network",
             network = %network_id,
@@ -560,7 +581,6 @@ async fn answer_query(
         backends = candidates;
     }
     sort_backends(&mut backends);
-    let expose_to_host = service_is_public(service_specs, network_id, &service_name);
 
     if backends.is_empty() {
         if let Some((vip, mac)) = compute_service_vip(registry, network_id, &service_name, &[])? {
@@ -574,7 +594,7 @@ async fn answer_query(
                 vip,
                 mac,
                 &[],
-                expose_to_host,
+                catalog_entry.expose_to_host,
             )
             .await;
         }
@@ -612,7 +632,7 @@ async fn answer_query(
             vip,
             mac,
             &backends,
-            expose_to_host,
+            catalog_entry.expose_to_host,
         )
         .await
     {
@@ -1424,6 +1444,115 @@ async fn probe_backend_http(ip: &Ipv4Addr, port: u16, path: &str, timeout: Durat
     }
 }
 
+/// Refresh the per-network backend catalog when any upstream generation (attachments, tasks,
+/// services) or peer-health snapshot has changed.
+///
+/// This centralizes backend resolution so both DNS answers and periodic refresh reuse the same
+/// computed candidate set.
+async fn refresh_backend_catalog_if_needed(
+    backend_catalog: &Arc<AsyncMutex<NetworkBackendCatalog>>,
+    registry: &NetworkRegistry,
+    tasks: &TaskStore,
+    services: &ServiceRegistry,
+    network_id: Uuid,
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
+    default_health_port: Option<u16>,
+) -> Result<()> {
+    let attachment_generation = registry.attachment_change_clock();
+    let task_generation = tasks.change_clock();
+    let service_generation = services.change_clock();
+    let health_fingerprint = health_snapshot_fingerprint(health_snapshot);
+
+    {
+        let guard = backend_catalog.lock().await;
+        if guard.attachment_generation == attachment_generation
+            && guard.task_generation == task_generation
+            && guard.service_generation == service_generation
+            && guard.health_fingerprint == health_fingerprint
+        {
+            return Ok(());
+        }
+    }
+
+    let service_specs = services
+        .list()
+        .context("load service specs for backend catalog refresh")?;
+    let template_index = build_task_template_index(&service_specs);
+    let service_names = services_for_network(&service_specs, network_id);
+    let mut next_services = HashMap::with_capacity(service_names.len());
+    for service_name in service_names {
+        let candidates = resolve_service_backends(
+            registry,
+            tasks,
+            &template_index,
+            network_id,
+            &service_name,
+            health_snapshot,
+        )
+        .await?;
+        let health_port = default_health_port
+            .or_else(|| service_health_port(&service_specs, &service_name))
+            .and_then(|port| if port == 0 { None } else { Some(port) });
+        let public_port = service_public_port(&service_specs, &service_name);
+        let public_protocols = if public_port.is_some() {
+            service_public_protocols(&service_specs, &service_name)
+        } else {
+            Vec::new()
+        };
+        let health_path = service_health_path(&service_specs, &service_name);
+        let expose_to_host = service_is_public(&service_specs, network_id, &service_name);
+        let service_key = service_name.to_ascii_lowercase();
+
+        next_services.insert(
+            service_key,
+            ServiceBackendCatalogEntry {
+                service_name,
+                candidates,
+                health_port,
+                health_path,
+                expose_to_host,
+                public_port,
+                public_protocols,
+            },
+        );
+    }
+
+    let mut guard = backend_catalog.lock().await;
+    guard.attachment_generation = attachment_generation;
+    guard.task_generation = task_generation;
+    guard.service_generation = service_generation;
+    guard.health_fingerprint = health_fingerprint;
+    guard.services = next_services;
+    Ok(())
+}
+
+/// Hash a peer-health snapshot into a stable fingerprint so backend cache invalidation can react
+/// to node liveness changes that affect candidate filtering.
+fn health_snapshot_fingerprint(snapshot: &HashMap<Uuid, HealthStatus>) -> u64 {
+    let mut entries: Vec<(Uuid, HealthStatus)> = snapshot.iter().map(|(k, v)| (*k, *v)).collect();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut hasher = Hasher::new();
+    for (peer_id, status) in entries {
+        hasher.update(peer_id.as_bytes());
+        hasher.update(&[health_status_discriminant(status)]);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+/// Encode health status as a compact numeric discriminant for cache fingerprinting.
+fn health_status_discriminant(status: HealthStatus) -> u8 {
+    match status {
+        HealthStatus::Unknown => 0,
+        HealthStatus::Alive => 1,
+        HealthStatus::Suspect => 2,
+        HealthStatus::Down => 3,
+        HealthStatus::Degraded => 4,
+    }
+}
+
 /// Periodically refresh health and BPF state for all services attached to a specific network so
 /// dataplane programming keeps up with container restarts even when no DNS queries arrive.
 async fn refresh_network_services(
@@ -1439,28 +1568,35 @@ async fn refresh_network_services(
     nodeport: &NodePortManager,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
     health_monitor: &Arc<HealthMonitor>,
+    backend_catalog: &Arc<AsyncMutex<NetworkBackendCatalog>>,
 ) -> Result<()> {
-    let service_specs = services.list().context("load service specs for refresh")?;
-    let template_index = build_task_template_index(&service_specs);
-    let names = services_for_network(&service_specs, network_id);
-    let mut nodeport_entries = Vec::new();
     let health_snapshot = health_monitor.snapshot();
+    refresh_backend_catalog_if_needed(
+        backend_catalog,
+        registry,
+        tasks,
+        services,
+        network_id,
+        &health_snapshot,
+        health_port,
+    )
+    .await?;
+    let entries: Vec<ServiceBackendCatalogEntry> = {
+        let guard = backend_catalog.lock().await;
+        guard.services.values().cloned().collect()
+    };
+    let mut nodeport_entries = Vec::new();
 
-    for service_name in names {
+    for entry in entries {
         let mappings = refresh_single_service(
             registry,
-            tasks,
-            &service_specs,
-            &template_index,
             bpf,
             network_id,
-            &service_name,
+            &entry,
             health,
-            health_port,
             health_timeout,
             bpf_lb,
             lb_missing,
-            &health_snapshot,
         )
         .await?;
         nodeport_entries.extend(mappings);
@@ -1495,45 +1631,29 @@ fn services_for_network(service_specs: &[ServiceSpecValue], network_id: Uuid) ->
 /// reconciled by the caller.
 async fn refresh_single_service(
     registry: &NetworkRegistry,
-    tasks: &TaskStore,
-    service_specs: &[ServiceSpecValue],
-    template_index: &HashMap<Uuid, (String, String)>,
     bpf: &NetworkBpfManager,
     network_id: Uuid,
-    service_name: &str,
+    service: &ServiceBackendCatalogEntry,
     health: &Arc<AsyncMutex<BackendHealth>>,
-    health_port: Option<u16>,
     health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
-    health_snapshot: &HashMap<Uuid, HealthStatus>,
 ) -> Result<Vec<NodePortMapping>> {
-    let candidates = resolve_service_backends(
-        registry,
-        tasks,
-        template_index,
-        network_id,
-        service_name,
-        health_snapshot,
-    )
-    .await?;
-    let service_port = health_port
-        .or_else(|| service_health_port(service_specs, service_name))
-        .and_then(|port| if port == 0 { None } else { Some(port) });
-    let http_path = service_health_path(service_specs, service_name);
+    let service_name = service.service_name.as_str();
+    let candidates = service.candidates.clone();
     let mut backends = evaluate_backend_health(
         health,
         registry,
         network_id,
         service_name,
         candidates.clone(),
-        service_port,
-        http_path,
+        service.health_port,
+        service.health_path.clone(),
         health_timeout,
     )
     .await;
 
-    let health_checks_enabled = service_port.is_some();
+    let health_checks_enabled = service.health_port.is_some();
     if backends.is_empty() && !candidates.is_empty() && !health_checks_enabled {
         warn!(
             target: "network",
@@ -1558,7 +1678,7 @@ async fn refresh_single_service(
                 vip,
                 mac,
                 &[],
-                service_is_public(service_specs, network_id, service_name),
+                service.expose_to_host,
             )
             .await;
         }
@@ -1576,13 +1696,13 @@ async fn refresh_single_service(
             vip,
             mac,
             &backends,
-            service_is_public(service_specs, network_id, service_name),
+            service.expose_to_host,
         )
         .await;
 
-        if let Some(port) = service_public_port(service_specs, service_name) {
+        if let Some(port) = service.public_port {
             let mut mappings = Vec::new();
-            for protocol in service_public_protocols(service_specs, service_name) {
+            for protocol in service.public_protocols.clone() {
                 mappings.push(NodePortMapping {
                     port,
                     vip,

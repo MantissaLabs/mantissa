@@ -17,6 +17,11 @@ impl ServiceRegistry {
         Self { store }
     }
 
+    /// Returns the underlying store change clock so callers can invalidate cached projections.
+    pub fn change_clock(&self) -> u64 {
+        self.store.change_clock()
+    }
+
     pub async fn upsert(&self, value: ServiceSpecValue) -> Result<()> {
         self.store
             .upsert(&UuidKey::from(value.id), value)
