@@ -27,7 +27,6 @@ use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::VerifyingKey;
 use protocol::gossip::gossip_message;
 use protocol::server::{self, cluster_session};
-use protocol::topology::split_selector_clause::Operator as SplitOperator;
 use protocol::topology::{topology, topology_event};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -40,6 +39,12 @@ use uuid::Uuid;
 const COMMIT_PRECONDITION_FAILURE_PREFIX: &str = "cluster operation commit precondition failed";
 /// Number of finalized/aborted operation rows retained durably before old rows are garbage-collected.
 const CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT: usize = 512;
+
+#[path = "split_selector.rs"]
+mod split_selector;
+use split_selector::{
+    SplitNodeCandidate, SplitSelectorClauseSpec, SplitTargetSpec, build_split_assignments_for_nodes,
+};
 
 #[derive(Clone)]
 struct JoinPayload {
@@ -82,36 +87,6 @@ struct JoinResponse {
     ticket: Vec<u8>,
     credential: Vec<u8>,
     session: cluster_session::Client,
-}
-
-#[derive(Clone, Debug)]
-struct SplitSelectorClauseSpec {
-    key: String,
-    op: SplitOperator,
-    value: String,
-}
-
-#[derive(Clone, Debug)]
-struct SplitTargetSpec {
-    name: String,
-    clauses: Vec<SplitSelectorClauseSpec>,
-    explicit_nodes: HashSet<Uuid>,
-}
-
-#[derive(Clone, Debug)]
-struct SplitNodeCandidate {
-    node_id: Uuid,
-    hostname: String,
-    address: String,
-    wireguard_enabled: bool,
-    cpu_vendor: Option<String>,
-    cpu_brand: Option<String>,
-    cpu_logical: Option<u64>,
-    cpu_cores: Option<u64>,
-    memory_total_kb: Option<u64>,
-    gpu_vendor: Option<String>,
-    gpu_count: Option<u64>,
-    gpu_models: Vec<String>,
 }
 
 struct PeerScopeParticipant {
@@ -681,312 +656,14 @@ impl Topology {
         Ok(values)
     }
 
-    /// Parses a textual boolean selector value accepted by split selector clauses.
-    fn parse_split_boolean(value: &str) -> Option<bool> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Some(true),
-            "false" | "0" | "no" | "off" => Some(false),
-            _ => None,
-        }
-    }
-
-    /// Parses a split selector numeric operand as an unsigned integer.
-    fn parse_split_u64(value: &str, key: &str) -> Result<u64, capnp::Error> {
-        value.parse::<u64>().map_err(|_| {
-            capnp::Error::failed(format!(
-                "selector key '{key}' expects an unsigned integer value, got '{value}'"
-            ))
-        })
-    }
-
-    /// Evaluates one numeric selector clause against an optional node metric.
-    fn evaluate_u64_clause(
-        node: &SplitNodeCandidate,
-        key: &str,
-        op: SplitOperator,
-        expected_raw: &str,
-        actual: Option<u64>,
-    ) -> Result<bool, capnp::Error> {
-        let expected = Self::parse_split_u64(expected_raw, key)?;
-        let actual = actual.ok_or_else(|| {
-            capnp::Error::failed(format!(
-                "node {} has no metric for selector key '{}'",
-                node.node_id, key
-            ))
-        })?;
-        match op {
-            SplitOperator::Eq => Ok(actual == expected),
-            SplitOperator::Ne => Ok(actual != expected),
-            SplitOperator::Gt => Ok(actual > expected),
-            SplitOperator::Gte => Ok(actual >= expected),
-            SplitOperator::Lt => Ok(actual < expected),
-            SplitOperator::Lte => Ok(actual <= expected),
-        }
-    }
-
-    /// Evaluates one selector clause against one node candidate in split assignment planning.
-    fn evaluate_split_clause(
-        node: &SplitNodeCandidate,
-        clause: &SplitSelectorClauseSpec,
-    ) -> Result<bool, capnp::Error> {
-        match clause.key.as_str() {
-            "node.id" => match clause.op {
-                SplitOperator::Eq => Ok(node.node_id.to_string() == clause.value),
-                SplitOperator::Ne => Ok(node.node_id.to_string() != clause.value),
-                _ => Err(capnp::Error::failed(
-                    "node.id supports only eq/ne operators".to_string(),
-                )),
-            },
-            "node.hostname" => match clause.op {
-                SplitOperator::Eq => Ok(node.hostname == clause.value),
-                SplitOperator::Ne => Ok(node.hostname != clause.value),
-                _ => Err(capnp::Error::failed(
-                    "node.hostname supports only eq/ne operators".to_string(),
-                )),
-            },
-            "node.address" => match clause.op {
-                SplitOperator::Eq => Ok(node.address == clause.value),
-                SplitOperator::Ne => Ok(node.address != clause.value),
-                _ => Err(capnp::Error::failed(
-                    "node.address supports only eq/ne operators".to_string(),
-                )),
-            },
-            "wireguard.enabled" => {
-                let expected = Self::parse_split_boolean(&clause.value).ok_or_else(|| {
-                    capnp::Error::failed(format!(
-                        "wireguard.enabled expects a boolean value, got '{}'",
-                        clause.value
-                    ))
-                })?;
-                match clause.op {
-                    SplitOperator::Eq => Ok(node.wireguard_enabled == expected),
-                    SplitOperator::Ne => Ok(node.wireguard_enabled != expected),
-                    _ => Err(capnp::Error::failed(
-                        "wireguard.enabled supports only eq/ne operators".to_string(),
-                    )),
-                }
-            }
-            "resources.cpu.logical" => Self::evaluate_u64_clause(
-                node,
-                &clause.key,
-                clause.op,
-                &clause.value,
-                node.cpu_logical,
-            ),
-            "resources.cpu.cores" => Self::evaluate_u64_clause(
-                node,
-                &clause.key,
-                clause.op,
-                &clause.value,
-                node.cpu_cores,
-            ),
-            "resources.memory.total_kb" => Self::evaluate_u64_clause(
-                node,
-                &clause.key,
-                clause.op,
-                &clause.value,
-                node.memory_total_kb,
-            ),
-            "resources.memory.total_bytes" => Self::evaluate_u64_clause(
-                node,
-                &clause.key,
-                clause.op,
-                &clause.value,
-                node.memory_total_kb.map(|kb| kb.saturating_mul(1024)),
-            ),
-            "resources.gpu.count" => Self::evaluate_u64_clause(
-                node,
-                &clause.key,
-                clause.op,
-                &clause.value,
-                node.gpu_count,
-            ),
-            "resources.cpu.vendor" => match clause.op {
-                SplitOperator::Eq => Ok(node.cpu_vendor.as_deref() == Some(clause.value.as_str())),
-                SplitOperator::Ne => Ok(node.cpu_vendor.as_deref() != Some(clause.value.as_str())),
-                _ => Err(capnp::Error::failed(
-                    "resources.cpu.vendor supports only eq/ne operators".to_string(),
-                )),
-            },
-            "resources.cpu.brand" => match clause.op {
-                SplitOperator::Eq => Ok(node.cpu_brand.as_deref() == Some(clause.value.as_str())),
-                SplitOperator::Ne => Ok(node.cpu_brand.as_deref() != Some(clause.value.as_str())),
-                _ => Err(capnp::Error::failed(
-                    "resources.cpu.brand supports only eq/ne operators".to_string(),
-                )),
-            },
-            "resources.gpu.vendor" => match clause.op {
-                SplitOperator::Eq => Ok(node.gpu_vendor.as_deref() == Some(clause.value.as_str())),
-                SplitOperator::Ne => Ok(node.gpu_vendor.as_deref() != Some(clause.value.as_str())),
-                _ => Err(capnp::Error::failed(
-                    "resources.gpu.vendor supports only eq/ne operators".to_string(),
-                )),
-            },
-            "resources.gpu.model" => match clause.op {
-                SplitOperator::Eq => Ok(node.gpu_models.iter().any(|model| model == &clause.value)),
-                SplitOperator::Ne => Ok(node.gpu_models.iter().all(|model| model != &clause.value)),
-                _ => Err(capnp::Error::failed(
-                    "resources.gpu.model supports only eq/ne operators".to_string(),
-                )),
-            },
-            _ => Err(capnp::Error::failed(format!(
-                "unsupported split selector key '{}'",
-                clause.key
-            ))),
-        }
-    }
-
-    /// Evaluates whether one split target selector matches the provided node candidate.
-    fn split_target_matches_node(
-        target: &SplitTargetSpec,
-        node: &SplitNodeCandidate,
-    ) -> Result<bool, capnp::Error> {
-        if target.clauses.is_empty() {
-            return Ok(true);
-        }
-
-        for clause in &target.clauses {
-            if !Self::evaluate_split_clause(node, clause)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Assigns nodes to split targets deterministically when no explicit selectors are provided.
-    fn assign_split_targets_by_order(
-        source_view: ClusterViewId,
-        nodes: &[SplitNodeCandidate],
-        target_count: usize,
-    ) -> Vec<SplitNodeAssignment> {
-        let offset = source_view.epoch as usize % target_count;
-        let mut assignments = Vec::with_capacity(nodes.len());
-        for (index, node) in nodes.iter().enumerate() {
-            assignments.push(SplitNodeAssignment {
-                node_id: node.node_id,
-                target_index: (index + offset) % target_count,
-            });
-        }
-        assignments.sort_by_key(|assignment| assignment.node_id);
-        assignments
-    }
-
     /// Computes deterministic split assignments and validates selector coverage for all nodes.
     async fn build_split_assignments(
         &self,
         source_view: ClusterViewId,
         targets: &[SplitTargetSpec],
     ) -> Result<Vec<SplitNodeAssignment>, capnp::Error> {
-        if targets.is_empty() {
-            return Err(capnp::Error::failed(
-                "split assignment requires at least one target".to_string(),
-            ));
-        }
-
         let nodes = self.collect_split_node_candidates(source_view).await?;
-        if nodes.is_empty() {
-            return Err(capnp::Error::failed(
-                "split assignment requires at least one node candidate".to_string(),
-            ));
-        }
-
-        let selectorless = targets
-            .iter()
-            .all(|target| target.clauses.is_empty() && target.explicit_nodes.is_empty());
-        if selectorless {
-            return Ok(Self::assign_split_targets_by_order(
-                source_view,
-                &nodes,
-                targets.len(),
-            ));
-        }
-
-        let fallback_targets = targets
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, target)| {
-                if target.clauses.is_empty() && target.explicit_nodes.is_empty() {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        if fallback_targets.len() > 1 {
-            return Err(capnp::Error::failed(
-                "split supports at most one fallback target without selectors".to_string(),
-            ));
-        }
-        let fallback_target = fallback_targets.first().copied();
-
-        let mut assignments = Vec::with_capacity(nodes.len());
-        let mut per_target_count = vec![0usize; targets.len()];
-
-        for node in nodes {
-            let explicit_matches = targets
-                .iter()
-                .enumerate()
-                .filter(|(_, target)| target.explicit_nodes.contains(&node.node_id))
-                .map(|(idx, _)| idx)
-                .collect::<Vec<_>>();
-            if explicit_matches.len() > 1 {
-                return Err(capnp::Error::failed(format!(
-                    "node {} is explicitly assigned to multiple split targets",
-                    node.node_id
-                )));
-            }
-
-            let chosen = if let Some(index) = explicit_matches.first().copied() {
-                index
-            } else {
-                let mut selector_matches = Vec::new();
-                for (idx, target) in targets.iter().enumerate() {
-                    if Some(idx) == fallback_target {
-                        continue;
-                    }
-                    if Self::split_target_matches_node(target, &node)? {
-                        selector_matches.push(idx);
-                    }
-                }
-
-                match selector_matches.as_slice() {
-                    [] => fallback_target.ok_or_else(|| {
-                        capnp::Error::failed(format!(
-                            "node {} did not match any split target selectors",
-                            node.node_id
-                        ))
-                    })?,
-                    [only] => *only,
-                    _ => {
-                        return Err(capnp::Error::failed(format!(
-                            "node {} matched multiple split target selectors",
-                            node.node_id
-                        )));
-                    }
-                }
-            };
-
-            per_target_count[chosen] = per_target_count[chosen].saturating_add(1);
-            assignments.push(SplitNodeAssignment {
-                node_id: node.node_id,
-                target_index: chosen,
-            });
-        }
-
-        for (index, count) in per_target_count.into_iter().enumerate() {
-            if Some(index) == fallback_target {
-                continue;
-            }
-            if count == 0 {
-                return Err(capnp::Error::failed(format!(
-                    "split target '{}' has no matched nodes",
-                    targets[index].name
-                )));
-            }
-        }
-
-        assignments.sort_by_key(|assignment| assignment.node_id);
-        Ok(assignments)
+        build_split_assignments_for_nodes(source_view, targets, &nodes)
     }
 
     /// Resolves the split target index selected for the local node in a split operation.
