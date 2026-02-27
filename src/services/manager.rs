@@ -381,6 +381,7 @@ impl ServiceController {
         let slots = build_replica_slots(&spec);
         let slot_targets = compute_slot_targets(spec.id, &spec.tasks, eligible_nodes);
         let desired_ids: HashSet<Uuid> = slots.iter().filter_map(|slot| slot.task_id).collect();
+        let service_tasks = inventory.service_task_snapshot(&spec.service_name, desired_ids);
         let service_degraded = slots.iter().any(|slot| {
             let Some(task_id) = slot.task_id else {
                 return true;
@@ -391,7 +392,7 @@ impl ServiceController {
             node_is_down(task.node_id, health_snapshot) || !task_state_healthy(&task.state)
         });
 
-        self.reconcile_extra_tasks(&spec, inventory, eligible_nodes, &desired_ids)
+        self.reconcile_extra_tasks(&spec, &service_tasks, eligible_nodes)
             .await;
 
         for slot in slots {
@@ -473,16 +474,11 @@ impl ServiceController {
     async fn reconcile_extra_tasks(
         &self,
         spec: &ServiceSpecValue,
-        inventory: &TaskInventory,
+        service_tasks: &ServiceTaskSnapshot<'_>,
         eligible_nodes: &[Uuid],
-        desired_ids: &HashSet<Uuid>,
     ) {
-        let Some(tasks) = inventory.by_service.get(&spec.service_name) else {
-            return;
-        };
-
-        for task in tasks {
-            if desired_ids.contains(&task.id) {
+        for task in service_tasks.observed_tasks() {
+            if service_tasks.is_desired(task.id) {
                 continue;
             }
             if !task_state_healthy(&task.state) {
@@ -1238,14 +1234,9 @@ impl ServiceController {
     /// Stops every locally owned task associated with the service, including stale rows that are
     /// no longer referenced by the current service spec task id list.
     async fn stop_local_service_tasks(&self, spec: &ServiceSpecValue, inventory: &TaskInventory) {
-        let mut task_ids: HashSet<Uuid> = spec.task_ids.iter().copied().collect();
-        if let Some(tasks) = inventory.by_service.get(&spec.service_name) {
-            for task in tasks {
-                task_ids.insert(task.id);
-            }
-        }
-
-        for task_id in task_ids {
+        let desired_ids: HashSet<Uuid> = spec.task_ids.iter().copied().collect();
+        let service_tasks = inventory.service_task_snapshot(&spec.service_name, desired_ids);
+        for task_id in service_tasks.all_known_task_ids() {
             let Some(task) = inventory.by_id.get(&task_id) else {
                 continue;
             };
@@ -1311,26 +1302,73 @@ impl ServiceController {
 #[derive(Clone, Debug)]
 struct TaskInventory {
     by_id: HashMap<Uuid, TaskSpec>,
-    by_service: HashMap<String, Vec<TaskSpec>>,
+    by_service: HashMap<String, Vec<Uuid>>,
 }
 
 impl TaskInventory {
     /// Builds a task inventory snapshot for service-level reconciliation checks.
     fn from_specs(specs: Vec<TaskSpec>) -> Self {
         let mut by_id = HashMap::with_capacity(specs.len());
-        let mut by_service: HashMap<String, Vec<TaskSpec>> = HashMap::new();
+        let mut by_service: HashMap<String, Vec<Uuid>> = HashMap::new();
 
         for spec in specs {
-            by_id.insert(spec.id, spec.clone());
+            let task_id = spec.id;
             if let Some(meta) = spec.service_metadata.as_ref() {
                 by_service
                     .entry(meta.service_name.clone())
                     .or_default()
-                    .push(spec);
+                    .push(task_id);
             }
+            by_id.insert(task_id, spec);
         }
 
         Self { by_id, by_service }
+    }
+
+    /// Builds a reusable, service-scoped task view combining desired and observed task ids.
+    fn service_task_snapshot<'a>(
+        &'a self,
+        service_name: &'a str,
+        desired_ids: HashSet<Uuid>,
+    ) -> ServiceTaskSnapshot<'a> {
+        ServiceTaskSnapshot {
+            inventory: self,
+            service_name,
+            desired_ids,
+        }
+    }
+}
+
+/// Lightweight service-scoped task view used by reconcile and stop paths.
+struct ServiceTaskSnapshot<'a> {
+    inventory: &'a TaskInventory,
+    service_name: &'a str,
+    desired_ids: HashSet<Uuid>,
+}
+
+impl ServiceTaskSnapshot<'_> {
+    /// Returns true when the task id is still assigned to a desired service replica slot.
+    fn is_desired(&self, task_id: Uuid) -> bool {
+        self.desired_ids.contains(&task_id)
+    }
+
+    /// Iterates all currently observed tasks that advertise this service metadata.
+    fn observed_tasks(&self) -> impl Iterator<Item = &TaskSpec> {
+        self.inventory
+            .by_service
+            .get(self.service_name)
+            .into_iter()
+            .flat_map(|task_ids| task_ids.iter())
+            .filter_map(|task_id| self.inventory.by_id.get(task_id))
+    }
+
+    /// Returns the union of desired and observed task ids used for stop/drain workflows.
+    fn all_known_task_ids(&self) -> HashSet<Uuid> {
+        let mut task_ids = self.desired_ids.clone();
+        if let Some(observed) = self.inventory.by_service.get(self.service_name) {
+            task_ids.extend(observed.iter().copied());
+        }
+        task_ids
     }
 }
 
