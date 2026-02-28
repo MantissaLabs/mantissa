@@ -500,22 +500,15 @@ impl Registry {
     }
 
     pub async fn session_for_peer(&self, peer_id: Uuid) -> Option<cluster_session::Client> {
-        if self.peer_is_excluded(peer_id) {
-            return None;
-        }
-        let entry = self.ensure_entry(peer_id).await;
-        self.ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
+        self.resolve_session(peer_id, SessionStrategy::TicketThenCredential, false, false)
             .await
     }
 
     /// Returns the currently cached session for a peer without triggering reconnects or
     /// credential bootstrap flows.
     pub async fn cached_session_for(&self, peer_id: Uuid) -> Option<cluster_session::Client> {
-        if self.peer_is_excluded(peer_id) {
-            return None;
-        }
-        let entry = self.entry_if_present(peer_id).await?;
-        self.cached_session(&entry).await
+        self.resolve_session(peer_id, SessionStrategy::TicketThenCredential, false, true)
+            .await
     }
 
     /// Returns a session for a peer while ignoring split-time exclusion scope.
@@ -526,8 +519,7 @@ impl Registry {
         &self,
         peer_id: Uuid,
     ) -> Option<cluster_session::Client> {
-        let entry = self.ensure_entry(peer_id).await;
-        self.ensure_session_unscoped(peer_id, &entry, SessionStrategy::TicketThenCredential)
+        self.resolve_session(peer_id, SessionStrategy::TicketThenCredential, true, false)
             .await
     }
 
@@ -536,20 +528,16 @@ impl Registry {
         client: &server::Client,
         peer_id: Uuid,
     ) -> Option<cluster_session::Client> {
-        if self.peer_is_excluded(peer_id) {
-            return None;
-        }
-        if let Some(entry) = self.entry_if_present(peer_id).await {
-            if let Some(session) = self.cached_session(&entry).await {
-                return Some(session);
-            }
+        let entry = self.session_entry(peer_id, false, true).await?;
+        if let Some(session) = self.cached_session(&entry).await {
+            return Some(session);
         }
 
         let session = self
             .session_for_strategy(client, peer_id, SessionStrategy::TicketThenCredential)
             .await?;
 
-        self.store_session(peer_id, session.clone()).await;
+        Self::store_session_in_entry(&entry, session.clone()).await;
         Some(session)
     }
 
@@ -706,7 +694,12 @@ impl Registry {
         }
 
         let Some(session) = self
-            .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
+            .ensure_session_scoped(
+                peer_id,
+                &entry,
+                SessionStrategy::TicketThenCredential,
+                false,
+            )
             .await
         else {
             return Ok(None);
@@ -767,7 +760,12 @@ impl Registry {
         }
 
         let Some(session) = self
-            .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
+            .ensure_session_scoped(
+                peer_id,
+                &entry,
+                SessionStrategy::TicketThenCredential,
+                false,
+            )
             .await
         else {
             return Ok(None);
@@ -828,7 +826,12 @@ impl Registry {
         }
 
         let Some(session) = self
-            .ensure_session(peer_id, &entry, SessionStrategy::TicketThenCredential)
+            .ensure_session_scoped(
+                peer_id,
+                &entry,
+                SessionStrategy::TicketThenCredential,
+                false,
+            )
             .await
         else {
             return Ok(None);
@@ -881,51 +884,58 @@ impl Registry {
     /// Stores a freshly obtained ClusterSession for `peer_id` and clears derived capability caches.
     async fn store_session(&self, peer_id: Uuid, session: cluster_session::Client) {
         let entry = self.ensure_entry(peer_id).await;
+        Self::store_session_in_entry(&entry, session).await;
+    }
+
+    /// Stores a ClusterSession in the provided peer entry and clears derived capability caches.
+    async fn store_session_in_entry(entry: &PeerEntry, session: cluster_session::Client) {
         let mut state = entry.lock().await;
         state.replace_session(session);
     }
 
-    /// Guarantees a ClusterSession for `peer_id`, reconnecting as needed with the supplied strategy.
-    async fn ensure_session(
+    /// Resolves a cache entry for session acquisition while honoring scoped split exclusions.
+    async fn session_entry(
         &self,
         peer_id: Uuid,
-        entry: &PeerEntry,
-        strategy: SessionStrategy,
-    ) -> Option<cluster_session::Client> {
-        if let Some(session) = self.cached_session(entry).await {
-            return Some(session);
+        allow_excluded: bool,
+        require_existing: bool,
+    ) -> Option<PeerEntry> {
+        if !allow_excluded && self.peer_is_excluded(peer_id) {
+            return None;
         }
 
-        if let Some(server) = {
-            let state = entry.lock().await;
-            state.server.clone()
-        } {
-            if let Some(session) = self.session_for_strategy(&server, peer_id, strategy).await {
-                let mut state = entry.lock().await;
-                state.replace_session(session.clone());
-                return Some(session);
-            }
-
-            let mut state = entry.lock().await;
-            state.server = None;
+        if require_existing {
+            self.entry_if_present(peer_id).await
+        } else {
+            Some(self.ensure_entry(peer_id).await)
         }
-
-        let refreshed = self.refresh_peer_handle(peer_id).await?;
-        let session = self
-            .session_for_strategy(&refreshed, peer_id, strategy)
-            .await?;
-
-        let mut state = entry.lock().await;
-        state.replace_session(session.clone());
-        Some(session)
     }
 
-    /// Guarantees a ClusterSession for `peer_id` while bypassing split exclusion filters.
-    async fn ensure_session_unscoped(
+    /// Resolves a cluster session according to scope and cache policy for peer-facing callers.
+    async fn resolve_session(
+        &self,
+        peer_id: Uuid,
+        strategy: SessionStrategy,
+        allow_excluded: bool,
+        cached_only: bool,
+    ) -> Option<cluster_session::Client> {
+        let entry = self
+            .session_entry(peer_id, allow_excluded, cached_only)
+            .await?;
+        if cached_only {
+            return self.cached_session(&entry).await;
+        }
+        self.ensure_session_scoped(peer_id, &entry, strategy, allow_excluded)
+            .await
+    }
+
+    /// Guarantees a ClusterSession for `peer_id`, reconnecting as needed with scoped peer filters.
+    async fn ensure_session_scoped(
         &self,
         peer_id: Uuid,
         entry: &PeerEntry,
         strategy: SessionStrategy,
+        allow_excluded: bool,
     ) -> Option<cluster_session::Client> {
         if let Some(session) = self.cached_session(entry).await {
             return Some(session);
@@ -936,8 +946,7 @@ impl Registry {
             state.server.clone()
         } {
             if let Some(session) = self.session_for_strategy(&server, peer_id, strategy).await {
-                let mut state = entry.lock().await;
-                state.replace_session(session.clone());
+                Self::store_session_in_entry(entry, session.clone()).await;
                 return Some(session);
             }
 
@@ -945,13 +954,16 @@ impl Registry {
             state.server = None;
         }
 
-        let refreshed = self.refresh_peer_handle_unscoped(peer_id).await?;
+        let refreshed = if allow_excluded {
+            self.refresh_peer_handle_unscoped(peer_id).await?
+        } else {
+            self.refresh_peer_handle(peer_id).await?
+        };
         let session = self
             .session_for_strategy(&refreshed, peer_id, strategy)
             .await?;
 
-        let mut state = entry.lock().await;
-        state.replace_session(session.clone());
+        Self::store_session_in_entry(entry, session.clone()).await;
         Some(session)
     }
 
