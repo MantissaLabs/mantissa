@@ -726,7 +726,7 @@ impl Topology {
     /// # Description:
     ///
     /// Records that a peer joined the membership and seeds SWIM state as alive.
-    pub async fn swim_note_join(&self, id: Uuid, incarnation: u64) {
+    pub async fn swim_record_join(&self, id: Uuid, incarnation: u64) {
         let mut states = self.swim.peers.lock().await;
         let state = states.entry(id).or_default();
         state.incarnation = state.incarnation.max(incarnation);
@@ -935,7 +935,7 @@ impl Topology {
                                 error!("Failed to register peer: {e}");
                                 continue;
                             }
-                            self.swim_note_join(id, incarnation).await;
+                            self.swim_record_join(id, incarnation).await;
                         }
 
                         TopologyEvent::Leave { id } => {
@@ -1028,7 +1028,8 @@ impl Topology {
                     .local_incarnation
                     .store(incarnation, Ordering::SeqCst);
             }
-            self.swim_note_join(id, self.swim_local_incarnation()).await;
+            self.swim_record_join(id, self.swim_local_incarnation())
+                .await;
             return;
         }
         self.apply_remote_swim_update(id, incarnation, ::health::Status::Alive)
@@ -1120,7 +1121,7 @@ impl Topology {
         }
         let next = observed_incarnation.saturating_add(1);
         self.swim.local_incarnation.store(next, Ordering::SeqCst);
-        self.swim_note_join(self.node.id, next).await;
+        self.swim_record_join(self.node.id, next).await;
         Some(next)
     }
 

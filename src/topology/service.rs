@@ -843,7 +843,7 @@ impl topology::Server for Topology {
 
         ClusterCredential::from_bytes_verified(&credential).map_err(Error::failed)?;
 
-        self.swim_note_join(peer_id, peer_incarnation).await;
+        self.swim_record_join(peer_id, peer_incarnation).await;
 
         self.attach_handle_only(peer_id, anchor_handle).await;
 
