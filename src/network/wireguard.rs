@@ -310,7 +310,7 @@ pub async fn ensure_wireguard_underlay(
     let mut desired_tunnel_routes = HashSet::with_capacity(peer_configs.len() + 1);
     desired_tunnel_routes.insert(tunnel_v6);
     desired_tunnel_routes.extend(peer_configs.iter().map(|peer| peer.allowed_ip));
-    if let Err(err) = prune_stale_wireguard_routes(&ifname, &desired_tunnel_routes) {
+    if let Err(err) = prune_stale_wireguard_routes(&ifname, &desired_tunnel_routes).await {
         tracing::warn!(
             target: "network",
             ifname,
@@ -471,64 +471,91 @@ fn ensure_vxlan_firewall_accept(_ifname: &str) {}
 /// those stale routes can blackhole VXLAN traffic whenever stale forwarding entries still point at
 /// retired tunnel addresses, so we prune every route outside the current self + peer set.
 #[cfg(target_os = "linux")]
-fn prune_stale_wireguard_routes(ifname: &str, desired_routes: &HashSet<Ipv6Addr>) -> Result<()> {
-    let output = Command::new("ip")
-        .arg("-6")
-        .arg("route")
-        .arg("show")
-        .arg("dev")
-        .arg(ifname)
-        .output()
-        .with_context(|| format!("list ipv6 routes on {ifname}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "ip -6 route show dev {ifname} failed (status {:?}): {}",
-            output.status.code(),
-            stderr.trim()
-        ));
-    }
+async fn prune_stale_wireguard_routes(
+    ifname: &str,
+    desired_routes: &HashSet<Ipv6Addr>,
+) -> Result<()> {
+    use futures::TryStreamExt;
+    use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteHeader};
+    use rtnetlink::{RouteMessageBuilder, new_connection};
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let Some(prefix) = line.split_whitespace().next() else {
-            continue;
-        };
-        let (ip_text, prefix_len) = if let Some((ip_text, prefix_len)) = prefix.split_once('/') {
-            (ip_text, prefix_len.parse::<u8>().ok())
-        } else {
-            // `ip route` may omit `/128` for host routes; treat bare IPv6 addresses as /128.
-            (prefix, Some(128))
-        };
-        if prefix_len != Some(128) {
+    let (connection, handle, _) =
+        new_connection().context("open rtnetlink connection for wireguard route pruning")?;
+    tokio::spawn(connection);
+
+    let mut links = handle.link().get().match_name(ifname.to_string()).execute();
+    let link = links
+        .try_next()
+        .await
+        .with_context(|| format!("lookup link index for {ifname}"))?
+        .ok_or_else(|| anyhow::anyhow!("link {ifname} missing while pruning wireguard routes"))?;
+    let ifindex = link.header.index;
+
+    let mut routes = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
+        .execute();
+
+    let mut stale_routes = Vec::new();
+    while let Some(route) = routes
+        .try_next()
+        .await
+        .with_context(|| format!("list ipv6 routes on {ifname}"))?
+    {
+        let mut table = u32::from(route.header.table);
+        let prefix_len = route.header.destination_prefix_length;
+        let mut route_ifindex = None;
+        let mut route_ip = None;
+
+        for attribute in route.attributes {
+            match attribute {
+                RouteAttribute::Oif(index) => route_ifindex = Some(index),
+                RouteAttribute::Destination(RouteAddress::Inet6(ip)) => route_ip = Some(ip),
+                RouteAttribute::Table(route_table) => table = route_table,
+                _ => {}
+            }
+        }
+
+        // Match `ip -6 route show dev <ifname>` semantics: main table and this output interface.
+        if table != u32::from(RouteHeader::RT_TABLE_MAIN) || route_ifindex != Some(ifindex) {
             continue;
         }
 
-        let Ok(route_ip) = ip_text.parse::<Ipv6Addr>() else {
+        if prefix_len != 128 {
+            continue;
+        }
+
+        let Some(route_ip) = route_ip else {
             continue;
         };
         if !is_mantissa_tunnel_ipv6(route_ip) || desired_routes.contains(&route_ip) {
             continue;
         }
+        stale_routes.push(route_ip);
+    }
 
-        let cidr = format!("{route_ip}/128");
-        let delete = Command::new("ip")
-            .arg("-6")
-            .arg("route")
-            .arg("del")
-            .arg(cidr.as_str())
-            .arg("dev")
-            .arg(ifname)
-            .output()
-            .with_context(|| format!("delete stale ipv6 route {cidr} on {ifname}"))?;
-        if !delete.status.success() {
-            let stderr = String::from_utf8_lossy(&delete.stderr);
-            if !stderr.contains("No such process") {
-                return Err(anyhow::anyhow!(
-                    "ip -6 route del {cidr} dev {ifname} failed (status {:?}): {}",
-                    delete.status.code(),
-                    stderr.trim()
-                ));
+    for route_ip in stale_routes {
+        let delete = RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(route_ip, 128)
+            .output_interface(ifindex)
+            .build();
+
+        if let Err(err) = handle.route().del(delete).execute().await {
+            match err {
+                rtnetlink::Error::NetlinkError(message) => {
+                    let errno = message.raw_code().abs();
+                    if errno != libc::ENOENT && errno != libc::ESRCH {
+                        let cidr = format!("{route_ip}/128");
+                        return Err(rtnetlink::Error::NetlinkError(message)).with_context(|| {
+                            format!("delete stale ipv6 route {cidr} on {ifname}")
+                        });
+                    }
+                }
+                other => {
+                    let cidr = format!("{route_ip}/128");
+                    return Err(other)
+                        .with_context(|| format!("delete stale ipv6 route {cidr} on {ifname}"));
+                }
             }
         }
     }
