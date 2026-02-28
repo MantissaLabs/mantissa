@@ -1,8 +1,8 @@
 use super::{Topology, types::TopologyEvent};
+use crate::cluster::ClusterViewId;
 use crate::cluster::coordinator::ClusterTransitionCoordinator;
 use crate::cluster::participant::{ClusterParticipantReport, ClusterTransitionParticipant};
 use crate::cluster::transition::ClusterTransition;
-use crate::cluster::{ClusterId, ClusterViewId};
 use crate::config;
 use crate::node::address::extract_port;
 use crate::node::id::{read_node_id, set_node_id};
@@ -28,7 +28,6 @@ use ed25519_dalek::VerifyingKey;
 use protocol::gossip::gossip_message;
 use protocol::server::{self, cluster_session};
 use protocol::topology::{topology, topology_event};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use tracing::{info, warn};
@@ -43,9 +42,10 @@ const CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT: usize = 512;
 mod assignment;
 #[path = "operation_progress.rs"]
 mod operation_progress;
+#[path = "operation_rpc.rs"]
+mod operation_rpc;
 #[path = "split_selector.rs"]
 mod split_selector;
-use split_selector::{SplitSelectorClauseSpec, SplitTargetSpec};
 
 #[derive(Clone)]
 struct JoinPayload {
@@ -540,36 +540,6 @@ impl Topology {
             }),
         ]);
         coordinator.on_commit(transition).await
-    }
-
-    /// Converts the merge request policy from the Cap'n Proto enum into local durable policy state.
-    fn merge_service_policy_from_capnp(
-        policy: protocol::topology::MergeServicePolicy,
-    ) -> MergeServicePolicy {
-        match policy {
-            protocol::topology::MergeServicePolicy::Rebalance => MergeServicePolicy::Rebalance,
-            protocol::topology::MergeServicePolicy::Preserve => MergeServicePolicy::Preserve,
-        }
-    }
-
-    /// Converts the split request service policy into local durable policy state.
-    fn split_service_policy_from_capnp(
-        policy: protocol::topology::SplitServicePolicy,
-    ) -> SplitServicePolicy {
-        match policy {
-            protocol::topology::SplitServicePolicy::Partitioned => SplitServicePolicy::Partitioned,
-            protocol::topology::SplitServicePolicy::Preserve => SplitServicePolicy::Preserve,
-        }
-    }
-
-    /// Converts the split request network policy into local durable policy state.
-    fn split_network_policy_from_capnp(
-        policy: protocol::topology::SplitNetworkPolicy,
-    ) -> SplitNetworkPolicy {
-        match policy {
-            protocol::topology::SplitNetworkPolicy::Isolate => SplitNetworkPolicy::Isolate,
-            protocol::topology::SplitNetworkPolicy::Preserve => SplitNetworkPolicy::Preserve,
-        }
     }
 
     /// Removes out-of-scope task runtime rows after split so each partition reconciles services locally.
@@ -1131,27 +1101,13 @@ impl topology::Server for Topology {
             )));
         }
 
-        let operation = ClusterOperationRecord {
-            id: Uuid::new_v4(),
-            kind: ClusterOperationKind::Merge,
-            stage: ClusterOperationStage::Proposed,
+        let operation = self.build_merge_operation_record(
+            source_view,
+            destination_view,
             dry_run,
-            source_views: vec![source_view],
-            target_views: vec![destination_view],
-            split_assignments: Vec::new(),
-            split_service_policy: SplitServicePolicy::default(),
-            split_network_policy: SplitNetworkPolicy::default(),
             merge_service_policy,
-            updated_at_unix_ms: Self::now_unix_ms(),
-            details: format!(
-                "merge proposed: source={source_view}, destination={destination_view}, dry_run={dry_run}, service_policy={merge_service_policy:?}"
-            ),
-        };
-        self.persist_cluster_operation(&operation)?;
-        if !dry_run {
-            let _ = self.broadcast_cluster_operation(&operation).await?;
-        }
-        self.trigger_operation_progress(operation.id, dry_run);
+        );
+        self.persist_and_dispatch_operation(&operation).await?;
 
         info!(
             target: "cluster_view",
@@ -1190,122 +1146,23 @@ impl topology::Server for Topology {
         }
 
         let targets = req.get_targets()?;
-        if targets.is_empty() {
-            return Err(capnp::Error::failed(
-                "split request requires at least one target".into(),
-            ));
-        }
-
-        let mut seen_names = HashSet::<String>::new();
-        let mut target_specs = Vec::with_capacity(targets.len() as usize);
-        let mut target_views = Vec::with_capacity(targets.len() as usize);
-        let mut detail_targets = Vec::with_capacity(targets.len() as usize);
-
-        for idx in 0..targets.len() {
-            let target = targets.get(idx);
-            let name = target.get_name()?.to_string()?;
-            if name.trim().is_empty() {
-                return Err(capnp::Error::failed(
-                    "split target name must not be empty".into(),
-                ));
-            }
-            if !seen_names.insert(name.clone()) {
-                return Err(capnp::Error::failed(format!(
-                    "duplicate split target name: {name}"
-                )));
-            }
-
-            let selector = target.get_selector()?;
-            let clauses_reader = selector.get_clauses()?;
-            let explicit_nodes_reader = selector.get_explicit_nodes()?;
-            let clause_count = clauses_reader.len();
-            let explicit_count = explicit_nodes_reader.len();
-            let mut clauses = Vec::with_capacity(clause_count as usize);
-            for clause_index in 0..clauses_reader.len() {
-                let clause = clauses_reader.get(clause_index);
-                let key = clause.get_key()?.to_string()?;
-                if key.trim().is_empty() {
-                    return Err(capnp::Error::failed(
-                        "split selector clause key must not be empty".into(),
-                    ));
-                }
-
-                clauses.push(SplitSelectorClauseSpec {
-                    key,
-                    op: clause.get_op()?,
-                    value: clause.get_value()?.to_string()?,
-                });
-            }
-
-            let mut explicit_nodes = HashSet::with_capacity(explicit_count as usize);
-            for node_index in 0..explicit_nodes_reader.len() {
-                let node_id = read_node_id(explicit_nodes_reader.get(node_index))?;
-                if !explicit_nodes.insert(node_id) {
-                    return Err(capnp::Error::failed(format!(
-                        "split target '{name}' contains duplicate explicit node {node_id}"
-                    )));
-                }
-            }
-
-            let mut hasher = Sha256::new();
-            hasher.update(source_view.cluster_id.as_bytes());
-            hasher.update(source_view.epoch.to_le_bytes());
-            hasher.update(name.as_bytes());
-            let digest = hasher.finalize();
-            let mut cluster_bytes = [0u8; 16];
-            cluster_bytes.copy_from_slice(&digest[..16]);
-            let target_cluster = ClusterId::from_bytes(cluster_bytes);
-            let view = ClusterViewId::new(target_cluster, source_view.epoch.saturating_add(1));
-            target_views.push(view);
-            target_specs.push(SplitTargetSpec {
-                name: name.clone(),
-                clauses,
-                explicit_nodes,
-            });
-            detail_targets.push(format!(
-                "{name}(clauses={clause_count}, explicit_nodes={explicit_count}, view={view})"
-            ));
-        }
+        let (target_specs, target_views, detail_targets) =
+            self.parse_split_target_specs(source_view, targets)?;
 
         let split_assignments = self
             .build_split_assignments(source_view, &target_specs)
             .await?;
-        let mut assignments_per_target = vec![0usize; target_views.len()];
-        for assignment in &split_assignments {
-            if let Some(slot) = assignments_per_target.get_mut(assignment.target_index) {
-                *slot = slot.saturating_add(1);
-            }
-        }
-        let assignment_detail = target_specs
-            .iter()
-            .enumerate()
-            .map(|(idx, target)| format!("{}={}", target.name, assignments_per_target[idx]))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let operation = ClusterOperationRecord {
-            id: Uuid::new_v4(),
-            kind: ClusterOperationKind::Split,
-            stage: ClusterOperationStage::Proposed,
+        let operation = self.build_split_operation_record(
+            source_view,
             dry_run,
-            source_views: vec![source_view],
-            target_views: target_views.clone(),
-            split_assignments,
             split_service_policy,
             split_network_policy,
-            merge_service_policy: MergeServicePolicy::default(),
-            updated_at_unix_ms: Self::now_unix_ms(),
-            details: format!(
-                "split proposed: source={source_view}, dry_run={dry_run}, service_policy={split_service_policy:?}, network_policy={split_network_policy:?}, targets=[{}], assignments=[{}]",
-                detail_targets.join(", "),
-                assignment_detail
-            ),
-        };
-        self.persist_cluster_operation(&operation)?;
-        if !dry_run {
-            let _ = self.broadcast_cluster_operation(&operation).await?;
-        }
-        self.trigger_operation_progress(operation.id, dry_run);
+            &target_specs,
+            target_views,
+            detail_targets,
+            split_assignments,
+        );
+        self.persist_and_dispatch_operation(&operation).await?;
 
         info!(
             target: "cluster_view",
@@ -1332,72 +1189,8 @@ impl topology::Server for Topology {
         let reader = params.get()?;
         let operation_id = Self::operation_id_from_data(reader.get_id()?)?;
         let payload = reader.get_payload()?;
-        let mut incoming: ClusterOperationRecord =
-            bincode::deserialize(payload).map_err(|e| capnp::Error::failed(e.to_string()))?;
-        if incoming.updated_at_unix_ms == 0 {
-            incoming.updated_at_unix_ms = Self::now_unix_ms();
-        }
-        if incoming.id != operation_id {
-            return Err(capnp::Error::failed(format!(
-                "relayed operation id mismatch: envelope={operation_id}, payload={}",
-                incoming.id
-            )));
-        }
-        if let Some(active) = self.active_cluster_operation()? {
-            if active.id != operation_id {
-                return Err(capnp::Error::failed(format!(
-                    "cannot accept operation {operation_id} while operation {} ({:?}/{:?}) is in progress",
-                    active.id, active.kind, active.stage
-                )));
-            }
-        }
-
-        let merged = match self.load_cluster_operation(operation_id)? {
-            Some(current)
-                if Self::stage_rank(current.stage) >= Self::stage_rank(incoming.stage) =>
-            {
-                current
-            }
-            _ => {
-                self.persist_cluster_operation(&incoming)?;
-                incoming
-            }
-        };
-
-        if merged.dry_run {
-            return Ok(());
-        }
-
-        match merged.stage {
-            ClusterOperationStage::Proposed
-            | ClusterOperationStage::Prepared
-            | ClusterOperationStage::Committed => {
-                self.trigger_operation_progress(merged.id, false);
-            }
-            ClusterOperationStage::Finalized => {
-                let target = self.local_target_view_for_operation(&merged)?;
-                if merged.kind == ClusterOperationKind::Merge
-                    || self.active_cluster_view() != target
-                {
-                    if let Err(err) = self.apply_committed_operation_side_effects(&merged).await {
-                        if Self::is_commit_precondition_failure(&err) {
-                            warn!(
-                                target: "cluster_view",
-                                operation_id = %merged.id,
-                                "skipped finalized operation side effects due to commit precondition mismatch: {err}"
-                            );
-                        } else {
-                            return Err(err);
-                        }
-                    }
-                }
-            }
-            ClusterOperationStage::Aborted => {}
-        }
-
-        let _ = self.garbage_collect_cluster_operations()?;
-
-        Ok(())
+        self.accept_submitted_cluster_operation(operation_id, payload)
+            .await
     }
 
     /// Returns the most recent locally persisted operation record for the requested operation id.
