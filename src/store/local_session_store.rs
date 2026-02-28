@@ -1,3 +1,4 @@
+use crate::store::tx::{into_io, with_read_tx, with_write_tx};
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -17,11 +18,6 @@ use uuid::Uuid;
 /// KV table: key = remote peer UUID (16 bytes), value = sealed blob (nonce||ciphertext).
 const T_SESS: TableDefinition<[u8; 16], &'static [u8]> =
     TableDefinition::new("session_tickets_local");
-
-#[inline]
-fn ioerr<E: std::error::Error>(e: E) -> io::Error {
-    io::Error::other(e.to_string())
-}
 
 fn now_secs() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -96,11 +92,10 @@ impl LocalSessionStore {
     /// Open or create the table and derive the local KEK from Noise keys.
     pub fn open(db: Arc<Database>, noise_keys: &NoiseKeys) -> io::Result<Self> {
         let kek = derive_local_key(&noise_keys.to_private_bytes());
-        let w = db.begin_write().map_err(ioerr)?;
-        {
-            let _ = w.open_table(T_SESS).map_err(ioerr)?;
-        }
-        w.commit().map_err(ioerr)?;
+        with_write_tx(&db, |tx| {
+            let _ = tx.open_table(T_SESS).map_err(into_io)?;
+            Ok(())
+        })?;
         Ok(Self { db, kek })
     }
 
@@ -117,13 +112,11 @@ impl LocalSessionStore {
     /// Remove ticket for `peer`.
     #[allow(dead_code)]
     pub fn remove(&self, peer: Uuid) -> io::Result<()> {
-        let w = self.db.begin_write().map_err(ioerr)?;
-        {
-            let mut t = w.open_table(T_SESS).map_err(ioerr)?;
-            let _ = t.remove(*peer.as_bytes()).map_err(ioerr)?;
-        }
-        w.commit().map_err(ioerr)?;
-        Ok(())
+        with_write_tx(&self.db, |tx| {
+            let mut table = tx.open_table(T_SESS).map_err(into_io)?;
+            let _ = table.remove(*peer.as_bytes()).map_err(into_io)?;
+            Ok(())
+        })
     }
 
     /// List all peers with their ticket bytes (returns even if expired).
@@ -152,32 +145,33 @@ impl LocalSessionStore {
             expires_at,
             note,
         };
-        let plain = bincode::serialize(&rec).map_err(ioerr)?;
+        let plain = bincode::serialize(&rec).map_err(into_io)?;
         let blob = seal(&self.kek, &plain)?;
 
-        let w = self.db.begin_write().map_err(ioerr)?;
-        {
-            let mut t = w.open_table(T_SESS).map_err(ioerr)?;
-            t.insert(*peer.as_bytes(), blob.as_slice()).map_err(ioerr)?;
-        }
-        w.commit().map_err(ioerr)?;
-        Ok(())
+        with_write_tx(&self.db, |tx| {
+            let mut table = tx.open_table(T_SESS).map_err(into_io)?;
+            table
+                .insert(*peer.as_bytes(), blob.as_slice())
+                .map_err(into_io)?;
+            Ok(())
+        })
     }
 
     // Return full record (even if expired).
     pub fn get_record(&self, peer: Uuid) -> io::Result<Option<TicketRecord>> {
-        let r = self.db.begin_read().map_err(ioerr)?;
-        let t = r.open_table(T_SESS).map_err(ioerr)?;
-        let out = match t.get(*peer.as_bytes()).map_err(ioerr)? {
-            Some(g) => {
-                let blob = g.value();
-                let pt = open(&self.kek, blob)?;
-                let rec: TicketRecord = bincode::deserialize(&pt).map_err(ioerr)?;
-                Some(rec)
-            }
-            None => None,
-        };
-        Ok(out)
+        with_read_tx(&self.db, |tx| {
+            let table = tx.open_table(T_SESS).map_err(into_io)?;
+            let out = match table.get(*peer.as_bytes()).map_err(into_io)? {
+                Some(guard) => {
+                    let blob = guard.value();
+                    let pt = open(&self.kek, blob)?;
+                    let rec: TicketRecord = bincode::deserialize(&pt).map_err(into_io)?;
+                    Some(rec)
+                }
+                None => None,
+            };
+            Ok(out)
+        })
     }
 
     // Return full record only if not expired (and optionally auto-purge).
@@ -210,18 +204,19 @@ impl LocalSessionStore {
 
     // List all records (even if expired).
     pub fn list_records(&self) -> io::Result<Vec<(Uuid, TicketRecord)>> {
-        let r = self.db.begin_read().map_err(ioerr)?;
-        let t = r.open_table(T_SESS).map_err(ioerr)?;
-        let mut it = t.iter().map_err(ioerr)?;
-        let mut out = Vec::new();
-        while let Some(Ok((k, v))) = it.next() {
-            let peer = Uuid::from_bytes(k.value());
-            let blob = v.value();
-            let pt = open(&self.kek, blob)?;
-            let rec: TicketRecord = bincode::deserialize(&pt).map_err(ioerr)?;
-            out.push((peer, rec));
-        }
-        Ok(out)
+        with_read_tx(&self.db, |tx| {
+            let table = tx.open_table(T_SESS).map_err(into_io)?;
+            let mut it = table.iter().map_err(into_io)?;
+            let mut out = Vec::new();
+            while let Some(Ok((key, value))) = it.next() {
+                let peer = Uuid::from_bytes(key.value());
+                let blob = value.value();
+                let pt = open(&self.kek, blob)?;
+                let rec: TicketRecord = bincode::deserialize(&pt).map_err(into_io)?;
+                out.push((peer, rec));
+            }
+            Ok(out)
+        })
     }
 
     /// Purge expired entries; returns the number removed.
@@ -240,14 +235,12 @@ impl LocalSessionStore {
             return Ok(0);
         }
 
-        let w = self.db.begin_write().map_err(ioerr)?;
-        {
-            let mut t = w.open_table(T_SESS).map_err(ioerr)?;
-            for p in &peers {
-                let _ = t.remove(*p.as_bytes()).map_err(ioerr)?;
+        with_write_tx(&self.db, |tx| {
+            let mut table = tx.open_table(T_SESS).map_err(into_io)?;
+            for peer in &peers {
+                let _ = table.remove(*peer.as_bytes()).map_err(into_io)?;
             }
-        }
-        w.commit().map_err(ioerr)?;
-        Ok(peers.len())
+            Ok(peers.len())
+        })
     }
 }

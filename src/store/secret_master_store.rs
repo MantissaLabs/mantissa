@@ -1,4 +1,5 @@
 use crate::secrets::crypto::SecretKeyring;
+use crate::store::tx::{into_io, with_read_tx, with_write_tx};
 use redb::{Database, TableDefinition};
 use std::{io, sync::Arc};
 
@@ -7,11 +8,6 @@ const T_MASTER_KEYS: TableDefinition<u64, &'static [u8]> =
 const T_MASTER_META: TableDefinition<&'static str, &'static [u8]> =
     TableDefinition::new("secret_master_meta");
 const CURRENT_VERSION_KEY: &str = "current_version";
-
-#[inline]
-fn ioerr<E: std::error::Error>(err: E) -> io::Error {
-    io::Error::other(err.to_string())
-}
 
 /// Immutable snapshot of a master key version stored in the durable key vault.
 #[derive(Debug, Clone, Copy)]
@@ -42,12 +38,11 @@ pub struct SecretMasterStore {
 impl SecretMasterStore {
     /// Opens (or creates) the secret master key tables without generating a key.
     pub fn new(db: Arc<Database>) -> io::Result<Self> {
-        let write_tx = db.begin_write().map_err(ioerr)?;
-        {
-            let _ = write_tx.open_table(T_MASTER_KEYS).map_err(ioerr)?;
-            let _ = write_tx.open_table(T_MASTER_META).map_err(ioerr)?;
-        }
-        write_tx.commit().map_err(ioerr)?;
+        with_write_tx(&db, |tx| {
+            let _ = tx.open_table(T_MASTER_KEYS).map_err(into_io)?;
+            let _ = tx.open_table(T_MASTER_META).map_err(into_io)?;
+            Ok(())
+        })?;
 
         Ok(Self { db })
     }
@@ -77,21 +72,22 @@ impl SecretMasterStore {
     /// have installed the newer key, older entries can be garbage-collected
     /// separately.
     pub fn load_version(&self, version: u64) -> io::Result<Option<MasterKeyRecord>> {
-        let read_tx = self.db.begin_read().map_err(ioerr)?;
-        let table = read_tx.open_table(T_MASTER_KEYS).map_err(ioerr)?;
-        let Some(raw_key) = table.get(version).map_err(ioerr)? else {
-            return Ok(None);
-        };
-        let bytes = raw_key.value();
-        if bytes.len() != 32 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "secret master key length invalid",
-            ));
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(bytes);
-        MasterKeyRecord::new(version, key).map(Some)
+        with_read_tx(&self.db, |tx| {
+            let table = tx.open_table(T_MASTER_KEYS).map_err(into_io)?;
+            let Some(raw_key) = table.get(version).map_err(into_io)? else {
+                return Ok(None);
+            };
+            let bytes = raw_key.value();
+            if bytes.len() != 32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "secret master key length invalid",
+                ));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(bytes);
+            MasterKeyRecord::new(version, key).map(Some)
+        })
     }
 
     /// Imports an externally provided master key as the active version.
@@ -117,59 +113,61 @@ impl SecretMasterStore {
 
     /// Loads the currently active master key record if one has been persisted.
     fn load_current(&self) -> io::Result<Option<MasterKeyRecord>> {
-        let read_tx = self.db.begin_read().map_err(ioerr)?;
-        let meta = read_tx.open_table(T_MASTER_META).map_err(ioerr)?;
-        let version_bytes = match meta.get(CURRENT_VERSION_KEY).map_err(ioerr)? {
-            Some(raw) => raw.value().to_vec(),
-            None => return Ok(None),
-        };
-        if version_bytes.len() != 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "secret master key metadata corrupted",
-            ));
-        }
-        let mut version_buf = [0u8; 8];
-        version_buf.copy_from_slice(&version_bytes);
-        let version = u64::from_be_bytes(version_buf);
+        with_read_tx(&self.db, |tx| {
+            let meta = tx.open_table(T_MASTER_META).map_err(into_io)?;
+            let version_bytes = match meta.get(CURRENT_VERSION_KEY).map_err(into_io)? {
+                Some(raw) => raw.value().to_vec(),
+                None => return Ok(None),
+            };
+            if version_bytes.len() != 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "secret master key metadata corrupted",
+                ));
+            }
+            let mut version_buf = [0u8; 8];
+            version_buf.copy_from_slice(&version_bytes);
+            let version = u64::from_be_bytes(version_buf);
 
-        let table = read_tx.open_table(T_MASTER_KEYS).map_err(ioerr)?;
-        let Some(raw_key) = table.get(version).map_err(ioerr)? else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "secret master key missing for recorded version",
-            ));
-        };
+            let table = tx.open_table(T_MASTER_KEYS).map_err(into_io)?;
+            let Some(raw_key) = table.get(version).map_err(into_io)? else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "secret master key missing for recorded version",
+                ));
+            };
 
-        let bytes = raw_key.value();
-        if bytes.len() != 32 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "secret master key length invalid",
-            ));
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(bytes);
-        MasterKeyRecord::new(version, key).map(Some)
+            let bytes = raw_key.value();
+            if bytes.len() != 32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "secret master key length invalid",
+                ));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(bytes);
+            MasterKeyRecord::new(version, key).map(Some)
+        })
     }
 
     /// Reads the version pointer from metadata, returning `None` when uninitialized.
     fn current_version(&self) -> io::Result<Option<u64>> {
-        let read_tx = self.db.begin_read().map_err(ioerr)?;
-        let meta = read_tx.open_table(T_MASTER_META).map_err(ioerr)?;
-        let Some(raw) = meta.get(CURRENT_VERSION_KEY).map_err(ioerr)? else {
-            return Ok(None);
-        };
-        let bytes = raw.value();
-        if bytes.len() != 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "secret master key metadata corrupted",
-            ));
-        }
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(bytes);
-        Ok(Some(u64::from_be_bytes(buf)))
+        with_read_tx(&self.db, |tx| {
+            let meta = tx.open_table(T_MASTER_META).map_err(into_io)?;
+            let Some(raw) = meta.get(CURRENT_VERSION_KEY).map_err(into_io)? else {
+                return Ok(None);
+            };
+            let bytes = raw.value();
+            if bytes.len() != 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "secret master key metadata corrupted",
+                ));
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(bytes);
+            Ok(Some(u64::from_be_bytes(buf)))
+        })
     }
 
     /// Persists `key` under `version` and advances the metadata pointer atomically.
@@ -184,17 +182,15 @@ impl SecretMasterStore {
         let mut version_bytes = [0u8; 8];
         version_bytes.copy_from_slice(&version.to_be_bytes());
 
-        let write_tx = self.db.begin_write().map_err(ioerr)?;
-        {
-            let mut keys = write_tx.open_table(T_MASTER_KEYS).map_err(ioerr)?;
-            keys.insert(version, key.as_slice()).map_err(ioerr)?;
+        with_write_tx(&self.db, |tx| {
+            let mut keys = tx.open_table(T_MASTER_KEYS).map_err(into_io)?;
+            keys.insert(version, key.as_slice()).map_err(into_io)?;
 
-            let mut meta = write_tx.open_table(T_MASTER_META).map_err(ioerr)?;
+            let mut meta = tx.open_table(T_MASTER_META).map_err(into_io)?;
             meta.insert(CURRENT_VERSION_KEY, version_bytes.as_slice())
-                .map_err(ioerr)?;
-        }
-        write_tx.commit().map_err(ioerr)?;
-        Ok(())
+                .map_err(into_io)?;
+            Ok(())
+        })
     }
 }
 
