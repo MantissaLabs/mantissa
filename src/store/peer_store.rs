@@ -1,3 +1,4 @@
+use crate::store::open::open_arc_store;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::table_set::TableSet;
 use crdt_store::uuid_key::UuidKey;
@@ -29,6 +30,5 @@ pub type PeersStoreInner =
 pub type PeersStore = Arc<PeersStoreInner>;
 
 pub fn open_peers_store(db: Arc<redb::Database>, actor: uuid::Uuid) -> std::io::Result<PeersStore> {
-    let inner = PeersStoreInner::open(db, actor)?;
-    Ok(Arc::new(inner))
+    open_arc_store(db, actor, PeersStoreInner::open)
 }

@@ -1,4 +1,5 @@
 use crate::secrets::types::SecretValue;
+use crate::store::open::open_arc_store;
 use crdt_store::adapter::MvRegAdapterSorted;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
@@ -22,9 +23,9 @@ pub type SecretStore = Arc<SecretStoreInner>;
 
 /// Opens the replicated secret store backed by Redb.
 pub fn open_secret_store(db: Arc<redb::Database>, actor: Uuid) -> std::io::Result<SecretStore> {
-    let inner = SecretStoreInner::builder(db, actor)
-        .with_preserve_local_tombs(true)
-        .build()
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    Ok(Arc::new(inner))
+    open_arc_store(db, actor, |db, actor| {
+        SecretStoreInner::builder(db, actor)
+            .with_preserve_local_tombs(true)
+            .build()
+    })
 }

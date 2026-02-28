@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::store::open::open_arc_store;
 use crdt_store::adapter::MvRegAdapterSorted;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
@@ -26,6 +27,5 @@ pub fn open_scheduler_store(
     db: Arc<redb::Database>,
     actor: Uuid,
 ) -> std::io::Result<SchedulerStore> {
-    let inner = SchedulerStoreInner::open(db, actor)?;
-    Ok(Arc::new(inner))
+    open_arc_store(db, actor, SchedulerStoreInner::open)
 }

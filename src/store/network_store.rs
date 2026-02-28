@@ -1,4 +1,5 @@
 use crate::network::types::{NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue};
+use crate::store::open::open_arc_store;
 use crdt_store::adapter::MvRegAdapterSorted;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
@@ -66,8 +67,7 @@ pub fn open_network_spec_store(
     db: Arc<redb::Database>,
     actor: Uuid,
 ) -> std::io::Result<NetworkSpecStore> {
-    let inner = NetworkSpecStoreInner::open(db, actor)?;
-    Ok(Arc::new(inner))
+    open_arc_store(db, actor, NetworkSpecStoreInner::open)
 }
 
 /// Open or create the network peer state store scoped to the provided actor.
@@ -75,8 +75,7 @@ pub fn open_network_peer_store(
     db: Arc<redb::Database>,
     actor: Uuid,
 ) -> std::io::Result<NetworkPeerStore> {
-    let inner = NetworkPeerStoreInner::open(db, actor)?;
-    Ok(Arc::new(inner))
+    open_arc_store(db, actor, NetworkPeerStoreInner::open)
 }
 
 /// Open or create the network attachment store scoped to the provided actor.
@@ -84,6 +83,5 @@ pub fn open_network_attachment_store(
     db: Arc<redb::Database>,
     actor: Uuid,
 ) -> std::io::Result<NetworkAttachmentStore> {
-    let inner = NetworkAttachmentStoreInner::open(db, actor)?;
-    Ok(Arc::new(inner))
+    open_arc_store(db, actor, NetworkAttachmentStoreInner::open)
 }

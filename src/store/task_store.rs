@@ -1,3 +1,4 @@
+use crate::store::open::open_arc_store;
 use crate::task::types::TaskValue;
 use crdt_store::adapter::MvRegAdapterSorted;
 use crdt_store::hash::XXHash128;
@@ -21,8 +22,9 @@ pub type TaskStoreInner =
 pub type TaskStore = Arc<TaskStoreInner>;
 
 pub fn open_task_store(db: Arc<redb::Database>, actor: Uuid) -> std::io::Result<TaskStore> {
-    let inner = TaskStoreInner::builder(db, actor)
-        .with_preserve_local_tombs(true)
-        .build()?;
-    Ok(Arc::new(inner))
+    open_arc_store(db, actor, |db, actor| {
+        TaskStoreInner::builder(db, actor)
+            .with_preserve_local_tombs(true)
+            .build()
+    })
 }

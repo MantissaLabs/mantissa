@@ -5,6 +5,7 @@ pub mod local_credential_store;
 pub mod local_session_store;
 pub mod local_token_store;
 pub mod network_store;
+pub mod open;
 pub mod path;
 pub mod peer_store;
 pub mod scheduler_store;
