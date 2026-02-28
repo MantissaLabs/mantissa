@@ -97,6 +97,36 @@ impl Topology {
         Ok(active.into_iter().next())
     }
 
+    /// Returns the most recent non-finalized operation excluding one specific id.
+    pub(crate) fn active_cluster_operation_excluding(
+        &self,
+        excluded_operation_id: Uuid,
+    ) -> Result<Option<ClusterOperationRecord>, capnp::Error> {
+        let mut active = self
+            .load_cluster_operations()?
+            .into_iter()
+            .filter(|operation| {
+                operation.id != excluded_operation_id
+                    && !operation.dry_run
+                    && matches!(
+                        operation.stage,
+                        ClusterOperationStage::Proposed
+                            | ClusterOperationStage::Prepared
+                            | ClusterOperationStage::Committed
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        active.sort_by(|left, right| {
+            right
+                .updated_at_unix_ms
+                .cmp(&left.updated_at_unix_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+
+        Ok(active.into_iter().next())
+    }
+
     /// Rejects one mutating action while a split/merge operation is still in progress.
     pub(crate) fn ensure_no_active_cluster_operation(
         &self,
@@ -421,6 +451,10 @@ impl Topology {
 
         if !operation.dry_run {
             let _ = self.broadcast_cluster_operation(&operation).await?;
+        }
+
+        if let Some(next) = self.active_cluster_operation_excluding(operation_id)? {
+            self.trigger_operation_progress(next.id, false);
         }
 
         Ok(())

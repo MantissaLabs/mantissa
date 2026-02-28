@@ -1950,6 +1950,100 @@ local_test!(cluster_view_rejects_concurrent_operation_submission, {
     );
 });
 
+// Validates relayed operations are persisted and deferred instead of rejected when another
+// operation is already active on the node.
+local_test!(cluster_view_defers_relayed_operation_while_other_active, {
+    let node = TestNode::new_with_tick_ms(100).await;
+    let source_view = current_cluster_view(&node.topology()).await;
+
+    // Intentionally malformed split operation: missing split assignments keeps it stuck in Prepared.
+    let active_operation = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Split,
+        stage: StoredOperationStage::Proposed,
+        dry_run: false,
+        source_views: vec![source_view],
+        target_views: vec![ClusterViewId::new(
+            source_view.cluster_id,
+            source_view.epoch.saturating_add(1),
+        )],
+        split_assignments: Vec::new(),
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
+        updated_at_unix_ms: 1,
+        details: "malformed split operation for relay deferral validation".to_string(),
+    };
+    submit_cluster_operation_record(&node.topology(), &active_operation).await;
+
+    wait_for_operation_stage(
+        &node.topology(),
+        active_operation.id.as_bytes(),
+        ClusterOperationStage::Prepared,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let deferred_operation = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Merge,
+        stage: StoredOperationStage::Proposed,
+        dry_run: false,
+        source_views: vec![source_view],
+        target_views: vec![ClusterViewId::new(
+            source_view.cluster_id,
+            source_view.epoch.saturating_add(2),
+        )],
+        split_assignments: Vec::new(),
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
+        updated_at_unix_ms: 2,
+        details: "relayed merge operation for deferral validation".to_string(),
+    };
+
+    // This must not fail even though another operation is active.
+    submit_cluster_operation_record(&node.topology(), &deferred_operation).await;
+
+    let mut deferred_lookup = node.topology().get_cluster_operation_request();
+    deferred_lookup
+        .get()
+        .set_id(deferred_operation.id.as_bytes());
+    let deferred_response = deferred_lookup
+        .send()
+        .promise
+        .await
+        .expect("getClusterOperation deferred send");
+    let deferred = deferred_response
+        .get()
+        .expect("getClusterOperation deferred get")
+        .get_op()
+        .expect("deferred operation");
+    assert_eq!(
+        deferred.get_stage().expect("deferred stage"),
+        ClusterOperationStage::Proposed,
+        "relayed operation should be persisted and remain pending while another op is active"
+    );
+
+    let mut active_lookup = node.topology().get_cluster_operation_request();
+    active_lookup.get().set_id(active_operation.id.as_bytes());
+    let active_response = active_lookup
+        .send()
+        .promise
+        .await
+        .expect("getClusterOperation active send");
+    let active = active_response
+        .get()
+        .expect("getClusterOperation active get")
+        .get_op()
+        .expect("active operation");
+    assert_eq!(
+        active.get_stage().expect("active stage"),
+        ClusterOperationStage::Prepared,
+        "existing active operation should remain active"
+    );
+});
+
 // Validates join admission is rejected while an active split operation is in progress.
 local_test!(cluster_view_rejects_join_while_split_in_progress, {
     let anchor = TestNode::new_tcp_with_tick_ms(100).await;

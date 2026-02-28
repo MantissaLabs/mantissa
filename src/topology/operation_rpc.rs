@@ -229,14 +229,6 @@ impl Topology {
                 incoming.id
             )));
         }
-        if let Some(active) = self.active_cluster_operation()? {
-            if active.id != operation_id {
-                return Err(capnp::Error::failed(format!(
-                    "cannot accept operation {operation_id} while operation {} ({:?}/{:?}) is in progress",
-                    active.id, active.kind, active.stage
-                )));
-            }
-        }
 
         let merged = match self.load_cluster_operation(operation_id)? {
             Some(current)
@@ -251,6 +243,21 @@ impl Topology {
         };
 
         if merged.dry_run {
+            return Ok(());
+        }
+
+        if let Some(active) = self.active_cluster_operation_excluding(operation_id)? {
+            warn!(
+                target: "cluster_view",
+                operation_id = %merged.id,
+                incoming_kind = ?merged.kind,
+                incoming_stage = ?merged.stage,
+                active_operation = %active.id,
+                active_kind = ?active.kind,
+                active_stage = ?active.stage,
+                "deferring relayed cluster operation until active operation finalizes"
+            );
+            self.trigger_operation_progress(active.id, false);
             return Ok(());
         }
 
@@ -282,6 +289,9 @@ impl Topology {
         }
 
         let _ = self.garbage_collect_cluster_operations()?;
+        if let Some(next) = self.active_cluster_operation_excluding(operation_id)? {
+            self.trigger_operation_progress(next.id, false);
+        }
 
         Ok(())
     }
