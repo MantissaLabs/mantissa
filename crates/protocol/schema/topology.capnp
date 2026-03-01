@@ -48,6 +48,17 @@ interface Topology {
 
   listSplitCandidates @11 (sourceView :ClusterViewId) -> (nodes :List(SplitCandidate));
   # Lists node candidates and host metadata used to prepare interactive split assignments.
+
+  setClusterName @12 (clusterId :ClusterId, name :Text) -> ();
+  # Sets or updates the friendly name for one cluster lineage identifier.
+
+  submitClusterName @13 (
+    clusterId :ClusterId,
+    name :Text,
+    updatedAtUnixMs :UInt64,
+    actorNodeId :Node.NodeId
+  ) -> ();
+  # Replicates one cluster-name update payload to this node.
 }
 
 struct TopologyEvent {
@@ -165,6 +176,9 @@ struct ClusterViewSummary {
 
   localActive @2 :Bool;
   # True when this row corresponds to the local node's active view.
+
+  clusterName @3 :Text;
+  # Friendly cluster lineage name when one has been defined.
 }
 
 struct SplitCandidate {

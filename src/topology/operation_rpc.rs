@@ -143,6 +143,7 @@ impl Topology {
             dry_run,
             source_views: vec![source_view],
             target_views: vec![destination_view],
+            target_cluster_names: Vec::new(),
             split_assignments: Vec::new(),
             split_service_policy: SplitServicePolicy::default(),
             split_network_policy: SplitNetworkPolicy::default(),
@@ -186,6 +187,10 @@ impl Topology {
             dry_run,
             source_views: vec![source_view],
             target_views,
+            target_cluster_names: target_specs
+                .iter()
+                .map(|target| target.name.clone())
+                .collect(),
             split_assignments,
             split_service_policy,
             split_network_policy,

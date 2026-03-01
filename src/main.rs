@@ -79,6 +79,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .run_until(client::clusters::list_clusters(&cfg))
                     .await?;
             }
+            ClustersCommand::Name(n) => {
+                local
+                    .run_until(client::clusters::set_cluster_name(
+                        &cfg,
+                        &n.cluster_id,
+                        &n.name,
+                    ))
+                    .await?;
+            }
             ClustersCommand::Merge(m) => {
                 let service_policy = match m.services {
                     MergeServicePolicyOpt::Rebalance => {

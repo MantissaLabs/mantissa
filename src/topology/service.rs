@@ -1,14 +1,15 @@
 use super::{Topology, types::TopologyEvent};
-use crate::cluster::ClusterViewId;
 use crate::cluster::coordinator::ClusterTransitionCoordinator;
 use crate::cluster::participant::{ClusterParticipantReport, ClusterTransitionParticipant};
 use crate::cluster::transition::ClusterTransition;
+use crate::cluster::{ClusterId, ClusterViewId};
 use crate::config;
 use crate::node::address::extract_port;
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::pubkey_from_slice;
 use crate::server::credential::ClusterCredential;
 use crate::services::types::ServiceStatus;
+use crate::store::cluster_view_store::ClusterNameRecord;
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
@@ -675,6 +676,114 @@ impl Topology {
         Self::session_cluster_view(&session).await.ok()
     }
 
+    /// Decodes one raw Cap'n Proto cluster lineage identifier into internal `ClusterId` bytes.
+    fn cluster_id_from_capnp(
+        reader: protocol::topology::cluster_id::Reader<'_>,
+    ) -> Result<ClusterId, capnp::Error> {
+        let value = reader.get_value()?;
+        if value.len() != 16 {
+            return Err(capnp::Error::failed(format!(
+                "cluster id must be exactly 16 bytes, got {}",
+                value.len()
+            )));
+        }
+
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(value);
+        Ok(ClusterId::from_bytes(bytes))
+    }
+
+    /// Applies one local cluster lineage name update with deterministic last-writer conflict resolution.
+    fn apply_cluster_name_update(
+        &self,
+        cluster_id: ClusterId,
+        name: &str,
+        updated_at_unix_ms: u64,
+        actor_node_id: Uuid,
+    ) -> Result<bool, capnp::Error> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(capnp::Error::failed(
+                "cluster name must not be empty".to_string(),
+            ));
+        }
+
+        let record = ClusterNameRecord {
+            name: trimmed.to_string(),
+            updated_at_unix_ms,
+            actor_node_id,
+        };
+        self.upsert_cluster_name_record(cluster_id, &record)
+    }
+
+    /// Best-effort relay of one cluster lineage name update to known peers.
+    async fn broadcast_cluster_name_update(
+        &self,
+        cluster_id: ClusterId,
+        name: &str,
+        updated_at_unix_ms: u64,
+        actor_node_id: Uuid,
+    ) -> Result<usize, capnp::Error> {
+        let snapshot = match self.peer_snapshot().await {
+            Some(snapshot) => snapshot,
+            None => return Ok(0),
+        };
+
+        let mut relayed = 0usize;
+        for entry in snapshot.entries.iter() {
+            let peer_id = entry.peer_id;
+            if peer_id == self.node.id {
+                continue;
+            }
+
+            let Some(session) = self.registry.session_for_peer_unscoped(peer_id).await else {
+                continue;
+            };
+
+            let topology = session
+                .get_topology_request()
+                .send()
+                .pipeline
+                .get_topology();
+            let mut relay = topology.submit_cluster_name_request();
+            {
+                let mut request = relay.get();
+                request
+                    .reborrow()
+                    .init_cluster_id()
+                    .set_value(cluster_id.as_bytes());
+                request.set_name(name);
+                request.set_updated_at_unix_ms(updated_at_unix_ms);
+                set_node_id(request.reborrow().init_actor_node_id(), &actor_node_id);
+            }
+
+            match relay.send().promise.await {
+                Ok(_) => {
+                    relayed = relayed.saturating_add(1);
+                }
+                Err(err) => {
+                    warn!(
+                        target: "cluster_view",
+                        peer_id = %peer_id,
+                        cluster_id = %cluster_id,
+                        "failed to relay cluster name update: {err}"
+                    );
+                }
+            }
+        }
+
+        if relayed > 0 {
+            info!(
+                target: "cluster_view",
+                cluster_id = %cluster_id,
+                relayed,
+                "relayed cluster name update to peers"
+            );
+        }
+
+        Ok(relayed)
+    }
+
     /// Best-effort relay of one operation record to peers in the operation's relay scope.
     async fn broadcast_cluster_operation(
         &self,
@@ -1073,6 +1182,41 @@ impl topology::Server for Topology {
         Ok(())
     }
 
+    /// Persists a friendly cluster lineage name locally, then relays the update payload to peers.
+    async fn set_cluster_name(
+        self: Rc<Self>,
+        params: topology::SetClusterNameParams,
+        _results: topology::SetClusterNameResults,
+    ) -> Result<(), capnp::Error> {
+        let request = params.get()?;
+        let cluster_id = Self::cluster_id_from_capnp(request.get_cluster_id()?)?;
+        let name = request.get_name()?.to_string()?;
+        let updated_at_unix_ms = Self::now_unix_ms();
+        let actor_node_id = self.node.id;
+        let _ =
+            self.apply_cluster_name_update(cluster_id, &name, updated_at_unix_ms, actor_node_id)?;
+        let _ = self
+            .broadcast_cluster_name_update(cluster_id, &name, updated_at_unix_ms, actor_node_id)
+            .await?;
+        Ok(())
+    }
+
+    /// Accepts one relayed cluster-name payload and applies conflict-resolved local persistence only.
+    async fn submit_cluster_name(
+        self: Rc<Self>,
+        params: topology::SubmitClusterNameParams,
+        _results: topology::SubmitClusterNameResults,
+    ) -> Result<(), capnp::Error> {
+        let request = params.get()?;
+        let cluster_id = Self::cluster_id_from_capnp(request.get_cluster_id()?)?;
+        let name = request.get_name()?.to_string()?;
+        let updated_at_unix_ms = request.get_updated_at_unix_ms();
+        let actor_node_id = read_node_id(request.get_actor_node_id()?)?;
+        let _ =
+            self.apply_cluster_name_update(cluster_id, &name, updated_at_unix_ms, actor_node_id)?;
+        Ok(())
+    }
+
     /// Registers a merge operation intent and stores it durably for later orchestration stages.
     async fn merge_clusters(
         self: Rc<Self>,
@@ -1299,6 +1443,15 @@ impl topology::Server for Topology {
             }
         }
 
+        let cluster_name_rows = self
+            .cluster_view_store
+            .list_cluster_names()
+            .map_err(|err| capnp::Error::failed(err.to_string()))?;
+        let cluster_names = cluster_name_rows
+            .into_iter()
+            .map(|(cluster_id, record)| (cluster_id, record.name))
+            .collect::<HashMap<_, _>>();
+
         let mut rows = counts
             .into_iter()
             .filter(|(view, node_count)| {
@@ -1318,6 +1471,9 @@ impl topology::Server for Topology {
             view.write_capnp(row.reborrow().init_view());
             row.set_node_count(node_count);
             row.set_local_active(view == local_view);
+            if let Some(name) = cluster_names.get(&view.cluster_id) {
+                row.set_cluster_name(name);
+            }
         }
 
         Ok(())

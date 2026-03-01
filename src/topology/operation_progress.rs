@@ -1,7 +1,8 @@
 use super::{
     CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT, COMMIT_PRECONDITION_FAILURE_PREFIX, Topology,
 };
-use crate::cluster::ClusterViewId;
+use crate::cluster::{ClusterId, ClusterViewId};
+use crate::store::cluster_view_store::ClusterNameRecord;
 use crate::topology::operation::{
     ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage,
 };
@@ -10,6 +11,93 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 impl Topology {
+    /// Applies one conflict-resolved cluster lineage name update into durable cluster-view storage.
+    pub(super) fn upsert_cluster_name_record(
+        &self,
+        cluster_id: ClusterId,
+        record: &ClusterNameRecord,
+    ) -> Result<bool, capnp::Error> {
+        self.cluster_view_store
+            .upsert_cluster_name(cluster_id, record)
+            .map_err(|err| capnp::Error::failed(err.to_string()))
+    }
+
+    /// Persists split target names carried by one operation record so cluster lineage labels survive restarts.
+    fn persist_operation_cluster_name_hints(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<(), capnp::Error> {
+        if operation.target_cluster_names.len() != operation.target_views.len() {
+            return Ok(());
+        }
+
+        let updated_at_unix_ms = if operation.updated_at_unix_ms == 0 {
+            Self::now_unix_ms()
+        } else {
+            operation.updated_at_unix_ms
+        };
+
+        for (target_view, target_name) in operation
+            .target_views
+            .iter()
+            .zip(operation.target_cluster_names.iter())
+        {
+            let name = target_name.trim();
+            if name.is_empty() {
+                continue;
+            }
+
+            let record = ClusterNameRecord {
+                name: name.to_string(),
+                updated_at_unix_ms,
+                actor_node_id: operation.id,
+            };
+            let _ = self.upsert_cluster_name_record(target_view.cluster_id, &record)?;
+        }
+
+        Ok(())
+    }
+
+    /// Rehydrates missing cluster lineage names from durable operation history during startup and upgrades.
+    pub(crate) fn hydrate_cluster_names_from_operations(&self) -> Result<usize, capnp::Error> {
+        let operations = self.load_cluster_operations()?;
+        let mut hydrated = 0usize;
+        for operation in operations {
+            if operation.dry_run {
+                continue;
+            }
+            if operation.target_cluster_names.len() != operation.target_views.len() {
+                continue;
+            }
+
+            let updated_at_unix_ms = if operation.updated_at_unix_ms == 0 {
+                Self::now_unix_ms()
+            } else {
+                operation.updated_at_unix_ms
+            };
+            for (target_view, target_name) in operation
+                .target_views
+                .iter()
+                .zip(operation.target_cluster_names.iter())
+            {
+                let name = target_name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+
+                let record = ClusterNameRecord {
+                    name: name.to_string(),
+                    updated_at_unix_ms,
+                    actor_node_id: operation.id,
+                };
+                if self.upsert_cluster_name_record(target_view.cluster_id, &record)? {
+                    hydrated = hydrated.saturating_add(1);
+                }
+            }
+        }
+        Ok(hydrated)
+    }
+
     /// Maps operation stage values into a monotonic ordering used for conflict resolution.
     pub(super) fn stage_rank(stage: ClusterOperationStage) -> u8 {
         match stage {
@@ -178,7 +266,11 @@ impl Topology {
         let encoded = bincode::serialize(op).map_err(|e| capnp::Error::failed(e.to_string()))?;
         self.cluster_operations
             .put(op.id, &encoded)
-            .map_err(|e| capnp::Error::failed(e.to_string()))
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        if !op.dry_run {
+            self.persist_operation_cluster_name_hints(op)?;
+        }
+        Ok(())
     }
 
     /// Loads a cluster operation record by id from the local durable operation store.

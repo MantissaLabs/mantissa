@@ -34,6 +34,34 @@ async fn submit_cluster_operation_record(
         .expect("submitClusterOperation send");
 }
 
+async fn cluster_name_for_lineage(
+    topology: &mantissa::topology_capnp::topology::Client,
+    cluster_id: Uuid,
+) -> Option<String> {
+    let response = topology
+        .list_cluster_views_request()
+        .send()
+        .promise
+        .await
+        .ok()?;
+    let rows = response.get().ok()?.get_views().ok()?;
+    for idx in 0..rows.len() {
+        let row = rows.get(idx);
+        let row_view = ClusterViewId::from_capnp(row.get_view().ok()?).ok()?;
+        if row_view.cluster_id.to_uuid() != cluster_id {
+            continue;
+        }
+
+        let name = row.get_cluster_name().ok()?.to_string().ok()?;
+        if name.trim().is_empty() {
+            return None;
+        }
+        return Some(name);
+    }
+
+    None
+}
+
 // Validates strict view-scoped protocol behavior for sync and topology.
 local_test!(cluster_view_protocol_strict_inproc, {
     let node = TestNode::new_with_tick_ms(100).await;
@@ -800,6 +828,7 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
         dry_run: false,
         source_views: vec![source_view],
         target_views: vec![target_view],
+        target_cluster_names: Vec::new(),
         split_assignments: Vec::new(),
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),
@@ -869,6 +898,7 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
         dry_run: true,
         source_views: vec![source_view],
         target_views: vec![target_view],
+        target_cluster_names: Vec::new(),
         split_assignments: Vec::new(),
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),
@@ -952,6 +982,7 @@ local_test!(cluster_view_startup_restores_persisted_active_view, {
         dry_run: false,
         source_views: vec![source_view],
         target_views: vec![target_view],
+        target_cluster_names: Vec::new(),
         split_assignments: Vec::new(),
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),
@@ -1024,6 +1055,7 @@ local_test!(cluster_view_startup_restores_persisted_split_view, {
         dry_run: false,
         source_views: vec![source_view],
         target_views: vec![split_target_a, split_target_b],
+        target_cluster_names: Vec::new(),
         split_assignments: vec![SplitNodeAssignment {
             node_id,
             target_index: 1,
@@ -1100,6 +1132,7 @@ local_test!(
             dry_run: false,
             source_views: vec![source_view],
             target_views: vec![first_target],
+            target_cluster_names: Vec::new(),
             split_assignments: Vec::new(),
             split_service_policy: Default::default(),
             split_network_policy: Default::default(),
@@ -1114,6 +1147,7 @@ local_test!(
             dry_run: false,
             source_views: vec![source_view],
             target_views: vec![second_target],
+            target_cluster_names: Vec::new(),
             split_assignments: Vec::new(),
             split_service_policy: Default::default(),
             split_network_policy: Default::default(),
@@ -1207,6 +1241,7 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
             dry_run: false,
             source_views: vec![source_view],
             target_views: vec![target_view],
+            target_cluster_names: Vec::new(),
             split_assignments: Vec::new(),
             split_service_policy: Default::default(),
             split_network_policy: Default::default(),
@@ -1315,6 +1350,126 @@ local_test!(cluster_view_lists_local_active_row, {
         found_local,
         "cluster view list must include a local-active row"
     );
+});
+
+// Validates manual cluster naming is replicated to joined peers through topology relay.
+local_test!(cluster_view_name_updates_relay_to_peers, {
+    let anchor = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner = TestNode::new_tcp_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join");
+    anchor
+        .assert_cluster_size(2, "cluster size after join")
+        .await;
+
+    let source_view = current_cluster_view(&anchor.topology()).await;
+    let lineage_id = source_view.cluster_id.to_uuid();
+
+    let mut rename_req = anchor.topology().set_cluster_name_request();
+    rename_req
+        .get()
+        .reborrow()
+        .init_cluster_id()
+        .set_value(source_view.cluster_id.as_bytes());
+    rename_req.get().set_name("prod-east");
+    rename_req
+        .send()
+        .promise
+        .await
+        .expect("setClusterName send");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let anchor_name = cluster_name_for_lineage(&anchor.topology(), lineage_id).await;
+        let joiner_name = cluster_name_for_lineage(&joiner.topology(), lineage_id).await;
+        if anchor_name.as_deref() == Some("prod-east")
+            && joiner_name.as_deref() == Some("prod-east")
+        {
+            break;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cluster name update did not converge to all peers"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+});
+
+// Validates split target names are persisted and visible for both resulting cluster lineages.
+local_test!(cluster_view_split_persists_target_names, {
+    let anchor = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner = TestNode::new_tcp_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join");
+    anchor
+        .assert_cluster_size(2, "cluster size after join")
+        .await;
+
+    let source_view = current_cluster_view(&anchor.topology()).await;
+    let mut split_req = anchor.topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        source_view.write_capnp(req.reborrow().init_source_view());
+
+        let mut targets = req.reborrow().init_targets(2);
+        let mut target_a = targets.reborrow().get(0);
+        target_a.set_name("frontier");
+        let mut selector_a = target_a.reborrow().init_selector();
+        selector_a.reborrow().init_clauses(0);
+        let mut explicit_a = selector_a.reborrow().init_explicit_nodes(1);
+        set_node_id(explicit_a.reborrow().get(0), &anchor.id());
+
+        let mut target_b = targets.reborrow().get(1);
+        target_b.set_name("backend");
+        let mut selector_b = target_b.reborrow().init_selector();
+        selector_b.reborrow().init_clauses(0);
+        let mut explicit_b = selector_b.reborrow().init_explicit_nodes(1);
+        set_node_id(explicit_b.reborrow().get(0), &joiner.id());
+
+        req.set_dry_run(false);
+    }
+
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split operation");
+    let target_views = split_op.get_target_views().expect("target views");
+    let target_a = ClusterViewId::from_capnp(target_views.get(0)).expect("target A");
+    let target_b = ClusterViewId::from_capnp(target_views.get(1)).expect("target B");
+    let split_id = split_op.get_id().expect("split id").to_vec();
+
+    wait_for_operation_stage(
+        &anchor.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_cluster_view(&joiner.topology(), target_b, Duration::from_secs(5)).await;
+
+    let expectations = [
+        (target_a.cluster_id.to_uuid(), "frontier"),
+        (target_b.cluster_id.to_uuid(), "backend"),
+    ];
+    for (lineage_id, expected_name) in expectations {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let anchor_name = cluster_name_for_lineage(&anchor.topology(), lineage_id).await;
+            let joiner_name = cluster_name_for_lineage(&joiner.topology(), lineage_id).await;
+            if anchor_name.as_deref() == Some(expected_name)
+                && joiner_name.as_deref() == Some(expected_name)
+            {
+                break;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "split target name '{expected_name}' did not converge for lineage {lineage_id}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
 });
 
 // Validates split candidate listing returns node rows with active-view and resource metadata.
@@ -1830,6 +1985,7 @@ local_test!(cluster_view_rejects_concurrent_operation_submission, {
             source_view.cluster_id,
             source_view.epoch.saturating_add(1),
         )],
+        target_cluster_names: Vec::new(),
         split_assignments: Vec::new(),
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),
@@ -1884,6 +2040,7 @@ local_test!(cluster_view_defers_relayed_operation_while_other_active, {
             source_view.cluster_id,
             source_view.epoch.saturating_add(1),
         )],
+        target_cluster_names: Vec::new(),
         split_assignments: Vec::new(),
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),
@@ -1911,6 +2068,7 @@ local_test!(cluster_view_defers_relayed_operation_while_other_active, {
             source_view.cluster_id,
             source_view.epoch.saturating_add(2),
         )],
+        target_cluster_names: Vec::new(),
         split_assignments: Vec::new(),
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),
@@ -1978,6 +2136,7 @@ local_test!(cluster_view_rejects_join_while_split_in_progress, {
             source_view.cluster_id,
             source_view.epoch.saturating_add(1),
         )],
+        target_cluster_names: Vec::new(),
         split_assignments: Vec::new(),
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),

@@ -182,6 +182,9 @@ pub enum ClustersCommand {
     #[command(alias = "ls")]
     List,
 
+    /// Set or update a friendly name for one cluster lineage
+    Name(ClusterNameArgs),
+
     /// Merge one or more existing clusters together
     Merge(MergeArgs),
 
@@ -597,6 +600,17 @@ pub struct MergeArgs {
     /// Print debug information verbosely
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub debug: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ClusterNameArgs {
+    /// Cluster lineage identifier (`CLUSTER_UUID`)
+    #[arg(index = 1, value_name = "CLUSTER_ID")]
+    pub cluster_id: String,
+
+    /// Friendly name to apply to this cluster lineage
+    #[arg(index = 2, value_name = "NAME")]
+    pub name: String,
 }
 
 #[derive(Args, Debug)]

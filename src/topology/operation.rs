@@ -90,6 +90,8 @@ pub struct ClusterOperationRecord {
     pub source_views: Vec<ClusterViewId>,
     pub target_views: Vec<ClusterViewId>,
     #[serde(default)]
+    pub target_cluster_names: Vec<String>,
+    #[serde(default)]
     pub split_assignments: Vec<SplitNodeAssignment>,
     #[serde(default)]
     pub split_service_policy: SplitServicePolicy,

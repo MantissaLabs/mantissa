@@ -146,6 +146,13 @@ struct SplitTargetSpec {
     explicit_nodes: Vec<Uuid>,
 }
 
+/// One explicit split target name and node set produced by interactive group assignment.
+#[derive(Clone, Debug)]
+pub struct ExplicitSplitTarget {
+    pub name: String,
+    pub node_ids: Vec<Uuid>,
+}
+
 /// Resolves the split source view from either an explicit cluster id or the local active view.
 async fn resolve_source_view(
     cfg: &ClientConfig,
@@ -278,23 +285,26 @@ pub async fn split(cfg: &ClientConfig, request: &SplitCommandRequest) -> Result<
             return Err(anyhow!("no split candidates found in the selected cluster"));
         }
 
-        let selection = run_split_planner(
-            to_ui_payload(payload),
-            &request.left_name,
-            &request.right_name,
-        )?;
+        let initial_group_names = vec![request.left_name.clone(), request.right_name.clone()];
+        let selection = run_split_planner(to_ui_payload(payload), &initial_group_names)?;
         if selection.cancelled {
             output::emit_line("split cancelled");
             return Ok(());
         }
 
-        return split_by_explicit_nodes(
+        let targets = selection
+            .targets
+            .into_iter()
+            .map(|target| ExplicitSplitTarget {
+                name: target.name,
+                node_ids: target.node_ids,
+            })
+            .collect::<Vec<_>>();
+
+        return split_by_explicit_targets(
             cfg,
             request.source_cluster_id.as_deref(),
-            &selection.left_name,
-            &selection.right_name,
-            &selection.left_nodes,
-            &selection.right_nodes,
+            &targets,
             request.dry_run,
             request.service_policy,
             request.network_policy,
@@ -384,7 +394,85 @@ pub async fn split_by_filter(
     Ok(())
 }
 
-/// Submits a split request from explicit per-node assignments selected by interactive tooling.
+/// Submits a split request from explicit named-target assignments selected by interactive tooling.
+pub async fn split_by_explicit_targets(
+    cfg: &ClientConfig,
+    source_cluster_id: Option<&str>,
+    targets: &[ExplicitSplitTarget],
+    dry_run: bool,
+    service_policy: SplitServicePolicy,
+    network_policy: SplitNetworkPolicy,
+) -> Result<()> {
+    if targets.len() < 2 {
+        return Err(anyhow!(
+            "interactive split requires at least two named targets"
+        ));
+    }
+
+    let source_view = resolve_source_view(cfg, source_cluster_id).await?;
+    let mut names_seen = HashSet::<String>::with_capacity(targets.len());
+    let total_node_count = targets
+        .iter()
+        .map(|target| target.node_ids.len())
+        .sum::<usize>();
+    let mut node_seen = HashSet::<Uuid>::with_capacity(total_node_count);
+    let mut prepared_targets = Vec::with_capacity(targets.len());
+
+    for target in targets {
+        let name = target.name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("split target name must not be empty"));
+        }
+        if !names_seen.insert(name.to_string()) {
+            return Err(anyhow!("duplicate split target name '{name}'"));
+        }
+        if target.node_ids.is_empty() {
+            return Err(anyhow!(
+                "split target '{name}' must include at least one node"
+            ));
+        }
+
+        let mut unique_nodes = Vec::with_capacity(target.node_ids.len());
+        let mut target_seen = HashSet::<Uuid>::with_capacity(target.node_ids.len());
+        for node_id in target.node_ids.iter().copied() {
+            if !target_seen.insert(node_id) {
+                continue;
+            }
+            if !node_seen.insert(node_id) {
+                return Err(anyhow!(
+                    "node {node_id} is assigned multiple times across split targets"
+                ));
+            }
+            unique_nodes.push(node_id);
+        }
+
+        if unique_nodes.is_empty() {
+            return Err(anyhow!(
+                "split target '{name}' must include at least one unique node"
+            ));
+        }
+
+        prepared_targets.push(SplitTargetSpec {
+            name: name.to_string(),
+            clauses: Vec::new(),
+            explicit_nodes: unique_nodes,
+        });
+    }
+
+    let summary = submit_split_request(
+        cfg,
+        source_view,
+        &prepared_targets,
+        dry_run,
+        service_policy,
+        network_policy,
+    )
+    .await?;
+    emit_operation_summary(&summary);
+    Ok(())
+}
+
+/// Submits a split request from exactly two explicit target partitions.
 pub async fn split_by_explicit_nodes(
     cfg: &ClientConfig,
     source_cluster_id: Option<&str>,
@@ -396,73 +484,26 @@ pub async fn split_by_explicit_nodes(
     service_policy: SplitServicePolicy,
     network_policy: SplitNetworkPolicy,
 ) -> Result<()> {
-    let source_view = resolve_source_view(cfg, source_cluster_id).await?;
-    let left_name = left_name.trim();
-    let right_name = right_name.trim();
-    if left_name.is_empty() {
-        return Err(anyhow!("left partition name must not be empty"));
-    }
-    if right_name.is_empty() {
-        return Err(anyhow!("right partition name must not be empty"));
-    }
-    if left_name == right_name {
-        return Err(anyhow!(
-            "left and right partition names must differ ('{left_name}')"
-        ));
-    }
-    if left_nodes.is_empty() || right_nodes.is_empty() {
-        return Err(anyhow!(
-            "interactive split requires at least one node on each side"
-        ));
-    }
-
-    let mut seen = HashSet::<Uuid>::with_capacity(left_nodes.len() + right_nodes.len());
-    let mut left_unique = Vec::with_capacity(left_nodes.len());
-    for node_id in left_nodes {
-        if seen.insert(*node_id) {
-            left_unique.push(*node_id);
-        } else {
-            return Err(anyhow!(
-                "node {node_id} is assigned multiple times across split partitions"
-            ));
-        }
-    }
-
-    let mut right_unique = Vec::with_capacity(right_nodes.len());
-    for node_id in right_nodes {
-        if seen.insert(*node_id) {
-            right_unique.push(*node_id);
-        } else {
-            return Err(anyhow!(
-                "node {node_id} is assigned multiple times across split partitions"
-            ));
-        }
-    }
-
     let targets = vec![
-        SplitTargetSpec {
+        ExplicitSplitTarget {
             name: left_name.to_string(),
-            clauses: Vec::new(),
-            explicit_nodes: left_unique,
+            node_ids: left_nodes.to_vec(),
         },
-        SplitTargetSpec {
+        ExplicitSplitTarget {
             name: right_name.to_string(),
-            clauses: Vec::new(),
-            explicit_nodes: right_unique,
+            node_ids: right_nodes.to_vec(),
         },
     ];
 
-    let summary = submit_split_request(
+    split_by_explicit_targets(
         cfg,
-        source_view,
+        source_cluster_id,
         &targets,
         dry_run,
         service_policy,
         network_policy,
     )
-    .await?;
-    emit_operation_summary(&summary);
-    Ok(())
+    .await
 }
 
 /// Sends a split request to topology using resolved source view and expanded targets.

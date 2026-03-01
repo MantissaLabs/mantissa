@@ -1,5 +1,6 @@
 pub mod list;
 pub mod merge;
+pub mod name;
 mod operations;
 pub mod split;
 
@@ -8,6 +9,7 @@ pub use list::{
     list_cluster_views, list_clusters, list_split_candidates, resolve_cluster_view_by_cluster_id,
 };
 pub use merge::{MergeServicePolicy, merge_by_cluster_id};
+pub use name::set_cluster_name;
 pub use operations::{ClusterOperationSummary, ClusterViewSpec};
 pub use split::{
     SplitCommandRequest, SplitFilterKind, SplitNetworkPolicy, SplitServicePolicy, split,

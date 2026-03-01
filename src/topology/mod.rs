@@ -437,6 +437,23 @@ impl Topology {
             "initialized topology with active cluster view"
         );
 
+        match topology.hydrate_cluster_names_from_operations() {
+            Ok(hydrated) if hydrated > 0 => {
+                info!(
+                    target: "cluster_view",
+                    hydrated,
+                    "rehydrated cluster lineage names from durable operation history"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    target: "cluster_view",
+                    "failed to hydrate cluster lineage names from operation history: {err}"
+                );
+            }
+        }
+
         Ok(topology)
     }
 

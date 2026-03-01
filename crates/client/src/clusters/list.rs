@@ -14,12 +14,14 @@ pub struct ClusterViewSummary {
     pub view: ClusterViewSpec,
     pub node_count: u32,
     pub local_active: bool,
+    pub cluster_name: Option<String>,
 }
 
 /// Cluster lineage summary exposed by the CLI.
 #[derive(Clone, Debug)]
 pub struct ClusterSummary {
     pub cluster_id: Uuid,
+    pub cluster_name: Option<String>,
     pub epoch: u64,
     pub node_count: u32,
     pub local_active: bool,
@@ -94,6 +96,9 @@ fn aggregate_cluster_summaries(view_rows: &[ClusterViewSummary]) -> Vec<ClusterS
 
         clusters.push(ClusterSummary {
             cluster_id,
+            cluster_name: rows
+                .iter()
+                .find_map(|row| row.cluster_name.as_ref().cloned()),
             epoch: selected.view.epoch,
             node_count: selected.node_count,
             local_active,
@@ -125,6 +130,12 @@ pub async fn list_cluster_views(cfg: &ClientConfig) -> Result<Vec<ClusterViewSum
             view: ClusterViewSpec::from_capnp(row.get_view()?)?,
             node_count: row.get_node_count(),
             local_active: row.get_local_active(),
+            cluster_name: text_or_none(
+                row.get_cluster_name()
+                    .context("cluster view summary missing cluster name")?
+                    .to_string()
+                    .context("cluster view summary cluster name invalid utf8")?,
+            ),
         });
     }
 
@@ -147,12 +158,16 @@ pub async fn list_clusters(cfg: &ClientConfig) -> Result<()> {
     }
 
     let mut tw = TabWriter::new(Vec::new());
-    writeln!(&mut tw, "CLUSTER_ID\tEPOCH\tNODES\tACTIVE_ON_THIS_NODE")?;
+    writeln!(
+        &mut tw,
+        "CLUSTER_ID\tNAME\tEPOCH\tNODES\tACTIVE_ON_THIS_NODE"
+    )?;
     for summary in summaries {
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             summary.cluster_id,
+            summary.cluster_name.as_deref().unwrap_or("-"),
             summary.epoch,
             summary.node_count,
             if summary.local_active { "yes" } else { "no" }
@@ -358,11 +373,13 @@ mod tests {
         epoch: u64,
         node_count: u32,
         local_active: bool,
+        cluster_name: Option<&str>,
     ) -> ClusterViewSummary {
         ClusterViewSummary {
             view: ClusterViewSpec { cluster_id, epoch },
             node_count,
             local_active,
+            cluster_name: cluster_name.map(ToString::to_string),
         }
     }
 
@@ -370,9 +387,9 @@ mod tests {
     fn resolve_view_prefers_local_active_row() {
         let cluster = Uuid::from_u128(0xA0);
         let rows = vec![
-            view_row(cluster, 4, 5, false),
-            view_row(cluster, 3, 0, true),
-            view_row(cluster, 2, 1, false),
+            view_row(cluster, 4, 5, false, None),
+            view_row(cluster, 3, 0, true, None),
+            view_row(cluster, 2, 1, false, None),
         ];
 
         let resolved = resolve_view_from_summaries(&rows, cluster).expect("resolve cluster view");
@@ -386,8 +403,8 @@ mod tests {
     fn resolve_view_prefers_populated_rows_over_empty_future_rows() {
         let cluster = Uuid::from_u128(0xB0);
         let rows = vec![
-            view_row(cluster, 10, 0, false),
-            view_row(cluster, 8, 4, false),
+            view_row(cluster, 10, 0, false, None),
+            view_row(cluster, 8, 4, false, None),
         ];
 
         let resolved = resolve_view_from_summaries(&rows, cluster).expect("resolve cluster view");
@@ -402,9 +419,9 @@ mod tests {
         let cluster_a = Uuid::from_u128(0xC0);
         let cluster_b = Uuid::from_u128(0xD0);
         let rows = vec![
-            view_row(cluster_a, 2, 0, false),
-            view_row(cluster_a, 1, 3, false),
-            view_row(cluster_b, 7, 1, true),
+            view_row(cluster_a, 2, 0, false, Some("alpha")),
+            view_row(cluster_a, 1, 3, false, Some("alpha")),
+            view_row(cluster_b, 7, 1, true, Some("beta")),
         ];
 
         let summaries = aggregate_cluster_summaries(&rows);
@@ -430,6 +447,11 @@ mod tests {
             !summary_a.local_active,
             "cluster A should not be local-active"
         );
+        assert_eq!(
+            summary_a.cluster_name.as_deref(),
+            Some("alpha"),
+            "cluster A should keep its friendly name"
+        );
 
         let summary_b = summaries
             .iter()
@@ -441,5 +463,10 @@ mod tests {
         );
         assert_eq!(summary_b.node_count, 1, "cluster B node count mismatch");
         assert!(summary_b.local_active, "cluster B should be local-active");
+        assert_eq!(
+            summary_b.cluster_name.as_deref(),
+            Some("beta"),
+            "cluster B should keep its friendly name"
+        );
     }
 }
