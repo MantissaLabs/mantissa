@@ -7,6 +7,7 @@ use client::config::ClientConfig;
 use client::connection;
 use client::services::manifest::{ServiceManifest, TaskResources, TaskSpec as ManifestTaskSpec};
 use client::services::{ServiceDeploymentHandle, deploy_manifest};
+use common::convergence::wait_until;
 use mantissa::cluster::ClusterViewId;
 use protocol::health::NodeStatus;
 use protocol::services::ServiceStatus as ProtoServiceStatus;
@@ -425,19 +426,17 @@ impl ProcessNode {
 
     /// Waits for one stable cluster size on this node.
     async fn wait_for_cluster_size(&self, expected: usize, timeout_ms: u64) -> bool {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        while Instant::now() < deadline {
-            if self
-                .list_ids()
-                .await
-                .map(|ids| ids.len() == expected)
-                .unwrap_or(false)
-            {
-                return true;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-        false
+        wait_until(
+            Duration::from_millis(timeout_ms),
+            Duration::from_millis(50),
+            || async {
+                self.list_ids()
+                    .await
+                    .map(|ids| ids.len() == expected)
+                    .unwrap_or(false)
+            },
+        )
+        .await
     }
 
     /// Returns this node's local root hash for one sync domain in the active cluster view.

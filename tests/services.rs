@@ -7,6 +7,9 @@ use client::services::manifest::{
     RestartPolicyName as ManifestRestartPolicyName, SecretReference, ServiceManifest,
     load_manifest_from_path,
 };
+use common::convergence::{
+    current_cluster_view, wait_for_cluster_view, wait_for_operation_stage, wait_until,
+};
 use common::testkit::{
     ClusterConfig, ContainerManagerOverrideGuard, InMemoryContainerManager, TestNode,
 };
@@ -1718,14 +1721,10 @@ async fn wait_for_service_task_count_all(
     expected: usize,
     timeout: Duration,
 ) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if all_nodes_have_service_task_count(cluster, service_name, expected).await {
-            return true;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    false
+    wait_until(timeout, Duration::from_millis(100), || async {
+        all_nodes_have_service_task_count(cluster, service_name, expected).await
+    })
+    .await
 }
 
 /// Waits until each provided node owns at least `min_expected` active tasks for the service.
@@ -1735,25 +1734,19 @@ async fn wait_for_min_local_service_task_count_refs(
     min_expected: usize,
     timeout: Duration,
 ) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let mut all_match = true;
+    wait_until(timeout, Duration::from_millis(100), || async {
         for node in cluster {
             let count =
                 list_local_active_service_tasks(&node.node.task_manager, service_name, node.id())
                     .await
                     .len();
             if count < min_expected {
-                all_match = false;
-                break;
+                return false;
             }
         }
-        if all_match {
-            return true;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    false
+        true
+    })
+    .await
 }
 
 /// Waits until each provided node owns at least `min_expected` active tasks for the service.
@@ -1763,117 +1756,24 @@ async fn wait_for_min_local_service_task_count(
     min_expected: usize,
     timeout: Duration,
 ) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let mut all_match = true;
+    wait_until(timeout, Duration::from_millis(100), || async {
         for node in cluster {
             let count =
                 list_local_active_service_tasks(&node.node.task_manager, service_name, node.id())
                     .await
                     .len();
             if count < min_expected {
-                all_match = false;
-                break;
+                return false;
             }
         }
-        if all_match {
-            return true;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    false
-}
-
-/// Wait until one operation reaches the expected stage in topology operation storage.
-async fn wait_for_operation_stage(
-    topology: &mantissa::topology_capnp::topology::Client,
-    operation_id: &[u8],
-    expected: ClusterOperationStage,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let mut request = topology.get_cluster_operation_request();
-        request.get().set_id(operation_id);
-        let response = request
-            .send()
-            .promise
-            .await
-            .expect("getClusterOperation send");
-        let operation = response
-            .get()
-            .expect("getClusterOperation get")
-            .get_op()
-            .expect("operation payload");
-        let stage = operation.get_stage().expect("operation stage");
-        if stage == expected {
-            return;
-        }
-        assert!(
-            Instant::now() <= deadline,
-            "operation did not reach expected stage {:?}, current stage {:?}",
-            expected,
-            stage
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
-/// Wait until topology reports the expected active cluster view.
-async fn wait_for_cluster_view(
-    topology: &mantissa::topology_capnp::topology::Client,
-    expected: ClusterViewId,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let response = topology
-            .get_cluster_view_request()
-            .send()
-            .promise
-            .await
-            .expect("getClusterView send");
-        let view = response
-            .get()
-            .expect("getClusterView get")
-            .get_view()
-            .expect("view payload");
-        let current = ClusterViewId::from_capnp(view).expect("decode view");
-        if current == expected {
-            return;
-        }
-        assert!(
-            Instant::now() <= deadline,
-            "cluster view did not converge to expected {}, current {}",
-            expected,
-            current
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
-/// Returns the current active cluster view observed via topology.
-async fn current_cluster_view(
-    topology: &mantissa::topology_capnp::topology::Client,
-) -> ClusterViewId {
-    let response = topology
-        .get_cluster_view_request()
-        .send()
-        .promise
-        .await
-        .expect("getClusterView send");
-    let view = response
-        .get()
-        .expect("getClusterView get")
-        .get_view()
-        .expect("view payload");
-    ClusterViewId::from_capnp(view).expect("decode current view")
+        true
+    })
+    .await
 }
 
 /// Waits until the local scheduler reports the expected reserved slot count.
 async fn wait_for_reserved_slots(node: &TestNode, expected: usize, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    wait_until(timeout, Duration::from_millis(100), || async {
         if let Some(snapshot) = node.node.scheduler.snapshot().await {
             let reserved = snapshot
                 .slots
@@ -1884,9 +1784,9 @@ async fn wait_for_reserved_slots(node: &TestNode, expected: usize, timeout: Dura
                 return true;
             }
         }
-        sleep(Duration::from_millis(100)).await;
-    }
-    false
+        false
+    })
+    .await
 }
 
 /// Converts a task spec into a replicated task value for store-level fault-injection tests.
@@ -1943,18 +1843,18 @@ async fn wait_for_service_state(
     service_id: Uuid,
     expect_present: bool,
 ) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        let specs = manager
-            .list_services()
-            .expect("service list should succeed during wait");
-        let present = specs.iter().any(|spec| spec.id == service_id);
-        if present == expect_present {
-            return true;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    false
+    wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || async {
+            let specs = manager
+                .list_services()
+                .expect("service list should succeed during wait");
+            let present = specs.iter().any(|spec| spec.id == service_id);
+            present == expect_present
+        },
+    )
+    .await
 }
 
 async fn wait_for_service_status(
@@ -1962,16 +1862,19 @@ async fn wait_for_service_status(
     service_id: Uuid,
     expected: ServiceStatus,
 ) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if let Ok(Some(spec)) = manager.registry().get(service_id)
-            && spec.status() == expected
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    false
+    wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || async {
+            if let Ok(Some(spec)) = manager.registry().get(service_id)
+                && spec.status() == expected
+            {
+                return true;
+            }
+            false
+        },
+    )
+    .await
 }
 
 async fn ensure_demo_manifest_secrets(cluster: &[TestNode]) {
@@ -2117,9 +2020,8 @@ async fn list_service_ids(client: &services::Client) -> Vec<Uuid> {
 }
 
 async fn wait_for_task_count(manager: &TaskManager, expected: usize, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
     let filter = TaskStateFilter::all();
-    while Instant::now() < deadline {
+    wait_until(timeout, Duration::from_millis(50), || async {
         let specs = manager
             .list_tasks(&filter)
             .await
@@ -2127,9 +2029,9 @@ async fn wait_for_task_count(manager: &TaskManager, expected: usize, timeout: Du
         if specs.len() == expected {
             return true;
         }
-        sleep(Duration::from_millis(50)).await;
-    }
-    false
+        false
+    })
+    .await
 }
 
 async fn create_secret(
@@ -2176,8 +2078,7 @@ async fn list_secret_names(client: &secrets::Client) -> Vec<String> {
 }
 
 async fn wait_for_secret(client: &secrets::Client, name: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    wait_until(timeout, Duration::from_millis(50), || async {
         if list_secret_names(client)
             .await
             .into_iter()
@@ -2185,7 +2086,7 @@ async fn wait_for_secret(client: &secrets::Client, name: &str, timeout: Duration
         {
             return true;
         }
-        sleep(Duration::from_millis(50)).await;
-    }
-    false
+        false
+    })
+    .await
 }

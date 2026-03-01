@@ -1,6 +1,7 @@
 #[macro_use]
 mod common;
 
+use common::convergence::{current_cluster_view, wait_for_cluster_view, wait_for_operation_stage};
 use common::testkit::TestNode;
 use mantissa::cluster::ClusterViewId;
 use mantissa::node::id::set_node_id;
@@ -14,93 +15,9 @@ use mantissa::topology::operation::{
 use net::noise::NoiseKeys;
 use protocol::topology::{ClusterOperationKind, ClusterOperationStage};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
-
-async fn wait_for_operation_stage(
-    topology: &mantissa::topology_capnp::topology::Client,
-    operation_id: &[u8],
-    expected: ClusterOperationStage,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let mut request = topology.get_cluster_operation_request();
-        request.get().set_id(operation_id);
-        let response = request
-            .send()
-            .promise
-            .await
-            .expect("getClusterOperation send");
-        let operation = response
-            .get()
-            .expect("getClusterOperation get")
-            .get_op()
-            .expect("operation payload");
-        let stage = operation.get_stage().expect("operation stage");
-        if stage == expected {
-            return;
-        }
-        assert!(
-            Instant::now() <= deadline,
-            "operation did not reach expected stage {:?}, current stage {:?}",
-            expected,
-            stage
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
-async fn wait_for_cluster_view(
-    topology: &mantissa::topology_capnp::topology::Client,
-    expected: ClusterViewId,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let response = topology
-            .get_cluster_view_request()
-            .send()
-            .promise
-            .await
-            .expect("getClusterView send");
-        let view = response
-            .get()
-            .expect("getClusterView get")
-            .get_view()
-            .expect("view payload");
-        let current = ClusterViewId::from_capnp(view).expect("decode view");
-        if current == expected {
-            return;
-        }
-
-        assert!(
-            Instant::now() <= deadline,
-            "cluster view did not converge to expected {}, current {}",
-            expected,
-            current
-        );
-        sleep(Duration::from_millis(25)).await;
-    }
-}
-
-async fn current_cluster_view(
-    topology: &mantissa::topology_capnp::topology::Client,
-) -> ClusterViewId {
-    let response = topology
-        .get_cluster_view_request()
-        .send()
-        .promise
-        .await
-        .expect("getClusterView send");
-    let view = response
-        .get()
-        .expect("getClusterView get")
-        .get_view()
-        .expect("view payload");
-    ClusterViewId::from_capnp(view).expect("decode current view")
-}
 
 async fn submit_cluster_operation_record(
     topology: &mantissa::topology_capnp::topology::Client,

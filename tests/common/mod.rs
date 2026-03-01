@@ -19,4 +19,5 @@ pub fn fixed_noise_keys(byte: u8) -> net::noise::NoiseKeys {
 
 #[macro_use]
 pub mod macros;
+pub mod convergence;
 pub mod testkit;
