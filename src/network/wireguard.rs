@@ -6,7 +6,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::process::Command;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -572,41 +571,30 @@ fn is_mantissa_tunnel_ipv6(ip: Ipv6Addr) -> bool {
 
 #[cfg(target_os = "linux")]
 fn ip6tables_has_rule(chain: &str, spec: &[&str]) -> bool {
-    let output = match Command::new("ip6tables")
-        .arg("-C")
-        .arg(chain)
-        .args(spec)
-        .output()
-    {
-        Ok(output) => output,
+    let rule = spec.join(" ");
+    let ip6t = match iptables::new(true) {
+        Ok(client) => client,
         Err(err) => {
             tracing::debug!(
                 target: "network",
                 chain,
+                rule = %rule,
                 error = %err,
-                "ip6tables check failed (command missing or not permitted)"
+                "ip6tables check failed while creating client"
             );
             return false;
         }
     };
 
-    if output.status.success() {
-        return true;
-    }
-
-    // `ip6tables -C` exits with status 1 when the rule does not exist. It also prints a
-    // human-oriented message on stderr ("Bad rule ...") which we intentionally suppress by
-    // capturing command output.
-    match output.status.code() {
-        Some(1) => false,
-        code => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+    match ip6t.exists("filter", chain, &rule) {
+        Ok(exists) => exists,
+        Err(err) => {
             tracing::debug!(
                 target: "network",
                 chain,
-                exit_code = ?code,
-                stderr = %stderr.trim(),
-                "ip6tables check returned an unexpected status"
+                rule = %rule,
+                error = %err,
+                "ip6tables check failed"
             );
             false
         }
@@ -615,22 +603,10 @@ fn ip6tables_has_rule(chain: &str, spec: &[&str]) -> bool {
 
 #[cfg(target_os = "linux")]
 fn ip6tables_insert_rule(chain: &str, spec: &[&str]) -> std::io::Result<()> {
-    let output = Command::new("ip6tables")
-        .arg("-I")
-        .arg(chain)
-        .args(spec)
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "ip6tables returned status {:?}: {}",
-                output.status.code(),
-                stderr.trim()
-            ),
-        ))
-    }
+    let rule = spec.join(" ");
+    let ip6t = iptables::new(true).map_err(|err| {
+        std::io::Error::other(format!("failed to create ip6tables client: {err}"))
+    })?;
+    ip6t.insert("filter", chain, &rule, 1)
+        .map_err(|err| std::io::Error::other(format!("ip6tables insert failed: {err}")))
 }

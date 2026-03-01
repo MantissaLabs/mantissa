@@ -1834,6 +1834,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 
 [[package]]
+name = "iptables"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f30c9a636a0a728c67d1d420471c99b215708a17c222bb9afb16d0821e2d80d8"
+dependencies = [
+ "lazy_static",
+ "regex",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1994,6 +2004,7 @@ dependencies = [
  "health",
  "hickory-proto",
  "hkdf",
+ "iptables",
  "libc",
  "log",
  "merkle-search-tree",
