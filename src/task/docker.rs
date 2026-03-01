@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -269,6 +270,37 @@ impl DockerContainerManager {
         } else {
             Docker::connect_with_defaults()
         }
+    }
+
+    /// Executes one container-scoped Docker API call and normalizes not-found failures.
+    async fn run_container_call<T, F>(&self, container_id: &str, call: F) -> ContainerResult<T>
+    where
+        F: Future<Output = Result<T, BollardError>>,
+    {
+        call.await
+            .map_err(|err| classify_container_error(container_id, err))
+    }
+
+    /// Executes a unit-returning container operation with standard post-success logging.
+    async fn run_unit_container_call<F>(
+        &self,
+        container_id: &str,
+        success_message: &'static str,
+        call: F,
+    ) -> ContainerResult<()>
+    where
+        F: Future<Output = Result<(), BollardError>>,
+    {
+        self.run_container_call(container_id, call).await?;
+        info!("{success_message}: {container_id}");
+        Ok(())
+    }
+
+    /// Converts an optional duration to Docker's timeout seconds format with a default.
+    fn timeout_seconds_or_default(timeout: Option<Duration>, default_secs: i64) -> i64 {
+        timeout
+            .map(|value| value.as_secs() as i64)
+            .unwrap_or(default_secs)
     }
 }
 
@@ -620,14 +652,13 @@ impl ContainerManager for DockerContainerManager {
     async fn start_container(&self, container_id: &str) -> ContainerResult<()> {
         debug!("Starting container: {}", container_id);
 
-        self.docker
-            .start_container(container_id, None::<StartContainerOptions<String>>)
-            .await
-            .map_err(|err| classify_container_error(container_id, err))?;
-
-        info!("Container started: {}", container_id);
-
-        Ok(())
+        self.run_unit_container_call(
+            container_id,
+            "Container started",
+            self.docker
+                .start_container(container_id, None::<StartContainerOptions<String>>),
+        )
+        .await
     }
 
     async fn stop_container(
@@ -635,24 +666,24 @@ impl ContainerManager for DockerContainerManager {
         container_id: &str,
         timeout: Option<Duration>,
     ) -> ContainerResult<()> {
-        let seconds = timeout.map(|t| t.as_secs() as i64);
+        let seconds = timeout.map(|value| value.as_secs() as i64);
         debug!(
             "Stopping container: {} (timeout: {:?}s)",
             container_id, seconds
         );
+        let effective_seconds = Self::timeout_seconds_or_default(timeout, 10);
 
-        let options = StopContainerOptions {
-            t: seconds.unwrap_or(10),
-        };
-
-        self.docker
-            .stop_container(container_id, Some(options))
-            .await
-            .map_err(|err| classify_container_error(container_id, err))?;
-
-        info!("Container stopped: {}", container_id);
-
-        Ok(())
+        self.run_unit_container_call(
+            container_id,
+            "Container stopped",
+            self.docker.stop_container(
+                container_id,
+                Some(StopContainerOptions {
+                    t: effective_seconds,
+                }),
+            ),
+        )
+        .await
     }
 
     async fn restart_container(
@@ -660,24 +691,24 @@ impl ContainerManager for DockerContainerManager {
         container_id: &str,
         timeout: Option<Duration>,
     ) -> ContainerResult<()> {
-        let seconds = timeout.map(|t| t.as_secs() as i64);
+        let seconds = timeout.map(|value| value.as_secs() as i64);
         debug!(
             "Restarting container: {} (timeout: {:?}s)",
             container_id, seconds
         );
+        let effective_seconds = Self::timeout_seconds_or_default(timeout, 10);
 
-        let options = RestartContainerOptions {
-            t: seconds.unwrap_or(10) as isize,
-        };
-
-        self.docker
-            .restart_container(container_id, Some(options))
-            .await
-            .map_err(|err| classify_container_error(container_id, err))?;
-
-        info!("Container restarted: {}", container_id);
-
-        Ok(())
+        self.run_unit_container_call(
+            container_id,
+            "Container restarted",
+            self.docker.restart_container(
+                container_id,
+                Some(RestartContainerOptions {
+                    t: effective_seconds as isize,
+                }),
+            ),
+        )
+        .await
     }
 
     async fn remove_container(
@@ -691,20 +722,19 @@ impl ContainerManager for DockerContainerManager {
             container_id, force, remove_volumes
         );
 
-        let options = RemoveContainerOptions {
-            force,
-            v: remove_volumes,
-            link: false,
-        };
-
-        self.docker
-            .remove_container(container_id, Some(options))
-            .await
-            .map_err(|err| classify_container_error(container_id, err))?;
-
-        info!("Container removed: {}", container_id);
-
-        Ok(())
+        self.run_unit_container_call(
+            container_id,
+            "Container removed",
+            self.docker.remove_container(
+                container_id,
+                Some(RemoveContainerOptions {
+                    force,
+                    v: remove_volumes,
+                    link: false,
+                }),
+            ),
+        )
+        .await
     }
 
     async fn list_containers(
@@ -761,16 +791,12 @@ impl ContainerManager for DockerContainerManager {
         container_id: &str,
     ) -> ContainerResult<ContainerInspectResponse> {
         trace!("Inspecting container: {}", container_id);
-
-        let options = Some(InspectContainerOptions { size: false });
-
-        let container_info = self
-            .docker
-            .inspect_container(container_id, options)
-            .await
-            .map_err(|err| classify_container_error(container_id, err))?;
-
-        Ok(container_info)
+        self.run_container_call(
+            container_id,
+            self.docker
+                .inspect_container(container_id, Some(InspectContainerOptions { size: false })),
+        )
+        .await
     }
 
     async fn pull_image(&self, image: &str) -> ContainerResult<()> {
