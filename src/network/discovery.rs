@@ -589,34 +589,27 @@ async fn answer_query(
         healthy_backends = backends.len(),
         "post-health backends"
     );
-    if backends.is_empty() && !candidates.is_empty() && catalog_entry.health_port.is_none() {
-        warn!(
-            target: "network",
-            network = %network_id,
-            service = %service_name,
-            candidates = candidates.len(),
-            "no healthy backends; falling back to candidate attachments"
-        );
-        backends = candidates;
-    }
-    sort_backends(&mut backends);
+    backends = normalize_backend_selection(
+        network_id,
+        &service_name,
+        candidates,
+        backends,
+        catalog_entry.health_port.is_some(),
+        "dns",
+    );
 
     if backends.is_empty() {
-        if let Some((vip, mac)) = compute_service_vip(registry, network_id, &service_name, &[])? {
-            let _ = program_service_vip(
-                bpf_lb,
-                bpf,
-                lb_missing,
-                registry,
-                network_id,
-                &service_name,
-                vip,
-                mac,
-                &[],
-                catalog_entry.expose_to_host,
-            )
-            .await;
-        }
+        let _ = sync_service_vip_for_backends(
+            bpf_lb,
+            bpf,
+            lb_missing,
+            registry,
+            network_id,
+            &service_name,
+            &[],
+            catalog_entry.expose_to_host,
+        )
+        .await?;
         return Ok(LookupOutcome::NxDomain);
     }
     let mut records = Vec::new();
@@ -640,26 +633,25 @@ async fn answer_query(
         )
     }));
 
-    if let Some((vip, mac)) = compute_service_vip(registry, network_id, &service_name, &backends)?
-        && program_service_vip(
-            bpf_lb,
-            bpf,
-            lb_missing,
-            registry,
-            network_id,
-            &service_name,
-            vip,
-            mac,
-            &backends,
-            catalog_entry.expose_to_host,
-        )
-        .await
+    if let Some((vip, programmed)) = sync_service_vip_for_backends(
+        bpf_lb,
+        bpf,
+        lb_missing,
+        registry,
+        network_id,
+        &service_name,
+        &backends,
+        catalog_entry.expose_to_host,
+    )
+    .await?
     {
-        records.push(Record::from_rdata(
-            query.name().clone(),
-            SERVICE_TTL_SECS,
-            RData::A(vip.into()),
-        ));
+        if programmed {
+            records.push(Record::from_rdata(
+                query.name().clone(),
+                SERVICE_TTL_SECS,
+                RData::A(vip.into()),
+            ));
+        }
     }
 
     Ok(LookupOutcome::Records(records))
@@ -1140,6 +1132,36 @@ fn filter_cached_backends(
     } else {
         preferred
     }
+}
+
+/// Normalize one backend-selection result with shared fallback and stable ordering.
+///
+/// If health checks are disabled for the service and the selected set is empty, discovery falls
+/// back to all ready/running endpoints derived from attachment records so the service remains
+/// reachable without active probing.
+///
+/// Both DNS answering and periodic refresh use this helper to keep selection behavior in lockstep.
+fn normalize_backend_selection(
+    network_id: Uuid,
+    service_name: &str,
+    candidates: Vec<BackendAddress>,
+    mut selected: Vec<BackendAddress>,
+    health_checks_enabled: bool,
+    source: &'static str,
+) -> Vec<BackendAddress> {
+    if selected.is_empty() && !candidates.is_empty() && !health_checks_enabled {
+        warn!(
+            target: "network",
+            network = %network_id,
+            service = %service_name,
+            candidates = candidates.len(),
+            source,
+            "no healthy backends; falling back to candidate attachments"
+        );
+        selected = candidates;
+    }
+    sort_backends(&mut selected);
+    selected
 }
 
 /// Actively probe candidate backends so the cached health state and dataplane MACs stay fresh.
@@ -1672,53 +1694,42 @@ async fn refresh_single_service(
     )
     .await;
 
-    let health_checks_enabled = service.health_port.is_some();
-    if backends.is_empty() && !candidates.is_empty() && !health_checks_enabled {
-        warn!(
-            target: "network",
-            network = %network_id,
-            service = %service_name,
-            candidates = candidates.len(),
-            "no healthy backends during refresh; keeping candidate attachments"
-        );
-        backends = candidates;
-    }
-    sort_backends(&mut backends);
+    backends = normalize_backend_selection(
+        network_id,
+        service_name,
+        candidates,
+        backends,
+        service.health_port.is_some(),
+        "refresh",
+    );
 
     if backends.is_empty() {
-        if let Some((vip, mac)) = compute_service_vip(registry, network_id, service_name, &[])? {
-            let _ = program_service_vip(
-                bpf_lb,
-                bpf,
-                lb_missing,
-                registry,
-                network_id,
-                service_name,
-                vip,
-                mac,
-                &[],
-                service.expose_to_host,
-            )
-            .await;
-        }
-        return Ok(Vec::new());
-    }
-
-    if let Some((vip, mac)) = compute_service_vip(registry, network_id, service_name, &backends)? {
-        let _ = program_service_vip(
+        let _ = sync_service_vip_for_backends(
             bpf_lb,
             bpf,
             lb_missing,
             registry,
             network_id,
             service_name,
-            vip,
-            mac,
-            &backends,
+            &[],
             service.expose_to_host,
         )
-        .await;
+        .await?;
+        return Ok(Vec::new());
+    }
 
+    if let Some((vip, _)) = sync_service_vip_for_backends(
+        bpf_lb,
+        bpf,
+        lb_missing,
+        registry,
+        network_id,
+        service_name,
+        &backends,
+        service.expose_to_host,
+    )
+    .await?
+    {
         if let Some(port) = service.public_port {
             let mut mappings = Vec::new();
             for protocol in service.public_protocols.clone() {
@@ -1734,6 +1745,40 @@ async fn refresh_single_service(
     }
 
     Ok(Vec::new())
+}
+
+/// Compute and synchronize one service VIP for the provided backend set.
+///
+/// Returns the selected VIP and whether dataplane programming succeeded.
+#[allow(clippy::too_many_arguments)]
+async fn sync_service_vip_for_backends(
+    bpf_lb: &BpfLoadBalancer,
+    bpf: &NetworkBpfManager,
+    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
+    registry: &NetworkRegistry,
+    network_id: Uuid,
+    service_name: &str,
+    backends: &[BackendAddress],
+    expose_to_host: bool,
+) -> Result<Option<(Ipv4Addr, bool)>> {
+    let Some((vip, mac)) = compute_service_vip(registry, network_id, service_name, backends)?
+    else {
+        return Ok(None);
+    };
+    let programmed = program_service_vip(
+        bpf_lb,
+        bpf,
+        lb_missing,
+        registry,
+        network_id,
+        service_name,
+        vip,
+        mac,
+        backends,
+        expose_to_host,
+    )
+    .await;
+    Ok(Some((vip, programmed)))
 }
 
 /// Attempt to synchronize VIP metadata into the eBPF maps if they are available, returning whether
