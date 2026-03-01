@@ -579,6 +579,38 @@ mod platform {
         }
     }
 
+    /// Extract a stable interface name from link attributes, falling back to `ifindex<N>`.
+    fn link_name_from_attrs(attributes: &[LinkAttribute], index: u32) -> String {
+        attributes
+            .iter()
+            .find_map(|attr| match attr {
+                LinkAttribute::IfName(name) => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("ifindex{index}"))
+    }
+
+    /// Return true when any address attribute carries the provided IPv4 address.
+    fn address_attrs_contain_ipv4(attributes: &[AddressAttribute], needle: Ipv4Addr) -> bool {
+        attributes.iter().any(|attr| match attr {
+            AddressAttribute::Address(addr) | AddressAttribute::Local(addr) => {
+                matches!(addr, IpAddr::V4(ip) if *ip == needle)
+            }
+            _ => false,
+        })
+    }
+
+    /// Resolve the first IPv4 address found in one netlink address attribute list.
+    fn first_ipv4_from_address_attrs(attributes: &[AddressAttribute]) -> Option<Ipv4Addr> {
+        attributes.iter().find_map(|attr| match attr {
+            AddressAttribute::Address(addr) | AddressAttribute::Local(addr) => match addr {
+                IpAddr::V4(ip) => Some(*ip),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
     /// Find the interface that owns the provided IPv4 address.
     async fn detect_iface_for_ip(node_ip: Ipv4Addr) -> Result<Option<String>> {
         let (conn, handle, _) =
@@ -592,14 +624,7 @@ mod platform {
             .context("enumerate links for nodeport iface lookup")?
         {
             let index = link.header.index;
-            let name = link
-                .attributes
-                .iter()
-                .find_map(|attr| match attr {
-                    LinkAttribute::IfName(name) => Some(name.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| format!("ifindex{index}"));
+            let name = link_name_from_attrs(&link.attributes, index);
 
             let flags = link.header.flags;
             if !flags.contains(LinkFlags::Up) || flags.contains(LinkFlags::Loopback) {
@@ -620,14 +645,8 @@ mod platform {
                 .await
                 .context("enumerate nodeport iface addresses")?
             {
-                for attr in msg.attributes.iter() {
-                    if let AddressAttribute::Address(addr) | AddressAttribute::Local(addr) = attr {
-                        if let IpAddr::V4(ip) = *addr {
-                            if ip == node_ip {
-                                return Ok(Some(name.clone()));
-                            }
-                        }
-                    }
+                if address_attrs_contain_ipv4(&msg.attributes, node_ip) {
+                    return Ok(Some(name.clone()));
                 }
             }
         }
@@ -664,12 +683,8 @@ mod platform {
             .await
             .context("enumerate nodeport interface addresses")?
         {
-            for attr in msg.attributes.iter() {
-                if let AddressAttribute::Address(addr) | AddressAttribute::Local(addr) = attr {
-                    if let IpAddr::V4(ip) = *addr {
-                        return Ok(Some(ip));
-                    }
-                }
+            if let Some(ip) = first_ipv4_from_address_attrs(&msg.attributes) {
+                return Ok(Some(ip));
             }
         }
 
@@ -689,14 +704,7 @@ mod platform {
             .context("enumerate links for nodeport autodetect")?
         {
             let index = link.header.index;
-            let name = link
-                .attributes
-                .iter()
-                .find_map(|attr| match attr {
-                    LinkAttribute::IfName(name) => Some(name.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| format!("ifindex{index}"));
+            let name = link_name_from_attrs(&link.attributes, index);
 
             let flags = link.header.flags;
             if !flags.contains(LinkFlags::Up) || flags.contains(LinkFlags::Loopback) {
@@ -717,12 +725,8 @@ mod platform {
                 .await
                 .context("enumerate nodeport autodetect addresses")?
             {
-                for attr in msg.attributes.iter() {
-                    if let AddressAttribute::Address(addr) | AddressAttribute::Local(addr) = attr {
-                        if let IpAddr::V4(ip) = *addr {
-                            return Ok(Some((name.clone(), ip)));
-                        }
-                    }
+                if let Some(ip) = first_ipv4_from_address_attrs(&msg.attributes) {
+                    return Ok(Some((name.clone(), ip)));
                 }
             }
         }
@@ -816,12 +820,8 @@ mod platform {
             .await
             .context("enumerate host access addresses")?
         {
-            for attr in msg.attributes.iter() {
-                if let AddressAttribute::Address(addr) | AddressAttribute::Local(addr) = attr {
-                    if let IpAddr::V4(ip) = *addr {
-                        return Ok(ip);
-                    }
-                }
+            if let Some(ip) = first_ipv4_from_address_attrs(&msg.attributes) {
+                return Ok(ip);
             }
         }
 
