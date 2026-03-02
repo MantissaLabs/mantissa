@@ -63,13 +63,26 @@ interface Topology {
 
 struct TopologyEvent {
   # A TopologyEvent to be performed on remote peers, it is
-  # gossiped to other nodes to add, remove or update member liveness.
+  # gossiped to other nodes to add/remove peers, update liveness, and
+  # propagate cluster-level metadata updates.
 
   event @0 :EventType;
   # Type of event performed on the topology for a given node.
 
   node @1 :NodeInfo;
   # Node information linked to the action.
+
+  clusterId @2 :ClusterId;
+  # Cluster lineage id used by `clusterNameUpdated`.
+
+  clusterName @3 :Text;
+  # Friendly cluster lineage name carried by `clusterNameUpdated`.
+
+  updatedAtUnixMs @4 :UInt64;
+  # Last-writer timestamp for one `clusterNameUpdated` payload.
+
+  actorNodeId @5 :Node.NodeId;
+  # Actor node id used for deterministic name conflict resolution.
 
   enum EventType {
       # Enumerates actions possible on the topology.
@@ -79,6 +92,7 @@ struct TopologyEvent {
       suspect @2;
       alive @3;
       down @4;
+      clusterNameUpdated @5;
   }
 }
 

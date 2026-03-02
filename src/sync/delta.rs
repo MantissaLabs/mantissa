@@ -2,6 +2,7 @@ use crate::cluster::ClusterViewId;
 use crate::network::types::{NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue};
 use crate::secrets::types::SecretValue;
 use crate::services::types::ServiceSpecValue;
+use crate::store::cluster_view_store::{ClusterNameRecord, ClusterViewDomainStore};
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
 use crate::store::secret_store::SecretStore;
@@ -32,6 +33,7 @@ pub struct SyncStores {
     pub networks: NetworkSpecStore,
     pub network_peers: NetworkPeerStore,
     pub network_attachments: NetworkAttachmentStore,
+    pub cluster_views: ClusterViewDomainStore,
 }
 
 /// Carries one peer-scoped context for anti-entropy diagnostics.
@@ -65,6 +67,7 @@ impl SyncStores {
             Domain::Networks => self.networks.root_hex().await,
             Domain::NetworkPeers => self.network_peers.root_hex().await,
             Domain::NetworkAttachments => self.network_attachments.root_hex().await,
+            Domain::ClusterViews => self.cluster_views.root_hex().await,
         }
     }
 
@@ -77,6 +80,7 @@ impl SyncStores {
             Domain::Networks => self.networks.page_range_summary().await,
             Domain::NetworkPeers => self.network_peers.page_range_summary().await,
             Domain::NetworkAttachments => self.network_attachments.page_range_summary().await,
+            Domain::ClusterViews => self.cluster_views.page_range_summary().await,
         }
     }
 }
@@ -173,6 +177,14 @@ impl delta_sink::Server for DeltaSinkImpl {
                     self.stores.network_attachments.clone(),
                     &chunk,
                     decode_register::<NetworkAttachmentValue>,
+                )
+                .await?
+            }
+            Domain::ClusterViews => {
+                apply_chunk(
+                    self.stores.cluster_views.clone(),
+                    &chunk,
+                    decode_register::<ClusterNameRecord>,
                 )
                 .await?
             }
@@ -317,6 +329,17 @@ impl DeltaStore<NetworkAttachmentValue> for NetworkAttachmentStore {
     }
 }
 
+#[async_trait]
+impl DeltaStore<ClusterNameRecord> for ClusterViewDomainStore {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<ClusterNameRecord, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()> {
+        self.apply_delta_chunk_update_mst(regs, tombs).await
+    }
+}
+
 pub async fn sync_all_domains(
     stores: SyncStores,
     sync_cap: sync::Client,
@@ -332,6 +355,7 @@ pub async fn sync_all_domains(
             Domain::Networks,
             Domain::NetworkPeers,
             Domain::NetworkAttachments,
+            Domain::ClusterViews,
         ];
 
         let mut roots_req = sync_cap.get_roots_for_view_request();

@@ -1,4 +1,5 @@
 use crate::cluster::{ClusterViewId, ClusterViewState};
+use crate::store::cluster_view_store::ClusterViewDomainStore;
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
 use crate::store::secret_store::SecretStore;
@@ -19,7 +20,7 @@ type EncodedRegisters = Vec<EncodedRegister>;
 type EncodedTombstone = (Vec<u8>, u64);
 type EncodedTombstones = Vec<EncodedTombstone>;
 
-const ALL_DOMAINS: [Domain; 7] = [
+const ALL_DOMAINS: [Domain; 8] = [
     Domain::Peers,
     Domain::Tasks,
     Domain::Services,
@@ -27,6 +28,7 @@ const ALL_DOMAINS: [Domain; 7] = [
     Domain::Networks,
     Domain::NetworkPeers,
     Domain::NetworkAttachments,
+    Domain::ClusterViews,
 ];
 
 // Default chunk size used when streaming delta from server to client.
@@ -53,6 +55,7 @@ pub struct SyncService {
     networks: NetworkSpecStore,
     network_peers: NetworkPeerStore,
     network_attachments: NetworkAttachmentStore,
+    cluster_views: ClusterViewDomainStore,
 }
 
 impl SyncService {
@@ -66,6 +69,7 @@ impl SyncService {
         networks: NetworkSpecStore,
         network_peers: NetworkPeerStore,
         network_attachments: NetworkAttachmentStore,
+        cluster_views: ClusterViewDomainStore,
     ) -> Self {
         Self {
             cluster_view,
@@ -76,6 +80,7 @@ impl SyncService {
             networks,
             network_peers,
             network_attachments,
+            cluster_views,
         }
     }
 
@@ -109,6 +114,7 @@ impl SyncService {
             Domain::NetworkAttachments => {
                 DomainStoreRef::NetworkAttachments(&self.network_attachments)
             }
+            Domain::ClusterViews => DomainStoreRef::ClusterViews(&self.cluster_views),
         }
     }
 }
@@ -122,6 +128,7 @@ enum DomainStoreRef<'a> {
     Networks(&'a NetworkSpecStore),
     NetworkPeers(&'a NetworkPeerStore),
     NetworkAttachments(&'a NetworkAttachmentStore),
+    ClusterViews(&'a ClusterViewDomainStore),
 }
 
 macro_rules! with_domain_store {
@@ -134,6 +141,7 @@ macro_rules! with_domain_store {
             DomainStoreRef::Networks($store) => $body,
             DomainStoreRef::NetworkPeers($store) => $body,
             DomainStoreRef::NetworkAttachments($store) => $body,
+            DomainStoreRef::ClusterViews($store) => $body,
         }
     };
 }
@@ -149,6 +157,7 @@ impl DomainStoreRef<'_> {
             Self::Networks(_) => Domain::Networks,
             Self::NetworkPeers(_) => Domain::NetworkPeers,
             Self::NetworkAttachments(_) => Domain::NetworkAttachments,
+            Self::ClusterViews(_) => Domain::ClusterViews,
         }
     }
 
@@ -162,6 +171,7 @@ impl DomainStoreRef<'_> {
             Self::Networks(_) => "networks",
             Self::NetworkPeers(_) => "network peers",
             Self::NetworkAttachments(_) => "network attachments",
+            Self::ClusterViews(_) => "cluster views",
         }
     }
 
@@ -175,6 +185,7 @@ impl DomainStoreRef<'_> {
             Self::Networks(_) => "server.before.get_ranges.networks",
             Self::NetworkPeers(_) => "server.before.get_ranges.network_peers",
             Self::NetworkAttachments(_) => "server.before.get_ranges.network_attachments",
+            Self::ClusterViews(_) => "server.before.get_ranges.cluster_views",
         }
     }
 
@@ -188,6 +199,7 @@ impl DomainStoreRef<'_> {
             Self::Networks(_) => "server.before.open_delta.networks",
             Self::NetworkPeers(_) => "server.before.open_delta.network_peers",
             Self::NetworkAttachments(_) => "server.before.open_delta.network_attachments",
+            Self::ClusterViews(_) => "server.before.open_delta.cluster_views",
         }
     }
 

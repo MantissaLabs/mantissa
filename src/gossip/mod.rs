@@ -896,6 +896,7 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
             | TopologyEvent::Alive { id, .. }
             | TopologyEvent::Suspect { id, .. }
             | TopologyEvent::Down { id, .. } => *id == peer_id,
+            TopologyEvent::ClusterNameUpdated { .. } => false,
         },
         // Task updates replicate to every peer regardless of assignment so keep them.
         Message::Task { .. } => false,

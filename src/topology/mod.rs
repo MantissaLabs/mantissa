@@ -8,7 +8,7 @@ use crate::node::id::set_node_id;
 use crate::registry::Registry;
 use crate::secrets::crypto::SecretKeyring;
 use crate::store::cluster_operation_store::ClusterOperationStore;
-use crate::store::cluster_view_store::ClusterViewStore;
+use crate::store::cluster_view_store::{ClusterNameRecord, ClusterViewStore};
 use crate::store::local_credential_store::LocalCredentialStore;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
@@ -436,23 +436,6 @@ impl Topology {
             active_view = %topology.active_cluster_view(),
             "initialized topology with active cluster view"
         );
-
-        match topology.hydrate_cluster_names_from_operations() {
-            Ok(hydrated) if hydrated > 0 => {
-                info!(
-                    target: "cluster_view",
-                    hydrated,
-                    "rehydrated cluster lineage names from durable operation history"
-                );
-            }
-            Ok(_) => {}
-            Err(err) => {
-                warn!(
-                    target: "cluster_view",
-                    "failed to hydrate cluster lineage names from operation history: {err}"
-                );
-            }
-        }
 
         Ok(topology)
     }
@@ -888,6 +871,41 @@ impl Topology {
                         TopologyEvent::Down { id, incarnation } => {
                             self.handle_down_event(id, incarnation).await;
                         }
+
+                        TopologyEvent::ClusterNameUpdated {
+                            cluster_id,
+                            ref name,
+                            updated_at_unix_ms,
+                            actor_node_id,
+                        } => {
+                            let trimmed = name.trim();
+                            if trimmed.is_empty() {
+                                warn!(
+                                    target: "cluster_view",
+                                    cluster_id = %cluster_id,
+                                    actor_node_id = %actor_node_id,
+                                    "ignoring empty cluster name gossip update"
+                                );
+                                continue;
+                            }
+
+                            let record = ClusterNameRecord {
+                                name: trimmed.to_string(),
+                                updated_at_unix_ms,
+                                actor_node_id,
+                            };
+                            if let Err(err) =
+                                self.upsert_cluster_name_record(cluster_id, &record).await
+                            {
+                                warn!(
+                                    target: "cluster_view",
+                                    cluster_id = %cluster_id,
+                                    actor_node_id = %actor_node_id,
+                                    "failed to apply gossiped cluster name update: {err}"
+                                );
+                                continue;
+                            }
+                        }
                     }
 
                     let event_clone = match event.clone() {
@@ -1163,6 +1181,7 @@ impl Topology {
             networks: self.networks.clone(),
             network_peers: self.network_peers.clone(),
             network_attachments: self.network_attachments.clone(),
+            cluster_views: self.cluster_view_store.cluster_view_domain_store(),
         };
 
         let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic");

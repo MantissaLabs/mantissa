@@ -23,6 +23,9 @@ enum Domain {
 
   networkAttachments @6;
   # Network attachment registry domain.
+
+  clusterViews @7;
+  # Cluster view lineage metadata domain (names, future view-scoped metadata).
 }
 
 struct PageRange {

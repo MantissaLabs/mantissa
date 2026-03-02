@@ -4,6 +4,7 @@ use std::fmt;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
+use crate::cluster::ClusterId;
 use crate::topology::peers::WireGuardPeerValue;
 
 #[derive(Clone)]
@@ -66,5 +67,11 @@ pub enum TopologyEvent {
     Down {
         id: Uuid,
         incarnation: u64,
+    },
+    ClusterNameUpdated {
+        cluster_id: ClusterId,
+        name: String,
+        updated_at_unix_ms: u64,
+        actor_node_id: Uuid,
     },
 }

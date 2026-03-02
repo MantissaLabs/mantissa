@@ -209,7 +209,7 @@ impl Topology {
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
-        self.persist_cluster_operation(operation)?;
+        self.persist_cluster_operation(operation).await?;
         if !operation.dry_run {
             let _ = self.broadcast_cluster_operation(operation).await?;
         }
@@ -242,7 +242,7 @@ impl Topology {
                 current
             }
             _ => {
-                self.persist_cluster_operation(&incoming)?;
+                self.persist_cluster_operation(&incoming).await?;
                 incoming
             }
         };

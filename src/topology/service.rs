@@ -694,7 +694,7 @@ impl Topology {
     }
 
     /// Applies one local cluster lineage name update with deterministic last-writer conflict resolution.
-    fn apply_cluster_name_update(
+    async fn apply_cluster_name_update(
         &self,
         cluster_id: ClusterId,
         name: &str,
@@ -713,75 +713,7 @@ impl Topology {
             updated_at_unix_ms,
             actor_node_id,
         };
-        self.upsert_cluster_name_record(cluster_id, &record)
-    }
-
-    /// Best-effort relay of one cluster lineage name update to known peers.
-    async fn broadcast_cluster_name_update(
-        &self,
-        cluster_id: ClusterId,
-        name: &str,
-        updated_at_unix_ms: u64,
-        actor_node_id: Uuid,
-    ) -> Result<usize, capnp::Error> {
-        let snapshot = match self.peer_snapshot().await {
-            Some(snapshot) => snapshot,
-            None => return Ok(0),
-        };
-
-        let mut relayed = 0usize;
-        for entry in snapshot.entries.iter() {
-            let peer_id = entry.peer_id;
-            if peer_id == self.node.id {
-                continue;
-            }
-
-            let Some(session) = self.registry.session_for_peer_unscoped(peer_id).await else {
-                continue;
-            };
-
-            let topology = session
-                .get_topology_request()
-                .send()
-                .pipeline
-                .get_topology();
-            let mut relay = topology.submit_cluster_name_request();
-            {
-                let mut request = relay.get();
-                request
-                    .reborrow()
-                    .init_cluster_id()
-                    .set_value(cluster_id.as_bytes());
-                request.set_name(name);
-                request.set_updated_at_unix_ms(updated_at_unix_ms);
-                set_node_id(request.reborrow().init_actor_node_id(), &actor_node_id);
-            }
-
-            match relay.send().promise.await {
-                Ok(_) => {
-                    relayed = relayed.saturating_add(1);
-                }
-                Err(err) => {
-                    warn!(
-                        target: "cluster_view",
-                        peer_id = %peer_id,
-                        cluster_id = %cluster_id,
-                        "failed to relay cluster name update: {err}"
-                    );
-                }
-            }
-        }
-
-        if relayed > 0 {
-            info!(
-                target: "cluster_view",
-                cluster_id = %cluster_id,
-                relayed,
-                "relayed cluster name update to peers"
-            );
-        }
-
-        Ok(relayed)
+        self.upsert_cluster_name_record(cluster_id, &record).await
     }
 
     /// Best-effort relay of one operation record to peers in the operation's relay scope.
@@ -970,6 +902,7 @@ impl topology::Server for Topology {
             networks: self.networks.clone(),
             network_peers: self.network_peers.clone(),
             network_attachments: self.network_attachments.clone(),
+            cluster_views: self.cluster_view_store.cluster_view_domain_store(),
         };
 
         let sync_trace = SyncTraceContext::peer(peer_id, peer_value.address.clone(), "join");
@@ -1182,7 +1115,7 @@ impl topology::Server for Topology {
         Ok(())
     }
 
-    /// Persists a friendly cluster lineage name locally, then relays the update payload to peers.
+    /// Persists one friendly cluster lineage name locally, then gossips the update to peers.
     async fn set_cluster_name(
         self: Rc<Self>,
         params: topology::SetClusterNameParams,
@@ -1193,11 +1126,20 @@ impl topology::Server for Topology {
         let name = request.get_name()?.to_string()?;
         let updated_at_unix_ms = Self::now_unix_ms();
         let actor_node_id = self.node.id;
-        let _ =
-            self.apply_cluster_name_update(cluster_id, &name, updated_at_unix_ms, actor_node_id)?;
-        let _ = self
-            .broadcast_cluster_name_update(cluster_id, &name, updated_at_unix_ms, actor_node_id)
+        let changed = self
+            .apply_cluster_name_update(cluster_id, &name, updated_at_unix_ms, actor_node_id)
             .await?;
+        if !changed {
+            return Ok(());
+        }
+
+        self.gossip_topology_event(TopologyEvent::ClusterNameUpdated {
+            cluster_id,
+            name: name.trim().to_string(),
+            updated_at_unix_ms,
+            actor_node_id,
+        })
+        .await?;
         Ok(())
     }
 
@@ -1212,8 +1154,9 @@ impl topology::Server for Topology {
         let name = request.get_name()?.to_string()?;
         let updated_at_unix_ms = request.get_updated_at_unix_ms();
         let actor_node_id = read_node_id(request.get_actor_node_id()?)?;
-        let _ =
-            self.apply_cluster_name_update(cluster_id, &name, updated_at_unix_ms, actor_node_id)?;
+        let _ = self
+            .apply_cluster_name_update(cluster_id, &name, updated_at_unix_ms, actor_node_id)
+            .await?;
         Ok(())
     }
 
@@ -1488,13 +1431,29 @@ fn verifying_key_from_data(d: data::Reader<'_>) -> Result<VerifyingKey, capnp::E
     VerifyingKey::from_bytes(&arr).map_err(|e| capnp::Error::failed(e.to_string()))
 }
 
+fn cluster_id_from_topology_event(
+    reader: protocol::topology::cluster_id::Reader<'_>,
+) -> Result<ClusterId, capnp::Error> {
+    let value = reader.get_value()?;
+    if value.len() != 16 {
+        return Err(capnp::Error::failed(format!(
+            "cluster id must be exactly 16 bytes, got {}",
+            value.len()
+        )));
+    }
+
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(value);
+    Ok(ClusterId::from_bytes(bytes))
+}
+
 pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEvent, capnp::Error> {
     use topology_event::EventType;
 
-    let node = reader.get_node()?;
-    let id = read_node_id(node.get_id()?)?;
     let event = match reader.get_event()? {
         EventType::Add => {
+            let node = reader.get_node()?;
+            let id = read_node_id(node.get_id()?)?;
             let pubkey =
                 pubkey_from_slice(node.get_public_key()?).expect("Failed to parse public key");
             let signing_pub = verifying_key_from_data(node.get_signing_key()?)?;
@@ -1546,18 +1505,40 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 wireguard,
             }
         }
-        EventType::Remove => TopologyEvent::Leave { id },
-        EventType::Alive => TopologyEvent::Alive {
-            id,
-            incarnation: node.get_incarnation(),
-        },
-        EventType::Suspect => TopologyEvent::Suspect {
-            id,
-            incarnation: node.get_incarnation(),
-        },
-        EventType::Down => TopologyEvent::Down {
-            id,
-            incarnation: node.get_incarnation(),
+        EventType::Remove => {
+            let node = reader.get_node()?;
+            let id = read_node_id(node.get_id()?)?;
+            TopologyEvent::Leave { id }
+        }
+        EventType::Alive => {
+            let node = reader.get_node()?;
+            let id = read_node_id(node.get_id()?)?;
+            TopologyEvent::Alive {
+                id,
+                incarnation: node.get_incarnation(),
+            }
+        }
+        EventType::Suspect => {
+            let node = reader.get_node()?;
+            let id = read_node_id(node.get_id()?)?;
+            TopologyEvent::Suspect {
+                id,
+                incarnation: node.get_incarnation(),
+            }
+        }
+        EventType::Down => {
+            let node = reader.get_node()?;
+            let id = read_node_id(node.get_id()?)?;
+            TopologyEvent::Down {
+                id,
+                incarnation: node.get_incarnation(),
+            }
+        }
+        EventType::ClusterNameUpdated => TopologyEvent::ClusterNameUpdated {
+            cluster_id: cluster_id_from_topology_event(reader.get_cluster_id()?)?,
+            name: reader.get_cluster_name()?.to_string()?,
+            updated_at_unix_ms: reader.get_updated_at_unix_ms(),
+            actor_node_id: read_node_id(reader.get_actor_node_id()?)?,
         },
     };
 
@@ -1646,6 +1627,22 @@ pub fn add_event(
             set_node_id(node.reborrow().init_id(), id);
             cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
             node.set_incarnation(*incarnation);
+        }
+
+        TopologyEvent::ClusterNameUpdated {
+            cluster_id,
+            name,
+            updated_at_unix_ms,
+            actor_node_id,
+        } => {
+            let mut topo = msg.init_topology();
+            topo.set_event(topology_event::EventType::ClusterNameUpdated);
+            topo.reborrow()
+                .init_cluster_id()
+                .set_value(cluster_id.as_bytes());
+            topo.set_cluster_name(name);
+            topo.set_updated_at_unix_ms(*updated_at_unix_ms);
+            set_node_id(topo.init_actor_node_id(), actor_node_id);
         }
     }
 }

@@ -12,18 +12,19 @@ use uuid::Uuid;
 
 impl Topology {
     /// Applies one conflict-resolved cluster lineage name update into durable cluster-view storage.
-    pub(super) fn upsert_cluster_name_record(
+    pub(crate) async fn upsert_cluster_name_record(
         &self,
         cluster_id: ClusterId,
         record: &ClusterNameRecord,
     ) -> Result<bool, capnp::Error> {
         self.cluster_view_store
             .upsert_cluster_name(cluster_id, record)
+            .await
             .map_err(|err| capnp::Error::failed(err.to_string()))
     }
 
     /// Persists split target names carried by one operation record so cluster lineage labels survive restarts.
-    fn persist_operation_cluster_name_hints(
+    async fn persist_operation_cluster_name_hints(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
@@ -52,14 +53,18 @@ impl Topology {
                 updated_at_unix_ms,
                 actor_node_id: operation.id,
             };
-            let _ = self.upsert_cluster_name_record(target_view.cluster_id, &record)?;
+            let _ = self
+                .upsert_cluster_name_record(target_view.cluster_id, &record)
+                .await?;
         }
 
         Ok(())
     }
 
     /// Rehydrates missing cluster lineage names from durable operation history during startup and upgrades.
-    pub(crate) fn hydrate_cluster_names_from_operations(&self) -> Result<usize, capnp::Error> {
+    pub(crate) async fn hydrate_cluster_names_from_operations(
+        &self,
+    ) -> Result<usize, capnp::Error> {
         let operations = self.load_cluster_operations()?;
         let mut hydrated = 0usize;
         for operation in operations {
@@ -90,7 +95,10 @@ impl Topology {
                     updated_at_unix_ms,
                     actor_node_id: operation.id,
                 };
-                if self.upsert_cluster_name_record(target_view.cluster_id, &record)? {
+                if self
+                    .upsert_cluster_name_record(target_view.cluster_id, &record)
+                    .await?
+                {
                     hydrated = hydrated.saturating_add(1);
                 }
             }
@@ -259,7 +267,7 @@ impl Topology {
     }
 
     /// Persists a cluster operation record in the local durable operation store.
-    pub(super) fn persist_cluster_operation(
+    pub(super) async fn persist_cluster_operation(
         &self,
         op: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
@@ -268,7 +276,7 @@ impl Topology {
             .put(op.id, &encoded)
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         if !op.dry_run {
-            self.persist_operation_cluster_name_hints(op)?;
+            self.persist_operation_cluster_name_hints(op).await?;
         }
         Ok(())
     }
@@ -338,7 +346,7 @@ impl Topology {
     }
 
     /// Updates an operation stage, appends stage details, and persists the updated record.
-    fn update_cluster_operation_stage(
+    async fn update_cluster_operation_stage(
         &self,
         operation: &mut ClusterOperationRecord,
         stage: ClusterOperationStage,
@@ -349,7 +357,7 @@ impl Topology {
         if !detail.is_empty() {
             operation.details = format!("{} | {}", operation.details, detail);
         }
-        self.persist_cluster_operation(operation)
+        self.persist_cluster_operation(operation).await
     }
 
     /// Removes old terminal operations so the durable operation table stays bounded over long runtimes.
@@ -462,7 +470,8 @@ impl Topology {
                     &mut operation,
                     ClusterOperationStage::Prepared,
                     "prepared",
-                )?;
+                )
+                .await?;
                 if let Err(err) = self
                     .apply_committed_operation_side_effects(&operation)
                     .await
@@ -472,7 +481,8 @@ impl Topology {
                             &mut operation,
                             ClusterOperationStage::Aborted,
                             &format!("aborted stale_precondition: {err}"),
-                        )?;
+                        )
+                        .await?;
                         warn!(
                             target: "cluster_view",
                             operation_id = %operation.id,
@@ -487,12 +497,14 @@ impl Topology {
                         &mut operation,
                         ClusterOperationStage::Committed,
                         &format!("committed active_view={}", self.active_cluster_view()),
-                    )?;
+                    )
+                    .await?;
                     self.update_cluster_operation_stage(
                         &mut operation,
                         ClusterOperationStage::Finalized,
                         "finalized",
-                    )?;
+                    )
+                    .await?;
                 }
             }
             ClusterOperationStage::Prepared => {
@@ -505,7 +517,8 @@ impl Topology {
                             &mut operation,
                             ClusterOperationStage::Aborted,
                             &format!("aborted stale_precondition: {err}"),
-                        )?;
+                        )
+                        .await?;
                         warn!(
                             target: "cluster_view",
                             operation_id = %operation.id,
@@ -520,12 +533,14 @@ impl Topology {
                         &mut operation,
                         ClusterOperationStage::Committed,
                         &format!("committed active_view={}", self.active_cluster_view()),
-                    )?;
+                    )
+                    .await?;
                     self.update_cluster_operation_stage(
                         &mut operation,
                         ClusterOperationStage::Finalized,
                         "finalized",
-                    )?;
+                    )
+                    .await?;
                 }
             }
             ClusterOperationStage::Committed => {
@@ -533,7 +548,8 @@ impl Topology {
                     &mut operation,
                     ClusterOperationStage::Finalized,
                     "finalized",
-                )?;
+                )
+                .await?;
             }
             ClusterOperationStage::Finalized | ClusterOperationStage::Aborted => {}
         }

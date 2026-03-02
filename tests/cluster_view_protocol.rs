@@ -99,7 +99,7 @@ local_test!(cluster_view_protocol_strict_inproc, {
         .expect("roots");
     assert_eq!(
         roots.len(),
-        7,
+        8,
         "view-scoped roots should expose all domains"
     );
 
@@ -156,7 +156,7 @@ local_test!(cluster_view_protocol_strict_inproc, {
         .expect("ranges");
     assert_eq!(
         ranges.len(),
-        7,
+        8,
         "view-scoped ranges should expose all domains when none requested"
     );
 
@@ -971,7 +971,8 @@ local_test!(cluster_view_startup_restores_persisted_active_view, {
     let db_path = temp_dir.path().join("state.redb");
     let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
     let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
-    let view_store = ClusterViewStore::new(db.clone()).expect("open cluster view store");
+    let view_store =
+        ClusterViewStore::new(db.clone(), Uuid::new_v4()).expect("open cluster view store");
 
     let source_view = ClusterViewId::legacy_default();
     let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 17);
@@ -1036,9 +1037,8 @@ local_test!(cluster_view_startup_restores_persisted_split_view, {
     let db_path = temp_dir.path().join("state.redb");
     let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
     let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
-    let view_store = ClusterViewStore::new(db.clone()).expect("open cluster view store");
-
     let node_id = Uuid::new_v4();
+    let view_store = ClusterViewStore::new(db.clone(), node_id).expect("open cluster view store");
     let source_view = ClusterViewId::legacy_default();
     let split_target_a = ClusterViewId::new(
         mantissa::cluster::ClusterId::from_uuid(Uuid::new_v4()),
@@ -1116,7 +1116,8 @@ local_test!(
         let db_path = temp_dir.path().join("state.redb");
         let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
         let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
-        let view_store = ClusterViewStore::new(db.clone()).expect("open cluster view store");
+        let view_store =
+            ClusterViewStore::new(db.clone(), Uuid::new_v4()).expect("open cluster view store");
 
         let source_view = ClusterViewId::legacy_default();
         view_store
@@ -1352,7 +1353,7 @@ local_test!(cluster_view_lists_local_active_row, {
     );
 });
 
-// Validates manual cluster naming is replicated to joined peers through topology relay.
+// Validates manual cluster naming is replicated to joined peers through topology gossip.
 local_test!(cluster_view_name_updates_relay_to_peers, {
     let anchor = TestNode::new_tcp_with_tick_ms(100).await;
     let joiner = TestNode::new_tcp_with_tick_ms(100).await;
@@ -1390,6 +1391,91 @@ local_test!(cluster_view_name_updates_relay_to_peers, {
         assert!(
             tokio::time::Instant::now() < deadline,
             "cluster name update did not converge to all peers"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+});
+
+// Validates name updates spread quickly through gossip even when periodic sync is very slow.
+local_test!(cluster_view_name_updates_gossip_without_sync_assist, {
+    let anchor = TestNode::new_tcp_with_tick_ms(60_000).await;
+    let joiner = TestNode::new_tcp_with_tick_ms(60_000).await;
+    joiner.join(&anchor).await.expect("join");
+    anchor
+        .assert_cluster_size(2, "cluster size after join")
+        .await;
+
+    let source_view = current_cluster_view(&anchor.topology()).await;
+    let lineage_id = source_view.cluster_id.to_uuid();
+
+    let mut rename_req = anchor.topology().set_cluster_name_request();
+    rename_req
+        .get()
+        .reborrow()
+        .init_cluster_id()
+        .set_value(source_view.cluster_id.as_bytes());
+    rename_req.get().set_name("gossip-only");
+    rename_req
+        .send()
+        .promise
+        .await
+        .expect("setClusterName send");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let joiner_name = cluster_name_for_lineage(&joiner.topology(), lineage_id).await;
+        if joiner_name.as_deref() == Some("gossip-only") {
+            break;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cluster name gossip convergence did not complete before sync fallback"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+});
+
+// Validates cluster lineage names converge through sync anti-entropy even without relay broadcast.
+local_test!(cluster_view_name_updates_converge_via_sync_domain, {
+    let anchor = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner = TestNode::new_tcp_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join");
+    anchor
+        .assert_cluster_size(2, "cluster size after join")
+        .await;
+
+    let source_view = current_cluster_view(&anchor.topology()).await;
+    let lineage_id = source_view.cluster_id.to_uuid();
+
+    let mut submit_req = anchor.topology().submit_cluster_name_request();
+    submit_req
+        .get()
+        .reborrow()
+        .init_cluster_id()
+        .set_value(source_view.cluster_id.as_bytes());
+    submit_req.get().set_name("sync-only");
+    submit_req.get().set_updated_at_unix_ms(42);
+    set_node_id(submit_req.get().init_actor_node_id(), &Uuid::new_v4());
+    submit_req
+        .send()
+        .promise
+        .await
+        .expect("submitClusterName send");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let anchor_name = cluster_name_for_lineage(&anchor.topology(), lineage_id).await;
+        let joiner_name = cluster_name_for_lineage(&joiner.topology(), lineage_id).await;
+        if anchor_name.as_deref() == Some("sync-only")
+            && joiner_name.as_deref() == Some("sync-only")
+        {
+            break;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cluster name sync-domain convergence did not complete"
         );
         sleep(Duration::from_millis(100)).await;
     }

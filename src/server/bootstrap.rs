@@ -258,7 +258,8 @@ impl Bootstrap {
         let peers: PeersStore = open_peers_store(ctx.db.clone(), ctx.self_id)?;
         peers.rebuild_mst_from_disk().await?;
         let cluster_operations = ClusterOperationStore::new(ctx.db.clone())?;
-        let cluster_view = ClusterViewStore::new(ctx.db.clone())?;
+        let cluster_view = ClusterViewStore::new(ctx.db.clone(), ctx.self_id)?;
+        cluster_view.rebuild_cluster_view_domain_mst().await?;
 
         // Server-side session ticket store (anchor issues)
         let session_auth = crate::server::auth::AuthStore::new(ctx.db.clone())?;
@@ -442,6 +443,23 @@ impl Bootstrap {
             runtime_health,
         })?;
 
+        match topology.hydrate_cluster_names_from_operations().await {
+            Ok(hydrated) if hydrated > 0 => {
+                info!(
+                    target: "cluster_view",
+                    hydrated,
+                    "rehydrated cluster lineage names from durable operation history"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    target: "cluster_view",
+                    "failed to hydrate cluster lineage names from operation history: {err}"
+                );
+            }
+        }
+
         let replayed = topology.replay_cluster_operations_on_startup().await?;
         if replayed > 0 {
             info!(
@@ -463,6 +481,7 @@ impl Bootstrap {
             stores.networks.clone(),
             stores.network_peers.clone(),
             stores.network_attachments.clone(),
+            stores.cluster_view.cluster_view_domain_store(),
         );
         let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
 
