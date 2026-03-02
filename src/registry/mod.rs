@@ -727,6 +727,72 @@ impl Registry {
         }
     }
 
+    /// Resolves the Sync capability while bypassing split exclusion scope and view filtering.
+    ///
+    /// Returns both the capability and the peer's currently active cluster view so callers can
+    /// perform unscoped metadata anti-entropy against the peer-selected view.
+    pub async fn fetch_sync_capability_unscoped(
+        &self,
+        peer_id: Uuid,
+    ) -> Result<Option<(sync::Client, ClusterViewId)>, capnp::Error> {
+        let entry = self.ensure_entry(peer_id).await;
+
+        if let Some(sync_cap) = {
+            let state = entry.lock().await;
+            state.sync.clone()
+        } {
+            let cached_session = {
+                let state = entry.lock().await;
+                state.session.clone()
+            };
+            if let Some(session) = cached_session {
+                match Self::session_cluster_view(&session).await {
+                    Ok(peer_view) => return Ok(Some((sync_cap, peer_view))),
+                    Err(_) => {
+                        self.invalidate_peer(peer_id, &entry).await;
+                    }
+                }
+            }
+        }
+
+        let Some(session) = self
+            .ensure_session_scoped(peer_id, &entry, SessionStrategy::TicketThenCredential, true)
+            .await
+        else {
+            return Ok(None);
+        };
+
+        let peer_view = match Self::session_cluster_view(&session).await {
+            Ok(view) => view,
+            Err(err) => {
+                self.invalidate_peer(peer_id, &entry).await;
+                debug!(
+                    target: "sync",
+                    peer = %peer_id,
+                    "session_cluster_view (unscoped) failed, deferring retry: {err}"
+                );
+                return Ok(None);
+            }
+        };
+
+        match Self::fetch_sync_from_session(&session).await {
+            Ok(sync_cap) => {
+                let mut state = entry.lock().await;
+                state.sync = Some(sync_cap.clone());
+                Ok(Some((sync_cap, peer_view)))
+            }
+            Err(err) => {
+                self.invalidate_peer(peer_id, &entry).await;
+                debug!(
+                    target: "sync",
+                    peer = %peer_id,
+                    "fetch_sync_from_session (unscoped) failed, deferring retry: {err}"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     pub async fn fetch_health_capability(
         &self,
         peer_id: Uuid,
@@ -853,6 +919,48 @@ impl Registry {
                     target: "gossip",
                     peer = %peer_id,
                     "fetch_gossip_from_session failed, deferring retry: {err}"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Resolves a gossip capability while bypassing active-view session checks.
+    ///
+    /// This is reserved for low-rate global metadata dissemination that must cross
+    /// split view boundaries (for example cluster lineage name updates).
+    pub async fn gossip_client_for_unscoped(
+        &self,
+        peer_id: Uuid,
+    ) -> Result<Option<GossipClient>, capnp::Error> {
+        let entry = self.ensure_entry(peer_id).await;
+
+        if let Some(gossip_cap) = {
+            let state = entry.lock().await;
+            state.gossip.clone()
+        } {
+            return Ok(Some(gossip_cap));
+        }
+
+        let Some(session) = self
+            .ensure_session_scoped(peer_id, &entry, SessionStrategy::TicketThenCredential, true)
+            .await
+        else {
+            return Ok(None);
+        };
+
+        match Self::fetch_gossip_from_session(&session).await {
+            Ok(gossip_cap) => {
+                let mut state = entry.lock().await;
+                state.gossip = Some(gossip_cap.clone());
+                Ok(Some(gossip_cap))
+            }
+            Err(err) => {
+                self.invalidate_peer(peer_id, &entry).await;
+                debug!(
+                    target: "gossip",
+                    peer = %peer_id,
+                    "fetch_gossip_from_session (unscoped) failed, deferring retry: {err}"
                 );
                 Ok(None)
             }
@@ -1058,14 +1166,20 @@ impl Registry {
     }
 
     /// Returns whether the provided session is scoped to `expected_view`.
+    async fn session_cluster_view(
+        session: &cluster_session::Client,
+    ) -> Result<ClusterViewId, capnp::Error> {
+        let req = session.get_cluster_view_request();
+        let resp = req.send().promise.await?;
+        ClusterViewId::from_capnp(resp.get()?.get_view()?).map_err(capnp::Error::failed)
+    }
+
+    /// Returns whether the provided session is scoped to `expected_view`.
     async fn session_matches_view(
         session: &cluster_session::Client,
         expected_view: ClusterViewId,
     ) -> Result<bool, capnp::Error> {
-        let req = session.get_cluster_view_request();
-        let resp = req.send().promise.await?;
-        let actual_view =
-            ClusterViewId::from_capnp(resp.get()?.get_view()?).map_err(capnp::Error::failed)?;
+        let actual_view = Self::session_cluster_view(session).await?;
         Ok(actual_view == expected_view)
     }
 

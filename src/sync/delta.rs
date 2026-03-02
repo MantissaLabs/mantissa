@@ -23,6 +23,16 @@ use tracing::{debug, warn};
 
 type RegisterDelta<V> = Vec<(UuidKey, MVReg<V, uuid::Uuid>)>;
 type TombstoneDelta = Vec<(UuidKey, u64)>;
+const ALL_SYNC_DOMAINS: [Domain; 8] = [
+    Domain::Peers,
+    Domain::Tasks,
+    Domain::Services,
+    Domain::Secrets,
+    Domain::Networks,
+    Domain::NetworkPeers,
+    Domain::NetworkAttachments,
+    Domain::ClusterViews,
+];
 
 #[derive(Clone)]
 pub struct SyncStores {
@@ -340,24 +350,37 @@ impl DeltaStore<ClusterNameRecord> for ClusterViewDomainStore {
     }
 }
 
+/// # Description:
+///
+/// Runs anti-entropy for all registered replication domains against one peer.
 pub async fn sync_all_domains(
     stores: SyncStores,
     sync_cap: sync::Client,
     cluster_view: ClusterViewId,
     trace: Option<SyncTraceContext>,
 ) {
-    let res: Result<(), capnp::Error> = async {
-        let domains = [
-            Domain::Peers,
-            Domain::Tasks,
-            Domain::Services,
-            Domain::Secrets,
-            Domain::Networks,
-            Domain::NetworkPeers,
-            Domain::NetworkAttachments,
-            Domain::ClusterViews,
-        ];
+    sync_selected_domains(stores, sync_cap, cluster_view, &ALL_SYNC_DOMAINS, trace).await;
+}
 
+/// # Description:
+///
+/// Runs anti-entropy for one caller-selected domain subset against one peer view.
+///
+/// This is used by the global metadata loop to sync only `cluster_views` across split
+/// boundaries while keeping heavy domains view-scoped.
+pub async fn sync_selected_domains(
+    stores: SyncStores,
+    sync_cap: sync::Client,
+    cluster_view: ClusterViewId,
+    domains: &[Domain],
+    trace: Option<SyncTraceContext>,
+) {
+    if domains.is_empty() {
+        return;
+    }
+
+    let requested_domains = domains.to_vec();
+    let res: Result<(), capnp::Error> = async {
         let mut roots_req = sync_cap.get_roots_for_view_request();
         {
             let mut req = roots_req.get().init_req();
@@ -384,11 +407,11 @@ pub async fn sync_all_domains(
         }
 
         let mut domains_to_sync = Vec::new();
-        for domain in domains.iter() {
+        for domain in &requested_domains {
             let local_root = stores.root_hex(*domain).await;
             let remote_root = remote_roots
                 .iter()
-                .find(|(d, _)| *d == *domain)
+                .find(|(candidate, _)| candidate == domain)
                 .map(|(_, hex)| hex.clone())
                 .unwrap_or_default();
             if remote_root != local_root {
@@ -458,8 +481,9 @@ pub async fn sync_all_domains(
         debug!(
             target: "sync",
             cluster_view = %cluster_view,
-            domains = ?domains_wants.len(),
-            "opening multi-domain delta stream"
+            domains_requested = requested_domains.len(),
+            domains_with_delta = domains_wants.len(),
+            "opening selective delta stream"
         );
         od.send().promise.await?;
         Ok(())
@@ -470,7 +494,8 @@ pub async fn sync_all_domains(
         warn!(
             target: "sync",
             cluster_view = %cluster_view,
-            "sync_all_domains error: {e}"
+            domains_requested = requested_domains.len(),
+            "sync_selected_domains error: {e}"
         );
         if let Some(ctx) = trace.as_ref() {
             warn!(
@@ -481,7 +506,7 @@ pub async fn sync_all_domains(
                 reason = %ctx.reason,
                 disconnected = is_disconnected_capnp(&e),
                 error = %e,
-                "peer-scoped sync_all_domains failure"
+                "peer-scoped sync_selected_domains failure"
             );
         }
     }

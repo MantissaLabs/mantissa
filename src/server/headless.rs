@@ -38,6 +38,8 @@ pub struct HeadlessConfig {
     pub transport: HeadlessTransport,
     pub sync_tick: Option<Duration>,
     pub sync_fanout: Option<usize>,
+    pub global_metadata_sync_tick: Option<Duration>,
+    pub global_metadata_sync_fanout: Option<usize>,
     pub gossip_tick: Option<Duration>,
     pub gossip_fanout: Option<usize>,
     pub gossip_channel_capacity: Option<usize>,
@@ -51,6 +53,8 @@ impl Default for HeadlessConfig {
             transport: HeadlessTransport::Inproc,
             sync_tick: None,
             sync_fanout: None,
+            global_metadata_sync_tick: None,
+            global_metadata_sync_fanout: None,
             gossip_tick: None,
             gossip_fanout: None,
             gossip_channel_capacity: None,
@@ -129,6 +133,8 @@ impl HeadlessNode {
             transport,
             sync_tick,
             sync_fanout,
+            global_metadata_sync_tick,
+            global_metadata_sync_fanout,
             gossip_tick,
             gossip_fanout,
             gossip_channel_capacity,
@@ -160,6 +166,12 @@ impl HeadlessNode {
         }
         if let Some(fanout) = sync_fanout {
             comps.topology.set_sync_fanout(fanout);
+        }
+        if let Some(d) = global_metadata_sync_tick.or(sync_tick) {
+            comps.topology.set_global_metadata_sync_interval(d);
+        }
+        if let Some(fanout) = global_metadata_sync_fanout.or(sync_fanout) {
+            comps.topology.set_global_metadata_sync_fanout(fanout);
         }
         if let Some(d) = gossip_tick {
             comps.topology.set_gossip_interval(d);
@@ -440,6 +452,8 @@ impl HeadlessNode {
                 transport: HeadlessTransport::Inproc,
                 sync_tick,
                 sync_fanout: None,
+                global_metadata_sync_tick: sync_tick,
+                global_metadata_sync_fanout: None,
                 gossip_tick,
                 gossip_fanout: fanout,
                 gossip_channel_capacity,

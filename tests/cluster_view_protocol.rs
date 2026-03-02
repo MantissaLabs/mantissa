@@ -1646,6 +1646,196 @@ local_test!(cluster_view_name_updates_converge_via_sync_domain, {
     }
 });
 
+// Validates cluster lineage names propagate across split view boundaries through the
+// global metadata gossip plane, without relying on periodic sync fanout.
+local_test!(cluster_view_name_updates_cross_view_after_split, {
+    let anchor = TestNode::new_tcp_with_tick_ms(60_000).await;
+    let joiner_a = TestNode::new_tcp_with_tick_ms(60_000).await;
+    let joiner_b = TestNode::new_tcp_with_tick_ms(60_000).await;
+    joiner_a.join(&anchor).await.expect("join A");
+    joiner_b.join(&anchor).await.expect("join B");
+    anchor
+        .assert_cluster_size(3, "cluster size after joins")
+        .await;
+
+    let source_view = current_cluster_view(&anchor.topology()).await;
+    let mut split_req = anchor.topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        source_view.write_capnp(req.reborrow().init_source_view());
+
+        let mut targets = req.reborrow().init_targets(2);
+        let mut target_self = targets.reborrow().get(0);
+        target_self.set_name("self-only");
+        let mut selector_self = target_self.reborrow().init_selector();
+        selector_self.reborrow().init_clauses(0);
+        let mut explicit_self = selector_self.reborrow().init_explicit_nodes(1);
+        set_node_id(explicit_self.reborrow().get(0), &anchor.id());
+
+        let mut target_others = targets.reborrow().get(1);
+        target_others.set_name("others");
+        let mut selector_others = target_others.reborrow().init_selector();
+        selector_others.reborrow().init_clauses(0);
+        let mut explicit_others = selector_others.reborrow().init_explicit_nodes(2);
+        set_node_id(explicit_others.reborrow().get(0), &joiner_a.id());
+        set_node_id(explicit_others.reborrow().get(1), &joiner_b.id());
+
+        req.set_dry_run(false);
+    }
+
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split operation");
+    let split_targets = split_op.get_target_views().expect("split target views");
+    let remote_view =
+        ClusterViewId::from_capnp(split_targets.get(1)).expect("decode remote split target");
+    let split_id = split_op.get_id().expect("split operation id").to_vec();
+
+    wait_for_operation_stage(
+        &anchor.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_cluster_view(&joiner_a.topology(), remote_view, Duration::from_secs(5)).await;
+    wait_for_cluster_view(&joiner_b.topology(), remote_view, Duration::from_secs(5)).await;
+
+    let anchor_view = current_cluster_view(&anchor.topology()).await;
+    let lineage_id = anchor_view.cluster_id.to_uuid();
+
+    let mut rename_req = anchor.topology().set_cluster_name_request();
+    rename_req
+        .get()
+        .reborrow()
+        .init_cluster_id()
+        .set_value(anchor_view.cluster_id.as_bytes());
+    rename_req.get().set_name("cross-view-name");
+    rename_req
+        .send()
+        .promise
+        .await
+        .expect("setClusterName send");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let anchor_name = cluster_name_for_lineage(&anchor.topology(), lineage_id).await;
+        let joiner_a_name = cluster_name_for_lineage(&joiner_a.topology(), lineage_id).await;
+        let joiner_b_name = cluster_name_for_lineage(&joiner_b.topology(), lineage_id).await;
+        if anchor_name.as_deref() == Some("cross-view-name")
+            && joiner_a_name.as_deref() == Some("cross-view-name")
+            && joiner_b_name.as_deref() == Some("cross-view-name")
+        {
+            break;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cross-view cluster name update did not converge through global gossip plane"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+});
+
+// Validates cluster lineage names converge across split boundaries via metadata anti-entropy
+// even when the update is injected without gossip relay (`submitClusterName` path).
+local_test!(cluster_view_name_updates_cross_view_via_sync_domain, {
+    let anchor = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner_a = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner_b = TestNode::new_tcp_with_tick_ms(100).await;
+    joiner_a.join(&anchor).await.expect("join A");
+    joiner_b.join(&anchor).await.expect("join B");
+    anchor
+        .assert_cluster_size(3, "cluster size after joins")
+        .await;
+
+    let source_view = current_cluster_view(&anchor.topology()).await;
+    let mut split_req = anchor.topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        source_view.write_capnp(req.reborrow().init_source_view());
+
+        let mut targets = req.reborrow().init_targets(2);
+        let mut target_self = targets.reborrow().get(0);
+        target_self.set_name("self-only");
+        let mut selector_self = target_self.reborrow().init_selector();
+        selector_self.reborrow().init_clauses(0);
+        let mut explicit_self = selector_self.reborrow().init_explicit_nodes(1);
+        set_node_id(explicit_self.reborrow().get(0), &anchor.id());
+
+        let mut target_others = targets.reborrow().get(1);
+        target_others.set_name("others");
+        let mut selector_others = target_others.reborrow().init_selector();
+        selector_others.reborrow().init_clauses(0);
+        let mut explicit_others = selector_others.reborrow().init_explicit_nodes(2);
+        set_node_id(explicit_others.reborrow().get(0), &joiner_a.id());
+        set_node_id(explicit_others.reborrow().get(1), &joiner_b.id());
+
+        req.set_dry_run(false);
+    }
+
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split operation");
+    let split_targets = split_op.get_target_views().expect("split target views");
+    let remote_view =
+        ClusterViewId::from_capnp(split_targets.get(1)).expect("decode remote split target");
+    let split_id = split_op.get_id().expect("split operation id").to_vec();
+
+    wait_for_operation_stage(
+        &anchor.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_cluster_view(&joiner_a.topology(), remote_view, Duration::from_secs(5)).await;
+    wait_for_cluster_view(&joiner_b.topology(), remote_view, Duration::from_secs(5)).await;
+
+    let anchor_view = current_cluster_view(&anchor.topology()).await;
+    let lineage_id = anchor_view.cluster_id.to_uuid();
+
+    let mut submit_req = anchor.topology().submit_cluster_name_request();
+    submit_req
+        .get()
+        .reborrow()
+        .init_cluster_id()
+        .set_value(anchor_view.cluster_id.as_bytes());
+    submit_req.get().set_name("cross-view-sync-only");
+    submit_req.get().set_updated_at_unix_ms(u64::MAX - 1);
+    set_node_id(submit_req.get().init_actor_node_id(), &anchor.id());
+    submit_req
+        .send()
+        .promise
+        .await
+        .expect("submitClusterName send");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let anchor_name = cluster_name_for_lineage(&anchor.topology(), lineage_id).await;
+        let joiner_a_name = cluster_name_for_lineage(&joiner_a.topology(), lineage_id).await;
+        let joiner_b_name = cluster_name_for_lineage(&joiner_b.topology(), lineage_id).await;
+        if anchor_name.as_deref() == Some("cross-view-sync-only")
+            && joiner_a_name.as_deref() == Some("cross-view-sync-only")
+            && joiner_b_name.as_deref() == Some("cross-view-sync-only")
+        {
+            break;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cross-view cluster name update did not converge through metadata sync domain"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+});
+
 // Validates split target names are persisted and visible for both resulting cluster lineages.
 local_test!(cluster_view_split_persists_target_names, {
     let anchor = TestNode::new_tcp_with_tick_ms(100).await;

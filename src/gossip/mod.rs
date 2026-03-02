@@ -53,6 +53,25 @@ pub trait GossipContext: PeerProvider {
         peer: &PeerHandle,
     ) -> Result<Option<GossipClient>, capnp::Error>;
 
+    /// Returns peers for the global metadata gossip plane.
+    ///
+    /// By default this reuses the view-scoped peer list so non-topology callers do
+    /// not need to implement a second provider path.
+    async fn get_peers_unscoped(&self) -> Vec<PeerHandle> {
+        self.get_peers().await
+    }
+
+    /// Resolves a gossip capability without enforcing active-view session matching.
+    ///
+    /// The default implementation keeps existing behavior, but topology can override
+    /// this to route selected metadata events across split view boundaries.
+    async fn gossip_client_for_unscoped(
+        &self,
+        peer: &PeerHandle,
+    ) -> Result<Option<GossipClient>, capnp::Error> {
+        self.gossip_client_for(peer).await
+    }
+
     async fn invalidate_peer_capabilities(&self, peer: &PeerHandle) {
         let _ = peer;
     }
@@ -80,6 +99,65 @@ impl Message {
             | Message::Secret { id, .. } => *id,
         }
     }
+}
+
+/// Gossip transport plane selector.
+///
+/// `ViewScoped` carries regular control-plane events that must stay inside the active
+/// view boundary. `GlobalMetadata` carries low-rate metadata that is allowed to cross
+/// split view boundaries (currently cluster lineage names).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GossipPlane {
+    ViewScoped,
+    GlobalMetadata,
+}
+
+impl GossipPlane {
+    /// Returns a stable telemetry label for the plane.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ViewScoped => "view_scoped",
+            Self::GlobalMetadata => "global_metadata",
+        }
+    }
+
+    /// Returns true when this plane may cross view boundaries.
+    fn allows_cross_view(self) -> bool {
+        matches!(self, Self::GlobalMetadata)
+    }
+}
+
+/// Selects the gossip plane for one outbound message.
+fn gossip_plane_for_message(message: &Message) -> GossipPlane {
+    match message {
+        Message::Topology {
+            event: TopologyEvent::ClusterNameUpdated { .. },
+            ..
+        } => GossipPlane::GlobalMetadata,
+        _ => GossipPlane::ViewScoped,
+    }
+}
+
+/// Selects the gossip plane for one inbound wire message.
+fn gossip_plane_for_wire_message(message: gossip::gossip_message::Reader<'_>) -> GossipPlane {
+    match message.which() {
+        Ok(Topology(Ok(reader))) => match reader.get_event() {
+            Ok(protocol::topology::topology_event::EventType::ClusterNameUpdated) => {
+                GossipPlane::GlobalMetadata
+            }
+            _ => GossipPlane::ViewScoped,
+        },
+        _ => GossipPlane::ViewScoped,
+    }
+}
+
+/// Returns whether one inbound message should be enqueued for relay.
+///
+/// Global metadata events are always relayed regardless of the generic relay env flag
+/// so cluster lineage names converge quickly without enabling high-volume relay for all
+/// task/service update traffic.
+fn should_relay_inbound_message(relay_inbound: bool, message: &Message) -> bool {
+    relay_inbound || gossip_plane_for_message(message).allows_cross_view()
 }
 
 pub const DEFAULT_FANOUT: usize = 5;
@@ -416,13 +494,15 @@ impl gossip::Server for Gossip {
                     continue;
                 }
             };
+            let gossip_plane = gossip_plane_for_wire_message(msg.reborrow());
             let active_view = self.cluster_view.active_view();
-            if message_view != active_view {
+            if !gossip_plane.allows_cross_view() && message_view != active_view {
                 debug!(
                     target: "gossip",
                     gossip_id = %id,
                     message_view = %message_view,
                     active_view = %active_view,
+                    gossip_plane = gossip_plane.as_str(),
                     "dropping gossip message for non-active cluster view"
                 );
                 continue;
@@ -452,6 +532,7 @@ impl gossip::Server for Gossip {
                 target: "gossip",
                 gossip_id = %id,
                 view = %message_view,
+                gossip_plane = gossip_plane.as_str(),
                 message_type = message_type,
                 "received gossip message"
             );
@@ -459,7 +540,7 @@ impl gossip::Server for Gossip {
             match which {
                 Void(_) => {
                     let message = Message::Void { id };
-                    if relay_inbound {
+                    if should_relay_inbound_message(relay_inbound, &message) {
                         forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
                     }
                     let _ = topo_tx.send(message).await;
@@ -467,7 +548,7 @@ impl gossip::Server for Gossip {
                 Topology(Ok(reader)) => match topology::read_topology_event(reader) {
                     Ok(event) => {
                         let message = Message::Topology { id, event };
-                        if relay_inbound {
+                        if should_relay_inbound_message(relay_inbound, &message) {
                             forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
                         }
                         topo_tx.send(message).await.map_err(|e| {
@@ -482,7 +563,7 @@ impl gossip::Server for Gossip {
                 Task(Ok(reader)) => match task_service::read_event(reader) {
                     Ok(event) => {
                         let message = Message::Task { id, event };
-                        if relay_inbound {
+                        if should_relay_inbound_message(relay_inbound, &message) {
                             forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
                         }
                         task_tx.send(message).await.map_err(|e| {
@@ -497,7 +578,7 @@ impl gossip::Server for Gossip {
                 Service(Ok(reader)) => match read_service_event(reader) {
                     Ok(event) => {
                         let message = Message::Service { id, event };
-                        if relay_inbound {
+                        if should_relay_inbound_message(relay_inbound, &message) {
                             forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
                         }
                         service_tx.send(message).await.map_err(|e| {
@@ -512,7 +593,7 @@ impl gossip::Server for Gossip {
                 Network(Ok(reader)) => match read_network_event(reader) {
                     Ok(event) => {
                         let message = Message::Network { id, event };
-                        if relay_inbound {
+                        if should_relay_inbound_message(relay_inbound, &message) {
                             forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
                         }
                         network_tx.send(message).await.map_err(|e| {
@@ -527,7 +608,7 @@ impl gossip::Server for Gossip {
                 Secret(Ok(reader)) => match read_secret_event(reader) {
                     Ok(event) => {
                         let message = Message::Secret { id, event };
-                        if relay_inbound {
+                        if should_relay_inbound_message(relay_inbound, &message) {
                             forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
                         }
                         secret_tx.send(message).await.map_err(|e| {
@@ -577,7 +658,7 @@ pub(crate) async fn start<C>(
                 }
 
                 let before_count = pending.len();
-                let (mut pending, coalesced_task_updates) = coalesce_pending_messages(pending);
+                let (pending, coalesced_task_updates) = coalesce_pending_messages(pending);
                 if coalesced_task_updates > 0 {
                     let total_coalesced_task_updates = GOSSIP_COALESCED_TASK_UPDATES_TOTAL
                         .fetch_add(coalesced_task_updates as u64, AtomicOrdering::Relaxed)
@@ -602,66 +683,30 @@ pub(crate) async fn start<C>(
                     }
                 }
 
-                let peers = match fanout {
-                    Some(0) => context.get_peers().await,
-                    Some(n) => fanout_sample(&context, n, &mut fanout_cursor).await,
-                    None => fanout_sample(&context, DEFAULT_FANOUT, &mut fanout_cursor).await,
-                };
-                let self_id = context.local_peer_id();
-                let cluster_view = context.active_cluster_view();
-                debug!(
-                    target: "gossip",
-                    cluster_view = %cluster_view,
-                    peer_count = peers.len(),
-                    message_count = pending.len(),
-                    "gossip tick dispatch"
-                );
-
-                let total_batches = pending.len().div_ceil(MAX_GOSSIP_BATCH_MESSAGES);
-                for (batch_idx, batch) in pending.chunks(MAX_GOSSIP_BATCH_MESSAGES).enumerate() {
-                    debug!(
-                        target: "gossip",
-                        cluster_view = %cluster_view,
-                        batch = batch_idx + 1,
-                        total_batches,
-                        message_count = batch.len(),
-                        "gossip chunk dispatch"
-                    );
-
-                    let mut inflight = FuturesUnordered::new();
-                    for peer in peers.iter() {
-                        if peer.id == self_id {
-                            continue;
-                        }
-
-                        // Filter out messages that describe the peer itself so we never
-                        // hand its exported capability back to the same connection.
-                        let outbound: Vec<Message> = batch
-                            .iter()
-                            .filter(|msg| !message_targets_peer(msg, peer.id))
-                            .cloned()
-                            .collect();
-
-                        if outbound.is_empty() {
-                            continue;
-                        }
-                        inflight.push(send_gossip_to_peer(
-                            outbound,
-                            peer,
-                            &context,
-                            rpc_batch_max,
-                            send_timeout,
-                            cluster_view,
-                        ));
-                        if inflight.len() >= send_parallelism {
-                            let _ = inflight.next().await;
-                        }
-                    }
-                    while inflight.next().await.is_some() {}
-                }
-
-                pending.clear();
-                buffer = pending;
+                let (view_scoped, global_metadata) = split_messages_by_plane(pending);
+                dispatch_gossip_plane(
+                    &context,
+                    view_scoped,
+                    GossipPlane::ViewScoped,
+                    fanout,
+                    &mut fanout_cursor,
+                    rpc_batch_max,
+                    send_parallelism,
+                    send_timeout,
+                )
+                .await;
+                dispatch_gossip_plane(
+                    &context,
+                    global_metadata,
+                    GossipPlane::GlobalMetadata,
+                    fanout,
+                    &mut fanout_cursor,
+                    rpc_batch_max,
+                    send_parallelism,
+                    send_timeout,
+                )
+                .await;
+                buffer = Vec::new();
             }
 
             Ok(msg) = event_rx.recv() => {
@@ -674,6 +719,117 @@ pub(crate) async fn start<C>(
             // channel closed
             else => break,
         }
+    }
+}
+
+/// Partitions pending outbound messages by gossip plane.
+///
+/// This keeps control-plane traffic inside the active view while allowing selected
+/// low-rate metadata updates to use the global metadata plane.
+fn split_messages_by_plane(pending: Vec<Message>) -> (Vec<Message>, Vec<Message>) {
+    let mut view_scoped = Vec::new();
+    let mut global_metadata = Vec::new();
+
+    for message in pending {
+        match gossip_plane_for_message(&message) {
+            GossipPlane::ViewScoped => view_scoped.push(message),
+            GossipPlane::GlobalMetadata => global_metadata.push(message),
+        }
+    }
+
+    (view_scoped, global_metadata)
+}
+
+/// Dispatches one plane-specific outbound gossip batch to the selected peers.
+///
+/// The plane controls both peer selection (view-scoped vs unscoped) and capability
+/// resolution strategy, while preserving the same bounded fanout and chunking behavior.
+async fn dispatch_gossip_plane<C>(
+    context: &C,
+    pending: Vec<Message>,
+    plane: GossipPlane,
+    fanout: Option<usize>,
+    fanout_cursor: &mut usize,
+    rpc_batch_max: usize,
+    send_parallelism: usize,
+    send_timeout: Option<Duration>,
+) where
+    C: GossipContext + ?Sized,
+{
+    if pending.is_empty() {
+        return;
+    }
+
+    let peers = match plane {
+        GossipPlane::ViewScoped => match fanout {
+            Some(0) => context.get_peers().await,
+            Some(n) => fanout_sample(context, n, fanout_cursor).await,
+            None => fanout_sample(context, DEFAULT_FANOUT, fanout_cursor).await,
+        },
+        GossipPlane::GlobalMetadata => {
+            let peer_population = context.get_peers_unscoped().await;
+            match fanout {
+                Some(0) => peer_population,
+                Some(n) => select_fanout_window(peer_population, n, fanout_cursor),
+                None => select_fanout_window(peer_population, DEFAULT_FANOUT, fanout_cursor),
+            }
+        }
+    };
+    let self_id = context.local_peer_id();
+    let cluster_view = context.active_cluster_view();
+
+    debug!(
+        target: "gossip",
+        cluster_view = %cluster_view,
+        gossip_plane = plane.as_str(),
+        peer_count = peers.len(),
+        message_count = pending.len(),
+        "gossip tick dispatch"
+    );
+
+    let total_batches = pending.len().div_ceil(MAX_GOSSIP_BATCH_MESSAGES);
+    for (batch_idx, batch) in pending.chunks(MAX_GOSSIP_BATCH_MESSAGES).enumerate() {
+        debug!(
+            target: "gossip",
+            cluster_view = %cluster_view,
+            gossip_plane = plane.as_str(),
+            batch = batch_idx + 1,
+            total_batches,
+            message_count = batch.len(),
+            "gossip chunk dispatch"
+        );
+
+        let mut inflight = FuturesUnordered::new();
+        for peer in peers.iter() {
+            if peer.id == self_id {
+                continue;
+            }
+
+            // Filter out messages that describe the peer itself so we never hand
+            // its exported capability back to the same connection.
+            let outbound: Vec<Message> = batch
+                .iter()
+                .filter(|msg| !message_targets_peer(msg, peer.id))
+                .cloned()
+                .collect();
+
+            if outbound.is_empty() {
+                continue;
+            }
+            inflight.push(send_gossip_to_peer(
+                outbound,
+                peer,
+                context,
+                rpc_batch_max,
+                send_timeout,
+                cluster_view,
+                plane,
+            ));
+            if inflight.len() >= send_parallelism {
+                let _ = inflight.next().await;
+            }
+        }
+        while inflight.next().await.is_some() {}
     }
 }
 
@@ -759,17 +915,21 @@ async fn send_gossip_to_peer<C>(
     rpc_batch_max: usize,
     send_timeout: Option<Duration>,
     cluster_view: ClusterViewId,
+    plane: GossipPlane,
 ) where
     C: GossipContext + ?Sized,
 {
     for outbound_batch in outbound.chunks(rpc_batch_max) {
         let send_result = if let Some(timeout) = send_timeout {
-            match tokio::time::timeout(timeout, send_gossip(outbound_batch, peer, context)).await {
+            match tokio::time::timeout(timeout, send_gossip(outbound_batch, peer, context, plane))
+                .await
+            {
                 Ok(result) => result,
                 Err(_) => {
                     warn!(
                         target: "diag.gossip.send",
                         cluster_view = %cluster_view,
+                        gossip_plane = plane.as_str(),
                         peer = %peer.id,
                         addr = %peer.address,
                         message_count = outbound_batch.len(),
@@ -780,7 +940,7 @@ async fn send_gossip_to_peer<C>(
                 }
             }
         } else {
-            send_gossip(outbound_batch, peer, context).await
+            send_gossip(outbound_batch, peer, context, plane).await
         };
 
         match send_result {
@@ -790,6 +950,7 @@ async fn send_gossip_to_peer<C>(
                 warn!(
                     target: "diag.gossip.send",
                     cluster_view = %cluster_view,
+                    gossip_plane = plane.as_str(),
                     peer = %peer.id,
                     addr = %peer.address,
                     message_count = outbound_batch.len(),
@@ -807,6 +968,7 @@ async fn send_gossip<C>(
     messages: &[Message],
     peer: &PeerHandle,
     ctx: &C,
+    plane: GossipPlane,
 ) -> Result<(), capnp::Error>
 where
     C: GossipContext + ?Sized,
@@ -816,7 +978,11 @@ where
     }
     let cluster_view = ctx.active_cluster_view();
 
-    let Some(gossip_cap) = ctx.gossip_client_for(peer).await? else {
+    let gossip_cap = match plane {
+        GossipPlane::ViewScoped => ctx.gossip_client_for(peer).await?,
+        GossipPlane::GlobalMetadata => ctx.gossip_client_for_unscoped(peer).await?,
+    };
+    let Some(gossip_cap) = gossip_cap else {
         return Ok(());
     };
 
@@ -860,6 +1026,7 @@ where
             debug!(
                 target: "gossip",
                 cluster_view = %cluster_view,
+                gossip_plane = plane.as_str(),
                 peer = %peer.id,
                 message_count = messages.len(),
                 "gossip batch delivered"
@@ -914,7 +1081,19 @@ pub async fn fanout_sample<P>(provider: &P, fanout: usize, cursor: &mut usize) -
 where
     P: PeerProvider + ?Sized,
 {
-    let mut peers = provider.get_peers().await;
+    let peers = provider.get_peers().await;
+    select_fanout_window(peers, fanout, cursor)
+}
+
+/// Selects one deterministic fanout window from an already-materialized peer list.
+///
+/// The selection is stable for a given cursor value and rotates on each call so all
+/// peers are eventually selected without randomized shuffles.
+fn select_fanout_window(
+    mut peers: Vec<PeerHandle>,
+    fanout: usize,
+    cursor: &mut usize,
+) -> Vec<PeerHandle> {
     if peers.is_empty() {
         *cursor = 0;
         return peers;

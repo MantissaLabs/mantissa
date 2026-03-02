@@ -17,7 +17,7 @@ use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
-use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains};
+use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains, sync_selected_domains};
 use crate::token::TokenStore;
 use crate::topology::peers::PeerValue;
 use ::health::HealthMonitor;
@@ -30,6 +30,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use net::noise::NoisePeerVerifier;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::server::{self, ServerClient};
+use protocol::sync::Domain;
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashSet;
 use std::io;
@@ -77,12 +78,49 @@ const DEFAULT_SYNC_FANOUT: usize = 8;
 /// Default maximum number of peers synchronized concurrently within one tick.
 const DEFAULT_SYNC_PARALLELISM: usize = 1;
 
+/// Default anti-entropy interval for cross-view cluster metadata sync.
+const DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+/// Default number of peers sampled per metadata sync tick.
+const DEFAULT_GLOBAL_METADATA_SYNC_FANOUT: usize = 8;
+/// Default maximum concurrent cross-view metadata sync operations per tick.
+const DEFAULT_GLOBAL_METADATA_SYNC_PARALLELISM: usize = 1;
+/// Cross-view domains synchronized by the global metadata anti-entropy loop.
+const GLOBAL_METADATA_SYNC_DOMAINS: [Domain; 1] = [Domain::ClusterViews];
+
 /// Reads the optional per-tick sync parallelism override from the environment.
 fn sync_parallelism_from_env(default: usize) -> usize {
     std::env::var("MANTISSA_SYNC_PARALLELISM")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+/// Reads the optional metadata sync parallelism override from the environment.
+fn global_metadata_sync_parallelism_from_env(default: usize) -> usize {
+    std::env::var("MANTISSA_GLOBAL_METADATA_SYNC_PARALLELISM")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+/// Reads the optional metadata sync fanout override from the environment.
+fn global_metadata_sync_fanout_from_env(default: usize) -> usize {
+    std::env::var("MANTISSA_GLOBAL_METADATA_SYNC_FANOUT")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+/// Reads the optional metadata sync tick interval (milliseconds) from the environment.
+fn global_metadata_sync_interval_from_env(default: Duration) -> Duration {
+    std::env::var("MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
         .unwrap_or(default)
 }
 
@@ -327,6 +365,12 @@ pub struct Topology {
     /// Runtime state for background sync loop management.
     sync: SyncState,
 
+    /// Runtime state for cross-view cluster metadata anti-entropy management.
+    metadata_sync: SyncState,
+
+    /// Rotating cursor used by metadata sync to deterministically sweep all peers.
+    metadata_sync_cursor: Arc<Mutex<usize>>,
+
     /// Runtime state for merge/split operation progression.
     operations: ClusterOperationState,
 
@@ -422,6 +466,11 @@ impl Topology {
             public_key: noise_public_key,
             signing_key,
             sync: SyncState::new(DEFAULT_SYNC_INTERVAL, DEFAULT_SYNC_FANOUT),
+            metadata_sync: SyncState::new(
+                global_metadata_sync_interval_from_env(DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL),
+                global_metadata_sync_fanout_from_env(DEFAULT_GLOBAL_METADATA_SYNC_FANOUT),
+            ),
+            metadata_sync_cursor: Arc::new(Mutex::new(0)),
             operations: ClusterOperationState::new(),
             token_store,
             secret_master_store,
@@ -671,6 +720,16 @@ impl Topology {
         self.sync.set_fanout(fanout);
     }
 
+    /// Set the metadata sync interval used by the cross-view cluster metadata loop.
+    pub fn set_global_metadata_sync_interval(&self, d: Duration) {
+        self.metadata_sync.set_interval(d);
+    }
+
+    /// Set metadata sync fanout (`0` means sync metadata against all known peers per tick).
+    pub fn set_global_metadata_sync_fanout(&self, fanout: usize) {
+        self.metadata_sync.set_fanout(fanout);
+    }
+
     pub fn set_gossip_interval(&self, d: Duration) {
         self.gossip.set_interval(d);
     }
@@ -777,26 +836,32 @@ impl Topology {
         Ok(actives.iter().any(|(k, _)| k.to_uuid() != me))
     }
 
-    /// Spawns a single periodic sync loop (idempotent). Restartable after `stop_periodic_sync()`.
+    /// Spawns periodic anti-entropy loops (idempotent). Restartable after `stop_periodic_sync()`.
     pub fn ensure_periodic_sync(&self) {
-        // fast path if already running
-        if !self.sync.start_if_idle() {
-            return;
+        if self.sync.start_if_idle() {
+            let this = self.clone();
+            let handle = tokio::task::spawn_local(async move {
+                this.periodic_sync_loop().await;
+                // if the loop exits naturally, mark stopped
+                this.sync.mark_stopped();
+            });
+            self.sync.store_handle(handle);
         }
 
-        let this = self.clone();
-        let handle = tokio::task::spawn_local(async move {
-            this.periodic_sync_loop().await;
-            // if the loop exits naturally, mark stopped
-            this.sync.mark_stopped();
-        });
-
-        self.sync.store_handle(handle);
+        if self.metadata_sync.start_if_idle() {
+            let this = self.clone();
+            let handle = tokio::task::spawn_local(async move {
+                this.periodic_global_metadata_sync_loop().await;
+                this.metadata_sync.mark_stopped();
+            });
+            self.metadata_sync.store_handle(handle);
+        }
     }
 
-    /// Abort the periodic sync loop (if any) and mark it stopped.
+    /// Abort periodic sync loops (if any) and mark them stopped.
     pub fn stop_periodic_sync(&self) {
         self.sync.stop();
+        self.metadata_sync.stop();
     }
 
     // The run loop receives incoming events from Gossip.
@@ -1144,7 +1209,7 @@ impl Topology {
         while inflight.next().await.is_some() {}
     }
 
-    /// Select peers to target during one anti-entropy tick.
+    /// Select peers to target during one view-scoped anti-entropy tick.
     ///
     /// This keeps periodic sync efficient by sampling in `O(k)` expected time where `k` is
     /// `sync_fanout`, while preserving `sync_fanout = 0` as "sync with all peers".
@@ -1154,6 +1219,23 @@ impl Topology {
         sync_fanout: usize,
     ) -> Vec<&'a PeerCacheEntry> {
         select_sync_peers_for_node(self.node.id, entries, sync_fanout)
+    }
+
+    /// Select peers to target during one cross-view metadata anti-entropy tick.
+    ///
+    /// This uses a deterministic rotating window so every peer is covered in bounded time:
+    /// within `ceil(peer_count / fanout)` ticks (or one tick when `fanout = 0`).
+    fn select_metadata_sync_peers<'a>(
+        &self,
+        entries: &'a [PeerCacheEntry],
+        sync_fanout: usize,
+    ) -> Vec<&'a PeerCacheEntry> {
+        select_sync_peers_round_robin_for_node(
+            self.node.id,
+            entries,
+            sync_fanout,
+            &self.metadata_sync_cursor,
+        )
     }
 
     async fn sync_with_peer(&self, entry: &PeerCacheEntry, cluster_view: ClusterViewId) {
@@ -1188,11 +1270,107 @@ impl Topology {
         sync_all_domains(stores, sync_cap, cluster_view, Some(trace)).await;
     }
 
+    /// Runs one unscoped metadata anti-entropy exchange against a peer.
+    ///
+    /// This intentionally syncs only the `cluster_views` domain while using the peer's active
+    /// view for request validation, so metadata can converge across split boundaries without
+    /// pulling heavy domains (`tasks`, `services`, `networks`) across those boundaries.
+    async fn sync_metadata_with_peer(&self, entry: &PeerCacheEntry) {
+        let peer_id = entry.peer_id;
+        let value = entry.value.as_ref();
+
+        let (sync_cap, peer_view) =
+            match self.registry.fetch_sync_capability_unscoped(peer_id).await {
+                Ok(Some(resolved)) => resolved,
+                Ok(None) => return,
+                Err(e) => {
+                    error!(
+                        target: "sync",
+                        peer = %peer_id,
+                        addr = %value.address,
+                        "get_sync (unscoped) failed: {e}"
+                    );
+                    return;
+                }
+            };
+
+        let stores = SyncStores {
+            peers: self.peers.clone(),
+            tasks: self.tasks.clone(),
+            services: self.services.clone(),
+            secrets: self.secrets.clone(),
+            networks: self.networks.clone(),
+            network_peers: self.network_peers.clone(),
+            network_attachments: self.network_attachments.clone(),
+            cluster_views: self.cluster_view_store.cluster_view_domain_store(),
+        };
+
+        let trace =
+            SyncTraceContext::peer(peer_id, value.address.clone(), "periodic-global-metadata");
+        sync_selected_domains(
+            stores,
+            sync_cap,
+            peer_view,
+            &GLOBAL_METADATA_SYNC_DOMAINS,
+            Some(trace),
+        )
+        .await;
+    }
+
+    /// Run one cross-view metadata sync tick.
+    ///
+    /// This loop uses unscoped sessions and deterministic fanout sweep to guarantee every known
+    /// peer is eventually covered even in very large split topologies.
+    pub async fn periodic_global_metadata_sync_tick(&self) {
+        let snapshot = match self.peer_snapshot().await {
+            Some(s) => s,
+            None => return,
+        };
+
+        let peers = snapshot.entries.clone();
+        let entries = peers.as_ref();
+        if entries.is_empty() {
+            return;
+        }
+
+        let sync_fanout = self.metadata_sync.fanout();
+        let peer_count = entries
+            .iter()
+            .filter(|entry| entry.peer_id != self.node.id)
+            .count();
+        if peer_count == 0 {
+            return;
+        }
+
+        trace!(
+            target: "sync",
+            cluster_view = %self.active_cluster_view(),
+            peer_count,
+            fanout = sync_fanout,
+            domains = "cluster_views",
+            plane = "global_metadata",
+            "running periodic global metadata sync tick"
+        );
+
+        let selected_entries = self.select_metadata_sync_peers(entries, sync_fanout);
+        let sync_parallelism =
+            global_metadata_sync_parallelism_from_env(DEFAULT_GLOBAL_METADATA_SYNC_PARALLELISM);
+        let mut inflight = FuturesUnordered::new();
+        for entry in selected_entries {
+            inflight.push(self.sync_metadata_with_peer(entry));
+            if inflight.len() >= sync_parallelism {
+                let _ = inflight.next().await;
+            }
+        }
+        while inflight.next().await.is_some() {}
+    }
+
     /// Kick a one-shot sync pass immediately (no waiting for the next interval).
     pub fn sync_once_now(&self) {
         let topo = self.clone();
         tokio::task::spawn_local(async move {
             topo.periodic_sync_tick().await;
+            topo.periodic_global_metadata_sync_tick().await;
         });
     }
 
@@ -1202,6 +1380,15 @@ impl Topology {
             let d = self.sync.interval();
             tokio::time::sleep(d).await;
             self.periodic_sync_tick().await;
+        }
+    }
+
+    /// Periodically call [`periodic_global_metadata_sync_tick`] every few seconds.
+    pub async fn periodic_global_metadata_sync_loop(&self) {
+        loop {
+            let d = self.metadata_sync.interval();
+            tokio::time::sleep(d).await;
+            self.periodic_global_metadata_sync_tick().await;
         }
     }
 
@@ -1262,6 +1449,41 @@ impl GossipContext for Topology {
             .await
     }
 
+    /// Returns peer handles for the global metadata gossip plane.
+    ///
+    /// Unlike the default `PeerProvider` path this intentionally keeps split-excluded peers
+    /// so selected low-rate metadata events can cross view boundaries.
+    async fn get_peers_unscoped(&self) -> Vec<PeerHandle> {
+        let snapshot = match self.peer_snapshot().await {
+            Some(snapshot) => snapshot,
+            None => return Vec::new(),
+        };
+
+        let peers = snapshot.entries.clone();
+        let mut out = Vec::with_capacity(peers.len());
+        for entry in peers.iter() {
+            let value = entry.value.as_ref();
+            out.push(PeerHandle {
+                id: entry.peer_id,
+                address: value.address.clone(),
+                hostname: value.hostname.clone(),
+                noise_static_pub: PublicKey::from(value.noise_static_pub),
+                root_hash: Default::default(),
+            });
+        }
+
+        out
+    }
+
+    /// Resolves gossip capability without active-view matching so global metadata events
+    /// can be forwarded across split boundaries.
+    async fn gossip_client_for_unscoped(
+        &self,
+        peer: &PeerHandle,
+    ) -> Result<Option<GossipClient>, capnp::Error> {
+        self.registry.gossip_client_for_unscoped(peer.id).await
+    }
+
     async fn invalidate_peer_capabilities(&self, peer: &PeerHandle) {
         self.registry.invalidate_peer_capabilities(peer.id).await;
     }
@@ -1320,11 +1542,54 @@ fn select_sync_peers_for_node<'a>(
     selected_entries
 }
 
+/// Select peers for one deterministic sync sweep while excluding `local_id`.
+///
+/// The rotating cursor ensures bounded convergence coverage instead of probabilistic sampling.
+fn select_sync_peers_round_robin_for_node<'a>(
+    local_id: Uuid,
+    entries: &'a [PeerCacheEntry],
+    sync_fanout: usize,
+    cursor: &Arc<Mutex<usize>>,
+) -> Vec<&'a PeerCacheEntry> {
+    let mut candidates: Vec<&PeerCacheEntry> = entries
+        .iter()
+        .filter(|entry| entry.peer_id != local_id)
+        .collect();
+    if candidates.is_empty() {
+        *lock_or_recover(cursor, "topology.metadata_sync_cursor") = 0;
+        return Vec::new();
+    }
+
+    candidates.sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
+
+    let target = if sync_fanout == 0 {
+        candidates.len()
+    } else {
+        sync_fanout.min(candidates.len())
+    };
+    if target >= candidates.len() {
+        *lock_or_recover(cursor, "topology.metadata_sync_cursor") = 0;
+        return candidates;
+    }
+
+    let mut guard = lock_or_recover(cursor, "topology.metadata_sync_cursor");
+    let start = *guard % candidates.len();
+    let mut selected = Vec::with_capacity(target);
+    for offset in 0..target {
+        selected.push(candidates[(start + offset) % candidates.len()]);
+    }
+    *guard = (start + target) % candidates.len();
+    selected
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PeerCacheEntry, PeerValue, select_sync_peers_for_node};
+    use super::{
+        PeerCacheEntry, PeerValue, select_sync_peers_for_node,
+        select_sync_peers_round_robin_for_node,
+    };
     use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     /// Build a synthetic peer cache entry with deterministic placeholder values.
@@ -1393,5 +1658,27 @@ mod tests {
         let selected = select_sync_peers_for_node(local_id, &entries, 32);
         assert_eq!(selected.len(), 4);
         assert!(selected.iter().all(|entry| entry.peer_id != local_id));
+    }
+
+    /// Round-robin selection should deterministically sweep all peers in bounded ticks.
+    #[test]
+    fn select_sync_peers_round_robin_sweeps_all_peers() {
+        let local_id = Uuid::new_v4();
+        let mut entries = vec![make_entry(local_id, 0)];
+        for idx in 0..5 {
+            entries.push(make_entry(Uuid::new_v4(), idx + 1));
+        }
+
+        let cursor = Arc::new(Mutex::new(0usize));
+        let mut seen = HashSet::new();
+        for _ in 0..3 {
+            let selected = select_sync_peers_round_robin_for_node(local_id, &entries, 2, &cursor);
+            assert_eq!(selected.len(), 2);
+            for entry in selected {
+                seen.insert(entry.peer_id);
+            }
+        }
+
+        assert_eq!(seen.len(), 5, "round-robin fanout should cover every peer");
     }
 }
