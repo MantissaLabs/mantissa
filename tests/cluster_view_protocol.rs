@@ -3,15 +3,18 @@ mod common;
 
 use common::convergence::{current_cluster_view, wait_for_cluster_view, wait_for_operation_stage};
 use common::testkit::TestNode;
-use mantissa::cluster::ClusterViewId;
+use crdt_store::uuid_key::UuidKey;
+use mantissa::cluster::{ClusterId, ClusterViewId};
 use mantissa::node::id::set_node_id;
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 use mantissa::store::cluster_operation_store::ClusterOperationStore;
 use mantissa::store::cluster_view_store::ClusterViewStore;
+use mantissa::store::peer_store::open_peers_store;
 use mantissa::topology::operation::{
     ClusterOperationKind as StoredOperationKind, ClusterOperationRecord,
     ClusterOperationStage as StoredOperationStage, SplitNodeAssignment,
 };
+use mantissa::topology::peers::PeerValue;
 use net::noise::NoiseKeys;
 use protocol::topology::{ClusterOperationKind, ClusterOperationStage};
 use std::sync::Arc;
@@ -879,6 +882,168 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
     assert_eq!(
         active_view, target_view,
         "startup replay should apply the committed target view"
+    );
+});
+
+// Validates startup restores split peer scope so node listing does not leak remote split peers.
+local_test!(cluster_view_startup_restores_split_peer_scope, {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+    let self_id = Uuid::new_v4();
+    let peer_a = Uuid::new_v4();
+    let peer_b = Uuid::new_v4();
+
+    let source_view = ClusterViewId::legacy_default();
+    let local_view = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 1);
+    let remote_view = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 1);
+
+    let cluster_view_store = ClusterViewStore::new(db.clone(), self_id).expect("open view store");
+    cluster_view_store
+        .write_active_view(local_view)
+        .expect("persist local active view");
+
+    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+    let split = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Split,
+        stage: StoredOperationStage::Finalized,
+        dry_run: false,
+        source_views: vec![source_view],
+        target_views: vec![local_view, remote_view],
+        target_cluster_names: vec!["local".to_string(), "remote".to_string()],
+        split_assignments: vec![
+            SplitNodeAssignment {
+                node_id: self_id,
+                target_index: 0,
+            },
+            SplitNodeAssignment {
+                node_id: peer_a,
+                target_index: 1,
+            },
+            SplitNodeAssignment {
+                node_id: peer_b,
+                target_index: 1,
+            },
+        ],
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
+        updated_at_unix_ms: 42,
+        details: "startup split scope restore".to_string(),
+    };
+    let payload = bincode::serialize(&split).expect("serialize split operation");
+    operation_store
+        .put(split.id, &payload)
+        .expect("persist split operation");
+
+    let peers = open_peers_store(db.clone(), self_id).expect("open peers store");
+    let peer_value = |address: &str, hostname: &str| PeerValue {
+        address: address.to_string(),
+        hostname: hostname.to_string(),
+        noise_static_pub: [0x11; 32],
+        signing_pub: [0x22; 32],
+        identity_sig: vec![0x33; 64],
+        wireguard: None,
+    };
+    peers
+        .upsert(
+            &UuidKey::from(self_id),
+            peer_value("127.0.0.1:6578", "local-node"),
+        )
+        .await
+        .expect("persist local peer");
+    peers
+        .upsert(
+            &UuidKey::from(peer_a),
+            peer_value("127.0.0.1:6579", "peer-a"),
+        )
+        .await
+        .expect("persist remote peer A");
+    peers
+        .upsert(
+            &UuidKey::from(peer_b),
+            peer_value("127.0.0.1:6580", "peer-b"),
+        )
+        .await
+        .expect("persist remote peer B");
+
+    let node = HeadlessNode::new_with(
+        db,
+        self_id,
+        HeadlessKeys::new(
+            Arc::new(NoiseKeys::from_private_bytes([0x71; 32])),
+            ed25519_dalek::SigningKey::from_bytes(&[0x81; 32]),
+        ),
+        HeadlessConfig::default(),
+    )
+    .await
+    .expect("start scope restore node");
+
+    let list_resp = node
+        .topology_client
+        .list_request()
+        .send()
+        .promise
+        .await
+        .expect("topology list send");
+    let node_rows = list_resp
+        .get()
+        .expect("topology list get")
+        .get_nodes()
+        .expect("node list payload")
+        .get_nodes()
+        .expect("node rows");
+    assert_eq!(
+        node_rows.len(),
+        1,
+        "startup should restore split peer scope before node listing"
+    );
+    let listed_id = Uuid::from_slice(
+        node_rows
+            .get(0)
+            .get_id()
+            .expect("listed node id")
+            .get_bytes()
+            .expect("listed node id bytes"),
+    )
+    .expect("decode listed node id");
+    assert_eq!(
+        listed_id, self_id,
+        "only local split peer should remain listed"
+    );
+
+    let views_resp = node
+        .topology_client
+        .list_cluster_views_request()
+        .send()
+        .promise
+        .await
+        .expect("listClusterViews send");
+    let rows = views_resp
+        .get()
+        .expect("listClusterViews get")
+        .get_views()
+        .expect("cluster view rows");
+    let mut local_count = None::<u32>;
+    let mut remote_count = None::<u32>;
+    for idx in 0..rows.len() {
+        let row = rows.get(idx);
+        if row.get_local_active() {
+            local_count = Some(row.get_node_count());
+        } else {
+            remote_count = Some(row.get_node_count());
+        }
+    }
+    assert_eq!(
+        local_count,
+        Some(1),
+        "local active view count should exclude remote split peers after restart"
+    );
+    assert_eq!(
+        remote_count,
+        Some(2),
+        "remote split sibling count should still be inferred from split assignments"
     );
 });
 

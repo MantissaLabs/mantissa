@@ -6,6 +6,7 @@ use crate::store::cluster_view_store::ClusterNameRecord;
 use crate::topology::operation::{
     ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage,
 };
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -606,5 +607,91 @@ impl Topology {
         let _ = self.garbage_collect_cluster_operations()?;
 
         Ok(replayed)
+    }
+
+    /// Restores split/merge peer scope from durable operation history after process startup.
+    ///
+    /// This rebuilds the in-memory excluded-peer set used by list/sync/health loops so
+    /// restart does not temporarily fall back to cross-view peer assumptions.
+    pub(crate) async fn restore_peer_scope_from_operation_history(
+        &self,
+    ) -> Result<usize, capnp::Error> {
+        let active_view = self.active_cluster_view();
+        let mut operations = self.load_cluster_operations()?;
+        operations.sort_by(|left, right| {
+            left.updated_at_unix_ms
+                .cmp(&right.updated_at_unix_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut excluded = HashSet::<Uuid>::new();
+        let mut source_operation = None::<Uuid>;
+
+        for operation in operations {
+            if operation.dry_run {
+                continue;
+            }
+            if !matches!(
+                operation.stage,
+                ClusterOperationStage::Committed | ClusterOperationStage::Finalized
+            ) {
+                continue;
+            }
+
+            let local_target_view = match self.local_target_view_for_operation(&operation) {
+                Ok(view) => view,
+                Err(err) => {
+                    warn!(
+                        target: "cluster_view",
+                        operation_id = %operation.id,
+                        kind = ?operation.kind,
+                        stage = ?operation.stage,
+                        "skipping operation while restoring peer scope: {err}"
+                    );
+                    continue;
+                }
+            };
+            if local_target_view != active_view {
+                continue;
+            }
+
+            match operation.kind {
+                ClusterOperationKind::Merge => {
+                    excluded.clear();
+                    source_operation = Some(operation.id);
+                }
+                ClusterOperationKind::Split => {
+                    let transition = match self.transition_for_operation(&operation) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            warn!(
+                                target: "cluster_view",
+                                operation_id = %operation.id,
+                                kind = ?operation.kind,
+                                stage = ?operation.stage,
+                                "skipping split scope restore because transition derivation failed: {err}"
+                            );
+                            continue;
+                        }
+                    };
+                    excluded = transition.evicted_node_ids;
+                    source_operation = Some(operation.id);
+                }
+            }
+        }
+
+        self.set_excluded_peers(excluded.clone()).await;
+        self.registry.set_excluded_peers(excluded.clone());
+
+        let excluded_count = excluded.len();
+        info!(
+            target: "cluster_view",
+            active_view = %active_view,
+            excluded_count,
+            source_operation = ?source_operation,
+            "restored peer scope from durable operation history"
+        );
+
+        Ok(excluded_count)
     }
 }

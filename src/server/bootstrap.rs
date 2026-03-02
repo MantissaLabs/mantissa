@@ -468,6 +468,14 @@ impl Bootstrap {
                 "replayed pending cluster operations during startup"
             );
         }
+        let restored_scope = topology.restore_peer_scope_from_operation_history().await?;
+        if restored_scope > 0 {
+            info!(
+                target: "cluster_view",
+                restored_scope,
+                "restored split peer scope during startup"
+            );
+        }
 
         let topology_client: TopologyClient = capnp_rpc::new_client(topology.clone());
 
