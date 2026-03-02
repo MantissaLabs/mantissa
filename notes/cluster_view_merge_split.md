@@ -1,5 +1,8 @@
 # Cluster merge/split design with ClusterView and ClusterViewId
 
+Runtime replication details for the current implementation are documented in
+`docs/cluster_view_gossip_sync.md`.
+
 ## Context
 
 Mantissa currently operates as a single global cluster view. Merge/split requires us to represent
@@ -56,6 +59,7 @@ pub enum ClusterOperationStage {
 Additional control-plane records:
 
 1. `ClusterOperationRecord`:
+
 - `op_id: Uuid`
 - `kind: Merge|Split`
 - `stage`
@@ -66,12 +70,14 @@ Additional control-plane records:
 - `conflict_report` (resource name/id conflicts, policy decisions)
 
 2. `NodeMembershipRecord`:
+
 - `node_id`
 - `active_view: ClusterViewId`
 - `allowed_views: Vec<ClusterViewId>` (temporary bridge during transition)
 - `last_transition_op: op_id`
 
 3. `ClusterViewMeta`:
+
 - `view_id`
 - `parents: Vec<ClusterViewId>`
 - `status: Active|Draining|Retired`
@@ -95,21 +101,25 @@ Additional control-plane records:
 ### Stages
 
 1. `Proposed`
+
 - Create `ClusterOperationRecord(kind=Merge)` in CRDT store.
 - Collect remote roots and capability snapshots for all domains.
 - Compute conflict report.
 
 2. `Prepared`
+
 - Freeze placement churn (new reservations/scheduling moves), keep health/restarts active.
 - Establish temporary `allowed_views` for bridge replication.
 - Start view-aware anti-entropy to converge required state.
 
 3. `Committed`
+
 - Activate target `ClusterViewId` with next epoch.
 - Switch peer management, gossip fanout, and sync calls to target view.
 - Emit membership updates atomically in topology domain.
 
 4. `Finalized`
+
 - Revoke old-view tickets/credentials.
 - Mark source views as `Draining` then `Retired`.
 - Schedule asynchronous GC of old-view data.
@@ -133,19 +143,23 @@ Deterministic selector language (first phase supports conjunction):
 ### Stages
 
 1. `Proposed`
+
 - Compute deterministic partition and validate non-empty target views.
 - Validate policy constraints (minimum replicas/capacity per target).
 
 2. `Prepared`
+
 - Freeze placement churn across source view.
 - Materialize target view metadata and per-view peer subsets.
 - Start scoped state copy/availability checks.
 
 3. `Committed`
+
 - Assign each node a target `active_view`.
 - Scheduler/services/network controllers switch to per-view peer sets.
 
 4. `Finalized`
+
 - Revoke source-view sessions.
 - Retire source view once each target is healthy.
 
@@ -170,6 +184,7 @@ Impacted deterministic ID helpers:
 1. Add `ClusterId`, `ClusterViewId`, `ClusterOperation`, `SplitSelector` structs.
 2. Extend `NodeInfo` with `activeClusterView`.
 3. Add topology RPCs:
+
 - `getClusterView @5 () -> (view :ClusterViewId)`
 - `mergeClusters @6 (req :MergeRequest) -> (op :ClusterOperation)`
 - `splitCluster @7 (req :SplitRequest) -> (op :ClusterOperation)`
@@ -298,6 +313,7 @@ Likely file:
 Current UX goal is cluster-centric commands while keeping `ClusterViewId` internal:
 
 1. Expose:
+
 - `mantissa clusters list`
 - `mantissa merge <source-cluster-id> <destination-cluster-id> [--dry-run]`
 - `mantissa split --cluster <cluster-id> --by <filter> --values <v1,v2,...> [--dry-run]`
@@ -305,7 +321,7 @@ Current UX goal is cluster-centric commands while keeping `ClusterViewId` intern
 - `mantissa split --interactive [--left-name <name>] [--right-name <name>]` (interactive node picker)
 
 2. Client layer resolves cluster IDs to latest known views and compiles simple filters into
-split selector targets (plus one fallback partition).
+   split selector targets (plus one fallback partition).
 
 Likely files:
 
@@ -357,29 +373,35 @@ Likely files:
 ### New integration test suites
 
 1. `tests/cluster_merge.rs`
+
 - disjoint two-cluster merge converges to one target view.
 - idempotent retry of same `op_id`.
 - merge with transient node failures.
 
 2. `tests/cluster_split.rs`
+
 - split by label selector.
 - split by resource selector.
 - split rollback before commit.
 
 3. `tests/cluster_view_sync.rs`
+
 - delta rejection on mismatched view.
 - mixed-version compatibility behavior.
 
 4. `tests/cluster_view_sessions.rs`
+
 - ticket/credential replay rejected across views.
 - old-view ticket invalidated after finalize.
 
 5. `tests/cluster_workload_continuity.rs`
+
 - running service remains available across merge/split transition.
 
 ### Testkit updates
 
 1. Extend `tests/common/testkit.rs` with helpers:
+
 - wait for operation stage
 - assert per-view cluster size
 - assert per-view root convergence
