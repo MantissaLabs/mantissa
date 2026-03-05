@@ -1,0 +1,132 @@
+use crate::services::types::{ServiceSpecValue, ServiceStatus};
+use chrono::{DateTime, Utc};
+use std::cmp::Ordering;
+
+/// Compares two service specs and returns which one should win CRDT selection.
+pub(crate) fn compare_service_specs(left: &ServiceSpecValue, right: &ServiceSpecValue) -> Ordering {
+    if left.manifest_id == right.manifest_id {
+        return compare_causal_tuple(left, right).then_with(|| left.cmp(right));
+    }
+
+    compare_manifest_mismatch(left, right)
+}
+
+/// Returns true when the incoming spec should replace the current one.
+pub(crate) fn should_accept_service_update(
+    current: Option<&ServiceSpecValue>,
+    incoming: &ServiceSpecValue,
+) -> bool {
+    current
+        .map(|current| compare_service_specs(incoming, current).is_gt())
+        .unwrap_or(true)
+}
+
+/// Compares service specs that reference different deployment manifests.
+fn compare_manifest_mismatch(left: &ServiceSpecValue, right: &ServiceSpecValue) -> Ordering {
+    if let Some(ordering) = compare_stopping_preference(left, right) {
+        return ordering;
+    }
+
+    if is_immediate_rollback_result(left, right) {
+        return Ordering::Greater;
+    }
+    if is_immediate_rollback_result(right, left) {
+        return Ordering::Less;
+    }
+
+    if blocks_cross_manifest_reactivation(left, right) {
+        return Ordering::Greater;
+    }
+    if blocks_cross_manifest_reactivation(right, left) {
+        return Ordering::Less;
+    }
+
+    compare_causal_tuple(left, right)
+        .then_with(|| {
+            left.manifest_id
+                .as_bytes()
+                .cmp(right.manifest_id.as_bytes())
+        })
+        .then_with(|| left.cmp(right))
+}
+
+/// Gives stop propagation priority so new manifests cannot resurrect a stopping service.
+fn compare_stopping_preference(
+    left: &ServiceSpecValue,
+    right: &ServiceSpecValue,
+) -> Option<Ordering> {
+    match (left.status, right.status) {
+        (ServiceStatus::Stopping, ServiceStatus::Stopping) => None,
+        (ServiceStatus::Stopping, _) => Some(Ordering::Greater),
+        (_, ServiceStatus::Stopping) => Some(Ordering::Less),
+        _ => None,
+    }
+}
+
+/// Detects an explicit rollback result that should beat the immediately newer deploying epoch.
+fn is_immediate_rollback_result(older: &ServiceSpecValue, newer: &ServiceSpecValue) -> bool {
+    older.service_epoch.saturating_add(1) == newer.service_epoch
+        && newer.status == ServiceStatus::Deploying
+        && matches!(
+            older.status,
+            ServiceStatus::Running | ServiceStatus::Stopped | ServiceStatus::Failed
+        )
+        && carries_rollout_history(older)
+}
+
+/// Blocks cross-manifest reactivation from bypassing a stopped or failed terminal state.
+fn blocks_cross_manifest_reactivation(
+    current: &ServiceSpecValue,
+    candidate: &ServiceSpecValue,
+) -> bool {
+    matches!(
+        current.status,
+        ServiceStatus::Stopped | ServiceStatus::Failed
+    ) && candidate.service_epoch > current.service_epoch
+        && !(candidate.status == ServiceStatus::Deploying && candidate.task_ids.is_empty())
+}
+
+/// Returns true when the spec carries persisted rollout evidence from a failed redeploy.
+fn carries_rollout_history(spec: &ServiceSpecValue) -> bool {
+    spec.rollout.total_steps > 0
+        || spec.rollout.completed_steps > 0
+        || spec.rollout.failed_steps > 0
+        || spec.rollout.max_failures > 0
+        || spec.rollout.last_error.is_some()
+}
+
+/// Compares service specs using the shared causal tuple `(epoch, phase, timestamp, status-rank)`.
+fn compare_causal_tuple(left: &ServiceSpecValue, right: &ServiceSpecValue) -> Ordering {
+    left.service_epoch
+        .cmp(&right.service_epoch)
+        .then_with(|| left.phase_version.cmp(&right.phase_version))
+        .then_with(|| compare_timestamps(&left.updated_at, &right.updated_at))
+        .then_with(|| status_rank(left.status).cmp(&status_rank(right.status)))
+}
+
+/// Parses RFC3339 timestamps for service state comparisons.
+fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+}
+
+/// Compares service timestamps, preferring the most recent valid timestamp.
+fn compare_timestamps(left: &str, right: &str) -> Ordering {
+    match (parse_timestamp(left), parse_timestamp(right)) {
+        (Some(left_ts), Some(right_ts)) => left_ts.cmp(&right_ts),
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Ranks service status values for deterministic selection ordering.
+fn status_rank(status: ServiceStatus) -> u8 {
+    match status {
+        ServiceStatus::Deploying | ServiceStatus::Failed => 0,
+        ServiceStatus::Running => 1,
+        ServiceStatus::Stopping => 2,
+        ServiceStatus::Stopped => 3,
+    }
+}

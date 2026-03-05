@@ -17,7 +17,7 @@ where
         }
         sleep(interval).await;
     }
-    false
+    predicate().await
 }
 
 /// Wait until one operation reaches the expected stage in topology operation storage.

@@ -1,4 +1,5 @@
 pub mod manager;
+pub(crate) mod ordering;
 pub(crate) mod reconcile;
 pub mod registry;
 pub mod service;

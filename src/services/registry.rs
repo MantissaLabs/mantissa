@@ -1,9 +1,8 @@
+use crate::services::ordering::compare_service_specs;
 use crate::services::types::{ServiceSpecValue, compute_service_id};
 use crate::store::service_store::ServiceStore;
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Utc};
 use crdt_store::uuid_key::UuidKey;
-use std::cmp::Ordering;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -84,7 +83,7 @@ fn select_best_service_spec(values: &[ServiceSpecValue]) -> Option<ServiceSpecVa
         match best {
             None => best = Some(value),
             Some(current) => {
-                if should_prefer_candidate(current, value) {
+                if compare_service_specs(value, current).is_gt() {
                     best = Some(value);
                 }
             }
@@ -93,113 +92,15 @@ fn select_best_service_spec(values: &[ServiceSpecValue]) -> Option<ServiceSpecVa
     best.cloned()
 }
 
-/// Decides whether the candidate spec should replace the current selection.
-fn should_prefer_candidate(current: &ServiceSpecValue, candidate: &ServiceSpecValue) -> bool {
-    if current.manifest_id == candidate.manifest_id {
-        return compare_service_causality(current, candidate).is_gt();
-    } else {
-        return should_prefer_manifest_mismatch(current, candidate);
-    }
-}
-
-/// Resolves selection when concurrent values carry different deployment manifests.
-///
-/// This mirrors service-controller gating so stale cross-generation updates cannot resurrect a
-/// stopped service unless they represent a fresh Deploying bootstrap.
-fn should_prefer_manifest_mismatch(
-    current: &ServiceSpecValue,
-    candidate: &ServiceSpecValue,
-) -> bool {
-    if candidate.service_epoch < current.service_epoch {
-        return current.status == crate::services::types::ServiceStatus::Deploying
-            && candidate.service_epoch.saturating_add(1) == current.service_epoch
-            && matches!(
-                candidate.status,
-                crate::services::types::ServiceStatus::Running
-                    | crate::services::types::ServiceStatus::Stopped
-                    | crate::services::types::ServiceStatus::Failed
-            );
-    }
-
-    if candidate.service_epoch == current.service_epoch {
-        return false;
-    }
-
-    use crate::services::types::ServiceStatus;
-
-    match current.status {
-        ServiceStatus::Stopping => false,
-        ServiceStatus::Stopped | ServiceStatus::Failed => {
-            candidate.status == ServiceStatus::Deploying && candidate.task_ids.is_empty()
-        }
-        ServiceStatus::Deploying | ServiceStatus::Running => {
-            matches!(
-                candidate.status,
-                ServiceStatus::Deploying | ServiceStatus::Running
-            )
-        }
-    }
-}
-
-/// Compares service specs by causal tuple `(epoch, phase, timestamp, status-rank)`.
-fn compare_service_causality(current: &ServiceSpecValue, candidate: &ServiceSpecValue) -> Ordering {
-    match candidate.service_epoch.cmp(&current.service_epoch) {
-        Ordering::Equal => {}
-        order => return order,
-    }
-
-    match candidate.phase_version.cmp(&current.phase_version) {
-        Ordering::Equal => {}
-        order => return order,
-    }
-
-    match (
-        parse_timestamp(&current.updated_at),
-        parse_timestamp(&candidate.updated_at),
-    ) {
-        (Some(current_ts), Some(candidate_ts)) => {
-            if candidate_ts > current_ts {
-                return Ordering::Greater;
-            } else if candidate_ts < current_ts {
-                return Ordering::Less;
-            }
-        }
-        (None, Some(_)) => return Ordering::Greater,
-        (Some(_), None) => return Ordering::Less,
-        (None, None) => {}
-    }
-
-    let current_rank = status_rank(current.status);
-    let candidate_rank = status_rank(candidate.status);
-    candidate_rank.cmp(&current_rank)
-}
-
-/// Parses RFC3339 timestamps for service state comparisons.
-fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&Utc))
-        .ok()
-}
-
-/// Ranks service status values for deterministic selection ordering.
-fn status_rank(status: crate::services::types::ServiceStatus) -> u8 {
-    use crate::services::types::ServiceStatus::{Deploying, Failed, Running, Stopped, Stopping};
-    match status {
-        Deploying | Failed => 0,
-        Running => 1,
-        Stopping => 2,
-        Stopped => 3,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::types::ServiceStatus;
     use crate::services::types::ServiceTaskSpecValue;
+    use crate::services::types::{ServiceRolloutState, ServiceStatus};
     use crate::store::service_store::open_service_store;
-    use chrono::Duration as ChronoDuration;
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use redb::Database;
+    use std::cmp::Ordering;
     use tempfile::tempdir;
 
     fn temp_store() -> ServiceStore {
@@ -330,7 +231,7 @@ mod tests {
         );
         candidate.service_epoch = 3;
 
-        assert!(!should_prefer_candidate(&current, &candidate));
+        assert_eq!(compare_service_specs(&candidate, &current), Ordering::Less);
     }
 
     /// Ensures stopped services only accept manifest-mismatch Deploying bootstrap candidates.
@@ -348,7 +249,10 @@ mod tests {
         );
         candidate.service_epoch = 5;
 
-        assert!(should_prefer_candidate(&current, &candidate));
+        assert_eq!(
+            compare_service_specs(&candidate, &current),
+            Ordering::Greater
+        );
     }
 
     /// Ensures stopped services reject manifest-mismatch Deploying candidates with task ids.
@@ -366,12 +270,12 @@ mod tests {
         );
         candidate.service_epoch = 7;
 
-        assert!(!should_prefer_candidate(&current, &candidate));
+        assert_eq!(compare_service_specs(&candidate, &current), Ordering::Less);
     }
 
-    /// Ensures deploying services prefer immediate prior-generation running rollback candidates.
+    /// Ensures plain prior-generation running values do not override a fresh deploying intent.
     #[test]
-    fn deploying_prefers_previous_generation_running_rollback_candidate() {
+    fn deploying_rejects_previous_generation_running_without_rollout_history() {
         let now = Utc::now();
         let mut current = build_service_value(
             Uuid::new_v4(),
@@ -388,6 +292,40 @@ mod tests {
         );
         candidate.service_epoch = 11;
 
-        assert!(should_prefer_candidate(&current, &candidate));
+        assert_eq!(compare_service_specs(&candidate, &current), Ordering::Less);
+    }
+
+    /// Ensures explicit rollback completions beat the immediately newer deploying generation.
+    #[test]
+    fn deploying_prefers_previous_generation_running_rollback_candidate() {
+        let now = Utc::now();
+        let mut current = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Deploying,
+            now + ChronoDuration::seconds(3),
+            Vec::new(),
+        );
+        current.service_epoch = 12;
+
+        let mut candidate = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Running,
+            now + ChronoDuration::seconds(4),
+            vec![Uuid::new_v4()],
+        );
+        candidate.service_epoch = 11;
+        candidate.rollout = ServiceRolloutState {
+            total_steps: 1,
+            completed_steps: 1,
+            failed_steps: 1,
+            max_failures: 1,
+            last_error: Some("redeploy failed".into()),
+            ..ServiceRolloutState::default()
+        };
+
+        assert_eq!(
+            compare_service_specs(&candidate, &current),
+            Ordering::Greater
+        );
     }
 }

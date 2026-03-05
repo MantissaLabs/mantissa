@@ -1,5 +1,6 @@
 use crate::gossip::Message;
 use crate::registry::Registry;
+use crate::services::ordering::should_accept_service_update;
 use crate::services::reconcile::{
     ReplicaReplacement, ServiceTaskAssignment, compute_change_plan, parse_template_and_replica,
 };
@@ -18,7 +19,6 @@ use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use health::{HealthMonitor, Status as HealthStatus};
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1853,93 +1853,8 @@ fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
         .ok()
 }
 
-fn status_rank(status: ServiceStatus) -> u8 {
-    match status {
-        ServiceStatus::Deploying | ServiceStatus::Failed => 0,
-        ServiceStatus::Running => 1,
-        ServiceStatus::Stopping => 2,
-        ServiceStatus::Stopped => 3,
-    }
-}
-
-/// Compares service specs by causal tuple `(epoch, phase, timestamp, status-rank)`.
-fn compare_service_causality(current: &ServiceSpecValue, incoming: &ServiceSpecValue) -> Ordering {
-    match incoming.service_epoch.cmp(&current.service_epoch) {
-        Ordering::Equal => {}
-        order => return order,
-    }
-
-    match incoming.phase_version.cmp(&current.phase_version) {
-        Ordering::Equal => {}
-        order => return order,
-    }
-
-    match (
-        parse_timestamp(&current.updated_at),
-        parse_timestamp(&incoming.updated_at),
-    ) {
-        (Some(current_ts), Some(incoming_ts)) => {
-            if incoming_ts > current_ts {
-                return Ordering::Greater;
-            } else if incoming_ts < current_ts {
-                return Ordering::Less;
-            }
-        }
-        (None, Some(_)) => return Ordering::Greater,
-        (Some(_), None) => return Ordering::Less,
-        (None, None) => {}
-    }
-
-    let current_rank = status_rank(current.status());
-    let incoming_rank = status_rank(incoming.status());
-    incoming_rank.cmp(&current_rank)
-}
-
 fn should_accept_update(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecValue) -> bool {
-    if let Some(current) = current {
-        if current.manifest_id == incoming.manifest_id {
-            return compare_service_causality(current, incoming).is_gt();
-        } else {
-            return should_accept_manifest_mismatch(current, incoming);
-        }
-    }
-
-    true
-}
-
-/// Validates updates that carry a different deployment manifest id.
-///
-/// Manifest mismatches are sensitive because stale cross-generation updates can resurrect
-/// services after stop. We only allow mismatches that represent a fresh deployment bootstrap.
-fn should_accept_manifest_mismatch(
-    current: &ServiceSpecValue,
-    incoming: &ServiceSpecValue,
-) -> bool {
-    if incoming.service_epoch < current.service_epoch {
-        return current.status() == ServiceStatus::Deploying
-            && incoming.service_epoch.saturating_add(1) == current.service_epoch
-            && matches!(
-                incoming.status(),
-                ServiceStatus::Running | ServiceStatus::Stopped | ServiceStatus::Failed
-            );
-    }
-
-    if incoming.service_epoch == current.service_epoch {
-        return false;
-    }
-
-    match current.status() {
-        ServiceStatus::Stopping => false,
-        ServiceStatus::Stopped | ServiceStatus::Failed => {
-            incoming.status() == ServiceStatus::Deploying && incoming.task_ids.is_empty()
-        }
-        ServiceStatus::Deploying | ServiceStatus::Running => {
-            matches!(
-                incoming.status(),
-                ServiceStatus::Deploying | ServiceStatus::Running
-            )
-        }
-    }
+    should_accept_service_update(current, incoming)
 }
 
 fn should_stop_tasks(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecValue) -> bool {
@@ -2342,7 +2257,30 @@ mod tests {
         assert!(!should_accept_update(Some(&current), &incoming));
     }
 
-    /// Ensures deploying services accept immediate prior-generation running rollback updates.
+    /// Ensures plain prior-generation running values do not override a fresh deploying update.
+    #[test]
+    fn deploying_rejects_previous_generation_running_without_rollout_history() {
+        let now = Utc::now();
+        let mut current = build_service_spec_with_status(
+            Uuid::new_v4(),
+            ServiceStatus::Deploying,
+            now + chrono::Duration::seconds(5),
+            Vec::new(),
+        );
+        current.service_epoch = 11;
+
+        let mut incoming = build_service_spec_with_status(
+            Uuid::new_v4(),
+            ServiceStatus::Running,
+            now + chrono::Duration::seconds(6),
+            vec![Uuid::new_v4()],
+        );
+        incoming.service_epoch = 10;
+
+        assert!(!should_accept_update(Some(&current), &incoming));
+    }
+
+    /// Ensures explicit rollback completions accept immediate prior-generation updates.
     #[test]
     fn deploying_accepts_previous_generation_running_rollback() {
         let now = Utc::now();
@@ -2361,6 +2299,14 @@ mod tests {
             vec![Uuid::new_v4()],
         );
         incoming.service_epoch = 10;
+        incoming.rollout = ServiceRolloutState {
+            total_steps: 1,
+            completed_steps: 1,
+            failed_steps: 1,
+            max_failures: 1,
+            last_error: Some("redeploy failed".into()),
+            ..ServiceRolloutState::default()
+        };
 
         assert!(should_accept_update(Some(&current), &incoming));
     }
