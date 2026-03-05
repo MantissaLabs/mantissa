@@ -64,6 +64,9 @@ fn compare_stopping_preference(
 }
 
 /// Detects an explicit rollback result that should beat the immediately newer deploying epoch.
+///
+/// The prior generation must also be timestamp-fresher than the deploying generation so stale
+/// historical values cannot block a fresh deployment bootstrap.
 fn is_immediate_rollback_result(older: &ServiceSpecValue, newer: &ServiceSpecValue) -> bool {
     older.service_epoch.saturating_add(1) == newer.service_epoch
         && newer.status == ServiceStatus::Deploying
@@ -72,6 +75,7 @@ fn is_immediate_rollback_result(older: &ServiceSpecValue, newer: &ServiceSpecVal
             ServiceStatus::Running | ServiceStatus::Stopped | ServiceStatus::Failed
         )
         && carries_rollout_history(older)
+        && compare_timestamps(&older.updated_at, &newer.updated_at).is_gt()
 }
 
 /// Blocks cross-manifest reactivation from bypassing a stopped or failed terminal state.

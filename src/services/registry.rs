@@ -295,6 +295,37 @@ mod tests {
         assert_eq!(compare_service_specs(&candidate, &current), Ordering::Less);
     }
 
+    /// Ensures stale prior-generation failed values cannot block a fresh deploy bootstrap.
+    #[test]
+    fn deploying_rejects_previous_generation_failed_rollout_history_when_stale() {
+        let now = Utc::now();
+        let mut current = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Deploying,
+            now + ChronoDuration::seconds(3),
+            Vec::new(),
+        );
+        current.service_epoch = 22;
+
+        let mut candidate = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Failed,
+            now,
+            vec![Uuid::new_v4()],
+        );
+        candidate.service_epoch = 21;
+        candidate.rollout = ServiceRolloutState {
+            total_steps: 1,
+            completed_steps: 0,
+            failed_steps: 1,
+            max_failures: 1,
+            last_error: Some("older failed generation".into()),
+            ..ServiceRolloutState::default()
+        };
+
+        assert_eq!(compare_service_specs(&candidate, &current), Ordering::Less);
+    }
+
     /// Ensures explicit rollback completions beat the immediately newer deploying generation.
     #[test]
     fn deploying_prefers_previous_generation_running_rollback_candidate() {
