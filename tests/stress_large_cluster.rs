@@ -5,7 +5,9 @@ mod common;
 use anyhow::{Context, Result, bail};
 use client::config::ClientConfig;
 use client::connection;
-use client::services::manifest::{ServiceManifest, TaskResources, TaskSpec as ManifestTaskSpec};
+use client::services::manifest::{
+    ServiceManifest, ServiceUpdateStrategy, TaskResources, TaskSpec as ManifestTaskSpec,
+};
 use client::services::{ServiceDeploymentHandle, deploy_manifest};
 use common::convergence::wait_until;
 use mantissa::cluster::ClusterViewId;
@@ -104,6 +106,7 @@ fn write_stress_config(root: &Path) -> Result<PathBuf> {
 fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
     ServiceManifest {
         name: name.to_string(),
+        update: ServiceUpdateStrategy::default(),
         tasks: vec![ManifestTaskSpec {
             name: "stress-backend".to_string(),
             image: "hashicorp/http-echo:1.0.0".to_string(),

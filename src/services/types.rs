@@ -21,6 +21,8 @@ pub struct ServiceSpecValue {
     #[serde(default)]
     pub phase_version: u64,
     #[serde(default)]
+    pub rollout: ServiceRolloutState,
+    #[serde(default)]
     pub status: ServiceStatus,
     #[serde(default)]
     pub reschedule_lock: Option<ServiceRescheduleLock>,
@@ -49,6 +51,7 @@ impl ServiceSpecValue {
             update_strategy: ServiceUpdateStrategy::default(),
             service_epoch: 0,
             phase_version: 0,
+            rollout: ServiceRolloutState::default(),
             status: ServiceStatus::Running,
             reschedule_lock: None,
         }
@@ -73,6 +76,15 @@ impl ServiceSpecValue {
             self.phase_version = self.phase_version.saturating_add(1);
         }
         self.status = status;
+        self.touch();
+    }
+
+    /// Updates rollout progress metadata and advances causal ordering when values change.
+    pub fn set_rollout(&mut self, rollout: ServiceRolloutState) {
+        if self.rollout != rollout {
+            self.phase_version = self.phase_version.saturating_add(1);
+        }
+        self.rollout = rollout;
         self.touch();
     }
 }
@@ -123,6 +135,47 @@ pub struct ServiceUpdateStrategy {
     pub mode: ServiceUpdateStrategyMode,
     #[serde(default)]
     pub rolling: ServiceRollingUpdatePolicy,
+}
+
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceRolloutPhase {
+    #[default]
+    Idle,
+    RollingForward,
+    RollingBack,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceRolloutState {
+    #[serde(default)]
+    pub phase: ServiceRolloutPhase,
+    #[serde(default)]
+    pub total_steps: u32,
+    #[serde(default)]
+    pub completed_steps: u32,
+    #[serde(default)]
+    pub failed_steps: u32,
+    #[serde(default)]
+    pub max_failures: u16,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+impl Default for ServiceRolloutState {
+    fn default() -> Self {
+        Self {
+            phase: ServiceRolloutPhase::Idle,
+            total_steps: 0,
+            completed_steps: 0,
+            failed_steps: 0,
+            max_failures: 0,
+            last_error: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]

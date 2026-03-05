@@ -2,9 +2,10 @@ use crate::network::types::compute_network_id;
 use crate::services::manager::ServiceController;
 use crate::services::types::{
     ServiceEvent, ServicePortProtocol, ServiceRescheduleLock, ServiceRescheduleReason,
-    ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceSpecValue, ServiceStatus,
-    ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
-    ServiceTaskSpecValue, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
+    ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
+    ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
+    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy,
+    ServiceUpdateStrategyMode,
 };
 use crate::task::capnp_codec::{
     decode_env_vars, decode_secret_files, encode_env_vars, encode_secret_files,
@@ -127,6 +128,7 @@ pub(crate) fn write_service_spec(
     builder.set_updated_at(&value.updated_at);
     builder.set_service_epoch(value.service_epoch);
     builder.set_phase_version(value.phase_version);
+    write_rollout_state(builder.reborrow().init_rollout(), &value.rollout);
     write_update_strategy(
         builder.reborrow().init_update_strategy(),
         &value.update_strategy,
@@ -208,6 +210,11 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
     value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
     value.service_epoch = reader.get_service_epoch();
     value.phase_version = reader.get_phase_version();
+    value.rollout = if reader.has_rollout() {
+        read_rollout_state(reader.get_rollout()?)?
+    } else {
+        ServiceRolloutState::default()
+    };
     value.status = proto_to_service_status(reader.get_status()?);
     value.update_strategy = if reader.has_update_strategy() {
         read_update_strategy(reader.get_update_strategy()?)?
@@ -220,6 +227,55 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
         None
     };
     Ok(value)
+}
+
+/// Encodes rollout diagnostics and progress counters into the service wire payload.
+fn write_rollout_state(
+    mut builder: protocol::services::rollout_state::Builder<'_>,
+    rollout: &ServiceRolloutState,
+) {
+    let phase = match rollout.phase {
+        ServiceRolloutPhase::Idle => protocol::services::RolloutPhase::Idle,
+        ServiceRolloutPhase::RollingForward => protocol::services::RolloutPhase::RollingForward,
+        ServiceRolloutPhase::RollingBack => protocol::services::RolloutPhase::RollingBack,
+        ServiceRolloutPhase::Failed => protocol::services::RolloutPhase::Failed,
+    };
+    builder.set_phase(phase);
+    builder.set_total_steps(rollout.total_steps);
+    builder.set_completed_steps(rollout.completed_steps);
+    builder.set_failed_steps(rollout.failed_steps);
+    builder.set_max_failures(rollout.max_failures);
+    if let Some(last_error) = rollout.last_error.as_ref() {
+        builder.set_last_error(last_error);
+    } else {
+        builder.set_last_error("");
+    }
+}
+
+/// Decodes rollout diagnostics and progress counters from the service wire payload.
+fn read_rollout_state(
+    reader: protocol::services::rollout_state::Reader<'_>,
+) -> Result<ServiceRolloutState, Error> {
+    let phase = match reader.get_phase() {
+        Ok(protocol::services::RolloutPhase::Idle) => ServiceRolloutPhase::Idle,
+        Ok(protocol::services::RolloutPhase::RollingForward) => ServiceRolloutPhase::RollingForward,
+        Ok(protocol::services::RolloutPhase::RollingBack) => ServiceRolloutPhase::RollingBack,
+        Ok(protocol::services::RolloutPhase::Failed) => ServiceRolloutPhase::Failed,
+        Err(_) => ServiceRolloutPhase::Idle,
+    };
+    let last_error = reader.get_last_error()?.to_str()?.trim().to_string();
+    Ok(ServiceRolloutState {
+        phase,
+        total_steps: reader.get_total_steps(),
+        completed_steps: reader.get_completed_steps(),
+        failed_steps: reader.get_failed_steps(),
+        max_failures: reader.get_max_failures(),
+        last_error: if last_error.is_empty() {
+            None
+        } else {
+            Some(last_error)
+        },
+    })
 }
 
 fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSpecValue, Error> {

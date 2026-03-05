@@ -20,8 +20,9 @@ use mantissa::scheduler::SlotReservationRequest;
 use mantissa::scheduler::SlotState;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
-    ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
-    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
+    ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceStatus,
+    ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
+    ServiceTaskSpecValue, ServiceUpdateStrategy,
 };
 use mantissa::task::container::ContainerState;
 use mantissa::task::manager::TaskManager;
@@ -1732,6 +1733,130 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
     assert_eq!(
         rolled_back.task_ids, baseline_task_ids,
         "failed rollout should restore previous task assignments"
+    );
+});
+
+local_test!(services_redeploy_enforces_max_failures_budget, {
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+    let node = TestNode::new().await;
+
+    let service_name = "redeploy-max-failures";
+    let manifest_name = "redeploy-max-failures";
+
+    let tasks = vec![ServiceTaskSpecValue {
+        name: "echo".into(),
+        image: "alpine:3.20".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "while true; do sleep 1; done".into(),
+        ],
+        replicas: 1,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        health_port: None,
+        health_command: None,
+        public_port: None,
+        public_protocol: None,
+    }];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
+        .await
+        .expect("submit baseline deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "baseline deployment should reach running"
+    );
+
+    let baseline_spec = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read baseline spec")
+        .expect("baseline spec present");
+    let baseline_manifest_id = baseline_spec.manifest_id;
+    let baseline_task_ids = baseline_spec.task_ids.clone();
+
+    let mut failing_tasks = tasks;
+    failing_tasks[0].cpu_millis = 500_000;
+    failing_tasks[0].memory_bytes = 8 * 1024 * 1024 * 1024;
+
+    let strategy = ServiceUpdateStrategy {
+        rolling: ServiceRollingUpdatePolicy {
+            parallelism: 1,
+            order: ServiceRolloutOrder::StartFirst,
+            monitor_secs: 1,
+            max_failures: 2,
+            auto_rollback: true,
+        },
+        ..ServiceUpdateStrategy::default()
+    };
+
+    node.node
+        .service_controller
+        .submit_deployment_with_strategy(
+            Uuid::new_v4(),
+            manifest_name,
+            service_name,
+            failing_tasks,
+            strategy,
+        )
+        .await
+        .expect("submit failing redeployment with max_failures");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "failing redeployment should roll back to running"
+    );
+
+    let rolled_back = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read rolled back spec")
+        .expect("rolled back spec present");
+    assert_eq!(
+        rolled_back.manifest_id, baseline_manifest_id,
+        "failing rollout should keep previous manifest after rollback"
+    );
+    assert_eq!(
+        rolled_back.task_ids, baseline_task_ids,
+        "failing rollout should keep previous task ids after rollback"
+    );
+    assert_eq!(
+        rolled_back.rollout.phase,
+        ServiceRolloutPhase::Idle,
+        "rollback-complete state should return rollout phase to idle"
+    );
+    assert_eq!(
+        rolled_back.rollout.failed_steps, 2,
+        "rollout should fail once the configured failure budget is exhausted"
+    );
+    assert!(
+        rolled_back.rollout.last_error.is_some(),
+        "rollout diagnostics should include the last failure reason"
     );
 });
 

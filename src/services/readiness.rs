@@ -1,5 +1,5 @@
 use super::ServiceController;
-use crate::services::types::{ServiceEvent, ServiceSpecValue, ServiceStatus};
+use crate::services::types::{ServiceEvent, ServiceRolloutState, ServiceSpecValue, ServiceStatus};
 use crate::task::container::ContainerState;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -68,6 +68,7 @@ pub(super) async fn start_readiness_wait(
         {
             ReadinessOutcome::Success(snapshot) => {
                 let mut running_spec = snapshot.clone();
+                running_spec.set_rollout(ServiceRolloutState::default());
                 running_spec.set_status(ServiceStatus::Running);
                 match controller.apply_upsert(running_spec.clone()).await {
                     Ok(_) => {
@@ -343,6 +344,7 @@ async fn mark_service_failed(
     controller.stop_tasks(&spec).await;
 
     let mut failed_spec = spec.clone();
+    failed_spec.set_rollout(ServiceRolloutState::default());
     failed_spec.set_status(ServiceStatus::Failed);
 
     if let Err(err) = controller.apply_upsert(failed_spec.clone()).await {

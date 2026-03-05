@@ -137,6 +137,40 @@ enum ServiceStatus {
   # Service failed to deploy or reconcile.
 }
 
+enum RolloutPhase {
+  idle @0;
+  # No rollout currently in progress.
+
+  rollingForward @1;
+  # Service is progressing through forward replacement steps.
+
+  rollingBack @2;
+  # Service is restoring the previous generation after rollout failure.
+
+  failed @3;
+  # Rollout failed and could not complete rollback.
+}
+
+struct RolloutState {
+  phase @0 :RolloutPhase;
+  # Current rollout phase.
+
+  totalSteps @1 :UInt32;
+  # Total replacement/removal steps planned for the rollout.
+
+  completedSteps @2 :UInt32;
+  # Number of rollout steps completed successfully.
+
+  failedSteps @3 :UInt32;
+  # Number of rollout steps that failed.
+
+  maxFailures @4 :UInt16;
+  # Maximum failed rollout steps tolerated before failure.
+
+  lastError @5 :Text;
+  # Most recent rollout failure reason when one is known.
+}
+
 enum RescheduleReason {
   missingReplicas @0;
   # Too few replicas are running.
@@ -204,6 +238,9 @@ struct ServiceSpec {
 
   phaseVersion @11 :UInt64;
   # Monotonic phase counter within one deployment generation.
+
+  rollout @12 :RolloutState;
+  # Rollout progress and last failure diagnostics.
 }
 
 struct ServiceEvent {

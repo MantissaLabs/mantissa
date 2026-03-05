@@ -5,8 +5,9 @@ use crate::services::reconcile::{
 };
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServiceEvent, ServiceRolloutOrder, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
-    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy, compute_service_id,
+    ServiceEvent, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue,
+    ServiceStatus, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
+    ServiceUpdateStrategy, compute_service_id,
 };
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
@@ -552,6 +553,10 @@ impl ServiceController {
         let rollout_parallelism = update_strategy.rolling.parallelism.max(1) as usize;
         let rollout_monitor_secs = update_strategy.rolling.monitor_secs.max(1);
         let rollout_order = update_strategy.rolling.order;
+        let rollout_max_failures = update_strategy.rolling.max_failures;
+        let rollout_total_steps = replace.len().saturating_add(remove.len()) as u32;
+        let mut rollout_completed_steps: u32 = 0;
+        let mut rollout_failed_steps: u32 = 0;
 
         tracing::info!(
             target: "services",
@@ -565,6 +570,19 @@ impl ServiceController {
             rollout_monitor_secs,
             update_strategy.rolling.auto_rollback
         );
+        self.persist_rollout_state(
+            current_spec.id,
+            manifest_id,
+            ServiceRolloutState {
+                phase: ServiceRolloutPhase::RollingForward,
+                total_steps: rollout_total_steps,
+                completed_steps: rollout_completed_steps,
+                failed_steps: rollout_failed_steps,
+                max_failures: rollout_max_failures,
+                last_error: None,
+            },
+        )
+        .await;
 
         let eligible_nodes = self.collect_eligible_nodes();
         let replacement_requests = build_replacement_requests(
@@ -597,6 +615,7 @@ impl ServiceController {
             let end = (replacement_cursor + rollout_parallelism).min(replace.len());
             let replacement_chunk = &replace[replacement_cursor..end];
             let request_chunk = replacement_requests[replacement_cursor..end].to_vec();
+            let mut replacement_chunk_failed = false;
 
             if matches!(rollout_order, ServiceRolloutOrder::StopFirst) {
                 for replacement in replacement_chunk {
@@ -610,13 +629,35 @@ impl ServiceController {
                             )
                             .await
                         {
-                            rollout_error = Some(err);
+                            rollout_failed_steps = rollout_failed_steps.saturating_add(1);
+                            self.persist_rollout_state(
+                                current_spec.id,
+                                manifest_id,
+                                ServiceRolloutState {
+                                    phase: ServiceRolloutPhase::RollingForward,
+                                    total_steps: rollout_total_steps,
+                                    completed_steps: rollout_completed_steps,
+                                    failed_steps: rollout_failed_steps,
+                                    max_failures: rollout_max_failures,
+                                    last_error: Some(err.to_string()),
+                                },
+                            )
+                            .await;
+                            if rollout_failed_steps >= rollout_max_failures as u32 {
+                                rollout_error = Some(err);
+                            } else {
+                                replacement_chunk_failed = true;
+                            }
                             break;
                         }
                     }
                 }
                 if rollout_error.is_some() {
                     break;
+                }
+                if replacement_chunk_failed {
+                    sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+                    continue;
                 }
             }
 
@@ -626,18 +667,51 @@ impl ServiceController {
             {
                 Ok(specs) => specs,
                 Err(err) => {
-                    rollout_error = Some(err);
-                    break;
+                    rollout_failed_steps = rollout_failed_steps.saturating_add(1);
+                    self.persist_rollout_state(
+                        current_spec.id,
+                        manifest_id,
+                        ServiceRolloutState {
+                            phase: ServiceRolloutPhase::RollingForward,
+                            total_steps: rollout_total_steps,
+                            completed_steps: rollout_completed_steps,
+                            failed_steps: rollout_failed_steps,
+                            max_failures: rollout_max_failures,
+                            last_error: Some(err.to_string()),
+                        },
+                    )
+                    .await;
+                    if rollout_failed_steps >= rollout_max_failures as u32 {
+                        rollout_error = Some(err);
+                        break;
+                    }
+                    sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+                    continue;
                 }
             };
 
             if started_specs.len() != replacement_chunk.len() {
-                rollout_error = Some(anyhow!(
+                let err = anyhow!(
                     "replacement count mismatch for '{}': expected {}, got {}",
                     service_name,
                     replacement_chunk.len(),
                     started_specs.len()
-                ));
+                );
+                rollout_failed_steps = rollout_failed_steps.saturating_add(1);
+                self.persist_rollout_state(
+                    current_spec.id,
+                    manifest_id,
+                    ServiceRolloutState {
+                        phase: ServiceRolloutPhase::RollingForward,
+                        total_steps: rollout_total_steps,
+                        completed_steps: rollout_completed_steps,
+                        failed_steps: rollout_failed_steps,
+                        max_failures: rollout_max_failures,
+                        last_error: Some(err.to_string()),
+                    },
+                )
+                .await;
+                rollout_error = Some(err);
                 break;
             }
 
@@ -654,12 +728,44 @@ impl ServiceController {
                     .wait_rollout_task_running(&service_name, spec.id, rollout_monitor_secs)
                     .await
                 {
-                    rollout_error = Some(err);
+                    rollout_failed_steps = rollout_failed_steps.saturating_add(1);
+                    self.persist_rollout_state(
+                        current_spec.id,
+                        manifest_id,
+                        ServiceRolloutState {
+                            phase: ServiceRolloutPhase::RollingForward,
+                            total_steps: rollout_total_steps,
+                            completed_steps: rollout_completed_steps,
+                            failed_steps: rollout_failed_steps,
+                            max_failures: rollout_max_failures,
+                            last_error: Some(err.to_string()),
+                        },
+                    )
+                    .await;
+                    if rollout_failed_steps >= rollout_max_failures as u32 {
+                        rollout_error = Some(err);
+                    }
+                    replacement_chunk_failed = true;
+                    for started in &started_specs {
+                        if let Err(stop_err) = self.task_manager.request_task_stop(started.id).await
+                        {
+                            tracing::warn!(
+                                target: "services",
+                                "failed to stop unhealthy replacement task {} for service '{}': {stop_err}",
+                                started.id,
+                                service_name
+                            );
+                        }
+                    }
                     break;
                 }
             }
             if rollout_error.is_some() {
                 break;
+            }
+            if replacement_chunk_failed {
+                sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+                continue;
             }
 
             if matches!(rollout_order, ServiceRolloutOrder::StartFirst) {
@@ -674,7 +780,25 @@ impl ServiceController {
                             )
                             .await
                         {
-                            rollout_error = Some(err);
+                            rollout_failed_steps = rollout_failed_steps.saturating_add(1);
+                            self.persist_rollout_state(
+                                current_spec.id,
+                                manifest_id,
+                                ServiceRolloutState {
+                                    phase: ServiceRolloutPhase::RollingForward,
+                                    total_steps: rollout_total_steps,
+                                    completed_steps: rollout_completed_steps,
+                                    failed_steps: rollout_failed_steps,
+                                    max_failures: rollout_max_failures,
+                                    last_error: Some(err.to_string()),
+                                },
+                            )
+                            .await;
+                            if rollout_failed_steps >= rollout_max_failures as u32 {
+                                rollout_error = Some(err);
+                            } else {
+                                replacement_chunk_failed = true;
+                            }
                             break;
                         }
                     }
@@ -682,8 +806,27 @@ impl ServiceController {
                 if rollout_error.is_some() {
                     break;
                 }
+                if replacement_chunk_failed {
+                    sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+                    continue;
+                }
             }
 
+            rollout_completed_steps =
+                rollout_completed_steps.saturating_add(replacement_chunk.len() as u32);
+            self.persist_rollout_state(
+                current_spec.id,
+                manifest_id,
+                ServiceRolloutState {
+                    phase: ServiceRolloutPhase::RollingForward,
+                    total_steps: rollout_total_steps,
+                    completed_steps: rollout_completed_steps,
+                    failed_steps: rollout_failed_steps,
+                    max_failures: rollout_max_failures,
+                    last_error: None,
+                },
+            )
+            .await;
             replacement_cursor = end;
         }
 
@@ -692,6 +835,7 @@ impl ServiceController {
             while remove_cursor < remove.len() {
                 let end = (remove_cursor + rollout_parallelism).min(remove.len());
                 let remove_chunk = &remove[remove_cursor..end];
+                let mut remove_chunk_failed = false;
                 for assignment in remove_chunk {
                     if let Err(err) = self
                         .stop_task_and_track_rollback(
@@ -702,13 +846,50 @@ impl ServiceController {
                         )
                         .await
                     {
-                        rollout_error = Some(err);
+                        rollout_failed_steps = rollout_failed_steps.saturating_add(1);
+                        self.persist_rollout_state(
+                            current_spec.id,
+                            manifest_id,
+                            ServiceRolloutState {
+                                phase: ServiceRolloutPhase::RollingForward,
+                                total_steps: rollout_total_steps,
+                                completed_steps: rollout_completed_steps,
+                                failed_steps: rollout_failed_steps,
+                                max_failures: rollout_max_failures,
+                                last_error: Some(err.to_string()),
+                            },
+                        )
+                        .await;
+                        if rollout_failed_steps >= rollout_max_failures as u32 {
+                            rollout_error = Some(err);
+                        } else {
+                            remove_chunk_failed = true;
+                        }
                         break;
                     }
                 }
                 if rollout_error.is_some() {
                     break;
                 }
+                if remove_chunk_failed {
+                    sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+                    continue;
+                }
+                rollout_completed_steps =
+                    rollout_completed_steps.saturating_add(remove_chunk.len() as u32);
+                self.persist_rollout_state(
+                    current_spec.id,
+                    manifest_id,
+                    ServiceRolloutState {
+                        phase: ServiceRolloutPhase::RollingForward,
+                        total_steps: rollout_total_steps,
+                        completed_steps: rollout_completed_steps,
+                        failed_steps: rollout_failed_steps,
+                        max_failures: rollout_max_failures,
+                        last_error: None,
+                    },
+                )
+                .await;
                 remove_cursor = end;
             }
         }
@@ -721,6 +902,10 @@ impl ServiceController {
                 &current_spec,
                 previous_status,
                 rollout_monitor_secs,
+                rollout_total_steps,
+                rollout_completed_steps,
+                rollout_failed_steps,
+                rollout_max_failures,
                 &rollback_new_task_ids,
                 &rollback_old_tasks,
                 err,
@@ -739,6 +924,7 @@ impl ServiceController {
         );
         next_spec.update_strategy = update_strategy;
         next_spec.service_epoch = current_spec.service_epoch.saturating_add(1);
+        next_spec.set_rollout(ServiceRolloutState::default());
         next_spec.set_status(ServiceStatus::Deploying);
         self.apply_upsert(next_spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(next_spec.clone()))
@@ -984,6 +1170,39 @@ impl ServiceController {
         Ok(())
     }
 
+    /// Persists rollout progress metadata on the active service generation, when still current.
+    async fn persist_rollout_state(
+        &self,
+        service_id: Uuid,
+        manifest_id: Uuid,
+        rollout: ServiceRolloutState,
+    ) {
+        match self.registry.get(service_id) {
+            Ok(Some(mut spec)) if spec.manifest_id == manifest_id => {
+                spec.set_rollout(rollout);
+                if let Err(err) = self.apply_upsert(spec.clone()).await {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to persist rollout state for '{}': {err}",
+                        spec.service_name
+                    );
+                } else if let Err(err) = self.broadcast(ServiceEvent::Upsert(spec)).await {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to broadcast rollout state for service {service_id}: {err}",
+                    );
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    target: "services",
+                    "failed to load service {service_id} while persisting rollout state: {err}",
+                );
+            }
+        }
+    }
+
     /// Handles a failed rolling redeployment by rolling back or failing the active generation.
     async fn handle_rollout_failure(
         &self,
@@ -993,6 +1212,10 @@ impl ServiceController {
         current_spec: &ServiceSpecValue,
         previous_status: ServiceStatus,
         rollout_monitor_secs: u32,
+        rollout_total_steps: u32,
+        rollout_completed_steps: u32,
+        rollout_failed_steps: u32,
+        rollout_max_failures: u16,
         rollback_new_task_ids: &HashSet<Uuid>,
         rollback_old_tasks: &HashMap<Uuid, RollbackTaskRecord>,
         rollout_error: anyhow::Error,
@@ -1004,6 +1227,20 @@ impl ServiceController {
         );
 
         if update_strategy.rolling.auto_rollback {
+            self.persist_rollout_state(
+                current_spec.id,
+                manifest_id,
+                ServiceRolloutState {
+                    phase: ServiceRolloutPhase::RollingBack,
+                    total_steps: rollout_total_steps,
+                    completed_steps: rollout_completed_steps,
+                    failed_steps: rollout_failed_steps,
+                    max_failures: rollout_max_failures,
+                    last_error: Some(rollout_error.to_string()),
+                },
+            )
+            .await;
+
             match self
                 .rollback_redeployment_tasks(
                     service_name,
@@ -1016,6 +1253,14 @@ impl ServiceController {
             {
                 Ok(()) => {
                     let mut rollback_spec = current_spec.clone();
+                    rollback_spec.set_rollout(ServiceRolloutState {
+                        phase: ServiceRolloutPhase::Idle,
+                        total_steps: rollout_total_steps,
+                        completed_steps: rollout_completed_steps,
+                        failed_steps: rollout_failed_steps,
+                        max_failures: rollout_max_failures,
+                        last_error: Some(rollout_error.to_string()),
+                    });
                     rollback_spec.set_status(previous_status);
 
                     if let Err(err) = self.apply_upsert(rollback_spec.clone()).await {
@@ -1054,6 +1299,14 @@ impl ServiceController {
 
         match self.registry.get(current_spec.id) {
             Ok(Some(mut failed_spec)) if failed_spec.manifest_id == manifest_id => {
+                failed_spec.set_rollout(ServiceRolloutState {
+                    phase: ServiceRolloutPhase::Failed,
+                    total_steps: rollout_total_steps,
+                    completed_steps: rollout_completed_steps,
+                    failed_steps: rollout_failed_steps,
+                    max_failures: rollout_max_failures,
+                    last_error: Some(rollout_error.to_string()),
+                });
                 failed_spec.set_status(ServiceStatus::Failed);
                 if let Err(err) = self.apply_upsert(failed_spec.clone()).await {
                     tracing::warn!(
