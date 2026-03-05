@@ -82,6 +82,44 @@ struct RestartPolicy {
   # -1 indicates unset for policies that support retries.
 }
 
+enum RolloutOrder {
+  startFirst @0;
+  # Launch the replacement replica before stopping the previous one.
+
+  stopFirst @1;
+  # Stop the previous replica before launching the replacement.
+}
+
+struct RollingUpdatePolicy {
+  parallelism @0 :UInt16;
+  # Maximum replica slots updated concurrently.
+
+  order @1 :RolloutOrder;
+  # Replacement ordering for each slot.
+
+  monitorSecs @2 :UInt32;
+  # Stabilization window after each step before the rollout advances.
+
+  maxFailures @3 :UInt16;
+  # Maximum failed rollout steps before marking the rollout failed.
+
+  autoRollback @4 :Bool;
+  # When true, automatically roll back to the previous template on failure.
+}
+
+enum UpdateStrategyMode {
+  rolling @0;
+  # Rolling update strategy.
+}
+
+struct UpdateStrategy {
+  mode @0 :UpdateStrategyMode;
+  # Selected update strategy implementation.
+
+  rolling @1 :RollingUpdatePolicy;
+  # Rolling update policy parameters.
+}
+
 enum ServiceStatus {
   deploying @0;
   # Service is deploying or reconciling.
@@ -157,6 +195,15 @@ struct ServiceSpec {
 
   rescheduleLock @8 :RescheduleLock;
   # Active reschedule lock (empty when unlocked).
+
+  updateStrategy @9 :UpdateStrategy;
+  # Strategy used for service rollout updates.
+
+  serviceEpoch @10 :UInt64;
+  # Causal generation counter incremented on each new deployment manifest.
+
+  phaseVersion @11 :UInt64;
+  # Monotonic phase counter within one deployment generation.
 }
 
 struct ServiceEvent {
@@ -187,6 +234,9 @@ struct ServiceDeploySpec {
 
   tasks @3 :List(TaskTemplate);
   # Desired task templates composing the service
+
+  updateStrategy @4 :UpdateStrategy;
+  # Desired rollout strategy for this deployment generation.
 }
 
 interface Services {

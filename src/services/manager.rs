@@ -5,8 +5,8 @@ use crate::services::reconcile::{
 };
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServiceEvent, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
-    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, compute_service_id,
+    ServiceEvent, ServiceRolloutOrder, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
+    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy, compute_service_id,
 };
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::time::interval;
+use tokio::time::{interval, sleep};
 use uuid::Uuid;
 
 #[path = "ownership.rs"]
@@ -46,6 +46,10 @@ const SERVICE_SLOT_MISSING_GRACE_SECS: u64 = 6;
 const SERVICE_REBALANCE_MIN_AGE_SECS: i64 = 20;
 /// Cooldown window between rebalance attempts for the same slot.
 const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
+/// Maximum time to wait for one rollout task to report running.
+const SERVICE_ROLLOUT_STEP_TIMEOUT_SECS: u64 = 120;
+/// Poll interval while waiting on rollout task readiness transitions.
+const SERVICE_ROLLOUT_POLL_INTERVAL_MS: u64 = 200;
 /// Proactive slot rebalance keeps long-lived running services aligned with deterministic ownership.
 ///
 /// This is required for split/merge convergence so replicas migrate off overloaded partitions once
@@ -179,12 +183,32 @@ impl ServiceController {
 
     /// Schedules an asynchronous deployment for the provided service manifest and returns
     /// the deterministic service identifier so the caller can track progress separately.
+    #[allow(dead_code)]
     pub async fn submit_deployment(
         &self,
         manifest_id: Uuid,
         manifest_name: impl Into<String>,
         service_name: impl Into<String>,
         tasks: Vec<ServiceTaskSpecValue>,
+    ) -> anyhow::Result<Uuid> {
+        self.submit_deployment_with_strategy(
+            manifest_id,
+            manifest_name,
+            service_name,
+            tasks,
+            ServiceUpdateStrategy::default(),
+        )
+        .await
+    }
+
+    /// Schedules an asynchronous deployment with explicit rollout strategy configuration.
+    pub async fn submit_deployment_with_strategy(
+        &self,
+        manifest_id: Uuid,
+        manifest_name: impl Into<String>,
+        service_name: impl Into<String>,
+        tasks: Vec<ServiceTaskSpecValue>,
+        update_strategy: ServiceUpdateStrategy,
     ) -> anyhow::Result<Uuid> {
         let manifest_name = manifest_name.into();
         let service_name = service_name.into();
@@ -212,6 +236,8 @@ impl ServiceController {
             pending_spec.manifest_id = manifest_id;
             pending_spec.manifest_name = manifest_name.clone();
             pending_spec.tasks = tasks.clone();
+            pending_spec.update_strategy = update_strategy.clone();
+            pending_spec.start_new_generation();
             // A new deployment generation must start from an empty assignment set so peers can
             // observe a clean Deploying bootstrap before task ids are repopulated.
             pending_spec.task_ids.clear();
@@ -233,6 +259,7 @@ impl ServiceController {
                 service_name,
                 templates: tasks,
                 current_spec,
+                update_strategy,
             };
 
             let controller = self.clone();
@@ -255,6 +282,7 @@ impl ServiceController {
             tasks.clone(),
             Vec::new(),
         );
+        pending_spec.update_strategy = update_strategy.clone();
         pending_spec.set_status(ServiceStatus::Deploying);
         self.apply_upsert(pending_spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(pending_spec)).await?;
@@ -264,6 +292,7 @@ impl ServiceController {
             manifest_name,
             service_name,
             templates: tasks,
+            update_strategy,
         };
 
         let controller = self.clone();
@@ -379,6 +408,7 @@ impl ServiceController {
             manifest_name,
             service_name,
             templates,
+            update_strategy,
         } = job;
 
         let service_id = compute_service_id(&service_name);
@@ -393,6 +423,8 @@ impl ServiceController {
                 templates,
                 Vec::new(),
             );
+            let mut spec = spec;
+            spec.update_strategy = update_strategy;
             self.apply_upsert(spec.clone()).await?;
             self.broadcast(ServiceEvent::Upsert(spec)).await?;
             tracing::info!(
@@ -458,6 +490,7 @@ impl ServiceController {
             templates,
             task_ids,
         );
+        spec.update_strategy = update_strategy;
         spec.set_status(ServiceStatus::Deploying);
         self.apply_upsert(spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(spec.clone())).await?;
@@ -485,6 +518,7 @@ impl ServiceController {
             service_name,
             templates,
             current_spec,
+            update_strategy,
         } = job;
 
         let previous_status = current_spec.status();
@@ -499,6 +533,8 @@ impl ServiceController {
             updated.manifest_id = manifest_id;
             updated.manifest_name = manifest_name;
             updated.tasks = templates;
+            updated.update_strategy = update_strategy;
+            updated.start_new_generation();
             updated.set_status(previous_status);
             self.apply_upsert(updated.clone()).await?;
             self.broadcast(ServiceEvent::Upsert(updated)).await?;
@@ -513,61 +549,31 @@ impl ServiceController {
         let retain = plan.retain;
         let replace = plan.replace;
         let remove = plan.remove;
+        let rollout_parallelism = update_strategy.rolling.parallelism.max(1) as usize;
+        let rollout_monitor_secs = update_strategy.rolling.monitor_secs.max(1);
+        let rollout_order = update_strategy.rolling.order;
 
         tracing::info!(
             target: "services",
-            "redeployment plan for '{}': {} replacements, {} removals, {} retained replicas",
+            "redeployment plan for '{}': {} replacements, {} removals, {} retained replicas (parallelism={}, order={:?}, monitor={}s, auto_rollback={})",
             service_name,
             replace.len(),
             remove.len(),
-            retain.len()
+            retain.len(),
+            rollout_parallelism,
+            rollout_order,
+            rollout_monitor_secs,
+            update_strategy.rolling.auto_rollback
         );
 
         let eligible_nodes = self.collect_eligible_nodes();
-        let start_requests = build_replacement_requests(
+        let replacement_requests = build_replacement_requests(
             &service_name,
             current_spec.id,
             &templates,
             &replace,
             &eligible_nodes,
         );
-        let mut started_specs = Vec::new();
-        if !start_requests.is_empty() {
-            match self
-                .start_tasks_with_fallback(
-                    start_requests,
-                    &format!("service '{}' redeployment", service_name),
-                )
-                .await
-            {
-                Ok(specs) => {
-                    if specs.len() != replace.len() {
-                        tracing::warn!(
-                            target: "services",
-                            "replacement count mismatch for '{}': expected {}, got {}",
-                            service_name,
-                            replace.len(),
-                            specs.len()
-                        );
-                    }
-                    started_specs = specs;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        target: "services",
-                        "failed to launch replacement replicas for '{}': {err}",
-                        service_name
-                    );
-
-                    let mut rollback = current_spec.clone();
-                    rollback.set_status(previous_status);
-                    self.apply_upsert(rollback.clone()).await?;
-                    self.broadcast(ServiceEvent::Upsert(rollback)).await?;
-                    return Ok(());
-                }
-            }
-        }
-
         let mut assignment_index: BTreeMap<(String, u16), Uuid> = BTreeMap::new();
         for assignment in &retain {
             assignment_index.insert(
@@ -575,12 +581,152 @@ impl ServiceController {
                 assignment.task_id,
             );
         }
+        let old_templates_by_name: HashMap<String, ServiceTaskSpecValue> = current_spec
+            .tasks
+            .iter()
+            .cloned()
+            .map(|template| (template.name.clone(), template))
+            .collect();
+        let mut rollback_new_task_ids: HashSet<Uuid> = HashSet::new();
+        let mut rollback_old_tasks: HashMap<Uuid, RollbackTaskRecord> = HashMap::new();
+        let mut rollout_error: Option<anyhow::Error> = None;
 
-        for (replacement, spec) in replace.iter().zip(started_specs.iter()) {
-            assignment_index.insert(
-                (replacement.template.name.clone(), replacement.replica),
-                spec.id,
-            );
+        let mut replacement_cursor = 0usize;
+        let replacement_context = format!("service '{}' rolling replacement", service_name);
+        while replacement_cursor < replace.len() {
+            let end = (replacement_cursor + rollout_parallelism).min(replace.len());
+            let replacement_chunk = &replace[replacement_cursor..end];
+            let request_chunk = replacement_requests[replacement_cursor..end].to_vec();
+
+            if matches!(rollout_order, ServiceRolloutOrder::StopFirst) {
+                for replacement in replacement_chunk {
+                    if let Some(previous) = replacement.previous.as_ref() {
+                        if let Err(err) = self
+                            .stop_task_and_track_rollback(
+                                &service_name,
+                                previous,
+                                &old_templates_by_name,
+                                &mut rollback_old_tasks,
+                            )
+                            .await
+                        {
+                            rollout_error = Some(err);
+                            break;
+                        }
+                    }
+                }
+                if rollout_error.is_some() {
+                    break;
+                }
+            }
+
+            let started_specs = match self
+                .start_tasks_with_fallback(request_chunk, &replacement_context)
+                .await
+            {
+                Ok(specs) => specs,
+                Err(err) => {
+                    rollout_error = Some(err);
+                    break;
+                }
+            };
+
+            if started_specs.len() != replacement_chunk.len() {
+                rollout_error = Some(anyhow!(
+                    "replacement count mismatch for '{}': expected {}, got {}",
+                    service_name,
+                    replacement_chunk.len(),
+                    started_specs.len()
+                ));
+                break;
+            }
+
+            for (replacement, spec) in replacement_chunk.iter().zip(started_specs.iter()) {
+                rollback_new_task_ids.insert(spec.id);
+                assignment_index.insert(
+                    (replacement.template.name.clone(), replacement.replica),
+                    spec.id,
+                );
+            }
+
+            for spec in &started_specs {
+                if let Err(err) = self
+                    .wait_rollout_task_running(&service_name, spec.id, rollout_monitor_secs)
+                    .await
+                {
+                    rollout_error = Some(err);
+                    break;
+                }
+            }
+            if rollout_error.is_some() {
+                break;
+            }
+
+            if matches!(rollout_order, ServiceRolloutOrder::StartFirst) {
+                for replacement in replacement_chunk {
+                    if let Some(previous) = replacement.previous.as_ref() {
+                        if let Err(err) = self
+                            .stop_task_and_track_rollback(
+                                &service_name,
+                                previous,
+                                &old_templates_by_name,
+                                &mut rollback_old_tasks,
+                            )
+                            .await
+                        {
+                            rollout_error = Some(err);
+                            break;
+                        }
+                    }
+                }
+                if rollout_error.is_some() {
+                    break;
+                }
+            }
+
+            replacement_cursor = end;
+        }
+
+        if rollout_error.is_none() {
+            let mut remove_cursor = 0usize;
+            while remove_cursor < remove.len() {
+                let end = (remove_cursor + rollout_parallelism).min(remove.len());
+                let remove_chunk = &remove[remove_cursor..end];
+                for assignment in remove_chunk {
+                    if let Err(err) = self
+                        .stop_task_and_track_rollback(
+                            &service_name,
+                            assignment,
+                            &old_templates_by_name,
+                            &mut rollback_old_tasks,
+                        )
+                        .await
+                    {
+                        rollout_error = Some(err);
+                        break;
+                    }
+                }
+                if rollout_error.is_some() {
+                    break;
+                }
+                remove_cursor = end;
+            }
+        }
+
+        if let Some(err) = rollout_error {
+            self.handle_rollout_failure(
+                &service_name,
+                manifest_id,
+                &update_strategy,
+                &current_spec,
+                previous_status,
+                rollout_monitor_secs,
+                &rollback_new_task_ids,
+                &rollback_old_tasks,
+                err,
+            )
+            .await;
+            return Ok(());
         }
 
         let ordered_task_ids = order_task_ids(&service_name, &templates, &assignment_index);
@@ -591,6 +737,8 @@ impl ServiceController {
             templates.clone(),
             ordered_task_ids,
         );
+        next_spec.update_strategy = update_strategy;
+        next_spec.service_epoch = current_spec.service_epoch.saturating_add(1);
         next_spec.set_status(ServiceStatus::Deploying);
         self.apply_upsert(next_spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(next_spec.clone()))
@@ -601,30 +749,6 @@ impl ServiceController {
         tokio::task::spawn_local(async move {
             controller.await_service_readiness(readiness_spec).await;
         });
-
-        let mut retire = HashSet::new();
-        for assignment in remove {
-            retire.insert(assignment.task_id);
-        }
-        for replacement in &replace {
-            if let Some(previous) = &replacement.previous {
-                retire.insert(previous.task_id);
-            }
-        }
-
-        if !retire.is_empty() {
-            let controller = self.clone();
-            tokio::task::spawn_local(async move {
-                for task_id in retire {
-                    if let Err(err) = controller.task_manager.request_task_stop(task_id).await {
-                        tracing::warn!(
-                            target: "services",
-                            "failed to stop retired task {task_id}: {err}"
-                        );
-                    }
-                }
-            });
-        }
 
         Ok(())
     }
@@ -674,6 +798,292 @@ impl ServiceController {
     /// alone.
     async fn await_service_readiness(self, initial_spec: ServiceSpecValue) {
         start_readiness_wait(self, initial_spec).await;
+    }
+
+    /// Waits for one rollout task to reach running state and remain stable for the monitor window.
+    async fn wait_rollout_task_running(
+        &self,
+        service_name: &str,
+        task_id: Uuid,
+        monitor_secs: u32,
+    ) -> anyhow::Result<()> {
+        let readiness_deadline =
+            Instant::now() + Duration::from_secs(SERVICE_ROLLOUT_STEP_TIMEOUT_SECS);
+        loop {
+            if Instant::now() >= readiness_deadline {
+                return Err(anyhow!(
+                    "timed out waiting for rollout task {} in service '{}' to reach running",
+                    task_id,
+                    service_name
+                ));
+            }
+
+            let states = self.task_manager.task_state_snapshot(&[task_id]).await?;
+            let state = states
+                .first()
+                .and_then(|(_, state)| state.as_ref())
+                .cloned();
+
+            match state {
+                Some(ContainerState::Running) => break,
+                Some(ContainerState::Pending)
+                | Some(ContainerState::Pulling)
+                | Some(ContainerState::Creating) => {}
+                Some(other) => {
+                    return Err(anyhow!(
+                        "rollout task {} for service '{}' entered terminal state {:?}",
+                        task_id,
+                        service_name,
+                        other
+                    ));
+                }
+                None => {}
+            }
+
+            sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+        }
+
+        let monitor_deadline = Instant::now() + Duration::from_secs(monitor_secs as u64);
+        while Instant::now() < monitor_deadline {
+            let states = self.task_manager.task_state_snapshot(&[task_id]).await?;
+            let state = states
+                .first()
+                .and_then(|(_, state)| state.as_ref())
+                .cloned();
+
+            if !matches!(state, Some(ContainerState::Running)) {
+                return Err(anyhow!(
+                    "rollout task {} for service '{}' became unstable during monitor window: {:?}",
+                    task_id,
+                    service_name,
+                    state
+                ));
+            }
+
+            sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+        }
+
+        Ok(())
+    }
+
+    /// Requests stop for one old task and records enough metadata to restart it during rollback.
+    async fn stop_task_and_track_rollback(
+        &self,
+        service_name: &str,
+        assignment: &ServiceTaskAssignment,
+        old_templates_by_name: &HashMap<String, ServiceTaskSpecValue>,
+        rollback_old_tasks: &mut HashMap<Uuid, RollbackTaskRecord>,
+    ) -> anyhow::Result<()> {
+        self.task_manager
+            .request_task_stop(assignment.task_id)
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "failed to stop old task {} for service '{}' template '{}' replica {}: {err}",
+                    assignment.task_id,
+                    service_name,
+                    assignment.template,
+                    assignment.replica
+                )
+            })?;
+
+        if old_templates_by_name.contains_key(&assignment.template) {
+            rollback_old_tasks
+                .entry(assignment.task_id)
+                .or_insert_with(|| RollbackTaskRecord {
+                    task_id: assignment.task_id,
+                    template: assignment.template.clone(),
+                    replica: assignment.replica,
+                });
+        }
+
+        Ok(())
+    }
+
+    /// Attempts to restore old replicas and stop new ones after a rolling step fails.
+    async fn rollback_redeployment_tasks(
+        &self,
+        service_name: &str,
+        current_spec: &ServiceSpecValue,
+        monitor_secs: u32,
+        rollback_new_task_ids: &HashSet<Uuid>,
+        rollback_old_tasks: &HashMap<Uuid, RollbackTaskRecord>,
+    ) -> anyhow::Result<()> {
+        for task_id in rollback_new_task_ids {
+            if let Err(err) = self.task_manager.request_task_stop(*task_id).await {
+                tracing::warn!(
+                    target: "services",
+                    "failed to stop replacement task {task_id} during rollback of '{}': {err}",
+                    service_name
+                );
+            }
+        }
+
+        if rollback_old_tasks.is_empty() {
+            return Ok(());
+        }
+
+        let old_templates_by_name: HashMap<String, ServiceTaskSpecValue> = current_spec
+            .tasks
+            .iter()
+            .cloned()
+            .map(|template| (template.name.clone(), template))
+            .collect();
+
+        let eligible_nodes = self.collect_eligible_nodes();
+        let slot_targets =
+            compute_slot_targets(current_spec.id, &current_spec.tasks, &eligible_nodes);
+
+        let mut rollback_steps: Vec<RollbackTaskRecord> =
+            rollback_old_tasks.values().cloned().collect();
+        rollback_steps.sort_by(|left, right| {
+            left.template
+                .cmp(&right.template)
+                .then(left.replica.cmp(&right.replica))
+                .then(left.task_id.cmp(&right.task_id))
+        });
+
+        for step in rollback_steps {
+            let template = old_templates_by_name.get(&step.template).ok_or_else(|| {
+                anyhow!(
+                    "rollback template '{}' missing while restoring service '{}'",
+                    step.template,
+                    service_name
+                )
+            })?;
+
+            let key = SlotKey::new(current_spec.id, &step.template, step.replica);
+            let target_node = slot_targets.get(&key).copied();
+            let request = make_replica_request(
+                service_name,
+                template,
+                step.replica,
+                step.task_id,
+                target_node,
+            );
+
+            let started = self
+                .start_tasks_with_fallback(
+                    vec![request],
+                    &format!("service '{}' rollback restart", service_name),
+                )
+                .await?;
+
+            if started.len() != 1 {
+                return Err(anyhow!(
+                    "rollback restart count mismatch for service '{}': expected 1, got {}",
+                    service_name,
+                    started.len()
+                ));
+            }
+
+            self.wait_rollout_task_running(service_name, step.task_id, monitor_secs)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Handles a failed rolling redeployment by rolling back or failing the active generation.
+    async fn handle_rollout_failure(
+        &self,
+        service_name: &str,
+        manifest_id: Uuid,
+        update_strategy: &ServiceUpdateStrategy,
+        current_spec: &ServiceSpecValue,
+        previous_status: ServiceStatus,
+        rollout_monitor_secs: u32,
+        rollback_new_task_ids: &HashSet<Uuid>,
+        rollback_old_tasks: &HashMap<Uuid, RollbackTaskRecord>,
+        rollout_error: anyhow::Error,
+    ) {
+        tracing::warn!(
+            target: "services",
+            "rolling redeployment failed for '{}': {rollout_error:#}",
+            service_name
+        );
+
+        if update_strategy.rolling.auto_rollback {
+            match self
+                .rollback_redeployment_tasks(
+                    service_name,
+                    current_spec,
+                    rollout_monitor_secs,
+                    rollback_new_task_ids,
+                    rollback_old_tasks,
+                )
+                .await
+            {
+                Ok(()) => {
+                    let mut rollback_spec = current_spec.clone();
+                    rollback_spec.set_status(previous_status);
+
+                    if let Err(err) = self.apply_upsert(rollback_spec.clone()).await {
+                        tracing::warn!(
+                            target: "services",
+                            "failed to persist rollback state for '{}': {err}",
+                            service_name
+                        );
+                    } else if let Err(err) =
+                        self.broadcast(ServiceEvent::Upsert(rollback_spec)).await
+                    {
+                        tracing::warn!(
+                            target: "services",
+                            "failed to broadcast rollback state for '{}': {err}",
+                            service_name
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "services",
+                            "rolling redeployment for '{}' rolled back to manifest {}",
+                            service_name,
+                            current_spec.manifest_id
+                        );
+                    }
+                    return;
+                }
+                Err(rollback_err) => {
+                    tracing::warn!(
+                        target: "services",
+                        "rollback execution failed for '{}': {rollback_err:#}",
+                        service_name
+                    );
+                }
+            }
+        }
+
+        match self.registry.get(current_spec.id) {
+            Ok(Some(mut failed_spec)) if failed_spec.manifest_id == manifest_id => {
+                failed_spec.set_status(ServiceStatus::Failed);
+                if let Err(err) = self.apply_upsert(failed_spec.clone()).await {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to persist failed rollout state for '{}': {err}",
+                        service_name
+                    );
+                } else if let Err(err) = self.broadcast(ServiceEvent::Upsert(failed_spec)).await {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to broadcast failed rollout state for '{}': {err}",
+                        service_name
+                    );
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {
+                tracing::warn!(
+                    target: "services",
+                    "rollout failure for '{}' could not mark failed state because active manifest changed",
+                    service_name
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "services",
+                    "rollout failure for '{}' could not load service state: {err}",
+                    service_name
+                );
+            }
+        }
     }
 
     /// Runs the local stop workflow for a service that originated on this node.
@@ -965,6 +1375,7 @@ struct ServiceDeploymentJob {
     manifest_name: String,
     service_name: String,
     templates: Vec<ServiceTaskSpecValue>,
+    update_strategy: ServiceUpdateStrategy,
 }
 
 struct ServiceRedeploymentJob {
@@ -973,6 +1384,14 @@ struct ServiceRedeploymentJob {
     service_name: String,
     templates: Vec<ServiceTaskSpecValue>,
     current_spec: ServiceSpecValue,
+    update_strategy: ServiceUpdateStrategy,
+}
+
+#[derive(Clone, Debug)]
+struct RollbackTaskRecord {
+    task_id: Uuid,
+    template: String,
+    replica: u16,
 }
 
 /// Builds the individual task start requests for every replica defined in the service manifest.
@@ -1124,28 +1543,43 @@ fn status_rank(status: ServiceStatus) -> u8 {
     }
 }
 
+/// Compares service specs by causal tuple `(epoch, phase, timestamp, status-rank)`.
+fn compare_service_causality(current: &ServiceSpecValue, incoming: &ServiceSpecValue) -> Ordering {
+    match incoming.service_epoch.cmp(&current.service_epoch) {
+        Ordering::Equal => {}
+        order => return order,
+    }
+
+    match incoming.phase_version.cmp(&current.phase_version) {
+        Ordering::Equal => {}
+        order => return order,
+    }
+
+    match (
+        parse_timestamp(&current.updated_at),
+        parse_timestamp(&incoming.updated_at),
+    ) {
+        (Some(current_ts), Some(incoming_ts)) => {
+            if incoming_ts > current_ts {
+                return Ordering::Greater;
+            } else if incoming_ts < current_ts {
+                return Ordering::Less;
+            }
+        }
+        (None, Some(_)) => return Ordering::Greater,
+        (Some(_), None) => return Ordering::Less,
+        (None, None) => {}
+    }
+
+    let current_rank = status_rank(current.status());
+    let incoming_rank = status_rank(incoming.status());
+    incoming_rank.cmp(&current_rank)
+}
+
 fn should_accept_update(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecValue) -> bool {
     if let Some(current) = current {
         if current.manifest_id == incoming.manifest_id {
-            let current_rank = status_rank(current.status());
-            let incoming_rank = status_rank(incoming.status());
-
-            match incoming_rank.cmp(&current_rank) {
-                Ordering::Less => return false,
-                Ordering::Equal => {
-                    if let (Some(current_ts), Some(incoming_ts)) = (
-                        parse_timestamp(&current.updated_at),
-                        parse_timestamp(&incoming.updated_at),
-                    ) {
-                        if incoming_ts <= current_ts {
-                            return false;
-                        }
-                    } else {
-                        return false;
-                    }
-                }
-                Ordering::Greater => {}
-            }
+            return compare_service_causality(current, incoming).is_gt();
         } else {
             return should_accept_manifest_mismatch(current, incoming);
         }
@@ -1162,14 +1596,16 @@ fn should_accept_manifest_mismatch(
     current: &ServiceSpecValue,
     incoming: &ServiceSpecValue,
 ) -> bool {
-    let (Some(current_ts), Some(incoming_ts)) = (
-        parse_timestamp(&current.updated_at),
-        parse_timestamp(&incoming.updated_at),
-    ) else {
-        return false;
-    };
+    if incoming.service_epoch < current.service_epoch {
+        return current.status() == ServiceStatus::Deploying
+            && incoming.service_epoch.saturating_add(1) == current.service_epoch
+            && matches!(
+                incoming.status(),
+                ServiceStatus::Running | ServiceStatus::Stopped | ServiceStatus::Failed
+            );
+    }
 
-    if incoming_ts <= current_ts {
+    if incoming.service_epoch == current.service_epoch {
         return false;
     }
 
@@ -1537,14 +1973,16 @@ mod tests {
     #[test]
     fn stopped_rejects_manifest_mismatch_running_update() {
         let now = Utc::now();
-        let current =
+        let mut current =
             build_service_spec_with_status(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
-        let incoming = build_service_spec_with_status(
+        current.service_epoch = 5;
+        let mut incoming = build_service_spec_with_status(
             Uuid::new_v4(),
             ServiceStatus::Running,
             now + chrono::Duration::seconds(5),
             vec![Uuid::new_v4()],
         );
+        incoming.service_epoch = 6;
 
         assert!(!should_accept_update(Some(&current), &incoming));
     }
@@ -1553,14 +1991,16 @@ mod tests {
     #[test]
     fn stopped_accepts_manifest_mismatch_deploying_bootstrap() {
         let now = Utc::now();
-        let current =
+        let mut current =
             build_service_spec_with_status(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
-        let incoming = build_service_spec_with_status(
+        current.service_epoch = 7;
+        let mut incoming = build_service_spec_with_status(
             Uuid::new_v4(),
             ServiceStatus::Deploying,
             now + chrono::Duration::seconds(5),
             Vec::new(),
         );
+        incoming.service_epoch = 8;
 
         assert!(should_accept_update(Some(&current), &incoming));
     }
@@ -1569,16 +2009,41 @@ mod tests {
     #[test]
     fn stopped_rejects_manifest_mismatch_deploying_with_task_ids() {
         let now = Utc::now();
-        let current =
+        let mut current =
             build_service_spec_with_status(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
-        let incoming = build_service_spec_with_status(
+        current.service_epoch = 9;
+        let mut incoming = build_service_spec_with_status(
             Uuid::new_v4(),
             ServiceStatus::Deploying,
             now + chrono::Duration::seconds(5),
             vec![Uuid::new_v4()],
         );
+        incoming.service_epoch = 10;
 
         assert!(!should_accept_update(Some(&current), &incoming));
+    }
+
+    /// Ensures deploying services accept immediate prior-generation running rollback updates.
+    #[test]
+    fn deploying_accepts_previous_generation_running_rollback() {
+        let now = Utc::now();
+        let mut current = build_service_spec_with_status(
+            Uuid::new_v4(),
+            ServiceStatus::Deploying,
+            now + chrono::Duration::seconds(5),
+            Vec::new(),
+        );
+        current.service_epoch = 11;
+
+        let mut incoming = build_service_spec_with_status(
+            Uuid::new_v4(),
+            ServiceStatus::Running,
+            now + chrono::Duration::seconds(6),
+            vec![Uuid::new_v4()],
+        );
+        incoming.service_epoch = 10;
+
+        assert!(should_accept_update(Some(&current), &incoming));
     }
 
     /// Ensures pulling tasks are treated as in-flight deployment work.

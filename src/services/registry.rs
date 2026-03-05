@@ -96,22 +96,7 @@ fn select_best_service_spec(values: &[ServiceSpecValue]) -> Option<ServiceSpecVa
 /// Decides whether the candidate spec should replace the current selection.
 fn should_prefer_candidate(current: &ServiceSpecValue, candidate: &ServiceSpecValue) -> bool {
     if current.manifest_id == candidate.manifest_id {
-        let current_rank = status_rank(current.status);
-        let candidate_rank = status_rank(candidate.status);
-
-        match candidate_rank.cmp(&current_rank) {
-            Ordering::Less => return false,
-            Ordering::Equal => {
-                if let (Some(current_ts), Some(candidate_ts)) = (
-                    parse_timestamp(&current.updated_at),
-                    parse_timestamp(&candidate.updated_at),
-                ) {
-                    return candidate_ts > current_ts;
-                }
-                return false;
-            }
-            Ordering::Greater => return true,
-        }
+        return compare_service_causality(current, candidate).is_gt();
     } else {
         return should_prefer_manifest_mismatch(current, candidate);
     }
@@ -125,14 +110,18 @@ fn should_prefer_manifest_mismatch(
     current: &ServiceSpecValue,
     candidate: &ServiceSpecValue,
 ) -> bool {
-    let (Some(current_ts), Some(candidate_ts)) = (
-        parse_timestamp(&current.updated_at),
-        parse_timestamp(&candidate.updated_at),
-    ) else {
-        return false;
-    };
+    if candidate.service_epoch < current.service_epoch {
+        return current.status == crate::services::types::ServiceStatus::Deploying
+            && candidate.service_epoch.saturating_add(1) == current.service_epoch
+            && matches!(
+                candidate.status,
+                crate::services::types::ServiceStatus::Running
+                    | crate::services::types::ServiceStatus::Stopped
+                    | crate::services::types::ServiceStatus::Failed
+            );
+    }
 
-    if candidate_ts <= current_ts {
+    if candidate.service_epoch == current.service_epoch {
         return false;
     }
 
@@ -150,6 +139,39 @@ fn should_prefer_manifest_mismatch(
             )
         }
     }
+}
+
+/// Compares service specs by causal tuple `(epoch, phase, timestamp, status-rank)`.
+fn compare_service_causality(current: &ServiceSpecValue, candidate: &ServiceSpecValue) -> Ordering {
+    match candidate.service_epoch.cmp(&current.service_epoch) {
+        Ordering::Equal => {}
+        order => return order,
+    }
+
+    match candidate.phase_version.cmp(&current.phase_version) {
+        Ordering::Equal => {}
+        order => return order,
+    }
+
+    match (
+        parse_timestamp(&current.updated_at),
+        parse_timestamp(&candidate.updated_at),
+    ) {
+        (Some(current_ts), Some(candidate_ts)) => {
+            if candidate_ts > current_ts {
+                return Ordering::Greater;
+            } else if candidate_ts < current_ts {
+                return Ordering::Less;
+            }
+        }
+        (None, Some(_)) => return Ordering::Greater,
+        (Some(_), None) => return Ordering::Less,
+        (None, None) => {}
+    }
+
+    let current_rank = status_rank(current.status);
+    let candidate_rank = status_rank(candidate.status);
+    candidate_rank.cmp(&current_rank)
 }
 
 /// Parses RFC3339 timestamps for service state comparisons.
@@ -230,7 +252,7 @@ mod tests {
         assert_eq!(listed[0].tasks[0].name, "web");
 
         // Update same service with new manifest id (should overwrite)
-        let updated = ServiceSpecValue::new(
+        let mut updated = ServiceSpecValue::new(
             Uuid::new_v4(),
             "demo-manifest",
             "demo-service",
@@ -253,6 +275,7 @@ mod tests {
             }],
             vec![Uuid::new_v4(), Uuid::new_v4()],
         );
+        updated.service_epoch = spec.service_epoch.saturating_add(1);
         registry.upsert(updated.clone()).await.expect("upsert");
 
         let listed = registry.list().expect("list again");
@@ -296,13 +319,16 @@ mod tests {
     #[test]
     fn stopped_rejects_manifest_mismatch_running_candidate() {
         let now = Utc::now();
-        let current = build_service_value(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
-        let candidate = build_service_value(
+        let mut current =
+            build_service_value(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
+        current.service_epoch = 2;
+        let mut candidate = build_service_value(
             Uuid::new_v4(),
             ServiceStatus::Running,
             now + ChronoDuration::seconds(3),
             vec![Uuid::new_v4()],
         );
+        candidate.service_epoch = 3;
 
         assert!(!should_prefer_candidate(&current, &candidate));
     }
@@ -311,13 +337,16 @@ mod tests {
     #[test]
     fn stopped_accepts_manifest_mismatch_deploying_bootstrap_candidate() {
         let now = Utc::now();
-        let current = build_service_value(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
-        let candidate = build_service_value(
+        let mut current =
+            build_service_value(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
+        current.service_epoch = 4;
+        let mut candidate = build_service_value(
             Uuid::new_v4(),
             ServiceStatus::Deploying,
             now + ChronoDuration::seconds(3),
             Vec::new(),
         );
+        candidate.service_epoch = 5;
 
         assert!(should_prefer_candidate(&current, &candidate));
     }
@@ -326,14 +355,39 @@ mod tests {
     #[test]
     fn stopped_rejects_manifest_mismatch_deploying_prefilled_candidate() {
         let now = Utc::now();
-        let current = build_service_value(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
-        let candidate = build_service_value(
+        let mut current =
+            build_service_value(Uuid::new_v4(), ServiceStatus::Stopped, now, Vec::new());
+        current.service_epoch = 6;
+        let mut candidate = build_service_value(
             Uuid::new_v4(),
             ServiceStatus::Deploying,
             now + ChronoDuration::seconds(3),
             vec![Uuid::new_v4()],
         );
+        candidate.service_epoch = 7;
 
         assert!(!should_prefer_candidate(&current, &candidate));
+    }
+
+    /// Ensures deploying services prefer immediate prior-generation running rollback candidates.
+    #[test]
+    fn deploying_prefers_previous_generation_running_rollback_candidate() {
+        let now = Utc::now();
+        let mut current = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Deploying,
+            now + ChronoDuration::seconds(3),
+            Vec::new(),
+        );
+        current.service_epoch = 12;
+        let mut candidate = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Running,
+            now + ChronoDuration::seconds(4),
+            vec![Uuid::new_v4()],
+        );
+        candidate.service_epoch = 11;
+
+        assert!(should_prefer_candidate(&current, &candidate));
     }
 }

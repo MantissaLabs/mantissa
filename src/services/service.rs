@@ -2,8 +2,9 @@ use crate::network::types::compute_network_id;
 use crate::services::manager::ServiceController;
 use crate::services::types::{
     ServiceEvent, ServicePortProtocol, ServiceRescheduleLock, ServiceRescheduleReason,
-    ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
-    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
+    ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceSpecValue, ServiceStatus,
+    ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
+    ServiceTaskSpecValue, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
 };
 use crate::task::capnp_codec::{
     decode_env_vars, decode_secret_files, encode_env_vars, encode_secret_files,
@@ -48,9 +49,21 @@ impl services::Server for ServicesRPC {
             tasks.push(read_task_template(tmpl)?);
         }
 
+        let update_strategy = if spec.has_update_strategy() {
+            read_update_strategy(spec.get_update_strategy()?)?
+        } else {
+            ServiceUpdateStrategy::default()
+        };
+
         let service_id = self
             .manager
-            .submit_deployment(manifest_id, manifest_name, service_name, tasks)
+            .submit_deployment_with_strategy(
+                manifest_id,
+                manifest_name,
+                service_name,
+                tasks,
+                update_strategy,
+            )
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 
@@ -112,6 +125,12 @@ pub(crate) fn write_service_spec(
     builder.set_service_name(&value.service_name);
     builder.set_status(service_status_to_proto(value.status));
     builder.set_updated_at(&value.updated_at);
+    builder.set_service_epoch(value.service_epoch);
+    builder.set_phase_version(value.phase_version);
+    write_update_strategy(
+        builder.reborrow().init_update_strategy(),
+        &value.update_strategy,
+    );
 
     let mut tasks_builder = builder.reborrow().init_tasks(value.tasks.len() as u32);
     for (idx, task) in value.tasks.iter().enumerate() {
@@ -187,7 +206,14 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
         ServiceSpecValue::new(manifest_id, manifest_name, service_name, tasks, task_ids);
     value.id = id;
     value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
+    value.service_epoch = reader.get_service_epoch();
+    value.phase_version = reader.get_phase_version();
     value.status = proto_to_service_status(reader.get_status()?);
+    value.update_strategy = if reader.has_update_strategy() {
+        read_update_strategy(reader.get_update_strategy()?)?
+    } else {
+        ServiceUpdateStrategy::default()
+    };
     value.reschedule_lock = if reader.has_reschedule_lock() {
         Some(read_reschedule_lock(reader.get_reschedule_lock()?)?)
     } else {
@@ -330,6 +356,58 @@ fn proto_to_service_status(status: protocol::services::ServiceStatus) -> Service
         protocol::services::ServiceStatus::Stopped => ServiceStatus::Stopped,
         protocol::services::ServiceStatus::Failed => ServiceStatus::Failed,
     }
+}
+
+/// Encodes the service update strategy so rollout behavior is replicated with the service spec.
+fn write_update_strategy(
+    mut builder: protocol::services::update_strategy::Builder<'_>,
+    strategy: &ServiceUpdateStrategy,
+) {
+    let mode = match strategy.mode {
+        ServiceUpdateStrategyMode::Rolling => protocol::services::UpdateStrategyMode::Rolling,
+    };
+    builder.set_mode(mode);
+
+    let mut rolling = builder.reborrow().init_rolling();
+    rolling.set_parallelism(strategy.rolling.parallelism);
+    let order = match strategy.rolling.order {
+        ServiceRolloutOrder::StartFirst => protocol::services::RolloutOrder::StartFirst,
+        ServiceRolloutOrder::StopFirst => protocol::services::RolloutOrder::StopFirst,
+    };
+    rolling.set_order(order);
+    rolling.set_monitor_secs(strategy.rolling.monitor_secs);
+    rolling.set_max_failures(strategy.rolling.max_failures);
+    rolling.set_auto_rollback(strategy.rolling.auto_rollback);
+}
+
+/// Decodes the service rollout strategy from the deployment wire payload.
+fn read_update_strategy(
+    reader: protocol::services::update_strategy::Reader<'_>,
+) -> Result<ServiceUpdateStrategy, Error> {
+    let mode = match reader.get_mode() {
+        Ok(protocol::services::UpdateStrategyMode::Rolling) => ServiceUpdateStrategyMode::Rolling,
+        Err(_) => ServiceUpdateStrategyMode::Rolling,
+    };
+
+    let rolling = if reader.has_rolling() {
+        let rolling_reader = reader.get_rolling()?;
+        let order = match rolling_reader.get_order() {
+            Ok(protocol::services::RolloutOrder::StartFirst) => ServiceRolloutOrder::StartFirst,
+            Ok(protocol::services::RolloutOrder::StopFirst) => ServiceRolloutOrder::StopFirst,
+            Err(_) => ServiceRolloutOrder::StartFirst,
+        };
+        ServiceRollingUpdatePolicy {
+            parallelism: rolling_reader.get_parallelism().max(1),
+            order,
+            monitor_secs: rolling_reader.get_monitor_secs().max(1),
+            max_failures: rolling_reader.get_max_failures(),
+            auto_rollback: rolling_reader.get_auto_rollback(),
+        }
+    } else {
+        ServiceRollingUpdatePolicy::default()
+    };
+
+    Ok(ServiceUpdateStrategy { mode, rolling })
 }
 
 /// Maps an internal reschedule reason into the protocol wire enum.

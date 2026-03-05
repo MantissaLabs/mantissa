@@ -1,6 +1,6 @@
 use super::manifest::{
-    EnvironmentVariable, RestartPolicyName, SecretFileProjection, SecretReference, ServiceManifest,
-    TaskSpec,
+    EnvironmentVariable, RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference,
+    ServiceManifest, ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskSpec,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -85,6 +85,27 @@ fn write_secret_reference(
     Ok(())
 }
 
+fn write_update_strategy(
+    mut builder: protocol::services::update_strategy::Builder<'_>,
+    strategy: &ServiceUpdateStrategy,
+) {
+    let mode = match strategy.mode {
+        ServiceUpdateStrategyMode::Rolling => protocol::services::UpdateStrategyMode::Rolling,
+    };
+    builder.set_mode(mode);
+
+    let mut rolling = builder.reborrow().init_rolling();
+    rolling.set_parallelism(strategy.rolling.parallelism);
+    let order = match strategy.rolling.order {
+        RolloutOrder::StartFirst => protocol::services::RolloutOrder::StartFirst,
+        RolloutOrder::StopFirst => protocol::services::RolloutOrder::StopFirst,
+    };
+    rolling.set_order(order);
+    rolling.set_monitor_secs(strategy.rolling.monitor_secs);
+    rolling.set_max_failures(strategy.rolling.max_failures);
+    rolling.set_auto_rollback(strategy.rolling.auto_rollback);
+}
+
 fn write_env_vars(
     builder: &mut struct_list::Builder<environment_var::Owned>,
     vars: &[EnvironmentVariable],
@@ -139,6 +160,7 @@ pub async fn deploy_manifest(
         spec.set_manifest_id(manifest_id.as_bytes());
         spec.set_manifest_name(&manifest.name);
         spec.set_service_name(&manifest.name);
+        write_update_strategy(spec.reborrow().init_update_strategy(), &manifest.update);
 
         let mut tasks_builder = spec.reborrow().init_tasks(manifest.tasks.len() as u32);
         for (idx, task) in manifest.tasks.iter().enumerate() {

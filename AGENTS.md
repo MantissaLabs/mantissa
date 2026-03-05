@@ -52,12 +52,14 @@ The system needs to be:
 - Framework: Tokio (`#[tokio::test]`) with helpers in `tests/common/testkit.rs` and `local_test!` macro.
 - Add new integration tests under `tests/` (e.g., `tests/<area>_*.rs`). Keep tests deterministic; avoid arbitrary sleeps: use helpers like `wait_roots_equal` and `assert_cluster_size` to check convergence.
 - Scope tests by name: `cargo test register_node_tcp`.
+- Always run tests sequentially. Don't trigger cargo locks by attempting to run tests in parallel.
 
 ## Commit & Pull Request Guidelines
 
 - Run `cargo fmt`, `cargo clippy`, and `cargo test` before marking work as complete. Note protocol/schema changes explicitly.
 - Commit style: `<area>: <summary>` (examples: `topology: fix leave`, `store: refactor MST`, `tests: add testkit`). After and beneath the commit title, add a complete description of the changes made and why it was necessary. Lines should not exceed 80 characters. Use paragraphs and do not abuse bullet points. Explain the change assuming this will be read by humans, figuring out the reasons and context behind it.
 - Never commit yourself, simply output the commit at the end of each atomic change or step and let the user commit.
+- Never leave git commands hanging in the background after you complete some work or end a session.
 
 ## Security & Configuration Tips
 

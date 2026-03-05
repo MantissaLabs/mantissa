@@ -15,6 +15,12 @@ pub struct ServiceSpecValue {
     pub task_ids: Vec<Uuid>,
     pub updated_at: String,
     #[serde(default)]
+    pub update_strategy: ServiceUpdateStrategy,
+    #[serde(default)]
+    pub service_epoch: u64,
+    #[serde(default)]
+    pub phase_version: u64,
+    #[serde(default)]
     pub status: ServiceStatus,
     #[serde(default)]
     pub reschedule_lock: Option<ServiceRescheduleLock>,
@@ -40,6 +46,9 @@ impl ServiceSpecValue {
             tasks,
             task_ids,
             updated_at: current_timestamp(),
+            update_strategy: ServiceUpdateStrategy::default(),
+            service_epoch: 0,
+            phase_version: 0,
             status: ServiceStatus::Running,
             reschedule_lock: None,
         }
@@ -49,14 +58,71 @@ impl ServiceSpecValue {
         self.updated_at = current_timestamp();
     }
 
+    pub fn start_new_generation(&mut self) {
+        self.service_epoch = self.service_epoch.saturating_add(1);
+        self.phase_version = 0;
+        self.touch();
+    }
+
     pub fn status(&self) -> ServiceStatus {
         self.status
     }
 
     pub fn set_status(&mut self, status: ServiceStatus) {
+        if self.status != status {
+            self.phase_version = self.phase_version.saturating_add(1);
+        }
         self.status = status;
         self.touch();
     }
+}
+
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceUpdateStrategyMode {
+    #[default]
+    Rolling,
+}
+
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceRolloutOrder {
+    #[default]
+    StartFirst,
+    StopFirst,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceRollingUpdatePolicy {
+    pub parallelism: u16,
+    pub order: ServiceRolloutOrder,
+    pub monitor_secs: u32,
+    pub max_failures: u16,
+    pub auto_rollback: bool,
+}
+
+impl Default for ServiceRollingUpdatePolicy {
+    fn default() -> Self {
+        Self {
+            parallelism: 1,
+            order: ServiceRolloutOrder::StartFirst,
+            monitor_secs: 1,
+            max_failures: 1,
+            auto_rollback: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ServiceUpdateStrategy {
+    #[serde(default)]
+    pub mode: ServiceUpdateStrategyMode,
+    #[serde(default)]
+    pub rolling: ServiceRollingUpdatePolicy,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]

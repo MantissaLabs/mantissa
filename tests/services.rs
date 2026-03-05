@@ -1641,6 +1641,100 @@ local_test!(services_redeploy_updates_resources, {
     );
 });
 
+local_test!(services_redeploy_rolls_back_on_failed_replacement, {
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+    let node = TestNode::new().await;
+
+    let service_name = "redeploy-rollback";
+    let manifest_name = "redeploy-rollback";
+
+    let tasks = vec![ServiceTaskSpecValue {
+        name: "echo".into(),
+        image: "alpine:3.20".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "while true; do sleep 1; done".into(),
+        ],
+        replicas: 1,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        health_port: None,
+        health_command: None,
+        public_port: None,
+        public_protocol: None,
+    }];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
+        .await
+        .expect("submit baseline deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "baseline deployment should reach running"
+    );
+
+    let baseline_spec = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read baseline spec")
+        .expect("baseline spec present");
+    let baseline_manifest_id = baseline_spec.manifest_id;
+    let baseline_task_ids = baseline_spec.task_ids.clone();
+
+    let mut failing_tasks = tasks;
+    failing_tasks[0].cpu_millis = 500_000;
+    failing_tasks[0].memory_bytes = 8 * 1024 * 1024 * 1024;
+
+    node.node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, failing_tasks)
+        .await
+        .expect("submit failing redeployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "failed redeployment should roll back to running"
+    );
+
+    let rolled_back = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read rolled back spec")
+        .expect("rolled back spec present");
+    assert_eq!(
+        rolled_back.manifest_id, baseline_manifest_id,
+        "failed rollout should restore previous manifest generation"
+    );
+    assert_eq!(
+        rolled_back.task_ids, baseline_task_ids,
+        "failed rollout should restore previous task assignments"
+    );
+});
+
 /// Builds a lightweight backend template used by placement-focused integration tests.
 fn demo_backend_task_template(name: &str, replicas: u16) -> ServiceTaskSpecValue {
     ServiceTaskSpecValue {

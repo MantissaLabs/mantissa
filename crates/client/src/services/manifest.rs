@@ -10,6 +10,8 @@ pub struct ServiceManifest {
     pub name: String,
     #[serde(default)]
     pub tasks: Vec<TaskSpec>,
+    #[serde(default)]
+    pub update: ServiceUpdateStrategy,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -93,6 +95,65 @@ pub struct TaskSpec {
     pub health_command: Option<Vec<String>>,
     #[serde(default)]
     pub public_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceUpdateStrategyMode {
+    Rolling,
+}
+
+impl Default for ServiceUpdateStrategyMode {
+    fn default() -> Self {
+        Self::Rolling
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutOrder {
+    StartFirst,
+    StopFirst,
+}
+
+impl Default for RolloutOrder {
+    fn default() -> Self {
+        Self::StartFirst
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RollingUpdatePolicy {
+    #[serde(default = "default_rollout_parallelism")]
+    pub parallelism: u16,
+    #[serde(default)]
+    pub order: RolloutOrder,
+    #[serde(default = "default_rollout_monitor_secs")]
+    pub monitor_secs: u32,
+    #[serde(default = "default_rollout_max_failures")]
+    pub max_failures: u16,
+    #[serde(default = "default_rollout_auto_rollback")]
+    pub auto_rollback: bool,
+}
+
+impl Default for RollingUpdatePolicy {
+    fn default() -> Self {
+        Self {
+            parallelism: default_rollout_parallelism(),
+            order: RolloutOrder::default(),
+            monitor_secs: default_rollout_monitor_secs(),
+            max_failures: default_rollout_max_failures(),
+            auto_rollback: default_rollout_auto_rollback(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ServiceUpdateStrategy {
+    #[serde(default)]
+    pub mode: ServiceUpdateStrategyMode,
+    #[serde(default)]
+    pub rolling: RollingUpdatePolicy,
 }
 
 impl ServiceManifest {
@@ -287,6 +348,18 @@ impl ServiceManifest {
             }
         }
 
+        if self.update.rolling.parallelism == 0 {
+            return Err(anyhow!(
+                "service manifest must set update.rolling.parallelism to at least 1"
+            ));
+        }
+
+        if self.update.rolling.monitor_secs == 0 {
+            return Err(anyhow!(
+                "service manifest must set update.rolling.monitor_secs to at least 1"
+            ));
+        }
+
         Ok(())
     }
 }
@@ -304,4 +377,20 @@ pub fn load_manifest_from_path(path: &Path) -> Result<ServiceManifest> {
 
 fn default_replicas() -> u16 {
     1
+}
+
+fn default_rollout_parallelism() -> u16 {
+    1
+}
+
+fn default_rollout_monitor_secs() -> u32 {
+    1
+}
+
+fn default_rollout_max_failures() -> u16 {
+    1
+}
+
+fn default_rollout_auto_rollback() -> bool {
+    true
 }
