@@ -394,3 +394,52 @@ fn default_rollout_max_failures() -> u16 {
 fn default_rollout_auto_rollback() -> bool {
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn example_manifest(path: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples")
+            .join(path)
+    }
+
+    #[test]
+    fn replicated_service_manifest_uses_default_rolling_strategy() {
+        let manifest =
+            load_manifest_from_path(&example_manifest("replicated_service.ron")).expect("manifest");
+
+        assert!(matches!(
+            manifest.update.mode,
+            ServiceUpdateStrategyMode::Rolling
+        ));
+        assert_eq!(manifest.update.rolling.parallelism, 1);
+        assert!(matches!(
+            manifest.update.rolling.order,
+            RolloutOrder::StartFirst
+        ));
+        assert_eq!(manifest.update.rolling.monitor_secs, 1);
+        assert_eq!(manifest.update.rolling.max_failures, 1);
+        assert!(manifest.update.rolling.auto_rollback);
+    }
+
+    #[test]
+    fn rolling_update_example_manifest_loads_expected_strategy() {
+        let manifest =
+            load_manifest_from_path(&example_manifest("rolling_update.ron")).expect("manifest");
+
+        assert!(matches!(
+            manifest.update.mode,
+            ServiceUpdateStrategyMode::Rolling
+        ));
+        assert_eq!(manifest.update.rolling.parallelism, 2);
+        assert!(matches!(
+            manifest.update.rolling.order,
+            RolloutOrder::StartFirst
+        ));
+        assert_eq!(manifest.update.rolling.monitor_secs, 15);
+        assert_eq!(manifest.update.rolling.max_failures, 2);
+        assert!(manifest.update.rolling.auto_rollback);
+    }
+}

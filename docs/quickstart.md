@@ -95,4 +95,5 @@ Use `mantissa nodes list` and `mantissa scheduler slots` to inspect cluster stat
 - GPU setup: `docs/gpu-setup.md`
 - Configuration and hot reload: `docs/configuration.md`
 - Secrets in manifests: `docs/secrets.md`
+- Service rollout strategy: `docs/service-rollouts.md`
 - Large-cluster stress test: `docs/stress-test.md`

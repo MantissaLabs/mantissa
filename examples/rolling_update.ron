@@ -1,0 +1,29 @@
+(
+    name: "rolling-demo",
+    update: (
+        mode: rolling,
+        rolling: (
+            parallelism: 2,
+            order: start_first,
+            monitor_secs: 15,
+            max_failures: 2,
+            auto_rollback: true,
+        ),
+    ),
+    tasks: [
+        (
+            name: "api",
+            image: "ghcr.io/mantissa/demo-api:v2",
+            command: [
+                "sh",
+                "-c",
+                "while true; do echo 'rolling-demo api'; sleep 5; done",
+            ],
+            replicas: 4,
+            resources: (
+                cpu_millis: 300,
+                memory_mb: 256,
+            ),
+        ),
+    ],
+)

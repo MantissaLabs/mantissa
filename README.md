@@ -53,6 +53,7 @@ See `docs/quickstart.md` for the full local and multi-VM workflow.
 - `docs/configuration.md` - config file format, env overrides, hot reload
 - `docs/gpu-setup.md` - NVIDIA GPU setup + container runtime wiring
 - `docs/secrets.md` - secrets management and manifest usage
+- `docs/service-rollouts.md` - service manifest rollout strategy
 - `docs/cli.md` - CLI reference and common commands
 - `docs/permissions.md` - running as root vs unprivileged
 - `docs/repo-layout.md` - repository structure

@@ -18,3 +18,5 @@ Common commands:
 - `mantissa services run|list|stop ...` - manage RON service manifests
 - `mantissa info` - emit local system and capacity diagnostics
 - `mantissa config show|validate|path` - inspect configuration
+
+For rollout fields and manifest examples, see `docs/service-rollouts.md`.
