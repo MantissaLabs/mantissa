@@ -1,6 +1,7 @@
 #[macro_use]
 mod common;
 
+use async_trait::async_trait;
 use capnp::Error as CapnpError;
 use chrono::Utc;
 use client::services::manifest::{
@@ -25,6 +26,9 @@ use mantissa::services::types::{
     ServiceTaskSpecValue, ServiceUpdateStrategy,
 };
 use mantissa::task::container::ContainerState;
+use mantissa::task::docker::{
+    ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager,
+};
 use mantissa::task::manager::TaskManager;
 use mantissa::task::types::{
     TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskServiceMetadata, TaskSpec,
@@ -39,6 +43,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -1489,15 +1494,29 @@ local_test!(services_redeploy_scales_replicas, {
         "service identifier should remain stable across redeploys"
     );
 
-    assert!(
-        wait_for_service_status(
-            &node.node.service_controller,
-            service_id,
-            ServiceStatus::Running
-        )
-        .await,
-        "service should return to running after scale-out redeploy"
-    );
+    let scaled_running = wait_for_service_status(
+        &node.node.service_controller,
+        service_id,
+        ServiceStatus::Running,
+    )
+    .await;
+    if !scaled_running {
+        let current = node
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read scaled service spec")
+            .expect("scaled service spec should exist");
+        panic!(
+            "service should return to running after scale-out redeploy; current status={:?}, task_ids={}, rollout_phase={:?}, rollout_failed_steps={}, rollout_error={:?}",
+            current.status(),
+            current.task_ids.len(),
+            current.rollout.phase,
+            current.rollout.failed_steps,
+            current.rollout.last_error
+        );
+    }
     assert!(
         wait_for_task_count(&node.node.task_manager, 3, Duration::from_secs(8)).await,
         "scaled service should eventually report three replicas"
@@ -1599,15 +1618,29 @@ local_test!(services_redeploy_updates_resources, {
         "redeploy should target existing service identifier"
     );
 
-    assert!(
-        wait_for_service_status(
-            &node.node.service_controller,
-            service_id,
-            ServiceStatus::Running
-        )
-        .await,
-        "service should return to running after resource refresh"
-    );
+    let refreshed_running = wait_for_service_status(
+        &node.node.service_controller,
+        service_id,
+        ServiceStatus::Running,
+    )
+    .await;
+    if !refreshed_running {
+        let current = node
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read refreshed service spec")
+            .expect("refreshed service spec should exist");
+        panic!(
+            "service should return to running after resource refresh; current status={:?}, task_ids={}, rollout_phase={:?}, rollout_failed_steps={}, rollout_error={:?}",
+            current.status(),
+            current.task_ids.len(),
+            current.rollout.phase,
+            current.rollout.failed_steps,
+            current.rollout.last_error
+        );
+    }
     let updated_spec = node
         .node
         .service_controller
@@ -1860,6 +1893,431 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
     );
 });
 
+local_test!(
+    services_redeploy_stop_first_stops_previous_before_replacement_visible,
+    {
+        let _guard =
+            ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+        let node = TestNode::new().await;
+
+        let service_name = "redeploy-stop-first";
+        let manifest_name = "redeploy-stop-first";
+
+        let mut tasks = vec![ServiceTaskSpecValue {
+            name: "echo".into(),
+            image: "alpine:3.20".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while true; do sleep 1; done".into(),
+            ],
+            replicas: 1,
+            cpu_millis: 100,
+            memory_bytes: 64 * 1024 * 1024,
+            gpu_count: 0,
+            restart_policy: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            networks: Vec::new(),
+            health_port: None,
+            health_command: None,
+            public_port: None,
+            public_protocol: None,
+        }];
+
+        let service_id = node
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
+            .await
+            .expect("submit baseline deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "baseline deployment should reach running"
+        );
+
+        let baseline_spec = node
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read baseline spec")
+            .expect("baseline spec present");
+        let old_task_id = baseline_spec.task_ids[0];
+
+        tasks[0].image = "alpine:3.19".into();
+        let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, 1, true);
+
+        node.node
+            .service_controller
+            .submit_deployment_with_strategy(
+                Uuid::new_v4(),
+                manifest_name,
+                service_name,
+                tasks,
+                strategy,
+            )
+            .await
+            .expect("submit stop-first redeployment");
+
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut verified_order = false;
+        while Instant::now() < deadline {
+            let tasks = node
+                .node
+                .task_manager
+                .list_tasks(&TaskStateFilter::all())
+                .await
+                .expect("list tasks during stop-first rollout");
+            let replacement_visible = tasks.iter().any(|task| {
+                task.id != old_task_id
+                    && task
+                        .service_metadata
+                        .as_ref()
+                        .map(|meta| meta.service_name == service_name)
+                        .unwrap_or(false)
+            });
+
+            if replacement_visible {
+                let states = node
+                    .node
+                    .task_manager
+                    .task_state_snapshot(&[old_task_id])
+                    .await
+                    .expect("snapshot old task state");
+                let old_state = states.first().and_then(|(_, state)| state.clone());
+                assert!(
+                    !matches!(old_state, Some(ContainerState::Running)),
+                    "stop_first rollout should not expose replacement while previous task is still running"
+                );
+                verified_order = true;
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            verified_order,
+            "replacement task should become visible during stop-first rollout"
+        );
+
+        assert!(
+            wait_until(
+                Duration::from_secs(30),
+                Duration::from_millis(100),
+                || async {
+                    if let Ok(Some(spec)) = node.node.service_controller.registry().get(service_id)
+                    {
+                        return matches!(
+                            spec.status(),
+                            ServiceStatus::Running | ServiceStatus::Failed
+                        );
+                    }
+                    false
+                }
+            )
+            .await,
+            "stop-first ordering test should drive rollout to a terminal state before shutdown"
+        );
+    }
+);
+
+local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+    let node = TestNode::new().await;
+
+    let service_name = "redeploy-parallelism-two";
+    let manifest_name = "redeploy-parallelism-two";
+
+    let mut tasks = vec![ServiceTaskSpecValue {
+        name: "echo".into(),
+        image: "alpine:3.20".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "while true; do sleep 1; done".into(),
+        ],
+        replicas: 4,
+        cpu_millis: 0,
+        memory_bytes: 0,
+        gpu_count: 0,
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        health_port: None,
+        health_command: None,
+        public_port: None,
+        public_protocol: None,
+    }];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
+        .await
+        .expect("submit baseline deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "baseline deployment should reach running"
+    );
+
+    tasks[0].image = "alpine:3.19".into();
+    let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, 1, true);
+    node.node
+        .service_controller
+        .submit_deployment_with_strategy(
+            Uuid::new_v4(),
+            manifest_name,
+            service_name,
+            tasks,
+            strategy,
+        )
+        .await
+        .expect("submit parallel rollout redeployment");
+
+    let desired = 4usize;
+    let deadline = Instant::now() + Duration::from_secs(16);
+    let mut max_seen = 0usize;
+    let mut deploying_seen = false;
+    let mut terminal_seen = false;
+    while Instant::now() < deadline {
+        if let Ok(Some(spec)) = node.node.service_controller.registry().get(service_id) {
+            match spec.status() {
+                ServiceStatus::Deploying => deploying_seen = true,
+                ServiceStatus::Running | ServiceStatus::Failed => {
+                    if deploying_seen {
+                        terminal_seen = true;
+                    }
+                }
+                ServiceStatus::Stopping | ServiceStatus::Stopped => {}
+            }
+        }
+
+        let count = list_active_service_tasks(&node.node.task_manager, service_name)
+            .await
+            .len();
+        max_seen = max_seen.max(count);
+
+        if terminal_seen {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        deploying_seen,
+        "parallel rollout should enter deploying phase"
+    );
+    assert!(
+        terminal_seen,
+        "parallel rollout should reach a terminal status after deploying"
+    );
+    assert!(
+        max_seen >= desired + 2,
+        "parallelism=2 start-first rollout should temporarily run at least two additional active tasks; saw max {max_seen}"
+    );
+});
+
+local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+    let node = TestNode::new().await;
+
+    let service_name = "redeploy-no-rollback";
+    let manifest_name = "redeploy-no-rollback";
+
+    let tasks = vec![ServiceTaskSpecValue {
+        name: "echo".into(),
+        image: "alpine:3.20".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "while true; do sleep 1; done".into(),
+        ],
+        replicas: 1,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        health_port: None,
+        health_command: None,
+        public_port: None,
+        public_protocol: None,
+    }];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
+        .await
+        .expect("submit baseline deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "baseline deployment should reach running"
+    );
+
+    let failing_manifest_id = Uuid::new_v4();
+    let mut failing_tasks = tasks;
+    failing_tasks[0].cpu_millis = 500_000;
+    failing_tasks[0].memory_bytes = 8 * 1024 * 1024 * 1024;
+    let strategy = rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, 1, false);
+
+    node.node
+        .service_controller
+        .submit_deployment_with_strategy(
+            failing_manifest_id,
+            manifest_name,
+            service_name,
+            failing_tasks,
+            strategy,
+        )
+        .await
+        .expect("submit non-rollback failing redeployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Failed
+        )
+        .await,
+        "failed rollout with auto_rollback=false should remain failed"
+    );
+
+    let failed = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read failed spec")
+        .expect("failed spec present");
+    assert_eq!(
+        failed.manifest_id, failing_manifest_id,
+        "auto_rollback=false should keep the failing manifest generation active"
+    );
+    assert_eq!(
+        failed.rollout.phase,
+        ServiceRolloutPhase::Failed,
+        "failed rollout should expose failed rollout phase"
+    );
+});
+
+local_test!(services_redeploy_rollback_failure_marks_failed, {
+    let _guard = ContainerManagerOverrideGuard::install(Arc::new(
+        CreateFailAfterFirstContainerManager::default(),
+    ));
+    let node = TestNode::new().await;
+
+    let service_name = "redeploy-rollback-failure";
+    let manifest_name = "redeploy-rollback-failure";
+
+    let tasks = vec![ServiceTaskSpecValue {
+        name: "echo".into(),
+        image: "alpine:3.20".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "while true; do sleep 1; done".into(),
+        ],
+        replicas: 1,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        health_port: None,
+        health_command: None,
+        public_port: None,
+        public_protocol: None,
+    }];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
+        .await
+        .expect("submit baseline deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "baseline deployment should reach running"
+    );
+
+    let failing_manifest_id = Uuid::new_v4();
+    let mut failing_tasks = tasks;
+    failing_tasks[0].image = "alpine:3.19".into();
+    let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, 1, true);
+
+    node.node
+        .service_controller
+        .submit_deployment_with_strategy(
+            failing_manifest_id,
+            manifest_name,
+            service_name,
+            failing_tasks,
+            strategy,
+        )
+        .await
+        .expect("submit failing redeployment with rollback enabled");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Failed
+        )
+        .await,
+        "rollback failure should mark service failed"
+    );
+
+    let failed = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read failed spec")
+        .expect("failed spec present");
+    assert_eq!(
+        failed.manifest_id, failing_manifest_id,
+        "failed rollback should not restore the previous manifest generation"
+    );
+    assert_eq!(
+        failed.status(),
+        ServiceStatus::Failed,
+        "rollback-failure path should mark the service failed"
+    );
+});
+
 /// Builds a lightweight backend template used by placement-focused integration tests.
 fn demo_backend_task_template(name: &str, replicas: u16) -> ServiceTaskSpecValue {
     ServiceTaskSpecValue {
@@ -1966,6 +2424,102 @@ async fn wait_for_min_local_service_task_count_refs(
         true
     })
     .await
+}
+
+/// Builds a rollout strategy used by redeploy integration tests.
+fn rollout_strategy(
+    parallelism: u16,
+    order: ServiceRolloutOrder,
+    monitor_secs: u32,
+    max_failures: u16,
+    auto_rollback: bool,
+) -> ServiceUpdateStrategy {
+    ServiceUpdateStrategy {
+        rolling: ServiceRollingUpdatePolicy {
+            parallelism,
+            order,
+            monitor_secs,
+            max_failures,
+            auto_rollback,
+        },
+        ..ServiceUpdateStrategy::default()
+    }
+}
+
+#[derive(Default)]
+struct CreateFailAfterFirstContainerManager {
+    inner: InMemoryContainerManager,
+    create_calls: AsyncMutex<u32>,
+}
+
+#[async_trait]
+impl ContainerManager for CreateFailAfterFirstContainerManager {
+    async fn create_container(
+        &self,
+        request: ContainerCreateRequest,
+    ) -> Result<String, ContainerError> {
+        let mut calls = self.create_calls.lock().await;
+        if *calls >= 1 {
+            return Err(ContainerError::DockerAPI(
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 500,
+                    message: "injected create failure".to_string(),
+                },
+            ));
+        }
+        *calls += 1;
+        drop(calls);
+        self.inner.create_container(request).await
+    }
+
+    async fn start_container(&self, container_id: &str) -> Result<(), ContainerError> {
+        self.inner.start_container(container_id).await
+    }
+
+    async fn stop_container(
+        &self,
+        container_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<(), ContainerError> {
+        self.inner.stop_container(container_id, timeout).await
+    }
+
+    async fn restart_container(
+        &self,
+        container_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<(), ContainerError> {
+        self.inner.restart_container(container_id, timeout).await
+    }
+
+    async fn remove_container(
+        &self,
+        container_id: &str,
+        force: bool,
+        remove_volumes: bool,
+    ) -> Result<(), ContainerError> {
+        self.inner
+            .remove_container(container_id, force, remove_volumes)
+            .await
+    }
+
+    async fn list_containers(
+        &self,
+        filters: Option<HashMap<String, Vec<String>>>,
+    ) -> Result<Vec<ContainerInfo>, ContainerError> {
+        self.inner.list_containers(filters).await
+    }
+
+    async fn inspect_container(
+        &self,
+        container_id: &str,
+    ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
+        self.inner.inspect_container(container_id).await
+    }
+
+    async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
+        self.inner.pull_image(image).await
+    }
 }
 
 /// Waits until each provided node owns at least `min_expected` active tasks for the service.

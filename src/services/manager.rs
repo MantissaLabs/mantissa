@@ -917,13 +917,21 @@ impl ServiceController {
         }
 
         let ordered_task_ids = order_task_ids(&service_name, &templates, &assignment_index);
-        let mut next_spec = ServiceSpecValue::new(
-            manifest_id,
-            manifest_name.clone(),
-            service_name.clone(),
-            templates.clone(),
-            ordered_task_ids,
-        );
+        let mut next_spec = match self.registry.get(current_spec.id)? {
+            Some(spec) if spec.manifest_id == manifest_id => spec,
+            _ => ServiceSpecValue::new(
+                manifest_id,
+                manifest_name.clone(),
+                service_name.clone(),
+                templates.clone(),
+                Vec::new(),
+            ),
+        };
+        next_spec.manifest_id = manifest_id;
+        next_spec.manifest_name = manifest_name.clone();
+        next_spec.service_name = service_name.clone();
+        next_spec.tasks = templates.clone();
+        next_spec.task_ids = ordered_task_ids;
         next_spec.update_strategy = update_strategy;
         next_spec.service_epoch = current_spec.service_epoch.saturating_add(1);
         next_spec.set_rollout(ServiceRolloutState::default());
