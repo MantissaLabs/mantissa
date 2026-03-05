@@ -49,6 +49,8 @@ const SERVICE_REBALANCE_MIN_AGE_SECS: i64 = 20;
 const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
 /// Maximum time to wait for one rollout task to report running.
 const SERVICE_ROLLOUT_STEP_TIMEOUT_SECS: u64 = 120;
+/// Maximum time to wait for one rollout task to fully stop before id reuse.
+const SERVICE_ROLLOUT_STOP_TIMEOUT_SECS: u64 = 120;
 /// Poll interval while waiting on rollout task readiness transitions.
 const SERVICE_ROLLOUT_POLL_INTERVAL_MS: u64 = 200;
 /// Proactive slot rebalance keeps long-lived running services aligned with deterministic ownership.
@@ -1052,6 +1054,40 @@ impl ServiceController {
         Ok(())
     }
 
+    /// Waits for one rollout task to transition out of active states before id reuse.
+    ///
+    /// Rollback reuses historical task ids to preserve stable slot identity. We must not issue
+    /// the restart until the previous incarnation is confirmed terminal or absent in replicated
+    /// state, otherwise duplicate-name races can occur during container create/start.
+    async fn wait_rollout_task_stopped(
+        &self,
+        service_name: &str,
+        task_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(SERVICE_ROLLOUT_STOP_TIMEOUT_SECS);
+        loop {
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "timed out waiting for rollout task {} in service '{}' to stop",
+                    task_id,
+                    service_name
+                ));
+            }
+
+            let states = self.task_manager.task_state_snapshot(&[task_id]).await?;
+            let state = states
+                .first()
+                .and_then(|(_, state)| state.as_ref())
+                .cloned();
+
+            if rollout_task_stopped_or_absent(state.as_ref()) {
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+        }
+    }
+
     /// Requests stop for one old task and records enough metadata to restart it during rollback.
     async fn stop_task_and_track_rollback(
         &self,
@@ -1103,6 +1139,13 @@ impl ServiceController {
                     service_name
                 );
             }
+            if let Err(err) = self.wait_rollout_task_stopped(service_name, *task_id).await {
+                tracing::warn!(
+                    target: "services",
+                    "replacement task {task_id} did not fully stop before rollback of '{}': {err}",
+                    service_name
+                );
+            }
         }
 
         if rollback_old_tasks.is_empty() {
@@ -1116,6 +1159,8 @@ impl ServiceController {
             .map(|template| (template.name.clone(), template))
             .collect();
 
+        // Rollback placement intentionally follows deterministic current ownership so recovery
+        // converges the same way as regular reconciliation after membership changes.
         let eligible_nodes = self.collect_eligible_nodes();
         let slot_targets =
             compute_slot_targets(current_spec.id, &current_spec.tasks, &eligible_nodes);
@@ -1137,6 +1182,9 @@ impl ServiceController {
                     service_name
                 )
             })?;
+
+            self.wait_rollout_task_stopped(service_name, step.task_id)
+                .await?;
 
             let key = SlotKey::new(current_spec.id, &step.template, step.replica);
             let target_node = slot_targets.get(&key).copied();
@@ -1555,6 +1603,16 @@ fn task_state_healthy(state: &ContainerState) -> bool {
 /// Returns true if a task is stable enough to migrate during rebalancing.
 fn task_state_rebalanceable(state: &ContainerState) -> bool {
     matches!(state, ContainerState::Running)
+}
+
+/// Returns true when a rollout task is terminally stopped or absent from replicated state.
+fn rollout_task_stopped_or_absent(state: Option<&ContainerState>) -> bool {
+    matches!(
+        state,
+        None | Some(ContainerState::Stopped)
+            | Some(ContainerState::Failed)
+            | Some(ContainerState::Exited(_))
+    )
 }
 
 /// Returns true when a task has been running long enough to permit rebalancing.
@@ -2441,6 +2499,41 @@ mod tests {
                 ContainerState::Failed
             ))
         ));
+    }
+
+    /// Ensures rollout stop gating treats absent and terminal task states as reusable.
+    #[test]
+    fn rollout_stop_gate_accepts_absent_and_terminal_states() {
+        assert!(rollout_task_stopped_or_absent(None));
+        assert!(rollout_task_stopped_or_absent(Some(
+            &ContainerState::Stopped
+        )));
+        assert!(rollout_task_stopped_or_absent(Some(
+            &ContainerState::Failed
+        )));
+        assert!(rollout_task_stopped_or_absent(Some(
+            &ContainerState::Exited(1)
+        )));
+    }
+
+    /// Ensures rollout stop gating blocks id reuse while tasks are still active.
+    #[test]
+    fn rollout_stop_gate_rejects_active_states() {
+        assert!(!rollout_task_stopped_or_absent(Some(
+            &ContainerState::Pending
+        )));
+        assert!(!rollout_task_stopped_or_absent(Some(
+            &ContainerState::Pulling
+        )));
+        assert!(!rollout_task_stopped_or_absent(Some(
+            &ContainerState::Creating
+        )));
+        assert!(!rollout_task_stopped_or_absent(Some(
+            &ContainerState::Running
+        )));
+        assert!(!rollout_task_stopped_or_absent(Some(
+            &ContainerState::Stopping
+        )));
     }
 
     /// Ensures deploy-time reconciliation waits for full task-id assignment.
