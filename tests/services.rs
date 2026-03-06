@@ -2854,7 +2854,7 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
 });
 
 local_test!(services_redeploy_rollback_failure_marks_failed, {
-    let manager = Arc::new(CreateFailAfterFirstContainerManager::default());
+    let manager = Arc::new(CreateFailureAfterBaselineContainerManager::default());
     let _guard = ContainerManagerOverrideGuard::install(manager.clone());
     let node = TestNode::new().await;
 
@@ -2904,7 +2904,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
     let mut failing_tasks = tasks;
     failing_tasks[0].image = "alpine:3.19".into();
     let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, 1, true);
-    manager.arm_failures();
+    manager.enable_create_failures();
 
     node.node
         .service_controller
@@ -3074,6 +3074,10 @@ fn rollout_strategy(
     }
 }
 
+/// Emits synthetic runtime exit events for started containers.
+///
+/// We use this manager to validate the runtime-event failure path deterministically
+/// in tests, without depending on Docker timing or external process behavior.
 #[derive(Default)]
 struct ExitSignalContainerManager {
     inner: InMemoryContainerManager,
@@ -3186,20 +3190,25 @@ impl ContainerManager for ExitSignalContainerManager {
 }
 
 #[derive(Default)]
-struct CreateFailAfterFirstContainerManager {
+/// Fails container creation only after explicit activation.
+///
+/// The rollback-failure test first deploys a healthy baseline, then enables
+/// failures before submitting the redeploy, so failure and rollback behavior can
+/// be isolated from initial bootstrap.
+struct CreateFailureAfterBaselineContainerManager {
     inner: InMemoryContainerManager,
     fail_creates: AtomicBool,
 }
 
-impl CreateFailAfterFirstContainerManager {
-    /// Arms create failure injection after baseline setup has completed.
-    fn arm_failures(&self) {
+impl CreateFailureAfterBaselineContainerManager {
+    /// Enables create failure injection for subsequent create requests.
+    fn enable_create_failures(&self) {
         self.fail_creates.store(true, Ordering::Relaxed);
     }
 }
 
 #[async_trait]
-impl ContainerManager for CreateFailAfterFirstContainerManager {
+impl ContainerManager for CreateFailureAfterBaselineContainerManager {
     async fn create_container(
         &self,
         request: ContainerCreateRequest,
