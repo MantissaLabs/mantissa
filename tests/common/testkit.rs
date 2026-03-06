@@ -5,15 +5,18 @@
 use async_trait::async_trait;
 use mantissa::task::docker::{
     ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager,
-    clear_container_manager_override, container_manager_override, set_container_manager_override,
 };
 use mantissa::task::manager::TaskRuntimeConfig;
 use mantissa::topology_capnp::topology;
-use mantissa::{node, server::headless::HeadlessNode};
-use once_cell::sync::Lazy;
+use mantissa::{
+    node,
+    server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport},
+};
 use protocol::health::NodeStatus;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -222,19 +225,30 @@ fn default_container_manager() -> Arc<dyn ContainerManager + Send + Sync> {
     Arc::new(InMemoryContainerManager::default())
 }
 
-static TEST_CONTAINER_MANAGER: Lazy<()> = Lazy::new(|| {
-    set_container_manager_override(default_container_manager());
-});
-
-pub struct ContainerManagerOverrideGuard {
-    previous: Option<Arc<dyn ContainerManager + Send + Sync>>,
+thread_local! {
+    static TEST_CONTAINER_MANAGER_STACK: RefCell<Vec<Arc<dyn ContainerManager + Send + Sync>>> =
+        RefCell::new(Vec::new());
 }
+
+fn current_container_manager_override() -> Option<Arc<dyn ContainerManager + Send + Sync>> {
+    TEST_CONTAINER_MANAGER_STACK.with(|stack| stack.borrow().last().cloned())
+}
+
+fn container_manager_for_next_node() -> Arc<dyn ContainerManager + Send + Sync> {
+    current_container_manager_override().unwrap_or_else(default_container_manager)
+}
+
+fn pick_loopback_ephemeral_addr() -> std::io::Result<String> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.to_string())
+}
+
+pub struct ContainerManagerOverrideGuard;
 
 impl ContainerManagerOverrideGuard {
     pub fn install(manager: Arc<dyn ContainerManager + Send + Sync>) -> Self {
-        let previous = container_manager_override();
-        set_container_manager_override(manager);
-        Self { previous }
+        TEST_CONTAINER_MANAGER_STACK.with(|stack| stack.borrow_mut().push(manager));
+        Self
     }
 
     pub fn install_default() -> Self {
@@ -244,12 +258,13 @@ impl ContainerManagerOverrideGuard {
 
 impl Drop for ContainerManagerOverrideGuard {
     fn drop(&mut self) {
-        if let Some(prev) = self.previous.as_ref() {
-            set_container_manager_override(prev.clone());
-        } else {
-            clear_container_manager_override();
-            set_container_manager_override(default_container_manager());
-        }
+        TEST_CONTAINER_MANAGER_STACK.with(|stack| {
+            let removed = stack.borrow_mut().pop();
+            debug_assert!(
+                removed.is_some(),
+                "container manager override guard dropped without a matching install"
+            );
+        });
     }
 }
 
@@ -262,24 +277,53 @@ pub struct TestNode {
 }
 
 impl TestNode {
-    fn ensure_test_container_manager() {
-        Lazy::force(&TEST_CONTAINER_MANAGER);
+    /// Resolves the runtime to inject into the next headless node this test creates.
+    fn apply_test_container_manager(mut cfg: HeadlessConfig) -> HeadlessConfig {
+        if cfg.container_manager.is_none() {
+            cfg.container_manager = Some(container_manager_for_next_node());
+        }
+        cfg
+    }
+
+    /// Builds the shared in-process config used by local tests.
+    fn inproc_config(
+        sync_tick: Option<Duration>,
+        gossip_tick: Option<Duration>,
+        gossip_fanout: Option<usize>,
+        gossip_channel_capacity: Option<usize>,
+        task_runtime: Option<TaskRuntimeConfig>,
+    ) -> HeadlessConfig {
+        HeadlessConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            transport: HeadlessTransport::Inproc,
+            sync_tick,
+            sync_fanout: None,
+            global_metadata_sync_tick: sync_tick,
+            global_metadata_sync_fanout: None,
+            gossip_tick,
+            gossip_fanout,
+            gossip_channel_capacity,
+            task_runtime,
+            container_manager: None,
+        }
     }
 
     /// Start a node with in-process transport (fast path).
     pub async fn new() -> Self {
-        Self::ensure_test_container_manager();
-        let node = HeadlessNode::new_inproc()
-            .await
-            .expect("headless inproc node");
+        let node = HeadlessNode::new_with_config(Self::apply_test_container_manager(
+            Self::inproc_config(None, None, None, None, None),
+        ))
+        .await
+        .expect("headless inproc node");
         Self { node }
     }
 
     pub async fn new_with_fanout(fanout: usize) -> Self {
-        Self::ensure_test_container_manager();
-        let node = HeadlessNode::new_inproc_custom(None, None, Some(fanout))
-            .await
-            .expect("headless inproc node (custom fanout)");
+        let node = HeadlessNode::new_with_config(Self::apply_test_container_manager(
+            Self::inproc_config(None, None, Some(fanout), None, None),
+        ))
+        .await
+        .expect("headless inproc node (custom fanout)");
         Self { node }
     }
 
@@ -289,18 +333,24 @@ impl TestNode {
     }
 
     pub async fn try_new_tcp() -> Result<Self, Box<dyn std::error::Error>> {
-        Self::ensure_test_container_manager();
-        let node = HeadlessNode::new_tcp_ephemeral().await?;
+        let addr = pick_loopback_ephemeral_addr()?;
+        let node =
+            HeadlessNode::new_with_config(Self::apply_test_container_manager(HeadlessConfig {
+                listen_addr: addr.clone(),
+                transport: HeadlessTransport::Tcp { addr },
+                ..HeadlessConfig::default()
+            }))
+            .await?;
         Ok(Self { node })
     }
 
     /// Start a node with in-process transport and a custom periodic sync tick.
     pub async fn new_with_tick_ms(ms: u64) -> Self {
-        Self::ensure_test_container_manager();
-        let node =
-            HeadlessNode::new_inproc_custom(Some(std::time::Duration::from_millis(ms)), None, None)
-                .await
-                .expect("headless inproc node (with tick)");
+        let node = HeadlessNode::new_with_config(Self::apply_test_container_manager(
+            Self::inproc_config(Some(Duration::from_millis(ms)), None, None, None, None),
+        ))
+        .await
+        .expect("headless inproc node (with tick)");
         Self { node }
     }
 
@@ -312,9 +362,16 @@ impl TestNode {
     }
 
     pub async fn try_new_tcp_with_tick_ms(ms: u64) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::ensure_test_container_manager();
+        let addr = pick_loopback_ephemeral_addr()?;
         let node =
-            HeadlessNode::new_tcp_ephemeral_with_tick(std::time::Duration::from_millis(ms)).await?;
+            HeadlessNode::new_with_config(Self::apply_test_container_manager(HeadlessConfig {
+                listen_addr: addr.clone(),
+                transport: HeadlessTransport::Tcp { addr },
+                sync_tick: Some(Duration::from_millis(ms)),
+                global_metadata_sync_tick: Some(Duration::from_millis(ms)),
+                ..HeadlessConfig::default()
+            }))
+            .await?;
         Ok(Self { node })
     }
 
@@ -746,24 +803,19 @@ impl ClusterConfig {
 }
 
 async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
-    // Each test node must get an isolated fake runtime. Sharing one in-memory manager across
-    // the cluster causes nodes to "see" and stop each other's containers, which stalls
-    // reconciliation in large multi-node stress runs.
-    let _container_guard =
-        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
-
     let (sync_tick, fanout) = cfg.as_options();
     let gossip_tick = cfg.gossip_tick_ms.map(std::time::Duration::from_millis);
     let gossip_channel_capacity = cfg.gossip_channel_capacity;
-    HeadlessNode::new_inproc_custom_with_task_runtime(
+    let headless_cfg = TestNode::inproc_config(
         sync_tick,
         gossip_tick,
         fanout,
         gossip_channel_capacity,
         cfg.task_runtime_config(),
-    )
-    .await
-    .expect("headless inproc node (custom)")
+    );
+    HeadlessNode::new_with_config(TestNode::apply_test_container_manager(headless_cfg))
+        .await
+        .expect("headless inproc node (custom)")
 }
 
 impl TestNode {

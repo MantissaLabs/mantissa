@@ -13,6 +13,7 @@ use crate::{
         bootstrap::{Bootstrap, Stores},
     },
     services::ServiceController,
+    task::docker::ContainerManager,
     task::manager::{TaskManager, TaskRuntimeConfig},
 };
 use net::noise::NoiseKeys;
@@ -44,6 +45,7 @@ pub struct HeadlessConfig {
     pub gossip_fanout: Option<usize>,
     pub gossip_channel_capacity: Option<usize>,
     pub task_runtime: Option<TaskRuntimeConfig>,
+    pub container_manager: Option<Arc<dyn ContainerManager + Send + Sync>>,
 }
 
 impl Default for HeadlessConfig {
@@ -59,6 +61,7 @@ impl Default for HeadlessConfig {
             gossip_fanout: None,
             gossip_channel_capacity: None,
             task_runtime: None,
+            container_manager: None,
         }
     }
 }
@@ -139,6 +142,7 @@ impl HeadlessNode {
             gossip_fanout,
             gossip_channel_capacity,
             task_runtime,
+            container_manager,
         } = cfg;
         // Local Node + client
         let mut node_obj = node::Node::new();
@@ -158,9 +162,14 @@ impl HeadlessNode {
         );
         let stores: Stores = Bootstrap::open_stores(&ctx).await?;
         let gossip_channel_capacity = gossip_channel_capacity.unwrap_or(128);
-        let (comps, gossip_rx, gossip_dedupe) =
-            Bootstrap::build_components(&ctx, &stores, task_runtime, gossip_channel_capacity)
-                .await?;
+        let (comps, gossip_rx, gossip_dedupe) = Bootstrap::build_components(
+            &ctx,
+            &stores,
+            task_runtime,
+            gossip_channel_capacity,
+            container_manager,
+        )
+        .await?;
         if let Some(d) = sync_tick {
             comps.topology.set_sync_interval(d);
         }
@@ -364,6 +373,21 @@ impl HeadlessNode {
         .await
     }
 
+    /// Quick-start a self-contained node with an explicit headless runtime config.
+    pub async fn new_with_config(cfg: HeadlessConfig) -> io::Result<Self> {
+        let state = self_contained_state()?;
+        let mut node = Self::new_with(
+            state.db,
+            state.id,
+            HeadlessKeys::new(state.noise_keys, state.signing_key),
+            cfg,
+        )
+        .await
+        .map_err(to_io)?;
+        node._tmp_dir = Some(state.tmp_dir);
+        Ok(node)
+    }
+
     /// Quick-start **in-process** node using a temp DB and deterministic test keys.
     /// Great for simple tests. For full control, prefer the *_from_parts variants.
     pub async fn new_inproc() -> io::Result<Self> {
@@ -458,6 +482,7 @@ impl HeadlessNode {
                 gossip_fanout: fanout,
                 gossip_channel_capacity,
                 task_runtime,
+                container_manager: None,
             },
         )
         .await

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::Docker;
@@ -25,7 +25,6 @@ use crate::config;
 use async_trait::async_trait;
 use futures::StreamExt;
 use log::{debug, info, trace, warn};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc::UnboundedSender};
@@ -302,32 +301,6 @@ impl DockerContainerManager {
             .map(|value| value.as_secs() as i64)
             .unwrap_or(default_secs)
     }
-}
-
-static CONTAINER_MANAGER_OVERRIDE: Lazy<Mutex<Option<Arc<dyn ContainerManager + Send + Sync>>>> =
-    Lazy::new(|| Mutex::new(None));
-
-pub fn container_manager_override() -> Option<Arc<dyn ContainerManager + Send + Sync>> {
-    CONTAINER_MANAGER_OVERRIDE
-        .lock()
-        .expect("container manager override mutex poisoned")
-        .as_ref()
-        .cloned()
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn set_container_manager_override(manager: Arc<dyn ContainerManager + Send + Sync>) {
-    *CONTAINER_MANAGER_OVERRIDE
-        .lock()
-        .expect("container manager override mutex poisoned") = Some(manager);
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn clear_container_manager_override() {
-    CONTAINER_MANAGER_OVERRIDE
-        .lock()
-        .expect("container manager override mutex poisoned")
-        .take();
 }
 
 /// Returns true when tests request the in-memory runtime through environment configuration.
@@ -884,89 +857,6 @@ impl ContainerManager for DockerContainerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    #[derive(Default)]
-    struct NullContainerManager;
-
-    #[async_trait]
-    impl ContainerManager for NullContainerManager {
-        async fn create_container(
-            &self,
-            _request: ContainerCreateRequest,
-        ) -> ContainerResult<String> {
-            Ok(String::from("noop"))
-        }
-
-        async fn start_container(&self, _container_id: &str) -> ContainerResult<()> {
-            Ok(())
-        }
-
-        async fn stop_container(
-            &self,
-            _container_id: &str,
-            _timeout: Option<Duration>,
-        ) -> ContainerResult<()> {
-            Ok(())
-        }
-
-        async fn restart_container(
-            &self,
-            _container_id: &str,
-            _timeout: Option<Duration>,
-        ) -> ContainerResult<()> {
-            Ok(())
-        }
-
-        async fn remove_container(
-            &self,
-            _container_id: &str,
-            _force: bool,
-            _remove_volumes: bool,
-        ) -> ContainerResult<()> {
-            Ok(())
-        }
-
-        async fn list_containers(
-            &self,
-            _filters: Option<HashMap<String, Vec<String>>>,
-        ) -> ContainerResult<Vec<ContainerInfo>> {
-            Ok(Vec::new())
-        }
-
-        async fn inspect_container(
-            &self,
-            _container_id: &str,
-        ) -> ContainerResult<ContainerInspectResponse> {
-            Err(ContainerError::OperationFailed("noop".into()))
-        }
-
-        async fn pull_image(&self, _image: &str) -> ContainerResult<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn container_manager_override_round_trip() {
-        let previous = container_manager_override();
-        clear_container_manager_override();
-
-        let manager: Arc<dyn ContainerManager + Send + Sync> = Arc::new(NullContainerManager);
-        set_container_manager_override(manager.clone());
-
-        let current = container_manager_override().expect("override installed");
-        assert!(Arc::ptr_eq(&current, &manager));
-
-        clear_container_manager_override();
-
-        if let Some(previous_manager) = previous {
-            set_container_manager_override(previous_manager);
-        }
-    }
-
     #[test]
     fn classify_container_error_maps_404_to_not_found() {
         let error = bollard::errors::Error::DockerResponseServerError {

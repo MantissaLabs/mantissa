@@ -109,7 +109,7 @@ pub async fn start(
     // Build runtime components (gossip, topology, sync) and their clients
     let gossip_channel_capacity = gossip_channel_capacity_from_env(128);
     let (comps, gossip_rx, gossip_dedupe) =
-        Bootstrap::build_components(&ctx, &stores, None, gossip_channel_capacity).await?;
+        Bootstrap::build_components(&ctx, &stores, None, gossip_channel_capacity, None).await?;
     let gossip_tick = gossip_tick_from_env(comps.topology.gossip_interval());
     comps.topology.set_gossip_interval(gossip_tick);
 
@@ -333,6 +333,7 @@ impl Bootstrap {
         stores: &Stores,
         task_runtime_config: Option<TaskRuntimeConfig>,
         gossip_channel_capacity: usize,
+        container_manager_override: Option<Arc<dyn ContainerManager + Send + Sync>>,
     ) -> Result<(Components, Receiver<Message>, DedupeStateHandle), Box<dyn std::error::Error>>
     {
         let channel_capacity = gossip_channel_capacity.max(1);
@@ -506,7 +507,7 @@ impl Bootstrap {
             SecretReplicator::new(secret_registry.clone(), gossip_tx.clone(), secret_rx);
 
         let container_manager: Arc<dyn ContainerManager + Send + Sync> =
-            if let Some(manager) = docker::container_manager_override() {
+            if let Some(manager) = container_manager_override {
                 manager
             } else if docker::use_in_memory_container_manager_from_env() {
                 info!(

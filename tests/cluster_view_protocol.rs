@@ -10,6 +10,7 @@ use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 use mantissa::store::cluster_operation_store::ClusterOperationStore;
 use mantissa::store::cluster_view_store::ClusterViewStore;
 use mantissa::store::peer_store::open_peers_store;
+use mantissa::task::docker::new_in_memory_container_manager;
 use mantissa::topology::operation::{
     ClusterOperationKind as StoredOperationKind, ClusterOperationRecord,
     ClusterOperationStage as StoredOperationStage, SplitNodeAssignment,
@@ -63,6 +64,13 @@ async fn cluster_name_for_lineage(
     }
 
     None
+}
+
+fn headless_config_with_in_memory_runtime() -> HeadlessConfig {
+    HeadlessConfig {
+        container_manager: Some(new_in_memory_container_manager()),
+        ..HeadlessConfig::default()
+    }
 }
 
 // Validates strict view-scoped protocol behavior for sync and topology.
@@ -852,7 +860,7 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
             Arc::new(NoiseKeys::from_private_bytes([0x31; 32])),
             ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]),
         ),
-        HeadlessConfig::default(),
+        headless_config_with_in_memory_runtime(),
     )
     .await
     .expect("start replay node");
@@ -975,7 +983,7 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
             Arc::new(NoiseKeys::from_private_bytes([0x71; 32])),
             ed25519_dalek::SigningKey::from_bytes(&[0x81; 32]),
         ),
-        HeadlessConfig::default(),
+        headless_config_with_in_memory_runtime(),
     )
     .await
     .expect("start scope restore node");
@@ -1084,7 +1092,7 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
             Arc::new(NoiseKeys::from_private_bytes([0x51; 32])),
             ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]),
         ),
-        HeadlessConfig::default(),
+        headless_config_with_in_memory_runtime(),
     )
     .await
     .expect("start replay node");
@@ -1172,7 +1180,7 @@ local_test!(cluster_view_startup_restores_persisted_active_view, {
             Arc::new(NoiseKeys::from_private_bytes([0x71; 32])),
             ed25519_dalek::SigningKey::from_bytes(&[0x81; 32]),
         ),
-        HeadlessConfig::default(),
+        headless_config_with_in_memory_runtime(),
     )
     .await
     .expect("start restore node");
@@ -1249,7 +1257,7 @@ local_test!(cluster_view_startup_restores_persisted_split_view, {
             Arc::new(NoiseKeys::from_private_bytes([0xB1; 32])),
             ed25519_dalek::SigningKey::from_bytes(&[0xC1; 32]),
         ),
-        HeadlessConfig::default(),
+        headless_config_with_in_memory_runtime(),
     )
     .await
     .expect("start split restore node");
@@ -1342,7 +1350,7 @@ local_test!(
                 Arc::new(NoiseKeys::from_private_bytes([0x91; 32])),
                 ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]),
             ),
-            HeadlessConfig::default(),
+            headless_config_with_in_memory_runtime(),
         )
         .await
         .expect("start stale-precondition node");
@@ -1430,7 +1438,7 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
             Arc::new(NoiseKeys::from_private_bytes([0xD1; 32])),
             ed25519_dalek::SigningKey::from_bytes(&[0xE1; 32]),
         ),
-        HeadlessConfig::default(),
+        headless_config_with_in_memory_runtime(),
     )
     .await
     .expect("start gc node");
