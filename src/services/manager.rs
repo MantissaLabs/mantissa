@@ -234,6 +234,55 @@ impl ServiceController {
                 _ => {}
             }
 
+            if matches!(
+                existing.status(),
+                ServiceStatus::Failed | ServiceStatus::Stopped
+            ) {
+                let previous_status = existing.status();
+                self.stop_tasks(&existing).await;
+
+                let mut pending_spec = existing;
+                pending_spec.manifest_id = manifest_id;
+                pending_spec.manifest_name = manifest_name.clone();
+                pending_spec.tasks = tasks.clone();
+                pending_spec.update_strategy = update_strategy.clone();
+                pending_spec.start_new_generation();
+                pending_spec.task_ids.clear();
+                pending_spec.set_rollout(ServiceRolloutState::default());
+                pending_spec.set_status(ServiceStatus::Deploying);
+
+                tracing::info!(
+                    target: "services",
+                    "starting deployment recovery for service '{}' from {:?} with manifest {}",
+                    service_name,
+                    previous_status,
+                    manifest_id
+                );
+
+                self.apply_upsert(pending_spec.clone()).await?;
+                self.broadcast(ServiceEvent::Upsert(pending_spec)).await?;
+
+                let job = ServiceDeploymentJob {
+                    manifest_id,
+                    manifest_name,
+                    service_name,
+                    templates: tasks,
+                    update_strategy,
+                };
+
+                let controller = self.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(err) = controller.execute_deployment(job).await {
+                        tracing::warn!(
+                            target: "services",
+                            "service recovery deployment failed: {err}"
+                        );
+                    }
+                });
+
+                return Ok(service_id);
+            }
+
             let current_spec = existing.clone();
             let mut pending_spec = existing;
             pending_spec.manifest_id = manifest_id;
@@ -468,9 +517,34 @@ impl ServiceController {
                     Ok(None) => {
                         tracing::warn!(
                             target: "services",
-                            "unable to schedule deployment retry for '{}' because the service spec is missing",
+                            "unable to schedule deployment retry for '{}' because the service spec is missing; marking service failed",
                             service_name
                         );
+                        let mut failed_spec = ServiceSpecValue::new(
+                            manifest_id,
+                            manifest_name.clone(),
+                            service_name.clone(),
+                            templates.clone(),
+                            Vec::new(),
+                        );
+                        failed_spec.update_strategy = update_strategy.clone();
+                        failed_spec.set_rollout(ServiceRolloutState::default());
+                        failed_spec.set_status(ServiceStatus::Failed);
+                        if let Err(upsert_err) = self.apply_upsert(failed_spec.clone()).await {
+                            tracing::warn!(
+                                target: "services",
+                                "failed to persist fallback failed state for '{}': {upsert_err}",
+                                service_name
+                            );
+                        } else if let Err(broadcast_err) =
+                            self.broadcast(ServiceEvent::Upsert(failed_spec)).await
+                        {
+                            tracing::warn!(
+                                target: "services",
+                                "failed to broadcast fallback failed state for '{}': {broadcast_err}",
+                                service_name
+                            );
+                        }
                     }
                     Err(fetch_err) => {
                         tracing::warn!(
@@ -486,14 +560,23 @@ impl ServiceController {
         };
         let task_ids: Vec<Uuid> = task_specs.iter().map(|spec| spec.id).collect();
 
-        let mut spec = ServiceSpecValue::new(
-            manifest_id,
-            manifest_name,
-            service_name.clone(),
-            templates,
-            task_ids,
-        );
+        let mut spec = match self.registry.get(service_id)? {
+            Some(spec) if spec.manifest_id == manifest_id => spec,
+            _ => ServiceSpecValue::new(
+                manifest_id,
+                manifest_name.clone(),
+                service_name.clone(),
+                templates.clone(),
+                Vec::new(),
+            ),
+        };
+        spec.manifest_id = manifest_id;
+        spec.manifest_name = manifest_name;
+        spec.service_name = service_name.clone();
+        spec.tasks = templates;
+        spec.task_ids = task_ids;
         spec.update_strategy = update_strategy;
+        spec.set_rollout(ServiceRolloutState::default());
         spec.set_status(ServiceStatus::Deploying);
         self.apply_upsert(spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(spec.clone())).await?;
@@ -1226,6 +1309,53 @@ impl ServiceController {
         Ok(())
     }
 
+    /// Verifies rollback target assignments still exist and are healthy before claiming success.
+    ///
+    /// Rollback can be deemed successful even when the old task ids disappeared while the failed
+    /// rollout was in progress. This guard prevents publishing a stale running service spec that
+    /// references unknown tasks.
+    async fn verify_rollback_target_assignments(
+        &self,
+        service_name: &str,
+        task_ids: &[Uuid],
+    ) -> anyhow::Result<()> {
+        if task_ids.is_empty() {
+            return Err(anyhow!(
+                "rollback target for service '{}' has no assigned task ids",
+                service_name
+            ));
+        }
+
+        let states = self.task_manager.task_state_snapshot(task_ids).await?;
+        for (task_id, state) in states {
+            match state {
+                Some(
+                    ContainerState::Pending
+                    | ContainerState::Pulling
+                    | ContainerState::Creating
+                    | ContainerState::Running,
+                ) => {}
+                Some(other) => {
+                    return Err(anyhow!(
+                        "rollback target task {} for service '{}' entered terminal state {:?}",
+                        task_id,
+                        service_name,
+                        other
+                    ));
+                }
+                None => {
+                    return Err(anyhow!(
+                        "rollback target task {} for service '{}' is missing from the task registry",
+                        task_id,
+                        service_name
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Persists rollout progress metadata on the active service generation, when still current.
     async fn persist_rollout_state(
         &self,
@@ -1276,6 +1406,7 @@ impl ServiceController {
         rollback_old_tasks: &HashMap<Uuid, RollbackTaskRecord>,
         rollout_error: anyhow::Error,
     ) {
+        let mut rollout_error = rollout_error;
         tracing::warn!(
             target: "services",
             "rolling redeployment failed for '{}': {rollout_error:#}",
@@ -1308,40 +1439,54 @@ impl ServiceController {
                 .await
             {
                 Ok(()) => {
-                    let mut rollback_spec = current_spec.clone();
-                    rollback_spec.set_rollout(ServiceRolloutState {
-                        phase: ServiceRolloutPhase::Idle,
-                        total_steps: rollout_total_steps,
-                        completed_steps: rollout_completed_steps,
-                        failed_steps: rollout_failed_steps,
-                        max_failures: rollout_max_failures,
-                        last_error: Some(rollout_error.to_string()),
-                    });
-                    rollback_spec.set_status(previous_status);
-
-                    if let Err(err) = self.apply_upsert(rollback_spec.clone()).await {
-                        tracing::warn!(
-                            target: "services",
-                            "failed to persist rollback state for '{}': {err}",
-                            service_name
-                        );
-                    } else if let Err(err) =
-                        self.broadcast(ServiceEvent::Upsert(rollback_spec)).await
+                    if let Err(validation_err) = self
+                        .verify_rollback_target_assignments(service_name, &current_spec.task_ids)
+                        .await
                     {
                         tracing::warn!(
                             target: "services",
-                            "failed to broadcast rollback state for '{}': {err}",
+                            "rollback validation failed for '{}': {validation_err:#}",
                             service_name
                         );
-                    } else {
-                        tracing::info!(
-                            target: "services",
-                            "rolling redeployment for '{}' rolled back to manifest {}",
-                            service_name,
-                            current_spec.manifest_id
+                        rollout_error = anyhow!(
+                            "{rollout_error:#}; rollback validation failed: {validation_err:#}"
                         );
+                    } else {
+                        let mut rollback_spec = current_spec.clone();
+                        rollback_spec.set_rollout(ServiceRolloutState {
+                            phase: ServiceRolloutPhase::Idle,
+                            total_steps: rollout_total_steps,
+                            completed_steps: rollout_completed_steps,
+                            failed_steps: rollout_failed_steps,
+                            max_failures: rollout_max_failures,
+                            last_error: Some(rollout_error.to_string()),
+                        });
+                        rollback_spec.set_status(previous_status);
+
+                        if let Err(err) = self.apply_upsert(rollback_spec.clone()).await {
+                            tracing::warn!(
+                                target: "services",
+                                "failed to persist rollback state for '{}': {err}",
+                                service_name
+                            );
+                        } else if let Err(err) =
+                            self.broadcast(ServiceEvent::Upsert(rollback_spec)).await
+                        {
+                            tracing::warn!(
+                                target: "services",
+                                "failed to broadcast rollback state for '{}': {err}",
+                                service_name
+                            );
+                        } else {
+                            tracing::info!(
+                                target: "services",
+                                "rolling redeployment for '{}' rolled back to manifest {}",
+                                service_name,
+                                current_spec.manifest_id
+                            );
+                        }
+                        return;
                     }
-                    return;
                 }
                 Err(rollback_err) => {
                     tracing::warn!(
@@ -1363,6 +1508,7 @@ impl ServiceController {
                     max_failures: rollout_max_failures,
                     last_error: Some(rollout_error.to_string()),
                 });
+                failed_spec.task_ids.clear();
                 failed_spec.set_status(ServiceStatus::Failed);
                 if let Err(err) = self.apply_upsert(failed_spec.clone()).await {
                     tracing::warn!(

@@ -222,6 +222,7 @@ pub struct ContainerInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContainerRuntimeEvent {
     ContainerStateChanged,
+    TaskExited { task_id: uuid::Uuid, exit_code: i32 },
 }
 
 /// Docker container manager implementation
@@ -840,6 +841,28 @@ impl ContainerManager for DockerContainerManager {
                 .and_then(|attrs| attrs.get("name"));
             if name.map(|value| value.starts_with("mantissa-")) != Some(true) {
                 continue;
+            }
+
+            if action == "die" {
+                let task_id = name
+                    .and_then(|value| value.strip_prefix("mantissa-"))
+                    .and_then(|suffix| uuid::Uuid::parse_str(suffix).ok());
+                let exit_code = event
+                    .actor
+                    .as_ref()
+                    .and_then(|actor| actor.attributes.as_ref())
+                    .and_then(|attrs| attrs.get("exitCode"))
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .unwrap_or(1);
+
+                if let Some(task_id) = task_id {
+                    if events_tx
+                        .send(ContainerRuntimeEvent::TaskExited { task_id, exit_code })
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
             }
 
             if events_tx

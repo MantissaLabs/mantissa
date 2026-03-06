@@ -27,7 +27,7 @@ use mantissa::services::types::{
 };
 use mantissa::task::container::ContainerState;
 use mantissa::task::docker::{
-    ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager,
+    ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager, ContainerRuntimeEvent,
 };
 use mantissa::task::manager::TaskManager;
 use mantissa::task::types::{
@@ -40,7 +40,10 @@ use protocol::topology::ClusterOperationStage;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex as AsyncMutex;
@@ -331,6 +334,166 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
         .expect("load failed service spec")
         .expect("service spec present after failure");
     assert_eq!(failed_spec.status(), ServiceStatus::Failed);
+    assert!(
+        failed_spec.task_ids.is_empty(),
+        "failed service should clear task assignments so operators can see an explicit failed state"
+    );
+
+    let listed = node
+        .node
+        .service_controller
+        .list_services()
+        .expect("list services after failure");
+    assert!(
+        listed
+            .iter()
+            .any(|spec| spec.id == service_id && spec.status() == ServiceStatus::Failed),
+        "failed service should remain visible in service listing"
+    );
+
+    let recovered_manifest_id = Uuid::new_v4();
+    node.node
+        .service_controller
+        .submit_deployment(
+            recovered_manifest_id,
+            "capacity-starved",
+            "capacity-starved",
+            vec![ServiceTaskSpecValue {
+                name: "heavy".into(),
+                image: "ghcr.io/mantissa/demo:web".into(),
+                command: vec!["--serve".into()],
+                replicas: 1,
+                cpu_millis: 200,
+                memory_bytes: 128 * 1024 * 1024,
+                gpu_count: 0,
+                restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                networks: Vec::new(),
+                health_port: None,
+                health_command: None,
+                public_port: None,
+                public_protocol: None,
+            }],
+        )
+        .await
+        .expect("submit recovery deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "service should recover from failed state after a valid deployment"
+    );
+
+    let recovered = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load recovered service")
+        .expect("recovered service spec present");
+    assert_eq!(
+        recovered.manifest_id, recovered_manifest_id,
+        "recovery deployment should activate the new manifest generation"
+    );
+    assert_eq!(
+        recovered.task_ids.len(),
+        1,
+        "recovery deployment should repopulate task ids"
+    );
+});
+
+local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(ExitSignalContainerManager::default()));
+    let node = TestNode::new().await;
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            "missing-runtime",
+            "missing-runtime",
+            vec![ServiceTaskSpecValue {
+                name: "api".into(),
+                image: "alpine:3.20".into(),
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "while true; do sleep 1; done".into(),
+                ],
+                replicas: 1,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1024 * 1024,
+                gpu_count: 0,
+                restart_policy: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                networks: Vec::new(),
+                health_port: None,
+                health_command: None,
+                public_port: None,
+                public_protocol: None,
+            }],
+        )
+        .await
+        .expect("submit deployment with missing runtime containers");
+
+    let failed = wait_until(
+        Duration::from_secs(20),
+        Duration::from_millis(100),
+        || async {
+            if let Ok(Some(spec)) = node.node.service_controller.registry().get(service_id) {
+                return spec.status() == ServiceStatus::Failed;
+            }
+            false
+        },
+    )
+    .await;
+    if !failed {
+        let current = node
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read service after failed wait")
+            .expect("service should still be present");
+        let mut task_details = Vec::new();
+        for task_id in &current.task_ids {
+            let detail = match node.node.task_manager.inspect_task(*task_id).await {
+                Ok(task) => format!("{}:{:?}:phase{}", task.id, task.state, task.phase_version),
+                Err(err) => format!("{task_id}:inspect-error:{err}"),
+            };
+            task_details.push(detail);
+        }
+        panic!(
+            "deployment with runtime exit signals should converge to failed instead of looping; current status={:?}, task_ids={}, rollout_phase={:?}, rollout_failed_steps={}, rollout_error={:?}, task_details={:?}",
+            current.status(),
+            current.task_ids.len(),
+            current.rollout.phase,
+            current.rollout.failed_steps,
+            current.rollout.last_error,
+            task_details
+        );
+    }
+
+    let failed_spec = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load failed service")
+        .expect("failed service spec present");
+    assert_eq!(failed_spec.status(), ServiceStatus::Failed);
+    assert!(
+        failed_spec.task_ids.is_empty(),
+        "failed service should clear task ids after runtime-exit-driven readiness failure"
+    );
 });
 
 local_test!(services_deployment_replicates_across_cluster, {
@@ -1023,6 +1186,110 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
         "inactive service reconciliation should release stale slot reservations"
     );
 });
+
+local_test!(
+    services_deploy_from_stopped_bootstraps_without_stale_assignments,
+    {
+        let _guard =
+            ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+        let node = TestNode::new().await;
+
+        let service_name = "deploy-from-stopped";
+        let manifest_name = "deploy-from-stopped";
+        let templates = vec![demo_backend_task_template("backend", 2)];
+        let service_id = node
+            .node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                manifest_name,
+                service_name,
+                templates.clone(),
+            )
+            .await
+            .expect("submit baseline deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "service should reach running state before stop"
+        );
+
+        let baseline = node
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("load running service")
+            .expect("running service present");
+        assert_eq!(
+            baseline.task_ids.len(),
+            2,
+            "baseline deployment should allocate both replicas"
+        );
+
+        node.node
+            .service_controller
+            .submit_stop(service_id)
+            .await
+            .expect("submit stop");
+
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Stopped
+            )
+            .await,
+            "service should transition to stopped before bootstrap deploy"
+        );
+
+        let redeploy_manifest_id = Uuid::new_v4();
+        let mut redeploy_templates = templates;
+        redeploy_templates[0].image = "hashicorp/http-echo:0.2.3".to_string();
+        node.node
+            .service_controller
+            .submit_deployment(
+                redeploy_manifest_id,
+                manifest_name,
+                service_name,
+                redeploy_templates,
+            )
+            .await
+            .expect("submit deployment from stopped state");
+
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "deploying from stopped should recover to running"
+        );
+
+        let redeployed = node
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("load redeployed service")
+            .expect("redeployed service present");
+        assert_eq!(
+            redeployed.manifest_id, redeploy_manifest_id,
+            "deploying from stopped should activate the new manifest generation"
+        );
+        assert_eq!(
+            redeployed.task_ids.len(),
+            2,
+            "deploying from stopped should repopulate assignments for all replicas"
+        );
+    }
+);
 
 local_test!(services_stop_propagates_and_drains_three_nodes, {
     let _guard =
@@ -2587,9 +2854,8 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
 });
 
 local_test!(services_redeploy_rollback_failure_marks_failed, {
-    let _guard = ContainerManagerOverrideGuard::install(Arc::new(
-        CreateFailAfterFirstContainerManager::default(),
-    ));
+    let manager = Arc::new(CreateFailAfterFirstContainerManager::default());
+    let _guard = ContainerManagerOverrideGuard::install(manager.clone());
     let node = TestNode::new().await;
 
     let service_name = "redeploy-rollback-failure";
@@ -2638,6 +2904,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
     let mut failing_tasks = tasks;
     failing_tasks[0].image = "alpine:3.19".into();
     let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, 1, true);
+    manager.arm_failures();
 
     node.node
         .service_controller
@@ -2808,9 +3075,127 @@ fn rollout_strategy(
 }
 
 #[derive(Default)]
+struct ExitSignalContainerManager {
+    inner: InMemoryContainerManager,
+    task_ids_by_container: AsyncMutex<HashMap<String, Uuid>>,
+    runtime_events_tx:
+        AsyncMutex<Option<tokio::sync::mpsc::UnboundedSender<ContainerRuntimeEvent>>>,
+}
+
+#[async_trait]
+impl ContainerManager for ExitSignalContainerManager {
+    async fn create_container(
+        &self,
+        request: ContainerCreateRequest,
+    ) -> Result<String, ContainerError> {
+        let task_id = request
+            .name
+            .strip_prefix("mantissa-")
+            .and_then(|raw| Uuid::parse_str(raw).ok());
+        let container_id = self.inner.create_container(request).await?;
+        if let Some(task_id) = task_id {
+            self.task_ids_by_container
+                .lock()
+                .await
+                .insert(container_id.clone(), task_id);
+        }
+        Ok(container_id)
+    }
+
+    async fn start_container(&self, container_id: &str) -> Result<(), ContainerError> {
+        self.inner.start_container(container_id).await?;
+
+        let task_id = self
+            .task_ids_by_container
+            .lock()
+            .await
+            .get(container_id)
+            .copied();
+        if let Some(task_id) = task_id {
+            if let Some(sender) = self.runtime_events_tx.lock().await.clone() {
+                let _ = sender.send(ContainerRuntimeEvent::TaskExited {
+                    task_id,
+                    exit_code: 255,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn stop_container(
+        &self,
+        container_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<(), ContainerError> {
+        self.inner.stop_container(container_id, timeout).await
+    }
+
+    async fn restart_container(
+        &self,
+        container_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<(), ContainerError> {
+        self.inner.restart_container(container_id, timeout).await
+    }
+
+    async fn remove_container(
+        &self,
+        container_id: &str,
+        force: bool,
+        remove_volumes: bool,
+    ) -> Result<(), ContainerError> {
+        self.task_ids_by_container.lock().await.remove(container_id);
+        self.inner
+            .remove_container(container_id, force, remove_volumes)
+            .await
+    }
+
+    async fn list_containers(
+        &self,
+        filters: Option<HashMap<String, Vec<String>>>,
+    ) -> Result<Vec<ContainerInfo>, ContainerError> {
+        self.inner.list_containers(filters).await
+    }
+
+    async fn inspect_container(
+        &self,
+        container_id: &str,
+    ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
+        self.inner.inspect_container(container_id).await
+    }
+
+    async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn supports_runtime_events(&self) -> bool {
+        true
+    }
+
+    async fn watch_runtime_events(
+        &self,
+        events_tx: tokio::sync::mpsc::UnboundedSender<ContainerRuntimeEvent>,
+    ) -> Result<(), ContainerError> {
+        *self.runtime_events_tx.lock().await = Some(events_tx.clone());
+        while !events_tx.is_closed() {
+            sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 struct CreateFailAfterFirstContainerManager {
     inner: InMemoryContainerManager,
-    create_calls: AsyncMutex<u32>,
+    fail_creates: AtomicBool,
+}
+
+impl CreateFailAfterFirstContainerManager {
+    /// Arms create failure injection after baseline setup has completed.
+    fn arm_failures(&self) {
+        self.fail_creates.store(true, Ordering::Relaxed);
+    }
 }
 
 #[async_trait]
@@ -2819,8 +3204,7 @@ impl ContainerManager for CreateFailAfterFirstContainerManager {
         &self,
         request: ContainerCreateRequest,
     ) -> Result<String, ContainerError> {
-        let mut calls = self.create_calls.lock().await;
-        if *calls >= 1 {
+        if self.fail_creates.load(Ordering::Relaxed) {
             return Err(ContainerError::DockerAPI(
                 bollard::errors::Error::DockerResponseServerError {
                     status_code: 500,
@@ -2828,8 +3212,6 @@ impl ContainerManager for CreateFailAfterFirstContainerManager {
                 },
             ));
         }
-        *calls += 1;
-        drop(calls);
         self.inner.create_container(request).await
     }
 
@@ -2997,7 +3379,7 @@ async fn wait_for_service_status(
     expected: ServiceStatus,
 ) -> bool {
     wait_until(
-        Duration::from_secs(10),
+        Duration::from_secs(20),
         Duration::from_millis(50),
         || async {
             if let Ok(Some(spec)) = manager.registry().get(service_id)

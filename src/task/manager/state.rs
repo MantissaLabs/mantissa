@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use async_channel::{Sender, TrySendError};
+use bollard::models::ContainerStateStatusEnum;
 use chrono::Utc;
 use crdt_store::uuid_key::UuidKey;
 use rand::Rng;
@@ -17,7 +18,9 @@ use crate::scheduler::{
 };
 use crate::task::container::ContainerState;
 use crate::task::docker::{ContainerError, ContainerInfo};
-use crate::task::types::{TaskEvent, TaskServiceMetadata, TaskSpec, TaskValue};
+use crate::task::types::{
+    TaskEvent, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec, TaskValue,
+};
 
 use super::{
     TaskManager, container_remove_in_progress, launch::ContainerLaunchRequest,
@@ -47,7 +50,7 @@ impl TaskManager {
     /// Returns `Ok(true)` when the task is already healthy and no further start work is needed.
     /// Returns `Ok(false)` when reconciliation should continue (for example if runtime restart
     /// is required because the running container is missing).
-    async fn reconcile_recorded_running_task(
+    pub(super) async fn reconcile_recorded_running_task(
         &self,
         working: &mut TaskSpec,
     ) -> Result<bool, anyhow::Error> {
@@ -62,6 +65,49 @@ impl TaskManager {
                 Ok(true)
             }
             Ok(None) => {
+                if let Some((exit_code, exit_error)) =
+                    self.resolve_terminal_exit_for_task(working).await?
+                {
+                    if should_restart_after_exit(working, exit_code) {
+                        warn!(
+                            target: "task",
+                            task = %working.id,
+                            exit_code,
+                            "running task container exited; restarting task runtime per restart policy"
+                        );
+                    } else {
+                        let mut reason = format!(
+                            "container exited with status code {exit_code} while task was running"
+                        );
+                        if let Some(exit_error) = exit_error {
+                            reason.push_str(": ");
+                            reason.push_str(exit_error.trim());
+                        }
+                        let _ = self
+                            .mark_task_failed(working.clone(), anyhow!(reason))
+                            .await;
+                        return Ok(true);
+                    }
+                }
+                // Reload once before transitioning to `Pending` so stale running snapshots do not
+                // overwrite a newer terminal transition (for example, runtime-exit failure).
+                if let Ok(latest) = self.load_spec(working.id).await {
+                    if latest.phase_version != working.phase_version
+                        || latest.state != working.state
+                    {
+                        *working = latest;
+                        if matches!(
+                            working.state,
+                            ContainerState::Running
+                                | ContainerState::Stopping
+                                | ContainerState::Stopped
+                                | ContainerState::Failed
+                        ) {
+                            return Ok(true);
+                        }
+                        return Ok(false);
+                    }
+                }
                 warn!(
                     target: "task",
                     task = %working.id,
@@ -770,9 +816,13 @@ impl TaskManager {
             spec.slot_id = None;
         }
 
-        if !matches!(spec.state, ContainerState::Failed) {
-            spec.phase_version = spec.phase_version.saturating_add(1);
+        // Ensure the failed transition is causally newer than any concurrent local write.
+        if let Ok(current) = self.load_spec(task_id).await {
+            if current.phase_version > spec.phase_version {
+                spec.phase_version = current.phase_version;
+            }
         }
+        spec.phase_version = spec.phase_version.saturating_add(1);
         spec.state = ContainerState::Failed;
         spec.phase_reason = None;
         spec.phase_progress = None;
@@ -853,6 +903,38 @@ impl TaskManager {
         }
 
         Ok(servers)
+    }
+
+    /// Inspect the currently tracked container names and return terminal exit details when
+    /// Docker reports the task container as exited or dead.
+    async fn resolve_terminal_exit_for_task(
+        &self,
+        spec: &TaskSpec,
+    ) -> Result<Option<(i32, Option<String>)>, ContainerError> {
+        let desired_name = format!("mantissa-{}", spec.id);
+        let candidate = {
+            let guard = self.local_containers.lock().await;
+            guard
+                .get(&spec.id)
+                .cloned()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| desired_name.clone())
+        };
+
+        let mut inspect_targets = vec![candidate.clone()];
+        if candidate != desired_name {
+            inspect_targets.push(desired_name);
+        }
+
+        for target in inspect_targets {
+            match self.container_manager.inspect_container(&target).await {
+                Ok(info) => return Ok(terminal_exit_from_inspect(&info)),
+                Err(ContainerError::NotFound(_)) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(None)
     }
 
     /// Resolves the live container identifier for a task from cache and deterministic name.
@@ -2196,4 +2278,48 @@ fn task_revision(value: &TaskValue) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// Returns true when a task should be restarted after a terminal runtime exit.
+fn should_restart_after_exit(spec: &TaskSpec, exit_code: i32) -> bool {
+    let Some(policy) = spec.restart_policy.as_ref() else {
+        return false;
+    };
+
+    match policy.name {
+        TaskRestartPolicyKind::No => false,
+        TaskRestartPolicyKind::Always | TaskRestartPolicyKind::UnlessStopped => true,
+        TaskRestartPolicyKind::OnFailure => exit_code != 0,
+    }
+}
+
+/// Extracts terminal exit metadata from one Docker inspect response.
+fn terminal_exit_from_inspect(
+    inspect: &bollard::service::ContainerInspectResponse,
+) -> Option<(i32, Option<String>)> {
+    let state = inspect.state.as_ref()?;
+    let running = state.running.unwrap_or(false);
+    if running {
+        return None;
+    }
+
+    let status = state.status.as_ref();
+    if matches!(status, Some(ContainerStateStatusEnum::RESTARTING)) {
+        return None;
+    }
+
+    let terminal_status = matches!(
+        status,
+        Some(ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD)
+    );
+    if !terminal_status && state.exit_code.is_none() {
+        return None;
+    }
+
+    let exit_code = state
+        .exit_code
+        .map(|value| value.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+        .unwrap_or(1);
+    let exit_error = state.error.clone().filter(|value| !value.trim().is_empty());
+    Some((exit_code, exit_error))
 }

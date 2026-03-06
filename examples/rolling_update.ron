@@ -13,17 +13,24 @@
     tasks: [
         (
             name: "api",
-            image: "ghcr.io/mantissa/demo-api:v2",
+            image: "hashicorp/http-echo:1.0.0",
             command: [
-                "sh",
-                "-c",
-                "while true; do echo 'rolling-demo api'; sleep 5; done",
+                "-listen",
+                ":8000",
+                "-text",
+                "hello from backend replica",
             ],
             replicas: 4,
             resources: (
                 cpu_millis: 300,
                 memory_mb: 256,
             ),
+            env: [],
+            secret_files: [],
+            health_port: Some(8000),
+            health_command: Some([
+                "/",
+            ]),
         ),
     ],
 )

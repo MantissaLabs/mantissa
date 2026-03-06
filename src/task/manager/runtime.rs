@@ -21,7 +21,7 @@ use crate::network::types::{
 use crate::network::wireguard;
 use crate::task::container::ContainerState;
 use crate::task::docker::ContainerRuntimeEvent;
-use crate::task::types::{TaskEvent, TaskServiceMetadata};
+use crate::task::types::{TaskEvent, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec};
 
 use super::TaskManager;
 use super::{compare_task_causality, select_best_task_value, spec_to_value};
@@ -326,6 +326,17 @@ impl TaskManager {
                         Some(ContainerRuntimeEvent::ContainerStateChanged) => {
                             runtime_reconcile_pending = true;
                         }
+                        Some(ContainerRuntimeEvent::TaskExited { task_id, exit_code }) => {
+                            if let Err(err) = self.handle_runtime_task_exit(task_id, exit_code).await {
+                                warn!(
+                                    target: "task",
+                                    task = %task_id,
+                                    exit_code,
+                                    "failed to process runtime exit signal: {err:#}"
+                                );
+                            }
+                            runtime_reconcile_pending = true;
+                        }
                         None => {
                             runtime_events_enabled = false;
                         }
@@ -351,6 +362,42 @@ impl TaskManager {
                 }
             }
         }
+    }
+
+    /// Handles one runtime-reported task exit so non-restartable crashes become terminal state.
+    async fn handle_runtime_task_exit(&self, task_id: Uuid, exit_code: i32) -> Result<()> {
+        let spec = match self.load_spec(task_id).await {
+            Ok(spec) => spec,
+            Err(_) => return Ok(()),
+        };
+
+        if spec.node_id != self.local_node_id {
+            return Ok(());
+        }
+        if matches!(
+            spec.state,
+            ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
+        ) {
+            return Ok(());
+        }
+
+        if task_policy_allows_runtime_restart(&spec, exit_code) {
+            debug!(
+                target: "task",
+                task = %task_id,
+                exit_code,
+                "runtime reported container exit that is restartable by policy"
+            );
+            return Ok(());
+        }
+
+        let reason = if exit_code == 0 {
+            "container exited with status code 0 and restart policy disabled".to_string()
+        } else {
+            format!("container exited with status code {exit_code}")
+        };
+        let _ = self.mark_task_failed(spec, anyhow::anyhow!(reason)).await;
+        Ok(())
     }
 
     /// Watches runtime lifecycle events and reconnects the stream when it drops.
@@ -493,6 +540,19 @@ impl TaskManager {
                 }
             }
         }
+    }
+}
+
+/// Returns true when runtime exits should be auto-restarted for the task policy.
+fn task_policy_allows_runtime_restart(spec: &TaskSpec, exit_code: i32) -> bool {
+    let Some(policy) = spec.restart_policy.as_ref() else {
+        return false;
+    };
+
+    match policy.name {
+        TaskRestartPolicyKind::No => false,
+        TaskRestartPolicyKind::Always | TaskRestartPolicyKind::UnlessStopped => true,
+        TaskRestartPolicyKind::OnFailure => exit_code != 0,
     }
 }
 

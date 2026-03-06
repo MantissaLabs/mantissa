@@ -1,6 +1,7 @@
 use super::ServiceController;
 use crate::services::types::{ServiceEvent, ServiceRolloutState, ServiceSpecValue, ServiceStatus};
 use crate::task::container::ContainerState;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -12,6 +13,11 @@ const SERVICE_READY_POLL_INTERVAL_MS: u64 = 200;
 const SERVICE_READY_TIMEOUT_SECS: u64 = 60;
 /// Base delay (in milliseconds) for exponential backoff between deployment retries.
 const SERVICE_READY_BACKOFF_BASE_MS: u64 = 500;
+/// Continuous all-running window required before declaring the service as Running.
+///
+/// This must exceed the default task reconcile tick (5s) so containers that die
+/// immediately after start cannot be acknowledged as stable running replicas.
+const SERVICE_READY_STABILITY_SECS: u64 = 8;
 /// Maximum consecutive unhealthy readiness probe results before marking the service failed.
 ///
 /// A slightly wider budget gives the periodic slot reconciler enough time to restart replicas
@@ -22,6 +28,8 @@ const SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES: u32 = 5;
 /// Degraded means at least one replica is terminal while others are still running. This budget
 /// allows reconciliation to restart transiently failed replicas without stalling forever.
 const SERVICE_DEPLOYMENT_MAX_DEGRADED_PROBES: u32 = 6;
+/// Maximum number of terminal failures tolerated for any single task during one deployment.
+const SERVICE_DEPLOYMENT_MAX_TASK_FAILURES: u32 = 3;
 
 enum ReadinessOutcome {
     Success(ServiceSpecValue),
@@ -52,21 +60,71 @@ pub(super) async fn start_readiness_wait(
     let manifest_id = initial_spec.manifest_id;
 
     let mut probes: u32 = 0;
+    let mut success_since: Option<Instant> = None;
     let mut failure_streak: u32 = 0;
     let mut degraded_streak: u32 = 0;
     let mut last_observed_states: Vec<(Uuid, Option<ContainerState>)> = Vec::new();
+    let mut last_observed_phase_versions: HashMap<Uuid, u64> = HashMap::new();
+    let mut task_terminal_phase_seen: HashMap<Uuid, u64> = HashMap::new();
+    let mut task_failure_counts: HashMap<Uuid, u32> = HashMap::new();
 
     loop {
         probes = probes.saturating_add(1);
-        match poll_service_attempt(
+        let outcome = poll_service_attempt(
             &controller,
             service_id,
             manifest_id,
             &mut last_observed_states,
+            &mut last_observed_phase_versions,
         )
-        .await
-        {
+        .await;
+
+        if let Some((task_id, failures)) = record_terminal_task_failure(
+            &last_observed_states,
+            &last_observed_phase_versions,
+            &mut task_terminal_phase_seen,
+            &mut task_failure_counts,
+        ) {
+            let snapshot = match controller.registry.get(service_id) {
+                Ok(Some(current)) if current.manifest_id == manifest_id => current,
+                Ok(Some(_)) | Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to load service '{}' while applying task failure budget: {err}",
+                        service_name
+                    );
+                    break;
+                }
+            };
+
+            tracing::warn!(
+                target: "services",
+                "service '{}' task {} reached {} terminal failures during deployment; marking service failed",
+                service_name,
+                task_id,
+                failures
+            );
+            mark_service_failed(&controller, snapshot, &last_observed_states).await;
+            break;
+        }
+
+        match outcome {
             ReadinessOutcome::Success(snapshot) => {
+                let stable_since = success_since.get_or_insert_with(Instant::now);
+                let stable_elapsed = stable_since.elapsed();
+                if stable_elapsed < Duration::from_secs(SERVICE_READY_STABILITY_SECS) {
+                    tracing::debug!(
+                        target: "services",
+                        "service '{}' readiness running state observed for {:?}; waiting for {}s stability window",
+                        service_name,
+                        stable_elapsed,
+                        SERVICE_READY_STABILITY_SECS
+                    );
+                    sleep(Duration::from_millis(SERVICE_READY_POLL_INTERVAL_MS)).await;
+                    continue;
+                }
+
                 let mut running_spec = snapshot.clone();
                 running_spec.set_rollout(ServiceRolloutState::default());
                 running_spec.set_status(ServiceStatus::Running);
@@ -100,6 +158,7 @@ pub(super) async fn start_readiness_wait(
                 break;
             }
             ReadinessOutcome::Pending => {
+                success_since = None;
                 if failure_streak != 0 || degraded_streak != 0 {
                     tracing::debug!(
                         target: "services",
@@ -111,6 +170,7 @@ pub(super) async fn start_readiness_wait(
                 }
             }
             ReadinessOutcome::Degraded(snapshot) => {
+                success_since = None;
                 degraded_streak = degraded_streak.saturating_add(1);
                 failure_streak = 0;
                 if degraded_streak >= SERVICE_DEPLOYMENT_MAX_DEGRADED_PROBES {
@@ -131,6 +191,7 @@ pub(super) async fn start_readiness_wait(
                 sleep(backoff).await;
             }
             ReadinessOutcome::Failure(snapshot) => {
+                success_since = None;
                 failure_streak = failure_streak.saturating_add(1);
                 degraded_streak = 0;
                 if failure_streak >= SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES {
@@ -197,6 +258,7 @@ async fn poll_service_attempt(
     service_id: Uuid,
     manifest_id: Uuid,
     last_states: &mut Vec<(Uuid, Option<ContainerState>)>,
+    last_phase_versions: &mut HashMap<Uuid, u64>,
 ) -> ReadinessOutcome {
     let deadline = Instant::now() + Duration::from_secs(SERVICE_READY_TIMEOUT_SECS);
 
@@ -238,6 +300,8 @@ async fn poll_service_attempt(
         }
 
         if current.task_ids.is_empty() {
+            last_states.clear();
+            last_phase_versions.clear();
             if current.tasks.is_empty() {
                 return ReadinessOutcome::Success(current);
             } else {
@@ -250,43 +314,46 @@ async fn poll_service_attempt(
             }
         }
 
-        match controller
-            .task_manager
-            .task_state_snapshot(&current.task_ids)
-            .await
-        {
-            Ok(states) => {
-                *last_states = states.clone();
-                match classify_readiness_states(last_states) {
-                    ReadinessClass::AllRunning => return ReadinessOutcome::Success(current),
-                    ReadinessClass::Inflight => {}
-                    ReadinessClass::Degraded => {
-                        tracing::debug!(
-                            target: "services",
-                            "service '{}' tasks entered mixed running/terminal states before convergence: {}",
-                            current.service_name,
-                            format_task_state_summary(last_states)
-                        );
-                        return ReadinessOutcome::Degraded(current);
-                    }
-                    ReadinessClass::Unhealthy => {
-                        tracing::debug!(
-                            target: "services",
-                            "service '{}' tasks entered terminal states before running: {}",
-                            current.service_name,
-                            format_task_state_summary(last_states)
-                        );
-                        return ReadinessOutcome::Failure(current);
-                    }
+        last_states.clear();
+        last_phase_versions.clear();
+        for task_id in &current.task_ids {
+            match controller.task_manager.inspect_task(*task_id).await {
+                Ok(spec) => {
+                    last_states.push((*task_id, Some(spec.state.clone())));
+                    last_phase_versions.insert(*task_id, spec.phase_version);
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        target: "services",
+                        "failed to inspect task {} for '{}': {err}",
+                        task_id,
+                        current.service_name
+                    );
+                    last_states.push((*task_id, None));
                 }
             }
-            Err(err) => {
-                tracing::warn!(
+        }
+
+        match classify_readiness_states(last_states) {
+            ReadinessClass::AllRunning => return ReadinessOutcome::Success(current),
+            ReadinessClass::Inflight => {}
+            ReadinessClass::Degraded => {
+                tracing::debug!(
                     target: "services",
-                    "failed to load task states for '{}': {err}",
-                    current.service_name
+                    "service '{}' tasks entered mixed running/terminal states before convergence: {}",
+                    current.service_name,
+                    format_task_state_summary(last_states)
                 );
-                return ReadinessOutcome::Pending;
+                return ReadinessOutcome::Degraded(current);
+            }
+            ReadinessClass::Unhealthy => {
+                tracing::debug!(
+                    target: "services",
+                    "service '{}' tasks entered terminal states before running: {}",
+                    current.service_name,
+                    format_task_state_summary(last_states)
+                );
+                return ReadinessOutcome::Failure(current);
             }
         }
 
@@ -327,6 +394,42 @@ async fn poll_service_attempt(
     }
 }
 
+/// Records terminal task transitions and returns the task that exceeded deployment failure budget.
+fn record_terminal_task_failure(
+    states: &[(Uuid, Option<ContainerState>)],
+    phase_versions: &HashMap<Uuid, u64>,
+    seen_terminal_phase: &mut HashMap<Uuid, u64>,
+    failure_counts: &mut HashMap<Uuid, u32>,
+) -> Option<(Uuid, u32)> {
+    for (task_id, state) in states {
+        let Some(state) = state else {
+            continue;
+        };
+        if !matches!(
+            state,
+            ContainerState::Failed | ContainerState::Stopped | ContainerState::Exited(_)
+        ) {
+            continue;
+        }
+
+        let phase_version = phase_versions.get(task_id).copied().unwrap_or(0);
+        if seen_terminal_phase.get(task_id).copied() == Some(phase_version) {
+            continue;
+        }
+        seen_terminal_phase.insert(*task_id, phase_version);
+
+        let count = failure_counts
+            .entry(*task_id)
+            .and_modify(|value| *value = value.saturating_add(1))
+            .or_insert(1);
+        if *count >= SERVICE_DEPLOYMENT_MAX_TASK_FAILURES {
+            return Some((*task_id, *count));
+        }
+    }
+
+    None
+}
+
 /// Marks the service as failed after unhealthy readiness retries have been exhausted.
 async fn mark_service_failed(
     controller: &ServiceController,
@@ -341,10 +444,30 @@ async fn mark_service_failed(
         summary
     );
 
-    controller.stop_tasks(&spec).await;
-
-    let mut failed_spec = spec.clone();
+    let mut failed_spec = match controller.registry.get(spec.id) {
+        Ok(Some(current)) if current.manifest_id == spec.manifest_id => current,
+        Ok(Some(current)) => {
+            tracing::debug!(
+                target: "services",
+                "skipping failed-state update for '{}' because manifest changed from {} to {}",
+                spec.service_name,
+                spec.manifest_id,
+                current.manifest_id
+            );
+            return;
+        }
+        Ok(None) => spec.clone(),
+        Err(err) => {
+            tracing::warn!(
+                target: "services",
+                "failed to load current service '{}' before marking failed: {err}",
+                spec.service_name
+            );
+            spec.clone()
+        }
+    };
     failed_spec.set_rollout(ServiceRolloutState::default());
+    failed_spec.task_ids.clear();
     failed_spec.set_status(ServiceStatus::Failed);
 
     if let Err(err) = controller.apply_upsert(failed_spec.clone()).await {
@@ -366,6 +489,8 @@ async fn mark_service_failed(
             failed_spec.service_name
         );
     }
+
+    controller.stop_tasks(&failed_spec).await;
 }
 
 /// Computes exponential backoff delay for readiness retries.

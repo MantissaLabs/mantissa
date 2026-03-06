@@ -1083,6 +1083,141 @@ async fn reconcile_running_task_restarts_when_container_is_missing() {
 }
 
 #[tokio::test]
+async fn reconcile_running_task_marks_failed_when_container_exits_without_restart_policy() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    assert!(matches!(spec.state, ContainerState::Running));
+
+    let container_id = mock_cm
+        .created
+        .lock()
+        .await
+        .first()
+        .cloned()
+        .expect("container id");
+
+    {
+        let mut inspect = mock_cm.inspect.lock().await;
+        inspect.insert(
+            container_id.clone(),
+            bollard::service::ContainerInspectResponse {
+                id: Some(container_id),
+                state: Some(bollard::models::ContainerState {
+                    status: Some(bollard::models::ContainerStateStatusEnum::EXITED),
+                    running: Some(false),
+                    pid: Some(0),
+                    exit_code: Some(255),
+                    error: Some("exec format error".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("reconcile should mark terminal exit as failed");
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load refreshed spec");
+    assert!(
+        matches!(refreshed.state, ContainerState::Failed),
+        "task should transition to failed after terminal container exit"
+    );
+    assert_eq!(
+        mock_cm.created.lock().await.len(),
+        1,
+        "task runtime should not be recreated for terminal exit without restart policy"
+    );
+
+    let slot_id = *spec.slot_ids.first().expect("task slot assignment");
+    let snapshot = scheduler.snapshot().await.expect("scheduler snapshot");
+    let slot = snapshot
+        .slots
+        .iter()
+        .find(|entry| entry.slot_id == slot_id)
+        .expect("slot entry");
+    assert!(
+        matches!(slot.state, SlotState::Free),
+        "failed task should release its reserved slot"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_running_task_does_not_overwrite_newer_failed_state() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    assert!(matches!(spec.state, ContainerState::Running));
+
+    {
+        let mut inspect = mock_cm.inspect.lock().await;
+        inspect.clear();
+    }
+
+    let mut failed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load running task before failure");
+    failed.phase_version = failed.phase_version.saturating_add(1);
+    failed.state = ContainerState::Failed;
+    failed.updated_at = Utc::now().to_rfc3339();
+    manager
+        .persist_spec(&failed)
+        .await
+        .expect("persist newer failed task state");
+
+    let mut stale_running = spec.clone();
+    stale_running.state = ContainerState::Running;
+
+    let short_circuit = manager
+        .reconcile_recorded_running_task(&mut stale_running)
+        .await
+        .expect("reconcile stale running task");
+    assert!(
+        short_circuit,
+        "reconcile should short-circuit after detecting newer terminal state"
+    );
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load refreshed task after stale reconcile");
+    assert!(
+        matches!(refreshed.state, ContainerState::Failed),
+        "newer failed state should not be overwritten by stale running reconcile"
+    );
+    assert_eq!(
+        mock_cm.created.lock().await.len(),
+        1,
+        "stale reconcile should not recreate runtime after terminal failure"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_running_task_keeps_running_when_list_finds_container() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
