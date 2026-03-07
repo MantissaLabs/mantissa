@@ -373,6 +373,12 @@ pub enum ServicesCommand {
     #[command(alias = "ls")]
     List(ServicesListArgs),
 
+    /// Inspect rollout progress and failure details for one service
+    Rollout {
+        #[command(subcommand)]
+        cmd: ServicesRolloutCommand,
+    },
+
     /// Stop a service and all associated tasks
     Stop(ServicesStopArgs),
 }
@@ -392,6 +398,19 @@ pub struct ServicesStopArgs {
     /// Service ID (UUID)
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServicesRolloutCommand {
+    /// Show current rollout progress and diagnostics for one service
+    Status(ServicesRolloutStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ServicesRolloutStatusArgs {
+    /// Service ID (UUID) or service name
+    #[arg(index = 1, value_name = "SERVICE")]
+    pub service: String,
 }
 
 #[derive(Subcommand, Debug)]

@@ -7,18 +7,21 @@ use crate::tasks::uuid_to_string;
 use anyhow::Result;
 use blake3::Hasher;
 use capnp::Error as CapnpError;
-use protocol::services::{ServiceStatus as ProtoServiceStatus, service_spec, task_template};
+use protocol::services::{
+    RolloutPhase as ProtoRolloutPhase, ServiceStatus as ProtoServiceStatus, service_spec,
+    task_template,
+};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::Ipv4Addr;
 use tabwriter::TabWriter;
 use uuid::Uuid;
 
-pub async fn list(cfg: &ClientConfig) -> Result<()> {
+/// Fetches and decodes service specs from the daemon into client-facing rows.
+pub(crate) async fn fetch_service_rows(cfg: &ClientConfig) -> Result<Vec<ServiceRow>> {
     let client = connection::get_local_session(cfg).await?;
     let request = client.get_services_request();
     let services = request.send().pipeline.get_services();
-
     let response = services.list_request().send().promise.await?;
     let reader = response.get()?;
     let specs = reader.get_services()?;
@@ -27,6 +30,11 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     for spec in specs.iter() {
         rows.push(ServiceRow::from_reader(spec)?);
     }
+    Ok(rows)
+}
+
+pub async fn list(cfg: &ClientConfig) -> Result<()> {
+    let mut rows = fetch_service_rows(cfg).await?;
 
     rows.sort_by(|a, b| a.service_name.cmp(&b.service_name));
 
@@ -45,7 +53,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "SERVICE\tSTATUS\tTASKS\tPUBLIC\tTASK IDS\tUPDATED\tID"
+        "SERVICE\tSTATUS\tROLLOUT\tREASON\tTASKS\tPUBLIC\tTASK IDS\tUPDATED\tID"
     )?;
 
     for row in display_rows {
@@ -67,9 +75,11 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
 
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.service_name,
             row.status,
+            row.rollout_summary(),
+            row.rollout_reason_summary(),
             tasks_summary,
             public_summary,
             row.task_ids.len(),
@@ -93,10 +103,12 @@ pub struct ServiceRow {
     pub updated_at: String,
     pub task_ids: Vec<Uuid>,
     pub status: ServiceStatusRow,
+    pub rollout: ServiceRolloutRow,
     pub public_endpoints: Vec<String>,
 }
 
 impl ServiceRow {
+    /// Builds a printable service row from one protocol reader payload.
     pub fn from_reader(spec: service_spec::Reader<'_>) -> Result<Self, CapnpError> {
         let id = uuid_to_string(spec.get_id()?)?;
         let service_name = spec.get_service_name()?.to_str()?.to_string();
@@ -117,6 +129,8 @@ impl ServiceRow {
             task_ids.push(Uuid::from_bytes(bytes));
         }
 
+        let rollout = ServiceRolloutRow::from_reader(spec.get_rollout()?)?;
+
         Ok(Self {
             id,
             service_name,
@@ -124,8 +138,19 @@ impl ServiceRow {
             updated_at: spec.get_updated_at()?.to_str()?.to_string(),
             task_ids,
             status: ServiceStatusRow::from_proto(spec.get_status()?),
+            rollout,
             public_endpoints: Vec::new(),
         })
+    }
+
+    /// Returns a compact rollout progress label for tabular list output.
+    fn rollout_summary(&self) -> String {
+        self.rollout.progress_summary()
+    }
+
+    /// Returns the latest rollout error summary, truncated for table readability.
+    fn rollout_reason_summary(&self) -> String {
+        self.rollout.reason_summary()
     }
 }
 
@@ -179,6 +204,7 @@ pub enum ServiceStatusRow {
 }
 
 impl ServiceStatusRow {
+    /// Converts protocol service status values into CLI display variants.
     fn from_proto(status: ProtoServiceStatus) -> Self {
         match status {
             ProtoServiceStatus::Deploying => Self::Deploying,
@@ -201,6 +227,115 @@ impl std::fmt::Display for ServiceStatusRow {
         };
         write!(f, "{label}")
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceRolloutRow {
+    pub phase: ServiceRolloutPhaseRow,
+    pub total_steps: u32,
+    pub completed_steps: u32,
+    pub failed_steps: u32,
+    pub max_failures: u16,
+    pub last_error: Option<String>,
+}
+
+impl ServiceRolloutRow {
+    /// Builds a printable rollout row from one protocol reader payload.
+    fn from_reader(
+        reader: protocol::services::rollout_state::Reader<'_>,
+    ) -> Result<Self, CapnpError> {
+        let last_error = reader.get_last_error()?.to_str()?.trim().to_string();
+        Ok(Self {
+            phase: ServiceRolloutPhaseRow::from_proto(reader.get_phase()?),
+            total_steps: reader.get_total_steps(),
+            completed_steps: reader.get_completed_steps(),
+            failed_steps: reader.get_failed_steps(),
+            max_failures: reader.get_max_failures(),
+            last_error: if last_error.is_empty() {
+                None
+            } else {
+                Some(last_error)
+            },
+        })
+    }
+
+    /// Returns a compact rollout progress label used by `services list`.
+    fn progress_summary(&self) -> String {
+        match self.phase {
+            ServiceRolloutPhaseRow::RollingForward => {
+                format!("forward {}/{}", self.completed_steps, self.total_steps)
+            }
+            ServiceRolloutPhaseRow::RollingBack => {
+                format!("rollback {}/{}", self.completed_steps, self.total_steps)
+            }
+            ServiceRolloutPhaseRow::Failed => {
+                if self.max_failures == 0 {
+                    "failed".to_string()
+                } else {
+                    format!("failed {}/{}", self.failed_steps, self.max_failures)
+                }
+            }
+            ServiceRolloutPhaseRow::Idle => {
+                if self.failed_steps > 0 || self.last_error.is_some() {
+                    "rolled-back".to_string()
+                } else {
+                    "-".to_string()
+                }
+            }
+        }
+    }
+
+    /// Returns a compact rollout failure reason for `services list` table output.
+    fn reason_summary(&self) -> String {
+        const MAX_REASON_CHARS: usize = 80;
+        let Some(reason) = self.last_error.as_deref() else {
+            return "-".to_string();
+        };
+        let trimmed = reason.trim();
+        if trimmed.is_empty() {
+            return "-".to_string();
+        }
+        truncate_for_table(trimmed, MAX_REASON_CHARS)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceRolloutPhaseRow {
+    Idle,
+    RollingForward,
+    RollingBack,
+    Failed,
+}
+
+impl ServiceRolloutPhaseRow {
+    /// Converts protocol rollout phase values into CLI display variants.
+    fn from_proto(phase: ProtoRolloutPhase) -> Self {
+        match phase {
+            ProtoRolloutPhase::Idle => Self::Idle,
+            ProtoRolloutPhase::RollingForward => Self::RollingForward,
+            ProtoRolloutPhase::RollingBack => Self::RollingBack,
+            ProtoRolloutPhase::Failed => Self::Failed,
+        }
+    }
+}
+
+/// Truncates verbose values to keep tabular output readable in narrow terminals.
+fn truncate_for_table(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return "...".to_string();
+    }
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars.saturating_sub(3) {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
 }
 
 /// Best-effort enrichment that computes per-service public VIP endpoints so operators can

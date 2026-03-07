@@ -205,6 +205,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ServicesCommand::List(_) => {
                 local.run_until(client::services::list(&cfg)).await?;
             }
+            ServicesCommand::Rollout { cmd } => match cmd {
+                ServicesRolloutCommand::Status(args) => {
+                    local
+                        .run_until(client::services::rollout_status(&cfg, &args.service))
+                        .await?;
+                }
+            },
             ServicesCommand::Stop(args) => {
                 local
                     .run_until(client::services::stop(&cfg, &args.id))
