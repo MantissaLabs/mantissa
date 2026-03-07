@@ -151,6 +151,8 @@ fn running_task(task_id: Uuid, node_id: Uuid, service_name: &str, network_id: Uu
         service_metadata: Some(TaskServiceMetadata::new(service_name, "backend")),
         task_epoch: 0,
         phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     })
 }
 

@@ -2155,6 +2155,8 @@ mod tests {
             service_metadata: Some(TaskServiceMetadata::new(service_name, template)),
             task_epoch: 0,
             phase_version: 0,
+            launch_attempt: 0,
+            last_terminal_observed_launch: None,
         }
     }
 

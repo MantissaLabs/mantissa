@@ -103,6 +103,8 @@ impl TaskManager {
                 service_metadata: plan.service_metadata.clone(),
                 task_epoch,
                 phase_version: 0,
+                launch_attempt: 1,
+                last_terminal_observed_launch: None,
             };
             specs.push(spec);
         }
@@ -208,17 +210,20 @@ impl TaskManager {
 
             let slot_ids = plan.slot_ids();
             let slot_id = slot_ids.first().copied();
-            let (task_epoch, phase_version) = match self.load_spec(plan.id).await {
-                Ok(current) => (
-                    current.task_epoch,
-                    if matches!(current.state, ContainerState::Running) {
-                        current.phase_version
-                    } else {
-                        current.phase_version.saturating_add(1)
-                    },
-                ),
-                Err(_) => (0, 1),
-            };
+            let (task_epoch, phase_version, launch_attempt, last_terminal_observed_launch) =
+                match self.load_spec(plan.id).await {
+                    Ok(current) => (
+                        current.task_epoch,
+                        if matches!(current.state, ContainerState::Running) {
+                            current.phase_version
+                        } else {
+                            current.phase_version.saturating_add(1)
+                        },
+                        current.launch_attempt.max(1),
+                        current.last_terminal_observed_launch,
+                    ),
+                    Err(_) => (0, 1, 1, None),
+                };
             let spec = TaskSpec {
                 id: plan.id,
                 name: plan.name.clone(),
@@ -244,6 +249,8 @@ impl TaskManager {
                 service_metadata: plan.service_metadata.clone(),
                 task_epoch,
                 phase_version,
+                launch_attempt,
+                last_terminal_observed_launch,
             };
             specs.push(spec);
         }

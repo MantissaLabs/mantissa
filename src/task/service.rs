@@ -114,6 +114,8 @@ pub fn add_event(
             spec_builder.set_phase_progress("");
             spec_builder.set_task_epoch(0);
             spec_builder.set_phase_version(0);
+            spec_builder.set_launch_attempt(0);
+            spec_builder.set_last_terminal_observed_launch(0);
             spec_builder.set_node_id(&[0u8; 16]);
             spec_builder.set_node_name("");
             spec_builder.reborrow().init_slot_ids(0);
@@ -156,6 +158,8 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     builder.set_phase_progress(spec.phase_progress.as_deref().unwrap_or(""));
     builder.set_task_epoch(spec.task_epoch);
     builder.set_phase_version(spec.phase_version);
+    builder.set_launch_attempt(spec.launch_attempt);
+    builder.set_last_terminal_observed_launch(spec.last_terminal_observed_launch.unwrap_or(0));
     builder.set_node_id(spec.node_id.as_bytes());
     builder.set_node_name(&spec.node_name);
 
@@ -214,6 +218,11 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     let phase_progress = reader.get_phase_progress()?.to_str()?.to_string();
     let task_epoch = reader.get_task_epoch();
     let phase_version = reader.get_phase_version();
+    let launch_attempt = reader.get_launch_attempt();
+    let last_terminal_observed_launch = match reader.get_last_terminal_observed_launch() {
+        0 => None,
+        value => Some(value),
+    };
     let node_bytes = reader.get_node_id()?.to_owned();
     let node_slice: [u8; 16] = node_bytes
         .as_slice()
@@ -314,6 +323,8 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         service_metadata,
         task_epoch,
         phase_version,
+        launch_attempt,
+        last_terminal_observed_launch,
     })
 }
 

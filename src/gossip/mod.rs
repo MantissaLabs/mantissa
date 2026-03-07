@@ -1279,6 +1279,8 @@ mod tests {
             service_metadata: None,
             task_epoch: 4,
             phase_version: 7,
+            launch_attempt: 0,
+            last_terminal_observed_launch: None,
         };
 
         let stale = TaskSpec {
@@ -1306,6 +1308,8 @@ mod tests {
             service_metadata: None,
             task_epoch: 4,
             phase_version: 6,
+            launch_attempt: 0,
+            last_terminal_observed_launch: None,
         };
 
         let pending = vec![
@@ -1364,6 +1368,8 @@ mod tests {
             service_metadata: None,
             task_epoch: 2,
             phase_version: 9,
+            launch_attempt: 0,
+            last_terminal_observed_launch: None,
         };
 
         let pending = vec![
@@ -1433,6 +1439,8 @@ mod tests {
                 service_metadata: None,
                 task_epoch: 2,
                 phase_version,
+                launch_attempt: 0,
+                last_terminal_observed_launch: None,
             };
             pending.push(Message::Task {
                 id: Uuid::new_v4(),

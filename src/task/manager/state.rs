@@ -68,6 +68,25 @@ impl TaskManager {
                 if let Some((exit_code, exit_error)) =
                     self.resolve_terminal_exit_for_task(working).await?
                 {
+                    let mut observation_reason =
+                        format!("container exited with status code {exit_code}");
+                    if let Some(exit_error) = exit_error.as_ref() {
+                        observation_reason.push_str(": ");
+                        observation_reason.push_str(exit_error.trim());
+                    }
+                    if let Err(err) = self
+                        .record_terminal_observation_for_current_launch(
+                            working.id,
+                            Some(observation_reason),
+                        )
+                        .await
+                    {
+                        warn!(
+                            target: "task",
+                            task = %working.id,
+                            "failed to persist terminal observation from runtime inspect: {err:#}"
+                        );
+                    }
                     if should_restart_after_exit(working, exit_code) {
                         warn!(
                             target: "task",
@@ -89,12 +108,23 @@ impl TaskManager {
                         return Ok(true);
                     }
                 }
+                if let Err(err) = self
+                    .record_terminal_observation_for_current_launch(
+                        working.id,
+                        Some("running task container missing locally".to_string()),
+                    )
+                    .await
+                {
+                    warn!(
+                        target: "task",
+                        task = %working.id,
+                        "failed to persist terminal observation for missing running container: {err:#}"
+                    );
+                }
                 // Reload once before transitioning to `Pending` so stale running snapshots do not
                 // overwrite a newer terminal transition (for example, runtime-exit failure).
                 if let Ok(latest) = self.load_spec(working.id).await {
-                    if latest.phase_version != working.phase_version
-                        || latest.state != working.state
-                    {
+                    if latest.state != working.state {
                         *working = latest;
                         if matches!(
                             working.state,
@@ -106,6 +136,11 @@ impl TaskManager {
                             return Ok(true);
                         }
                         return Ok(false);
+                    }
+                    if latest.phase_version != working.phase_version {
+                        // Allow phase-only updates (such as terminal observation markers) to
+                        // refresh the local snapshot without suppressing the pending restart.
+                        *working = latest;
                     }
                 }
                 warn!(
@@ -366,6 +401,10 @@ impl TaskManager {
 
         if spec.state != state {
             spec.phase_version = spec.phase_version.saturating_add(1);
+            if matches!(state, ContainerState::Pulling) {
+                // Pulling marks the start of one concrete launch attempt.
+                spec.launch_attempt = spec.launch_attempt.saturating_add(1);
+            }
         }
         spec.state = state;
         spec.phase_reason = next_reason;
@@ -386,6 +425,47 @@ impl TaskManager {
                     target: "task",
                     task = %task_id,
                     "failed to enqueue task phase gossip: {err}"
+                );
+            }
+        }
+        Ok(spec)
+    }
+
+    /// Records a terminal runtime observation for the task's current launch attempt.
+    ///
+    /// Runtime `die` events and reconcile fallback both call this helper so service-level
+    /// crash-loop accounting has one durable signal even when terminal snapshots are brief.
+    /// The observation is deduplicated per launch attempt.
+    pub(super) async fn record_terminal_observation_for_current_launch(
+        &self,
+        task_id: Uuid,
+        reason: Option<String>,
+    ) -> Result<TaskSpec, anyhow::Error> {
+        let mut spec = self.load_spec(task_id).await?;
+        if spec.last_terminal_observed_launch == Some(spec.launch_attempt) {
+            return Ok(spec);
+        }
+
+        spec.phase_version = spec.phase_version.saturating_add(1);
+        spec.last_terminal_observed_launch = Some(spec.launch_attempt);
+        spec.phase_reason = reason.filter(|value| !value.trim().is_empty());
+        spec.phase_progress = None;
+        spec.updated_at = Utc::now().to_rfc3339();
+        self.persist_spec(&spec).await?;
+        match self.enqueue_gossip_best_effort(TaskEvent::Upsert(Box::new(spec.clone()))) {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    target: "task",
+                    task = %task_id,
+                    "dropping terminal observation gossip due full queue; anti-entropy will reconcile"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    target: "task",
+                    task = %task_id,
+                    "failed to enqueue terminal observation gossip: {err}"
                 );
             }
         }
@@ -818,12 +898,25 @@ impl TaskManager {
 
         // Ensure the failed transition is causally newer than any concurrent local write.
         if let Ok(current) = self.load_spec(task_id).await {
+            if matches!(current.state, ContainerState::Failed)
+                && current.last_terminal_observed_launch == Some(current.launch_attempt)
+                && current.launch_attempt >= spec.launch_attempt
+            {
+                return error;
+            }
             if current.phase_version > spec.phase_version {
                 spec.phase_version = current.phase_version;
+            }
+            if current.launch_attempt > spec.launch_attempt {
+                spec.launch_attempt = current.launch_attempt;
+            }
+            if spec.last_terminal_observed_launch.is_none() {
+                spec.last_terminal_observed_launch = current.last_terminal_observed_launch;
             }
         }
         spec.phase_version = spec.phase_version.saturating_add(1);
         spec.state = ContainerState::Failed;
+        spec.last_terminal_observed_launch = Some(spec.launch_attempt);
         spec.phase_reason = None;
         spec.phase_progress = None;
         spec.updated_at = Utc::now().to_rfc3339();

@@ -44,6 +44,10 @@ pub struct TaskSpec {
     pub task_epoch: u64,
     #[serde(default)]
     pub phase_version: u64,
+    #[serde(default)]
+    pub launch_attempt: u64,
+    #[serde(default)]
+    pub last_terminal_observed_launch: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -176,6 +180,10 @@ pub struct TaskValue {
     pub task_epoch: u64,
     #[serde(default)]
     pub phase_version: u64,
+    #[serde(default)]
+    pub launch_attempt: u64,
+    #[serde(default)]
+    pub last_terminal_observed_launch: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +210,8 @@ pub struct TaskValueDraft {
     pub service_metadata: Option<TaskServiceMetadata>,
     pub task_epoch: u64,
     pub phase_version: u64,
+    pub launch_attempt: u64,
+    pub last_terminal_observed_launch: Option<u64>,
 }
 
 impl TaskValue {
@@ -232,6 +242,8 @@ impl TaskValue {
             service_metadata: draft.service_metadata,
             task_epoch: draft.task_epoch,
             phase_version: draft.phase_version,
+            launch_attempt: draft.launch_attempt,
+            last_terminal_observed_launch: draft.last_terminal_observed_launch,
         }
     }
 }

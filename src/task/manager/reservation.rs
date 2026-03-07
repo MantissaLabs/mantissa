@@ -560,6 +560,8 @@ impl TaskManager {
                 service_metadata: plan.service_metadata.clone(),
                 task_epoch,
                 phase_version: 0,
+                launch_attempt: 0,
+                last_terminal_observed_launch: None,
             };
             results.push((plan.index, spec));
         }

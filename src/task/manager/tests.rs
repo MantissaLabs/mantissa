@@ -551,6 +551,8 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
         service_metadata: None,
         task_epoch: 0,
         phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     };
     manager.persist_spec(&spec).await.expect("persist task");
 
@@ -613,6 +615,8 @@ async fn reconcile_rejects_missing_slot_assignments() {
         service_metadata: None,
         task_epoch: 0,
         phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     };
 
     let err = manager
@@ -661,6 +665,8 @@ async fn reconcile_pending_task_reserves_assigned_slots_before_launch() {
         service_metadata: None,
         task_epoch: 0,
         phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     };
     manager.persist_spec(&spec).await.expect("persist task");
 
@@ -721,6 +727,8 @@ async fn reconcile_uses_latest_persisted_slot_assignment() {
         service_metadata: None,
         task_epoch: 0,
         phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     };
 
     // Persist a fresher snapshot with missing assignments to emulate a concurrent CRDT update
@@ -834,6 +842,8 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         service_metadata: None,
         task_epoch: 2,
         phase_version: 7,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     });
 
     let lower_epoch = TaskValue::new(TaskValueDraft {
@@ -859,6 +869,8 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         service_metadata: None,
         task_epoch: 1,
         phase_version: 99,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     });
     assert!(
         !should_accept_incoming_task_value(&current, &lower_epoch),
@@ -888,6 +900,8 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         service_metadata: None,
         task_epoch: 2,
         phase_version: 6,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     });
     assert!(
         !should_accept_incoming_task_value(&current, &same_epoch_lower_phase),
@@ -917,6 +931,8 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         service_metadata: None,
         task_epoch: 3,
         phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     });
     assert!(
         should_accept_incoming_task_value(&current, &higher_epoch),
@@ -953,6 +969,8 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         service_metadata: None,
         task_epoch: 0,
         phase_version: 4,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     });
 
     let stale_pending_later_timestamp = TaskValue::new(TaskValueDraft {
@@ -978,6 +996,8 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         service_metadata: None,
         task_epoch: 0,
         phase_version: 3,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     });
 
     let chosen = select_best_task_value(&[
@@ -1503,6 +1523,8 @@ async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims
         service_metadata: None,
         task_epoch: 0,
         phase_version: 3,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     };
     manager.persist_spec(&loser).await.expect("persist loser");
 
@@ -2036,6 +2058,8 @@ async fn task_owned_locally_detects_remote_entries() {
         service_metadata: None,
         task_epoch: 0,
         phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     });
 
     let store = manager.store.clone();
@@ -2641,6 +2665,8 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         service_metadata: None,
         task_epoch: original.task_epoch,
         phase_version: original.phase_version,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     });
 
     let (remote_db, _remote_dir) = temp_db("tasks-sync-tomb");
@@ -2711,6 +2737,8 @@ fn build_remote_task_spec(
         service_metadata: None,
         task_epoch,
         phase_version,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     }
 }
 
@@ -2801,6 +2829,8 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         service_metadata: None,
         task_epoch: gossip_running.task_epoch,
         phase_version: gossip_running.phase_version.saturating_sub(1),
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     });
     let (remote_db, _remote_dir) = temp_db("tasks-sync-delta");
     let remote_store = open_task_store(remote_db, Uuid::new_v4()).expect("open remote task store");
@@ -2928,6 +2958,8 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
         service_metadata: None,
         task_epoch: 0,
         phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
     });
     manager
         .store

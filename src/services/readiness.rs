@@ -70,6 +70,8 @@ pub(super) async fn start_readiness_wait(
     let mut degraded_streak: u32 = 0;
     let mut last_observed_states: Vec<(Uuid, Option<ContainerState>)> = Vec::new();
     let mut last_observed_phase_versions: HashMap<Uuid, u64> = HashMap::new();
+    let mut last_observed_terminal_launches: HashMap<Uuid, Option<u64>> = HashMap::new();
+    let mut task_terminal_launch_seen: HashMap<Uuid, u64> = HashMap::new();
     let mut task_terminal_phase_seen: HashMap<Uuid, u64> = HashMap::new();
     let mut task_failure_counts: HashMap<Uuid, u32> = HashMap::new();
     let progress_window = Duration::from_secs(SERVICE_DEPLOYMENT_PROGRESS_DEADLINE_SECS);
@@ -84,12 +86,15 @@ pub(super) async fn start_readiness_wait(
             manifest_id,
             &mut last_observed_states,
             &mut last_observed_phase_versions,
+            &mut last_observed_terminal_launches,
         )
         .await;
 
         if let Some((task_id, failures)) = record_terminal_task_failure(
             &last_observed_states,
             &last_observed_phase_versions,
+            &last_observed_terminal_launches,
+            &mut task_terminal_launch_seen,
             &mut task_terminal_phase_seen,
             &mut task_failure_counts,
         ) {
@@ -299,6 +304,7 @@ async fn poll_service_attempt(
     manifest_id: Uuid,
     last_states: &mut Vec<(Uuid, Option<ContainerState>)>,
     last_phase_versions: &mut HashMap<Uuid, u64>,
+    last_terminal_launches: &mut HashMap<Uuid, Option<u64>>,
 ) -> ReadinessOutcome {
     let deadline = Instant::now() + Duration::from_secs(SERVICE_READY_TIMEOUT_SECS);
 
@@ -342,6 +348,7 @@ async fn poll_service_attempt(
         if current.task_ids.is_empty() {
             last_states.clear();
             last_phase_versions.clear();
+            last_terminal_launches.clear();
             if current.tasks.is_empty() {
                 return ReadinessOutcome::Success(current);
             } else {
@@ -356,11 +363,13 @@ async fn poll_service_attempt(
 
         last_states.clear();
         last_phase_versions.clear();
+        last_terminal_launches.clear();
         for task_id in &current.task_ids {
             match controller.task_manager.inspect_task(*task_id).await {
                 Ok(spec) => {
                     last_states.push((*task_id, Some(spec.state.clone())));
                     last_phase_versions.insert(*task_id, spec.phase_version);
+                    last_terminal_launches.insert(*task_id, spec.last_terminal_observed_launch);
                 }
                 Err(err) => {
                     tracing::debug!(
@@ -370,6 +379,7 @@ async fn poll_service_attempt(
                         current.service_name
                     );
                     last_states.push((*task_id, None));
+                    last_terminal_launches.insert(*task_id, None);
                 }
             }
         }
@@ -438,10 +448,26 @@ async fn poll_service_attempt(
 fn record_terminal_task_failure(
     states: &[(Uuid, Option<ContainerState>)],
     phase_versions: &HashMap<Uuid, u64>,
+    terminal_launches: &HashMap<Uuid, Option<u64>>,
+    seen_terminal_launch: &mut HashMap<Uuid, u64>,
     seen_terminal_phase: &mut HashMap<Uuid, u64>,
     failure_counts: &mut HashMap<Uuid, u32>,
 ) -> Option<(Uuid, u32)> {
     for (task_id, state) in states {
+        if let Some(Some(launch_attempt)) = terminal_launches.get(task_id).copied() {
+            if seen_terminal_launch.get(task_id).copied() != Some(launch_attempt) {
+                seen_terminal_launch.insert(*task_id, launch_attempt);
+                let count = failure_counts
+                    .entry(*task_id)
+                    .and_modify(|value| *value = value.saturating_add(1))
+                    .or_insert(1);
+                if *count >= SERVICE_DEPLOYMENT_MAX_TASK_FAILURES {
+                    return Some((*task_id, *count));
+                }
+            }
+            continue;
+        }
+
         let Some(state) = state else {
             continue;
         };
@@ -601,6 +627,7 @@ fn format_task_state_summary(states: &[(Uuid, Option<ContainerState>)]) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     /// Ensures the progress deadline extends only when running replicas increase.
     #[test]
@@ -662,5 +689,103 @@ mod tests {
             now + Duration::from_secs(2),
             deadline
         ));
+    }
+
+    /// Ensures persisted terminal launch markers increment crash-loop counters even when
+    /// current snapshots are still in non-terminal states.
+    #[test]
+    fn terminal_launch_marker_counts_failures_without_terminal_snapshot() {
+        let task_id = Uuid::new_v4();
+        let states = vec![(task_id, Some(ContainerState::Pulling))];
+        let phase_versions = HashMap::from([(task_id, 11u64)]);
+        let mut terminal_launches = HashMap::from([(task_id, Some(1u64))]);
+        let mut seen_terminal_launch = HashMap::new();
+        let mut seen_terminal_phase = HashMap::new();
+        let mut failure_counts = HashMap::new();
+
+        let first = record_terminal_task_failure(
+            &states,
+            &phase_versions,
+            &terminal_launches,
+            &mut seen_terminal_launch,
+            &mut seen_terminal_phase,
+            &mut failure_counts,
+        );
+        assert!(
+            first.is_none(),
+            "first marker should increment but stay below threshold"
+        );
+        assert_eq!(failure_counts.get(&task_id).copied(), Some(1));
+
+        let duplicate = record_terminal_task_failure(
+            &states,
+            &phase_versions,
+            &terminal_launches,
+            &mut seen_terminal_launch,
+            &mut seen_terminal_phase,
+            &mut failure_counts,
+        );
+        assert!(
+            duplicate.is_none(),
+            "duplicate marker for same launch must not increment again"
+        );
+        assert_eq!(failure_counts.get(&task_id).copied(), Some(1));
+
+        terminal_launches.insert(task_id, Some(2u64));
+        let second_attempt = record_terminal_task_failure(
+            &states,
+            &phase_versions,
+            &terminal_launches,
+            &mut seen_terminal_launch,
+            &mut seen_terminal_phase,
+            &mut failure_counts,
+        );
+        assert!(
+            second_attempt.is_none(),
+            "second launch marker should count but remain under threshold"
+        );
+        assert_eq!(failure_counts.get(&task_id).copied(), Some(2));
+    }
+
+    /// Ensures terminal-state fallback still deduplicates by phase when launch markers are absent.
+    #[test]
+    fn terminal_state_fallback_counts_once_per_phase() {
+        let task_id = Uuid::new_v4();
+        let mut states = vec![(task_id, Some(ContainerState::Failed))];
+        let mut phase_versions = HashMap::from([(task_id, 5u64)]);
+        let terminal_launches = HashMap::from([(task_id, None)]);
+        let mut seen_terminal_launch = HashMap::new();
+        let mut seen_terminal_phase = HashMap::new();
+        let mut failure_counts = HashMap::new();
+
+        record_terminal_task_failure(
+            &states,
+            &phase_versions,
+            &terminal_launches,
+            &mut seen_terminal_launch,
+            &mut seen_terminal_phase,
+            &mut failure_counts,
+        );
+        record_terminal_task_failure(
+            &states,
+            &phase_versions,
+            &terminal_launches,
+            &mut seen_terminal_launch,
+            &mut seen_terminal_phase,
+            &mut failure_counts,
+        );
+        assert_eq!(failure_counts.get(&task_id).copied(), Some(1));
+
+        states[0].1 = Some(ContainerState::Stopped);
+        phase_versions.insert(task_id, 6u64);
+        record_terminal_task_failure(
+            &states,
+            &phase_versions,
+            &terminal_launches,
+            &mut seen_terminal_launch,
+            &mut seen_terminal_phase,
+            &mut failure_counts,
+        );
+        assert_eq!(failure_counts.get(&task_id).copied(), Some(2));
     }
 }

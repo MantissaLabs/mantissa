@@ -99,6 +99,12 @@ struct TaskSpec {
 
   phaseVersion @22 :UInt64;
   # Monotonic lifecycle version incremented on each task state transition.
+
+  launchAttempt @23 :UInt64;
+  # Monotonic launch attempt for this task incarnation.
+
+  lastTerminalObservedLaunch @24 :UInt64;
+  # Last launch attempt observed as terminal, 0 means unset.
 }
 
 struct ServiceMetadata {

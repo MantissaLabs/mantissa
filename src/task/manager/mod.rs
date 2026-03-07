@@ -1051,6 +1051,8 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         service_metadata: value.service_metadata,
         task_epoch: value.task_epoch,
         phase_version: value.phase_version,
+        launch_attempt: value.launch_attempt,
+        last_terminal_observed_launch: value.last_terminal_observed_launch,
     }
 }
 
@@ -1079,6 +1081,8 @@ pub(crate) fn spec_to_value(spec: &TaskSpec) -> TaskValue {
         service_metadata: spec.service_metadata.clone(),
         task_epoch: spec.task_epoch,
         phase_version: spec.phase_version,
+        launch_attempt: spec.launch_attempt,
+        last_terminal_observed_launch: spec.last_terminal_observed_launch,
     });
 
     value.restart_policy = spec.restart_policy.clone();
