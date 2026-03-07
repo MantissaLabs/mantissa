@@ -283,6 +283,18 @@ interface Services {
   delete @1 (ids :List(Data)); # Each entry is a 16-byte service UUID
   # Delete services by UUID.
 
-  deploy @2 (spec :ServiceDeploySpec) -> (serviceId :Data);
-  # Deploy or update a service and return its UUID.
+  deploy @2 (spec :ServiceDeploySpec) -> (
+    serviceId :Data,
+    outcome :DeployOutcome,
+    detail :Text
+  );
+  # Deploy or update a service and return the resolved outcome.
+}
+
+enum DeployOutcome {
+  accepted @0;
+  # Deployment was accepted and reconciliation started.
+
+  unchanged @1;
+  # Requested spec already matches the running service.
 }

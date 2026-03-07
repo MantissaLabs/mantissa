@@ -6,7 +6,7 @@ use crate::config::ClientConfig;
 use crate::connection;
 use crate::networks;
 use anyhow::{Context, Result, anyhow};
-use capnp::struct_list;
+use capnp::{Error as CapnpError, struct_list};
 use protocol::services::task_template;
 use protocol::task::{environment_var, secret_file, secret_ref};
 use std::collections::HashSet;
@@ -17,6 +17,13 @@ use uuid::Uuid;
 pub struct ServiceDeploymentHandle {
     pub service_id: Uuid,
     pub manifest_id: Uuid,
+}
+
+/// Simplified deploy outcomes surfaced by the services RPC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeployOutcome {
+    Accepted,
+    Unchanged,
 }
 
 /// Ensure every network referenced by the manifest exists so scheduling can attach tasks reliably.
@@ -168,11 +175,7 @@ pub async fn deploy_manifest(
         }
     }
 
-    let response = deploy
-        .send()
-        .promise
-        .await
-        .context("service deployment request failed")?;
+    let response = deploy.send().promise.await.map_err(map_deploy_rpc_error)?;
     let reader = response
         .get()
         .context("failed to read deployment response")?;
@@ -191,13 +194,39 @@ pub async fn deploy_manifest(
     let service_id = Uuid::from_slice(&id_bytes)
         .context("failed to decode service id from deployment response")?;
 
-    println!(
-        "service '{}' accepted with id {}",
-        manifest.name, service_id
-    );
-    println!(
-        "deployment is running in the background; track it with `mantissa services list` or stop it with `mantissa services stop {service_id}`"
-    );
+    let outcome = parse_deploy_outcome(reader.get_outcome()?);
+    let detail = reader
+        .get_detail()
+        .ok()
+        .and_then(|text| text.to_str().ok())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+
+    match outcome {
+        DeployOutcome::Accepted => {
+            println!(
+                "service '{}' accepted with id {}",
+                manifest.name, service_id
+            );
+            println!(
+                "deployment is running in the background; track it with `mantissa services list` or stop it with `mantissa services stop {service_id}`"
+            );
+        }
+        DeployOutcome::Unchanged => {
+            if let Some(detail) = detail {
+                println!(
+                    "service '{}' unchanged (id {}): {}",
+                    manifest.name, service_id, detail
+                );
+            } else {
+                println!(
+                    "service '{}' unchanged (id {}): already deployed at desired spec",
+                    manifest.name, service_id
+                );
+            }
+        }
+    }
 
     Ok(ServiceDeploymentHandle {
         service_id,
@@ -264,4 +293,21 @@ fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) -> Resul
     write_secret_files(&mut files_builder, &task.secret_files, &task.name)?;
 
     Ok(())
+}
+
+/// Maps transport-level Cap'n Proto failures to user-facing deploy errors.
+fn map_deploy_rpc_error(err: CapnpError) -> anyhow::Error {
+    let text = err.to_string();
+    if let Some((_, message)) = text.split_once("remote exception: ") {
+        return anyhow!("service deployment rejected: {}", message.trim());
+    }
+    anyhow!("service deployment request failed: {text}")
+}
+
+/// Converts protocol deploy outcomes into a compact client-side representation.
+fn parse_deploy_outcome(outcome: protocol::services::DeployOutcome) -> DeployOutcome {
+    match outcome {
+        protocol::services::DeployOutcome::Accepted => DeployOutcome::Accepted,
+        protocol::services::DeployOutcome::Unchanged => DeployOutcome::Unchanged,
+    }
 }

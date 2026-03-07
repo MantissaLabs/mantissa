@@ -58,6 +58,21 @@ const SERVICE_ROLLOUT_POLL_INTERVAL_MS: u64 = 200;
 /// This is required for split/merge convergence so replicas migrate off overloaded partitions once
 /// the unified cluster view is restored.
 const SERVICE_ENABLE_PROACTIVE_REBALANCE: bool = true;
+
+/// Outcome returned when submitting a service deployment request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceDeploymentOutcome {
+    Accepted,
+    Unchanged,
+}
+
+/// Result returned by deployment submission APIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServiceDeploymentSubmission {
+    pub service_id: Uuid,
+    pub outcome: ServiceDeploymentOutcome,
+}
+
 #[derive(Clone)]
 pub struct ServiceController {
     registry: ServiceRegistry,
@@ -194,17 +209,20 @@ impl ServiceController {
         service_name: impl Into<String>,
         tasks: Vec<ServiceTaskSpecValue>,
     ) -> anyhow::Result<Uuid> {
-        self.submit_deployment_with_strategy(
-            manifest_id,
-            manifest_name,
-            service_name,
-            tasks,
-            ServiceUpdateStrategy::default(),
-        )
-        .await
+        let submission = self
+            .submit_deployment_with_strategy_outcome(
+                manifest_id,
+                manifest_name,
+                service_name,
+                tasks,
+                ServiceUpdateStrategy::default(),
+            )
+            .await?;
+        Ok(submission.service_id)
     }
 
     /// Schedules an asynchronous deployment with explicit rollout strategy configuration.
+    #[allow(dead_code)]
     pub async fn submit_deployment_with_strategy(
         &self,
         manifest_id: Uuid,
@@ -213,6 +231,27 @@ impl ServiceController {
         tasks: Vec<ServiceTaskSpecValue>,
         update_strategy: ServiceUpdateStrategy,
     ) -> anyhow::Result<Uuid> {
+        let submission = self
+            .submit_deployment_with_strategy_outcome(
+                manifest_id,
+                manifest_name,
+                service_name,
+                tasks,
+                update_strategy,
+            )
+            .await?;
+        Ok(submission.service_id)
+    }
+
+    /// Submits a deployment and returns a structured outcome for idempotent callers.
+    pub async fn submit_deployment_with_strategy_outcome(
+        &self,
+        manifest_id: Uuid,
+        manifest_name: impl Into<String>,
+        service_name: impl Into<String>,
+        tasks: Vec<ServiceTaskSpecValue>,
+        update_strategy: ServiceUpdateStrategy,
+    ) -> anyhow::Result<ServiceDeploymentSubmission> {
         let manifest_name = manifest_name.into();
         let service_name = service_name.into();
         let service_id = compute_service_id(&service_name);
@@ -246,10 +285,10 @@ impl ServiceController {
                     "deployment for '{}' ignored because desired spec is already running",
                     service_name
                 );
-                return Err(anyhow!(
-                    "service '{}' already deployed at desired spec",
-                    service_name
-                ));
+                return Ok(ServiceDeploymentSubmission {
+                    service_id,
+                    outcome: ServiceDeploymentOutcome::Unchanged,
+                });
             }
 
             if matches!(
@@ -298,7 +337,10 @@ impl ServiceController {
                     }
                 });
 
-                return Ok(service_id);
+                return Ok(ServiceDeploymentSubmission {
+                    service_id,
+                    outcome: ServiceDeploymentOutcome::Accepted,
+                });
             }
 
             let current_spec = existing.clone();
@@ -342,7 +384,10 @@ impl ServiceController {
                 }
             });
 
-            return Ok(service_id);
+            return Ok(ServiceDeploymentSubmission {
+                service_id,
+                outcome: ServiceDeploymentOutcome::Accepted,
+            });
         }
 
         let mut pending_spec = ServiceSpecValue::new(
@@ -375,7 +420,10 @@ impl ServiceController {
             }
         });
 
-        Ok(service_id)
+        Ok(ServiceDeploymentSubmission {
+            service_id,
+            outcome: ServiceDeploymentOutcome::Accepted,
+        })
     }
 
     async fn handle_event(&self, event: ServiceEvent) -> anyhow::Result<()> {

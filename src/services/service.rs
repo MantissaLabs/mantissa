@@ -1,5 +1,5 @@
 use crate::network::types::compute_network_id;
-use crate::services::manager::ServiceController;
+use crate::services::manager::{ServiceController, ServiceDeploymentOutcome};
 use crate::services::types::{
     ServiceEvent, ServicePortProtocol, ServiceRescheduleLock, ServiceRescheduleReason,
     ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
@@ -56,9 +56,9 @@ impl services::Server for ServicesRPC {
             ServiceUpdateStrategy::default()
         };
 
-        let service_id = self
+        let submission = self
             .manager
-            .submit_deployment_with_strategy(
+            .submit_deployment_with_strategy_outcome(
                 manifest_id,
                 manifest_name,
                 service_name,
@@ -68,7 +68,18 @@ impl services::Server for ServicesRPC {
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 
-        results.get().set_service_id(service_id.as_bytes());
+        let mut result = results.get();
+        result.set_service_id(submission.service_id.as_bytes());
+        let outcome = match submission.outcome {
+            ServiceDeploymentOutcome::Accepted => protocol::services::DeployOutcome::Accepted,
+            ServiceDeploymentOutcome::Unchanged => protocol::services::DeployOutcome::Unchanged,
+        };
+        result.set_outcome(outcome);
+        if matches!(submission.outcome, ServiceDeploymentOutcome::Unchanged) {
+            result.set_detail("service already deployed at desired spec");
+        } else {
+            result.set_detail("");
+        }
         Ok(())
     }
 

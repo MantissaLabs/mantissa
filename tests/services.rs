@@ -20,6 +20,7 @@ use mantissa::node::id::set_node_id;
 use mantissa::scheduler::SlotReservationRequest;
 use mantissa::scheduler::SlotState;
 use mantissa::services::ServiceController;
+use mantissa::services::manager::ServiceDeploymentOutcome;
 use mantissa::services::types::{
     ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
     ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
@@ -2358,16 +2359,26 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
         .expect("read baseline spec")
         .expect("baseline spec present");
 
-    let err = node
+    let submission = node
         .node
         .service_controller
-        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks)
+        .submit_deployment_with_strategy_outcome(
+            Uuid::new_v4(),
+            manifest_name,
+            service_name,
+            tasks,
+            ServiceUpdateStrategy::default(),
+        )
         .await
-        .expect_err("unchanged running redeploy should be rejected");
-    let err_text = err.to_string();
-    assert!(
-        err_text.contains("already deployed at desired spec"),
-        "unexpected unchanged-redeploy error: {err_text}"
+        .expect("unchanged running redeploy should return a no-op outcome");
+    assert_eq!(
+        submission.outcome,
+        ServiceDeploymentOutcome::Unchanged,
+        "unchanged running redeploy should report unchanged outcome"
+    );
+    assert_eq!(
+        submission.service_id, service_id,
+        "unchanged running redeploy should target the existing service id"
     );
 
     let deadline = Instant::now() + Duration::from_secs(2);
