@@ -2303,6 +2303,116 @@ local_test!(services_redeploy_updates_resources, {
     );
 });
 
+local_test!(services_redeploy_rejects_unchanged_running_spec, {
+    let _guard =
+        ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));
+    let node = TestNode::new().await;
+
+    let service_name = "redeploy-unchanged";
+    let manifest_name = "redeploy-unchanged";
+
+    let tasks = vec![ServiceTaskSpecValue {
+        name: "echo".into(),
+        image: "alpine:3.20".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "while true; do sleep 1; done".into(),
+        ],
+        replicas: 1,
+        cpu_millis: 100,
+        memory_bytes: 32 * 1024 * 1024,
+        gpu_count: 0,
+        restart_policy: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        health_port: None,
+        health_command: None,
+        public_port: None,
+        public_protocol: None,
+    }];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
+        .await
+        .expect("submit initial deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "initial deployment should reach running state"
+    );
+
+    let baseline = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read baseline spec")
+        .expect("baseline spec present");
+
+    let err = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks)
+        .await
+        .expect_err("unchanged running redeploy should be rejected");
+    let err_text = err.to_string();
+    assert!(
+        err_text.contains("already deployed at desired spec"),
+        "unexpected unchanged-redeploy error: {err_text}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let current = node
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read service during no-op rejection")
+            .expect("service should remain present");
+        assert_eq!(
+            current.status(),
+            ServiceStatus::Running,
+            "unchanged redeploy rejection should not flip service status"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let after = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read final spec after no-op rejection")
+        .expect("final spec should remain present");
+
+    assert_eq!(
+        after.manifest_id, baseline.manifest_id,
+        "unchanged redeploy should keep the active manifest id"
+    );
+    assert_eq!(
+        after.task_ids, baseline.task_ids,
+        "unchanged redeploy should not churn task assignments"
+    );
+    assert_eq!(
+        after.service_epoch, baseline.service_epoch,
+        "unchanged redeploy should not bump service generation"
+    );
+    assert_eq!(
+        after.phase_version, baseline.phase_version,
+        "unchanged redeploy should not mutate causal phase ordering"
+    );
+});
+
 local_test!(services_redeploy_rolls_back_on_failed_replacement, {
     let _guard =
         ContainerManagerOverrideGuard::install(Arc::new(InMemoryContainerManager::default()));

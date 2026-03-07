@@ -234,6 +234,24 @@ impl ServiceController {
                 _ => {}
             }
 
+            if is_running_deployment_noop(
+                &existing,
+                &manifest_name,
+                &service_name,
+                &tasks,
+                &update_strategy,
+            ) {
+                tracing::info!(
+                    target: "services",
+                    "deployment for '{}' ignored because desired spec is already running",
+                    service_name
+                );
+                return Err(anyhow!(
+                    "service '{}' already deployed at desired spec",
+                    service_name
+                ));
+            }
+
             if matches!(
                 existing.status(),
                 ServiceStatus::Failed | ServiceStatus::Stopped
@@ -1833,6 +1851,24 @@ fn expected_task_id_count(spec: &ServiceSpecValue) -> usize {
 /// Returns true when deployment has not yet assigned task ids for every desired replica.
 fn deploying_assignment_incomplete(spec: &ServiceSpecValue) -> bool {
     spec.status() == ServiceStatus::Deploying && spec.task_ids.len() < expected_task_id_count(spec)
+}
+
+/// Returns true when a submission matches the active running service spec exactly.
+///
+/// This preserves idempotent `services run` behavior by rejecting unchanged
+/// submissions before any generation/status mutation is broadcast.
+fn is_running_deployment_noop(
+    existing: &ServiceSpecValue,
+    manifest_name: &str,
+    service_name: &str,
+    tasks: &[ServiceTaskSpecValue],
+    update_strategy: &ServiceUpdateStrategy,
+) -> bool {
+    existing.status() == ServiceStatus::Running
+        && existing.manifest_name == manifest_name
+        && existing.service_name == service_name
+        && existing.tasks == tasks
+        && existing.update_strategy == *update_strategy
 }
 
 struct ServiceDeploymentJob {
