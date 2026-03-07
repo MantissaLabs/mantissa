@@ -225,17 +225,27 @@ fn default_container_manager() -> Arc<dyn ContainerManager + Send + Sync> {
     Arc::new(InMemoryContainerManager::default())
 }
 
+#[derive(Clone)]
+enum ContainerManagerOverrideEntry {
+    Shared(Arc<dyn ContainerManager + Send + Sync>),
+    Factory(Arc<dyn Fn() -> Arc<dyn ContainerManager + Send + Sync> + Send + Sync>),
+}
+
 thread_local! {
-    static TEST_CONTAINER_MANAGER_STACK: RefCell<Vec<Arc<dyn ContainerManager + Send + Sync>>> =
+    static TEST_CONTAINER_MANAGER_STACK: RefCell<Vec<ContainerManagerOverrideEntry>> =
         RefCell::new(Vec::new());
 }
 
-fn current_container_manager_override() -> Option<Arc<dyn ContainerManager + Send + Sync>> {
+fn current_container_manager_override() -> Option<ContainerManagerOverrideEntry> {
     TEST_CONTAINER_MANAGER_STACK.with(|stack| stack.borrow().last().cloned())
 }
 
 fn container_manager_for_next_node() -> Arc<dyn ContainerManager + Send + Sync> {
-    current_container_manager_override().unwrap_or_else(default_container_manager)
+    match current_container_manager_override() {
+        Some(ContainerManagerOverrideEntry::Shared(manager)) => manager,
+        Some(ContainerManagerOverrideEntry::Factory(factory)) => factory(),
+        None => default_container_manager(),
+    }
 }
 
 fn pick_loopback_ephemeral_addr() -> std::io::Result<String> {
@@ -247,12 +257,31 @@ pub struct ContainerManagerOverrideGuard;
 
 impl ContainerManagerOverrideGuard {
     pub fn install(manager: Arc<dyn ContainerManager + Send + Sync>) -> Self {
-        TEST_CONTAINER_MANAGER_STACK.with(|stack| stack.borrow_mut().push(manager));
+        TEST_CONTAINER_MANAGER_STACK.with(|stack| {
+            stack
+                .borrow_mut()
+                .push(ContainerManagerOverrideEntry::Shared(manager))
+        });
+        Self
+    }
+
+    pub fn install_factory(
+        factory: Arc<dyn Fn() -> Arc<dyn ContainerManager + Send + Sync> + Send + Sync>,
+    ) -> Self {
+        TEST_CONTAINER_MANAGER_STACK.with(|stack| {
+            stack
+                .borrow_mut()
+                .push(ContainerManagerOverrideEntry::Factory(factory))
+        });
         Self
     }
 
     pub fn install_default() -> Self {
-        Self::install(Arc::new(InMemoryContainerManager::default()))
+        // Use a factory so each node in a test cluster receives an isolated in-memory
+        // runtime. Sharing one runtime across peers causes cross-node container teardown.
+        Self::install_factory(Arc::new(|| -> Arc<dyn ContainerManager + Send + Sync> {
+            Arc::new(InMemoryContainerManager::default())
+        }))
     }
 }
 
