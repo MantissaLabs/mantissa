@@ -30,6 +30,11 @@ const SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES: u32 = 5;
 const SERVICE_DEPLOYMENT_MAX_DEGRADED_PROBES: u32 = 6;
 /// Maximum number of terminal failures tolerated for any single task during one deployment.
 const SERVICE_DEPLOYMENT_MAX_TASK_FAILURES: u32 = 3;
+/// Maximum wall-clock window without running-replica progress before failing deployment.
+///
+/// This prevents services from remaining in Deploying forever when replicas stay stuck in
+/// pending/pulling/creating loops without converging to a stable Running set.
+const SERVICE_DEPLOYMENT_PROGRESS_DEADLINE_SECS: u64 = 600;
 
 enum ReadinessOutcome {
     Success(ServiceSpecValue),
@@ -50,7 +55,7 @@ pub(super) enum ReadinessClass {
 /// Waits until a deployment converges or repeatedly reports terminal unhealthy states.
 ///
 /// Pending launch phases (`pending`, `pulling`, `creating`) do not consume the failure budget,
-/// which prevents slow image pulls from being marked failed by readiness timing alone.
+/// but they are bounded by a progress deadline so deployments cannot remain in-flight forever.
 pub(super) async fn start_readiness_wait(
     controller: ServiceController,
     initial_spec: ServiceSpecValue,
@@ -67,6 +72,9 @@ pub(super) async fn start_readiness_wait(
     let mut last_observed_phase_versions: HashMap<Uuid, u64> = HashMap::new();
     let mut task_terminal_phase_seen: HashMap<Uuid, u64> = HashMap::new();
     let mut task_failure_counts: HashMap<Uuid, u32> = HashMap::new();
+    let progress_window = Duration::from_secs(SERVICE_DEPLOYMENT_PROGRESS_DEADLINE_SECS);
+    let mut running_high_watermark = 0usize;
+    let mut progress_deadline = Instant::now() + progress_window;
 
     loop {
         probes = probes.saturating_add(1);
@@ -107,6 +115,23 @@ pub(super) async fn start_readiness_wait(
             );
             mark_service_failed(&controller, snapshot, &last_observed_states).await;
             break;
+        }
+
+        let now = Instant::now();
+        if deployment_running_progress_advanced(
+            &last_observed_states,
+            &mut running_high_watermark,
+            now,
+            progress_window,
+            &mut progress_deadline,
+        ) {
+            tracing::debug!(
+                target: "services",
+                "service '{}' readiness progressed to {} running replica(s); extending progress deadline by {}s",
+                service_name,
+                running_high_watermark,
+                SERVICE_DEPLOYMENT_PROGRESS_DEADLINE_SECS
+            );
         }
 
         match outcome {
@@ -159,14 +184,29 @@ pub(super) async fn start_readiness_wait(
             }
             ReadinessOutcome::Pending => {
                 success_since = None;
-                if failure_streak != 0 || degraded_streak != 0 {
-                    tracing::debug!(
+                if deployment_progress_timed_out(now, progress_deadline) {
+                    let snapshot = match controller.registry.get(service_id) {
+                        Ok(Some(current)) if current.manifest_id == manifest_id => current,
+                        Ok(Some(_)) | Ok(None) => break,
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "services",
+                                "failed to load service '{}' while enforcing readiness progress deadline: {err}",
+                                service_name
+                            );
+                            break;
+                        }
+                    };
+
+                    tracing::error!(
                         target: "services",
-                        "service '{}' readiness recovered to in-flight state; resetting failure/degraded streaks",
-                        service_name
+                        "service '{}' deployment exceeded {}s without running-replica progress; marking failed ({})",
+                        service_name,
+                        SERVICE_DEPLOYMENT_PROGRESS_DEADLINE_SECS,
+                        format_task_state_summary(&last_observed_states)
                     );
-                    failure_streak = 0;
-                    degraded_streak = 0;
+                    mark_service_failed(&controller, snapshot, &last_observed_states).await;
+                    break;
                 }
             }
             ReadinessOutcome::Degraded(snapshot) => {
@@ -500,6 +540,35 @@ fn readiness_backoff(attempt: u32) -> Duration {
     Duration::from_millis(SERVICE_READY_BACKOFF_BASE_MS.saturating_mul(multiplier.max(1)))
 }
 
+/// Returns true when observed readiness state increases the running-replica high watermark.
+///
+/// Running-replica growth is treated as deployment progress and extends the global progress
+/// deadline so large services can converge incrementally without being prematurely failed.
+fn deployment_running_progress_advanced(
+    states: &[(Uuid, Option<ContainerState>)],
+    running_high_watermark: &mut usize,
+    now: Instant,
+    progress_window: Duration,
+    progress_deadline: &mut Instant,
+) -> bool {
+    let running = states
+        .iter()
+        .filter(|(_, state)| matches!(state, Some(ContainerState::Running)))
+        .count();
+    if running <= *running_high_watermark {
+        return false;
+    }
+
+    *running_high_watermark = running;
+    *progress_deadline = now + progress_window;
+    true
+}
+
+/// Returns true when deployment has exceeded its readiness progress deadline.
+fn deployment_progress_timed_out(now: Instant, progress_deadline: Instant) -> bool {
+    now >= progress_deadline
+}
+
 /// Builds a compact human-readable summary of observed task states for readiness logs.
 fn format_task_state_summary(states: &[(Uuid, Option<ContainerState>)]) -> String {
     if states.is_empty() {
@@ -527,4 +596,71 @@ fn format_task_state_summary(states: &[(Uuid, Option<ContainerState>)]) -> Strin
     }
 
     parts.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensures the progress deadline extends only when running replicas increase.
+    #[test]
+    fn running_progress_extends_deadline_on_high_watermark() {
+        let task_a = Uuid::new_v4();
+        let task_b = Uuid::new_v4();
+        let mut running_high_watermark = 0usize;
+        let now = Instant::now();
+        let progress_window = Duration::from_secs(30);
+        let mut progress_deadline = now + Duration::from_secs(5);
+
+        let advanced = deployment_running_progress_advanced(
+            &[
+                (task_a, Some(ContainerState::Running)),
+                (task_b, Some(ContainerState::Pending)),
+            ],
+            &mut running_high_watermark,
+            now,
+            progress_window,
+            &mut progress_deadline,
+        );
+        assert!(
+            advanced,
+            "running growth should be treated as deployment progress"
+        );
+        assert_eq!(running_high_watermark, 1);
+        assert!(
+            progress_deadline > now + Duration::from_secs(20),
+            "progress deadline should be extended by the configured window"
+        );
+
+        let unchanged = deployment_running_progress_advanced(
+            &[
+                (task_a, Some(ContainerState::Running)),
+                (task_b, Some(ContainerState::Creating)),
+            ],
+            &mut running_high_watermark,
+            now + Duration::from_secs(1),
+            progress_window,
+            &mut progress_deadline,
+        );
+        assert!(
+            !unchanged,
+            "non-increasing running count should not reset progress deadline"
+        );
+    }
+
+    /// Ensures readiness timeout helper marks elapsed deployment progress windows.
+    #[test]
+    fn progress_deadline_timeout_triggers_when_elapsed() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        assert!(!deployment_progress_timed_out(now, deadline));
+        assert!(deployment_progress_timed_out(
+            now + Duration::from_secs(1),
+            deadline
+        ));
+        assert!(deployment_progress_timed_out(
+            now + Duration::from_secs(2),
+            deadline
+        ));
+    }
 }
