@@ -97,13 +97,16 @@ struct RollingUpdatePolicy {
   order @1 :RolloutOrder;
   # Replacement ordering for each slot.
 
-  monitorSecs @2 :UInt32;
+  startupTimeoutSecs @2 :UInt32;
+  # Maximum seconds allowed for a replacement to reach Running.
+
+  monitorSecs @3 :UInt32;
   # Stabilization window after each step before the rollout advances.
 
-  maxFailures @3 :UInt16;
+  maxFailures @4 :UInt16;
   # Maximum failed rollout steps before marking the rollout failed.
 
-  autoRollback @4 :Bool;
+  autoRollback @5 :Bool;
   # When true, automatically roll back to the previous template on failure.
 }
 

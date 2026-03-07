@@ -128,6 +128,8 @@ pub struct RollingUpdatePolicy {
     pub parallelism: u16,
     #[serde(default)]
     pub order: RolloutOrder,
+    #[serde(default = "default_rollout_startup_timeout_secs")]
+    pub startup_timeout_secs: u32,
     #[serde(default = "default_rollout_monitor_secs")]
     pub monitor_secs: u32,
     #[serde(default = "default_rollout_max_failures")]
@@ -141,6 +143,7 @@ impl Default for RollingUpdatePolicy {
         Self {
             parallelism: default_rollout_parallelism(),
             order: RolloutOrder::default(),
+            startup_timeout_secs: default_rollout_startup_timeout_secs(),
             monitor_secs: default_rollout_monitor_secs(),
             max_failures: default_rollout_max_failures(),
             auto_rollback: default_rollout_auto_rollback(),
@@ -360,6 +363,12 @@ impl ServiceManifest {
             ));
         }
 
+        if self.update.rolling.startup_timeout_secs == 0 {
+            return Err(anyhow!(
+                "service manifest must set update.rolling.startup_timeout_secs to at least 1"
+            ));
+        }
+
         Ok(())
     }
 }
@@ -381,6 +390,10 @@ fn default_replicas() -> u16 {
 
 fn default_rollout_parallelism() -> u16 {
     1
+}
+
+fn default_rollout_startup_timeout_secs() -> u32 {
+    600
 }
 
 fn default_rollout_monitor_secs() -> u32 {
@@ -419,6 +432,7 @@ mod tests {
             manifest.update.rolling.order,
             RolloutOrder::StartFirst
         ));
+        assert_eq!(manifest.update.rolling.startup_timeout_secs, 600);
         assert_eq!(manifest.update.rolling.monitor_secs, 1);
         assert_eq!(manifest.update.rolling.max_failures, 1);
         assert!(manifest.update.rolling.auto_rollback);
@@ -438,6 +452,7 @@ mod tests {
             manifest.update.rolling.order,
             RolloutOrder::StartFirst
         ));
+        assert_eq!(manifest.update.rolling.startup_timeout_secs, 600);
         assert_eq!(manifest.update.rolling.monitor_secs, 15);
         assert_eq!(manifest.update.rolling.max_failures, 2);
         assert!(manifest.update.rolling.auto_rollback);

@@ -24,6 +24,7 @@ This manifest shows the full `update.rolling` surface:
 
 - `parallelism`
 - `order`
+- `startup_timeout_secs`
 - `monitor_secs`
 - `max_failures`
 - `auto_rollback`

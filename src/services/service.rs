@@ -442,6 +442,7 @@ fn write_update_strategy(
         ServiceRolloutOrder::StopFirst => protocol::services::RolloutOrder::StopFirst,
     };
     rolling.set_order(order);
+    rolling.set_startup_timeout_secs(strategy.rolling.startup_timeout_secs);
     rolling.set_monitor_secs(strategy.rolling.monitor_secs);
     rolling.set_max_failures(strategy.rolling.max_failures);
     rolling.set_auto_rollback(strategy.rolling.auto_rollback);
@@ -463,9 +464,17 @@ fn read_update_strategy(
             Ok(protocol::services::RolloutOrder::StopFirst) => ServiceRolloutOrder::StopFirst,
             Err(_) => ServiceRolloutOrder::StartFirst,
         };
+        let startup_timeout_secs = rolling_reader.get_startup_timeout_secs();
+        let default_startup_timeout_secs =
+            ServiceRollingUpdatePolicy::default().startup_timeout_secs;
         ServiceRollingUpdatePolicy {
             parallelism: rolling_reader.get_parallelism().max(1),
             order,
+            startup_timeout_secs: if startup_timeout_secs == 0 {
+                default_startup_timeout_secs
+            } else {
+                startup_timeout_secs
+            },
             monitor_secs: rolling_reader.get_monitor_secs().max(1),
             max_failures: rolling_reader.get_max_failures(),
             auto_rollback: rolling_reader.get_auto_rollback(),

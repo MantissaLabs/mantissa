@@ -108,6 +108,7 @@ fn write_update_strategy(
         RolloutOrder::StopFirst => protocol::services::RolloutOrder::StopFirst,
     };
     rolling.set_order(order);
+    rolling.set_startup_timeout_secs(strategy.rolling.startup_timeout_secs);
     rolling.set_monitor_secs(strategy.rolling.monitor_secs);
     rolling.set_max_failures(strategy.rolling.max_failures);
     rolling.set_auto_rollback(strategy.rolling.auto_rollback);

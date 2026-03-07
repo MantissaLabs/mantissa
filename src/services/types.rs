@@ -112,6 +112,7 @@ pub enum ServiceRolloutOrder {
 pub struct ServiceRollingUpdatePolicy {
     pub parallelism: u16,
     pub order: ServiceRolloutOrder,
+    pub startup_timeout_secs: u32,
     pub monitor_secs: u32,
     pub max_failures: u16,
     pub auto_rollback: bool,
@@ -122,6 +123,7 @@ impl Default for ServiceRollingUpdatePolicy {
         Self {
             parallelism: 1,
             order: ServiceRolloutOrder::StartFirst,
+            startup_timeout_secs: 600,
             monitor_secs: 1,
             max_failures: 1,
             auto_rollback: true,

@@ -20,6 +20,7 @@ use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use health::{HealthMonitor, Status as HealthStatus};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -47,8 +48,6 @@ const SERVICE_SLOT_MISSING_GRACE_SECS: u64 = 6;
 const SERVICE_REBALANCE_MIN_AGE_SECS: i64 = 20;
 /// Cooldown window between rebalance attempts for the same slot.
 const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
-/// Maximum time to wait for one rollout task to report running.
-const SERVICE_ROLLOUT_STEP_TIMEOUT_SECS: u64 = 120;
 /// Maximum time to wait for one rollout task to fully stop before id reuse.
 const SERVICE_ROLLOUT_STOP_TIMEOUT_SECS: u64 = 120;
 /// Poll interval while waiting on rollout task readiness transitions.
@@ -702,6 +701,7 @@ impl ServiceController {
         let replace = plan.replace;
         let remove = plan.remove;
         let rollout_parallelism = update_strategy.rolling.parallelism.max(1) as usize;
+        let rollout_startup_timeout_secs = update_strategy.rolling.startup_timeout_secs.max(1);
         let rollout_monitor_secs = update_strategy.rolling.monitor_secs.max(1);
         let rollout_order = update_strategy.rolling.order;
         let rollout_max_failures = update_strategy.rolling.max_failures;
@@ -711,13 +711,14 @@ impl ServiceController {
 
         tracing::info!(
             target: "services",
-            "redeployment plan for '{}': {} replacements, {} removals, {} retained replicas (parallelism={}, order={:?}, monitor={}s, auto_rollback={})",
+            "redeployment plan for '{}': {} replacements, {} removals, {} retained replicas (parallelism={}, order={:?}, startup_timeout={}s, monitor={}s, auto_rollback={})",
             service_name,
             replace.len(),
             remove.len(),
             retain.len(),
             rollout_parallelism,
             rollout_order,
+            rollout_startup_timeout_secs,
             rollout_monitor_secs,
             update_strategy.rolling.auto_rollback
         );
@@ -876,7 +877,12 @@ impl ServiceController {
 
             for spec in &started_specs {
                 if let Err(err) = self
-                    .wait_rollout_task_running(&service_name, spec.id, rollout_monitor_secs)
+                    .wait_rollout_task_running(
+                        &service_name,
+                        spec.id,
+                        rollout_startup_timeout_secs,
+                        rollout_monitor_secs,
+                    )
                     .await
                 {
                     rollout_failed_steps = rollout_failed_steps.saturating_add(1);
@@ -1052,6 +1058,7 @@ impl ServiceController {
                 &update_strategy,
                 &current_spec,
                 previous_status,
+                rollout_startup_timeout_secs,
                 rollout_monitor_secs,
                 rollout_total_steps,
                 rollout_completed_steps,
@@ -1145,70 +1152,28 @@ impl ServiceController {
         start_readiness_wait(self, initial_spec).await;
     }
 
-    /// Waits for one rollout task to reach running state and remain stable for the monitor window.
+    /// Waits for one rollout task to reach running and then remain stable during monitoring.
     async fn wait_rollout_task_running(
         &self,
         service_name: &str,
         task_id: Uuid,
+        startup_timeout_secs: u32,
         monitor_secs: u32,
     ) -> anyhow::Result<()> {
-        let readiness_deadline =
-            Instant::now() + Duration::from_secs(SERVICE_ROLLOUT_STEP_TIMEOUT_SECS);
-        loop {
-            if Instant::now() >= readiness_deadline {
-                return Err(anyhow!(
-                    "timed out waiting for rollout task {} in service '{}' to reach running",
-                    task_id,
-                    service_name
-                ));
-            }
-
-            let states = self.task_manager.task_state_snapshot(&[task_id]).await?;
-            let state = states
-                .first()
-                .and_then(|(_, state)| state.as_ref())
-                .cloned();
-
-            match state {
-                Some(ContainerState::Running) => break,
-                Some(ContainerState::Pending)
-                | Some(ContainerState::Pulling)
-                | Some(ContainerState::Creating) => {}
-                Some(other) => {
-                    return Err(anyhow!(
-                        "rollout task {} for service '{}' entered terminal state {:?}",
-                        task_id,
-                        service_name,
-                        other
-                    ));
-                }
-                None => {}
-            }
-
-            sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
-        }
-
-        let monitor_deadline = Instant::now() + Duration::from_secs(monitor_secs as u64);
-        while Instant::now() < monitor_deadline {
-            let states = self.task_manager.task_state_snapshot(&[task_id]).await?;
-            let state = states
-                .first()
-                .and_then(|(_, state)| state.as_ref())
-                .cloned();
-
-            if !matches!(state, Some(ContainerState::Running)) {
-                return Err(anyhow!(
-                    "rollout task {} for service '{}' became unstable during monitor window: {:?}",
-                    task_id,
-                    service_name,
-                    state
-                ));
-            }
-
-            sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
-        }
-
-        Ok(())
+        wait_rollout_task_running_with_state_fetcher(
+            service_name,
+            task_id,
+            startup_timeout_secs,
+            monitor_secs,
+            || async {
+                let states = self.task_manager.task_state_snapshot(&[task_id]).await?;
+                Ok(states
+                    .first()
+                    .and_then(|(_, state)| state.as_ref())
+                    .cloned())
+            },
+        )
+        .await
     }
 
     /// Waits for one rollout task to transition out of active states before id reuse.
@@ -1284,6 +1249,7 @@ impl ServiceController {
         &self,
         service_name: &str,
         current_spec: &ServiceSpecValue,
+        startup_timeout_secs: u32,
         monitor_secs: u32,
         rollback_new_task_ids: &HashSet<Uuid>,
         rollback_old_tasks: &HashMap<Uuid, RollbackTaskRecord>,
@@ -1368,8 +1334,13 @@ impl ServiceController {
                 ));
             }
 
-            self.wait_rollout_task_running(service_name, step.task_id, monitor_secs)
-                .await?;
+            self.wait_rollout_task_running(
+                service_name,
+                step.task_id,
+                startup_timeout_secs,
+                monitor_secs,
+            )
+            .await?;
         }
 
         Ok(())
@@ -1463,6 +1434,7 @@ impl ServiceController {
         update_strategy: &ServiceUpdateStrategy,
         current_spec: &ServiceSpecValue,
         previous_status: ServiceStatus,
+        rollout_startup_timeout_secs: u32,
         rollout_monitor_secs: u32,
         rollout_total_steps: u32,
         rollout_completed_steps: u32,
@@ -1498,6 +1470,7 @@ impl ServiceController {
                 .rollback_redeployment_tasks(
                     service_name,
                     current_spec,
+                    rollout_startup_timeout_secs,
                     rollout_monitor_secs,
                     rollback_new_task_ids,
                     rollback_old_tasks,
@@ -1733,6 +1706,69 @@ impl ServiceController {
     pub fn registry(&self) -> &ServiceRegistry {
         &self.registry
     }
+}
+
+/// Waits for one rollout task to become running and remain stable during monitoring.
+///
+/// The state fetcher indirection allows deterministic timeout tests without requiring
+/// multi-node task orchestration in every test case.
+async fn wait_rollout_task_running_with_state_fetcher<F, Fut>(
+    service_name: &str,
+    task_id: Uuid,
+    startup_timeout_secs: u32,
+    monitor_secs: u32,
+    mut fetch_state: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<Option<ContainerState>>>,
+{
+    let readiness_deadline = Instant::now() + Duration::from_secs(startup_timeout_secs as u64);
+    loop {
+        if Instant::now() >= readiness_deadline {
+            return Err(anyhow!(
+                "timed out waiting for rollout task {} in service '{}' to reach running",
+                task_id,
+                service_name
+            ));
+        }
+
+        let state = fetch_state().await?;
+        match state {
+            Some(ContainerState::Running) => break,
+            Some(ContainerState::Pending)
+            | Some(ContainerState::Pulling)
+            | Some(ContainerState::Creating) => {}
+            Some(other) => {
+                return Err(anyhow!(
+                    "rollout task {} for service '{}' entered terminal state {:?}",
+                    task_id,
+                    service_name,
+                    other
+                ));
+            }
+            None => {}
+        }
+
+        sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+    }
+
+    let monitor_deadline = Instant::now() + Duration::from_secs(monitor_secs as u64);
+    while Instant::now() < monitor_deadline {
+        let state = fetch_state().await?;
+        if !matches!(state, Some(ContainerState::Running)) {
+            return Err(anyhow!(
+                "rollout task {} for service '{}' became unstable during monitor window: {:?}",
+                task_id,
+                service_name,
+                state
+            ));
+        }
+
+        sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -2625,6 +2661,62 @@ mod tests {
             classify_readiness_states(&states),
             ReadinessClass::Unhealthy
         ));
+    }
+
+    /// Ensures rollout startup timeout fails when task startup stays in-flight too long.
+    #[tokio::test]
+    async fn rollout_startup_timeout_fails_for_slow_start() {
+        let task_id = Uuid::new_v4();
+        let started = Instant::now();
+
+        let result = wait_rollout_task_running_with_state_fetcher(
+            "timeout-service",
+            task_id,
+            1,
+            1,
+            || async {
+                if started.elapsed() < Duration::from_secs(2) {
+                    Ok(Some(ContainerState::Pulling))
+                } else {
+                    Ok(Some(ContainerState::Running))
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_err(), "slow startup should exceed timeout budget");
+        let message = format!("{:#}", result.expect_err("expected timeout failure"));
+        assert!(
+            message.contains("timed out waiting for rollout task"),
+            "expected timeout error, got: {message}"
+        );
+    }
+
+    /// Ensures rollout startup timeout succeeds when startup completes within budget.
+    #[tokio::test]
+    async fn rollout_startup_timeout_allows_slow_start_with_larger_budget() {
+        let task_id = Uuid::new_v4();
+        let started = Instant::now();
+
+        let result = wait_rollout_task_running_with_state_fetcher(
+            "timeout-service",
+            task_id,
+            10,
+            1,
+            || async {
+                if started.elapsed() < Duration::from_secs(2) {
+                    Ok(Some(ContainerState::Pulling))
+                } else {
+                    Ok(Some(ContainerState::Running))
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "startup should succeed within relaxed timeout budget: {result:?}"
+        );
     }
 
     /// Ensures deploying services are included in slot reconciliation.

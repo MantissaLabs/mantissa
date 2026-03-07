@@ -2583,6 +2583,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
         rolling: ServiceRollingUpdatePolicy {
             parallelism: 1,
             order: ServiceRolloutOrder::StartFirst,
+            startup_timeout_secs: 600,
             monitor_secs: 1,
             max_failures: 2,
             auto_rollback: true,
@@ -3187,6 +3188,7 @@ fn rollout_strategy(
         rolling: ServiceRollingUpdatePolicy {
             parallelism,
             order,
+            startup_timeout_secs: 600,
             monitor_secs,
             max_failures,
             auto_rollback,

@@ -5,6 +5,7 @@
         rolling: (
             parallelism: 2,
             order: start_first,
+            startup_timeout_secs: 600,
             monitor_secs: 15,
             max_failures: 2,
             auto_rollback: true,

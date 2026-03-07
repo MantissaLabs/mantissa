@@ -14,6 +14,7 @@ with safe defaults.
         rolling: (
             parallelism: 2,
             order: start_first,
+            startup_timeout_secs: 600,
             monitor_secs: 15,
             max_failures: 2,
             auto_rollback: true,
@@ -40,6 +41,7 @@ If `update` is omitted, Mantissa uses:
 - `mode: rolling`
 - `parallelism: 1`
 - `order: start_first`
+- `startup_timeout_secs: 600`
 - `monitor_secs: 1`
 - `max_failures: 1`
 - `auto_rollback: true`
@@ -68,6 +70,11 @@ replica or stops first and then starts the replacement.
 
 The number of seconds a replacement replica must remain `Running` before the
 rollout step is considered successful.
+
+`startup_timeout_secs`
+
+The number of seconds Mantissa allows a replacement replica to spend in startup
+states (`Pending`, `Pulling`, `Creating`) before that rollout step fails.
 
 `max_failures`
 
