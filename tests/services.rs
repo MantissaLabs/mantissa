@@ -52,8 +52,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 local_test!(services_gossip_propagates_across_peers, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
 
     const SERVICE_NAME: &str = "demo-service";
     const MANIFEST_NAME: &str = "demo-manifest";
@@ -175,8 +174,7 @@ local_test!(services_gossip_propagates_across_peers, {
 });
 
 local_test!(services_submit_deployment_waits_for_task_ack, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let manifest_id = Uuid::new_v4();
@@ -258,8 +256,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
 });
 
 local_test!(services_deployment_exhausts_retries_and_fails, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let manifest_id = Uuid::new_v4();
@@ -498,8 +495,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
 });
 
 local_test!(services_deployment_replicates_across_cluster, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
 
     let cluster = match TestNode::new_cluster_tcp_with_tick(3, 100).await {
         Ok(cluster) => cluster,
@@ -612,8 +608,7 @@ local_test!(services_deployment_replicates_across_cluster, {
 });
 
 local_test!(services_placement_startup_avoids_over_replication, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -691,8 +686,7 @@ local_test!(services_placement_startup_avoids_over_replication, {
 local_test!(
     services_placement_balances_replicas_and_slot_reservations,
     {
-        let _guard =
-            ContainerManagerOverrideGuard::install_default();
+        let _guard = ContainerManagerOverrideGuard::install_default();
 
         let cfg = ClusterConfig {
             sync_tick_ms: Some(100),
@@ -834,8 +828,7 @@ local_test!(
 );
 
 local_test!(services_scale_out_balances_without_excess_replicas, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -970,8 +963,7 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
 });
 
 local_test!(services_large_deployment_converges_within_bound, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -1058,8 +1050,7 @@ local_test!(services_large_deployment_converges_within_bound, {
 });
 
 local_test!(services_stop_drains_stale_tasks_and_slots, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "stop-drain";
@@ -1191,8 +1182,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
 local_test!(
     services_deploy_from_stopped_bootstraps_without_stale_assignments,
     {
-        let _guard =
-            ContainerManagerOverrideGuard::install_default();
+        let _guard = ContainerManagerOverrideGuard::install_default();
         let node = TestNode::new().await;
 
         let service_name = "deploy-from-stopped";
@@ -1293,8 +1283,7 @@ local_test!(
 );
 
 local_test!(services_stop_propagates_and_drains_three_nodes, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -1405,8 +1394,7 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
 local_test!(
     services_split_merge_rebalance_preserves_replica_convergence,
     {
-        let _guard =
-            ContainerManagerOverrideGuard::install_default();
+        let _guard = ContainerManagerOverrideGuard::install_default();
 
         let cfg = ClusterConfig {
             sync_tick_ms: Some(100),
@@ -1580,8 +1568,7 @@ local_test!(
 local_test!(
     services_crdt_concurrent_generations_converge_to_highest_epoch,
     {
-        let _guard =
-            ContainerManagerOverrideGuard::install_default();
+        let _guard = ContainerManagerOverrideGuard::install_default();
 
         let cfg = ClusterConfig {
             sync_tick_ms: Some(100),
@@ -1651,8 +1638,7 @@ local_test!(
 local_test!(
     services_crdt_out_of_order_phase_updates_converge_to_highest_phase,
     {
-        let _guard =
-            ContainerManagerOverrideGuard::install_default();
+        let _guard = ContainerManagerOverrideGuard::install_default();
 
         let cfg = ClusterConfig {
             sync_tick_ms: Some(100),
@@ -1721,8 +1707,7 @@ local_test!(
 );
 
 local_test!(services_crdt_split_merge_rollback_generation_converges, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -1939,8 +1924,7 @@ local_test!(services_crdt_split_merge_rollback_generation_converges, {
 });
 
 local_test!(services_sync_recovers_missing_entries, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -2046,8 +2030,7 @@ local_test!(services_sync_recovers_missing_entries, {
 });
 
 local_test!(services_redeploy_scales_replicas, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-scale";
@@ -2171,8 +2154,7 @@ local_test!(services_redeploy_scales_replicas, {
 });
 
 local_test!(services_redeploy_updates_resources, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-resources";
@@ -2305,8 +2287,7 @@ local_test!(services_redeploy_updates_resources, {
 });
 
 local_test!(services_redeploy_rejects_unchanged_running_spec, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-unchanged";
@@ -2425,8 +2406,7 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
 });
 
 local_test!(services_redeploy_rolls_back_on_failed_replacement, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-rollback";
@@ -2519,8 +2499,7 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
 });
 
 local_test!(services_redeploy_enforces_max_failures_budget, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-max-failures";
@@ -2646,8 +2625,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
 local_test!(
     services_redeploy_stop_first_stops_previous_before_replacement_visible,
     {
-        let _guard =
-            ContainerManagerOverrideGuard::install_default();
+        let _guard = ContainerManagerOverrideGuard::install_default();
         let node = TestNode::new().await;
 
         let service_name = "redeploy-stop-first";
@@ -2779,8 +2757,7 @@ local_test!(
 );
 
 local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-parallelism-two";
@@ -2883,8 +2860,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
 });
 
 local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
-    let _guard =
-        ContainerManagerOverrideGuard::install_default();
+    let _guard = ContainerManagerOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-no-rollback";
