@@ -22,6 +22,18 @@ fn local_timer() -> OffsetTime<&'static [FormatItem<'static>]> {
     OffsetTime::new(offset, fmt)
 }
 
+/// Adds the default bollard directive when the user did not configure it.
+///
+/// The directive string is static, so parse failure would indicate a coding
+/// error. Falling back to the original filter keeps logger initialization
+/// non-fatal.
+fn add_default_bollard_directive(filter: EnvFilter) -> EnvFilter {
+    match "bollard::docker=warn".parse() {
+        Ok(directive) => filter.add_directive(directive),
+        Err(_) => filter,
+    }
+}
+
 /// Initialize pretty logs for binaries. Idempotent.
 /// Respects `RUST_LOG`, defaults to `info`.
 pub fn init() -> io::Result<()> {
@@ -34,7 +46,7 @@ pub fn init() -> io::Result<()> {
 
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     if !rust_log_mentions("bollard") {
-        filter = filter.add_directive("bollard::docker=warn".parse().unwrap());
+        filter = add_default_bollard_directive(filter);
     }
     let ansi = std::io::stderr().is_terminal();
     let timer = local_timer();
@@ -80,7 +92,7 @@ pub fn init_for_tests() {
     // Default to debug in tests unless overridden.
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     if !rust_log_mentions("bollard") {
-        filter = filter.add_directive("bollard::docker=warn".parse().unwrap());
+        filter = add_default_bollard_directive(filter);
     }
 
     let timer = local_timer();
