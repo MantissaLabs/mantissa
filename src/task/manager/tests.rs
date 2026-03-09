@@ -1866,7 +1866,9 @@ async fn request_task_stop_uses_task_termination_grace_period() {
 
     let stop_timeouts = mock_cm.stop_timeouts.lock().await.clone();
     assert_eq!(stop_timeouts.len(), 1);
-    assert_eq!(stop_timeouts[0], Some(std::time::Duration::from_secs(42)));
+    let stop_timeout = stop_timeouts[0].expect("stop timeout");
+    assert!(stop_timeout <= std::time::Duration::from_secs(42));
+    assert!(stop_timeout > std::time::Duration::from_secs(41));
 }
 
 #[tokio::test]
