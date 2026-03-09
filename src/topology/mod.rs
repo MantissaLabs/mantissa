@@ -666,6 +666,10 @@ impl Topology {
                 }
             };
 
+            let scheduling = registry
+                .peer_scheduling(local_id)
+                .unwrap_or_else(|| PeerSchedulingState::schedulable_default(local_id));
+
             let v = PeerValue {
                 address: advertise,
                 hostname: host,
@@ -673,7 +677,7 @@ impl Topology {
                 signing_pub: verifying_key.to_bytes(),
                 identity_sig: identity_sig.to_vec(),
                 wireguard,
-                scheduling: PeerSchedulingState::schedulable_default(local_id),
+                scheduling,
             };
 
             if let Err(e) = peers.upsert(&key, v).await {
@@ -830,6 +834,11 @@ impl Topology {
         let scheduling = self.current_scheduling_state();
         info.set_schedulable(scheduling.schedulable);
         info.set_drain_requested(scheduling.drain_requested);
+        info.set_drain_state(if scheduling.schedulable {
+            protocol::topology::NodeDrainState::Open
+        } else {
+            protocol::topology::NodeDrainState::Fenced
+        });
         info.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
         set_node_id(
             info.reborrow().init_scheduling_actor_node_id(),

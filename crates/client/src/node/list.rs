@@ -2,7 +2,7 @@ use crate::config::ClientConfig;
 use crate::connection;
 use crate::output;
 use anyhow::Result;
-use protocol::topology::node_info::Reader as NodeInfo;
+use protocol::topology::{NodeDrainState, node_info::Reader as NodeInfo};
 use std::io::Write;
 use tabwriter::TabWriter;
 use uuid::Uuid;
@@ -35,7 +35,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             n.get_addr()?.to_str()?,
             n.get_health()?,
             sched_label(n),
-            drain_label(n),
+            drain_label(n)?,
             reason_label(n)?,
         )?;
     }
@@ -69,9 +69,7 @@ fn id_string(n: &NodeInfo) -> anyhow::Result<String> {
 
 #[inline]
 fn sched_label(n: &NodeInfo) -> &'static str {
-    if n.get_drain_requested() {
-        "draining"
-    } else if n.get_schedulable() {
+    if n.get_schedulable() {
         "open"
     } else {
         "fenced"
@@ -79,12 +77,13 @@ fn sched_label(n: &NodeInfo) -> &'static str {
 }
 
 #[inline]
-fn drain_label(n: &NodeInfo) -> &'static str {
-    if n.get_drain_requested() {
-        "requested"
-    } else {
-        "-"
-    }
+fn drain_label(n: &NodeInfo) -> anyhow::Result<&'static str> {
+    Ok(match n.get_drain_state()? {
+        NodeDrainState::Open | NodeDrainState::Fenced => "-",
+        NodeDrainState::Draining => "draining",
+        NodeDrainState::Drained => "drained",
+        NodeDrainState::Blocked => "blocked",
+    })
 }
 
 #[inline]

@@ -505,6 +505,11 @@ impl Topology {
         info.set_incarnation(payload.incarnation);
         info.set_schedulable(payload.scheduling.schedulable);
         info.set_drain_requested(payload.scheduling.drain_requested);
+        info.set_drain_state(if payload.scheduling.schedulable {
+            protocol::topology::NodeDrainState::Open
+        } else {
+            protocol::topology::NodeDrainState::Fenced
+        });
         info.set_scheduling_updated_at_unix_ms(payload.scheduling.updated_at_unix_ms);
         set_node_id(
             info.reborrow().init_scheduling_actor_node_id(),
@@ -1049,6 +1054,34 @@ impl Topology {
             .peer_value_unscoped(node_id)
             .ok_or_else(|| capnp::Error::failed(format!("unknown node {node_id}")))?;
         let scheduling = peer.scheduling;
+        if !scheduling.drain_requested {
+            let state = if scheduling.schedulable {
+                DrainStatusState::Open
+            } else {
+                DrainStatusState::Fenced
+            };
+            let message = if scheduling.schedulable {
+                "node is schedulable".to_string()
+            } else {
+                "node is unschedulable without an active drain request".to_string()
+            };
+
+            return Ok(NodeDrainStatusSnapshot {
+                node_id,
+                schedulable: scheduling.schedulable,
+                drain_requested: scheduling.drain_requested,
+                state,
+                remaining_service_tasks: 0,
+                blocking_standalone_tasks: 0,
+                remaining_reserved_slots: 0,
+                remaining_reserved_gpus: 0,
+                scheduler_summary_known: true,
+                reason: scheduling.reason,
+                message,
+                last_scheduling_error: None,
+            });
+        }
+
         let active_tasks = self.active_task_values_on_node(node_id)?;
         let blocking_standalone_tasks = active_tasks
             .iter()
@@ -1102,13 +1135,7 @@ impl Topology {
                 }
             };
 
-        let state = if !scheduling.drain_requested {
-            if scheduling.schedulable {
-                DrainStatusState::Open
-            } else {
-                DrainStatusState::Fenced
-            }
-        } else if blocking_standalone_tasks > 0
+        let state = if blocking_standalone_tasks > 0
             || rollout_blocker.is_some()
             || replacement_blocker.is_some()
             || capacity_blocker.is_some()
@@ -1124,13 +1151,7 @@ impl Topology {
             DrainStatusState::Draining
         };
 
-        let message = if !scheduling.drain_requested {
-            if scheduling.schedulable {
-                "node is schedulable".to_string()
-            } else {
-                "node is unschedulable without an active drain request".to_string()
-            }
-        } else if blocking_standalone_tasks > 0 {
+        let message = if blocking_standalone_tasks > 0 {
             format!("drain blocked by {blocking_standalone_tasks} active standalone task(s)")
         } else if let Some(message) = rollout_blocker.as_ref() {
             message.clone()
@@ -1524,6 +1545,7 @@ impl topology::Server for Topology {
             let mut node = node_list.reborrow().get(index as u32);
             set_node_id(node.reborrow().init_id(), &id);
             local_view.write_capnp(node.reborrow().init_active_cluster_view());
+            let mut drain_state = protocol::topology::NodeDrainState::Open;
 
             if let Some(val) = value {
                 node.set_addr(&val.address);
@@ -1532,6 +1554,13 @@ impl topology::Server for Topology {
                 node.set_signing_key(&val.signing_pub);
                 node.set_schedulable(val.scheduling.schedulable);
                 node.set_drain_requested(val.scheduling.drain_requested);
+                drain_state = if val.scheduling.drain_requested {
+                    self.build_node_drain_status(id).await?.state.as_capnp()
+                } else if val.scheduling.schedulable {
+                    protocol::topology::NodeDrainState::Open
+                } else {
+                    protocol::topology::NodeDrainState::Fenced
+                };
                 node.set_scheduling_updated_at_unix_ms(val.scheduling.updated_at_unix_ms);
                 set_node_id(
                     node.reborrow().init_scheduling_actor_node_id(),
@@ -1546,6 +1575,7 @@ impl topology::Server for Topology {
                     node.set_wireguard_enabled(wg.enabled);
                 }
             }
+            node.set_drain_state(drain_state);
             node.set_health(node_status);
         }
 

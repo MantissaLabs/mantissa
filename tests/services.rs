@@ -1870,6 +1870,103 @@ local_test!(services_node_drain_timeout_keeps_node_unschedulable, {
     );
 });
 
+local_test!(services_node_list_reports_drained_node_after_evacuation, {
+    let _guard = ContainerManagerOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
+
+    let service_name = "drain-list-state";
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![demo_backend_task_template("backend", 1)],
+        )
+        .await
+        .expect("submit singleton deployment");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "singleton service should reach running before list-state drain test"
+    );
+
+    let service = cluster[0]
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load singleton service")
+        .expect("singleton service should exist");
+    let task_id = *service
+        .task_ids
+        .first()
+        .expect("singleton service should have one task id");
+    let initial_task = cluster[0]
+        .node
+        .task_manager
+        .inspect_task(task_id)
+        .await
+        .expect("inspect singleton task");
+    let drained_node_id = initial_task.node_id;
+
+    drain_node_via_topology(
+        &cluster[0].topology(),
+        drained_node_id,
+        "list state maintenance",
+    )
+    .await
+    .expect("drain singleton host");
+
+    let drained = wait_until(
+        Duration::from_secs(20),
+        Duration::from_millis(100),
+        || async {
+            matches!(
+                drain_status_via_topology(&cluster[1].topology(), drained_node_id)
+                    .await
+                    .ok()
+                    .map(|status| status.state),
+                Some(NodeDrainState::Drained)
+            )
+        },
+    )
+    .await;
+    assert!(
+        drained,
+        "singleton drain should reach drained state before reading topology list"
+    );
+
+    let row = listed_node_state_via_topology(&cluster[1].topology(), drained_node_id)
+        .await
+        .expect("read listed node state");
+    assert!(
+        !row.schedulable && row.drain_requested,
+        "drained node should remain fenced until resume"
+    );
+    assert_eq!(
+        row.drain_state,
+        NodeDrainState::Drained,
+        "topology list should surface the completed drain state"
+    );
+});
+
 local_test!(
     services_split_merge_rebalance_preserves_replica_convergence,
     {
@@ -4033,6 +4130,13 @@ struct TestDrainStatus {
     last_scheduling_error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct TestListedNodeState {
+    schedulable: bool,
+    drain_requested: bool,
+    drain_state: NodeDrainState,
+}
+
 /// Reads the topology drain-status projection used by maintenance integration tests.
 async fn drain_status_via_topology(
     client: &topology::Client,
@@ -4059,6 +4163,32 @@ async fn drain_status_via_topology(
             Some(last_scheduling_error)
         },
     })
+}
+
+/// Reads one node row from `Topology.list` so tests can assert the list projection directly.
+async fn listed_node_state_via_topology(
+    client: &topology::Client,
+    node_id: Uuid,
+) -> Result<TestListedNodeState, CapnpError> {
+    let response = client.list_request().send().promise.await?;
+    let nodes = response.get()?.get_nodes()?.get_nodes()?;
+    for node in nodes.iter() {
+        let listed_id = Uuid::from_slice(node.get_id()?.get_bytes()?)
+            .map_err(|err| CapnpError::failed(err.to_string()))?;
+        if listed_id != node_id {
+            continue;
+        }
+
+        return Ok(TestListedNodeState {
+            schedulable: node.get_schedulable(),
+            drain_requested: node.get_drain_requested(),
+            drain_state: node.get_drain_state()?,
+        });
+    }
+
+    Err(CapnpError::failed(format!(
+        "node {node_id} not found in topology list"
+    )))
 }
 
 /// Reserves every local scheduler slot on one node so evacuation tests can create hard blockers.

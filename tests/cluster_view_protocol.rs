@@ -17,10 +17,10 @@ use mantissa::topology::operation::{
 };
 use mantissa::topology::peers::{PeerSchedulingState, PeerValue};
 use net::noise::NoiseKeys;
-use protocol::topology::{ClusterOperationKind, ClusterOperationStage};
+use protocol::topology::{ClusterOperationKind, ClusterOperationStage, NodeDrainState};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 async fn submit_cluster_operation_record(
@@ -1053,6 +1053,116 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
         remote_count,
         Some(2),
         "remote split sibling count should still be inferred from split assignments"
+    );
+});
+
+// Validates startup preserves a durable self maintenance fence instead of reopening the node.
+local_test!(cluster_view_startup_preserves_persisted_self_drain_fence, {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+    let self_id = Uuid::new_v4();
+    let peers = open_peers_store(db.clone(), self_id).expect("open peers store");
+    let persisted_scheduling = PeerSchedulingState {
+        schedulable: false,
+        drain_requested: true,
+        updated_at_unix_ms: 77,
+        actor_node_id: self_id,
+        reason: Some("maintenance restart test".to_string()),
+    };
+
+    peers
+        .upsert(
+            &UuidKey::from(self_id),
+            PeerValue {
+                address: "127.0.0.1:6578".to_string(),
+                hostname: "local-node".to_string(),
+                noise_static_pub: [0x11; 32],
+                signing_pub: [0x22; 32],
+                identity_sig: vec![0x33; 64],
+                wireguard: None,
+                scheduling: persisted_scheduling,
+            },
+        )
+        .await
+        .expect("persist fenced local peer");
+
+    let node = HeadlessNode::new_with(
+        db,
+        self_id,
+        HeadlessKeys::new(
+            Arc::new(NoiseKeys::from_private_bytes([0x91; 32])),
+            ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]),
+        ),
+        headless_config_with_in_memory_runtime(),
+    )
+    .await
+    .expect("start fenced restart node");
+
+    let expected_addr = format!("inproc://{}", self_id);
+    let (schedulable, drain_requested, drain_state) = timeout(Duration::from_secs(5), async {
+        loop {
+            let list_resp = node
+                .topology_client
+                .list_request()
+                .send()
+                .promise
+                .await
+                .expect("topology list send");
+            let node_rows = list_resp
+                .get()
+                .expect("topology list get")
+                .get_nodes()
+                .expect("node list payload")
+                .get_nodes()
+                .expect("node rows");
+
+            for row in node_rows.iter() {
+                let listed_id = Uuid::from_slice(
+                    row.get_id()
+                        .expect("listed node id")
+                        .get_bytes()
+                        .expect("listed node id bytes"),
+                )
+                .expect("decode listed node id");
+                if listed_id != self_id {
+                    continue;
+                }
+
+                let listed_addr = row
+                    .get_addr()
+                    .expect("listed addr")
+                    .to_string()
+                    .expect("decode listed addr");
+                if listed_addr != expected_addr {
+                    break;
+                }
+
+                return (
+                    row.get_schedulable(),
+                    row.get_drain_requested(),
+                    row.get_drain_state().expect("drain state"),
+                );
+            }
+
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("wait for startup self peer refresh");
+
+    assert!(
+        !schedulable,
+        "startup should preserve the persisted unschedulable fence for self"
+    );
+    assert!(
+        drain_requested,
+        "startup should preserve the persisted drain request for self"
+    );
+    assert_eq!(
+        drain_state,
+        NodeDrainState::Drained,
+        "startup should derive the node as drained when the persisted fence is intact"
     );
 });
 

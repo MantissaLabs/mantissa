@@ -241,6 +241,9 @@ struct NodeInfo {
 
   schedulingReason @19 :Text;
   # Optional operator-supplied maintenance reason for diagnostics.
+
+  drainState @20 :NodeDrainState;
+  # Derived maintenance progress state used by `Topology.list` output.
 }
 
 struct NodeList {
