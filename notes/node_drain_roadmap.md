@@ -263,15 +263,17 @@ Implemented:
 2. Added `mantissa nodes status <node-id>` for detailed maintenance diagnostics.
 3. `mantissa nodes drain <node-id>` now waits by default until the node reaches
    `drained`, supports `--timeout`, and supports `--no-wait`.
-4. Drain status now reports:
+4. `mantissa nodes list` now surfaces the derived drain state so completed
+   drains show `drained` while the node remains fenced.
+5. Drain status now reports:
    - remaining service tasks
    - blocking standalone tasks
    - remaining reserved scheduler slots
    - remaining reserved GPU devices
    - best-known capacity blocker
-5. Timed-out operator waits leave the node safely unschedulable. Timeout does
+6. Timed-out operator waits leave the node safely unschedulable. Timeout does
    not imply resume.
-6. Drain status marks stuck evacuation as `blocked` when schedulable
+7. Drain status marks stuck evacuation as `blocked` when schedulable
    replacement capacity is insufficient.
 
 Validation completed:
