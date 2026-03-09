@@ -729,6 +729,15 @@ async fn resolve_service_backends(
             );
             continue;
         }
+        if !attachment.traffic_published {
+            tracing::trace!(
+                target: "network",
+                network = %network_id,
+                attachment = %attachment.id,
+                "skipping attachment not published for traffic"
+            );
+            continue;
+        }
         let Some(ip_text) = &attachment.assigned_ip else {
             tracing::debug!(
                 target: "network",
@@ -2182,6 +2191,7 @@ mod tests {
             mac: Some("02:aa:bb:cc:dd:01".to_string()),
             state: NetworkAttachmentState::Ready,
             error: None,
+            traffic_published: true,
             service_name: Some(service_name.to_string()),
             template_name: Some("backend".to_string()),
         })

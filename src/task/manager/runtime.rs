@@ -713,6 +713,7 @@ impl TaskManager {
                         mac: None,
                         state: NetworkAttachmentState::Pending,
                         error: None,
+                        traffic_published: service_labels.is_none(),
                         service_name: service_labels.as_ref().map(|(service, _)| service.clone()),
                         template_name: service_labels
                             .as_ref()

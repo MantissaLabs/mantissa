@@ -844,6 +844,44 @@ impl ServiceController {
         }
     }
 
+    /// Publishes task traffic after attachment rows exist so cutover only exposes ready endpoints.
+    async fn publish_task_traffic_for_cutover(
+        &self,
+        service_name: &str,
+        task_id: Uuid,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        self.task_manager
+            .publish_task_traffic_when_attachment_rows_exist(task_id, timeout)
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "failed to publish task {} for service '{}' during traffic cutover: {err}",
+                    task_id,
+                    service_name
+                )
+            })
+    }
+
+    /// Best-effort steady-state publication for a running desired task.
+    ///
+    /// Reconciliation uses this to self-heal publication after restart or attachment refresh even
+    /// when no explicit rollout handoff is in flight.
+    async fn publish_running_task_traffic_best_effort(&self, service_name: &str, task_id: Uuid) {
+        if let Err(err) = self
+            .task_manager
+            .set_task_traffic_published(task_id, true)
+            .await
+        {
+            tracing::warn!(
+                target: "services",
+                service = %service_name,
+                task = %task_id,
+                "failed to publish running task traffic: {err:#}"
+            );
+        }
+    }
+
     #[allow(dead_code)]
     pub fn registry(&self) -> &ServiceRegistry {
         &self.registry

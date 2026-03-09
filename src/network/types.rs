@@ -483,6 +483,8 @@ pub struct NetworkAttachmentValue {
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
+    pub traffic_published: bool,
+    #[serde(default)]
     pub service_name: Option<String>,
     #[serde(default)]
     pub template_name: Option<String>,
@@ -502,11 +504,13 @@ pub struct NetworkAttachmentDraft {
     pub mac: Option<String>,
     pub state: NetworkAttachmentState,
     pub error: Option<String>,
+    pub traffic_published: bool,
     pub service_name: Option<String>,
     pub template_name: Option<String>,
 }
 
 impl NetworkAttachmentValue {
+    /// Builds one attachment value from a draft so attachment replication has a durable baseline.
     pub fn new(draft: NetworkAttachmentDraft) -> Self {
         let created_at = current_timestamp();
         Self {
@@ -523,23 +527,33 @@ impl NetworkAttachmentValue {
             updated_at: created_at,
             state: draft.state,
             error: draft.error,
+            traffic_published: draft.traffic_published,
             service_name: draft.service_name,
             template_name: draft.template_name,
         }
     }
 
+    /// Updates lifecycle state while preserving assignment and traffic-publication metadata.
     pub fn set_state(&mut self, state: NetworkAttachmentState, error: Option<String>) {
         self.state = state;
         self.error = error;
         self.touch();
     }
 
+    /// Applies the assigned IP/MAC pair after network provisioning converges.
     pub fn set_assignment(&mut self, assigned_ip: Option<String>, mac: Option<String>) {
         self.assigned_ip = assigned_ip;
         self.mac = mac;
         self.touch();
     }
 
+    /// Sets whether the attachment is eligible for service traffic and endpoint publication.
+    pub fn set_traffic_published(&mut self, traffic_published: bool) {
+        self.traffic_published = traffic_published;
+        self.touch();
+    }
+
+    /// Refreshes the attachment timestamp after mutating replicated metadata.
     pub fn touch(&mut self) {
         self.updated_at = current_timestamp();
     }

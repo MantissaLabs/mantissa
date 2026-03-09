@@ -414,6 +414,9 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
                 if attachment.state != NetworkAttachmentState::Ready {
                     continue;
                 }
+                if !attachment.traffic_published {
+                    continue;
+                }
                 if !template_ids.contains(&attachment.task_id) {
                     continue;
                 }

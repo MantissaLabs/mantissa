@@ -365,6 +365,29 @@ placement correctness by itself.
 
 ### Follow-on B: Task 13 Service traffic cutover control
 
+Status:
+
+Completed on March 9, 2026.
+
+Implemented:
+
+1. Added a durable attachment-level `trafficPublished` bit and threaded it
+   through the network RPC and client attachment views.
+2. Service discovery and `services list` public endpoint hydration now exclude
+   ready attachments until traffic publication is explicitly enabled.
+3. Service task attachments now start unpublished by default, while standalone
+   task attachments remain published immediately.
+4. Local stop and stale-runtime cleanup now withdraw attachment traffic before
+   invoking the container runtime stop path.
+5. Rolling replacement and service slot handoff now publish replacement traffic
+   only after the replacement task is stable and attachment rows exist.
+6. Running-service reconciliation now republishes desired healthy tasks
+   best-effort so restart and attachment-refresh flows self-heal publication.
+
+Still pending in Follow-on B:
+
+Nothing.
+
 Add:
 
 1. endpoint removal before task stop

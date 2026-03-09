@@ -166,6 +166,18 @@ fn ready_attachment(
     backend_ip: Ipv4Addr,
     service_name: &str,
 ) -> NetworkAttachmentValue {
+    ready_attachment_with_publication(task_id, node_id, network_id, backend_ip, service_name, true)
+}
+
+/// Creates a ready attachment and controls whether discovery may publish it for traffic.
+fn ready_attachment_with_publication(
+    task_id: Uuid,
+    node_id: Uuid,
+    network_id: Uuid,
+    backend_ip: Ipv4Addr,
+    service_name: &str,
+    traffic_published: bool,
+) -> NetworkAttachmentValue {
     NetworkAttachmentValue::new(NetworkAttachmentDraft {
         id: mantissa::network::types::compute_network_attachment_id(task_id, network_id),
         task_id,
@@ -178,6 +190,7 @@ fn ready_attachment(
         mac: Some("02:11:22:33:44:55".to_string()),
         state: NetworkAttachmentState::Ready,
         error: None,
+        traffic_published,
         service_name: Some(service_name.to_string()),
         template_name: Some("backend".to_string()),
     })
@@ -376,6 +389,78 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
         .await
         .expect("query dns after stop");
     assert_eq!(final_ips, vec![Ipv4Addr::new(10, 42, 1, 11)]);
+
+    harness
+        .discovery
+        .teardown_network(network_id)
+        .await
+        .expect("teardown discovery");
+});
+
+local_test!(discovery_dns_requires_attachment_traffic_publication, {
+    let dns_port = 10531;
+    let service_name = "published-service";
+    let harness = setup_discovery_harness(dns_port).await;
+    let network_id = harness.network.id;
+
+    let node_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    upsert_service(&harness.services, service_name, network_id, vec![task_id]).await;
+
+    harness
+        .tasks
+        .upsert(
+            &UuidKey::from(task_id),
+            running_task(task_id, node_id, service_name, network_id),
+        )
+        .await
+        .expect("upsert task");
+    harness
+        .registry
+        .upsert_attachment(ready_attachment_with_publication(
+            task_id,
+            node_id,
+            network_id,
+            Ipv4Addr::new(10, 42, 2, 10),
+            service_name,
+            false,
+        ))
+        .await
+        .expect("upsert unpublished attachment");
+
+    harness
+        .discovery
+        .ensure_network(&harness.network, Some(Ipv4Addr::LOCALHOST))
+        .await
+        .expect("start discovery");
+
+    let fqdn = format!("backend.{}.svc.mantissa.", harness.network.name);
+    let (initial_code, initial_ips) =
+        wait_for_answer_count(dns_port, &fqdn, 0, Duration::from_secs(5))
+            .await
+            .expect("query unpublished dns");
+    assert_eq!(initial_code, ResponseCode::NXDomain);
+    assert!(initial_ips.is_empty());
+
+    harness
+        .registry
+        .upsert_attachment(ready_attachment_with_publication(
+            task_id,
+            node_id,
+            network_id,
+            Ipv4Addr::new(10, 42, 2, 10),
+            service_name,
+            true,
+        ))
+        .await
+        .expect("upsert published attachment");
+
+    let (published_code, published_ips) =
+        wait_for_answer_count(dns_port, &fqdn, 1, Duration::from_secs(5))
+            .await
+            .expect("query published dns");
+    assert_eq!(published_code, ResponseCode::NoError);
+    assert_eq!(published_ips, vec![Ipv4Addr::new(10, 42, 2, 10)]);
 
     harness
         .discovery

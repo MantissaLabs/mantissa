@@ -671,6 +671,75 @@ impl TaskManager {
         Ok(updated)
     }
 
+    /// Updates whether a task's network attachments may receive service traffic.
+    ///
+    /// Attachment publication is separate from attachment readiness so controllers can stage
+    /// start-first handoffs: publish a replacement only after it is ready, and withdraw the old
+    /// endpoint before asking the runtime to stop.
+    pub async fn set_task_traffic_published(
+        &self,
+        task_id: Uuid,
+        traffic_published: bool,
+    ) -> Result<bool, anyhow::Error> {
+        let attachments = self
+            .network_registry
+            .list_attachments_for_task(task_id)
+            .context("list attachments for traffic publication update")?;
+        let mut changed = false;
+
+        for mut attachment in attachments {
+            if attachment.traffic_published == traffic_published {
+                continue;
+            }
+            attachment.set_traffic_published(traffic_published);
+            self.network_registry
+                .upsert_attachment(attachment)
+                .await
+                .context("persist attachment traffic publication update")?;
+            changed = true;
+        }
+
+        Ok(changed)
+    }
+
+    /// Waits until attachment rows exist for every declared task network and then publishes them.
+    ///
+    /// Service controllers use this during start-first handoff so replacement endpoints only
+    /// become visible after the runtime has created attachment rows that can carry the
+    /// publication bit durably.
+    pub async fn publish_task_traffic_when_attachment_rows_exist(
+        &self,
+        task_id: Uuid,
+        timeout: Duration,
+    ) -> Result<(), anyhow::Error> {
+        let spec = self.load_spec(task_id).await?;
+        if spec.networks.is_empty() {
+            return Ok(());
+        }
+
+        let expected = spec.networks.len();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let attachments = self
+                .network_registry
+                .list_attachments_for_task(task_id)
+                .context("list attachments while waiting for publishable task traffic")?;
+            if attachments.len() >= expected {
+                self.set_task_traffic_published(task_id, true).await?;
+                return Ok(());
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "timed out waiting for {} attachment row(s) before publishing task traffic",
+                    expected
+                ));
+            }
+
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     async fn ensure_remote_secret_availability(
         &self,
         plans: &[RemoteStartPlan],

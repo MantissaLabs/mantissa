@@ -176,6 +176,12 @@ pub(super) async fn start_readiness_wait(
                                 service_name
                             );
                         }
+
+                        for task_id in &running_spec.task_ids {
+                            controller
+                                .publish_running_task_traffic_best_effort(&service_name, *task_id)
+                                .await;
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(

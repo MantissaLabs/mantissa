@@ -283,6 +283,7 @@ pub struct NetworkAttachment {
     pub updated_at: String,
     pub state: NetworkAttachmentState,
     pub error: Option<String>,
+    pub traffic_published: bool,
 }
 
 impl NetworkAttachment {
@@ -301,6 +302,7 @@ impl NetworkAttachment {
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),
             state: reader.get_state()?.into(),
             error: optional_text(reader.get_error()?)?,
+            traffic_published: reader.get_traffic_published(),
         })
     }
 }

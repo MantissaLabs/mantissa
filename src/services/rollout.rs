@@ -487,6 +487,26 @@ impl ServiceController {
                     }
                     break;
                 }
+
+                if let Err(err) = self
+                    .publish_task_traffic_for_cutover(
+                        service_name,
+                        spec.id,
+                        Duration::from_secs(settings.startup_timeout_secs.max(5) as u64),
+                    )
+                    .await
+                {
+                    let failure_budget_exhausted = self
+                        .record_rollout_failure(service_id, manifest_id, settings, progress, &err)
+                        .await;
+                    replacement_chunk_failed = true;
+                    self.stop_unhealthy_replacement_chunk_tasks(service_name, &started_specs)
+                        .await;
+                    if failure_budget_exhausted {
+                        return Some(err);
+                    }
+                    break;
+                }
             }
             if replacement_chunk_failed {
                 sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
@@ -701,6 +721,19 @@ impl ServiceController {
         old_templates_by_name: &HashMap<String, ServiceTaskSpecValue>,
         rollback_old_tasks: &mut HashMap<Uuid, RollbackTaskRecord>,
     ) -> anyhow::Result<()> {
+        if let Err(err) = self
+            .task_manager
+            .set_task_traffic_published(assignment.task_id, false)
+            .await
+        {
+            tracing::warn!(
+                target: "services",
+                service = %service_name,
+                task = %assignment.task_id,
+                "failed to withdraw task traffic before stop: {err:#}"
+            );
+        }
+
         self.task_manager
             .request_task_stop(assignment.task_id)
             .await

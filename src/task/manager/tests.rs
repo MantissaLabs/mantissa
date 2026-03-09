@@ -2678,6 +2678,198 @@ async fn runtime_attachments_created_and_removed_on_stop() {
 }
 
 #[tokio::test]
+async fn service_runtime_attachments_start_unpublished_until_controller_publishes() {
+    let (manager, scheduler, _mock_cm, network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let spec = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "service-net".to_string(),
+        description: "service network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.52.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
+    network_registry
+        .upsert_spec(spec.clone())
+        .await
+        .expect("upsert network spec");
+
+    let peer_state = NetworkPeerStateValue::new(
+        spec.id,
+        manager.local_node_id,
+        "local-node",
+        NetworkPeerState::Ready,
+        None,
+    );
+    network_registry
+        .upsert_peer_state(peer_state)
+        .await
+        .expect("upsert peer state");
+
+    let request = TaskStartRequest {
+        name: "service-backend".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 200,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        id: None,
+        slot_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: vec![spec.id],
+        service_metadata: Some(TaskServiceMetadata::new("svc", "backend")),
+        target_node: None,
+    };
+
+    let mut specs = manager
+        .start_tasks_batch(vec![request])
+        .await
+        .expect("start service task");
+    let task_spec = specs.pop().expect("service task created");
+
+    let attachments = network_registry
+        .list_attachments_for_task(task_spec.id)
+        .expect("list attachments");
+    assert_eq!(attachments.len(), 1);
+    assert!(
+        !attachments[0].traffic_published,
+        "service attachments should start unpublished until the service controller cuts traffic over"
+    );
+
+    manager
+        .set_task_traffic_published(task_spec.id, true)
+        .await
+        .expect("publish task traffic");
+    let published = network_registry
+        .list_attachments_for_task(task_spec.id)
+        .expect("list attachments after publish");
+    assert!(published[0].traffic_published);
+}
+
+#[tokio::test]
+async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
+    let (manager, scheduler, mock_cm, network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let spec = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "stop-net".to_string(),
+        description: "stop network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.53.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
+    network_registry
+        .upsert_spec(spec.clone())
+        .await
+        .expect("upsert network spec");
+
+    let peer_state = NetworkPeerStateValue::new(
+        spec.id,
+        manager.local_node_id,
+        "local-node",
+        NetworkPeerState::Ready,
+        None,
+    );
+    network_registry
+        .upsert_peer_state(peer_state)
+        .await
+        .expect("upsert peer state");
+
+    let request = TaskStartRequest {
+        name: "standalone-net".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 200,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        id: None,
+        slot_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: vec![spec.id],
+        service_metadata: None,
+        target_node: None,
+    };
+
+    let mut specs = manager
+        .start_tasks_batch(vec![request])
+        .await
+        .expect("start standalone task");
+    let task_spec = specs.pop().expect("standalone task created");
+
+    let attachments = network_registry
+        .list_attachments_for_task(task_spec.id)
+        .expect("list initial attachments");
+    assert_eq!(attachments.len(), 1);
+    assert!(
+        attachments[0].traffic_published,
+        "standalone attachment should begin published"
+    );
+
+    *mock_cm.stop_delay.lock().await = Some(std::time::Duration::from_millis(300));
+
+    let requested = manager
+        .request_task_stop(task_spec.id)
+        .await
+        .expect("request stop");
+    let manager_for_stop = manager.clone();
+    let inspect_during_stop = async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let attachments = network_registry
+                .list_attachments_for_task(task_spec.id)
+                .expect("list attachments during stop");
+            if attachments.len() == 1 && !attachments[0].traffic_published {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attachment traffic should be withdrawn before runtime stop completes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            mock_cm.stopped.lock().await.is_empty(),
+            "runtime stop should still be pending while publication is already withdrawn"
+        );
+    };
+
+    let stop_task = async move { manager_for_stop.reconcile_local_task(requested).await };
+    let (_, stop_result) = tokio::join!(inspect_during_stop, stop_task);
+    stop_result.expect("reconcile stop");
+}
+
+#[tokio::test]
 async fn request_task_stop_cleans_up_after_teardown_failure() {
     let attachment: Arc<dyn AttachmentProvisionerApi> =
         Arc::new(FlakyAttachmentProvisioner::default());
@@ -2785,6 +2977,7 @@ async fn remove_event_purges_remote_attachment_without_local_spec() {
         mac: Some("02:11:22:33:44:55".to_string()),
         state: NetworkAttachmentState::Ready,
         error: None,
+        traffic_published: true,
         service_name: Some("svc".to_string()),
         template_name: Some("backend".to_string()),
     });
@@ -3325,6 +3518,7 @@ async fn teardown_local_attachment_records_preserves_remote_rows() {
         mac: Some("02:11:22:33:44:66".to_string()),
         state: NetworkAttachmentState::Ready,
         error: None,
+        traffic_published: true,
         service_name: Some("svc".to_string()),
         template_name: Some("backend".to_string()),
     });
@@ -3340,6 +3534,7 @@ async fn teardown_local_attachment_records_preserves_remote_rows() {
         mac: Some("02:11:22:33:44:77".to_string()),
         state: NetworkAttachmentState::Ready,
         error: None,
+        traffic_published: true,
         service_name: Some("svc".to_string()),
         template_name: Some("backend".to_string()),
     });
@@ -3420,6 +3615,7 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
         mac: Some("02:11:22:33:44:88".to_string()),
         state: NetworkAttachmentState::Ready,
         error: None,
+        traffic_published: true,
         service_name: Some("svc".to_string()),
         template_name: Some("backend".to_string()),
     });

@@ -219,6 +219,9 @@ struct NetworkAttachmentSpec {
 
   error @10 :Text;
   # Last error message (empty if none).
+
+  trafficPublished @12 :Bool;
+  # True when service discovery and public endpoint publication may route traffic here.
 }
 
 struct NetworkEvent {

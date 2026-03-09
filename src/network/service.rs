@@ -174,6 +174,7 @@ fn write_network_attachment(
     } else {
         builder.set_error("");
     }
+    builder.set_traffic_published(attachment.traffic_published);
 }
 
 fn aggregate_peer_counts(

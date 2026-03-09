@@ -210,6 +210,14 @@ impl ServiceController {
             return Ok(());
         };
 
+        if spec.status() == ServiceStatus::Running
+            && task_state_healthy(&task.state)
+            && !node_is_down(task.node_id, health_snapshot)
+        {
+            self.publish_running_task_traffic_best_effort(&spec.service_name, task.id)
+                .await;
+        }
+
         // Deployment reconciliation should heal missing/failed slots, but avoid proactive
         // rebalancing until the service is fully running to prevent startup churn.
         if spec.status() != ServiceStatus::Running {
@@ -282,6 +290,14 @@ impl ServiceController {
                         );
                     }
                     self.clear_slot_missing(key).await;
+                    if spec.status() == ServiceStatus::Running {
+                        self.publish_task_traffic_for_cutover(
+                            &spec.service_name,
+                            task_id,
+                            Duration::from_secs(30),
+                        )
+                        .await?;
+                    }
                     return Ok(());
                 }
                 Err(err) => {
@@ -321,6 +337,14 @@ impl ServiceController {
             .map_err(|err| anyhow!("fallback placement failed: {err}"))?;
 
         self.clear_slot_missing(key).await;
+        if spec.status() == ServiceStatus::Running {
+            self.publish_task_traffic_for_cutover(
+                &spec.service_name,
+                task_id,
+                Duration::from_secs(30),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -359,6 +383,8 @@ impl ServiceController {
                 )
             })?;
 
+        self.publish_task_traffic_for_cutover(&spec.service_name, task.id, Duration::from_secs(30))
+            .await?;
         self.set_rebalance_cooldown(key).await;
 
         tracing::debug!(

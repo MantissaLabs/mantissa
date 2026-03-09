@@ -766,6 +766,14 @@ impl TaskManager {
                 .await?;
         }
 
+        if let Err(err) = self.set_task_traffic_published(id, false).await {
+            warn!(
+                target: "task",
+                task = %id,
+                "failed to withdraw task traffic before stop: {err:#}"
+            );
+        }
+
         // Pre-stop hooks and the runtime stop call share one shutdown budget so the task never
         // exceeds its configured graceful termination window.
         let stop_deadline =
@@ -1792,6 +1800,14 @@ impl TaskManager {
         {
             let mut guard = self.local_containers.lock().await;
             guard.remove(&task_id);
+        }
+
+        if let Err(err) = self.set_task_traffic_published(task_id, false).await {
+            warn!(
+                target: "task",
+                task = %task_id,
+                "failed to withdraw task traffic before stopping unowned runtime: {err:#}"
+            );
         }
 
         match self
