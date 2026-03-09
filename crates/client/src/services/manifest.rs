@@ -84,6 +84,8 @@ pub struct TaskSpec {
     #[serde(default)]
     pub restart_policy: Option<TaskRestartPolicy>,
     #[serde(default)]
+    pub termination_grace_period_secs: Option<u32>,
+    #[serde(default)]
     pub env: Vec<EnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<SecretFileProjection>,

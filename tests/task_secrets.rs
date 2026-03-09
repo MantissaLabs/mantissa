@@ -342,6 +342,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
         id: None,
         slot_ids: Vec::new(),
         restart_policy: None,
+        termination_grace_period_secs: None,
         env: vec![TaskEnvironmentVariable {
             name: "DB_PASSWORD".into(),
             value: None,
@@ -478,6 +479,7 @@ local_test!(task_manager_rejects_missing_secret_reference, {
         id: None,
         slot_ids: Vec::new(),
         restart_policy: None,
+        termination_grace_period_secs: None,
         env: vec![TaskEnvironmentVariable {
             name: "API_KEY".into(),
             value: None,

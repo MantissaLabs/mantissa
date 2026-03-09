@@ -47,6 +47,9 @@ struct TaskTemplate {
 
   gpuCount @14 :UInt32;
   # Requested GPU count per replica.
+
+  terminationGracePeriodSecs @15 :UInt32;
+  # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
 }
 
 enum PublicProtocol {

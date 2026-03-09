@@ -325,6 +325,24 @@ These are not blockers for correctness, but they improve production behavior.
 
 ### Follow-on A: Task 7 Graceful termination semantics
 
+Status:
+
+Phase 1 completed on March 9, 2026.
+
+Implemented:
+
+1. Added `terminationGracePeriodSecs` to service templates and persisted task
+   specs.
+2. Propagated the field through service manifests, service/task RPC encoding,
+   replica request construction, and task gossip persistence.
+3. Task stop reconciliation now uses the per-task grace period instead of a
+   hard-coded 10-second stop timeout.
+
+Still pending in Follow-on A:
+
+1. optional pre-stop hook support
+2. any explicit drain-only override beyond the per-task grace period
+
 Add:
 
 1. `terminationGracePeriod`

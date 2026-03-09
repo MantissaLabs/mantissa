@@ -175,6 +175,7 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     builder.set_cpu_millis(spec.cpu_millis);
     builder.set_memory_bytes(spec.memory_bytes);
     builder.set_gpu_count(spec.gpu_count);
+    builder.set_termination_grace_period_secs(spec.termination_grace_period_secs.unwrap_or(0));
     let mut gpu_builder = builder
         .reborrow()
         .init_gpu_device_ids(spec.gpu_device_ids.len() as u32);
@@ -244,6 +245,10 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     let cpu_millis = reader.get_cpu_millis();
     let memory_bytes = reader.get_memory_bytes();
     let gpu_count = reader.get_gpu_count();
+    let termination_grace_period_secs = match reader.get_termination_grace_period_secs() {
+        0 => None,
+        value => Some(value),
+    };
     let mut gpu_device_ids = Vec::new();
     for entry in reader.get_gpu_device_ids()?.iter() {
         gpu_device_ids.push(entry?.to_str()?.to_string());
@@ -317,6 +322,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         gpu_count,
         gpu_device_ids,
         restart_policy,
+        termination_grace_period_secs,
         env,
         secret_files,
         networks,
@@ -390,6 +396,10 @@ impl task::Server for TaskService {
         } else {
             None
         };
+        let termination_grace_period_secs = match req.get_termination_grace_period_secs() {
+            0 => None,
+            value => Some(value),
+        };
         let env = decode_env_vars(req.get_env()?)?;
         let secret_files = decode_secret_files(req.get_secret_files()?)?;
 
@@ -415,6 +425,7 @@ impl task::Server for TaskService {
             id: None,
             slot_ids,
             restart_policy,
+            termination_grace_period_secs,
             env,
             secret_files,
             networks,
@@ -500,6 +511,10 @@ impl task::Server for TaskService {
             } else {
                 None
             };
+            let termination_grace_period_secs = match entry.get_termination_grace_period_secs() {
+                0 => None,
+                value => Some(value),
+            };
 
             requests.push(TaskStartRequest {
                 name,
@@ -512,6 +527,7 @@ impl task::Server for TaskService {
                 id: task_id,
                 slot_ids,
                 restart_policy,
+                termination_grace_period_secs,
                 env,
                 secret_files,
                 networks,

@@ -768,7 +768,7 @@ impl TaskManager {
 
         match self
             .container_manager
-            .stop_container(&container_identifier, Some(Duration::from_secs(10)))
+            .stop_container(&container_identifier, Some(task_stop_timeout(&spec)))
             .await
         {
             Ok(_) => {}
@@ -2311,6 +2311,11 @@ fn task_value_recent(value: &TaskValue, grace_secs: i64) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Resolves the effective graceful-stop timeout for one task stop workflow.
+fn task_stop_timeout(spec: &TaskSpec) -> Duration {
+    Duration::from_secs(u64::from(spec.termination_grace_period_secs.unwrap_or(10)))
 }
 
 /// Returns true when a task state should retain scheduler slot reservations.

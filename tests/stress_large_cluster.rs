@@ -123,6 +123,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
                 gpu_count: 0,
             },
             restart_policy: None,
+            termination_grace_period_secs: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             networks: Vec::new(),

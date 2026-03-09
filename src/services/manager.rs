@@ -1188,6 +1188,7 @@ fn make_replica_request(
         id: Some(desired_id),
         slot_ids: Vec::new(),
         restart_policy: template.restart_policy.as_ref().map(map_restart_policy),
+        termination_grace_period_secs: template.termination_grace_period_secs,
         env: template.env.clone(),
         secret_files: template.secret_files.clone(),
         networks: template.required_network_ids(),
@@ -1318,6 +1319,7 @@ mod tests {
             gpu_count: 0,
             gpu_device_ids: Vec::new(),
             restart_policy: None,
+            termination_grace_period_secs: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             networks: Vec::new(),
@@ -1327,6 +1329,34 @@ mod tests {
             launch_attempt: 0,
             last_terminal_observed_launch: None,
         }
+    }
+
+    /// Ensures service replica launch requests preserve graceful termination metadata.
+    #[test]
+    fn replica_request_preserves_termination_grace_period() {
+        let desired_id = Uuid::new_v4();
+        let template = ServiceTaskSpecValue {
+            name: "api".into(),
+            image: "ghcr.io/demo/api:latest".into(),
+            command: Vec::new(),
+            replicas: 1,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: Some(42),
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            networks: Vec::new(),
+            health_port: None,
+            health_command: None,
+            public_port: None,
+            public_protocol: None,
+        };
+
+        let request = make_replica_request("demo-service", &template, 1, desired_id, None);
+
+        assert_eq!(request.termination_grace_period_secs, Some(42));
     }
 
     /// Ensures replica slots map task ids in template/replica order.
@@ -1347,6 +1377,7 @@ mod tests {
                     memory_bytes: 0,
                     gpu_count: 0,
                     restart_policy: None,
+                    termination_grace_period_secs: None,
                     env: Vec::new(),
                     secret_files: Vec::new(),
                     networks: Vec::new(),
@@ -1364,6 +1395,7 @@ mod tests {
                     memory_bytes: 0,
                     gpu_count: 0,
                     restart_policy: None,
+                    termination_grace_period_secs: None,
                     env: Vec::new(),
                     secret_files: Vec::new(),
                     networks: Vec::new(),
@@ -1438,6 +1470,7 @@ mod tests {
                 memory_bytes: 0,
                 gpu_count: 0,
                 restart_policy: None,
+                termination_grace_period_secs: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
@@ -1455,6 +1488,7 @@ mod tests {
                 memory_bytes: 0,
                 gpu_count: 0,
                 restart_policy: None,
+                termination_grace_period_secs: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
@@ -1490,6 +1524,7 @@ mod tests {
                 memory_bytes: 0,
                 gpu_count: 0,
                 restart_policy: None,
+                termination_grace_period_secs: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
@@ -1507,6 +1542,7 @@ mod tests {
                 memory_bytes: 0,
                 gpu_count: 0,
                 restart_policy: None,
+                termination_grace_period_secs: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
@@ -1565,6 +1601,7 @@ mod tests {
             memory_bytes: 0,
             gpu_count: 0,
             restart_policy: None,
+            termination_grace_period_secs: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             networks: Vec::new(),
@@ -1611,6 +1648,7 @@ mod tests {
             memory_bytes: 0,
             gpu_count: 0,
             restart_policy: None,
+            termination_grace_period_secs: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             networks: Vec::new(),
@@ -2014,6 +2052,7 @@ mod tests {
             memory_bytes: 0,
             gpu_count: 0,
             restart_policy: None,
+            termination_grace_period_secs: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             networks: Vec::new(),

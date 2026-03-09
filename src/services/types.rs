@@ -193,6 +193,8 @@ pub struct ServiceTaskSpecValue {
     #[serde(default)]
     pub restart_policy: Option<ServiceTaskRestartPolicy>,
     #[serde(default)]
+    pub termination_grace_period_secs: Option<u32>,
+    #[serde(default)]
     pub env: Vec<TaskEnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,

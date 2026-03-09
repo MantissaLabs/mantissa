@@ -127,6 +127,7 @@ fn template_attributes_changed(
         || current.memory_bytes != desired.memory_bytes
         || current.gpu_count != desired.gpu_count
         || current.restart_policy != desired.restart_policy
+        || current.termination_grace_period_secs != desired.termination_grace_period_secs
         || current.env != desired.env
         || current.secret_files != desired.secret_files
         || current.networks != desired.networks

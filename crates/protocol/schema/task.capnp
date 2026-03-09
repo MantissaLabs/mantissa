@@ -105,6 +105,9 @@ struct TaskSpec {
 
   lastTerminalObservedLaunch @24 :UInt64;
   # Last launch attempt observed as terminal, 0 means unset.
+
+  terminationGracePeriodSecs @25 :UInt32;
+  # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
 }
 
 struct ServiceMetadata {
@@ -154,6 +157,9 @@ struct TaskStartRequest {
 
   gpuDeviceIds @12 :List(Text);
   # Requested GPU device identifiers (UUIDs preferred).
+
+  terminationGracePeriodSecs @13 :UInt32;
+  # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
 }
 
 struct TaskStopRequest {

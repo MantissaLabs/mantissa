@@ -395,6 +395,10 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         memory_bytes: reader.get_memory_bytes(),
         gpu_count: reader.get_gpu_count(),
         restart_policy,
+        termination_grace_period_secs: match reader.get_termination_grace_period_secs() {
+            0 => None,
+            value => Some(value),
+        },
         env,
         secret_files,
         networks,
@@ -561,6 +565,7 @@ fn write_task_template(
     builder.set_cpu_millis(task.cpu_millis);
     builder.set_memory_bytes(task.memory_bytes);
     builder.set_gpu_count(task.gpu_count);
+    builder.set_termination_grace_period_secs(task.termination_grace_period_secs.unwrap_or(0));
 
     let mut cmd_builder = builder.reborrow().init_command(task.command.len() as u32);
     for (idx, arg) in task.command.iter().enumerate() {
