@@ -483,7 +483,13 @@ fn should_prefer_attachment(
     match candidate_rank.cmp(&current_rank) {
         Ordering::Greater => true,
         Ordering::Less => false,
-        Ordering::Equal => candidate.node_id > current.node_id,
+        Ordering::Equal => {
+            if candidate.traffic_published != current.traffic_published {
+                candidate.traffic_published
+            } else {
+                candidate.node_id > current.node_id
+            }
+        }
     }
 }
 
@@ -568,5 +574,39 @@ mod tests {
         let chosen =
             NetworkRegistry::select_latest_peer_state(&[ready.clone(), removing.clone()]).unwrap();
         assert_eq!(chosen.state, NetworkPeerState::Ready);
+    }
+
+    /// Ensure attachment selection prefers published traffic state when revisions otherwise tie.
+    #[test]
+    fn published_attachment_wins_when_other_fields_tie() {
+        let task_id = Uuid::new_v4();
+        let network_id = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+
+        let mut unpublished =
+            NetworkAttachmentValue::new(crate::network::types::NetworkAttachmentDraft {
+                id: crate::network::types::compute_network_attachment_id(task_id, network_id),
+                task_id,
+                node_id,
+                container_id: "container-a".to_string(),
+                network_id,
+                task_updated_at: Some("2026-03-09T00:00:00Z".to_string()),
+                requested_ip: Some("10.0.0.2".to_string()),
+                assigned_ip: Some("10.0.0.2".to_string()),
+                mac: Some("02:11:22:33:44:55".to_string()),
+                state: crate::network::types::NetworkAttachmentState::Ready,
+                error: None,
+                traffic_published: false,
+                service_name: Some("svc".to_string()),
+                template_name: Some("backend".to_string()),
+            });
+        unpublished.updated_at = "2026-03-09T00:00:01Z".to_string();
+        unpublished.created_at = "2026-03-09T00:00:00Z".to_string();
+
+        let mut published = unpublished.clone();
+        published.traffic_published = true;
+
+        let chosen = select_best_attachment_value(&[unpublished, published]).unwrap();
+        assert!(chosen.traffic_published);
     }
 }

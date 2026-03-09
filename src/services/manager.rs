@@ -11,7 +11,7 @@ use crate::services::types::{
     ServiceUpdateStrategy, compute_service_id,
 };
 use crate::task::container::ContainerState;
-use crate::task::manager::{TaskManager, TaskStartRequest};
+use crate::task::manager::{TaskManager, TaskStartRequest, TaskTrafficPublicationUpdate};
 use crate::task::types::{
     TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec, TaskStateFilter,
 };
@@ -84,6 +84,7 @@ pub struct ServiceController {
     local_node_id: Uuid,
     health_monitor: Arc<HealthMonitor>,
     inflight_slots: Arc<AsyncMutex<HashSet<SlotKey>>>,
+    inflight_traffic_publish_waiters: Arc<AsyncMutex<HashSet<Uuid>>>,
     slot_missing_since: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
     slot_rebalance_after: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
 }
@@ -108,6 +109,7 @@ impl ServiceController {
             local_node_id,
             health_monitor,
             inflight_slots: Arc::new(AsyncMutex::new(HashSet::new())),
+            inflight_traffic_publish_waiters: Arc::new(AsyncMutex::new(HashSet::new())),
             slot_missing_since: Arc::new(AsyncMutex::new(HashMap::new())),
             slot_rebalance_after: Arc::new(AsyncMutex::new(HashMap::new())),
         }
@@ -868,18 +870,67 @@ impl ServiceController {
     /// Reconciliation uses this to self-heal publication after restart or attachment refresh even
     /// when no explicit rollout handoff is in flight.
     async fn publish_running_task_traffic_best_effort(&self, service_name: &str, task_id: Uuid) {
-        if let Err(err) = self
+        match self
             .task_manager
             .set_task_traffic_published(task_id, true)
             .await
         {
-            tracing::warn!(
-                target: "services",
-                service = %service_name,
-                task = %task_id,
-                "failed to publish running task traffic: {err:#}"
-            );
+            Ok(TaskTrafficPublicationUpdate::Updated | TaskTrafficPublicationUpdate::Unchanged) => {
+            }
+            Ok(TaskTrafficPublicationUpdate::NoAttachments) => {
+                self.spawn_task_traffic_publish_waiter(
+                    service_name.to_string(),
+                    task_id,
+                    Duration::from_secs(30),
+                )
+                .await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "services",
+                    service = %service_name,
+                    task = %task_id,
+                    "failed to publish running task traffic: {err:#}"
+                );
+            }
         }
+    }
+
+    /// Starts one background waiter that publishes a task once its attachment rows arrive locally.
+    ///
+    /// Publication intent can precede attachment replication during initial deployment and
+    /// convergence after partitions. This preserves the intent without blocking service
+    /// reconciliation or spawning duplicate waiters for the same task.
+    async fn spawn_task_traffic_publish_waiter(
+        &self,
+        service_name: String,
+        task_id: Uuid,
+        timeout: Duration,
+    ) {
+        let mut guard = self.inflight_traffic_publish_waiters.lock().await;
+        if !guard.insert(task_id) {
+            return;
+        }
+        drop(guard);
+
+        let task_manager = self.task_manager.clone();
+        let waiters = self.inflight_traffic_publish_waiters.clone();
+        tokio::task::spawn_local(async move {
+            let result = task_manager
+                .publish_task_traffic_when_attachment_rows_exist(task_id, timeout)
+                .await;
+            if let Err(err) = result {
+                tracing::warn!(
+                    target: "services",
+                    service = %service_name,
+                    task = %task_id,
+                    "failed to publish running task traffic after attachment wait: {err:#}"
+                );
+            }
+
+            let mut guard = waiters.lock().await;
+            guard.remove(&task_id);
+        });
     }
 
     #[allow(dead_code)]

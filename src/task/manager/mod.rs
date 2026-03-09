@@ -103,6 +103,13 @@ pub struct TaskManager {
     runtime_config: TaskRuntimeConfig,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskTrafficPublicationUpdate {
+    NoAttachments,
+    Unchanged,
+    Updated,
+}
+
 #[derive(Clone)]
 pub struct TaskStartRequest {
     pub name: String,
@@ -680,11 +687,14 @@ impl TaskManager {
         &self,
         task_id: Uuid,
         traffic_published: bool,
-    ) -> Result<bool, anyhow::Error> {
+    ) -> Result<TaskTrafficPublicationUpdate, anyhow::Error> {
         let attachments = self
             .network_registry
             .list_attachments_for_task(task_id)
             .context("list attachments for traffic publication update")?;
+        if attachments.is_empty() {
+            return Ok(TaskTrafficPublicationUpdate::NoAttachments);
+        }
         let mut changed = false;
 
         for mut attachment in attachments {
@@ -699,7 +709,11 @@ impl TaskManager {
             changed = true;
         }
 
-        Ok(changed)
+        if changed {
+            Ok(TaskTrafficPublicationUpdate::Updated)
+        } else {
+            Ok(TaskTrafficPublicationUpdate::Unchanged)
+        }
     }
 
     /// Waits until attachment rows exist for every declared task network and then publishes them.

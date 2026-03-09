@@ -2764,6 +2764,163 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
 }
 
 #[tokio::test]
+async fn set_task_traffic_published_reports_missing_attachments() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let network_id = Uuid::new_v4();
+    let now = Utc::now().to_rfc3339();
+    let value = TaskValue::new(TaskValueDraft {
+        id: task_id,
+        name: "service-task".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.clone(),
+        updated_at: now,
+        command: Vec::new(),
+        node_id: manager.local_node_id,
+        node_name: "local-node".to_string(),
+        slot_ids: vec![1],
+        networks: vec![network_id],
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        service_metadata: Some(TaskServiceMetadata::new("svc", "backend")),
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
+    });
+    manager
+        .store
+        .upsert(&UuidKey::from(task_id), value)
+        .await
+        .expect("persist service task");
+
+    let update = manager
+        .set_task_traffic_published(task_id, true)
+        .await
+        .expect("set task traffic publication");
+    assert_eq!(update, TaskTrafficPublicationUpdate::NoAttachments);
+}
+
+#[tokio::test]
+async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachment() {
+    let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;
+
+    let network = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "late-attachment-net".to_string(),
+        description: "late attachment network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.54.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
+    network_registry
+        .upsert_spec(network.clone())
+        .await
+        .expect("upsert network spec");
+
+    let peer_state = NetworkPeerStateValue::new(
+        network.id,
+        manager.local_node_id,
+        "local-node",
+        NetworkPeerState::Ready,
+        None,
+    );
+    network_registry
+        .upsert_peer_state(peer_state)
+        .await
+        .expect("upsert peer state");
+
+    let task_id = Uuid::new_v4();
+    let now = Utc::now().to_rfc3339();
+    let value = TaskValue::new(TaskValueDraft {
+        id: task_id,
+        name: "service-task".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        command: Vec::new(),
+        node_id: manager.local_node_id,
+        node_name: "local-node".to_string(),
+        slot_ids: vec![1],
+        networks: vec![network.id],
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        service_metadata: Some(TaskServiceMetadata::new("svc", "backend")),
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
+    });
+    manager
+        .store
+        .upsert(&UuidKey::from(task_id), value)
+        .await
+        .expect("persist service task");
+
+    let manager_for_wait = manager.clone();
+    let wait_publish = async move {
+        manager_for_wait
+            .publish_task_traffic_when_attachment_rows_exist(
+                task_id,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+    };
+    let insert_attachment = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        network_registry
+            .upsert_attachment(NetworkAttachmentValue::new(NetworkAttachmentDraft {
+                id: crate::network::types::compute_network_attachment_id(task_id, network.id),
+                task_id,
+                node_id: manager.local_node_id,
+                container_id: format!("mantissa-{task_id}"),
+                network_id: network.id,
+                task_updated_at: Some(now),
+                requested_ip: Some("10.54.0.2".to_string()),
+                assigned_ip: Some("10.54.0.2".to_string()),
+                mac: Some("02:11:22:33:44:aa".to_string()),
+                state: NetworkAttachmentState::Ready,
+                error: None,
+                traffic_published: false,
+                service_name: Some("svc".to_string()),
+                template_name: Some("backend".to_string()),
+            }))
+            .await
+            .expect("insert attachment");
+    };
+
+    let (wait_result, _) = tokio::join!(wait_publish, insert_attachment);
+    wait_result.expect("wait for late attachment publication");
+
+    let attachments = network_registry
+        .list_attachments_for_task(task_id)
+        .expect("list attachments after publish");
+    assert_eq!(attachments.len(), 1);
+    assert!(attachments[0].traffic_published);
+}
+
+#[tokio::test]
 async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
     let (manager, scheduler, mock_cm, network_registry) = setup_manager().await;
 
