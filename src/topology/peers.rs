@@ -2,11 +2,115 @@ use crate::topology::{PeerHandle, Topology, peer_provider::PeerProvider};
 use async_trait::async_trait;
 use capnp::Error as CapnpError;
 use ed25519_dalek::VerifyingKey;
+use protocol::node::node_id as node_id_capnp;
 use protocol::topology::node_info as node_info_capnp;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
 use serde::{Deserialize, Serialize};
+
+/// Cluster-visible scheduling policy attached to one peer entry.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub struct PeerSchedulingState {
+    /// True when schedulers may place new tasks on this node.
+    pub schedulable: bool,
+
+    /// True when operators requested maintenance drain for this node.
+    #[serde(default)]
+    pub drain_requested: bool,
+
+    /// Last-writer timestamp used to converge concurrent scheduling updates.
+    #[serde(default)]
+    pub updated_at_unix_ms: u64,
+
+    /// Actor node id used as the deterministic tie-breaker for equal timestamps.
+    #[serde(default = "Uuid::nil")]
+    pub actor_node_id: Uuid,
+
+    /// Optional operator-supplied reason displayed in diagnostics.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl Default for PeerSchedulingState {
+    /// Build the default schedulable state used by nodes that are not under maintenance.
+    fn default() -> Self {
+        Self {
+            schedulable: true,
+            drain_requested: false,
+            updated_at_unix_ms: 0,
+            actor_node_id: Uuid::nil(),
+            reason: None,
+        }
+    }
+}
+
+impl PeerSchedulingState {
+    /// Builds the default schedulable state for one node when no maintenance fence exists yet.
+    pub fn schedulable_default(actor_node_id: Uuid) -> Self {
+        Self {
+            actor_node_id,
+            ..Self::default()
+        }
+    }
+
+    /// Builds one converged scheduling state from Cap'n Proto node metadata.
+    pub fn from_node_info(
+        node_id: Uuid,
+        schedulable: bool,
+        drain_requested: bool,
+        updated_at_unix_ms: u64,
+        actor_node_id: Option<Uuid>,
+        reason: Option<String>,
+    ) -> Self {
+        let trimmed_reason = reason.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        let actor_node_id = actor_node_id.unwrap_or(Uuid::nil());
+
+        if updated_at_unix_ms == 0
+            && actor_node_id.is_nil()
+            && !drain_requested
+            && !schedulable
+            && trimmed_reason.is_none()
+        {
+            return Self::schedulable_default(node_id);
+        }
+
+        Self {
+            schedulable,
+            drain_requested,
+            updated_at_unix_ms,
+            actor_node_id,
+            reason: trimmed_reason,
+        }
+    }
+
+    /// Returns the deterministic conflict-resolution key for one scheduling update.
+    fn precedence_key(&self) -> (u64, Uuid, bool, bool, Option<&str>) {
+        (
+            self.updated_at_unix_ms,
+            self.actor_node_id,
+            self.drain_requested,
+            self.schedulable,
+            self.reason.as_deref(),
+        )
+    }
+
+    /// Selects the converged winner between two scheduling states.
+    pub fn merge(left: &Self, right: &Self) -> Self {
+        if left.precedence_key() >= right.precedence_key() {
+            left.clone()
+        } else {
+            right.clone()
+        }
+    }
+}
 
 /// WireGuard configuration advertised by a peer for encrypting the VXLAN underlay.
 ///
@@ -47,6 +151,10 @@ pub struct PeerValue {
     // Always serialize the option tag to keep bincode framing stable across reads.
     #[serde(default)]
     pub wireguard: Option<WireGuardPeerValue>,
+
+    /// Placement policy state used to fence nodes during maintenance operations.
+    #[serde(default)]
+    pub scheduling: PeerSchedulingState,
 }
 
 #[async_trait(?Send)]
@@ -81,6 +189,96 @@ impl PeerProvider for Topology {
 }
 
 impl PeerValue {
+    /// Selects one deterministic winner from the concurrent values stored for one peer row.
+    pub fn select(values: &[PeerValue]) -> Option<PeerValue> {
+        fn is_nonzero_key(key: &[u8; 32]) -> bool {
+            key.iter().any(|b| *b != 0)
+        }
+
+        fn rank_wireguard(wg: &WireGuardPeerValue) -> (bool, bool, bool, u16, [u8; 32]) {
+            (
+                wg.enabled,
+                is_nonzero_key(&wg.public_key),
+                wg.port != 0,
+                wg.port,
+                wg.public_key,
+            )
+        }
+
+        if values.is_empty() {
+            return None;
+        }
+
+        let mut address: Option<&str> = None;
+        let mut hostname: Option<&str> = None;
+        let mut noise_static_pub: Option<[u8; 32]> = None;
+        let mut signing_pub: Option<[u8; 32]> = None;
+        let mut identity_sig: Option<Vec<u8>> = None;
+        let mut wireguard: Option<WireGuardPeerValue> = None;
+        let mut scheduling: Option<PeerSchedulingState> = None;
+
+        for value in values {
+            if !value.address.is_empty() {
+                address = match address {
+                    None => Some(value.address.as_str()),
+                    Some(current) => Some(std::cmp::max(current, value.address.as_str())),
+                };
+            }
+
+            if !value.hostname.is_empty() {
+                hostname = match hostname {
+                    None => Some(value.hostname.as_str()),
+                    Some(current) => Some(std::cmp::max(current, value.hostname.as_str())),
+                };
+            }
+
+            noise_static_pub = match noise_static_pub {
+                None => Some(value.noise_static_pub),
+                Some(current) => Some(std::cmp::max(current, value.noise_static_pub)),
+            };
+
+            signing_pub = match signing_pub {
+                None => Some(value.signing_pub),
+                Some(current) => Some(std::cmp::max(current, value.signing_pub)),
+            };
+
+            if value.identity_sig.len() == 64 {
+                identity_sig = match identity_sig {
+                    None => Some(value.identity_sig.clone()),
+                    Some(current) => Some(std::cmp::max(current, value.identity_sig.clone())),
+                };
+            }
+
+            if let Some(candidate) = value.wireguard.as_ref() {
+                wireguard = match wireguard.as_ref() {
+                    None => Some(candidate.clone()),
+                    Some(current) => {
+                        if rank_wireguard(candidate) > rank_wireguard(current) {
+                            Some(candidate.clone())
+                        } else {
+                            Some(current.clone())
+                        }
+                    }
+                };
+            }
+
+            scheduling = Some(match scheduling.as_ref() {
+                None => value.scheduling.clone(),
+                Some(current) => PeerSchedulingState::merge(current, &value.scheduling),
+            });
+        }
+
+        Some(PeerValue {
+            address: address.unwrap_or_default().to_string(),
+            hostname: hostname.unwrap_or_default().to_string(),
+            noise_static_pub: noise_static_pub.unwrap_or_default(),
+            signing_pub: signing_pub.unwrap_or_default(),
+            identity_sig: identity_sig.unwrap_or_default(),
+            wireguard,
+            scheduling: scheduling.unwrap_or_default(),
+        })
+    }
+
     /// Build a `PeerValue` from a Cap'n Proto `NodeInfo` reader and verify its identity signature.
     pub fn from_node_info(
         node_id: Uuid,
@@ -148,6 +346,15 @@ impl PeerValue {
             })
         };
 
+        let scheduling = PeerSchedulingState::from_node_info(
+            node_id,
+            ni.get_schedulable(),
+            ni.get_drain_requested(),
+            ni.get_scheduling_updated_at_unix_ms(),
+            read_optional_node_id_capnp(ni.get_scheduling_actor_node_id()?)?,
+            Some(ni.get_scheduling_reason()?.to_string()?),
+        );
+
         Ok(PeerValue {
             address,
             hostname,
@@ -155,6 +362,76 @@ impl PeerValue {
             signing_pub,
             identity_sig: identity_sig.to_vec(),
             wireguard,
+            scheduling,
         })
+    }
+}
+
+/// Decode one optional node id payload used by peer scheduling metadata.
+fn read_optional_node_id_capnp(
+    reader: node_id_capnp::Reader<'_>,
+) -> Result<Option<Uuid>, CapnpError> {
+    let bytes = reader.get_bytes()?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+
+    Uuid::from_slice(bytes)
+        .map(Some)
+        .map_err(|err| CapnpError::failed(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PeerSchedulingState, PeerValue};
+    use uuid::Uuid;
+
+    /// Legacy nodes without scheduling metadata should default to schedulable.
+    #[test]
+    fn legacy_node_info_defaults_to_schedulable() {
+        let node_id = Uuid::from_bytes([7u8; 16]);
+
+        let scheduling = PeerSchedulingState::from_node_info(node_id, false, false, 0, None, None);
+
+        assert!(scheduling.schedulable);
+        assert!(!scheduling.drain_requested);
+        assert_eq!(scheduling.actor_node_id, node_id);
+    }
+
+    /// Later scheduling updates must win peer selection across concurrent values.
+    #[test]
+    fn peer_select_prefers_latest_scheduling_state() {
+        let node_id = Uuid::from_bytes([3u8; 16]);
+        let mut older = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            scheduling: PeerSchedulingState {
+                schedulable: true,
+                drain_requested: false,
+                updated_at_unix_ms: 10,
+                actor_node_id: node_id,
+                reason: None,
+            },
+        };
+        let mut newer = older.clone();
+        newer.scheduling = PeerSchedulingState {
+            schedulable: false,
+            drain_requested: true,
+            updated_at_unix_ms: 20,
+            actor_node_id: node_id,
+            reason: Some("maintenance".to_string()),
+        };
+        older.address = String::new();
+
+        let selected = PeerValue::select(&[older, newer]).expect("selected peer value");
+
+        assert!(!selected.scheduling.schedulable);
+        assert!(selected.scheduling.drain_requested);
+        assert_eq!(selected.scheduling.reason.as_deref(), Some("maintenance"));
+        assert_eq!(selected.address, "127.0.0.1:7000");
     }
 }

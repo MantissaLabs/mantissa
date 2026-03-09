@@ -660,19 +660,24 @@ impl TaskManager {
         local_ready: &HashSet<Uuid>,
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
-        if let Some(local_candidate) = Candidate::new(
-            CandidateLocation::Local,
-            local_slots,
-            local_gpus,
-            local_ready.clone(),
-        ) {
-            queue.push_back(local_candidate);
+        if self.registry.peer_schedulable(self.local_node_id) {
+            if let Some(local_candidate) = Candidate::new(
+                CandidateLocation::Local,
+                local_slots,
+                local_gpus,
+                local_ready.clone(),
+            ) {
+                queue.push_back(local_candidate);
+            }
         }
 
         let peers = self.registry.known_peers()?;
         let mut remote_candidates = Vec::new();
         for peer_id in peers {
             if peer_id == self.local_node_id {
+                continue;
+            }
+            if !self.registry.peer_schedulable(peer_id) {
                 continue;
             }
 

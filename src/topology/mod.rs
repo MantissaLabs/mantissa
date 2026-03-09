@@ -19,7 +19,7 @@ use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
 use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains, sync_selected_domains};
 use crate::token::TokenStore;
-use crate::topology::peers::PeerValue;
+use crate::topology::peers::{PeerSchedulingState, PeerValue};
 use ::health::HealthMonitor;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
@@ -522,6 +522,44 @@ impl Topology {
         self.gossip.send(Message::Topology { id, event }).await
     }
 
+    /// Returns the current converged scheduling state for the local node.
+    pub(crate) fn current_scheduling_state(&self) -> PeerSchedulingState {
+        self.registry
+            .peer_scheduling(self.node.id)
+            .unwrap_or_else(|| PeerSchedulingState::schedulable_default(self.node.id))
+    }
+
+    /// Applies one scheduling-state update to the peer store using deterministic convergence.
+    pub(crate) async fn apply_peer_scheduling_update(
+        &self,
+        node_id: Uuid,
+        scheduling: PeerSchedulingState,
+    ) -> Result<bool, capnp::Error> {
+        let Some(mut current) = self.registry.peer_value_unscoped(node_id) else {
+            return Err(capnp::Error::failed(format!(
+                "node '{}' not found",
+                node_id
+            )));
+        };
+
+        let merged = PeerSchedulingState::merge(&current.scheduling, &scheduling);
+        if current.scheduling == merged {
+            return Ok(false);
+        }
+
+        current.scheduling = merged;
+        self.peers
+            .upsert(&UuidKey::from(node_id), current)
+            .await
+            .map_err(|err| {
+                capnp::Error::failed(format!(
+                    "failed to persist scheduling update for node '{}': {err}",
+                    node_id
+                ))
+            })?;
+        Ok(true)
+    }
+
     pub fn registry(&self) -> Registry {
         self.registry.clone()
     }
@@ -628,6 +666,7 @@ impl Topology {
                 signing_pub: verifying_key.to_bytes(),
                 identity_sig: identity_sig.to_vec(),
                 wireguard,
+                scheduling: PeerSchedulingState::schedulable_default(local_id),
             };
 
             if let Err(e) = peers.upsert(&key, v).await {
@@ -781,6 +820,17 @@ impl Topology {
         info.set_signing_key(&signing_pub);
         info.set_identity_sig(&identity_sig);
         info.set_incarnation(self.swim_local_incarnation());
+        let scheduling = self.current_scheduling_state();
+        info.set_schedulable(scheduling.schedulable);
+        info.set_drain_requested(scheduling.drain_requested);
+        info.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
+        set_node_id(
+            info.reborrow().init_scheduling_actor_node_id(),
+            &scheduling.actor_node_id,
+        );
+        if let Some(reason) = scheduling.reason.as_deref() {
+            info.set_scheduling_reason(reason);
+        }
 
         // WireGuard underlay advertisement (best-effort).
         //
@@ -884,6 +934,7 @@ impl Topology {
                             ref signing_pub,
                             ref identity_sig,
                             ref wireguard,
+                            ref scheduling,
                         } => {
                             info!(target: "topology", "Node joined: {id} at {address}");
 
@@ -907,6 +958,7 @@ impl Topology {
                                 signing_pub: signing_pub.to_bytes(),
                                 identity_sig: identity_sig.clone(),
                                 wireguard: wireguard.clone(),
+                                scheduling: scheduling.clone(),
                             };
 
                             if let Err(e) = self.register_peer(id, &v, client.clone()).await {
@@ -971,6 +1023,19 @@ impl Topology {
                                 continue;
                             }
                         }
+                        TopologyEvent::NodeSchedulingUpdated { id, ref scheduling } => {
+                            if let Err(err) = self
+                                .apply_peer_scheduling_update(id, scheduling.clone())
+                                .await
+                            {
+                                warn!(
+                                    target: "topology",
+                                    node_id = %id,
+                                    "failed to apply gossiped scheduling update: {err}"
+                                );
+                                continue;
+                            }
+                        }
                     }
 
                     let event_clone = match event.clone() {
@@ -985,6 +1050,7 @@ impl Topology {
                             signing_pub,
                             identity_sig,
                             wireguard,
+                            scheduling,
                         } => {
                             // Never re-gossip a capability we only know as an import. Cap’n Proto
                             // will panic if we hand a borrowed client handle back to the peer that
@@ -1001,6 +1067,7 @@ impl Topology {
                                 signing_pub,
                                 identity_sig,
                                 wireguard,
+                                scheduling,
                             }
                         }
                         evt => evt,
@@ -1397,9 +1464,9 @@ impl Topology {
     pub fn signing_vk_for(&self, peer_id: Uuid) -> Option<VerifyingKey> {
         let (actives, _tombs) = self.peers.load_all().ok()?;
 
-        // Find the MVReg snapshot for this UUID and take the latest value.
+        // Find the MVReg snapshot for this UUID and deterministically select one converged value.
         let snap = actives.into_iter().find(|(k, _)| k.to_uuid() == peer_id)?.1;
-        let last = snap.as_slice().last()?.clone();
+        let last = PeerValue::select(snap.as_slice())?;
 
         // Convert the stored 32-byte pk -> ed25519_dalek::VerifyingKey
         let arr: [u8; 32] = last.signing_pub.as_slice().try_into().ok()?;
@@ -1585,7 +1652,7 @@ fn select_sync_peers_round_robin_for_node<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        PeerCacheEntry, PeerValue, select_sync_peers_for_node,
+        PeerCacheEntry, PeerSchedulingState, PeerValue, select_sync_peers_for_node,
         select_sync_peers_round_robin_for_node,
     };
     use std::collections::HashSet;
@@ -1603,6 +1670,7 @@ mod tests {
                 signing_pub: [idx as u8; 32],
                 identity_sig: Vec::new(),
                 wireguard: None,
+                scheduling: PeerSchedulingState::schedulable_default(peer_id),
             }),
         }
     }

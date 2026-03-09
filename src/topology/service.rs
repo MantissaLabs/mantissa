@@ -20,7 +20,7 @@ use crate::topology::operation::{
     ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
     SplitNetworkPolicy, SplitServicePolicy,
 };
-use crate::topology::peers::{PeerValue, WireGuardPeerValue};
+use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use async_trait::async_trait;
 use capnp::Error;
 use capnp::data;
@@ -59,6 +59,7 @@ struct JoinPayload {
     signing_key: [u8; 32],
     identity_sig: [u8; 64],
     wireguard: Option<WireGuardPeerValue>,
+    scheduling: PeerSchedulingState,
 }
 
 struct JoinInputs {
@@ -356,6 +357,7 @@ impl Topology {
                 &self.signing_key.verifying_key().to_bytes(),
             ),
             wireguard,
+            scheduling: self.current_scheduling_state(),
         })
     }
 
@@ -377,6 +379,16 @@ impl Topology {
         info.set_signing_key(&payload.signing_key);
         info.set_identity_sig(&payload.identity_sig);
         info.set_incarnation(payload.incarnation);
+        info.set_schedulable(payload.scheduling.schedulable);
+        info.set_drain_requested(payload.scheduling.drain_requested);
+        info.set_scheduling_updated_at_unix_ms(payload.scheduling.updated_at_unix_ms);
+        set_node_id(
+            info.reborrow().init_scheduling_actor_node_id(),
+            &payload.scheduling.actor_node_id,
+        );
+        if let Some(reason) = payload.scheduling.reason.as_deref() {
+            info.set_scheduling_reason(reason);
+        }
         if let Some(wg) = payload.wireguard.as_ref() {
             info.set_wireguard_public_key(&wg.public_key);
             info.set_wireguard_port(wg.port);
@@ -990,7 +1002,7 @@ impl topology::Server for Topology {
                 .cloned()
                 .unwrap_or(::health::Status::Unknown);
             let node_status = status_to_node_status(health_status);
-            scoped_nodes.push((id, snap.as_slice().last().cloned(), node_status));
+            scoped_nodes.push((id, PeerValue::select(snap.as_slice()), node_status));
         }
 
         scoped_nodes.sort_by_key(|(id, _, _)| *id);
@@ -1006,6 +1018,16 @@ impl topology::Server for Topology {
                 node.set_hostname(&val.hostname);
                 node.set_public_key(&val.noise_static_pub);
                 node.set_signing_key(&val.signing_pub);
+                node.set_schedulable(val.scheduling.schedulable);
+                node.set_drain_requested(val.scheduling.drain_requested);
+                node.set_scheduling_updated_at_unix_ms(val.scheduling.updated_at_unix_ms);
+                set_node_id(
+                    node.reborrow().init_scheduling_actor_node_id(),
+                    &val.scheduling.actor_node_id,
+                );
+                if let Some(reason) = val.scheduling.reason.as_deref() {
+                    node.set_scheduling_reason(reason);
+                }
                 if let Some(wg) = val.wireguard.as_ref() {
                     node.set_wireguard_public_key(&wg.public_key);
                     node.set_wireguard_port(wg.port);
@@ -1157,6 +1179,70 @@ impl topology::Server for Topology {
         let _ = self
             .apply_cluster_name_update(cluster_id, &name, updated_at_unix_ms, actor_node_id)
             .await?;
+        Ok(())
+    }
+
+    /// Marks one node unschedulable and gossips the maintenance fence cluster-wide.
+    async fn drain_node(
+        self: Rc<Self>,
+        params: topology::DrainNodeParams,
+        _results: topology::DrainNodeResults,
+    ) -> Result<(), capnp::Error> {
+        let request = params.get()?;
+        let node_id = read_node_id(request.get_node_id()?)?;
+        let reason = request.get_reason()?.to_string()?;
+        let scheduling = PeerSchedulingState {
+            schedulable: false,
+            drain_requested: true,
+            updated_at_unix_ms: Topology::now_unix_ms(),
+            actor_node_id: self.node.id,
+            reason: {
+                let trimmed = reason.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            },
+        };
+        let changed = self
+            .apply_peer_scheduling_update(node_id, scheduling.clone())
+            .await?;
+        if changed {
+            self.gossip_topology_event(TopologyEvent::NodeSchedulingUpdated {
+                id: node_id,
+                scheduling,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Clears one node maintenance fence so schedulers may place new work on it again.
+    async fn resume_node(
+        self: Rc<Self>,
+        params: topology::ResumeNodeParams,
+        _results: topology::ResumeNodeResults,
+    ) -> Result<(), capnp::Error> {
+        let request = params.get()?;
+        let node_id = read_node_id(request.get_node_id()?)?;
+        let scheduling = PeerSchedulingState {
+            schedulable: true,
+            drain_requested: false,
+            updated_at_unix_ms: Topology::now_unix_ms(),
+            actor_node_id: self.node.id,
+            reason: None,
+        };
+        let changed = self
+            .apply_peer_scheduling_update(node_id, scheduling.clone())
+            .await?;
+        if changed {
+            self.gossip_topology_event(TopologyEvent::NodeSchedulingUpdated {
+                id: node_id,
+                scheduling,
+            })
+            .await?;
+        }
         Ok(())
     }
 
@@ -1491,6 +1577,25 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             } else {
                 None
             };
+            let scheduling = PeerSchedulingState::from_node_info(
+                id,
+                node.get_schedulable(),
+                node.get_drain_requested(),
+                node.get_scheduling_updated_at_unix_ms(),
+                {
+                    let actor = node.get_scheduling_actor_node_id()?;
+                    let bytes = actor.get_bytes()?;
+                    if bytes.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            Uuid::from_slice(bytes)
+                                .map_err(|err| capnp::Error::failed(err.to_string()))?,
+                        )
+                    }
+                },
+                Some(node.get_scheduling_reason()?.to_string()?),
+            );
 
             TopologyEvent::Join {
                 id,
@@ -1503,6 +1608,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 signing_pub: Box::new(signing_pub),
                 identity_sig: identity_sig.to_vec(),
                 wireguard,
+                scheduling,
             }
         }
         EventType::Remove => {
@@ -1540,6 +1646,32 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             updated_at_unix_ms: reader.get_updated_at_unix_ms(),
             actor_node_id: read_node_id(reader.get_actor_node_id()?)?,
         },
+        EventType::NodeSchedulingUpdated => {
+            let node = reader.get_node()?;
+            let id = read_node_id(node.get_id()?)?;
+            TopologyEvent::NodeSchedulingUpdated {
+                id,
+                scheduling: PeerSchedulingState::from_node_info(
+                    id,
+                    node.get_schedulable(),
+                    node.get_drain_requested(),
+                    node.get_scheduling_updated_at_unix_ms(),
+                    {
+                        let actor = node.get_scheduling_actor_node_id()?;
+                        let bytes = actor.get_bytes()?;
+                        if bytes.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                Uuid::from_slice(bytes)
+                                    .map_err(|err| capnp::Error::failed(err.to_string()))?,
+                            )
+                        }
+                    },
+                    Some(node.get_scheduling_reason()?.to_string()?),
+                ),
+            }
+        }
     };
 
     Ok(event)
@@ -1565,6 +1697,7 @@ pub fn add_event(
             signing_pub,
             identity_sig,
             wireguard,
+            scheduling,
         } => {
             let mut topo = msg.init_topology();
 
@@ -1580,6 +1713,16 @@ pub fn add_event(
             node.set_signing_key(&signing_pub.to_bytes());
             node.set_identity_sig(identity_sig);
             node.set_incarnation(*incarnation);
+            node.set_schedulable(scheduling.schedulable);
+            node.set_drain_requested(scheduling.drain_requested);
+            node.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
+            set_node_id(
+                node.reborrow().init_scheduling_actor_node_id(),
+                &scheduling.actor_node_id,
+            );
+            if let Some(reason) = scheduling.reason.as_deref() {
+                node.set_scheduling_reason(reason);
+            }
             if let Some(wg) = wireguard.as_ref() {
                 node.set_wireguard_public_key(&wg.public_key);
                 node.set_wireguard_port(wg.port);
@@ -1643,6 +1786,23 @@ pub fn add_event(
             topo.set_cluster_name(name);
             topo.set_updated_at_unix_ms(*updated_at_unix_ms);
             set_node_id(topo.init_actor_node_id(), actor_node_id);
+        }
+        TopologyEvent::NodeSchedulingUpdated { id, scheduling } => {
+            let mut topo = msg.init_topology();
+            topo.set_event(topology_event::EventType::NodeSchedulingUpdated);
+            let mut node = topo.init_node();
+            set_node_id(node.reborrow().init_id(), id);
+            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
+            node.set_schedulable(scheduling.schedulable);
+            node.set_drain_requested(scheduling.drain_requested);
+            node.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
+            set_node_id(
+                node.reborrow().init_scheduling_actor_node_id(),
+                &scheduling.actor_node_id,
+            );
+            if let Some(reason) = scheduling.reason.as_deref() {
+                node.set_scheduling_reason(reason);
+            }
         }
     }
 }

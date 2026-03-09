@@ -174,6 +174,12 @@ pub enum NodesCommand {
     /// List nodes in a cluster
     #[command(alias = "ls")]
     List(NodesListArgs),
+
+    /// Mark one node unschedulable for maintenance
+    Drain(NodesDrainArgs),
+
+    /// Clear maintenance fencing for one node
+    Resume(NodesResumeArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -197,6 +203,24 @@ pub struct NodesListArgs {
     /// The cluster to list nodes from
     #[arg(index = 1)]
     pub cluster: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct NodesDrainArgs {
+    /// Identifier of the node to drain
+    #[arg(index = 1, value_name = "NODE-ID")]
+    pub node_id: Uuid,
+
+    /// Optional operator-supplied maintenance reason
+    #[arg(long = "reason", value_name = "TEXT")]
+    pub reason: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct NodesResumeArgs {
+    /// Identifier of the node to resume
+    #[arg(index = 1, value_name = "NODE-ID")]
+    pub node_id: Uuid,
 }
 
 #[derive(Subcommand, Debug)]

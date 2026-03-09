@@ -5,7 +5,7 @@ use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
 use crate::cluster::ClusterId;
-use crate::topology::peers::WireGuardPeerValue;
+use crate::topology::peers::{PeerSchedulingState, WireGuardPeerValue};
 
 #[derive(Clone)]
 pub struct PeerHandle {
@@ -52,6 +52,7 @@ pub enum TopologyEvent {
         signing_pub: Box<VerifyingKey>,
         identity_sig: Vec<u8>,
         wireguard: Option<WireGuardPeerValue>,
+        scheduling: PeerSchedulingState,
     },
     Leave {
         id: Uuid,
@@ -73,5 +74,9 @@ pub enum TopologyEvent {
         name: String,
         updated_at_unix_ms: u64,
         actor_node_id: Uuid,
+    },
+    NodeSchedulingUpdated {
+        id: Uuid,
+        scheduling: PeerSchedulingState,
     },
 }

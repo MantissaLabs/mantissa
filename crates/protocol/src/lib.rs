@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 capnp::generated_code!(pub mod server_capnp);

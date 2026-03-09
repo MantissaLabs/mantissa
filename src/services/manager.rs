@@ -507,16 +507,17 @@ impl ServiceController {
 
     /// Builds the deterministic set of nodes eligible to host service replicas from peer metadata.
     fn collect_eligible_nodes(&self) -> Vec<Uuid> {
-        let mut nodes: BTreeSet<Uuid> = BTreeSet::new();
-        nodes.insert(self.local_node_id);
-
-        if let Ok(peers) = self.cluster_registry.known_peers() {
-            for peer_id in peers {
-                nodes.insert(peer_id);
-            }
-        }
-
-        nodes.into_iter().collect()
+        let peer_states = self
+            .cluster_registry
+            .known_peers()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|peer_id| (peer_id, self.cluster_registry.peer_schedulable(peer_id)));
+        build_eligible_nodes(
+            self.local_node_id,
+            self.cluster_registry.peer_schedulable(self.local_node_id),
+            peer_states,
+        )
     }
 
     /// Executes the deployment workflow in the background by starting tasks via the task manager
@@ -1196,6 +1197,29 @@ fn short_id(id: &Uuid) -> String {
     raw[..8].to_string()
 }
 
+/// Collects the sorted set of nodes that remain eligible for service placement.
+fn build_eligible_nodes<I>(
+    local_node_id: Uuid,
+    local_schedulable: bool,
+    peer_states: I,
+) -> Vec<Uuid>
+where
+    I: IntoIterator<Item = (Uuid, bool)>,
+{
+    let mut nodes: BTreeSet<Uuid> = BTreeSet::new();
+    if local_schedulable {
+        nodes.insert(local_node_id);
+    }
+
+    for (peer_id, schedulable) in peer_states {
+        if schedulable {
+            nodes.insert(peer_id);
+        }
+    }
+
+    nodes.into_iter().collect()
+}
+
 /// Converts the service restart policy representation into a task manager policy structure.
 fn map_restart_policy(policy: &ServiceTaskRestartPolicy) -> TaskRestartPolicy {
     let name = match policy.name {
@@ -1492,6 +1516,29 @@ mod tests {
         assert_eq!(counts.get(&node_a).copied().unwrap_or(0), 1);
         assert_eq!(counts.get(&node_b).copied().unwrap_or(0), 1);
         assert_eq!(counts.get(&node_c).copied().unwrap_or(0), 1);
+    }
+
+    /// Unschedulable nodes must be excluded from deterministic placement targets.
+    #[test]
+    fn eligible_nodes_exclude_unschedulable_peers() {
+        let local = Uuid::from_bytes([1u8; 16]);
+        let draining = Uuid::from_bytes([2u8; 16]);
+        let peer = Uuid::from_bytes([3u8; 16]);
+
+        let eligible = build_eligible_nodes(local, true, [(draining, false), (peer, true)]);
+
+        assert_eq!(eligible, vec![local, peer]);
+    }
+
+    /// Draining the local node must remove it from future deterministic placement.
+    #[test]
+    fn eligible_nodes_exclude_unschedulable_local_node() {
+        let local = Uuid::from_bytes([1u8; 16]);
+        let peer = Uuid::from_bytes([2u8; 16]);
+
+        let eligible = build_eligible_nodes(local, false, [(peer, true)]);
+
+        assert_eq!(eligible, vec![peer]);
     }
 
     /// Ensure service stop progression does not launch duplicate local stop waves.

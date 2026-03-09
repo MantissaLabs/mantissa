@@ -97,29 +97,19 @@ pub struct TaskSpec {
     pub public_port: Option<u16>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceUpdateStrategyMode {
+    #[default]
     Rolling,
 }
 
-impl Default for ServiceUpdateStrategyMode {
-    fn default() -> Self {
-        Self::Rolling
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RolloutOrder {
+    #[default]
     StartFirst,
     StopFirst,
-}
-
-impl Default for RolloutOrder {
-    fn default() -> Self {
-        Self::StartFirst
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

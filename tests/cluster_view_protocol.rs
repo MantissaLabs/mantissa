@@ -15,7 +15,7 @@ use mantissa::topology::operation::{
     ClusterOperationKind as StoredOperationKind, ClusterOperationRecord,
     ClusterOperationStage as StoredOperationStage, SplitNodeAssignment,
 };
-use mantissa::topology::peers::PeerValue;
+use mantissa::topology::peers::{PeerSchedulingState, PeerValue};
 use net::noise::NoiseKeys;
 use protocol::topology::{ClusterOperationKind, ClusterOperationStage};
 use std::sync::Arc;
@@ -953,6 +953,7 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
         signing_pub: [0x22; 32],
         identity_sig: vec![0x33; 64],
         wireguard: None,
+        scheduling: PeerSchedulingState::schedulable_default(self_id),
     };
     peers
         .upsert(

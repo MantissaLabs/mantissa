@@ -489,20 +489,20 @@ pub async fn server_handshake_select(
                 .into_transport_mode()
                 .map_err(|e| io::Error::other(e.to_string()))?;
 
-            return Ok(ServerHandshake {
+            Ok(ServerHandshake {
                 stream: crate::noise::spawn_noise_io_bridge(rd, wr, transport),
                 kind: HandshakeKind::Peer,
                 join_probe: false,
-            });
+            })
         }
         Err(_) => {
             let join = server_handshake_join_with_first_frame_probe(rd, wr, keys, psk, first_frame)
                 .await?;
-            return Ok(ServerHandshake {
+            Ok(ServerHandshake {
                 stream: join.stream,
                 kind: HandshakeKind::Join,
                 join_probe: join.probe_required,
-            });
+            })
         }
     }
 }

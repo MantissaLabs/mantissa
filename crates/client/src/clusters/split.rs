@@ -333,6 +333,7 @@ pub async fn split(cfg: &ClientConfig, request: &SplitCommandRequest) -> Result<
 }
 
 /// Submits a split request derived from a simple filter and value list.
+#[allow(clippy::too_many_arguments)]
 pub async fn split_by_filter(
     cfg: &ClientConfig,
     source_cluster_id: Option<&str>,
@@ -473,6 +474,7 @@ pub async fn split_by_explicit_targets(
 }
 
 /// Submits a split request from exactly two explicit target partitions.
+#[allow(clippy::too_many_arguments)]
 pub async fn split_by_explicit_nodes(
     cfg: &ClientConfig,
     source_cluster_id: Option<&str>,

@@ -161,22 +161,21 @@ pub fn load_or_choose_wireguard_listen_port_with_preferred_and_override(
         // Migrate older deployments that defaulted to 51820 when we can safely infer a more
         // reachable port (for example the Mantissa RPC advertise port). This avoids clusters
         // getting stuck on a blocked/closed UDP port after upgrading.
-        if port == DEFAULT_WIREGUARD_LISTEN_PORT {
-            if let Some(preferred_port) = preferred_port {
-                if preferred_port != port {
-                    fs::write(&path, format!("{preferred_port}\n"))?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode = if running_as_root() { 0o640 } else { 0o600 };
-                        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(mode));
-                        if running_as_root() {
-                            ensure_mantissa_group(&path);
-                        }
-                    }
-                    return Ok(preferred_port);
+        if port == DEFAULT_WIREGUARD_LISTEN_PORT
+            && let Some(preferred_port) = preferred_port
+            && preferred_port != port
+        {
+            fs::write(&path, format!("{preferred_port}\n"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if running_as_root() { 0o640 } else { 0o600 };
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(mode));
+                if running_as_root() {
+                    ensure_mantissa_group(&path);
                 }
             }
+            return Ok(preferred_port);
         }
 
         return Ok(port);

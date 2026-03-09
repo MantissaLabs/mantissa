@@ -71,6 +71,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 cfg.cluster = n.cluster.clone();
                 local.run_until(client::node::list(&cfg)).await?;
             }
+            NodesCommand::Drain(args) => {
+                local
+                    .run_until(client::node::drain(
+                        &cfg,
+                        args.node_id,
+                        args.reason.as_deref(),
+                    ))
+                    .await?;
+            }
+            NodesCommand::Resume(args) => {
+                local
+                    .run_until(client::node::resume(&cfg, args.node_id))
+                    .await?;
+            }
         },
 
         Command::Clusters { cmd } => match cmd {

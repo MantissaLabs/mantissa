@@ -59,6 +59,12 @@ interface Topology {
     actorNodeId :Node.NodeId
   ) -> ();
   # Replicates one cluster-name update payload to this node.
+
+  drainNode @14 (nodeId :Node.NodeId, reason :Text) -> ();
+  # Marks one node unschedulable for maintenance and starts cluster-wide drain fencing.
+
+  resumeNode @15 (nodeId :Node.NodeId) -> ();
+  # Clears maintenance fencing so one node can receive placements again.
 }
 
 struct TopologyEvent {
@@ -93,6 +99,7 @@ struct TopologyEvent {
       alive @3;
       down @4;
       clusterNameUpdated @5;
+      nodeSchedulingUpdated @6;
   }
 }
 
@@ -161,6 +168,21 @@ struct NodeInfo {
 
   incarnation @14 :UInt64;
   # SWIM-style incarnation number for liveness conflict resolution.
+
+  schedulable @15 :Bool;
+  # True when this node is allowed to receive new workload placements.
+
+  drainRequested @16 :Bool;
+  # True when maintenance drain has been requested for this node.
+
+  schedulingUpdatedAtUnixMs @17 :UInt64;
+  # Last-writer timestamp for scheduling state convergence.
+
+  schedulingActorNodeId @18 :Node.NodeId;
+  # Actor node id used to resolve scheduling-state conflicts deterministically.
+
+  schedulingReason @19 :Text;
+  # Optional operator-supplied maintenance reason for diagnostics.
 }
 
 struct NodeList {

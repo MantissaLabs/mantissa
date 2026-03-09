@@ -1,7 +1,7 @@
 use crate::cluster::ClusterViewId;
 use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
-use crate::topology::peers::{PeerValue, WireGuardPeerValue};
+use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use ::health::HealthMonitor;
 use anyhow::{Result as AnyResult, anyhow};
 use crdt_store::uuid_key::UuidKey;
@@ -373,6 +373,28 @@ impl Registry {
             .and_then(|value| value.wireguard)
     }
 
+    /// Returns the converged scheduling metadata for one peer, if known locally.
+    pub fn peer_scheduling(&self, peer_id: Uuid) -> Option<PeerSchedulingState> {
+        self.peer_latest_value_unscoped(peer_id)
+            .map(|value| value.scheduling)
+    }
+
+    /// Returns true when the provided node remains eligible for new placements.
+    pub fn peer_schedulable(&self, peer_id: Uuid) -> bool {
+        if self.peer_is_excluded(peer_id) {
+            return false;
+        }
+
+        self.peer_latest_value_unscoped(peer_id)
+            .map(|value| value.scheduling.schedulable)
+            .unwrap_or(true)
+    }
+
+    /// Returns the converged peer value without applying excluded-peer scoping.
+    pub fn peer_value_unscoped(&self, peer_id: Uuid) -> Option<PeerValue> {
+        self.peer_latest_value_unscoped(peer_id)
+    }
+
     /// Returns a shared handle to the cluster health monitor.
     pub fn health_monitor(&self) -> Arc<HealthMonitor> {
         self.health_monitor.clone()
@@ -446,10 +468,10 @@ impl Registry {
         let mut values_by_peer = HashMap::with_capacity(actives.len());
         for (key, snapshot) in actives {
             let peer_id = key.to_uuid();
-            if snapshot.as_slice().last().is_some() {
+            if !snapshot.as_slice().is_empty() {
                 active_peer_ids.push(peer_id);
             }
-            if let Some(value) = Self::select_peer_value(snapshot.as_slice()) {
+            if let Some(value) = PeerValue::select(snapshot.as_slice()) {
                 values_by_peer.insert(peer_id, value.clone());
                 peer_values.push((peer_id, value));
             }
@@ -567,7 +589,7 @@ impl Registry {
                 continue;
             }
 
-            let Some(val) = snap.as_slice().last().cloned() else {
+            let Some(val) = PeerValue::select(snap.as_slice()) else {
                 continue;
             };
             let addr = val.address.clone();
@@ -611,7 +633,7 @@ impl Registry {
                     continue;
                 }
 
-                if let Some(val) = snap.as_slice().last().cloned() {
+                if let Some(val) = PeerValue::select(snap.as_slice()) {
                     if val.address == local_addr {
                         continue;
                     }
@@ -1373,94 +1395,6 @@ impl Registry {
             error = %error,
             "session bootstrap failure sampled"
         );
-    }
-
-    /// Select the "best" peer value from an MVReg snapshot.
-    ///
-    /// Peers are stored as a multi-value register to tolerate concurrent writes during cluster
-    /// joins/sync. For the networking stack we want a single, stable view of a peer that prefers
-    /// values with more complete metadata (e.g. WireGuard configuration and enabled state) instead
-    /// of relying on the arbitrary ordering of concurrent register entries.
-    fn select_peer_value(values: &[PeerValue]) -> Option<PeerValue> {
-        fn is_nonzero_key(key: &[u8; 32]) -> bool {
-            key.iter().any(|b| *b != 0)
-        }
-
-        fn rank_wireguard(wg: &WireGuardPeerValue) -> (bool, bool, bool, u16, [u8; 32]) {
-            (
-                wg.enabled,
-                is_nonzero_key(&wg.public_key),
-                wg.port != 0,
-                wg.port,
-                wg.public_key,
-            )
-        }
-
-        if values.is_empty() {
-            return None;
-        }
-
-        let mut address: Option<&str> = None;
-        let mut hostname: Option<&str> = None;
-        let mut noise_static_pub: Option<[u8; 32]> = None;
-        let mut signing_pub: Option<[u8; 32]> = None;
-        let mut identity_sig: Option<Vec<u8>> = None;
-        let mut wireguard: Option<WireGuardPeerValue> = None;
-
-        for value in values {
-            if !value.address.is_empty() {
-                address = match address {
-                    None => Some(value.address.as_str()),
-                    Some(current) => Some(std::cmp::max(current, value.address.as_str())),
-                };
-            }
-
-            if !value.hostname.is_empty() {
-                hostname = match hostname {
-                    None => Some(value.hostname.as_str()),
-                    Some(current) => Some(std::cmp::max(current, value.hostname.as_str())),
-                };
-            }
-
-            noise_static_pub = match noise_static_pub {
-                None => Some(value.noise_static_pub),
-                Some(current) => Some(std::cmp::max(current, value.noise_static_pub)),
-            };
-
-            signing_pub = match signing_pub {
-                None => Some(value.signing_pub),
-                Some(current) => Some(std::cmp::max(current, value.signing_pub)),
-            };
-
-            if value.identity_sig.len() == 64 {
-                identity_sig = match identity_sig {
-                    None => Some(value.identity_sig.clone()),
-                    Some(current) => Some(std::cmp::max(current, value.identity_sig.clone())),
-                };
-            }
-
-            if let Some(candidate) = value.wireguard.as_ref() {
-                wireguard = match wireguard.as_ref() {
-                    None => Some(candidate.clone()),
-                    Some(current) => {
-                        if rank_wireguard(candidate) > rank_wireguard(current) {
-                            Some(candidate.clone())
-                        } else {
-                            Some(current.clone())
-                        }
-                    }
-                };
-            }
-        }
-
-        Some(PeerValue {
-            address: address.unwrap_or_default().to_string(),
-            hostname: hostname.unwrap_or_default().to_string(),
-            noise_static_pub: noise_static_pub.unwrap_or_default(),
-            signing_pub: signing_pub.unwrap_or_default(),
-            identity_sig: identity_sig.unwrap_or_default(),
-            wireguard,
-        })
     }
 
     fn peer_latest_value(&self, peer_id: Uuid) -> Option<PeerValue> {

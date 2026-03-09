@@ -94,10 +94,8 @@ pub async fn get_client_secure_join_with_keys(
         .await
         .map_err(|e| capnp::Error::failed(format!("noise: {e}")))?;
 
-    if handshake.probe_enabled {
-        if join_probe_client(&mut handshake.stream).await.is_err() {
-            return Err(capnp::Error::failed("invalid join token".to_string()));
-        }
+    if handshake.probe_enabled && join_probe_client(&mut handshake.stream).await.is_err() {
+        return Err(capnp::Error::failed("invalid join token".to_string()));
     }
 
     rpc_client_from_stream(handshake.stream).await

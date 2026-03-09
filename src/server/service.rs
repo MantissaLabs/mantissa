@@ -5,7 +5,7 @@ use crate::node::id;
 use crate::node::identity::{pubkey_from_slice, verify_peer_identity};
 use crate::server::credential::ClusterCredential;
 use crate::topology::TopologyEvent;
-use crate::topology::peers::{PeerValue, WireGuardPeerValue};
+use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use std::rc::Rc;
 use tracing::debug;
 
@@ -116,6 +116,25 @@ impl protocol::server::Server for Server {
             signing_pub,
             identity_sig: identity_sig.to_vec(),
             wireguard,
+            scheduling: PeerSchedulingState::from_node_info(
+                joiner_id,
+                info.get_schedulable(),
+                info.get_drain_requested(),
+                info.get_scheduling_updated_at_unix_ms(),
+                {
+                    let actor = info.get_scheduling_actor_node_id()?;
+                    let bytes = actor.get_bytes()?;
+                    if bytes.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            uuid::Uuid::from_slice(bytes)
+                                .map_err(|err| capnp::Error::failed(err.to_string()))?,
+                        )
+                    }
+                },
+                Some(info.get_scheduling_reason()?.to_string()?),
+            ),
         };
         let joiner_incarnation = info.get_incarnation();
 
@@ -172,6 +191,7 @@ impl protocol::server::Server for Server {
             signing_pub: Box::new(signing_vk),
             identity_sig: identity_sig.to_vec(),
             wireguard: peer.wireguard.clone(),
+            scheduling: peer.scheduling.clone(),
         };
 
         self.topology.gossip_topology_event(join_event).await?;

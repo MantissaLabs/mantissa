@@ -50,10 +50,10 @@ impl PeerSnapshotCache {
 
         let mut fresh_entries = Vec::with_capacity(self.actives.len());
         for (key, snapshot) in &self.actives {
-            if let Some(value) = snapshot.as_slice().last() {
+            if let Some(value) = PeerValue::select(snapshot.as_slice()) {
                 fresh_entries.push(PeerCacheEntry {
                     peer_id: key.to_uuid(),
-                    value: Arc::new(value.clone()),
+                    value: Arc::new(value),
                 });
             }
         }
