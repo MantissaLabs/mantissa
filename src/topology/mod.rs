@@ -583,9 +583,9 @@ impl Topology {
         self.networking.set_override(s);
     }
 
-    /// Sets the server handle to be served to other Peers so that they could connect
-    /// and consume this Node's APIs.
-    pub fn set_server_handle(&self, handle: server::Client) -> Result<(), server::Client> {
+    /// Sets the server handle to be served to other peers and persists the local peer row before
+    /// the node starts accepting control-plane operations that depend on self visibility.
+    pub async fn set_server_handle(&self, handle: server::Client) -> Result<(), server::Client> {
         let registry = self.registry.clone();
         let local_id = self.node.id;
         let public_key = self.public_key;
@@ -629,73 +629,71 @@ impl Topology {
             log::debug!("server_handle already set, ignoring duplicate set");
         }
 
-        tokio::task::spawn_local(async move {
-            registry.register_peer_handle(local_id, handle).await;
+        registry.register_peer_handle(local_id, handle).await;
 
-            let key = UuidKey::from(local_id);
-            let wireguard = if !config::wireguard_enabled() || !net::paths::running_as_root() {
-                None
-            } else {
-                match net::wireguard::resolve_wireguard_key_path()
-                    .and_then(net::wireguard::load_or_generate_wireguard_keys)
-                {
-                    Ok(keys) => {
-                        match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
-                            preferred_wireguard_port,
-                            config::wireguard_port_override(),
-                        ) {
-                            Ok(port) => Some(crate::topology::peers::WireGuardPeerValue {
-                                public_key: keys.public_bytes(),
-                                port,
-                                enabled: false,
-                            }),
-                            Err(err) => {
-                                log::warn!(
-                                    "failed to resolve WireGuard listen port; continuing without underlay encryption: {err}"
-                                );
-                                None
-                            }
+        let key = UuidKey::from(local_id);
+        let wireguard = if !config::wireguard_enabled() || !net::paths::running_as_root() {
+            None
+        } else {
+            match net::wireguard::resolve_wireguard_key_path()
+                .and_then(net::wireguard::load_or_generate_wireguard_keys)
+            {
+                Ok(keys) => {
+                    match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
+                        preferred_wireguard_port,
+                        config::wireguard_port_override(),
+                    ) {
+                        Ok(port) => Some(crate::topology::peers::WireGuardPeerValue {
+                            public_key: keys.public_bytes(),
+                            port,
+                            enabled: false,
+                        }),
+                        Err(err) => {
+                            log::warn!(
+                                "failed to resolve WireGuard listen port; continuing without underlay encryption: {err}"
+                            );
+                            None
                         }
                     }
-                    Err(err) => {
-                        log::warn!(
-                            "failed to load WireGuard keys; continuing without underlay encryption: {err}"
-                        );
-                        None
-                    }
                 }
-            };
-
-            let scheduling = registry
-                .peer_scheduling(local_id)
-                .unwrap_or_else(|| PeerSchedulingState::schedulable_default(local_id));
-
-            let v = PeerValue {
-                address: advertise,
-                hostname: host,
-                noise_static_pub: public_key.to_bytes(),
-                signing_pub: verifying_key.to_bytes(),
-                identity_sig: identity_sig.to_vec(),
-                wireguard,
-                scheduling,
-            };
-
-            if let Err(e) = peers.upsert(&key, v).await {
-                log::warn!("failed to upsert self peer: {e}");
+                Err(err) => {
+                    log::warn!(
+                        "failed to load WireGuard keys; continuing without underlay encryption: {err}"
+                    );
+                    None
+                }
             }
+        };
 
-            {
-                let mut states = swim_peers.lock().await;
-                let state = states.entry(local_id).or_default();
-                state.incarnation = state.incarnation.max(local_incarnation);
-                state.status = ::health::Status::Alive;
-                state.first_failed_at = None;
-                state.suspect_deadline = None;
-            }
+        let scheduling = registry
+            .peer_scheduling(local_id)
+            .unwrap_or_else(|| PeerSchedulingState::schedulable_default(local_id));
 
-            // mark self as alive in health (passive observation)
-            health.observe_seen(local_id);
-        });
+        let v = PeerValue {
+            address: advertise,
+            hostname: host,
+            noise_static_pub: public_key.to_bytes(),
+            signing_pub: verifying_key.to_bytes(),
+            identity_sig: identity_sig.to_vec(),
+            wireguard,
+            scheduling,
+        };
+
+        if let Err(e) = peers.upsert(&key, v).await {
+            log::warn!("failed to upsert self peer: {e}");
+        }
+
+        {
+            let mut states = swim_peers.lock().await;
+            let state = states.entry(local_id).or_default();
+            state.incarnation = state.incarnation.max(local_incarnation);
+            state.status = ::health::Status::Alive;
+            state.first_failed_at = None;
+            state.suspect_deadline = None;
+        }
+
+        // mark self as alive in health (passive observation)
+        health.observe_seen(local_id);
 
         Ok(())
     }

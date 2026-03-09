@@ -676,7 +676,11 @@ impl Bootstrap {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Give Topology a Server handle (capability)
         let server_client: ServerClient = capnp_rpc::new_client(server.clone());
-        if let Err(handle) = comps.topology.set_server_handle(server_client.clone()) {
+        if let Err(handle) = comps
+            .topology
+            .set_server_handle(server_client.clone())
+            .await
+        {
             error!(target: "server", "failed to set server handle");
             drop(handle);
         }
