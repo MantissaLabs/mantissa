@@ -71,12 +71,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 cfg.cluster = n.cluster.clone();
                 local.run_until(client::node::list(&cfg)).await?;
             }
+            NodesCommand::Status(args) => {
+                local
+                    .run_until(client::node::status(&cfg, args.node_id))
+                    .await?;
+            }
             NodesCommand::Drain(args) => {
                 local
                     .run_until(client::node::drain(
                         &cfg,
                         args.node_id,
                         args.reason.as_deref(),
+                        args.timeout,
+                        args.no_wait,
                     ))
                     .await?;
             }

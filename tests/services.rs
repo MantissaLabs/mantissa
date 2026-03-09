@@ -38,7 +38,7 @@ use mantissa::task::types::{
 use mantissa::topology_capnp::topology;
 use protocol::secrets::secrets;
 use protocol::services::services;
-use protocol::topology::ClusterOperationStage;
+use protocol::topology::{ClusterOperationStage, NodeDrainState};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::Path,
@@ -1682,6 +1682,191 @@ local_test!(services_node_drain_blocks_while_service_is_deploying, {
     assert_eq!(
         task.node_id, drained_node_id,
         "rejected drain should leave the deploying task assignment unchanged"
+    );
+});
+
+local_test!(services_node_drain_reports_capacity_blocker, {
+    let _guard = ContainerManagerOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes").await;
+
+    reserve_all_scheduler_slots(&cluster[1], Uuid::new_v4()).await;
+
+    let service_name = "drain-capacity";
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![demo_backend_task_template("backend", 1)],
+        )
+        .await
+        .expect("submit singleton deployment");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "singleton service should reach running before capacity blocker test"
+    );
+
+    let service = cluster[0]
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load capacity-blocked service")
+        .expect("capacity-blocked service should exist");
+    let task_id = *service
+        .task_ids
+        .first()
+        .expect("singleton service should have one task id");
+    let initial_task = cluster[0]
+        .node
+        .task_manager
+        .inspect_task(task_id)
+        .await
+        .expect("inspect singleton task");
+    assert_eq!(
+        initial_task.node_id,
+        cluster[0].id(),
+        "service should land on the only node with free capacity before drain"
+    );
+
+    drain_node_via_topology(
+        &cluster[0].topology(),
+        cluster[0].id(),
+        "capacity maintenance",
+    )
+    .await
+    .expect("drain should be accepted when another schedulable node exists");
+
+    let blocked = wait_until(
+        Duration::from_secs(20),
+        Duration::from_millis(100),
+        || async {
+            match drain_status_via_topology(&cluster[1].topology(), cluster[0].id()).await {
+                Ok(status) => {
+                    status.state == NodeDrainState::Blocked
+                        && status.remaining_service_tasks > 0
+                        && status
+                            .last_scheduling_error
+                            .as_deref()
+                            .map(|message| message.contains("insufficient cluster capacity"))
+                            .unwrap_or(false)
+                }
+                Err(_) => false,
+            }
+        },
+    )
+    .await;
+    assert!(
+        blocked,
+        "drain status should surface the capacity blocker once evacuation stalls"
+    );
+
+    let status = drain_status_via_topology(&cluster[1].topology(), cluster[0].id())
+        .await
+        .expect("load blocked drain status");
+    assert!(
+        !status.schedulable && status.drain_requested,
+        "blocked drain should keep the node fenced"
+    );
+});
+
+local_test!(services_node_drain_timeout_keeps_node_unschedulable, {
+    let _guard = ContainerManagerOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes").await;
+
+    reserve_all_scheduler_slots(&cluster[1], Uuid::new_v4()).await;
+
+    let service_name = "drain-timeout";
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![demo_backend_task_template("backend", 1)],
+        )
+        .await
+        .expect("submit timeout deployment");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "singleton service should reach running before timeout test"
+    );
+
+    drain_node_via_topology(
+        &cluster[0].topology(),
+        cluster[0].id(),
+        "timeout maintenance",
+    )
+    .await
+    .expect("drain should be accepted when another schedulable node exists");
+
+    let drained = wait_until(
+        Duration::from_secs(1),
+        Duration::from_millis(100),
+        || async {
+            matches!(
+                drain_status_via_topology(&cluster[1].topology(), cluster[0].id())
+                    .await
+                    .ok()
+                    .map(|status| status.state),
+                Some(NodeDrainState::Drained)
+            )
+        },
+    )
+    .await;
+    assert!(
+        !drained,
+        "capacity-blocked drain should not report drained inside a short timeout window"
+    );
+
+    let status = drain_status_via_topology(&cluster[1].topology(), cluster[0].id())
+        .await
+        .expect("load timed-out drain status");
+    assert!(
+        !status.schedulable && status.drain_requested,
+        "timed-out drain waits must leave the node fenced"
+    );
+    assert!(
+        matches!(
+            status.state,
+            NodeDrainState::Blocked | NodeDrainState::Draining
+        ),
+        "timed-out drain should still report an in-progress or blocked state"
     );
 });
 
@@ -3837,6 +4022,71 @@ async fn drain_node_via_topology(
     params.set_reason(reason);
     request.send().promise.await?;
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct TestDrainStatus {
+    state: NodeDrainState,
+    schedulable: bool,
+    drain_requested: bool,
+    remaining_service_tasks: u32,
+    last_scheduling_error: Option<String>,
+}
+
+/// Reads the topology drain-status projection used by maintenance integration tests.
+async fn drain_status_via_topology(
+    client: &topology::Client,
+    node_id: Uuid,
+) -> Result<TestDrainStatus, CapnpError> {
+    let mut request = client.get_node_drain_status_request();
+    request.get().init_node_id().set_bytes(node_id.as_bytes());
+    let response = request.send().promise.await?;
+    let status = response.get()?.get_status()?;
+    let last_scheduling_error = status
+        .get_last_scheduling_error()?
+        .to_str()?
+        .trim()
+        .to_string();
+
+    Ok(TestDrainStatus {
+        state: status.get_state()?,
+        schedulable: status.get_schedulable(),
+        drain_requested: status.get_drain_requested(),
+        remaining_service_tasks: status.get_remaining_service_tasks(),
+        last_scheduling_error: if last_scheduling_error.is_empty() {
+            None
+        } else {
+            Some(last_scheduling_error)
+        },
+    })
+}
+
+/// Reserves every local scheduler slot on one node so evacuation tests can create hard blockers.
+async fn reserve_all_scheduler_slots(node: &TestNode, owner: Uuid) {
+    let snapshot = node
+        .node
+        .scheduler
+        .snapshot()
+        .await
+        .expect("scheduler snapshot should be present");
+    let intents: Vec<SlotReservationRequest> = snapshot
+        .slots
+        .iter()
+        .map(|slot| SlotReservationRequest {
+            slot_id: slot.slot_id,
+            owner,
+            task_id: None,
+        })
+        .collect();
+    if intents.is_empty() {
+        return;
+    }
+
+    node.node
+        .scheduler
+        .reserve_resources(snapshot.version, intents, Vec::new())
+        .await
+        .expect("reserve all scheduler slots");
 }
 
 async fn wait_for_service_state(

@@ -253,6 +253,33 @@ Validation completed:
 
 Make the command operationally usable for maintenance windows.
 
+### Status
+
+Completed on March 9, 2026.
+
+Implemented:
+
+1. Added topology `getNodeDrainStatus` RPC and a derived drain-status model.
+2. Added `mantissa nodes status <node-id>` for detailed maintenance diagnostics.
+3. `mantissa nodes drain <node-id>` now waits by default until the node reaches
+   `drained`, supports `--timeout`, and supports `--no-wait`.
+4. Drain status now reports:
+   - remaining service tasks
+   - blocking standalone tasks
+   - remaining reserved scheduler slots
+   - remaining reserved GPU devices
+   - best-known capacity blocker
+5. Timed-out operator waits leave the node safely unschedulable. Timeout does
+   not imply resume.
+6. Drain status marks stuck evacuation as `blocked` when schedulable
+   replacement capacity is insufficient.
+
+Validation completed:
+
+1. `cargo check`
+2. `cargo test --test services services_node_drain_ -- --test-threads=1`
+3. `cargo test --test cluster_view_protocol -- --test-threads=1`
+
 ### Scope
 
 1. Add progress reporting for drain:

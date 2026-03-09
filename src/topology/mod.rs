@@ -6,6 +6,7 @@ use crate::node::address::compute_advertise_ip;
 use crate::node::address::extract_port;
 use crate::node::id::set_node_id;
 use crate::registry::Registry;
+use crate::scheduler::Scheduler;
 use crate::secrets::crypto::SecretKeyring;
 use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::cluster_view_store::{ClusterNameRecord, ClusterViewStore};
@@ -353,6 +354,9 @@ pub struct Topology {
     /// Capability registry used to keep RPC client handles for peers.
     registry: Registry,
 
+    /// Local scheduler handle used to inspect reservations during node drains.
+    scheduler: Rc<Scheduler>,
+
     /// OnceCell holding the Cap'n Proto server capability exported to peers.
     server_handle: Rc<OnceCell<ServerClient>>,
 
@@ -402,6 +406,7 @@ pub struct TopologyConfig {
     pub stores: TopologyStores,
     pub crypto: Keys,
     pub registry: Registry,
+    pub scheduler: Rc<Scheduler>,
     pub health_monitor: Arc<HealthMonitor>,
     pub runtime_health: config::RuntimeHealthConfig,
 }
@@ -417,6 +422,7 @@ impl Topology {
             stores,
             crypto,
             registry,
+            scheduler,
             health_monitor,
             runtime_health,
         } = config;
@@ -462,6 +468,7 @@ impl Topology {
             local_sessions: sessions,
             local_credential_store: credentials,
             registry,
+            scheduler,
             server_handle: Rc::new(OnceCell::new()),
             public_key: noise_public_key,
             signing_key,

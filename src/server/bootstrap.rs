@@ -440,6 +440,7 @@ impl Bootstrap {
             stores: topology_stores.clone(),
             crypto: keys,
             registry: registry.clone(),
+            scheduler: scheduler.clone(),
             health_monitor: health_monitor.clone(),
             runtime_health,
         })?;

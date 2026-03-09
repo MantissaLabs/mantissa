@@ -16,7 +16,7 @@ protocol = { path = "../protocol" }
 net = { path = "../net" }
 ui = { path = "../ui" }
 tabwriter = "1"
-tokio = { version = "1", features = ["net", "rt"] }
+tokio = { version = "1", features = ["net", "rt", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }

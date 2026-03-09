@@ -65,6 +65,64 @@ interface Topology {
 
   resumeNode @15 (nodeId :Node.NodeId) -> ();
   # Clears maintenance fencing so one node can receive placements again.
+
+  getNodeDrainStatus @16 (nodeId :Node.NodeId) -> (status :NodeDrainStatus);
+  # Returns the best-known drain progress and diagnostics for one node.
+}
+
+enum NodeDrainState {
+  open @0;
+  # Node is schedulable and has no active drain request.
+
+  fenced @1;
+  # Node is unschedulable without an active drain request.
+
+  draining @2;
+  # Drain is in progress and work or reservations remain on the node.
+
+  drained @3;
+  # Drain is complete and the node is empty from the scheduler's perspective.
+
+  blocked @4;
+  # Drain cannot make progress with the current cluster state.
+}
+
+struct NodeDrainStatus {
+  nodeId @0 :Node.NodeId;
+  # Node identifier this status row describes.
+
+  schedulable @1 :Bool;
+  # True when the node is eligible for new placements.
+
+  drainRequested @2 :Bool;
+  # True when maintenance drain was requested for the node.
+
+  state @3 :NodeDrainState;
+  # Derived operator-facing drain state.
+
+  remainingServiceTasks @4 :UInt32;
+  # Non-terminal service-managed tasks still assigned to the node.
+
+  blockingStandaloneTasks @5 :UInt32;
+  # Non-terminal standalone tasks that prevent safe drain completion.
+
+  remainingReservedSlots @6 :UInt32;
+  # Scheduler slots still reserved on the node.
+
+  remainingReservedGpus @7 :UInt32;
+  # Scheduler GPU devices still reserved on the node.
+
+  schedulerSummaryKnown @8 :Bool;
+  # False when reservation counts could not be fetched from the node.
+
+  reason @9 :Text;
+  # Operator-supplied drain reason when one was recorded.
+
+  message @10 :Text;
+  # Human-readable progress or blocker summary.
+
+  lastSchedulingError @11 :Text;
+  # Best-known scheduling blocker if drain is waiting on placement capacity.
 }
 
 struct TopologyEvent {

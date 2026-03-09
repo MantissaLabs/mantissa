@@ -2,7 +2,48 @@
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use client::tasks::{TasksListOutput, TasksListState};
 use std::path::PathBuf;
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Parses CLI durations used by maintenance commands, defaulting bare integers to seconds.
+fn parse_cli_duration(raw: &str) -> Result<Duration, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("duration must not be empty".to_string());
+    }
+
+    let (digits, unit) = if let Some(value) = trimmed.strip_suffix("ms") {
+        (value, "ms")
+    } else if let Some(value) = trimmed.strip_suffix('s') {
+        (value, "s")
+    } else if let Some(value) = trimmed.strip_suffix('m') {
+        (value, "m")
+    } else if let Some(value) = trimmed.strip_suffix('h') {
+        (value, "h")
+    } else {
+        (trimmed, "s")
+    };
+
+    let value = digits
+        .trim()
+        .parse::<u64>()
+        .map_err(|err| format!("invalid duration '{raw}': {err}"))?;
+
+    match unit {
+        "ms" => Ok(Duration::from_millis(value)),
+        "s" => Ok(Duration::from_secs(value)),
+        "m" => value
+            .checked_mul(60)
+            .map(Duration::from_secs)
+            .ok_or_else(|| format!("duration '{raw}' is too large")),
+        "h" => value
+            .checked_mul(60)
+            .and_then(|minutes| minutes.checked_mul(60))
+            .map(Duration::from_secs)
+            .ok_or_else(|| format!("duration '{raw}' is too large")),
+        _ => Err(format!("unsupported duration unit in '{raw}'")),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -175,6 +216,9 @@ pub enum NodesCommand {
     #[command(alias = "ls")]
     List(NodesListArgs),
 
+    /// Show detailed drain state for one node
+    Status(NodesStatusArgs),
+
     /// Mark one node unschedulable for maintenance
     Drain(NodesDrainArgs),
 
@@ -206,6 +250,13 @@ pub struct NodesListArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct NodesStatusArgs {
+    /// Identifier of the node to inspect
+    #[arg(index = 1, value_name = "NODE-ID")]
+    pub node_id: Uuid,
+}
+
+#[derive(Args, Debug)]
 pub struct NodesDrainArgs {
     /// Identifier of the node to drain
     #[arg(index = 1, value_name = "NODE-ID")]
@@ -214,6 +265,19 @@ pub struct NodesDrainArgs {
     /// Optional operator-supplied maintenance reason
     #[arg(long = "reason", value_name = "TEXT")]
     pub reason: Option<String>,
+
+    /// Maximum time to wait for the node to finish draining
+    #[arg(
+        long = "timeout",
+        value_name = "DURATION",
+        default_value = "10m",
+        value_parser = parse_cli_duration
+    )]
+    pub timeout: Duration,
+
+    /// Return after fencing the node instead of waiting for full drain completion
+    #[arg(long = "no-wait", action = ArgAction::SetTrue)]
+    pub no_wait: bool,
 }
 
 #[derive(Args, Debug)]
