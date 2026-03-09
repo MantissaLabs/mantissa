@@ -125,6 +125,7 @@ struct NodeDrainStatusSnapshot {
     node_id: Uuid,
     schedulable: bool,
     drain_requested: bool,
+    task_stop_timeout_secs: Option<u32>,
     state: DrainStatusState,
     remaining_service_tasks: u32,
     blocking_standalone_tasks: u32,
@@ -510,6 +511,9 @@ impl Topology {
         } else {
             protocol::topology::NodeDrainState::Fenced
         });
+        info.set_drain_task_stop_timeout_secs(
+            payload.scheduling.drain_task_stop_timeout_secs.unwrap_or(0),
+        );
         info.set_scheduling_updated_at_unix_ms(payload.scheduling.updated_at_unix_ms);
         set_node_id(
             info.reborrow().init_scheduling_actor_node_id(),
@@ -1070,6 +1074,7 @@ impl Topology {
                 node_id,
                 schedulable: scheduling.schedulable,
                 drain_requested: scheduling.drain_requested,
+                task_stop_timeout_secs: scheduling.drain_task_stop_timeout_secs,
                 state,
                 remaining_service_tasks: 0,
                 blocking_standalone_tasks: 0,
@@ -1188,6 +1193,7 @@ impl Topology {
             node_id,
             schedulable: scheduling.schedulable,
             drain_requested: scheduling.drain_requested,
+            task_stop_timeout_secs: scheduling.drain_task_stop_timeout_secs,
             state,
             remaining_service_tasks,
             blocking_standalone_tasks,
@@ -1561,6 +1567,9 @@ impl topology::Server for Topology {
                 } else {
                     protocol::topology::NodeDrainState::Fenced
                 };
+                node.set_drain_task_stop_timeout_secs(
+                    val.scheduling.drain_task_stop_timeout_secs.unwrap_or(0),
+                );
                 node.set_scheduling_updated_at_unix_ms(val.scheduling.updated_at_unix_ms);
                 set_node_id(
                     node.reborrow().init_scheduling_actor_node_id(),
@@ -1733,6 +1742,10 @@ impl topology::Server for Topology {
         let request = params.get()?;
         let node_id = read_node_id(request.get_node_id()?)?;
         let reason = request.get_reason()?.to_string()?;
+        let drain_task_stop_timeout_secs = match request.get_task_stop_timeout_secs() {
+            0 => None,
+            value => Some(value),
+        };
         self.validate_node_drain_request(node_id)?;
         let scheduling = PeerSchedulingState {
             schedulable: false,
@@ -1747,6 +1760,7 @@ impl topology::Server for Topology {
                     Some(trimmed.to_string())
                 }
             },
+            drain_task_stop_timeout_secs,
         };
         let changed = self
             .apply_peer_scheduling_update(node_id, scheduling.clone())
@@ -1775,6 +1789,7 @@ impl topology::Server for Topology {
             updated_at_unix_ms: Topology::now_unix_ms(),
             actor_node_id: self.node.id,
             reason: None,
+            drain_task_stop_timeout_secs: None,
         };
         let changed = self
             .apply_peer_scheduling_update(node_id, scheduling.clone())
@@ -1803,6 +1818,7 @@ impl topology::Server for Topology {
         set_node_id(builder.reborrow().init_node_id(), &status.node_id);
         builder.set_schedulable(status.schedulable);
         builder.set_drain_requested(status.drain_requested);
+        builder.set_task_stop_timeout_secs(status.task_stop_timeout_secs.unwrap_or(0));
         builder.set_state(status.state.as_capnp());
         builder.set_remaining_service_tasks(status.remaining_service_tasks);
         builder.set_blocking_standalone_tasks(status.blocking_standalone_tasks);
@@ -2192,6 +2208,10 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                     }
                 },
                 Some(node.get_scheduling_reason()?.to_string()?),
+                match node.get_drain_task_stop_timeout_secs() {
+                    0 => None,
+                    value => Some(value),
+                },
             );
 
             TopologyEvent::Join {
@@ -2266,6 +2286,10 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                         }
                     },
                     Some(node.get_scheduling_reason()?.to_string()?),
+                    match node.get_drain_task_stop_timeout_secs() {
+                        0 => None,
+                        value => Some(value),
+                    },
                 ),
             }
         }
@@ -2312,6 +2336,9 @@ pub fn add_event(
             node.set_incarnation(*incarnation);
             node.set_schedulable(scheduling.schedulable);
             node.set_drain_requested(scheduling.drain_requested);
+            node.set_drain_task_stop_timeout_secs(
+                scheduling.drain_task_stop_timeout_secs.unwrap_or(0),
+            );
             node.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
             set_node_id(
                 node.reborrow().init_scheduling_actor_node_id(),
@@ -2392,6 +2419,9 @@ pub fn add_event(
             cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
             node.set_schedulable(scheduling.schedulable);
             node.set_drain_requested(scheduling.drain_requested);
+            node.set_drain_task_stop_timeout_secs(
+                scheduling.drain_task_stop_timeout_secs.unwrap_or(0),
+            );
             node.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
             set_node_id(
                 node.reborrow().init_scheduling_actor_node_id(),

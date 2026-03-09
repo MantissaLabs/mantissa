@@ -10,6 +10,7 @@ pub(crate) struct DrainStatusView {
     pub(crate) node_id: Uuid,
     pub(crate) schedulable: bool,
     pub(crate) drain_requested: bool,
+    pub(crate) task_stop_timeout_secs: Option<u32>,
     pub(crate) state: NodeDrainState,
     pub(crate) remaining_service_tasks: u32,
     pub(crate) blocking_standalone_tasks: u32,
@@ -37,6 +38,10 @@ impl DrainStatusView {
             node_id,
             schedulable: reader.get_schedulable(),
             drain_requested: reader.get_drain_requested(),
+            task_stop_timeout_secs: match reader.get_task_stop_timeout_secs() {
+                0 => None,
+                value => Some(value),
+            },
             state: reader.get_state()?,
             remaining_service_tasks: reader.get_remaining_service_tasks(),
             blocking_standalone_tasks: reader.get_blocking_standalone_tasks(),
@@ -94,6 +99,10 @@ pub async fn status(cfg: &ClientConfig, node_id: Uuid) -> Result<()> {
 
     let reason = status.reason.as_deref().unwrap_or("-");
     let last_scheduling_error = status.last_scheduling_error.as_deref().unwrap_or("-");
+    let task_stop_timeout = status
+        .task_stop_timeout_secs
+        .map(|value| format!("{value}s"))
+        .unwrap_or_else(|| "-".to_string());
     let scheduler_known = if status.scheduler_summary_known {
         "yes"
     } else {
@@ -101,11 +110,12 @@ pub async fn status(cfg: &ClientConfig, node_id: Uuid) -> Result<()> {
     };
 
     output::emit_block(format!(
-        "Node Drain Status:\n  Node: {}\n  State: {}\n  Schedulable: {}\n  Drain requested: {}\n  Remaining service tasks: {}\n  Blocking standalone tasks: {}\n  Remaining reserved slots: {}\n  Remaining reserved GPUs: {}\n  Scheduler summary known: {}\n  Reason: {}\n  Message: {}\n  Last scheduling error: {}",
+        "Node Drain Status:\n  Node: {}\n  State: {}\n  Schedulable: {}\n  Drain requested: {}\n  Task stop timeout override: {}\n  Remaining service tasks: {}\n  Blocking standalone tasks: {}\n  Remaining reserved slots: {}\n  Remaining reserved GPUs: {}\n  Scheduler summary known: {}\n  Reason: {}\n  Message: {}\n  Last scheduling error: {}",
         status.node_id,
         drain_state_label(status.state),
         yes_no(status.schedulable),
         yes_no(status.drain_requested),
+        task_stop_timeout,
         status.remaining_service_tasks,
         status.blocking_standalone_tasks,
         status.remaining_reserved_slots,

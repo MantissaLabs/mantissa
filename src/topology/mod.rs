@@ -837,6 +837,7 @@ impl Topology {
         } else {
             protocol::topology::NodeDrainState::Fenced
         });
+        info.set_drain_task_stop_timeout_secs(scheduling.drain_task_stop_timeout_secs.unwrap_or(0));
         info.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
         set_node_id(
             info.reborrow().init_scheduling_actor_node_id(),

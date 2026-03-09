@@ -519,7 +519,11 @@ async fn setup_manager_with_forwarding(
 }
 
 /// Writes the local peer scheduling row used by task-manager drain-aware reconciliation tests.
-async fn set_local_drain_requested(manager: &TaskManager, drain_requested: bool) {
+async fn set_local_drain_requested(
+    manager: &TaskManager,
+    drain_requested: bool,
+    task_stop_timeout_secs: Option<u32>,
+) {
     let local_id = manager.local_node_id;
     let scheduling = PeerSchedulingState {
         schedulable: !drain_requested,
@@ -527,6 +531,11 @@ async fn set_local_drain_requested(manager: &TaskManager, drain_requested: bool)
         updated_at_unix_ms: 1,
         actor_node_id: local_id,
         reason: drain_requested.then(|| "test drain".to_string()),
+        drain_task_stop_timeout_secs: if drain_requested {
+            task_stop_timeout_secs
+        } else {
+            None
+        },
     };
 
     manager
@@ -575,7 +584,7 @@ async fn start_container_reserves_slot_and_records_resources() {
 #[tokio::test]
 async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_pending() {
     let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
-    set_local_drain_requested(&manager, true).await;
+    set_local_drain_requested(&manager, true, None).await;
 
     let spec = TaskSpec {
         id: Uuid::new_v4(),
@@ -638,7 +647,7 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
 #[tokio::test]
 async fn pending_service_task_on_draining_node_does_not_launch_locally() {
     let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
-    set_local_drain_requested(&manager, true).await;
+    set_local_drain_requested(&manager, true, None).await;
 
     let spec = TaskSpec {
         id: Uuid::new_v4(),
@@ -1861,6 +1870,42 @@ async fn request_task_stop_uses_task_termination_grace_period() {
 }
 
 #[tokio::test]
+async fn request_task_stop_uses_drain_task_stop_timeout_override() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let mut spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    spec.termination_grace_period_secs = Some(42);
+    manager.persist_spec(&spec).await.expect("persist update");
+    set_local_drain_requested(&manager, true, Some(3)).await;
+
+    let requested = manager
+        .request_task_stop(spec.id)
+        .await
+        .expect("request stop");
+    manager
+        .reconcile_local_task(requested)
+        .await
+        .expect("reconcile requested stop");
+
+    let stop_timeouts = mock_cm.stop_timeouts.lock().await.clone();
+    assert_eq!(stop_timeouts.len(), 1);
+    let stop_timeout = stop_timeouts[0].expect("stop timeout");
+    assert!(stop_timeout <= std::time::Duration::from_secs(3));
+    assert!(stop_timeout > std::time::Duration::from_secs(2));
+}
+
+#[tokio::test]
 async fn request_task_stop_runs_pre_stop_hook_with_shared_shutdown_budget() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
@@ -1948,6 +1993,57 @@ async fn request_task_stop_continues_after_pre_stop_hook_failure() {
     assert_eq!(exec_calls.len(), 1);
     let stopped = mock_cm.stopped.lock().await.clone();
     assert_eq!(stopped.len(), 1);
+}
+
+#[tokio::test]
+async fn reconcile_inventory_uses_drain_stop_timeout_for_unowned_runtime() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    set_local_drain_requested(&manager, true, Some(4)).await;
+
+    {
+        let mut listed = mock_cm.listed.lock().await;
+        listed.clear();
+        listed.push(crate::task::docker::ContainerInfo {
+            id: format!("runtime-{}", spec.id),
+            name: format!("mantissa-{}", spec.id),
+            image: "img".to_string(),
+            status: "Up".to_string(),
+            state: "running".to_string(),
+            created: 0,
+        });
+    }
+
+    let mut remote_spec = spec.clone();
+    remote_spec.node_id = Uuid::new_v4();
+    remote_spec.node_name = "other-node".to_string();
+    remote_spec.updated_at = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+    manager
+        .persist_spec(&remote_spec)
+        .await
+        .expect("persist remote ownership");
+
+    manager
+        .reconcile_local_container_inventory()
+        .await
+        .expect("reconcile inventory");
+
+    let stop_timeouts = mock_cm.stop_timeouts.lock().await.clone();
+    assert_eq!(stop_timeouts.len(), 1);
+    assert_eq!(stop_timeouts[0], Some(std::time::Duration::from_secs(4)));
 }
 
 #[tokio::test]

@@ -60,7 +60,11 @@ interface Topology {
   ) -> ();
   # Replicates one cluster-name update payload to this node.
 
-  drainNode @14 (nodeId :Node.NodeId, reason :Text) -> ();
+  drainNode @14 (
+    nodeId :Node.NodeId,
+    reason :Text,
+    taskStopTimeoutSecs :UInt32
+  ) -> ();
   # Marks one node unschedulable for maintenance and starts cluster-wide drain fencing.
 
   resumeNode @15 (nodeId :Node.NodeId) -> ();
@@ -123,6 +127,9 @@ struct NodeDrainStatus {
 
   lastSchedulingError @11 :Text;
   # Best-known scheduling blocker if drain is waiting on placement capacity.
+
+  taskStopTimeoutSecs @12 :UInt32;
+  # Optional drain-only override for task stop timeout in seconds, 0 uses task defaults.
 }
 
 struct TopologyEvent {
@@ -244,6 +251,9 @@ struct NodeInfo {
 
   drainState @20 :NodeDrainState;
   # Derived maintenance progress state used by `Topology.list` output.
+
+  drainTaskStopTimeoutSecs @21 :UInt32;
+  # Optional drain-only override for task stop timeout in seconds, 0 uses task defaults.
 }
 
 struct NodeList {

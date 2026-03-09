@@ -30,6 +30,10 @@ pub struct PeerSchedulingState {
     /// Optional operator-supplied reason displayed in diagnostics.
     #[serde(default)]
     pub reason: Option<String>,
+
+    /// Optional drain-only stop timeout override used while the node evacuates.
+    #[serde(default)]
+    pub drain_task_stop_timeout_secs: Option<u32>,
 }
 
 impl Default for PeerSchedulingState {
@@ -41,6 +45,7 @@ impl Default for PeerSchedulingState {
             updated_at_unix_ms: 0,
             actor_node_id: Uuid::nil(),
             reason: None,
+            drain_task_stop_timeout_secs: None,
         }
     }
 }
@@ -62,6 +67,7 @@ impl PeerSchedulingState {
         updated_at_unix_ms: u64,
         actor_node_id: Option<Uuid>,
         reason: Option<String>,
+        drain_task_stop_timeout_secs: Option<u32>,
     ) -> Self {
         let trimmed_reason = reason.and_then(|value| {
             let trimmed = value.trim();
@@ -78,6 +84,7 @@ impl PeerSchedulingState {
             && !drain_requested
             && !schedulable
             && trimmed_reason.is_none()
+            && drain_task_stop_timeout_secs.is_none()
         {
             return Self::schedulable_default(node_id);
         }
@@ -88,17 +95,19 @@ impl PeerSchedulingState {
             updated_at_unix_ms,
             actor_node_id,
             reason: trimmed_reason,
+            drain_task_stop_timeout_secs,
         }
     }
 
     /// Returns the deterministic conflict-resolution key for one scheduling update.
-    fn precedence_key(&self) -> (u64, Uuid, bool, bool, Option<&str>) {
+    fn precedence_key(&self) -> (u64, Uuid, bool, bool, Option<&str>, Option<u32>) {
         (
             self.updated_at_unix_ms,
             self.actor_node_id,
             self.drain_requested,
             self.schedulable,
             self.reason.as_deref(),
+            self.drain_task_stop_timeout_secs,
         )
     }
 
@@ -353,6 +362,10 @@ impl PeerValue {
             ni.get_scheduling_updated_at_unix_ms(),
             read_optional_node_id_capnp(ni.get_scheduling_actor_node_id()?)?,
             Some(ni.get_scheduling_reason()?.to_string()?),
+            match ni.get_drain_task_stop_timeout_secs() {
+                0 => None,
+                value => Some(value),
+            },
         );
 
         Ok(PeerValue {
@@ -391,7 +404,8 @@ mod tests {
     fn legacy_node_info_defaults_to_schedulable() {
         let node_id = Uuid::from_bytes([7u8; 16]);
 
-        let scheduling = PeerSchedulingState::from_node_info(node_id, false, false, 0, None, None);
+        let scheduling =
+            PeerSchedulingState::from_node_info(node_id, false, false, 0, None, None, None);
 
         assert!(scheduling.schedulable);
         assert!(!scheduling.drain_requested);
@@ -415,6 +429,7 @@ mod tests {
                 updated_at_unix_ms: 10,
                 actor_node_id: node_id,
                 reason: None,
+                drain_task_stop_timeout_secs: None,
             },
         };
         let mut newer = older.clone();
@@ -424,6 +439,7 @@ mod tests {
             updated_at_unix_ms: 20,
             actor_node_id: node_id,
             reason: Some("maintenance".to_string()),
+            drain_task_stop_timeout_secs: Some(15),
         };
         older.address = String::new();
 
@@ -432,6 +448,7 @@ mod tests {
         assert!(!selected.scheduling.schedulable);
         assert!(selected.scheduling.drain_requested);
         assert_eq!(selected.scheduling.reason.as_deref(), Some("maintenance"));
+        assert_eq!(selected.scheduling.drain_task_stop_timeout_secs, Some(15));
         assert_eq!(selected.address, "127.0.0.1:7000");
     }
 }

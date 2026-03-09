@@ -1880,6 +1880,30 @@ local_test!(services_node_drain_timeout_keeps_node_unschedulable, {
     );
 });
 
+local_test!(
+    services_node_drain_status_reports_task_stop_timeout_override,
+    {
+        let _guard = ContainerManagerOverrideGuard::install_default();
+        let node = TestNode::new().await;
+
+        drain_node_with_timeout_via_topology(
+            &node.topology(),
+            node.id(),
+            "maintenance override",
+            Some(7),
+        )
+        .await
+        .expect("drain request with timeout override");
+
+        let status = drain_status_via_topology(&node.topology(), node.id())
+            .await
+            .expect("fetch drain status");
+        assert_eq!(status.task_stop_timeout_secs, Some(7));
+        assert!(!status.schedulable);
+        assert!(status.drain_requested);
+    }
+);
+
 local_test!(services_node_list_reports_drained_node_after_evacuation, {
     let _guard = ContainerManagerOverrideGuard::install_default();
 
@@ -4142,6 +4166,15 @@ async fn drain_node_via_topology(
     node_id: Uuid,
     reason: &str,
 ) -> Result<(), CapnpError> {
+    drain_node_with_timeout_via_topology(client, node_id, reason, None).await
+}
+
+async fn drain_node_with_timeout_via_topology(
+    client: &topology::Client,
+    node_id: Uuid,
+    reason: &str,
+    task_stop_timeout_secs: Option<u32>,
+) -> Result<(), CapnpError> {
     let mut request = client.drain_node_request();
     let mut params = request.get();
     params
@@ -4149,6 +4182,7 @@ async fn drain_node_via_topology(
         .init_node_id()
         .set_bytes(node_id.as_bytes());
     params.set_reason(reason);
+    params.set_task_stop_timeout_secs(task_stop_timeout_secs.unwrap_or(0));
     request.send().promise.await?;
     Ok(())
 }
@@ -4158,6 +4192,7 @@ struct TestDrainStatus {
     state: NodeDrainState,
     schedulable: bool,
     drain_requested: bool,
+    task_stop_timeout_secs: Option<u32>,
     remaining_service_tasks: u32,
     last_scheduling_error: Option<String>,
 }
@@ -4188,6 +4223,10 @@ async fn drain_status_via_topology(
         state: status.get_state()?,
         schedulable: status.get_schedulable(),
         drain_requested: status.get_drain_requested(),
+        task_stop_timeout_secs: match status.get_task_stop_timeout_secs() {
+            0 => None,
+            value => Some(value),
+        },
         remaining_service_tasks: status.get_remaining_service_tasks(),
         last_scheduling_error: if last_scheduling_error.is_empty() {
             None

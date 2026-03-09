@@ -1069,6 +1069,7 @@ local_test!(cluster_view_startup_preserves_persisted_self_drain_fence, {
         updated_at_unix_ms: 77,
         actor_node_id: self_id,
         reason: Some("maintenance restart test".to_string()),
+        drain_task_stop_timeout_secs: Some(15),
     };
 
     peers
@@ -1100,56 +1101,61 @@ local_test!(cluster_view_startup_preserves_persisted_self_drain_fence, {
     .expect("start fenced restart node");
 
     let expected_addr = format!("inproc://{}", self_id);
-    let (schedulable, drain_requested, drain_state) = timeout(Duration::from_secs(5), async {
-        loop {
-            let list_resp = node
-                .topology_client
-                .list_request()
-                .send()
-                .promise
-                .await
-                .expect("topology list send");
-            let node_rows = list_resp
-                .get()
-                .expect("topology list get")
-                .get_nodes()
-                .expect("node list payload")
-                .get_nodes()
-                .expect("node rows");
+    let (schedulable, drain_requested, drain_state, drain_task_stop_timeout_secs) =
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let list_resp = node
+                    .topology_client
+                    .list_request()
+                    .send()
+                    .promise
+                    .await
+                    .expect("topology list send");
+                let node_rows = list_resp
+                    .get()
+                    .expect("topology list get")
+                    .get_nodes()
+                    .expect("node list payload")
+                    .get_nodes()
+                    .expect("node rows");
 
-            for row in node_rows.iter() {
-                let listed_id = Uuid::from_slice(
-                    row.get_id()
-                        .expect("listed node id")
-                        .get_bytes()
-                        .expect("listed node id bytes"),
-                )
-                .expect("decode listed node id");
-                if listed_id != self_id {
-                    continue;
+                for row in node_rows.iter() {
+                    let listed_id = Uuid::from_slice(
+                        row.get_id()
+                            .expect("listed node id")
+                            .get_bytes()
+                            .expect("listed node id bytes"),
+                    )
+                    .expect("decode listed node id");
+                    if listed_id != self_id {
+                        continue;
+                    }
+
+                    let listed_addr = row
+                        .get_addr()
+                        .expect("listed addr")
+                        .to_string()
+                        .expect("decode listed addr");
+                    if listed_addr != expected_addr {
+                        break;
+                    }
+
+                    return (
+                        row.get_schedulable(),
+                        row.get_drain_requested(),
+                        row.get_drain_state().expect("drain state"),
+                        match row.get_drain_task_stop_timeout_secs() {
+                            0 => None,
+                            value => Some(value),
+                        },
+                    );
                 }
 
-                let listed_addr = row
-                    .get_addr()
-                    .expect("listed addr")
-                    .to_string()
-                    .expect("decode listed addr");
-                if listed_addr != expected_addr {
-                    break;
-                }
-
-                return (
-                    row.get_schedulable(),
-                    row.get_drain_requested(),
-                    row.get_drain_state().expect("drain state"),
-                );
+                sleep(Duration::from_millis(50)).await;
             }
-
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("wait for startup self peer refresh");
+        })
+        .await
+        .expect("wait for startup self peer refresh");
 
     assert!(
         !schedulable,
@@ -1163,6 +1169,11 @@ local_test!(cluster_view_startup_preserves_persisted_self_drain_fence, {
         drain_state,
         NodeDrainState::Drained,
         "startup should derive the node as drained when the persisted fence is intact"
+    );
+    assert_eq!(
+        drain_task_stop_timeout_secs,
+        Some(15),
+        "startup should preserve the drain stop-timeout override for self"
     );
 });
 

@@ -134,6 +134,10 @@ impl protocol::server::Server for Server {
                     }
                 },
                 Some(info.get_scheduling_reason()?.to_string()?),
+                match info.get_drain_task_stop_timeout_secs() {
+                    0 => None,
+                    value => Some(value),
+                },
             ),
         };
         let joiner_incarnation = info.get_incarnation();

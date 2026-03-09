@@ -768,7 +768,8 @@ impl TaskManager {
 
         // Pre-stop hooks and the runtime stop call share one shutdown budget so the task never
         // exceeds its configured graceful termination window.
-        let stop_deadline = Instant::now() + task_stop_timeout(&spec);
+        let stop_deadline =
+            Instant::now() + self.effective_task_stop_timeout(spec.termination_grace_period_secs);
         self.run_pre_stop_hook(&spec, &container_identifier, stop_deadline)
             .await;
 
@@ -931,6 +932,24 @@ impl TaskManager {
                 );
             }
         }
+    }
+
+    /// Resolves the effective stop timeout for a local runtime operation.
+    ///
+    /// During maintenance drain, the node-level override replaces the task's own
+    /// termination grace period so evacuation does not inherit an arbitrarily long
+    /// application default.
+    fn effective_task_stop_timeout(&self, task_grace_period_secs: Option<u32>) -> Duration {
+        if let Some(override_secs) = self
+            .registry
+            .peer_scheduling(self.local_node_id)
+            .filter(|state| state.drain_requested)
+            .and_then(|state| state.drain_task_stop_timeout_secs)
+        {
+            return Duration::from_secs(u64::from(override_secs));
+        }
+
+        task_stop_timeout(task_grace_period_secs)
     }
 
     /// Marks a task as failed and frees any resources it owned.
@@ -1664,7 +1683,7 @@ impl TaskManager {
             };
 
             let Some(value) = task_index.get(&task_id) else {
-                self.stop_unowned_container(task_id, &container.name, true)
+                self.stop_unowned_container(task_id, &container.name, true, None)
                     .await;
                 continue;
             };
@@ -1673,7 +1692,7 @@ impl TaskManager {
                 if task_value_recent(value, UNOWNED_TASK_GRACE_SECS) {
                     continue;
                 }
-                self.stop_unowned_container(task_id, &container.name, false)
+                self.stop_unowned_container(task_id, &container.name, false, Some(value))
                     .await;
                 continue;
             }
@@ -1762,6 +1781,7 @@ impl TaskManager {
         task_id: Uuid,
         container_name: &str,
         remove_attachments: bool,
+        task_value: Option<&TaskValue>,
     ) {
         let identifier = if container_name.is_empty() {
             format!("mantissa-{task_id}")
@@ -1776,7 +1796,12 @@ impl TaskManager {
 
         match self
             .container_manager
-            .stop_container(&identifier, Some(Duration::from_secs(10)))
+            .stop_container(
+                &identifier,
+                Some(self.effective_task_stop_timeout(
+                    task_value.and_then(|value| value.termination_grace_period_secs),
+                )),
+            )
             .await
         {
             Ok(_) => {}
@@ -2388,8 +2413,8 @@ fn task_value_recent(value: &TaskValue, grace_secs: i64) -> bool {
 }
 
 /// Resolves the effective graceful-stop timeout for one task stop workflow.
-fn task_stop_timeout(spec: &TaskSpec) -> Duration {
-    Duration::from_secs(u64::from(spec.termination_grace_period_secs.unwrap_or(10)))
+fn task_stop_timeout(task_grace_period_secs: Option<u32>) -> Duration {
+    Duration::from_secs(u64::from(task_grace_period_secs.unwrap_or(10)))
 }
 
 /// Computes the stop budget still available for the container runtime.

@@ -266,6 +266,14 @@ pub struct NodesDrainArgs {
     #[arg(long = "reason", value_name = "TEXT")]
     pub reason: Option<String>,
 
+    /// Override task terminationGracePeriod while this node is draining
+    #[arg(
+        long = "task-stop-timeout",
+        value_name = "DURATION",
+        value_parser = parse_cli_duration
+    )]
+    pub task_stop_timeout: Option<Duration>,
+
     /// Maximum time to wait for the node to finish draining
     #[arg(
         long = "timeout",

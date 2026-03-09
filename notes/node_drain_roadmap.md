@@ -329,6 +329,7 @@ Status:
 
 Phase 1 completed on March 9, 2026.
 Phase 2 completed on March 9, 2026.
+Phase 3 completed on March 9, 2026.
 
 Implemented:
 
@@ -343,10 +344,13 @@ Implemented:
 5. Local stop reconciliation now executes the pre-stop command inside the
    running container before termination and spends that time from the same
    graceful shutdown budget used by the runtime stop call.
+6. Added an explicit drain-only task stop timeout override to node maintenance
+   state, `nodes drain`, drain status output, and the local runtime stop paths
+   used by evacuation and stale-runtime cleanup.
 
 Still pending in Follow-on A:
 
-1. any explicit drain-only override beyond the per-task grace period
+Nothing.
 
 Add:
 

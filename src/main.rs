@@ -82,6 +82,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         &cfg,
                         args.node_id,
                         args.reason.as_deref(),
+                        args.task_stop_timeout,
                         args.timeout,
                         args.no_wait,
                     ))

@@ -13,6 +13,7 @@ pub async fn drain(
     cfg: &ClientConfig,
     node_id: Uuid,
     reason: Option<&str>,
+    task_stop_timeout: Option<Duration>,
     timeout: Duration,
     no_wait: bool,
 ) -> Result<()> {
@@ -27,6 +28,7 @@ pub async fn drain(
         .init_node_id()
         .set_bytes(node_id.as_bytes());
     params.set_reason(reason.unwrap_or_default());
+    params.set_task_stop_timeout_secs(duration_to_wire_secs(task_stop_timeout)?);
     request.send().promise.await?;
 
     if no_wait {
@@ -36,6 +38,15 @@ pub async fn drain(
 
     println!("drain requested for node {node_id}; waiting for completion");
     wait_for_drain_completion(&topology, node_id, timeout).await
+}
+
+/// Converts one optional CLI duration into the wire-level seconds field.
+fn duration_to_wire_secs(duration: Option<Duration>) -> Result<u32> {
+    let Some(duration) = duration else {
+        return Ok(0);
+    };
+    let secs = duration.as_secs();
+    u32::try_from(secs).map_err(|_| anyhow!("duration {duration:?} exceeds protocol limit"))
 }
 
 /// Polls the drain-status RPC until the node is fully drained or the timeout expires.
