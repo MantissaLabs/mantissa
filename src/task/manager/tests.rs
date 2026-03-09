@@ -22,7 +22,8 @@ use crate::store::scheduler_store::open_scheduler_store;
 use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
-use crate::task::types::{TaskStateKind, TaskValue, TaskValueDraft};
+use crate::task::types::{TaskRestartPolicyKind, TaskStateKind, TaskValue, TaskValueDraft};
+use crate::topology::peers::PeerSchedulingState;
 use ::health::HealthMonitor;
 use anyhow::{Result, anyhow};
 use async_channel::bounded;
@@ -486,6 +487,24 @@ async fn setup_manager_with_forwarding(
     (manager, scheduler, mock_cm, network_registry)
 }
 
+/// Writes the local peer scheduling row used by task-manager drain-aware reconciliation tests.
+async fn set_local_drain_requested(manager: &TaskManager, drain_requested: bool) {
+    let local_id = manager.local_node_id;
+    let scheduling = PeerSchedulingState {
+        schedulable: !drain_requested,
+        drain_requested,
+        updated_at_unix_ms: 1,
+        actor_node_id: local_id,
+        reason: drain_requested.then(|| "test drain".to_string()),
+    };
+
+    manager
+        .registry
+        .upsert_self_scheduling(scheduling)
+        .await
+        .expect("upsert local drain state");
+}
+
 #[tokio::test]
 async fn start_container_reserves_slot_and_records_resources() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
@@ -520,6 +539,128 @@ async fn start_container_reserves_slot_and_records_resources() {
     assert_eq!(recorded.memory_bytes, Some((64 * 1_024 * 1_024) as i64));
     assert_eq!(recorded.nano_cpus, Some(200_000_000));
     assert_eq!(recorded.cpu_shares, Some(204));
+}
+
+#[tokio::test]
+async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_pending() {
+    let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
+    set_local_drain_requested(&manager, true).await;
+
+    let spec = TaskSpec {
+        id: Uuid::new_v4(),
+        name: "svc-api-1".to_string(),
+        image: "ghcr.io/demo/api:latest".to_string(),
+        state: ContainerState::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: vec!["/bin/demo".to_string()],
+        node_id: manager.local_node_id,
+        node_name: manager.local_node_name.clone(),
+        slot_ids: Vec::new(),
+        slot_id: None,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: Some(TaskRestartPolicy {
+            name: TaskRestartPolicyKind::Always,
+            max_retry_count: None,
+        }),
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: Some(TaskServiceMetadata::new("svc", "api")),
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
+    };
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist service task");
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("reconcile draining running task");
+
+    let latest = manager
+        .inspect_task(spec.id)
+        .await
+        .expect("inspect updated task");
+    assert_eq!(
+        latest.state,
+        ContainerState::Failed,
+        "draining service task should fail instead of looping back to pending"
+    );
+    assert!(
+        mock_cm.created.lock().await.is_empty(),
+        "draining running task should not create a replacement container locally"
+    );
+}
+
+#[tokio::test]
+async fn pending_service_task_on_draining_node_does_not_launch_locally() {
+    let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
+    set_local_drain_requested(&manager, true).await;
+
+    let spec = TaskSpec {
+        id: Uuid::new_v4(),
+        name: "svc-api-1".to_string(),
+        image: "ghcr.io/demo/api:latest".to_string(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: vec!["/bin/demo".to_string()],
+        node_id: manager.local_node_id,
+        node_name: manager.local_node_name.clone(),
+        slot_ids: Vec::new(),
+        slot_id: None,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: Some(TaskRestartPolicy {
+            name: TaskRestartPolicyKind::Always,
+            max_retry_count: None,
+        }),
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: Some(TaskServiceMetadata::new("svc", "api")),
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
+    };
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist pending task");
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("reconcile draining pending task");
+
+    let latest = manager
+        .inspect_task(spec.id)
+        .await
+        .expect("inspect updated task");
+    assert_eq!(
+        latest.state,
+        ContainerState::Failed,
+        "draining service task should fail instead of launching locally"
+    );
+    assert!(
+        mock_cm.created.lock().await.is_empty(),
+        "draining pending task should not create a local container"
+    );
 }
 
 #[tokio::test]

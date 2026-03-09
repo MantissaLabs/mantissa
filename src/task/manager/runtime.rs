@@ -400,6 +400,18 @@ impl TaskManager {
             spec = latest;
         }
 
+        if spec.node_id != self.local_node_id {
+            return Ok(());
+        }
+        if self.should_block_local_service_runtime(&spec) {
+            let reason = format!(
+                "container exited with status code {exit_code} while node {} is draining",
+                self.local_node_id
+            );
+            let _ = self.mark_task_failed(spec, anyhow::anyhow!(reason)).await;
+            return Ok(());
+        }
+
         if task_policy_allows_runtime_restart(&spec, exit_code) {
             debug!(
                 target: "task",

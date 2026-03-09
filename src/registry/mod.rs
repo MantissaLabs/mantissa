@@ -521,6 +521,35 @@ impl Registry {
         Ok(())
     }
 
+    /// Updates the local node's replicated scheduling state in the peers store.
+    ///
+    /// Tests and maintenance workflows use this to exercise drain-aware placement without
+    /// bypassing the normal peer metadata convergence path.
+    #[cfg(test)]
+    pub async fn upsert_self_scheduling(&self, scheduling: PeerSchedulingState) -> AnyResult<()> {
+        let mut current = if let Some(current) = self.peer_latest_value(self.node_id) {
+            current
+        } else {
+            let signing_key = self.signing_key.lock().await;
+            PeerValue {
+                address: String::new(),
+                hostname: String::new(),
+                noise_static_pub: self.noise_keys.public_bytes(),
+                signing_pub: signing_key.verifying_key().to_bytes(),
+                identity_sig: Vec::new(),
+                wireguard: None,
+                scheduling: PeerSchedulingState::schedulable_default(self.node_id),
+            }
+        };
+
+        current.scheduling = scheduling;
+        self.peers
+            .upsert(&UuidKey::from(self.node_id), current)
+            .await
+            .map_err(|e| anyhow!("failed to upsert self peer scheduling state: {e}"))?;
+        Ok(())
+    }
+
     pub async fn session_for_peer(&self, peer_id: Uuid) -> Option<cluster_session::Client> {
         self.resolve_session(peer_id, SessionStrategy::TicketThenCredential, false, false)
             .await

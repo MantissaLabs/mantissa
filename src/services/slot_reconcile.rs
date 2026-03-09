@@ -172,15 +172,31 @@ impl ServiceController {
         };
 
         let task = inventory.by_id.get(&task_id);
+        let task_on_draining_node = task
+            .map(|task| self.node_drain_requested(task.node_id))
+            .unwrap_or(false);
         let missing = match task {
             None => true,
             Some(task) => {
-                node_is_down(task.node_id, health_snapshot) || !task_state_healthy(&task.state)
+                task_on_draining_node
+                    || node_is_down(task.node_id, health_snapshot)
+                    || !task_state_healthy(&task.state)
             }
         };
 
         if missing {
-            let restart_immediately = should_restart_missing_slot_immediately(spec.status(), task);
+            if task_on_draining_node {
+                tracing::debug!(
+                    target: "services",
+                    service = %spec.service_name,
+                    template = %slot.template.name,
+                    replica = slot.replica,
+                    task = %task_id,
+                    "slot task is assigned to a draining node; forcing evacuation"
+                );
+            }
+            let restart_immediately = task_on_draining_node
+                || should_restart_missing_slot_immediately(spec.status(), task);
             if restart_immediately || self.slot_missing_elapsed(key).await {
                 self.start_slot_task(spec, slot, task_id, preferred_node, key)
                     .await?;

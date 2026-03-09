@@ -228,6 +228,20 @@ impl TaskManager {
         })
     }
 
+    /// Returns true when the local node is under drain and this task belongs to a managed service.
+    ///
+    /// Drain-aware reconciliation uses this to suppress local relaunches so start-first
+    /// replacements can move service replicas away without the drained node racing them.
+    fn should_block_local_service_runtime(&self, spec: &TaskSpec) -> bool {
+        spec.node_id == self.local_node_id
+            && spec.service_metadata.is_some()
+            && self
+                .registry
+                .peer_scheduling(self.local_node_id)
+                .map(|state| state.drain_requested)
+                .unwrap_or(false)
+    }
+
     /// Records the latest remove watermark and epoch used to suppress stale remote task upserts.
     async fn record_remove_watermark(
         &self,

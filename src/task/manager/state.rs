@@ -124,6 +124,10 @@ impl TaskManager {
                 // Reload once before transitioning to `Pending` so stale running snapshots do not
                 // overwrite a newer terminal transition (for example, runtime-exit failure).
                 if let Ok(latest) = self.load_spec(working.id).await {
+                    if latest.node_id != self.local_node_id {
+                        *working = latest;
+                        return Ok(true);
+                    }
                     if latest.state != working.state {
                         *working = latest;
                         if matches!(
@@ -142,6 +146,14 @@ impl TaskManager {
                         // refresh the local snapshot without suppressing the pending restart.
                         *working = latest;
                     }
+                }
+                if self.should_block_local_service_runtime(working) {
+                    let reason = anyhow!(
+                        "service task runtime restart suppressed while node {} is draining",
+                        self.local_node_id
+                    );
+                    let _ = self.mark_task_failed(working.clone(), reason).await;
+                    return Ok(true);
                 }
                 warn!(
                     target: "task",
@@ -1087,6 +1099,9 @@ impl TaskManager {
     /// Starts or reuses a container so the task transitions into running state locally.
     pub(super) async fn ensure_task_running(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
         let mut working = self.load_spec(spec.id).await.unwrap_or(spec);
+        if working.node_id != self.local_node_id {
+            return Ok(());
+        }
         if self.reconcile_recorded_running_task(&mut working).await? {
             return Ok(());
         }
@@ -1095,6 +1110,14 @@ impl TaskManager {
             working.state,
             ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
         ) {
+            return Ok(());
+        }
+        if self.should_block_local_service_runtime(&working) {
+            let reason = anyhow!(
+                "service task launch suppressed while node {} is draining",
+                self.local_node_id
+            );
+            let _ = self.mark_task_failed(working, reason).await;
             return Ok(());
         }
 
@@ -1116,6 +1139,17 @@ impl TaskManager {
             working.state,
             ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
         ) {
+            return Ok(());
+        }
+        if working.node_id != self.local_node_id {
+            return Ok(());
+        }
+        if self.should_block_local_service_runtime(&working) {
+            let reason = anyhow!(
+                "service task launch suppressed while node {} is draining",
+                self.local_node_id
+            );
+            let _ = self.mark_task_failed(working, reason).await;
             return Ok(());
         }
         // Re-check after pull because phase updates and concurrent CRDT writes may have changed
@@ -1198,7 +1232,9 @@ impl TaskManager {
                 if matches!(
                     latest.state,
                     ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
-                ) {
+                ) || latest.node_id != self.local_node_id
+                    || self.should_block_local_service_runtime(&latest)
+                {
                     self.abort_launched_container(working.id, &container_id)
                         .await;
                     return Ok(());

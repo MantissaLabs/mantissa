@@ -35,6 +35,7 @@ use mantissa::task::types::{
     TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskServiceMetadata, TaskSpec,
     TaskStateFilter, TaskValue,
 };
+use mantissa::topology_capnp::topology;
 use protocol::secrets::secrets;
 use protocol::services::services;
 use protocol::topology::ClusterOperationStage;
@@ -1389,6 +1390,299 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
             node.id()
         );
     }
+});
+
+local_test!(services_node_drain_migrates_singleton_service, {
+    let _guard = ContainerManagerOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
+
+    let service_name = "drain-singleton";
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![demo_backend_task_template("backend", 1)],
+        )
+        .await
+        .expect("submit singleton deployment");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "singleton service should reach running before drain"
+    );
+
+    let service = cluster[0]
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load singleton service")
+        .expect("singleton service should exist");
+    let task_id = *service
+        .task_ids
+        .first()
+        .expect("singleton service should have one task id");
+    let initial_task = cluster[0]
+        .node
+        .task_manager
+        .inspect_task(task_id)
+        .await
+        .expect("inspect singleton task");
+    let drained_node_id = initial_task.node_id;
+
+    drain_node_via_topology(
+        &cluster[0].topology(),
+        drained_node_id,
+        "singleton maintenance",
+    )
+    .await
+    .expect("drain singleton host");
+
+    let drained_node = cluster
+        .iter()
+        .find(|node| node.id() == drained_node_id)
+        .expect("drained node should belong to cluster");
+
+    let migrated = wait_until(
+        Duration::from_secs(20),
+        Duration::from_millis(100),
+        || async {
+            let task = cluster[0]
+                .node
+                .task_manager
+                .inspect_task(task_id)
+                .await
+                .ok();
+            let local_drained = list_local_active_service_tasks(
+                &drained_node.node.task_manager,
+                service_name,
+                drained_node_id,
+            )
+            .await
+            .is_empty();
+
+            matches!(task, Some(task) if task.node_id != drained_node_id && local_drained)
+        },
+    )
+    .await;
+    assert!(
+        migrated,
+        "singleton service should evacuate the drained node"
+    );
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "singleton service should recover to running after drain migration"
+    );
+});
+
+local_test!(services_node_drain_migrates_multi_replica_service, {
+    let _guard = ContainerManagerOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
+
+    let service_name = "drain-multi";
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![demo_backend_task_template("backend", 3)],
+        )
+        .await
+        .expect("submit multi-replica deployment");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "multi-replica service should reach running before drain"
+    );
+    for node in &cluster {
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "node {} should observe running state before multi-replica drain",
+            node.id()
+        );
+    }
+    assert!(
+        wait_for_min_local_service_task_count(&cluster, service_name, 1, Duration::from_secs(15))
+            .await,
+        "service should spread at least one replica per node before drain"
+    );
+
+    let drained_node = &cluster[0];
+    drain_node_via_topology(
+        &cluster[0].topology(),
+        drained_node.id(),
+        "multi maintenance",
+    )
+    .await
+    .expect("drain multi-replica host");
+
+    let evacuated = wait_until(
+        Duration::from_secs(20),
+        Duration::from_millis(100),
+        || async {
+            let local_empty = list_local_active_service_tasks(
+                &drained_node.node.task_manager,
+                service_name,
+                drained_node.id(),
+            )
+            .await
+            .is_empty();
+            local_empty && all_nodes_have_service_task_count(&cluster, service_name, 3).await
+        },
+    )
+    .await;
+    assert!(
+        evacuated,
+        "multi-replica service should evacuate all replicas from the drained node"
+    );
+});
+
+local_test!(services_node_drain_blocks_on_standalone_task, {
+    let _guard = ContainerManagerOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    node.node
+        .task_manager
+        .start_container(
+            "standalone",
+            "ghcr.io/mantissa/demo:web",
+            vec!["--serve".into()],
+            100,
+            64 * 1024 * 1024,
+            None,
+        )
+        .await
+        .expect("start standalone task");
+
+    let err = drain_node_via_topology(&node.topology(), node.id(), "standalone maintenance")
+        .await
+        .expect_err("drain should reject standalone task");
+    assert!(
+        err.to_string().contains("active standalone task"),
+        "standalone drain blocker should explain the rejection: {err}"
+    );
+});
+
+local_test!(services_node_drain_blocks_while_service_is_deploying, {
+    let _guard = ContainerManagerOverrideGuard::install_factory(Arc::new(
+        || -> Arc<dyn ContainerManager + Send + Sync> {
+            Arc::new(SlowCreateContainerManager::default())
+        },
+    ));
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes").await;
+
+    let service_name = "drain-deploying";
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![demo_backend_task_template("backend", 1)],
+        )
+        .await
+        .expect("submit slow deployment");
+
+    let deploying_deadline = Instant::now() + Duration::from_secs(10);
+    let mut deployment_target = None;
+    while Instant::now() < deploying_deadline {
+        if let Some(spec) = cluster[0]
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("load slow service")
+            && spec.status() == ServiceStatus::Deploying
+            && let Some(task_id) = spec.task_ids.first().copied()
+            && let Ok(task) = cluster[0].node.task_manager.inspect_task(task_id).await
+        {
+            deployment_target = Some((task.node_id, task_id));
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let (drained_node_id, task_id) = deployment_target
+        .expect("service should remain deploying long enough to test drain blocker");
+
+    let err = drain_node_via_topology(
+        &cluster[1].topology(),
+        drained_node_id,
+        "deploying maintenance",
+    )
+    .await
+    .expect_err("drain should reject deploying service");
+    assert!(
+        err.to_string().contains("cannot drain while service"),
+        "deploying drain blocker should explain the rejection: {err}"
+    );
+
+    let task = cluster[0]
+        .node
+        .task_manager
+        .inspect_task(task_id)
+        .await
+        .expect("inspect deploying task after rejected drain");
+    assert_eq!(
+        task.node_id, drained_node_id,
+        "rejected drain should leave the deploying task assignment unchanged"
+    );
 });
 
 local_test!(
@@ -3173,6 +3467,71 @@ fn rollout_strategy(
     }
 }
 
+#[derive(Default)]
+struct SlowCreateContainerManager {
+    inner: InMemoryContainerManager,
+}
+
+#[async_trait]
+impl ContainerManager for SlowCreateContainerManager {
+    async fn create_container(
+        &self,
+        request: ContainerCreateRequest,
+    ) -> Result<String, ContainerError> {
+        sleep(Duration::from_secs(3)).await;
+        self.inner.create_container(request).await
+    }
+
+    async fn start_container(&self, container_id: &str) -> Result<(), ContainerError> {
+        self.inner.start_container(container_id).await
+    }
+
+    async fn stop_container(
+        &self,
+        container_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<(), ContainerError> {
+        self.inner.stop_container(container_id, timeout).await
+    }
+
+    async fn restart_container(
+        &self,
+        container_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<(), ContainerError> {
+        self.inner.restart_container(container_id, timeout).await
+    }
+
+    async fn remove_container(
+        &self,
+        container_id: &str,
+        force: bool,
+        remove_volumes: bool,
+    ) -> Result<(), ContainerError> {
+        self.inner
+            .remove_container(container_id, force, remove_volumes)
+            .await
+    }
+
+    async fn list_containers(
+        &self,
+        filters: Option<HashMap<String, Vec<String>>>,
+    ) -> Result<Vec<ContainerInfo>, ContainerError> {
+        self.inner.list_containers(filters).await
+    }
+
+    async fn inspect_container(
+        &self,
+        container_id: &str,
+    ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
+        self.inner.inspect_container(container_id).await
+    }
+
+    async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+        Ok(())
+    }
+}
+
 /// Emits synthetic runtime exit events for started containers.
 ///
 /// We use this manager to validate the runtime-event failure path deterministically
@@ -3462,6 +3821,22 @@ async fn remove_service_via_rpc(client: &services::Client, service_id: Uuid) {
         .promise
         .await
         .expect("service delete should succeed");
+}
+
+async fn drain_node_via_topology(
+    client: &topology::Client,
+    node_id: Uuid,
+    reason: &str,
+) -> Result<(), CapnpError> {
+    let mut request = client.drain_node_request();
+    let mut params = request.get();
+    params
+        .reborrow()
+        .init_node_id()
+        .set_bytes(node_id.as_bytes());
+    params.set_reason(reason);
+    request.send().promise.await?;
+    Ok(())
 }
 
 async fn wait_for_service_state(

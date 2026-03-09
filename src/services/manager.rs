@@ -520,6 +520,17 @@ impl ServiceController {
         )
     }
 
+    /// Returns true when peer metadata marks the provided node as actively draining.
+    ///
+    /// Slot reconciliation uses this to treat replicas on maintenance nodes as explicit drift so
+    /// evacuation bypasses the normal proactive rebalance gates.
+    fn node_drain_requested(&self, node_id: Uuid) -> bool {
+        self.cluster_registry
+            .peer_scheduling(node_id)
+            .map(|state| state.drain_requested)
+            .unwrap_or(false)
+    }
+
     /// Executes the deployment workflow in the background by starting tasks via the task manager
     /// and persisting the resulting service specification into the replicated registry.
     async fn execute_deployment(self, job: ServiceDeploymentJob) -> anyhow::Result<()> {

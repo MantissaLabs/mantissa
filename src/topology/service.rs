@@ -8,6 +8,7 @@ use crate::node::address::extract_port;
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::pubkey_from_slice;
 use crate::server::credential::ClusterCredential;
+use crate::services::registry::ServiceRegistry;
 use crate::services::types::ServiceStatus;
 use crate::store::cluster_view_store::ClusterNameRecord;
 use crate::store::local_credential_store::LocalCredentialStore;
@@ -15,6 +16,9 @@ use crate::store::local_session_store::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::store::secret_master_store::MasterKeyRecord;
 use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains};
+use crate::task::container::ContainerState;
+use crate::task::manager::select_best_task_value;
+use crate::task::types::TaskValue;
 use crate::topology::health::status_to_node_status;
 use crate::topology::operation::{
     ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
@@ -667,6 +671,116 @@ impl Topology {
         Ok(updated)
     }
 
+    /// Collects non-terminal task rows currently assigned to the provided node id.
+    ///
+    /// Drain validation uses the replicated task store directly so blockers are determined from
+    /// converged cluster state instead of the local runtime cache.
+    fn active_task_values_on_node(&self, node_id: Uuid) -> Result<Vec<TaskValue>, capnp::Error> {
+        let (entries, _) = self
+            .tasks
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        let mut tasks = Vec::new();
+        for (_key, snapshot) in entries {
+            let Some(value) = select_best_task_value(snapshot.as_slice()) else {
+                continue;
+            };
+            if value.node_id != node_id || !task_blocks_node_drain(&value.state) {
+                continue;
+            }
+            tasks.push(value);
+        }
+
+        Ok(tasks)
+    }
+
+    /// Returns true when at least one schedulable node other than the drained target remains.
+    ///
+    /// The first evacuation cut does not perform deep capacity simulation, but it must reject
+    /// drains that have no possible landing node at all.
+    fn has_schedulable_replacement_node(&self, drained_node_id: Uuid) -> bool {
+        if self.node.id != drained_node_id && self.registry.peer_schedulable(self.node.id) {
+            return true;
+        }
+
+        self.registry
+            .known_peers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|peer_id| *peer_id != drained_node_id)
+            .any(|peer_id| self.registry.peer_schedulable(peer_id))
+    }
+
+    /// Rejects drain requests that the current service/task control plane cannot evacuate safely.
+    ///
+    /// Milestone 2 supports service-managed evacuation only. Standalone tasks, orphaned service
+    /// metadata, and active service transitions must fail fast so operators do not strand work on
+    /// a fenced node.
+    fn validate_node_drain_request(&self, node_id: Uuid) -> Result<(), capnp::Error> {
+        if self.registry.peer_value_unscoped(node_id).is_none() {
+            return Err(capnp::Error::failed(format!("unknown node {node_id}")));
+        }
+
+        let active_tasks = self.active_task_values_on_node(node_id)?;
+        if active_tasks.is_empty() {
+            return Ok(());
+        }
+
+        let standalone: Vec<Uuid> = active_tasks
+            .iter()
+            .filter(|task| task.service_metadata.is_none())
+            .map(|task| task.id)
+            .collect();
+        if !standalone.is_empty() {
+            return Err(capnp::Error::failed(format!(
+                "node {node_id} has {} active standalone task(s); drain requires manual stop first",
+                standalone.len()
+            )));
+        }
+
+        let service_registry = ServiceRegistry::new(self.services.clone());
+        let services = service_registry
+            .list()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let service_by_name: HashMap<_, _> = services
+            .into_iter()
+            .map(|spec| (spec.service_name.clone(), spec))
+            .collect();
+
+        let mut affected_services = HashSet::new();
+        for task in &active_tasks {
+            let Some(meta) = task.service_metadata.as_ref() else {
+                continue;
+            };
+            let Some(spec) = service_by_name.get(&meta.service_name) else {
+                return Err(capnp::Error::failed(format!(
+                    "node {node_id} has active task {} for unknown service '{}'",
+                    task.id, meta.service_name
+                )));
+            };
+            if matches!(
+                spec.status(),
+                ServiceStatus::Deploying | ServiceStatus::Stopping
+            ) {
+                return Err(capnp::Error::failed(format!(
+                    "node {node_id} cannot drain while service '{}' is {:?}",
+                    spec.service_name,
+                    spec.status()
+                )));
+            }
+            affected_services.insert(spec.service_name.clone());
+        }
+
+        if !affected_services.is_empty() && !self.has_schedulable_replacement_node(node_id) {
+            return Err(capnp::Error::failed(format!(
+                "node {node_id} has active service tasks but no schedulable replacement node"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Reads the cluster view currently bound to a session for operation relay validation.
     async fn session_cluster_view(
         session: &cluster_session::Client,
@@ -1191,6 +1305,7 @@ impl topology::Server for Topology {
         let request = params.get()?;
         let node_id = read_node_id(request.get_node_id()?)?;
         let reason = request.get_reason()?.to_string()?;
+        self.validate_node_drain_request(node_id)?;
         let scheduling = PeerSchedulingState {
             schedulable: false,
             drain_requested: true,
@@ -1531,6 +1646,17 @@ fn cluster_id_from_topology_event(
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(value);
     Ok(ClusterId::from_bytes(bytes))
+}
+
+/// Returns true when a replicated task state still represents work that blocks node drain.
+///
+/// Milestone 2 only ignores terminal task rows that no longer require runtime ownership.
+/// Non-terminal tasks must either evacuate through service reconciliation or block the request.
+fn task_blocks_node_drain(state: &ContainerState) -> bool {
+    !matches!(
+        state,
+        ContainerState::Stopped | ContainerState::Failed | ContainerState::Exited(_)
+    )
 }
 
 pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEvent, capnp::Error> {
