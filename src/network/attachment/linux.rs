@@ -36,6 +36,14 @@ impl Default for AttachmentProvisioner {
 
 impl AttachmentProvisioner {
     pub fn new() -> Result<Self> {
+        if unsafe { libc::geteuid() } != 0 {
+            debug!(
+                target: "network",
+                "running unprivileged; using stub attachment provisioner"
+            );
+            return Ok(Self::unavailable());
+        }
+
         let (connection, handle, _) =
             rtnetlink::new_connection().context("failed to open rtnetlink connection")?;
         tokio::spawn(connection);

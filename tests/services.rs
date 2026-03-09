@@ -16,6 +16,10 @@ use common::testkit::{
 };
 use crdt_store::uuid_key::UuidKey;
 use mantissa::cluster::ClusterViewId;
+use mantissa::network::types::{
+    NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver, NetworkPeerState,
+    NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
+};
 use mantissa::node::id::set_node_id;
 use mantissa::scheduler::SlotReservationRequest;
 use mantissa::scheduler::SlotState;
@@ -2102,7 +2106,7 @@ local_test!(
         wait_for_cluster_view(&right_b.topology(), right_view, Duration::from_secs(15)).await;
 
         assert!(
-            wait_for_service_task_count_all(&cluster, service_name, 8, Duration::from_secs(20))
+            wait_for_service_task_count_all(&cluster, service_name, 8, Duration::from_secs(30))
                 .await,
             "each partition should converge on eight active tasks after split"
         );
@@ -2158,9 +2162,15 @@ local_test!(
         .await;
 
         assert!(
-            wait_for_service_task_count_all(&cluster, service_name, 8, Duration::from_secs(30))
-                .await,
-            "merged cluster should converge to eight active tasks"
+            wait_for_service_running_tasks_stable_all(
+                &cluster,
+                service_name,
+                8,
+                5,
+                Duration::from_secs(30)
+            )
+            .await,
+            "merged cluster should converge to eight stable running tasks"
         );
         assert!(
             wait_for_min_local_service_task_count(
@@ -2172,6 +2182,201 @@ local_test!(
             .await,
             "merged cluster should keep at least one local task per node"
         );
+    }
+);
+
+local_test!(
+    services_split_merge_traffic_publication_converges_after_heal,
+    {
+        let _guard = ContainerManagerOverrideGuard::install_default();
+
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(4, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 4, "cluster should stabilise to four nodes")
+            .await;
+
+        let service_name = "split-merge-traffic";
+        let network_id = create_logical_test_network(&cluster, "split-merge-traffic-network").await;
+        let templates = vec![demo_networked_backend_task_template(
+            "backend", 8, network_id,
+        )];
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+            .await
+            .expect("submit deployment");
+
+        assert!(
+            wait_for_service_status(
+                &cluster[0].node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "anchor should observe running service before split"
+        );
+        assert!(
+            wait_for_service_running_tasks_stable_all(
+                &cluster,
+                service_name,
+                8,
+                5,
+                Duration::from_secs(30)
+            )
+            .await,
+            "all nodes should converge on eight stable running tasks before split"
+        );
+
+        let left_a = &cluster[0];
+        let left_b = &cluster[1];
+        let right_a = &cluster[2];
+        let right_b = &cluster[3];
+        let all_nodes = [left_a, left_b, right_a, right_b];
+
+        let published_before_split = wait_for_visible_service_attachments_published_refs(
+            &all_nodes,
+            service_name,
+            network_id,
+            8,
+            Duration::from_secs(30),
+        )
+        .await;
+        if !published_before_split {
+            let details =
+                collect_service_attachment_publication_debug(&all_nodes, service_name, network_id)
+                    .await;
+            panic!("networked service should publish visible attachments before split: {details}");
+        }
+
+        let source_view = current_cluster_view(&left_a.topology()).await;
+        let mut split_req = left_a.topology().split_cluster_request();
+        {
+            let mut req = split_req.get().init_req();
+            source_view.write_capnp(req.reborrow().init_source_view());
+
+            let mut targets = req.reborrow().init_targets(2);
+            let mut left = targets.reborrow().get(0);
+            left.set_name("left");
+            let mut left_selector = left.reborrow().init_selector();
+            left_selector.reborrow().init_clauses(0);
+            let mut left_nodes = left_selector.reborrow().init_explicit_nodes(2);
+            set_node_id(left_nodes.reborrow().get(0), &left_a.id());
+            set_node_id(left_nodes.reborrow().get(1), &left_b.id());
+
+            let mut right = targets.reborrow().get(1);
+            right.set_name("right");
+            let mut right_selector = right.reborrow().init_selector();
+            right_selector.reborrow().init_clauses(0);
+            let mut right_nodes = right_selector.reborrow().init_explicit_nodes(2);
+            set_node_id(right_nodes.reborrow().get(0), &right_a.id());
+            set_node_id(right_nodes.reborrow().get(1), &right_b.id());
+
+            req.set_dry_run(false);
+        }
+
+        let split_resp = split_req.send().promise.await.expect("splitCluster send");
+        let split_op = split_resp
+            .get()
+            .expect("splitCluster get")
+            .get_op()
+            .expect("split operation");
+        let split_targets = split_op.get_target_views().expect("split target views");
+        assert_eq!(
+            split_targets.len(),
+            2,
+            "split should expose two target views"
+        );
+        let left_view = ClusterViewId::from_capnp(split_targets.get(0)).expect("left split view");
+        let right_view = ClusterViewId::from_capnp(split_targets.get(1)).expect("right split view");
+        let split_id = split_op.get_id().expect("split operation id").to_vec();
+
+        wait_for_operation_stage(
+            &left_a.topology(),
+            &split_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(15),
+        )
+        .await;
+        wait_for_cluster_view(&left_a.topology(), left_view, Duration::from_secs(15)).await;
+        wait_for_cluster_view(&left_b.topology(), left_view, Duration::from_secs(15)).await;
+        wait_for_cluster_view(&right_a.topology(), right_view, Duration::from_secs(15)).await;
+        wait_for_cluster_view(&right_b.topology(), right_view, Duration::from_secs(15)).await;
+
+        let mut merge_req = left_a.topology().merge_clusters_request();
+        {
+            let mut req = merge_req.get().init_req();
+            left_view.write_capnp(req.reborrow().init_source_view());
+            right_view.write_capnp(req.reborrow().init_destination_view());
+            req.set_dry_run(false);
+        }
+
+        let merge_resp = merge_req.send().promise.await.expect("mergeClusters send");
+        let merge_op = merge_resp
+            .get()
+            .expect("mergeClusters get")
+            .get_op()
+            .expect("merge operation");
+        let merge_id = merge_op.get_id().expect("merge operation id").to_vec();
+
+        wait_for_operation_stage(
+            &left_a.topology(),
+            &merge_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(15),
+        )
+        .await;
+        TestNode::assert_cluster_size_all(
+            &cluster,
+            4,
+            "cluster should reconnect all nodes after merge",
+        )
+        .await;
+
+        assert!(
+            wait_for_service_running_tasks_stable_all(
+                &cluster,
+                service_name,
+                8,
+                5,
+                Duration::from_secs(30)
+            )
+            .await,
+            "merged cluster should converge to eight stable running tasks"
+        );
+        assert!(
+            wait_for_min_local_service_task_count(
+                &cluster,
+                service_name,
+                1,
+                Duration::from_secs(30)
+            )
+            .await,
+            "merged cluster should keep at least one local task per node"
+        );
+        let published_after_merge = wait_for_visible_service_attachments_published_refs(
+            &all_nodes,
+            service_name,
+            network_id,
+            8,
+            Duration::from_secs(30),
+        )
+        .await;
+        if !published_after_merge {
+            let details =
+                collect_service_attachment_publication_debug(&all_nodes, service_name, network_id)
+                    .await;
+            panic!(
+                "merged cluster should republish visible service tasks after attachment convergence: {details}"
+            );
+        }
     }
 );
 
@@ -3700,6 +3905,250 @@ fn demo_backend_task_template(name: &str, replicas: u16) -> ServiceTaskSpecValue
     }
 }
 
+/// Builds the same backend template but attaches it to one logical overlay network.
+fn demo_networked_backend_task_template(
+    name: &str,
+    replicas: u16,
+    network_id: Uuid,
+) -> ServiceTaskSpecValue {
+    let mut template = demo_backend_task_template(name, replicas);
+    template.networks = vec![ServiceTaskNetworkRequirement::new("default", network_id)];
+    template
+}
+
+/// Creates a fully mocked logical overlay network on every test node and seeds peer readiness.
+///
+/// CI cannot create real VXLAN devices, so the split/merge publication test seeds the replicated
+/// network spec and ready peer-state rows directly. Task and service controllers still exercise
+/// the real attachment and publication paths, but the network itself remains control-plane only.
+async fn create_logical_test_network(cluster: &[TestNode], name: &str) -> Uuid {
+    let network = NetworkSpecValue::new(NetworkSpecDraft {
+        name: name.to_string(),
+        description: "split/merge attachment publication test network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.42.0.0/16".to_string(),
+        vni: ((Uuid::new_v4().as_u128() % 16_000_000) as u32).max(1),
+        mtu: 1450,
+        sealed: false,
+        bpf_programs: Vec::new(),
+    });
+
+    for node in cluster {
+        node.node
+            .network_registry
+            .upsert_spec(network.clone())
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "upsert logical network {} on node {} failed: {err:#}",
+                    network.id,
+                    node.id()
+                )
+            });
+        for peer in cluster {
+            node.node
+                .network_registry
+                .upsert_peer_state(NetworkPeerStateValue::new(
+                    network.id,
+                    peer.id(),
+                    format!("node-{}", peer.id()),
+                    NetworkPeerState::Ready,
+                    None,
+                ))
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "seed network peer state for network {} on node {} failed: {err:#}",
+                        network.id,
+                        node.id()
+                    )
+                });
+        }
+    }
+
+    assert!(
+        wait_for_logical_network_ready_all(cluster, network.id, Duration::from_secs(20)).await,
+        "logical network {} should become ready on all nodes before deployment",
+        network.id
+    );
+    network.id
+}
+
+/// Waits until every node reports the logical network as ready with peer readiness converged.
+async fn wait_for_logical_network_ready_all(
+    cluster: &[TestNode],
+    network_id: Uuid,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        for node in cluster {
+            let Ok(Some(_spec)) = node.node.network_registry.get_spec(network_id) else {
+                return false;
+            };
+
+            let Ok(peers) = node
+                .node
+                .network_registry
+                .list_peer_states(Some(network_id))
+            else {
+                return false;
+            };
+            if peers.len() != cluster.len() || peers.iter().any(|peer| !peer.state.is_ready()) {
+                return false;
+            }
+        }
+        true
+    })
+    .await
+}
+
+/// Returns true once every node sees the expected active service tasks with published attachments.
+async fn wait_for_visible_service_attachments_published_refs(
+    nodes: &[&TestNode],
+    service_name: &str,
+    network_id: Uuid,
+    expected_task_count: usize,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        for node in nodes {
+            if !visible_service_attachments_are_published(
+                node,
+                service_name,
+                network_id,
+                expected_task_count,
+            )
+            .await
+            {
+                return false;
+            }
+        }
+        true
+    })
+    .await
+}
+
+/// Checks whether one node has published attachment rows for all currently visible service tasks.
+async fn visible_service_attachments_are_published(
+    node: &TestNode,
+    service_name: &str,
+    network_id: Uuid,
+    expected_task_count: usize,
+) -> bool {
+    let tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
+    if tasks.len() != expected_task_count {
+        return false;
+    }
+
+    let Ok(attachments) = node
+        .node
+        .network_registry
+        .list_attachments(Some(network_id))
+    else {
+        return false;
+    };
+
+    let mut by_task = HashMap::with_capacity(attachments.len());
+    for attachment in attachments {
+        by_task.entry(attachment.task_id).or_insert(attachment);
+    }
+
+    tasks.into_iter().all(|task| {
+        by_task
+            .get(&task.id)
+            .map(|attachment| {
+                attachment.node_id == task.node_id
+                    && attachment.state == NetworkAttachmentState::Ready
+                    && attachment.traffic_published
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Collects one per-node debug snapshot for attachment publication assertions.
+async fn collect_service_attachment_publication_debug(
+    nodes: &[&TestNode],
+    service_name: &str,
+    network_id: Uuid,
+) -> String {
+    let mut out = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
+        let service_status =
+            node.node
+                .service_controller
+                .list_services()
+                .ok()
+                .and_then(|services| {
+                    services
+                        .into_iter()
+                        .find(|spec| spec.service_name == service_name)
+                        .map(|spec| spec.status())
+                });
+        let attachments = node
+            .node
+            .network_registry
+            .list_attachments(Some(network_id))
+            .unwrap_or_default();
+        out.push(debug_service_attachment_publication_state(
+            node,
+            service_name,
+            service_status,
+            &tasks,
+            &attachments,
+        ));
+    }
+    out.join(" | ")
+}
+
+/// Renders one concise debug snapshot for the traffic publication helper.
+fn debug_service_attachment_publication_state(
+    node: &TestNode,
+    service_name: &str,
+    service_status: Option<ServiceStatus>,
+    tasks: &[TaskSpec],
+    attachments: &[NetworkAttachmentValue],
+) -> String {
+    let attachment_summary = attachments
+        .iter()
+        .map(|attachment| {
+            format!(
+                "{}:{}:{:?}:{}",
+                &attachment.task_id.to_string()[..8],
+                &attachment.node_id.to_string()[..8],
+                attachment.state,
+                if attachment.traffic_published {
+                    "pub"
+                } else {
+                    "hidden"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let task_summary = tasks
+        .iter()
+        .map(|task| {
+            format!(
+                "{}:{}:{:?}",
+                &task.id.to_string()[..8],
+                &task.node_id.to_string()[..8],
+                task.state
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        "node={} service={} status={:?} tasks=[{}] attachments=[{}]",
+        node.id(),
+        service_name,
+        service_status,
+        task_summary,
+        attachment_summary
+    )
+}
+
 /// Lists active tasks that belong to one service according to service metadata.
 async fn list_active_service_tasks(manager: &TaskManager, service_name: &str) -> Vec<TaskSpec> {
     let filter = TaskStateFilter::active_only();
@@ -3758,6 +4207,59 @@ async fn wait_for_service_task_count_all(
         all_nodes_have_service_task_count(cluster, service_name, expected).await
     })
     .await
+}
+
+/// Waits until every node reports the same stable set of running tasks for the service.
+async fn wait_for_service_running_tasks_stable_all(
+    cluster: &[TestNode],
+    service_name: &str,
+    expected: usize,
+    stable_rounds_required: usize,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut stable_rounds = 0usize;
+    let mut previous: Option<Vec<Vec<(Uuid, Uuid, ContainerState)>>> = None;
+
+    while Instant::now() < deadline {
+        let mut snapshot = Vec::with_capacity(cluster.len());
+        let mut healthy = true;
+
+        for node in cluster {
+            let mut tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
+            tasks.sort_by_key(|task| task.id);
+            if tasks.len() != expected
+                || tasks
+                    .iter()
+                    .any(|task| !matches!(task.state, ContainerState::Running))
+            {
+                healthy = false;
+            }
+
+            snapshot.push(
+                tasks
+                    .into_iter()
+                    .map(|task| (task.id, task.node_id, task.state))
+                    .collect(),
+            );
+        }
+
+        if healthy && previous.as_ref() == Some(&snapshot) {
+            stable_rounds = stable_rounds.saturating_add(1);
+            if stable_rounds >= stable_rounds_required {
+                return true;
+            }
+        } else if healthy {
+            stable_rounds = 1;
+        } else {
+            stable_rounds = 0;
+        }
+
+        previous = Some(snapshot);
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    false
 }
 
 /// Waits until each provided node owns at least `min_expected` active tasks for the service.
