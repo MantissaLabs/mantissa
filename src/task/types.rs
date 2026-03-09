@@ -35,6 +35,8 @@ pub struct TaskSpec {
     #[serde(default)]
     pub termination_grace_period_secs: Option<u32>,
     #[serde(default)]
+    pub pre_stop_command: Option<Vec<String>>,
+    #[serde(default)]
     pub env: Vec<TaskEnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,
@@ -173,6 +175,8 @@ pub struct TaskValue {
     #[serde(default)]
     pub termination_grace_period_secs: Option<u32>,
     #[serde(default)]
+    pub pre_stop_command: Option<Vec<String>>,
+    #[serde(default)]
     pub env: Vec<TaskEnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,
@@ -210,6 +214,7 @@ pub struct TaskValueDraft {
     pub gpu_count: u32,
     pub gpu_device_ids: Vec<String>,
     pub termination_grace_period_secs: Option<u32>,
+    pub pre_stop_command: Option<Vec<String>>,
     pub env: Vec<TaskEnvironmentVariable>,
     pub secret_files: Vec<TaskSecretFile>,
     pub service_metadata: Option<TaskServiceMetadata>,
@@ -243,6 +248,7 @@ impl TaskValue {
             gpu_device_ids: draft.gpu_device_ids,
             restart_policy: None,
             termination_grace_period_secs: draft.termination_grace_period_secs,
+            pre_stop_command: draft.pre_stop_command,
             env: draft.env,
             secret_files: draft.secret_files,
             service_metadata: draft.service_metadata,

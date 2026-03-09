@@ -244,6 +244,13 @@ fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) -> Resul
     builder.set_memory_bytes(task.resources.memory_bytes());
     builder.set_gpu_count(task.resources.gpu_count);
     builder.set_termination_grace_period_secs(task.termination_grace_period_secs.unwrap_or(0));
+    let pre_stop = task.pre_stop_command.as_deref().unwrap_or(&[]);
+    let mut pre_stop_builder = builder
+        .reborrow()
+        .init_pre_stop_command(pre_stop.len() as u32);
+    for (idx, arg) in pre_stop.iter().enumerate() {
+        pre_stop_builder.set(idx as u32, arg);
+    }
 
     let mut cmd_builder = builder.reborrow().init_command(task.command.len() as u32);
     for (idx, arg) in task.command.iter().enumerate() {

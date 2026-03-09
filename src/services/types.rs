@@ -195,6 +195,8 @@ pub struct ServiceTaskSpecValue {
     #[serde(default)]
     pub termination_grace_period_secs: Option<u32>,
     #[serde(default)]
+    pub pre_stop_command: Option<Vec<String>>,
+    #[serde(default)]
     pub env: Vec<TaskEnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,

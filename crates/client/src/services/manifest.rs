@@ -86,6 +86,8 @@ pub struct TaskSpec {
     #[serde(default)]
     pub termination_grace_period_secs: Option<u32>,
     #[serde(default)]
+    pub pre_stop_command: Option<Vec<String>>,
+    #[serde(default)]
     pub env: Vec<EnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<SecretFileProjection>,
@@ -201,22 +203,20 @@ impl ServiceManifest {
                 ));
             }
 
-            if task.resources.cpu_millis == 0 && task.resources.memory_mb == 0 {
-                continue;
-            }
+            if task.resources.cpu_millis != 0 || task.resources.memory_mb != 0 {
+                if task.resources.cpu_millis == 0 {
+                    return Err(anyhow!(
+                        "task '{}' must set cpu_millis when memory_mb is specified",
+                        task.name
+                    ));
+                }
 
-            if task.resources.cpu_millis == 0 {
-                return Err(anyhow!(
-                    "task '{}' must set cpu_millis when memory_mb is specified",
-                    task.name
-                ));
-            }
-
-            if task.resources.memory_mb == 0 {
-                return Err(anyhow!(
-                    "task '{}' must set memory_mb when cpu_millis is specified",
-                    task.name
-                ));
+                if task.resources.memory_mb == 0 {
+                    return Err(anyhow!(
+                        "task '{}' must set memory_mb when cpu_millis is specified",
+                        task.name
+                    ));
+                }
             }
 
             if let Some(policy) = &task.restart_policy {
@@ -236,6 +236,22 @@ impl ServiceManifest {
                         "task '{}' must set max_retry_count <= {}",
                         task.name,
                         i32::MAX
+                    ));
+                }
+            }
+
+            if let Some(command) = &task.pre_stop_command {
+                if command.is_empty() {
+                    return Err(anyhow!(
+                        "task '{}' pre_stop_command must contain at least one argument",
+                        task.name
+                    ));
+                }
+
+                if command.iter().any(|arg| arg.trim().is_empty()) {
+                    return Err(anyhow!(
+                        "task '{}' pre_stop_command cannot contain empty arguments",
+                        task.name
                     ));
                 }
             }
@@ -448,5 +464,36 @@ mod tests {
         assert_eq!(manifest.update.rolling.monitor_secs, 15);
         assert_eq!(manifest.update.rolling.max_failures, 2);
         assert!(manifest.update.rolling.auto_rollback);
+    }
+
+    #[test]
+    fn manifest_rejects_empty_pre_stop_command() {
+        let manifest = ServiceManifest {
+            name: "demo".into(),
+            tasks: vec![TaskSpec {
+                name: "api".into(),
+                image: "ghcr.io/demo/api:latest".into(),
+                command: Vec::new(),
+                replicas: 1,
+                resources: TaskResources::default(),
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: Some(Vec::new()),
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                networks: Vec::new(),
+                health_port: None,
+                health_command: None,
+                public_port: None,
+            }],
+            update: ServiceUpdateStrategy::default(),
+        };
+
+        let error = manifest.validate().expect_err("empty pre-stop must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("pre_stop_command must contain at least one argument")
+        );
     }
 }

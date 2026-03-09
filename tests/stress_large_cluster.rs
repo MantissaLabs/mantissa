@@ -124,6 +124,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
             },
             restart_policy: None,
             termination_grace_period_secs: None,
+            pre_stop_command: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             networks: Vec::new(),

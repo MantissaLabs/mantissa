@@ -42,6 +42,15 @@ use tokio::sync::{RwLock, mpsc};
 struct MockContainerManager {
     created: Arc<AsyncMutex<Vec<String>>>,
     create_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
+    exec_calls: Arc<AsyncMutex<Vec<(String, Vec<String>, Option<std::time::Duration>)>>>,
+    exec_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
+    exec_results: Arc<
+        AsyncMutex<
+            VecDeque<
+                crate::task::docker::ContainerResult<crate::task::docker::ContainerExecResult>,
+            >,
+        >,
+    >,
     stopped: Arc<AsyncMutex<Vec<String>>>,
     stop_timeouts: Arc<AsyncMutex<Vec<Option<std::time::Duration>>>>,
     stop_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
@@ -103,6 +112,26 @@ impl ContainerManager for MockContainerManager {
         self.stopped.lock().await.push(container_id.to_string());
         self.stop_timeouts.lock().await.push(timeout);
         Ok(())
+    }
+
+    async fn exec_container(
+        &self,
+        container_id: &str,
+        command: &[String],
+        timeout: Option<std::time::Duration>,
+    ) -> crate::task::docker::ContainerResult<crate::task::docker::ContainerExecResult> {
+        let delay = *self.exec_delay.lock().await;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.exec_calls
+            .lock()
+            .await
+            .push((container_id.to_string(), command.to_vec(), timeout));
+        if let Some(result) = self.exec_results.lock().await.pop_front() {
+            return result;
+        }
+        Ok(crate::task::docker::ContainerExecResult { exit_code: Some(0) })
     }
 
     async fn restart_container(
@@ -571,6 +600,7 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
             max_retry_count: None,
         }),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: Vec::new(),
@@ -633,6 +663,7 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
             max_retry_count: None,
         }),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: Vec::new(),
@@ -691,6 +722,7 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
         gpu_device_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: Vec::new(),
@@ -756,6 +788,7 @@ async fn reconcile_rejects_missing_slot_assignments() {
         gpu_device_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: Vec::new(),
@@ -807,6 +840,7 @@ async fn reconcile_pending_task_reserves_assigned_slots_before_launch() {
         gpu_device_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: Vec::new(),
@@ -870,6 +904,7 @@ async fn reconcile_uses_latest_persisted_slot_assignment() {
         gpu_device_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: Vec::new(),
@@ -987,6 +1022,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
@@ -1015,6 +1051,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
@@ -1047,6 +1084,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
@@ -1079,6 +1117,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
@@ -1118,6 +1157,7 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
@@ -1146,6 +1186,7 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
@@ -1673,6 +1714,7 @@ async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims
         gpu_device_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: Vec::new(),
@@ -1816,6 +1858,96 @@ async fn request_task_stop_uses_task_termination_grace_period() {
     let stop_timeouts = mock_cm.stop_timeouts.lock().await.clone();
     assert_eq!(stop_timeouts.len(), 1);
     assert_eq!(stop_timeouts[0], Some(std::time::Duration::from_secs(42)));
+}
+
+#[tokio::test]
+async fn request_task_stop_runs_pre_stop_hook_with_shared_shutdown_budget() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let mut spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    spec.termination_grace_period_secs = Some(5);
+    spec.pre_stop_command = Some(vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()]);
+    manager.persist_spec(&spec).await.expect("persist update");
+
+    *mock_cm.exec_delay.lock().await = Some(std::time::Duration::from_secs(2));
+
+    let requested = manager
+        .request_task_stop(spec.id)
+        .await
+        .expect("request stop");
+    manager
+        .reconcile_local_task(requested)
+        .await
+        .expect("reconcile requested stop");
+
+    let exec_calls = mock_cm.exec_calls.lock().await.clone();
+    assert_eq!(exec_calls.len(), 1);
+    assert_eq!(
+        exec_calls[0].1,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 1".to_string()
+        ]
+    );
+    let exec_timeout = exec_calls[0].2.expect("pre-stop timeout");
+    assert!(exec_timeout <= std::time::Duration::from_secs(5));
+    assert!(exec_timeout > std::time::Duration::from_secs(4));
+
+    let stop_timeouts = mock_cm.stop_timeouts.lock().await.clone();
+    assert_eq!(stop_timeouts.len(), 1);
+    let stop_timeout = stop_timeouts[0].expect("stop timeout");
+    assert!(stop_timeout < std::time::Duration::from_secs(5));
+    assert!(stop_timeout >= std::time::Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn request_task_stop_continues_after_pre_stop_hook_failure() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let mut spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    spec.pre_stop_command = Some(vec!["/bin/false".into()]);
+    manager.persist_spec(&spec).await.expect("persist update");
+
+    mock_cm.exec_results.lock().await.push_back(Err(
+        crate::task::docker::ContainerError::OperationFailed("boom".into()),
+    ));
+
+    let requested = manager
+        .request_task_stop(spec.id)
+        .await
+        .expect("request stop");
+    manager
+        .reconcile_local_task(requested)
+        .await
+        .expect("reconcile requested stop");
+
+    let exec_calls = mock_cm.exec_calls.lock().await.clone();
+    assert_eq!(exec_calls.len(), 1);
+    let stopped = mock_cm.stopped.lock().await.clone();
+    assert_eq!(stopped.len(), 1);
 }
 
 #[tokio::test]
@@ -2115,6 +2247,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 slot_ids: Vec::new(),
                 restart_policy: None,
                 termination_grace_period_secs: None,
+                pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
@@ -2133,6 +2266,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 slot_ids: Vec::new(),
                 restart_policy: None,
                 termination_grace_period_secs: None,
+                pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
@@ -2186,6 +2320,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
             slot_ids: vec![slot_spec.slot_id],
             restart_policy: None,
             termination_grace_period_secs: None,
+            pre_stop_command: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             networks: Vec::new(),
@@ -2246,6 +2381,7 @@ async fn task_owned_locally_detects_remote_entries() {
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
@@ -2302,6 +2438,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 slot_ids: Vec::new(),
                 restart_policy: None,
                 termination_grace_period_secs: None,
+                pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
@@ -2320,6 +2457,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 slot_ids: Vec::new(),
                 restart_policy: None,
                 termination_grace_period_secs: None,
+                pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 networks: Vec::new(),
@@ -2398,6 +2536,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         slot_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: vec![spec.id],
@@ -2496,6 +2635,7 @@ async fn request_task_stop_cleans_up_after_teardown_failure() {
         slot_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: vec![spec.id],
@@ -2858,6 +2998,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
@@ -2930,6 +3071,7 @@ fn build_remote_task_spec(
         gpu_device_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: Vec::new(),
@@ -3024,6 +3166,7 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
@@ -3154,6 +3297,7 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         service_metadata: None,
@@ -3255,6 +3399,7 @@ async fn attachment_ready_triggers_forwarding_event() {
         slot_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: vec![spec.id],
@@ -3353,6 +3498,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         slot_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: vec![spec_a.id, spec_b.id],
@@ -3448,6 +3594,7 @@ async fn runtime_attachments_retry_transient_provision_errors() {
         slot_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: vec![spec.id],
@@ -3547,6 +3694,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         slot_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
+        pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         networks: vec![spec.id],

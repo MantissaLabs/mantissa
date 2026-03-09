@@ -128,6 +128,7 @@ fn template_attributes_changed(
         || current.gpu_count != desired.gpu_count
         || current.restart_policy != desired.restart_policy
         || current.termination_grace_period_secs != desired.termination_grace_period_secs
+        || current.pre_stop_command != desired.pre_stop_command
         || current.env != desired.env
         || current.secret_files != desired.secret_files
         || current.networks != desired.networks

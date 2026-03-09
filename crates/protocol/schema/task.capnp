@@ -108,6 +108,9 @@ struct TaskSpec {
 
   terminationGracePeriodSecs @25 :UInt32;
   # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
+
+  preStopCommand @26 :List(Text);
+  # Optional command executed inside the container before termination begins.
 }
 
 struct ServiceMetadata {
@@ -160,6 +163,9 @@ struct TaskStartRequest {
 
   terminationGracePeriodSecs @13 :UInt32;
   # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
+
+  preStopCommand @14 :List(Text);
+  # Optional command executed inside the container before termination begins.
 }
 
 struct TaskStopRequest {

@@ -555,6 +555,7 @@ impl TaskManager {
                 gpu_device_ids: plan.gpu_device_ids.clone(),
                 restart_policy: plan.restart_policy.clone(),
                 termination_grace_period_secs: plan.termination_grace_period_secs,
+                pre_stop_command: plan.pre_stop_command.clone(),
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),
                 networks: plan.networks.clone(),

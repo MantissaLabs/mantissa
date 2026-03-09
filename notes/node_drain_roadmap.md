@@ -328,6 +328,7 @@ These are not blockers for correctness, but they improve production behavior.
 Status:
 
 Phase 1 completed on March 9, 2026.
+Phase 2 completed on March 9, 2026.
 
 Implemented:
 
@@ -337,11 +338,15 @@ Implemented:
    replica request construction, and task gossip persistence.
 3. Task stop reconciliation now uses the per-task grace period instead of a
    hard-coded 10-second stop timeout.
+4. Added optional `preStopCommand` support to service manifests, service/task
+   RPC encoding, persisted task specs, and replica launch requests.
+5. Local stop reconciliation now executes the pre-stop command inside the
+   running container before termination and spends that time from the same
+   graceful shutdown budget used by the runtime stop call.
 
 Still pending in Follow-on A:
 
-1. optional pre-stop hook support
-2. any explicit drain-only override beyond the per-task grace period
+1. any explicit drain-only override beyond the per-task grace period
 
 Add:
 

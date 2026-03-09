@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use async_channel::{Sender, TrySendError};
@@ -766,9 +766,18 @@ impl TaskManager {
                 .await?;
         }
 
+        // Pre-stop hooks and the runtime stop call share one shutdown budget so the task never
+        // exceeds its configured graceful termination window.
+        let stop_deadline = Instant::now() + task_stop_timeout(&spec);
+        self.run_pre_stop_hook(&spec, &container_identifier, stop_deadline)
+            .await;
+
         match self
             .container_manager
-            .stop_container(&container_identifier, Some(task_stop_timeout(&spec)))
+            .stop_container(
+                &container_identifier,
+                Some(remaining_stop_timeout(stop_deadline)),
+            )
             .await
         {
             Ok(_) => {}
@@ -857,6 +866,71 @@ impl TaskManager {
             );
         }
         Ok(updated)
+    }
+
+    /// Executes the task pre-stop hook inside the running container before termination begins.
+    ///
+    /// The hook is best-effort. Any failure is logged and the stop workflow continues because
+    /// drain and rollout correctness must not depend on user-provided shutdown commands.
+    async fn run_pre_stop_hook(
+        &self,
+        spec: &TaskSpec,
+        container_identifier: &str,
+        stop_deadline: Instant,
+    ) {
+        let Some(command) = spec.pre_stop_command.as_deref() else {
+            return;
+        };
+
+        let remaining = remaining_stop_timeout(stop_deadline);
+        if remaining.is_zero() {
+            warn!(
+                target: "task",
+                task = %spec.id,
+                "skipping pre-stop hook because the graceful shutdown budget is exhausted"
+            );
+            return;
+        }
+
+        match self
+            .container_manager
+            .exec_container(container_identifier, command, Some(remaining))
+            .await
+        {
+            Ok(result) => {
+                if let Some(exit_code) = result.exit_code
+                    && exit_code != 0
+                {
+                    warn!(
+                        target: "task",
+                        task = %spec.id,
+                        exit_code,
+                        "pre-stop hook exited with a non-zero status"
+                    );
+                }
+            }
+            Err(ContainerError::NotFound(_)) => {
+                debug!(
+                    target: "task",
+                    task = %spec.id,
+                    "skipping pre-stop hook because the container is already absent"
+                );
+            }
+            Err(ContainerError::Timeout) => {
+                warn!(
+                    target: "task",
+                    task = %spec.id,
+                    "pre-stop hook timed out before graceful termination completed"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    target: "task",
+                    task = %spec.id,
+                    "pre-stop hook failed: {err}"
+                );
+            }
+        }
     }
 
     /// Marks a task as failed and frees any resources it owned.
@@ -2316,6 +2390,11 @@ fn task_value_recent(value: &TaskValue, grace_secs: i64) -> bool {
 /// Resolves the effective graceful-stop timeout for one task stop workflow.
 fn task_stop_timeout(spec: &TaskSpec) -> Duration {
     Duration::from_secs(u64::from(spec.termination_grace_period_secs.unwrap_or(10)))
+}
+
+/// Computes the stop budget still available for the container runtime.
+fn remaining_stop_timeout(stop_deadline: Instant) -> Duration {
+    stop_deadline.saturating_duration_since(Instant::now())
 }
 
 /// Returns true when a task state should retain scheduler slot reservations.

@@ -363,6 +363,19 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         Some(health_cmds)
     };
 
+    let mut pre_stop_cmds = Vec::new();
+    for arg in reader.get_pre_stop_command()?.iter() {
+        let text = arg?.to_str()?.to_string();
+        if !text.is_empty() {
+            pre_stop_cmds.push(text);
+        }
+    }
+    let pre_stop_command = if pre_stop_cmds.is_empty() {
+        None
+    } else {
+        Some(pre_stop_cmds)
+    };
+
     let raw_public = reader.get_public_port();
     let public_port = if raw_public == 0 {
         None
@@ -399,6 +412,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
             0 => None,
             value => Some(value),
         },
+        pre_stop_command,
         env,
         secret_files,
         networks,
@@ -566,6 +580,13 @@ fn write_task_template(
     builder.set_memory_bytes(task.memory_bytes);
     builder.set_gpu_count(task.gpu_count);
     builder.set_termination_grace_period_secs(task.termination_grace_period_secs.unwrap_or(0));
+    let pre_stop = task.pre_stop_command.as_deref().unwrap_or(&[]);
+    let mut pre_stop_builder = builder
+        .reborrow()
+        .init_pre_stop_command(pre_stop.len() as u32);
+    for (idx, arg) in pre_stop.iter().enumerate() {
+        pre_stop_builder.set(idx as u32, arg);
+    }
 
     let mut cmd_builder = builder.reborrow().init_command(task.command.len() as u32);
     for (idx, arg) in task.command.iter().enumerate() {

@@ -15,6 +15,7 @@ use bollard::container::{
     RemoveContainerOptions, RestartContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::errors::Error as BollardError;
+use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
     DeviceRequest, EventMessageTypeEnum, HostConfig, RestartPolicy, RestartPolicyNameEnum,
 };
@@ -49,6 +50,12 @@ pub enum ContainerError {
 
 /// Result type for container operations
 pub type ContainerResult<T> = Result<T, ContainerError>;
+
+/// Exit status returned by a command executed inside a running container.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContainerExecResult {
+    pub exit_code: Option<i64>,
+}
 
 /// Normalizes low-level Docker API errors into stable container error variants.
 fn classify_container_error(container_id: &str, err: BollardError) -> ContainerError {
@@ -90,6 +97,18 @@ pub trait ContainerManager {
         container_id: &str,
         timeout: Option<Duration>,
     ) -> ContainerResult<()>;
+
+    /// Execute a non-interactive command inside a running container.
+    async fn exec_container(
+        &self,
+        _container_id: &str,
+        _command: &[String],
+        _timeout: Option<Duration>,
+    ) -> ContainerResult<ContainerExecResult> {
+        Err(ContainerError::OperationFailed(
+            "container exec is not supported by this runtime".to_string(),
+        ))
+    }
 
     /// Restart a container
     #[allow(dead_code)]
@@ -302,6 +321,53 @@ impl DockerContainerManager {
             .map(|value| value.as_secs() as i64)
             .unwrap_or(default_secs)
     }
+
+    /// Runs a non-interactive command inside a running container and waits for its exit status.
+    async fn run_exec(
+        &self,
+        container_id: &str,
+        command: &[String],
+    ) -> ContainerResult<ContainerExecResult> {
+        let exec_id = self
+            .run_container_call(
+                container_id,
+                self.docker.create_exec(
+                    container_id,
+                    CreateExecOptions::<String> {
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        cmd: Some(command.to_vec()),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await?
+            .id;
+
+        match self
+            .run_container_call(container_id, self.docker.start_exec(&exec_id, None))
+            .await?
+        {
+            StartExecResults::Attached { mut output, .. } => {
+                while let Some(frame) = output.next().await {
+                    frame.map_err(ContainerError::DockerAPI)?;
+                }
+            }
+            StartExecResults::Detached => {
+                return Err(ContainerError::OperationFailed(format!(
+                    "exec unexpectedly detached for container {container_id}"
+                )));
+            }
+        }
+
+        let inspect = self
+            .run_container_call(container_id, self.docker.inspect_exec(&exec_id))
+            .await?;
+
+        Ok(ContainerExecResult {
+            exit_code: inspect.exit_code,
+        })
+    }
 }
 
 /// Returns true when tests request the in-memory runtime through environment configuration.
@@ -405,6 +471,29 @@ impl ContainerManager for InMemoryContainerManager {
         };
         container.running = false;
         Ok(())
+    }
+
+    async fn exec_container(
+        &self,
+        container_id: &str,
+        _command: &[String],
+        _timeout: Option<Duration>,
+    ) -> ContainerResult<ContainerExecResult> {
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let containers = self.containers.lock().await;
+        let Some(container) = containers.get(&id) else {
+            return Err(Self::not_found(container_id));
+        };
+        if !container.running {
+            return Err(ContainerError::OperationFailed(format!(
+                "container {container_id} is not running"
+            )));
+        }
+
+        Ok(ContainerExecResult { exit_code: Some(0) })
     }
 
     async fn restart_container(
@@ -658,6 +747,33 @@ impl ContainerManager for DockerContainerManager {
             ),
         )
         .await
+    }
+
+    async fn exec_container(
+        &self,
+        container_id: &str,
+        command: &[String],
+        timeout: Option<Duration>,
+    ) -> ContainerResult<ContainerExecResult> {
+        if command.is_empty() {
+            return Err(ContainerError::OperationFailed(
+                "pre-stop command must contain at least one argument".to_string(),
+            ));
+        }
+
+        debug!(
+            "Executing command in container: {} ({:?})",
+            container_id, command
+        );
+
+        let exec_future = self.run_exec(container_id, command);
+        match timeout {
+            Some(limit) => match tokio::time::timeout(limit, exec_future).await {
+                Ok(result) => result,
+                Err(_) => Err(ContainerError::Timeout),
+            },
+            None => exec_future.await,
+        }
     }
 
     async fn restart_container(

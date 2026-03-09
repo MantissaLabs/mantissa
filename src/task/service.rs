@@ -176,6 +176,13 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     builder.set_memory_bytes(spec.memory_bytes);
     builder.set_gpu_count(spec.gpu_count);
     builder.set_termination_grace_period_secs(spec.termination_grace_period_secs.unwrap_or(0));
+    let pre_stop = spec.pre_stop_command.as_deref().unwrap_or(&[]);
+    let mut pre_stop_builder = builder
+        .reborrow()
+        .init_pre_stop_command(pre_stop.len() as u32);
+    for (idx, arg) in pre_stop.iter().enumerate() {
+        pre_stop_builder.set(idx as u32, arg);
+    }
     let mut gpu_builder = builder
         .reborrow()
         .init_gpu_device_ids(spec.gpu_device_ids.len() as u32);
@@ -248,6 +255,18 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     let termination_grace_period_secs = match reader.get_termination_grace_period_secs() {
         0 => None,
         value => Some(value),
+    };
+    let mut pre_stop_cmds = Vec::new();
+    for arg in reader.get_pre_stop_command()?.iter() {
+        let text = arg?.to_str()?.to_string();
+        if !text.is_empty() {
+            pre_stop_cmds.push(text);
+        }
+    }
+    let pre_stop_command = if pre_stop_cmds.is_empty() {
+        None
+    } else {
+        Some(pre_stop_cmds)
     };
     let mut gpu_device_ids = Vec::new();
     for entry in reader.get_gpu_device_ids()?.iter() {
@@ -323,6 +342,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         gpu_device_ids,
         restart_policy,
         termination_grace_period_secs,
+        pre_stop_command,
         env,
         secret_files,
         networks,
@@ -400,6 +420,18 @@ impl task::Server for TaskService {
             0 => None,
             value => Some(value),
         };
+        let mut pre_stop_command = Vec::new();
+        for arg in req.get_pre_stop_command()?.iter() {
+            let text = arg?.to_str()?.to_string();
+            if !text.is_empty() {
+                pre_stop_command.push(text);
+            }
+        }
+        let pre_stop_command = if pre_stop_command.is_empty() {
+            None
+        } else {
+            Some(pre_stop_command)
+        };
         let env = decode_env_vars(req.get_env()?)?;
         let secret_files = decode_secret_files(req.get_secret_files()?)?;
 
@@ -426,6 +458,7 @@ impl task::Server for TaskService {
             slot_ids,
             restart_policy,
             termination_grace_period_secs,
+            pre_stop_command,
             env,
             secret_files,
             networks,
@@ -515,6 +548,18 @@ impl task::Server for TaskService {
                 0 => None,
                 value => Some(value),
             };
+            let mut pre_stop_command = Vec::new();
+            for arg in entry.get_pre_stop_command()?.iter() {
+                let text = arg?.to_str()?.to_string();
+                if !text.is_empty() {
+                    pre_stop_command.push(text);
+                }
+            }
+            let pre_stop_command = if pre_stop_command.is_empty() {
+                None
+            } else {
+                Some(pre_stop_command)
+            };
 
             requests.push(TaskStartRequest {
                 name,
@@ -528,6 +573,7 @@ impl task::Server for TaskService {
                 slot_ids,
                 restart_policy,
                 termination_grace_period_secs,
+                pre_stop_command,
                 env,
                 secret_files,
                 networks,

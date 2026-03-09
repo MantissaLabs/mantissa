@@ -50,6 +50,9 @@ struct TaskTemplate {
 
   terminationGracePeriodSecs @15 :UInt32;
   # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
+
+  preStopCommand @16 :List(Text);
+  # Optional command executed inside the container before termination begins.
 }
 
 enum PublicProtocol {

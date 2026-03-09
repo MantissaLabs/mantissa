@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use mantissa::task::docker::{
-    ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager,
+    ContainerCreateRequest, ContainerError, ContainerExecResult, ContainerInfo, ContainerManager,
 };
 use mantissa::task::manager::TaskRuntimeConfig;
 use mantissa::topology_capnp::topology;
@@ -126,6 +126,29 @@ impl ContainerManager for InMemoryContainerManager {
         };
         container.running = false;
         Ok(())
+    }
+
+    async fn exec_container(
+        &self,
+        container_id: &str,
+        _command: &[String],
+        _timeout: Option<Duration>,
+    ) -> Result<ContainerExecResult, ContainerError> {
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let containers = self.containers.lock().await;
+        let Some(container) = containers.get(&id) else {
+            return Err(Self::not_found(container_id));
+        };
+        if !container.running {
+            return Err(ContainerError::OperationFailed(format!(
+                "container {container_id} is not running"
+            )));
+        }
+
+        Ok(ContainerExecResult { exit_code: Some(0) })
     }
 
     async fn restart_container(
