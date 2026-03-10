@@ -9,6 +9,8 @@ use uuid::Uuid;
 pub struct ServiceManifest {
     pub name: String,
     #[serde(default)]
+    pub volumes: Vec<VolumeSpec>,
+    #[serde(default)]
     pub tasks: Vec<TaskSpec>,
     #[serde(default)]
     pub update: ServiceUpdateStrategy,
@@ -72,6 +74,81 @@ pub struct SecretFileProjection {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct VolumeLabel {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeAccessMode {
+    ReadWriteOnce,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeBindingMode {
+    Immediate,
+    WaitForFirstConsumer,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeReclaimPolicy {
+    Retain,
+    Delete,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LocalVolumeSpec {
+    pub source: LocalVolumeSource,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalVolumeSource {
+    Managed,
+    ImportedPath(String),
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExternalVolumeSpec {
+    pub driver_name: String,
+    pub handle: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeDriver {
+    Local(LocalVolumeSpec),
+    External(ExternalVolumeSpec),
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct VolumeSpec {
+    pub name: String,
+    pub driver: VolumeDriver,
+    #[serde(default = "default_volume_access_mode")]
+    pub access_mode: VolumeAccessMode,
+    #[serde(default = "default_volume_binding_mode")]
+    pub binding_mode: VolumeBindingMode,
+    #[serde(default = "default_volume_reclaim_policy")]
+    pub reclaim_policy: VolumeReclaimPolicy,
+    #[serde(default)]
+    pub capacity_mb: Option<u64>,
+    #[serde(default)]
+    pub labels: Vec<VolumeLabel>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct VolumeMount {
+    pub source: String,
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct TaskSpec {
     pub name: String,
     pub image: String,
@@ -91,6 +168,8 @@ pub struct TaskSpec {
     pub env: Vec<EnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<SecretFileProjection>,
+    #[serde(default)]
+    pub volumes: Vec<VolumeMount>,
     #[serde(default)]
     pub networks: Vec<String>,
     #[serde(default)]
@@ -161,6 +240,48 @@ impl ServiceManifest {
 
         if self.tasks.is_empty() {
             return Err(anyhow!("service manifest must define at least one task"));
+        }
+
+        let mut declared_volume_names = HashSet::new();
+        for volume in &self.volumes {
+            let name = volume.name.trim();
+            if name.is_empty() {
+                return Err(anyhow!("volume name cannot be empty"));
+            }
+            if !declared_volume_names.insert(name.to_string()) {
+                return Err(anyhow!("volume '{}' is declared multiple times", name));
+            }
+            for label in &volume.labels {
+                if label.key.trim().is_empty() {
+                    return Err(anyhow!(
+                        "volume '{}' defines a label with an empty key",
+                        volume.name
+                    ));
+                }
+            }
+            if let Some(capacity_mb) = volume.capacity_mb
+                && capacity_mb == 0
+            {
+                return Err(anyhow!(
+                    "volume '{}' must set capacity_mb to a value greater than zero when provided",
+                    volume.name
+                ));
+            }
+            if matches!(volume.binding_mode, VolumeBindingMode::Immediate)
+                && matches!(
+                    volume.driver,
+                    VolumeDriver::Local(LocalVolumeSpec {
+                        source: LocalVolumeSource::Managed
+                    })
+                )
+            {
+                // Immediate binding requires a node selection at object creation time rather than
+                // from the service manifest, so reject it early in Milestone 1.
+                return Err(anyhow!(
+                    "volume '{}' uses immediate binding, which must be created ahead of deployment through `mantissa volumes create --binding immediate --node ...`",
+                    volume.name
+                ));
+            }
         }
 
         for task in &self.tasks {
@@ -339,6 +460,60 @@ impl ServiceManifest {
                 }
             }
 
+            let mut seen_mount_targets = HashSet::new();
+            for mount in &task.volumes {
+                let source = mount.source.trim();
+                if source.is_empty() {
+                    return Err(anyhow!(
+                        "task '{}' references a volume with an empty source name",
+                        task.name
+                    ));
+                }
+                if !declared_volume_names.contains(source) {
+                    return Err(anyhow!(
+                        "task '{}' references undeclared volume '{}'",
+                        task.name,
+                        source
+                    ));
+                }
+                if mount.target.trim().is_empty() {
+                    return Err(anyhow!(
+                        "task '{}' volume '{}' target cannot be empty",
+                        task.name,
+                        source
+                    ));
+                }
+                if !mount.target.starts_with('/') {
+                    return Err(anyhow!(
+                        "task '{}' volume '{}' target '{}' must be an absolute path",
+                        task.name,
+                        source,
+                        mount.target
+                    ));
+                }
+                if !seen_mount_targets.insert(mount.target.clone()) {
+                    return Err(anyhow!(
+                        "task '{}' mounts multiple volumes at '{}'",
+                        task.name,
+                        mount.target
+                    ));
+                }
+                if task.replicas > 1 {
+                    let volume = self
+                        .volumes
+                        .iter()
+                        .find(|volume| volume.name == source)
+                        .ok_or_else(|| anyhow!("volume lookup failed for '{}'", source))?;
+                    if matches!(volume.access_mode, VolumeAccessMode::ReadWriteOnce) {
+                        return Err(anyhow!(
+                            "task '{}' cannot use read_write_once volume '{}' with replicas > 1",
+                            task.name,
+                            source
+                        ));
+                    }
+                }
+            }
+
             let mut seen_networks = HashSet::new();
             for network in &task.networks {
                 let trimmed = network.trim();
@@ -394,6 +569,18 @@ pub fn load_manifest_from_path(path: &Path) -> Result<ServiceManifest> {
 
 fn default_replicas() -> u16 {
     1
+}
+
+fn default_volume_access_mode() -> VolumeAccessMode {
+    VolumeAccessMode::ReadWriteOnce
+}
+
+fn default_volume_binding_mode() -> VolumeBindingMode {
+    VolumeBindingMode::WaitForFirstConsumer
+}
+
+fn default_volume_reclaim_policy() -> VolumeReclaimPolicy {
+    VolumeReclaimPolicy::Retain
 }
 
 fn default_rollout_parallelism() -> u16 {
@@ -470,6 +657,7 @@ mod tests {
     fn manifest_rejects_empty_pre_stop_command() {
         let manifest = ServiceManifest {
             name: "demo".into(),
+            volumes: Vec::new(),
             tasks: vec![TaskSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
@@ -481,6 +669,7 @@ mod tests {
                 pre_stop_command: Some(Vec::new()),
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                volumes: Vec::new(),
                 networks: Vec::new(),
                 health_port: None,
                 health_command: None,
@@ -494,6 +683,94 @@ mod tests {
             error
                 .to_string()
                 .contains("pre_stop_command must contain at least one argument")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_missing_volume_reference() {
+        let manifest = ServiceManifest {
+            name: "demo".into(),
+            volumes: Vec::new(),
+            tasks: vec![TaskSpec {
+                name: "api".into(),
+                image: "ghcr.io/demo/api:latest".into(),
+                command: Vec::new(),
+                replicas: 1,
+                resources: TaskResources::default(),
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: vec![VolumeMount {
+                    source: "pgdata".into(),
+                    target: "/data".into(),
+                    read_only: false,
+                }],
+                networks: Vec::new(),
+                health_port: None,
+                health_command: None,
+                public_port: None,
+            }],
+            update: ServiceUpdateStrategy::default(),
+        };
+
+        let error = manifest
+            .validate()
+            .expect_err("undeclared volume must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("references undeclared volume 'pgdata'")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_rwo_volume_with_replicas_gt_one() {
+        let manifest = ServiceManifest {
+            name: "demo".into(),
+            volumes: vec![VolumeSpec {
+                name: "pgdata".into(),
+                driver: VolumeDriver::Local(LocalVolumeSpec {
+                    source: LocalVolumeSource::Managed,
+                }),
+                access_mode: VolumeAccessMode::ReadWriteOnce,
+                binding_mode: VolumeBindingMode::WaitForFirstConsumer,
+                reclaim_policy: VolumeReclaimPolicy::Retain,
+                capacity_mb: Some(1024),
+                labels: Vec::new(),
+            }],
+            tasks: vec![TaskSpec {
+                name: "api".into(),
+                image: "ghcr.io/demo/api:latest".into(),
+                command: Vec::new(),
+                replicas: 2,
+                resources: TaskResources::default(),
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: vec![VolumeMount {
+                    source: "pgdata".into(),
+                    target: "/data".into(),
+                    read_only: false,
+                }],
+                networks: Vec::new(),
+                health_port: None,
+                health_command: None,
+                public_port: None,
+            }],
+            update: ServiceUpdateStrategy::default(),
+        };
+
+        let error = manifest
+            .validate()
+            .expect_err("replicated rwo volume must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot use read_write_once volume 'pgdata' with replicas > 1")
         );
     }
 }

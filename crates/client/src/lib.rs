@@ -12,3 +12,4 @@ pub mod secrets;
 pub mod services;
 pub mod tasks;
 pub mod token;
+pub mod volumes;

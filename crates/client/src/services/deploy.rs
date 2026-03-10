@@ -1,6 +1,6 @@
 use super::manifest::{
     EnvironmentVariable, RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference,
-    ServiceManifest, ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskSpec,
+    ServiceManifest, ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskSpec, VolumeMount,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -71,6 +71,28 @@ async fn ensure_manifest_networks(cfg: &ClientConfig, manifest: &ServiceManifest
                 return Err(err);
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Rejects manifests that declare or mount volumes until scheduler locality and runtime mounts land.
+fn ensure_manifest_volumes_supported(manifest: &ServiceManifest) -> Result<()> {
+    let has_declared_volumes = !manifest.volumes.is_empty();
+    let mounted: Vec<(&str, &VolumeMount)> = manifest
+        .tasks
+        .iter()
+        .flat_map(|task| {
+            task.volumes
+                .iter()
+                .map(move |mount| (task.name.as_str(), mount))
+        })
+        .collect();
+
+    if has_declared_volumes || !mounted.is_empty() {
+        return Err(anyhow!(
+            "volume-backed service deployments are not implemented yet; create and inspect volume objects now, then wait for scheduler locality and task mounts in the next milestone"
+        ));
     }
 
     Ok(())
@@ -156,6 +178,7 @@ pub async fn deploy_manifest(
     manifest: &ServiceManifest,
 ) -> Result<ServiceDeploymentHandle> {
     let manifest_id = Uuid::new_v4();
+    ensure_manifest_volumes_supported(manifest)?;
     ensure_manifest_networks(cfg, manifest).await?;
 
     let client = connection::get_local_session(cfg).await?;

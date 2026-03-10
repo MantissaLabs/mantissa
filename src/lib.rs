@@ -2,7 +2,7 @@
 
 pub use protocol::{
     gossip_capnp, health_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
-    topology_capnp,
+    topology_capnp, volumes_capnp,
 };
 
 pub mod cli;
@@ -25,3 +25,4 @@ pub mod sync;
 pub mod task;
 pub mod token;
 pub mod topology;
+pub mod volumes;

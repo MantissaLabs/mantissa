@@ -106,6 +106,7 @@ fn write_stress_config(root: &Path) -> Result<PathBuf> {
 fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
     ServiceManifest {
         name: name.to_string(),
+        volumes: Vec::new(),
         update: ServiceUpdateStrategy::default(),
         tasks: vec![ManifestTaskSpec {
             name: "stress-backend".to_string(),
@@ -127,6 +128,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
             pre_stop_command: None,
             env: Vec::new(),
             secret_files: Vec::new(),
+            volumes: Vec::new(),
             networks: Vec::new(),
             health_port: None,
             health_command: None,
@@ -1123,6 +1125,8 @@ fn domain_label(domain: Domain) -> &'static str {
         Domain::NetworkPeers => "network_peers",
         Domain::NetworkAttachments => "network_attachments",
         Domain::ClusterViews => "cluster_views",
+        Domain::Volumes => "volumes",
+        Domain::VolumeNodes => "volume_nodes",
     }
 }
 

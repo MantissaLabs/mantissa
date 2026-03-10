@@ -19,6 +19,8 @@ use crate::task::types::{TaskEvent, TaskSpec};
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
+use crate::volumes::service::{read_volume_event, write_volume_event};
+use crate::volumes::types::VolumeEvent;
 use async_channel::{Receiver, Sender, TrySendError};
 use async_trait::async_trait;
 use capnp::Error;
@@ -85,6 +87,7 @@ pub enum Message {
     Service { id: Uuid, event: ServiceEvent },
     Network { id: Uuid, event: NetworkEvent },
     Secret { id: Uuid, event: SecretEvent },
+    Volume { id: Uuid, event: VolumeEvent },
     // Scheduling(SchedulingEvent),
 }
 
@@ -96,7 +99,8 @@ impl Message {
             | Message::Task { id, .. }
             | Message::Service { id, .. }
             | Message::Network { id, .. }
-            | Message::Secret { id, .. } => *id,
+            | Message::Secret { id, .. }
+            | Message::Volume { id, .. } => *id,
         }
     }
 }
@@ -410,6 +414,7 @@ pub struct Channels {
     pub service_events: Sender<Message>,
     pub network_events: Sender<Message>,
     pub secret_events: Sender<Message>,
+    pub volume_events: Sender<Message>,
     /// Shared outbound queue so newly received gossip can be forwarded to additional peers.
     pub outbound_events: Sender<Message>,
     // scheduling_events: Sender<SchedulingEvent>,
@@ -443,6 +448,7 @@ impl gossip::Server for Gossip {
         let service_tx = self.chans.service_events.clone();
         let network_tx = self.chans.network_events.clone();
         let secret_tx = self.chans.secret_events.clone();
+        let volume_tx = self.chans.volume_events.clone();
         let outbound_tx = self.chans.outbound_events.clone();
         let relay_inbound = gossip_relay_inbound_from_env();
 
@@ -527,6 +533,7 @@ impl gossip::Server for Gossip {
                 Service(_) => "service",
                 Network(_) => "network",
                 Secret(_) => "secret",
+                Volume(_) => "volume",
             };
             debug!(
                 target: "gossip",
@@ -619,6 +626,21 @@ impl gossip::Server for Gossip {
                 },
                 Secret(Err(e)) => {
                     eprintln!("Error reading secret: {e}");
+                }
+                Volume(Ok(reader)) => match read_volume_event(reader) {
+                    Ok(event) => {
+                        let message = Message::Volume { id, event };
+                        if should_relay_inbound_message(relay_inbound, &message) {
+                            forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
+                        }
+                        volume_tx.send(message).await.map_err(|e| {
+                            capnp::Error::failed(format!("Couldn't send event to volumes: {e}"))
+                        })?;
+                    }
+                    Err(e) => eprintln!("Failed to convert volume event: {e}"),
+                },
+                Volume(Err(e)) => {
+                    eprintln!("Error reading volume: {e}");
                 }
             }
         }
@@ -1025,6 +1047,10 @@ where
                 let secret_builder = builder.init_secret();
                 write_secret_event(secret_builder, event)?;
             }
+            Message::Volume { event, .. } => {
+                let volume_builder = builder.init_volume();
+                write_volume_event(volume_builder, event)?;
+            }
         }
     }
 
@@ -1078,6 +1104,7 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
         Message::Service { .. } => false,
         Message::Network { .. } => false,
         Message::Secret { .. } => false,
+        Message::Volume { .. } => false,
     }
 }
 

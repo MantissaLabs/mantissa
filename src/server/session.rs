@@ -2,7 +2,7 @@ use crate::cluster::ClusterViewId;
 use protocol::{
     gossip::gossip, health::health, network::networks, node::node, scheduling::scheduler,
     secrets::secrets, server::cluster_session, services::services, sync::sync, task::task,
-    topology::topology,
+    topology::topology, volumes::volumes,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ pub struct ClusterSessionClients {
     pub services: services::Client,
     pub secrets: secrets::Client,
     pub networks: networks::Client,
+    pub volumes: volumes::Client,
 }
 
 #[derive(Clone)]
@@ -71,6 +72,7 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_services(self.clients.services.clone());
         caps.set_secrets(self.clients.secrets.clone());
         caps.set_networks(self.clients.networks.clone());
+        caps.set_volumes(self.clients.volumes.clone());
         self.cluster_view
             .write_capnp(caps.reborrow().init_active_view());
 
@@ -173,6 +175,18 @@ impl cluster_session::Server for ClusterSessionImpl {
         self.ensure_online()?;
 
         results.get().set_networks(self.clients.networks.clone());
+        Ok(())
+    }
+
+    /// Returns the volumes capability for cluster-scoped volume operations.
+    async fn get_volumes(
+        self: Rc<Self>,
+        _params: cluster_session::GetVolumesParams,
+        mut results: cluster_session::GetVolumesResults,
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
+
+        results.get().set_volumes(self.clients.volumes.clone());
         Ok(())
     }
 

@@ -709,6 +709,10 @@ shape so we do not box ourselves into a local-only metadata design.
 
 Create and inspect first-class volume objects without task mounting yet.
 
+### Status
+
+Completed on March 10, 2026.
+
 ### Scope
 
 1. add `VolumeSpecValue` and `VolumeNodeStateValue`,

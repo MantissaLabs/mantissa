@@ -14,3 +14,4 @@ pub mod secret_store;
 pub mod service_store;
 pub mod task_store;
 pub(crate) mod tx;
+pub mod volume_store;

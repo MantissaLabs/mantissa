@@ -32,12 +32,16 @@ use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::{SecretStore, open_secret_store};
 use crate::store::service_store::{ServiceStore, open_service_store};
 use crate::store::task_store::{TaskStore, open_task_store};
+use crate::store::volume_store::{
+    VolumeNodeStore, VolumeSpecStore, open_volume_node_store, open_volume_spec_store,
+};
 use crate::sync::{SyncService, SyncStores};
 use crate::task::docker::{self, ContainerManager, DockerContainerManager};
 use crate::task::manager::{TaskManager, TaskManagerConfig, TaskRuntimeConfig};
 use crate::task::service::TaskService;
 use crate::token::TokenStore;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyStores};
+use crate::volumes::{VolumeRegistry, VolumeReplicator, VolumesRpc};
 use crate::{config, node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
@@ -47,6 +51,7 @@ use protocol::secrets::secrets::Client as SecretsClient;
 use protocol::server::server::Client as ServerClient;
 use protocol::services::services::Client as ServicesClient;
 use protocol::topology::topology::Client as TopologyClient;
+use protocol::volumes::volumes::Client as VolumesClient;
 
 use tokio::sync::{RwLock, mpsc};
 
@@ -167,6 +172,8 @@ pub(crate) struct Stores {
     pub networks: NetworkSpecStore,
     pub network_peers: NetworkPeerStore,
     pub network_attachments: NetworkAttachmentStore,
+    pub volumes: VolumeSpecStore,
+    pub volume_nodes: VolumeNodeStore,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
@@ -187,12 +194,16 @@ pub(crate) struct Components {
     pub secret_registry: SecretRegistry,
     pub secrets_client: SecretsClient,
     pub networks_client: NetworksClient,
+    pub volumes_client: VolumesClient,
     #[allow(dead_code)]
     pub network_registry: NetworkRegistry,
+    #[allow(dead_code)]
+    pub volume_registry: VolumeRegistry,
     #[allow(dead_code)]
     pub network_controller: NetworkController,
     pub network_gossiper: NetworkGossiper,
     pub secret_replicator: SecretReplicator,
+    pub volume_replicator: VolumeReplicator,
 }
 
 impl Bootstrap {
@@ -306,6 +317,10 @@ impl Bootstrap {
 
         let network_attachments = open_network_attachment_store(ctx.db.clone(), ctx.self_id)?;
         network_attachments.rebuild_mst_from_disk().await?;
+        let volumes = open_volume_spec_store(ctx.db.clone(), ctx.self_id)?;
+        volumes.rebuild_mst_from_disk().await?;
+        let volume_nodes = open_volume_node_store(ctx.db.clone(), ctx.self_id)?;
+        volume_nodes.rebuild_mst_from_disk().await?;
 
         Ok(Stores {
             peers,
@@ -323,6 +338,8 @@ impl Bootstrap {
             networks,
             network_peers,
             network_attachments,
+            volumes,
+            volume_nodes,
             secret_keyring,
         })
     }
@@ -349,6 +366,8 @@ impl Bootstrap {
             async_channel::bounded(channel_capacity);
         let (secret_tx, secret_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(channel_capacity);
+        let (volume_tx, volume_rx): (Sender<Message>, Receiver<Message>) =
+            async_channel::bounded(channel_capacity);
         // Restore the last committed active view first; fallback to legacy view when absent.
         let persisted_active_view = stores
             .cluster_view
@@ -372,6 +391,7 @@ impl Bootstrap {
                 service_events: service_tx.clone(),
                 network_events: network_tx.clone(),
                 secret_events: secret_tx.clone(),
+                volume_events: volume_tx.clone(),
                 outbound_events: gossip_tx.clone(),
             },
             cluster_view.clone(),
@@ -398,6 +418,8 @@ impl Bootstrap {
             networks: stores.networks.clone(),
             network_peers: stores.network_peers.clone(),
             network_attachments: stores.network_attachments.clone(),
+            volumes: stores.volumes.clone(),
+            volume_nodes: stores.volume_nodes.clone(),
             secret_keyring: stores.secret_keyring.clone(),
         };
 
@@ -493,6 +515,8 @@ impl Bootstrap {
                 network_peers: stores.network_peers.clone(),
                 network_attachments: stores.network_attachments.clone(),
                 cluster_views: stores.cluster_view.cluster_view_domain_store(),
+                volumes: stores.volumes.clone(),
+                volume_nodes: stores.volume_nodes.clone(),
             },
         );
         let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
@@ -508,6 +532,10 @@ impl Bootstrap {
         let secret_registry = SecretRegistry::new(stores.secrets.clone());
         let secret_replicator =
             SecretReplicator::new(secret_registry.clone(), gossip_tx.clone(), secret_rx);
+        let volume_registry =
+            VolumeRegistry::new(stores.volumes.clone(), stores.volume_nodes.clone());
+        let volume_replicator =
+            VolumeReplicator::new(volume_registry.clone(), gossip_tx.clone(), volume_rx);
 
         let container_manager: Arc<dyn ContainerManager + Send + Sync> =
             if let Some(manager) = container_manager_override {
@@ -599,6 +627,13 @@ impl Bootstrap {
             secret_replicator.clone(),
         );
         let secrets_client_cap: SecretsClient = capnp_rpc::new_client(secrets_service);
+        let volumes_service = VolumesRpc::new(
+            volume_registry.clone(),
+            registry.clone(),
+            topology.clone(),
+            volume_replicator.clone(),
+        );
+        let volumes_client_cap: VolumesClient = capnp_rpc::new_client(volumes_service);
 
         let scheduler_service =
             SchedulerService::new(scheduler.clone(), ctx.self_id, local_node_name.clone());
@@ -620,10 +655,13 @@ impl Bootstrap {
                 secret_registry,
                 secrets_client: secrets_client_cap,
                 networks_client: networks_client_cap,
+                volumes_client: volumes_client_cap,
                 network_registry,
+                volume_registry,
                 network_controller,
                 network_gossiper,
                 secret_replicator,
+                volume_replicator,
             },
             gossip_rx,
             gossip_dedupe,
@@ -650,6 +688,7 @@ impl Bootstrap {
             services_client: comps.services_client.clone(),
             secrets_client: comps.secrets_client.clone(),
             networks_client: comps.networks_client.clone(),
+            volumes_client: comps.volumes_client.clone(),
         };
 
         let stores_bundle = ServerStores {
@@ -735,6 +774,11 @@ impl Bootstrap {
         let secret_replicator = comps.secret_replicator.clone();
         tokio::task::spawn_local(async move {
             secret_replicator.run().await;
+        });
+
+        let volume_replicator = comps.volume_replicator.clone();
+        tokio::task::spawn_local(async move {
+            volume_replicator.run().await;
         });
 
         let gossiper = comps.network_gossiper.clone();

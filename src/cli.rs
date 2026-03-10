@@ -165,6 +165,17 @@ pub enum Command {
         cmd: NetworksCommand,
     },
 
+    /// Volume management subcommands
+    #[command(
+        alias = "vol",
+        subcommand_required = true,
+        arg_required_else_help = true
+    )]
+    Volumes {
+        #[command(subcommand)]
+        cmd: VolumesCommand,
+    },
+
     /// Submit a job to the cluster
     Submit(SubmitArgs),
 }
@@ -573,6 +584,18 @@ pub enum NetworkDriverOpt {
     Vxlan,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum VolumeBindingOpt {
+    Immediate,
+    WaitForFirstConsumer,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum VolumeReclaimOpt {
+    Retain,
+    Delete,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum NetworksCommand {
     /// Create a new overlay network in the cluster
@@ -593,6 +616,28 @@ pub enum NetworksCommand {
 
     /// List network attachments and their assigned addresses
     Attachments(NetworksAttachmentsArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VolumesCommand {
+    /// Create a managed local volume
+    Create(VolumesCreateArgs),
+
+    /// Import an existing host path as a local volume
+    Import(VolumesImportArgs),
+
+    /// List known volumes
+    #[command(alias = "ls")]
+    List,
+
+    /// Inspect the canonical volume object
+    Inspect(VolumesInspectArgs),
+
+    /// Show node-local realization state for one volume
+    Status(VolumesStatusArgs),
+
+    /// Delete a volume object
+    Delete(VolumesDeleteArgs),
 }
 
 #[derive(Args, Debug)]
@@ -681,6 +726,81 @@ pub struct NetworksAttachmentsArgs {
     /// Network UUID whose attachments should be listed
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct VolumesCreateArgs {
+    /// Human-friendly volume name
+    #[arg(long = "name", value_name = "NAME")]
+    pub name: String,
+
+    /// Volume binding policy
+    #[arg(
+        long = "binding",
+        value_enum,
+        default_value = "wait-for-first-consumer"
+    )]
+    pub binding: VolumeBindingOpt,
+
+    /// Volume reclaim policy
+    #[arg(long = "reclaim", value_enum, default_value = "retain")]
+    pub reclaim: VolumeReclaimOpt,
+
+    /// Optional capacity hint in MiB
+    #[arg(long = "capacity-mb", value_name = "MIB")]
+    pub capacity_mb: Option<u64>,
+
+    /// Optional labels in KEY=VALUE form (repeat flag to add multiple labels)
+    #[arg(long = "label", value_name = "KEY=VALUE", action = ArgAction::Append)]
+    pub labels: Vec<String>,
+
+    /// Bound node selector when using immediate binding (UUID or hostname)
+    #[arg(long = "node", value_name = "NODE")]
+    pub node: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct VolumesImportArgs {
+    /// Human-friendly volume name
+    #[arg(long = "name", value_name = "NAME")]
+    pub name: String,
+
+    /// Node selector hosting the imported path (UUID or hostname)
+    #[arg(long = "node", value_name = "NODE")]
+    pub node: String,
+
+    /// Absolute host path to import
+    #[arg(long = "path", value_name = "PATH")]
+    pub path: PathBuf,
+
+    /// Optional capacity hint in MiB
+    #[arg(long = "capacity-mb", value_name = "MIB")]
+    pub capacity_mb: Option<u64>,
+
+    /// Optional labels in KEY=VALUE form (repeat flag to add multiple labels)
+    #[arg(long = "label", value_name = "KEY=VALUE", action = ArgAction::Append)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct VolumesInspectArgs {
+    /// Volume UUID or name to inspect
+    #[arg(index = 1, value_name = "ID-OR-NAME")]
+    pub selector: String,
+}
+
+#[derive(Args, Debug)]
+pub struct VolumesStatusArgs {
+    /// Volume UUID or name to query
+    #[arg(index = 1, value_name = "ID-OR-NAME")]
+    pub selector: String,
+}
+
+#[derive(Args, Debug)]
+pub struct VolumesDeleteArgs {
+    /// Volume UUID or name to delete
+    #[arg(index = 1, value_name = "ID-OR-NAME")]
+    pub selector: String,
 }
 
 #[derive(Args, Debug)]

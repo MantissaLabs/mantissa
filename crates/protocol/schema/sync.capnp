@@ -26,6 +26,12 @@ enum Domain {
 
   clusterViews @7;
   # Cluster view lineage metadata domain (names, future view-scoped metadata).
+
+  volumes @8;
+  # Volume registry domain.
+
+  volumeNodes @9;
+  # Volume node-state registry domain.
 }
 
 struct PageRange {

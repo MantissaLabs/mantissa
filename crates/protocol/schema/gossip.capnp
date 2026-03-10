@@ -6,6 +6,7 @@ using import "task.capnp".TaskEvent;
 using import "services.capnp".ServiceEvent;
 using import "network.capnp".NetworkEvent;
 using import "secrets.capnp".SecretEvent;
+using import "volumes.capnp".VolumeEvent;
 
 interface Gossip {
   # Gossip defines operations or event notifications to
@@ -49,6 +50,9 @@ struct GossipMessage {
 
     secret @6 :SecretEvent;
     # Secret upsert/remove event.
+
+    volume @8 :VolumeEvent;
+    # Volume upsert/remove event.
   }
 }
 

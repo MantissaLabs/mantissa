@@ -1456,6 +1456,8 @@ impl topology::Server for Topology {
             network_peers: self.network_peers.clone(),
             network_attachments: self.network_attachments.clone(),
             cluster_views: self.cluster_view_store.cluster_view_domain_store(),
+            volumes: self.volumes.clone(),
+            volume_nodes: self.volume_nodes.clone(),
         };
 
         let sync_trace = SyncTraceContext::peer(peer_id, peer_value.address.clone(), "join");

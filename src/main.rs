@@ -24,6 +24,7 @@ mod sync;
 mod task;
 mod token;
 mod topology;
+mod volumes;
 
 use clap::Parser;
 use protocol::{info_capnp, node_capnp, topology_capnp};
@@ -338,6 +339,62 @@ async fn main() -> Result<(), Box<dyn Error>> {
             NetworksCommand::Attachments(args) => {
                 local
                     .run_until(client::networks::attachments(&cfg, &args.id))
+                    .await?;
+            }
+        },
+
+        Command::Volumes { cmd } => match cmd {
+            VolumesCommand::Create(args) => {
+                let binding = match args.binding {
+                    VolumeBindingOpt::Immediate => client::volumes::VolumeBindingMode::Immediate,
+                    VolumeBindingOpt::WaitForFirstConsumer => {
+                        client::volumes::VolumeBindingMode::WaitForFirstConsumer
+                    }
+                };
+                let reclaim = match args.reclaim {
+                    VolumeReclaimOpt::Retain => client::volumes::VolumeReclaimPolicy::Retain,
+                    VolumeReclaimOpt::Delete => client::volumes::VolumeReclaimPolicy::Delete,
+                };
+                local
+                    .run_until(client::volumes::create(
+                        &cfg,
+                        &args.name,
+                        binding,
+                        reclaim,
+                        args.capacity_mb,
+                        &args.labels,
+                        args.node,
+                    ))
+                    .await?;
+            }
+            VolumesCommand::Import(args) => {
+                local
+                    .run_until(client::volumes::import(
+                        &cfg,
+                        &args.name,
+                        &args.node,
+                        &args.path.to_string_lossy(),
+                        args.capacity_mb,
+                        &args.labels,
+                    ))
+                    .await?;
+            }
+            VolumesCommand::List => {
+                local.run_until(client::volumes::list(&cfg)).await?;
+            }
+            VolumesCommand::Inspect(args) => {
+                local
+                    .run_until(client::volumes::inspect(&cfg, &args.selector))
+                    .await?;
+            }
+            VolumesCommand::Status(args) => {
+                local
+                    .run_until(client::volumes::status(&cfg, &args.selector))
+                    .await?;
+            }
+            VolumesCommand::Delete(args) => {
+                local
+                    .run_until(client::volumes::delete(&cfg, &args.selector))
                     .await?;
             }
         },

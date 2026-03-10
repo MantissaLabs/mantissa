@@ -13,6 +13,7 @@ capnp::generated_code!(pub mod task_capnp);
 capnp::generated_code!(pub mod services_capnp);
 capnp::generated_code!(pub mod secrets_capnp);
 capnp::generated_code!(pub mod network_capnp);
+capnp::generated_code!(pub mod volumes_capnp);
 
 // Flatten inner interface modules (e.g., protocol::gossip::Client),
 // while preserving existing paths (e.g., protocol::gossip::gossip::Client).
@@ -93,4 +94,10 @@ pub mod network {
     pub use super::network_capnp::networks;
     pub use super::network_capnp::*;
     pub type NetworksClient = super::network_capnp::networks::Client;
+}
+
+pub mod volumes {
+    pub use super::volumes_capnp::volumes;
+    pub use super::volumes_capnp::*;
+    pub type VolumesClient = super::volumes_capnp::volumes::Client;
 }

@@ -8,9 +8,11 @@ use crate::store::peer_store::PeersStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
+use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use crate::task::types::TaskValue;
 use crate::topology::peers::PeerValue;
+use crate::volumes::types::{VolumeNodeStateValue, VolumeSpecValue};
 use async_trait::async_trait;
 use bincode;
 use capnp_rpc::new_client;
@@ -23,7 +25,7 @@ use tracing::{debug, warn};
 
 type RegisterDelta<V> = Vec<(UuidKey, MVReg<V, uuid::Uuid>)>;
 type TombstoneDelta = Vec<(UuidKey, u64)>;
-const ALL_SYNC_DOMAINS: [Domain; 8] = [
+const ALL_SYNC_DOMAINS: [Domain; 10] = [
     Domain::Peers,
     Domain::Tasks,
     Domain::Services,
@@ -32,6 +34,8 @@ const ALL_SYNC_DOMAINS: [Domain; 8] = [
     Domain::NetworkPeers,
     Domain::NetworkAttachments,
     Domain::ClusterViews,
+    Domain::Volumes,
+    Domain::VolumeNodes,
 ];
 
 #[derive(Clone)]
@@ -44,6 +48,8 @@ pub struct SyncStores {
     pub network_peers: NetworkPeerStore,
     pub network_attachments: NetworkAttachmentStore,
     pub cluster_views: ClusterViewDomainStore,
+    pub volumes: VolumeSpecStore,
+    pub volume_nodes: VolumeNodeStore,
 }
 
 /// Carries one peer-scoped context for anti-entropy diagnostics.
@@ -78,6 +84,8 @@ impl SyncStores {
             Domain::NetworkPeers => self.network_peers.root_hex().await,
             Domain::NetworkAttachments => self.network_attachments.root_hex().await,
             Domain::ClusterViews => self.cluster_views.root_hex().await,
+            Domain::Volumes => self.volumes.root_hex().await,
+            Domain::VolumeNodes => self.volume_nodes.root_hex().await,
         }
     }
 
@@ -91,6 +99,8 @@ impl SyncStores {
             Domain::NetworkPeers => self.network_peers.page_range_summary().await,
             Domain::NetworkAttachments => self.network_attachments.page_range_summary().await,
             Domain::ClusterViews => self.cluster_views.page_range_summary().await,
+            Domain::Volumes => self.volumes.page_range_summary().await,
+            Domain::VolumeNodes => self.volume_nodes.page_range_summary().await,
         }
     }
 }
@@ -195,6 +205,22 @@ impl delta_sink::Server for DeltaSinkImpl {
                     self.stores.cluster_views.clone(),
                     &chunk,
                     decode_register::<ClusterNameRecord>,
+                )
+                .await?
+            }
+            Domain::Volumes => {
+                apply_chunk(
+                    self.stores.volumes.clone(),
+                    &chunk,
+                    decode_register::<VolumeSpecValue>,
+                )
+                .await?
+            }
+            Domain::VolumeNodes => {
+                apply_chunk(
+                    self.stores.volume_nodes.clone(),
+                    &chunk,
+                    decode_register::<VolumeNodeStateValue>,
                 )
                 .await?
             }
@@ -344,6 +370,28 @@ impl DeltaStore<ClusterNameRecord> for ClusterViewDomainStore {
     async fn apply_delta(
         self,
         regs: Vec<(UuidKey, MVReg<ClusterNameRecord, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()> {
+        self.apply_delta_chunk_update_mst(regs, tombs).await
+    }
+}
+
+#[async_trait]
+impl DeltaStore<VolumeSpecValue> for VolumeSpecStore {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<VolumeSpecValue, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()> {
+        self.apply_delta_chunk_update_mst(regs, tombs).await
+    }
+}
+
+#[async_trait]
+impl DeltaStore<VolumeNodeStateValue> for VolumeNodeStore {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<VolumeNodeStateValue, uuid::Uuid>)>,
         tombs: Vec<(UuidKey, u64)>,
     ) -> io::Result<()> {
         self.apply_delta_chunk_update_mst(regs, tombs).await

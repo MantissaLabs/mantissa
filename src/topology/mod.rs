@@ -18,6 +18,7 @@ use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
+use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
 use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains, sync_selected_domains};
 use crate::token::TokenStore;
 use crate::topology::peers::{PeerSchedulingState, PeerValue};
@@ -141,6 +142,8 @@ pub struct TopologyStores {
     pub networks: NetworkSpecStore,
     pub network_peers: NetworkPeerStore,
     pub network_attachments: NetworkAttachmentStore,
+    pub volumes: VolumeSpecStore,
+    pub volume_nodes: VolumeNodeStore,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
@@ -338,6 +341,8 @@ pub struct Topology {
     networks: NetworkSpecStore,
     network_peers: NetworkPeerStore,
     network_attachments: NetworkAttachmentStore,
+    volumes: VolumeSpecStore,
+    volume_nodes: VolumeNodeStore,
 
     /// Cached Peers snapshot to avoid hitting storage on every tick.
     peer_snapshot_cache: Arc<AsyncMutex<PeerSnapshotCache>>,
@@ -440,6 +445,8 @@ impl Topology {
             networks,
             network_peers,
             network_attachments,
+            volumes,
+            volume_nodes,
             secret_keyring,
         } = stores;
 
@@ -463,6 +470,8 @@ impl Topology {
             networks,
             network_peers,
             network_attachments,
+            volumes,
+            volume_nodes,
             peer_snapshot_cache: Arc::new(AsyncMutex::new(PeerSnapshotCache::new())),
             excluded_peers: Arc::new(AsyncMutex::new(HashSet::new())),
             local_sessions: sessions,
@@ -936,6 +945,9 @@ impl Topology {
                 Ok(Message::Void { .. }) => {
                     // Keepalive message; nothing to process for topology state.
                 }
+                Ok(Message::Volume { .. }) => {
+                    // Volume gossip is handled by the dedicated volume replicator.
+                }
                 Ok(Message::Topology { id, event }) => {
                     match event {
                         TopologyEvent::Join {
@@ -1344,6 +1356,8 @@ impl Topology {
             network_peers: self.network_peers.clone(),
             network_attachments: self.network_attachments.clone(),
             cluster_views: self.cluster_view_store.cluster_view_domain_store(),
+            volumes: self.volumes.clone(),
+            volume_nodes: self.volume_nodes.clone(),
         };
 
         let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic");
@@ -1383,6 +1397,8 @@ impl Topology {
             network_peers: self.network_peers.clone(),
             network_attachments: self.network_attachments.clone(),
             cluster_views: self.cluster_view_store.cluster_view_domain_store(),
+            volumes: self.volumes.clone(),
+            volume_nodes: self.volume_nodes.clone(),
         };
 
         let trace =

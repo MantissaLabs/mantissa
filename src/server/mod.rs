@@ -18,6 +18,7 @@ use protocol::{
     gossip::GossipClient, health::HealthClient, network::NetworksClient, node::NodeClient,
     scheduling::scheduler::Client as SchedulerClient, secrets::secrets::Client as SecretsClient,
     services::ServicesClient, sync::SyncClient, task::TaskClient, topology::TopologyClient,
+    volumes::VolumesClient,
 };
 
 pub mod auth;
@@ -90,6 +91,7 @@ pub struct ServerClients {
     pub services_client: ServicesClient,
     pub secrets_client: SecretsClient,
     pub networks_client: NetworksClient,
+    pub volumes_client: VolumesClient,
 }
 
 #[derive(Clone)]
@@ -138,6 +140,7 @@ impl Server {
             services: self.clients.services_client.clone(),
             secrets: self.clients.secrets_client.clone(),
             networks: self.clients.networks_client.clone(),
+            volumes: self.clients.volumes_client.clone(),
         };
         let session = ClusterSessionImpl::new(
             session_clients,

@@ -5,6 +5,7 @@ use crate::store::peer_store::PeersStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
+use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use crdt_store::mst_store::{Registers, Tombstones};
 use crdt_store::uuid_key::UuidKey;
@@ -20,7 +21,7 @@ type EncodedRegisters = Vec<EncodedRegister>;
 type EncodedTombstone = (Vec<u8>, u64);
 type EncodedTombstones = Vec<EncodedTombstone>;
 
-const ALL_DOMAINS: [Domain; 8] = [
+const ALL_DOMAINS: [Domain; 10] = [
     Domain::Peers,
     Domain::Tasks,
     Domain::Services,
@@ -29,6 +30,8 @@ const ALL_DOMAINS: [Domain; 8] = [
     Domain::NetworkPeers,
     Domain::NetworkAttachments,
     Domain::ClusterViews,
+    Domain::Volumes,
+    Domain::VolumeNodes,
 ];
 
 // Default chunk size used when streaming delta from server to client.
@@ -56,6 +59,8 @@ pub struct SyncService {
     network_peers: NetworkPeerStore,
     network_attachments: NetworkAttachmentStore,
     cluster_views: ClusterViewDomainStore,
+    volumes: VolumeSpecStore,
+    volume_nodes: VolumeNodeStore,
 }
 
 #[derive(Clone)]
@@ -68,6 +73,8 @@ pub struct SyncStores {
     pub network_peers: NetworkPeerStore,
     pub network_attachments: NetworkAttachmentStore,
     pub cluster_views: ClusterViewDomainStore,
+    pub volumes: VolumeSpecStore,
+    pub volume_nodes: VolumeNodeStore,
 }
 
 impl SyncService {
@@ -82,6 +89,8 @@ impl SyncService {
             network_peers,
             network_attachments,
             cluster_views,
+            volumes,
+            volume_nodes,
         } = stores;
         Self {
             cluster_view,
@@ -93,6 +102,8 @@ impl SyncService {
             network_peers,
             network_attachments,
             cluster_views,
+            volumes,
+            volume_nodes,
         }
     }
 
@@ -127,6 +138,8 @@ impl SyncService {
                 DomainStoreRef::NetworkAttachments(&self.network_attachments)
             }
             Domain::ClusterViews => DomainStoreRef::ClusterViews(&self.cluster_views),
+            Domain::Volumes => DomainStoreRef::Volumes(&self.volumes),
+            Domain::VolumeNodes => DomainStoreRef::VolumeNodes(&self.volume_nodes),
         }
     }
 }
@@ -141,6 +154,8 @@ enum DomainStoreRef<'a> {
     NetworkPeers(&'a NetworkPeerStore),
     NetworkAttachments(&'a NetworkAttachmentStore),
     ClusterViews(&'a ClusterViewDomainStore),
+    Volumes(&'a VolumeSpecStore),
+    VolumeNodes(&'a VolumeNodeStore),
 }
 
 macro_rules! with_domain_store {
@@ -154,6 +169,8 @@ macro_rules! with_domain_store {
             DomainStoreRef::NetworkPeers($store) => $body,
             DomainStoreRef::NetworkAttachments($store) => $body,
             DomainStoreRef::ClusterViews($store) => $body,
+            DomainStoreRef::Volumes($store) => $body,
+            DomainStoreRef::VolumeNodes($store) => $body,
         }
     };
 }
@@ -170,6 +187,8 @@ impl DomainStoreRef<'_> {
             Self::NetworkPeers(_) => Domain::NetworkPeers,
             Self::NetworkAttachments(_) => Domain::NetworkAttachments,
             Self::ClusterViews(_) => Domain::ClusterViews,
+            Self::Volumes(_) => Domain::Volumes,
+            Self::VolumeNodes(_) => Domain::VolumeNodes,
         }
     }
 
@@ -184,6 +203,8 @@ impl DomainStoreRef<'_> {
             Self::NetworkPeers(_) => "network peers",
             Self::NetworkAttachments(_) => "network attachments",
             Self::ClusterViews(_) => "cluster views",
+            Self::Volumes(_) => "volumes",
+            Self::VolumeNodes(_) => "volume nodes",
         }
     }
 
@@ -198,6 +219,8 @@ impl DomainStoreRef<'_> {
             Self::NetworkPeers(_) => "server.before.get_ranges.network_peers",
             Self::NetworkAttachments(_) => "server.before.get_ranges.network_attachments",
             Self::ClusterViews(_) => "server.before.get_ranges.cluster_views",
+            Self::Volumes(_) => "server.before.get_ranges.volumes",
+            Self::VolumeNodes(_) => "server.before.get_ranges.volume_nodes",
         }
     }
 
@@ -212,6 +235,8 @@ impl DomainStoreRef<'_> {
             Self::NetworkPeers(_) => "server.before.open_delta.network_peers",
             Self::NetworkAttachments(_) => "server.before.open_delta.network_attachments",
             Self::ClusterViews(_) => "server.before.open_delta.cluster_views",
+            Self::Volumes(_) => "server.before.open_delta.volumes",
+            Self::VolumeNodes(_) => "server.before.open_delta.volume_nodes",
         }
     }
 
