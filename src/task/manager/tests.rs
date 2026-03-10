@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+use super::planner::StartIntent;
 use super::*;
 
 use crate::network::attachment::{AttachmentProvisionerApi, AttachmentProvisioningRequest};
@@ -4184,4 +4185,56 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         .reconcile_local_task(requested)
         .await
         .expect("reconcile stop real networked task");
+}
+
+#[test]
+fn scheduling_retry_budget_stays_wide_for_untargeted_starts() {
+    let intents = vec![StartIntent {
+        index: 0,
+        id: Uuid::new_v4(),
+        name: "untargeted".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        preassigned_slots: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        target_node: None,
+    }];
+
+    assert_eq!(scheduling_retry_max_attempts_for_intents(&intents), 30);
+}
+
+#[test]
+fn scheduling_retry_budget_is_shorter_for_targeted_starts() {
+    let intents = vec![StartIntent {
+        index: 0,
+        id: Uuid::new_v4(),
+        name: "targeted".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        preassigned_slots: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        target_node: Some(Uuid::new_v4()),
+    }];
+
+    assert_eq!(scheduling_retry_max_attempts_for_intents(&intents), 8);
 }

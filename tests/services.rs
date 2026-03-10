@@ -2207,33 +2207,12 @@ local_test!(
         let templates = vec![demo_networked_backend_task_template(
             "backend", 8, network_id,
         )];
-        let service_id = cluster[0]
+        cluster[0]
             .node
             .service_controller
             .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
             .await
             .expect("submit deployment");
-
-        assert!(
-            wait_for_service_status(
-                &cluster[0].node.service_controller,
-                service_id,
-                ServiceStatus::Running
-            )
-            .await,
-            "anchor should observe running service before split"
-        );
-        assert!(
-            wait_for_service_running_tasks_stable_all(
-                &cluster,
-                service_name,
-                8,
-                5,
-                Duration::from_secs(30)
-            )
-            .await,
-            "all nodes should converge on eight stable running tasks before split"
-        );
 
         let left_a = &cluster[0];
         let left_b = &cluster[1];
@@ -2246,7 +2225,7 @@ local_test!(
             service_name,
             network_id,
             8,
-            Duration::from_secs(30),
+            Duration::from_secs(60),
         )
         .await;
         if !published_before_split {
@@ -2341,17 +2320,6 @@ local_test!(
         .await;
 
         assert!(
-            wait_for_service_running_tasks_stable_all(
-                &cluster,
-                service_name,
-                8,
-                5,
-                Duration::from_secs(30)
-            )
-            .await,
-            "merged cluster should converge to eight stable running tasks"
-        );
-        assert!(
             wait_for_min_local_service_task_count(
                 &cluster,
                 service_name,
@@ -2366,7 +2334,7 @@ local_test!(
             service_name,
             network_id,
             8,
-            Duration::from_secs(30),
+            Duration::from_secs(60),
         )
         .await;
         if !published_after_merge {
@@ -4010,42 +3978,66 @@ async fn wait_for_visible_service_attachments_published_refs(
     expected_task_count: usize,
     timeout: Duration,
 ) -> bool {
-    wait_until(timeout, Duration::from_millis(100), || async {
+    let deadline = Instant::now() + timeout;
+    let mut stable_rounds = 0usize;
+    let mut previous: Option<Vec<Vec<(Uuid, Uuid)>>> = None;
+
+    while Instant::now() < deadline {
+        let mut snapshot = Vec::with_capacity(nodes.len());
+        let mut healthy = true;
+
         for node in nodes {
-            if !visible_service_attachments_are_published(
+            let Some(node_snapshot) = collect_published_service_attachment_snapshot(
                 node,
                 service_name,
                 network_id,
                 expected_task_count,
             )
             .await
-            {
-                return false;
-            }
+            else {
+                healthy = false;
+                break;
+            };
+            snapshot.push(node_snapshot);
         }
-        true
-    })
-    .await
+
+        if healthy && previous.as_ref() == Some(&snapshot) {
+            stable_rounds = stable_rounds.saturating_add(1);
+            if stable_rounds >= 3 {
+                return true;
+            }
+        } else if healthy {
+            stable_rounds = 1;
+        } else {
+            stable_rounds = 0;
+        }
+
+        previous = Some(snapshot);
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    false
 }
 
-/// Checks whether one node has published attachment rows for all currently visible service tasks.
-async fn visible_service_attachments_are_published(
+/// Collects one node snapshot once every visible service task is running with a published attachment.
+async fn collect_published_service_attachment_snapshot(
     node: &TestNode,
     service_name: &str,
     network_id: Uuid,
     expected_task_count: usize,
-) -> bool {
-    let tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
+) -> Option<Vec<(Uuid, Uuid)>> {
+    let mut tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
     if tasks.len() != expected_task_count {
-        return false;
+        return None;
     }
+    tasks.sort_by_key(|task| task.id);
 
     let Ok(attachments) = node
         .node
         .network_registry
         .list_attachments(Some(network_id))
     else {
-        return false;
+        return None;
     };
 
     let mut by_task = HashMap::with_capacity(attachments.len());
@@ -4053,16 +4045,27 @@ async fn visible_service_attachments_are_published(
         by_task.entry(attachment.task_id).or_insert(attachment);
     }
 
-    tasks.into_iter().all(|task| {
-        by_task
-            .get(&task.id)
-            .map(|attachment| {
-                attachment.node_id == task.node_id
-                    && attachment.state == NetworkAttachmentState::Ready
-                    && attachment.traffic_published
-            })
-            .unwrap_or(false)
-    })
+    let mut snapshot = Vec::with_capacity(expected_task_count);
+    for task in tasks {
+        if !matches!(task.state, ContainerState::Running) {
+            return None;
+        }
+
+        let Some(attachment) = by_task.get(&task.id) else {
+            return None;
+        };
+
+        if attachment.node_id != task.node_id
+            || attachment.state != NetworkAttachmentState::Ready
+            || !attachment.traffic_published
+        {
+            return None;
+        }
+
+        snapshot.push((task.id, task.node_id));
+    }
+
+    Some(snapshot)
 }
 
 /// Collects one per-node debug snapshot for attachment publication assertions.

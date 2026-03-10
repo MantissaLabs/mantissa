@@ -435,9 +435,9 @@ impl TaskManager {
         let intents = Self::build_start_intents(requests)?;
 
         const MAX_ATTEMPTS: usize = 5;
-        const SCHEDULING_RETRY_MAX_ATTEMPTS: usize = 30;
         let mut attempt = 0usize;
         let mut scheduling_retry_attempts = 0usize;
+        let scheduling_retry_max_attempts = scheduling_retry_max_attempts_for_intents(&intents);
 
         while attempt < MAX_ATTEMPTS {
             let assignment = match self.compute_assignment(&intents).await {
@@ -448,7 +448,7 @@ impl TaskManager {
                 Err(err) => {
                     if is_retryable_scheduling_error(&err) {
                         scheduling_retry_attempts += 1;
-                        if scheduling_retry_attempts >= SCHEDULING_RETRY_MAX_ATTEMPTS {
+                        if scheduling_retry_attempts >= scheduling_retry_max_attempts {
                             return Err(err.context("failed to compute scheduling plan"));
                         }
                         let backoff = scheduling_retry_backoff(scheduling_retry_attempts);
@@ -850,6 +850,18 @@ impl TaskManager {
 /// Identify scheduling errors that should be retried because prerequisites are still converging.
 fn is_retryable_scheduling_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| cause.is::<SchedulingError>())
+}
+
+/// Pick a smaller scheduling retry budget for targeted starts so callers can fall back quickly.
+fn scheduling_retry_max_attempts_for_intents(intents: &[planner::StartIntent]) -> usize {
+    const DEFAULT_MAX_ATTEMPTS: usize = 30;
+    const TARGETED_MAX_ATTEMPTS: usize = 8;
+
+    if intents.iter().any(|intent| intent.target_node.is_some()) {
+        TARGETED_MAX_ATTEMPTS
+    } else {
+        DEFAULT_MAX_ATTEMPTS
+    }
 }
 
 /// Compute the retry backoff used while scheduling prerequisites are still converging.
