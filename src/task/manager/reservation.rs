@@ -558,6 +558,7 @@ impl TaskManager {
                 pre_stop_command: plan.pre_stop_command.clone(),
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),
+                volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),
                 service_metadata: plan.service_metadata.clone(),
                 task_epoch,

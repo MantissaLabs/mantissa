@@ -49,6 +49,7 @@ pub struct HeadlessConfig {
     pub gossip_channel_capacity: Option<usize>,
     pub task_runtime: Option<TaskRuntimeConfig>,
     pub container_manager: Option<Arc<dyn ContainerManager + Send + Sync>>,
+    pub local_volume_root: Option<PathBuf>,
 }
 
 impl Default for HeadlessConfig {
@@ -65,6 +66,7 @@ impl Default for HeadlessConfig {
             gossip_channel_capacity: None,
             task_runtime: None,
             container_manager: None,
+            local_volume_root: None,
         }
     }
 }
@@ -151,6 +153,7 @@ impl HeadlessNode {
             gossip_channel_capacity,
             task_runtime,
             container_manager,
+            local_volume_root,
         } = cfg;
         // Local Node + client
         let mut node_obj = node::Node::new();
@@ -176,6 +179,7 @@ impl HeadlessNode {
             task_runtime,
             gossip_channel_capacity,
             container_manager,
+            local_volume_root,
         )
         .await?;
         if let Some(d) = sync_tick {
@@ -389,11 +393,18 @@ impl HeadlessNode {
     /// Quick-start a self-contained node with an explicit headless runtime config.
     pub async fn new_with_config(cfg: HeadlessConfig) -> io::Result<Self> {
         let state = self_contained_state()?;
+        let local_volume_root = cfg
+            .local_volume_root
+            .clone()
+            .unwrap_or_else(|| state.tmp_dir.join("volumes"));
         let mut node = Self::new_with(
             state.db,
             state.id,
             HeadlessKeys::new(state.noise_keys, state.signing_key),
-            cfg,
+            HeadlessConfig {
+                local_volume_root: Some(local_volume_root),
+                ..cfg
+            },
         )
         .await
         .map_err(to_io)?;
@@ -496,6 +507,7 @@ impl HeadlessNode {
                 gossip_channel_capacity,
                 task_runtime,
                 container_manager: None,
+                local_volume_root: Some(state.tmp_dir.join("volumes")),
             },
         )
         .await

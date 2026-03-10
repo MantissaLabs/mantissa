@@ -2,7 +2,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile};
+use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskVolumeMount};
 
 /// Value stored in the replicated service store describing desired service state.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -200,6 +200,8 @@ pub struct ServiceTaskSpecValue {
     pub env: Vec<TaskEnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,
+    #[serde(default)]
+    pub volumes: Vec<TaskVolumeMount>,
     #[serde(default)]
     pub networks: Vec<ServiceTaskNetworkRequirement>,
     #[serde(default)]

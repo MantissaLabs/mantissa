@@ -131,6 +131,7 @@ fn template_attributes_changed(
         || current.pre_stop_command != desired.pre_stop_command
         || current.env != desired.env
         || current.secret_files != desired.secret_files
+        || current.volumes != desired.volumes
         || current.networks != desired.networks
         || current.health_port != desired.health_port
         || current.health_command != desired.health_command

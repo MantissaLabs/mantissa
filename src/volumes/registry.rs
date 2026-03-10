@@ -139,6 +139,20 @@ impl VolumeRegistry {
         });
         Ok(states)
     }
+
+    /// Reads the canonical node-state row for one volume on one node.
+    pub fn get_node_state(
+        &self,
+        volume_id: Uuid,
+        node_id: Uuid,
+    ) -> Result<Option<VolumeNodeStateValue>> {
+        let key = crate::volumes::types::compute_volume_node_state_id(volume_id, node_id);
+        let snapshot = self
+            .nodes
+            .get_snapshot(&UuidKey::from(key))
+            .map_err(|e| anyhow!("volume node-state lookup failed: {e}"))?;
+        Ok(snapshot.and_then(|snap| select_best_volume_node_state(snap.as_slice())))
+    }
 }
 
 /// Selects the canonical MVReg winner for one volume specification row.
@@ -180,6 +194,13 @@ fn compare_volume_specs(left: &VolumeSpecValue, right: &VolumeSpecValue) -> Orde
         .then(left.phase_version.cmp(&right.phase_version))
         .then(compare_timestamps(&left.updated_at, &right.updated_at))
         .then(left.status.cmp(&right.status))
+        .then(left.bound_node_id.cmp(&right.bound_node_id))
+        .then(left.bound_node_name.cmp(&right.bound_node_name))
+        .then(left.driver.cmp(&right.driver))
+        .then(left.access_mode.cmp(&right.access_mode))
+        .then(left.binding_mode.cmp(&right.binding_mode))
+        .then(left.reclaim_policy.cmp(&right.reclaim_policy))
+        .then(left.requested_bytes.cmp(&right.requested_bytes))
         .then(left.reason.cmp(&right.reason))
         .then(left.message.cmp(&right.message))
 }
@@ -191,6 +212,9 @@ fn compare_volume_node_states(
 ) -> Ordering {
     compare_timestamps(&left.updated_at, &right.updated_at)
         .then(left.state.cmp(&right.state))
+        .then(left.published_task_ids.cmp(&right.published_task_ids))
+        .then(left.capacity_bytes.cmp(&right.capacity_bytes))
+        .then(left.used_bytes.cmp(&right.used_bytes))
         .then(left.last_error.cmp(&right.last_error))
         .then(left.local_path.cmp(&right.local_path))
 }

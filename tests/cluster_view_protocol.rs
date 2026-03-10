@@ -10,6 +10,7 @@ use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 use mantissa::store::cluster_operation_store::ClusterOperationStore;
 use mantissa::store::cluster_view_store::ClusterViewStore;
 use mantissa::store::peer_store::open_peers_store;
+use mantissa::sync::VIEW_SCOPED_DOMAIN_COUNT;
 use mantissa::task::docker::new_in_memory_container_manager;
 use mantissa::topology::operation::{
     ClusterOperationKind as StoredOperationKind, ClusterOperationRecord,
@@ -110,7 +111,7 @@ local_test!(cluster_view_protocol_strict_inproc, {
         .expect("roots");
     assert_eq!(
         roots.len(),
-        8,
+        VIEW_SCOPED_DOMAIN_COUNT as u32,
         "view-scoped roots should expose all domains"
     );
 
@@ -167,7 +168,7 @@ local_test!(cluster_view_protocol_strict_inproc, {
         .expect("ranges");
     assert_eq!(
         ranges.len(),
-        8,
+        VIEW_SCOPED_DOMAIN_COUNT as u32,
         "view-scoped ranges should expose all domains when none requested"
     );
 

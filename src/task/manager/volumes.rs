@@ -1,0 +1,353 @@
+use std::collections::{HashMap, HashSet};
+
+use anyhow::{Result, anyhow};
+use chrono::Utc;
+use uuid::Uuid;
+
+use crate::gossip::Message;
+use crate::task::types::{TaskSpec, TaskVolumeMount};
+use crate::volumes::local::ensure_local_volume_path;
+use crate::volumes::types::{
+    VolumeBindingMode, VolumeEvent, VolumeNodeState, VolumeNodeStateValue, VolumeSpecValue,
+    VolumeStatus,
+};
+
+use super::TaskManager;
+use super::planner::{Assignment, StartIntent};
+
+impl TaskManager {
+    /// Applies existing volume bindings as hard placement constraints before the scheduler runs.
+    pub(super) async fn apply_volume_locality_to_intents(
+        &self,
+        intents: &mut [StartIntent],
+    ) -> Result<()> {
+        for intent in intents {
+            let mut required_node: Option<Uuid> = None;
+            for mount in &intent.volumes {
+                let spec = self
+                    .volume_registry
+                    .get_spec(mount.volume_id)?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unknown volume '{}' ({})",
+                            mount.volume_name,
+                            mount.volume_id
+                        )
+                    })?;
+
+                match spec.bound_node_id {
+                    Some(bound_node_id) => match required_node {
+                        Some(current) if current != bound_node_id => {
+                            return Err(anyhow!(
+                                "task '{}' references volumes bound to different nodes",
+                                intent.name
+                            ));
+                        }
+                        None => required_node = Some(bound_node_id),
+                        _ => {}
+                    },
+                    None => {
+                        if matches!(spec.binding_mode, VolumeBindingMode::Immediate) {
+                            return Err(anyhow!(
+                                "task '{}' references immediate volume '{}' before it is bound",
+                                intent.name,
+                                spec.name
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if let Some(required_node) = required_node {
+                if let Some(target_node) = intent.target_node
+                    && target_node != required_node
+                {
+                    return Err(anyhow!(
+                        "task '{}' is pinned to node {} by volume locality but the request targeted {}",
+                        intent.name,
+                        required_node,
+                        target_node
+                    ));
+                }
+                intent.target_node = Some(required_node);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Persists any first-consumer volume bindings chosen by the scheduler before slot reservation.
+    pub(super) async fn bind_assignment_volumes(
+        &self,
+        assignment: &Assignment,
+        intents: &[StartIntent],
+    ) -> Result<()> {
+        let mut planned_nodes: HashMap<Uuid, Uuid> = HashMap::new();
+        for plan in &assignment.local {
+            planned_nodes.insert(plan.id, self.local_node_id);
+        }
+        for plan in &assignment.remote {
+            planned_nodes.insert(plan.id, plan.peer_id);
+        }
+
+        let mut batch_bindings: HashMap<Uuid, Uuid> = HashMap::new();
+        for intent in intents {
+            let Some(planned_node) = planned_nodes.get(&intent.id).copied() else {
+                continue;
+            };
+            for mount in &intent.volumes {
+                if let Some(existing) = batch_bindings.insert(mount.volume_id, planned_node)
+                    && existing != planned_node
+                {
+                    return Err(anyhow!(
+                        "batch attempted to place volume '{}' on multiple nodes",
+                        mount.volume_name
+                    ));
+                }
+            }
+        }
+
+        for intent in intents {
+            let Some(planned_node) = planned_nodes.get(&intent.id).copied() else {
+                continue;
+            };
+            for volume_id in unique_volume_ids(&intent.volumes) {
+                let mut spec = self
+                    .volume_registry
+                    .get_spec(volume_id)?
+                    .ok_or_else(|| anyhow!("unknown volume {volume_id}"))?;
+                if let Some(bound_node_id) = spec.bound_node_id {
+                    if bound_node_id != planned_node {
+                        return Err(anyhow!(
+                            "volume '{}' is bound to node {} but task '{}' was placed on {}",
+                            spec.name,
+                            bound_node_id,
+                            intent.name,
+                            planned_node
+                        ));
+                    }
+                    continue;
+                }
+
+                if !matches!(spec.binding_mode, VolumeBindingMode::WaitForFirstConsumer) {
+                    return Err(anyhow!(
+                        "volume '{}' is not eligible for first-consumer binding",
+                        spec.name
+                    ));
+                }
+
+                let node_name = self.resolve_volume_node_name(planned_node);
+                spec.bound_node_id = Some(planned_node);
+                spec.bound_node_name = Some(node_name.clone());
+                spec.status = VolumeStatus::Bound;
+                spec.phase_version = spec.phase_version.saturating_add(1);
+                spec.updated_at = Utc::now().to_rfc3339();
+                spec.reason = None;
+                spec.message = Some(format!("bound to first consumer on {node_name}"));
+                self.upsert_volume_spec(spec.clone()).await?;
+
+                if self
+                    .volume_registry
+                    .get_node_state(spec.id, planned_node)?
+                    .is_none()
+                {
+                    let state = VolumeNodeStateValue::new(
+                        spec.id,
+                        planned_node,
+                        node_name,
+                        None,
+                        VolumeNodeState::Pending,
+                        spec.requested_bytes,
+                    );
+                    self.upsert_volume_node_state(state).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resolves concrete bind-mount descriptors for all local volume mounts on this node.
+    pub(super) async fn resolve_runtime_volume_mounts(
+        &self,
+        _task_id: Uuid,
+        mounts: &[TaskVolumeMount],
+    ) -> Result<Vec<String>> {
+        let mut resolved = Vec::with_capacity(mounts.len());
+        for mount in mounts {
+            let spec = self
+                .volume_registry
+                .get_spec(mount.volume_id)?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unknown volume '{}' ({})",
+                        mount.volume_name,
+                        mount.volume_id
+                    )
+                })?;
+            if spec.bound_node_id != Some(self.local_node_id) {
+                return Err(anyhow!(
+                    "volume '{}' is bound to {:?} and cannot be mounted on node {}",
+                    spec.name,
+                    spec.bound_node_id,
+                    self.local_node_id
+                ));
+            }
+
+            let path = self.ensure_local_volume_ready(&spec).await?;
+            let access = if mount.read_only { "ro" } else { "rw" };
+            resolved.push(format!("{}:{}:{access}", path.display(), mount.target));
+        }
+
+        Ok(resolved)
+    }
+
+    /// Marks the task as an active consumer on each referenced local volume after a successful launch.
+    pub(super) async fn publish_task_volume_mounts(&self, spec: &TaskSpec) -> Result<()> {
+        self.update_task_volume_publication(spec, true).await
+    }
+
+    /// Removes the task from the active consumer set for each referenced local volume.
+    pub(super) async fn unpublish_task_volume_mounts(&self, spec: &TaskSpec) -> Result<()> {
+        self.update_task_volume_publication(spec, false).await
+    }
+
+    /// Ensures the node-local volume row exists, is realized on disk, and reports a ready state.
+    async fn ensure_local_volume_ready(
+        &self,
+        spec: &VolumeSpecValue,
+    ) -> Result<std::path::PathBuf> {
+        let path = ensure_local_volume_path(&self.local_volume_root, spec)?;
+        let current = self
+            .volume_registry
+            .get_node_state(spec.id, self.local_node_id)?
+            .unwrap_or_else(|| {
+                VolumeNodeStateValue::new(
+                    spec.id,
+                    self.local_node_id,
+                    self.local_node_name.clone(),
+                    None,
+                    VolumeNodeState::Pending,
+                    spec.requested_bytes,
+                )
+            });
+        let path_string = path.to_string_lossy().to_string();
+        if current.local_path.as_deref() != Some(path_string.as_str())
+            || !matches!(
+                current.state,
+                VolumeNodeState::Ready | VolumeNodeState::Published
+            )
+            || current.last_error.is_some()
+        {
+            let mut desired = current.clone();
+            desired.local_path = Some(path_string);
+            desired.capacity_bytes = spec.requested_bytes;
+            desired.state = if desired.published_task_ids.is_empty() {
+                VolumeNodeState::Ready
+            } else {
+                VolumeNodeState::Published
+            };
+            desired.last_error = None;
+            desired.updated_at = Utc::now().to_rfc3339();
+            self.upsert_volume_node_state(desired).await?;
+        }
+        Ok(path)
+    }
+
+    /// Updates the published-task set on each mounted local volume to reflect runtime ownership.
+    async fn update_task_volume_publication(&self, spec: &TaskSpec, published: bool) -> Result<()> {
+        for volume_id in unique_volume_ids(&spec.volumes) {
+            let volume = self
+                .volume_registry
+                .get_spec(volume_id)?
+                .ok_or_else(|| anyhow!("unknown volume {volume_id}"))?;
+            if volume.bound_node_id != Some(self.local_node_id) {
+                continue;
+            }
+            let _ = self.ensure_local_volume_ready(&volume).await?;
+            let Some(mut state) = self
+                .volume_registry
+                .get_node_state(volume.id, self.local_node_id)?
+            else {
+                continue;
+            };
+
+            let had_task = state.published_task_ids.contains(&spec.id);
+            if published {
+                if had_task {
+                    continue;
+                }
+                state.published_task_ids.push(spec.id);
+                state.published_task_ids.sort_unstable();
+            } else if had_task {
+                state
+                    .published_task_ids
+                    .retain(|task_id| *task_id != spec.id);
+            } else {
+                continue;
+            }
+
+            state.state = if state.published_task_ids.is_empty() {
+                VolumeNodeState::Ready
+            } else {
+                VolumeNodeState::Published
+            };
+            state.updated_at = Utc::now().to_rfc3339();
+            self.upsert_volume_node_state(state).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Stores and broadcasts one volume spec update without routing through the RPC surface.
+    async fn upsert_volume_spec(&self, spec: VolumeSpecValue) -> Result<()> {
+        self.volume_registry.upsert_spec(spec.clone()).await?;
+        self.tx
+            .send(Message::Volume {
+                id: Uuid::new_v4(),
+                event: VolumeEvent::Upsert(Box::new(spec)),
+            })
+            .await
+            .map_err(|err| anyhow!("failed to enqueue volume spec gossip: {err}"))?;
+        Ok(())
+    }
+
+    /// Stores and broadcasts one volume node-state update without routing through the RPC surface.
+    async fn upsert_volume_node_state(&self, state: VolumeNodeStateValue) -> Result<()> {
+        self.volume_registry
+            .upsert_node_state(state.clone())
+            .await?;
+        self.tx
+            .send(Message::Volume {
+                id: Uuid::new_v4(),
+                event: VolumeEvent::NodeUpsert(Box::new(state)),
+            })
+            .await
+            .map_err(|err| anyhow!("failed to enqueue volume node-state gossip: {err}"))?;
+        Ok(())
+    }
+
+    /// Resolves the operator-facing node name used in bound-volume diagnostics.
+    fn resolve_volume_node_name(&self, node_id: Uuid) -> String {
+        if node_id == self.local_node_id {
+            self.local_node_name.clone()
+        } else {
+            self.registry
+                .peer_hostname(node_id)
+                .unwrap_or_else(|| node_id.to_string())
+        }
+    }
+}
+
+/// Returns the unique volume identifiers referenced by the mount list in sorted order.
+fn unique_volume_ids(mounts: &[TaskVolumeMount]) -> Vec<Uuid> {
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for mount in mounts {
+        if seen.insert(mount.volume_id) {
+            ids.push(mount.volume_id);
+        }
+    }
+    ids.sort_unstable();
+    ids
+}

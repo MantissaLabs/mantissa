@@ -8,6 +8,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use net::paths::ensure_state_dir;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ use tracing::warn;
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
     pub health: HealthConfig,
@@ -26,6 +29,15 @@ pub struct Config {
     pub docker: DockerConfig,
     #[serde(default)]
     pub gpu: GpuConfig,
+}
+
+/// # Description:
+///
+/// Storage subsystem configuration shared by runtime components that persist local state.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub local_volume_root: Option<String>,
 }
 
 /// # Description:
@@ -376,6 +388,21 @@ pub fn gpu_device_overrides() -> Option<String> {
 
 /// # Description:
 ///
+/// Resolve the local on-disk root used to materialize managed volume directories on this node.
+pub fn local_volume_root() -> Result<PathBuf> {
+    let configured = global_config()
+        .storage
+        .local_volume_root
+        .map(|path| PathBuf::from(path.trim()))
+        .filter(|path| !path.as_os_str().is_empty());
+    let root = configured.unwrap_or(ensure_state_dir()?.join("volumes"));
+    fs::create_dir_all(&root)
+        .with_context(|| format!("failed to create local volume root {}", root.display()))?;
+    Ok(root)
+}
+
+/// # Description:
+///
 /// Render a config snapshot as pretty-printed RON for diagnostics.
 pub fn render_config_ron(config: &Config) -> Result<String> {
     let pretty = ron::ser::PrettyConfig::default();
@@ -598,6 +625,14 @@ impl Config {
             }
         }
 
+        if let Ok(path) = std::env::var("MANTISSA_LOCAL_VOLUME_ROOT") {
+            applied = true;
+            let path = path.trim();
+            if !path.is_empty() {
+                self.storage.local_volume_root = Some(path.to_string());
+            }
+        }
+
         applied
     }
 
@@ -633,6 +668,15 @@ impl Config {
             && overrides.trim().is_empty()
         {
             anyhow::bail!("gpu.device_overrides cannot be empty");
+        }
+
+        if let Some(ref path) = self.storage.local_volume_root {
+            if path.trim().is_empty() {
+                anyhow::bail!("storage.local_volume_root cannot be empty");
+            }
+            if !Path::new(path).is_absolute() {
+                anyhow::bail!("storage.local_volume_root must be an absolute path");
+            }
         }
 
         if self.health.probe_fanout == 0 {
@@ -780,6 +824,10 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
 
     if old.gpu.device_overrides != new.gpu.device_overrides {
         changes.push("gpu.device_overrides".to_string());
+    }
+
+    if old.storage.local_volume_root != new.storage.local_volume_root {
+        changes.push("storage.local_volume_root".to_string());
     }
 
     if old.network.nodeport.enabled != new.network.nodeport.enabled {

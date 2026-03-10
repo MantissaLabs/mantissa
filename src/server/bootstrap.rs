@@ -15,7 +15,7 @@ use crate::secrets::service::SecretsService;
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerStores};
-use crate::services::{ServiceController, ServiceRegistry, ServicesRPC};
+use crate::services::{ServiceController, ServiceControllerConfig, ServiceRegistry, ServicesRPC};
 use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::cluster_view_store::ClusterViewStore;
 use crate::store::local::load_or_create_node_id;
@@ -41,7 +41,7 @@ use crate::task::manager::{TaskManager, TaskManagerConfig, TaskRuntimeConfig};
 use crate::task::service::TaskService;
 use crate::token::TokenStore;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyStores};
-use crate::volumes::{VolumeRegistry, VolumeReplicator, VolumesRpc};
+use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
 use crate::{config, node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
@@ -57,6 +57,7 @@ use tokio::sync::{RwLock, mpsc};
 
 use async_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,7 +115,8 @@ pub async fn start(
     // Build runtime components (gossip, topology, sync) and their clients
     let gossip_channel_capacity = gossip_channel_capacity_from_env(128);
     let (comps, gossip_rx, gossip_dedupe) =
-        Bootstrap::build_components(&ctx, &stores, None, gossip_channel_capacity, None).await?;
+        Bootstrap::build_components(&ctx, &stores, None, gossip_channel_capacity, None, None)
+            .await?;
     let gossip_tick = gossip_tick_from_env(comps.topology.gossip_interval());
     comps.topology.set_gossip_interval(gossip_tick);
 
@@ -199,6 +201,7 @@ pub(crate) struct Components {
     pub network_registry: NetworkRegistry,
     #[allow(dead_code)]
     pub volume_registry: VolumeRegistry,
+    pub volume_controller: VolumeController,
     #[allow(dead_code)]
     pub network_controller: NetworkController,
     pub network_gossiper: NetworkGossiper,
@@ -351,6 +354,7 @@ impl Bootstrap {
         task_runtime_config: Option<TaskRuntimeConfig>,
         gossip_channel_capacity: usize,
         container_manager_override: Option<Arc<dyn ContainerManager + Send + Sync>>,
+        local_volume_root_override: Option<PathBuf>,
     ) -> Result<(Components, Receiver<Message>, DedupeStateHandle), Box<dyn std::error::Error>>
     {
         let channel_capacity = gossip_channel_capacity.max(1);
@@ -536,6 +540,19 @@ impl Bootstrap {
             VolumeRegistry::new(stores.volumes.clone(), stores.volume_nodes.clone());
         let volume_replicator =
             VolumeReplicator::new(volume_registry.clone(), gossip_tx.clone(), volume_rx);
+        let local_volume_root = match local_volume_root_override {
+            Some(path) => path,
+            None => config::local_volume_root().map_err(|e| -> Box<dyn std::error::Error> {
+                Box::new(std::io::Error::other(e.to_string()))
+            })?,
+        };
+        let volume_controller = VolumeController::new(
+            volume_registry.clone(),
+            gossip_tx.clone(),
+            ctx.self_id,
+            local_node_name.clone(),
+            local_volume_root.clone(),
+        );
 
         let container_manager: Arc<dyn ContainerManager + Send + Sync> =
             if let Some(manager) = container_manager_override {
@@ -592,22 +609,25 @@ impl Bootstrap {
             container_manager,
             registry: registry.clone(),
             network_registry: network_registry.clone(),
+            volume_registry: volume_registry.clone(),
             secret_registry: secret_registry.clone(),
             secret_keyring: stores.secret_keyring.clone(),
             forwarding_events: Some(forwarding_tx),
             attachment_override: None,
             runtime_config: task_runtime_config,
+            local_volume_root,
         });
 
-        let service_controller = ServiceController::new(
-            service_registry.clone(),
-            task_manager.clone(),
-            registry.clone(),
-            gossip_tx.clone(),
-            service_rx,
-            ctx.self_id,
-            health_monitor.clone(),
-        );
+        let service_controller = ServiceController::new(ServiceControllerConfig {
+            registry: service_registry.clone(),
+            task_manager: task_manager.clone(),
+            cluster_registry: registry.clone(),
+            volume_registry: volume_registry.clone(),
+            gossip_tx: gossip_tx.clone(),
+            gossip_rx: service_rx,
+            local_node_id: ctx.self_id,
+            health_monitor: health_monitor.clone(),
+        });
         let services_service = ServicesRPC::new(service_controller.clone(), topology.clone());
         let services_client_cap = capnp_rpc::new_client(services_service);
 
@@ -658,6 +678,7 @@ impl Bootstrap {
                 volumes_client: volumes_client_cap,
                 network_registry,
                 volume_registry,
+                volume_controller,
                 network_controller,
                 network_gossiper,
                 secret_replicator,
@@ -779,6 +800,11 @@ impl Bootstrap {
         let volume_replicator = comps.volume_replicator.clone();
         tokio::task::spawn_local(async move {
             volume_replicator.run().await;
+        });
+
+        let volume_controller = comps.volume_controller.clone();
+        tokio::task::spawn_local(async move {
+            volume_controller.run().await;
         });
 
         let gossiper = comps.network_gossiper.clone();

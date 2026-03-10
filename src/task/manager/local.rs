@@ -101,6 +101,7 @@ impl TaskManager {
                 pre_stop_command: plan.pre_stop_command.clone(),
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),
+                volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),
                 service_metadata: plan.service_metadata.clone(),
                 task_epoch,
@@ -178,6 +179,7 @@ impl TaskManager {
                     restart_policy: plan.restart_policy.as_ref(),
                     env: &plan.env,
                     secret_files: &plan.secret_files,
+                    volume_mounts: &plan.volumes,
                     networks: &plan.networks,
                 })
                 .await?;
@@ -249,6 +251,7 @@ impl TaskManager {
                 pre_stop_command: plan.pre_stop_command.clone(),
                 env: plan.env.clone(),
                 secret_files: plan.secret_files.clone(),
+                volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),
                 service_metadata: plan.service_metadata.clone(),
                 task_epoch,

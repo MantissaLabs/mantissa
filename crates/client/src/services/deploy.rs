@@ -5,11 +5,12 @@ use super::manifest::{
 use crate::config::ClientConfig;
 use crate::connection;
 use crate::networks;
+use crate::volumes;
 use anyhow::{Context, Result, anyhow};
 use capnp::{Error as CapnpError, struct_list};
 use protocol::services::task_template;
-use protocol::task::{environment_var, secret_file, secret_ref};
-use std::collections::HashSet;
+use protocol::task::{environment_var, secret_file, secret_ref, volume_mount};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// Identifies the asynchronous deployment issued against the cluster so callers can poll status.
@@ -24,6 +25,12 @@ pub struct ServiceDeploymentHandle {
 enum DeployOutcome {
     Accepted,
     Unchanged,
+}
+
+#[derive(Clone)]
+struct ResolvedManifestVolume {
+    volume_id: Uuid,
+    volume_name: String,
 }
 
 /// Ensure every network referenced by the manifest exists so scheduling can attach tasks reliably.
@@ -76,28 +83,6 @@ async fn ensure_manifest_networks(cfg: &ClientConfig, manifest: &ServiceManifest
     Ok(())
 }
 
-/// Rejects manifests that declare or mount volumes until scheduler locality and runtime mounts land.
-fn ensure_manifest_volumes_supported(manifest: &ServiceManifest) -> Result<()> {
-    let has_declared_volumes = !manifest.volumes.is_empty();
-    let mounted: Vec<(&str, &VolumeMount)> = manifest
-        .tasks
-        .iter()
-        .flat_map(|task| {
-            task.volumes
-                .iter()
-                .map(move |mount| (task.name.as_str(), mount))
-        })
-        .collect();
-
-    if has_declared_volumes || !mounted.is_empty() {
-        return Err(anyhow!(
-            "volume-backed service deployments are not implemented yet; create and inspect volume objects now, then wait for scheduler locality and task mounts in the next milestone"
-        ));
-    }
-
-    Ok(())
-}
-
 fn write_secret_reference(
     mut builder: secret_ref::Builder<'_>,
     reference: &SecretReference,
@@ -111,6 +96,131 @@ fn write_secret_reference(
     } else {
         builder.set_version_id(&[]);
     }
+    Ok(())
+}
+
+/// Ensures manifest-declared volumes exist as cluster objects and returns their resolved identities.
+async fn ensure_manifest_volumes(
+    cfg: &ClientConfig,
+    manifest: &ServiceManifest,
+) -> Result<HashMap<String, ResolvedManifestVolume>> {
+    if manifest.volumes.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let existing = volumes::list_raw(cfg).await?;
+    let existing_by_name: HashMap<String, volumes::VolumeSummary> = existing
+        .into_iter()
+        .map(|volume| (volume.name.clone(), volume))
+        .collect();
+
+    let mut resolved = HashMap::new();
+    for volume in &manifest.volumes {
+        match &volume.driver {
+            super::manifest::VolumeDriver::Local(local) => match &local.source {
+                super::manifest::LocalVolumeSource::Managed => {}
+                super::manifest::LocalVolumeSource::ImportedPath(_) => {
+                    return Err(anyhow!(
+                        "service manifest volume '{}' cannot use imported_path; import host paths ahead of time with `mantissa volumes import`",
+                        volume.name
+                    ));
+                }
+            },
+            super::manifest::VolumeDriver::External(_) => {
+                return Err(anyhow!(
+                    "service manifest volume '{}' cannot use an external driver yet",
+                    volume.name
+                ));
+            }
+        }
+
+        let spec = if let Some(existing) = existing_by_name.get(&volume.name) {
+            validate_manifest_volume_compatibility(existing, volume)?;
+            volumes::inspect_raw(cfg, &volume.name).await?.spec
+        } else {
+            volumes::create_raw(
+                cfg,
+                &volumes::VolumeCreateRequest {
+                    name: volume.name.clone(),
+                    binding_mode: match volume.binding_mode {
+                        super::manifest::VolumeBindingMode::Immediate => {
+                            volumes::VolumeBindingMode::Immediate
+                        }
+                        super::manifest::VolumeBindingMode::WaitForFirstConsumer => {
+                            volumes::VolumeBindingMode::WaitForFirstConsumer
+                        }
+                    },
+                    reclaim_policy: match volume.reclaim_policy {
+                        super::manifest::VolumeReclaimPolicy::Retain => {
+                            volumes::VolumeReclaimPolicy::Retain
+                        }
+                        super::manifest::VolumeReclaimPolicy::Delete => {
+                            volumes::VolumeReclaimPolicy::Delete
+                        }
+                    },
+                    requested_bytes: volume
+                        .capacity_mb
+                        .map(|value| value.saturating_mul(1_048_576)),
+                    labels: volume
+                        .labels
+                        .iter()
+                        .map(|label| volumes::VolumeLabel {
+                            key: label.key.clone(),
+                            value: label.value.clone(),
+                        })
+                        .collect(),
+                    node_selector: None,
+                },
+            )
+            .await?
+        };
+
+        resolved.insert(
+            volume.name.clone(),
+            ResolvedManifestVolume {
+                volume_id: spec.id,
+                volume_name: spec.name,
+            },
+        );
+    }
+
+    Ok(resolved)
+}
+
+/// Validates that one existing cluster volume matches the immutable fields from the manifest.
+fn validate_manifest_volume_compatibility(
+    existing: &volumes::VolumeSummary,
+    declared: &super::manifest::VolumeSpec,
+) -> Result<()> {
+    match (&existing.driver, &declared.driver) {
+        (volumes::VolumeDriver::LocalManaged, super::manifest::VolumeDriver::Local(local))
+            if matches!(local.source, super::manifest::LocalVolumeSource::Managed) => {}
+        (
+            volumes::VolumeDriver::LocalImportedPath(_),
+            super::manifest::VolumeDriver::Local(super::manifest::LocalVolumeSpec {
+                source: super::manifest::LocalVolumeSource::ImportedPath(_),
+            }),
+        ) => {}
+        _ => {
+            return Err(anyhow!(
+                "existing volume '{}' does not match the manifest driver/source kind",
+                declared.name
+            ));
+        }
+    }
+
+    let declared_access = match declared.access_mode {
+        super::manifest::VolumeAccessMode::ReadWriteOnce => {
+            volumes::VolumeAccessMode::ReadWriteOnce
+        }
+    };
+    if existing.access_mode != declared_access {
+        return Err(anyhow!(
+            "existing volume '{}' does not match the manifest access_mode",
+            declared.name
+        ));
+    }
+
     Ok(())
 }
 
@@ -178,8 +288,8 @@ pub async fn deploy_manifest(
     manifest: &ServiceManifest,
 ) -> Result<ServiceDeploymentHandle> {
     let manifest_id = Uuid::new_v4();
-    ensure_manifest_volumes_supported(manifest)?;
     ensure_manifest_networks(cfg, manifest).await?;
+    let resolved_volumes = ensure_manifest_volumes(cfg, manifest).await?;
 
     let client = connection::get_local_session(cfg).await?;
     let request = client.get_services_request();
@@ -195,7 +305,11 @@ pub async fn deploy_manifest(
 
         let mut tasks_builder = spec.reborrow().init_tasks(manifest.tasks.len() as u32);
         for (idx, task) in manifest.tasks.iter().enumerate() {
-            write_task(tasks_builder.reborrow().get(idx as u32), task)?;
+            write_task(
+                tasks_builder.reborrow().get(idx as u32),
+                task,
+                &resolved_volumes,
+            )?;
         }
     }
 
@@ -259,7 +373,11 @@ pub async fn deploy_manifest(
 }
 
 /// Writes a manifest task specification into the Cap'n Proto builder for submission.
-fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) -> Result<()> {
+fn write_task(
+    mut builder: task_template::Builder<'_>,
+    task: &TaskSpec,
+    resolved_volumes: &HashMap<String, ResolvedManifestVolume>,
+) -> Result<()> {
     builder.set_name(&task.name);
     builder.set_image(&task.image);
     builder.set_replicas(task.replicas);
@@ -323,7 +441,39 @@ fn write_task(mut builder: task_template::Builder<'_>, task: &TaskSpec) -> Resul
         .reborrow()
         .init_secret_files(task.secret_files.len() as u32);
     write_secret_files(&mut files_builder, &task.secret_files, &task.name)?;
+    let mut volume_builder = builder.reborrow().init_volumes(task.volumes.len() as u32);
+    write_volume_mounts(
+        &mut volume_builder,
+        &task.name,
+        &task.volumes,
+        resolved_volumes,
+    )?;
 
+    Ok(())
+}
+
+/// Writes resolved named volume mounts into the task template builder for service deployment.
+fn write_volume_mounts(
+    builder: &mut struct_list::Builder<volume_mount::Owned>,
+    task_name: &str,
+    mounts: &[VolumeMount],
+    resolved_volumes: &HashMap<String, ResolvedManifestVolume>,
+) -> Result<()> {
+    for (idx, mount) in mounts.iter().enumerate() {
+        let source = mount.source.trim();
+        let resolved = resolved_volumes.get(source).ok_or_else(|| {
+            anyhow!(
+                "task '{}' references unresolved volume '{}'",
+                task_name,
+                mount.source
+            )
+        })?;
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_volume_id(resolved.volume_id.as_bytes());
+        entry.set_volume_name(&resolved.volume_name);
+        entry.set_target(&mount.target);
+        entry.set_read_only(mount.read_only);
+    }
     Ok(())
 }
 

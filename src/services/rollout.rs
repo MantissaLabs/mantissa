@@ -61,8 +61,11 @@ fn build_replacement_requests(
     templates: &[ServiceTaskSpecValue],
     replacements: &[ReplicaReplacement],
     eligible_nodes: &[Uuid],
+    volume_registry: &VolumeRegistry,
 ) -> Vec<TaskStartRequest> {
-    let slot_targets = compute_slot_targets(service_id, templates, eligible_nodes);
+    let slot_targets =
+        compute_effective_slot_targets(service_id, templates, eligible_nodes, volume_registry)
+            .unwrap_or_default();
     replacements
         .iter()
         .map(|replacement| {
@@ -273,6 +276,7 @@ impl ServiceController {
             templates,
             replace,
             &eligible_nodes,
+            &self.volume_registry,
         );
         let mut assignment_index: BTreeMap<(String, u16), Uuid> = BTreeMap::new();
         for assignment in retain {
@@ -808,8 +812,13 @@ impl ServiceController {
         // Rollback placement intentionally follows deterministic current ownership so recovery
         // converges the same way as regular reconciliation after membership changes.
         let eligible_nodes = self.collect_eligible_nodes();
-        let slot_targets =
-            compute_slot_targets(current_spec.id, &current_spec.tasks, &eligible_nodes);
+        let slot_targets = compute_effective_slot_targets(
+            current_spec.id,
+            &current_spec.tasks,
+            &eligible_nodes,
+            &self.volume_registry,
+        )
+        .unwrap_or_default();
 
         let mut rollback_steps: Vec<RollbackTaskRecord> =
             rollback_old_tasks.values().cloned().collect();

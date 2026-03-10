@@ -53,6 +53,9 @@ struct TaskTemplate {
 
   preStopCommand @16 :List(Text);
   # Optional command executed inside the container before termination begins.
+
+  volumes @17 :List(TaskSchema.VolumeMount);
+  # Named volumes mounted into each replica of this template.
 }
 
 enum PublicProtocol {

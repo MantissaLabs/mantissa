@@ -34,6 +34,9 @@ const ALL_DOMAINS: [Domain; 10] = [
     Domain::VolumeNodes,
 ];
 
+/// Number of replicated domains exposed through view-scoped sync RPCs.
+pub const VIEW_SCOPED_DOMAIN_COUNT: usize = ALL_DOMAINS.len();
+
 // Default chunk size used when streaming delta from server to client.
 pub const DEFAULT_DELTA_CHUNK_MAX: usize = 1024;
 
@@ -329,7 +332,7 @@ impl sync::Server for SyncService {
             "get_roots_for_view request received"
         );
 
-        let mut list = results.get().init_roots(ALL_DOMAINS.len() as u32);
+        let mut list = results.get().init_roots(VIEW_SCOPED_DOMAIN_COUNT as u32);
         for (idx, domain) in ALL_DOMAINS.iter().copied().enumerate() {
             let root_hex = self.domain_store(domain).root_hex().await;
             let mut entry = list.reborrow().get(idx as u32);

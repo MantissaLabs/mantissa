@@ -387,6 +387,10 @@ pub struct TasksStartArgs {
     /// GPU count requested
     #[arg(long = "gpu-count", value_name = "COUNT", default_value = "0")]
     pub gpu_count: u32,
+
+    /// Named volume mount in SOURCE:TARGET[:ro|rw] form (repeat flag to add multiple mounts)
+    #[arg(long = "volume", value_name = "MOUNT", action = ArgAction::Append)]
+    pub volumes: Vec<String>,
 }
 
 #[derive(Args, Debug)]

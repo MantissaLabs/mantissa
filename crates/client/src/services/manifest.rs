@@ -282,6 +282,17 @@ impl ServiceManifest {
                     volume.name
                 ));
             }
+            if matches!(
+                volume.driver,
+                VolumeDriver::Local(LocalVolumeSpec {
+                    source: LocalVolumeSource::ImportedPath(_)
+                })
+            ) {
+                return Err(anyhow!(
+                    "volume '{}' cannot use imported_path in a service manifest; import host paths ahead of deployment through `mantissa volumes import`",
+                    volume.name
+                ));
+            }
         }
 
         for task in &self.tasks {

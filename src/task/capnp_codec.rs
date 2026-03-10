@@ -1,6 +1,8 @@
-use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
+use crate::task::types::{
+    TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskVolumeMount,
+};
 use capnp::{Error, struct_list};
-use protocol::task::{environment_var, secret_file, secret_ref};
+use protocol::task::{environment_var, secret_file, secret_ref, volume_mount};
 use uuid::Uuid;
 
 /// Encodes one secret reference into the task schema payload.
@@ -101,4 +103,43 @@ pub fn decode_secret_files(
         files.push(TaskSecretFile { path, secret, mode });
     }
     Ok(files)
+}
+
+/// Encodes task volume mounts into the task schema list.
+pub fn encode_volume_mounts(
+    builder: &mut struct_list::Builder<volume_mount::Owned>,
+    mounts: &[TaskVolumeMount],
+) {
+    for (idx, mount) in mounts.iter().enumerate() {
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_volume_id(mount.volume_id.as_bytes());
+        entry.set_volume_name(&mount.volume_name);
+        entry.set_target(&mount.target);
+        entry.set_read_only(mount.read_only);
+    }
+}
+
+/// Decodes task volume mounts from the task schema list.
+pub fn decode_volume_mounts(
+    list: struct_list::Reader<volume_mount::Owned>,
+) -> Result<Vec<TaskVolumeMount>, Error> {
+    let mut mounts = Vec::with_capacity(list.len() as usize);
+    for entry in list.iter() {
+        let volume_id = {
+            let data = entry.get_volume_id()?;
+            if data.len() != 16 {
+                return Err(Error::failed("invalid volume id length".to_string()));
+            }
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(data);
+            Uuid::from_bytes(bytes)
+        };
+        mounts.push(TaskVolumeMount {
+            volume_id,
+            volume_name: entry.get_volume_name()?.to_str()?.to_string(),
+            target: entry.get_target()?.to_str()?.to_string(),
+            read_only: entry.get_read_only(),
+        });
+    }
+    Ok(mounts)
 }

@@ -163,12 +163,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 local
                     .run_until(client::tasks::start(
                         &cfg,
-                        &args.name,
-                        &args.image,
-                        &args.command,
-                        args.cpu_millis,
-                        args.memory_bytes,
-                        args.gpu_count,
+                        &client::tasks::TaskStartOptions {
+                            name: &args.name,
+                            image: &args.image,
+                            command: &args.command,
+                            cpu_millis: args.cpu_millis,
+                            memory_bytes: args.memory_bytes,
+                            gpu_count: args.gpu_count,
+                            volumes: &args.volumes,
+                        },
                     ))
                     .await?;
             }

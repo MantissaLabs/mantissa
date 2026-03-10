@@ -15,6 +15,7 @@ use crate::scheduler::{
 };
 use crate::task::types::{
     TaskEnvironmentVariable, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata,
+    TaskVolumeMount,
 };
 
 use super::{TaskManager, TaskStartRequest};
@@ -59,6 +60,7 @@ pub(super) struct BatchStartPlan {
     pub(super) pre_stop_command: Option<Vec<String>>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
     pub(super) secret_files: Vec<TaskSecretFile>,
+    pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
     pub(super) service_metadata: Option<TaskServiceMetadata>,
 }
@@ -89,6 +91,7 @@ pub(super) struct StartIntent {
     pub(super) pre_stop_command: Option<Vec<String>>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
     pub(super) secret_files: Vec<TaskSecretFile>,
+    pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
     pub(super) service_metadata: Option<TaskServiceMetadata>,
     pub(super) target_node: Option<Uuid>,
@@ -282,6 +285,7 @@ pub(super) struct RemoteStartPlan {
     pub(super) pre_stop_command: Option<Vec<String>>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
     pub(super) secret_files: Vec<TaskSecretFile>,
+    pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
     pub(super) service_metadata: Option<TaskServiceMetadata>,
 }
@@ -375,6 +379,7 @@ impl TaskManager {
                 pre_stop_command: request.pre_stop_command,
                 env: request.env,
                 secret_files: request.secret_files,
+                volumes: request.volumes,
                 networks: request.networks,
                 service_metadata: request.service_metadata,
                 target_node: request.target_node,
@@ -635,6 +640,7 @@ impl TaskManager {
                 pre_stop_command: intent.pre_stop_command.clone(),
                 env: intent.env.clone(),
                 secret_files: intent.secret_files.clone(),
+                volumes: intent.volumes.clone(),
                 networks: intent.networks.clone(),
                 service_metadata: intent.service_metadata.clone(),
             });
@@ -850,6 +856,7 @@ impl TaskManager {
                             pre_stop_command: intent.pre_stop_command.clone(),
                             env: intent.env.clone(),
                             secret_files: intent.secret_files.clone(),
+                            volumes: intent.volumes.clone(),
                             networks: intent.networks.clone(),
                             service_metadata: intent.service_metadata.clone(),
                         });
@@ -873,6 +880,7 @@ impl TaskManager {
                             pre_stop_command: intent.pre_stop_command.clone(),
                             env: intent.env.clone(),
                             secret_files: intent.secret_files.clone(),
+                            volumes: intent.volumes.clone(),
                             networks: intent.networks.clone(),
                             service_metadata: intent.service_metadata.clone(),
                         });
@@ -950,6 +958,7 @@ impl TaskManager {
                         pre_stop_command: intent.pre_stop_command.clone(),
                         env: intent.env.clone(),
                         secret_files: intent.secret_files.clone(),
+                        volumes: intent.volumes.clone(),
                         networks: intent.networks.clone(),
                         service_metadata: intent.service_metadata.clone(),
                     });
@@ -973,6 +982,7 @@ impl TaskManager {
                         pre_stop_command: intent.pre_stop_command.clone(),
                         env: intent.env.clone(),
                         secret_files: intent.secret_files.clone(),
+                        volumes: intent.volumes.clone(),
                         networks: intent.networks.clone(),
                         service_metadata: intent.service_metadata.clone(),
                     });

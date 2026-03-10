@@ -14,7 +14,9 @@ use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest, TaskTrafficPublicationUpdate};
 use crate::task::types::{
     TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec, TaskStateFilter,
+    TaskVolumeMount,
 };
+use crate::volumes::VolumeRegistry;
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -79,6 +81,7 @@ pub struct ServiceController {
     registry: ServiceRegistry,
     task_manager: TaskManager,
     cluster_registry: Registry,
+    volume_registry: VolumeRegistry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
     local_node_id: Uuid,
@@ -89,21 +92,35 @@ pub struct ServiceController {
     slot_rebalance_after: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
 }
 
+pub struct ServiceControllerConfig {
+    pub registry: ServiceRegistry,
+    pub task_manager: TaskManager,
+    pub cluster_registry: Registry,
+    pub volume_registry: VolumeRegistry,
+    pub gossip_tx: Sender<Message>,
+    pub gossip_rx: Receiver<Message>,
+    pub local_node_id: Uuid,
+    pub health_monitor: Arc<HealthMonitor>,
+}
+
 impl ServiceController {
     /// Creates a service controller bound to the local node and shared cluster state.
-    pub fn new(
-        registry: ServiceRegistry,
-        task_manager: TaskManager,
-        cluster_registry: Registry,
-        gossip_tx: Sender<Message>,
-        gossip_rx: Receiver<Message>,
-        local_node_id: Uuid,
-        health_monitor: Arc<HealthMonitor>,
-    ) -> Self {
+    pub fn new(config: ServiceControllerConfig) -> Self {
+        let ServiceControllerConfig {
+            registry,
+            task_manager,
+            cluster_registry,
+            volume_registry,
+            gossip_tx,
+            gossip_rx,
+            local_node_id,
+            health_monitor,
+        } = config;
         Self {
             registry,
             task_manager,
             cluster_registry,
+            volume_registry,
             gossip_tx,
             gossip_rx,
             local_node_id,
@@ -545,7 +562,13 @@ impl ServiceController {
 
         let service_id = compute_service_id(&service_name);
         let eligible_nodes = self.collect_eligible_nodes();
-        let requests = build_start_requests(&service_name, service_id, &templates, &eligible_nodes);
+        let requests = build_start_requests(
+            &service_name,
+            service_id,
+            &templates,
+            &eligible_nodes,
+            &self.volume_registry,
+        );
 
         if requests.is_empty() {
             let spec = ServiceSpecValue::new(
@@ -1208,8 +1231,11 @@ fn build_start_requests(
     service_id: Uuid,
     tasks: &[ServiceTaskSpecValue],
     eligible_nodes: &[Uuid],
+    volume_registry: &VolumeRegistry,
 ) -> Vec<TaskStartRequest> {
-    let slot_targets = compute_slot_targets(service_id, tasks, eligible_nodes);
+    let slot_targets =
+        compute_effective_slot_targets(service_id, tasks, eligible_nodes, volume_registry)
+            .unwrap_or_default();
     let mut requests = Vec::new();
     for task in tasks {
         for replica_idx in 0..task.replicas {
@@ -1227,6 +1253,59 @@ fn build_start_requests(
         }
     }
     requests
+}
+
+/// Computes effective slot targets after applying any hard local-volume locality overrides.
+fn compute_effective_slot_targets(
+    service_id: Uuid,
+    templates: &[ServiceTaskSpecValue],
+    eligible_nodes: &[Uuid],
+    volume_registry: &VolumeRegistry,
+) -> anyhow::Result<HashMap<SlotKey, Uuid>> {
+    let mut targets = compute_slot_targets(service_id, templates, eligible_nodes);
+    for template in templates {
+        let Some(target_node) = resolve_template_volume_target(volume_registry, &template.volumes)?
+        else {
+            continue;
+        };
+        for replica in 1..=template.replicas {
+            targets.insert(
+                SlotKey::new(service_id, &template.name, replica),
+                target_node,
+            );
+        }
+    }
+    Ok(targets)
+}
+
+/// Resolves one hard target node for a template when all mounted local volumes are already bound.
+fn resolve_template_volume_target(
+    volume_registry: &VolumeRegistry,
+    mounts: &[TaskVolumeMount],
+) -> anyhow::Result<Option<Uuid>> {
+    let mut bound_node: Option<Uuid> = None;
+    for mount in mounts {
+        let spec = volume_registry.get_spec(mount.volume_id)?.ok_or_else(|| {
+            anyhow!(
+                "unknown volume '{}' ({})",
+                mount.volume_name,
+                mount.volume_id
+            )
+        })?;
+        let Some(node_id) = spec.bound_node_id else {
+            continue;
+        };
+        match bound_node {
+            Some(current) if current != node_id => {
+                return Err(anyhow!(
+                    "mounted volumes are bound to different nodes for one service template"
+                ));
+            }
+            None => bound_node = Some(node_id),
+            _ => {}
+        }
+    }
+    Ok(bound_node)
 }
 
 /// Computes the ordered task identifiers for the manifest by iterating template/replica pairs.
@@ -1280,6 +1359,7 @@ fn make_replica_request(
         pre_stop_command: template.pre_stop_command.clone(),
         env: template.env.clone(),
         secret_files: template.secret_files.clone(),
+        volumes: template.volumes.clone(),
         networks: template.required_network_ids(),
         service_metadata: Some(TaskServiceMetadata::new(service_name, &template.name)),
         target_node,
@@ -1412,6 +1492,7 @@ mod tests {
             pre_stop_command: None,
             env: Vec::new(),
             secret_files: Vec::new(),
+            volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: Some(TaskServiceMetadata::new(service_name, template)),
             task_epoch: 0,
@@ -1438,6 +1519,7 @@ mod tests {
             pre_stop_command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()]),
             env: Vec::new(),
             secret_files: Vec::new(),
+            volumes: Vec::new(),
             networks: Vec::new(),
             health_port: None,
             health_command: None,
@@ -1476,6 +1558,7 @@ mod tests {
                     pre_stop_command: None,
                     env: Vec::new(),
                     secret_files: Vec::new(),
+                    volumes: Vec::new(),
                     networks: Vec::new(),
                     health_port: None,
                     health_command: None,
@@ -1495,6 +1578,7 @@ mod tests {
                     pre_stop_command: None,
                     env: Vec::new(),
                     secret_files: Vec::new(),
+                    volumes: Vec::new(),
                     networks: Vec::new(),
                     health_port: None,
                     health_command: None,
@@ -1571,6 +1655,7 @@ mod tests {
                 pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                volumes: Vec::new(),
                 networks: Vec::new(),
                 health_port: None,
                 health_command: None,
@@ -1590,6 +1675,7 @@ mod tests {
                 pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                volumes: Vec::new(),
                 networks: Vec::new(),
                 health_port: None,
                 health_command: None,
@@ -1627,6 +1713,7 @@ mod tests {
                 pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                volumes: Vec::new(),
                 networks: Vec::new(),
                 health_port: None,
                 health_command: None,
@@ -1646,6 +1733,7 @@ mod tests {
                 pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                volumes: Vec::new(),
                 networks: Vec::new(),
                 health_port: None,
                 health_command: None,
@@ -1706,6 +1794,7 @@ mod tests {
             pre_stop_command: None,
             env: Vec::new(),
             secret_files: Vec::new(),
+            volumes: Vec::new(),
             networks: Vec::new(),
             health_port: None,
             health_command: None,
@@ -1754,6 +1843,7 @@ mod tests {
             pre_stop_command: None,
             env: Vec::new(),
             secret_files: Vec::new(),
+            volumes: Vec::new(),
             networks: Vec::new(),
             health_port: None,
             health_command: None,
@@ -2159,6 +2249,7 @@ mod tests {
             pre_stop_command: None,
             env: Vec::new(),
             secret_files: Vec::new(),
+            volumes: Vec::new(),
             networks: Vec::new(),
             health_port: None,
             health_command: None,

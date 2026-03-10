@@ -41,6 +41,8 @@ pub struct TaskSpec {
     #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,
     #[serde(default)]
+    pub volumes: Vec<TaskVolumeMount>,
+    #[serde(default)]
     pub networks: Vec<Uuid>,
     #[serde(default)]
     pub service_metadata: Option<TaskServiceMetadata>,
@@ -181,6 +183,8 @@ pub struct TaskValue {
     #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,
     #[serde(default)]
+    pub volumes: Vec<TaskVolumeMount>,
+    #[serde(default)]
     pub networks: Vec<Uuid>,
     #[serde(default)]
     pub service_metadata: Option<TaskServiceMetadata>,
@@ -217,6 +221,7 @@ pub struct TaskValueDraft {
     pub pre_stop_command: Option<Vec<String>>,
     pub env: Vec<TaskEnvironmentVariable>,
     pub secret_files: Vec<TaskSecretFile>,
+    pub volumes: Vec<TaskVolumeMount>,
     pub service_metadata: Option<TaskServiceMetadata>,
     pub task_epoch: u64,
     pub phase_version: u64,
@@ -251,6 +256,7 @@ impl TaskValue {
             pre_stop_command: draft.pre_stop_command,
             env: draft.env,
             secret_files: draft.secret_files,
+            volumes: draft.volumes,
             service_metadata: draft.service_metadata,
             task_epoch: draft.task_epoch,
             phase_version: draft.phase_version,
@@ -258,6 +264,15 @@ impl TaskValue {
             last_terminal_observed_launch: draft.last_terminal_observed_launch,
         }
     }
+}
+
+/// One resolved volume mount attached to a task after manifest and CLI inputs are validated.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskVolumeMount {
+    pub volume_id: Uuid,
+    pub volume_name: String,
+    pub target: String,
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]

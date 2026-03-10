@@ -830,6 +830,13 @@ impl TaskManager {
         }
 
         self.cleanup_secret_artifacts(id).await;
+        if let Err(err) = self.unpublish_task_volume_mounts(&spec).await {
+            warn!(
+                target: "task",
+                task = %id,
+                "failed to unpublish local volume mounts during stop: {err:#}"
+            );
+        }
 
         if let Err(err) = self
             .teardown_runtime_attachments(id, HashSet::new(), false)
@@ -982,6 +989,13 @@ impl TaskManager {
         }
 
         self.cleanup_secret_artifacts(task_id).await;
+        if let Err(err) = self.unpublish_task_volume_mounts(&spec).await {
+            warn!(
+                target: "task",
+                task = %task_id,
+                "failed to unpublish local volume mounts after failure: {err:#}"
+            );
+        }
 
         if let Err(err) = self
             .teardown_runtime_attachments(task_id, HashSet::new(), false)
@@ -1296,6 +1310,7 @@ impl TaskManager {
                 restart_policy: working.restart_policy.as_ref(),
                 env: &working.env,
                 secret_files: &working.secret_files,
+                volume_mounts: &working.volumes,
                 networks: &working.networks,
             })
             .await
@@ -1436,6 +1451,14 @@ impl TaskManager {
                 let mut guard = self.local_containers.lock().await;
                 guard.insert(spec.id, container_id.to_string());
             }
+        }
+
+        if let Err(err) = self.publish_task_volume_mounts(spec).await {
+            warn!(
+                target: "task",
+                task = %spec.id,
+                "failed to publish local volume mounts after running commit: {err:#}"
+            );
         }
 
         dropped

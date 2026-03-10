@@ -7,6 +7,7 @@ use crate::task::docker::{
 };
 use crate::task::types::{
     TaskEnvironmentVariable, TaskRestartPolicy, TaskRestartPolicyKind, TaskSecretFile,
+    TaskVolumeMount,
 };
 
 use super::secrets::ResolvedTaskSecrets;
@@ -30,6 +31,7 @@ pub(super) struct ContainerLaunchRequest<'a> {
     pub restart_policy: Option<&'a TaskRestartPolicy>,
     pub env: &'a [TaskEnvironmentVariable],
     pub secret_files: &'a [TaskSecretFile],
+    pub volume_mounts: &'a [TaskVolumeMount],
     pub networks: &'a [Uuid],
 }
 
@@ -73,6 +75,18 @@ impl TaskManager {
             None
         } else {
             Some(resolved.mounts.clone())
+        };
+        let volume_mounts = self
+            .resolve_runtime_volume_mounts(request.task_id, request.volume_mounts)
+            .await?;
+        let volumes = match (volumes, volume_mounts.is_empty()) {
+            (Some(mut mounts), false) => {
+                mounts.extend(volume_mounts);
+                Some(mounts)
+            }
+            (Some(mounts), true) => Some(mounts),
+            (None, false) => Some(volume_mounts),
+            (None, true) => None,
         };
 
         let gpu_device_ids = if request.gpu_count > 0 {

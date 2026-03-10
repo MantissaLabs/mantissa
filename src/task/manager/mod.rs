@@ -12,8 +12,9 @@ use crate::task::docker::ContainerError;
 use crate::task::docker::ContainerManager;
 use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata,
-    TaskSpec, TaskStateFilter, TaskValue, TaskValueDraft,
+    TaskSpec, TaskStateFilter, TaskValue, TaskValueDraft, TaskVolumeMount,
 };
+use crate::volumes::VolumeRegistry;
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use bollard::errors::Error as BollardError;
@@ -37,6 +38,7 @@ mod reservation;
 mod runtime;
 mod secrets;
 mod state;
+mod volumes;
 
 #[cfg(test)]
 mod tests;
@@ -98,9 +100,11 @@ pub struct TaskManager {
     secret_artifacts: Arc<AsyncMutex<HashMap<Uuid, TaskSecretArtifacts>>>,
     secret_runtime_root: PathBuf,
     network_registry: NetworkRegistry,
+    volume_registry: VolumeRegistry,
     attachment_provisioner: Arc<dyn AttachmentProvisionerApi>,
     forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
     runtime_config: TaskRuntimeConfig,
+    local_volume_root: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +130,7 @@ pub struct TaskStartRequest {
     pub pre_stop_command: Option<Vec<String>>,
     pub env: Vec<TaskEnvironmentVariable>,
     pub secret_files: Vec<TaskSecretFile>,
+    pub volumes: Vec<TaskVolumeMount>,
     pub networks: Vec<Uuid>,
     pub service_metadata: Option<TaskServiceMetadata>,
     /// Placement hint used by the scheduler when a task must land on a specific node.
@@ -143,11 +148,13 @@ pub struct TaskManagerConfig {
     pub container_manager: Arc<dyn ContainerManager + Send + Sync>,
     pub registry: Registry,
     pub network_registry: NetworkRegistry,
+    pub volume_registry: VolumeRegistry,
     pub secret_registry: SecretRegistry,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
     pub forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
     pub attachment_override: Option<Arc<dyn AttachmentProvisionerApi>>,
     pub runtime_config: Option<TaskRuntimeConfig>,
+    pub local_volume_root: PathBuf,
 }
 
 impl TaskManager {
@@ -162,11 +169,13 @@ impl TaskManager {
             container_manager,
             registry,
             network_registry,
+            volume_registry,
             secret_registry,
             secret_keyring,
             forwarding_events,
             attachment_override,
             runtime_config,
+            local_volume_root,
         } = config;
         let secret_runtime_root = resolve_secret_runtime_root(local_node_id);
 
@@ -201,6 +210,7 @@ impl TaskManager {
             pull_limiter: Arc::new(Semaphore::new(IMAGE_PULL_MAX_CONCURRENCY)),
             registry,
             network_registry,
+            volume_registry,
             secret_registry,
             secret_keyring,
             secret_artifacts: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -208,6 +218,7 @@ impl TaskManager {
             attachment_provisioner,
             forwarding_events,
             runtime_config: runtime_config.unwrap_or_default(),
+            local_volume_root,
         }
     }
 
@@ -411,6 +422,7 @@ impl TaskManager {
             pre_stop_command: None,
             env: Vec::new(),
             secret_files: Vec::new(),
+            volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: None,
             target_node: None,
@@ -432,7 +444,8 @@ impl TaskManager {
 
         self.ensure_secret_dependencies(&requests)?;
 
-        let intents = Self::build_start_intents(requests)?;
+        let mut intents = Self::build_start_intents(requests)?;
+        self.apply_volume_locality_to_intents(&mut intents).await?;
 
         const MAX_ATTEMPTS: usize = 5;
         let mut attempt = 0usize;
@@ -462,6 +475,10 @@ impl TaskManager {
                     return Err(err.context("failed to compute scheduling plan"));
                 }
             };
+
+            self.bind_assignment_volumes(&assignment, &intents)
+                .await
+                .context("failed to bind local volumes for task batch")?;
 
             attempt += 1;
 
@@ -1162,6 +1179,7 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         pre_stop_command: value.pre_stop_command,
         env: value.env,
         secret_files: value.secret_files,
+        volumes: value.volumes,
         networks: value.networks,
         service_metadata: value.service_metadata,
         task_epoch: value.task_epoch,
@@ -1195,6 +1213,7 @@ pub(crate) fn spec_to_value(spec: &TaskSpec) -> TaskValue {
         pre_stop_command: spec.pre_stop_command.clone(),
         env: spec.env.clone(),
         secret_files: spec.secret_files.clone(),
+        volumes: spec.volumes.clone(),
         service_metadata: spec.service_metadata.clone(),
         task_epoch: spec.task_epoch,
         phase_version: spec.phase_version,

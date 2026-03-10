@@ -24,11 +24,13 @@ use mantissa::store::scheduler_store::open_scheduler_store;
 use mantissa::store::secret_master_store::SecretMasterStore;
 use mantissa::store::secret_store::open_secret_store;
 use mantissa::store::task_store::open_task_store;
+use mantissa::store::volume_store::{open_volume_node_store, open_volume_spec_store};
 use mantissa::task::docker::{
     ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager,
 };
 use mantissa::task::manager::{TaskManager, TaskManagerConfig, TaskStartRequest};
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
+use mantissa::volumes::VolumeRegistry;
 use net::noise::NoiseKeys;
 use protocol::secrets::secrets;
 use std::collections::HashMap;
@@ -222,6 +224,24 @@ async fn setup_task_manager() -> TestHarness {
         .await
         .expect("rebuild secret store");
     let secret_registry = SecretRegistry::new(secret_store);
+    let volume_dir = tempdir().expect("volume tempdir");
+    let volume_path = volume_dir
+        .path()
+        .join(format!("volume-{}.redb", Uuid::new_v4()));
+    let volume_db = Arc::new(redb::Database::create(volume_path).expect("create volume db"));
+    let volume_spec_store =
+        open_volume_spec_store(volume_db.clone(), actor).expect("open volume spec store");
+    volume_spec_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume spec store");
+    let volume_node_store =
+        open_volume_node_store(volume_db.clone(), actor).expect("open volume node store");
+    volume_node_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume node store");
+    let volume_registry = VolumeRegistry::new(volume_spec_store, volume_node_store);
 
     let master_dir = tempdir().expect("master tempdir");
     let master_path = master_dir
@@ -252,6 +272,7 @@ async fn setup_task_manager() -> TestHarness {
     );
 
     let (tx, rx) = async_channel::bounded(128);
+    let local_volume_root = tempdir().expect("local volume root");
 
     let manager = TaskManager::new(TaskManagerConfig {
         store: task_store,
@@ -267,11 +288,13 @@ async fn setup_task_manager() -> TestHarness {
             network_peer_store,
             network_attachment_store,
         ),
+        volume_registry,
         secret_registry: secret_registry.clone(),
         secret_keyring: secret_keyring_arc.clone(),
         forwarding_events: None,
         attachment_override: None,
         runtime_config: None,
+        local_volume_root: local_volume_root.path().to_path_buf(),
     });
 
     TestHarness {
@@ -360,6 +383,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
             },
             mode: Some(0o440),
         }],
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
         target_node: None,
@@ -491,6 +515,7 @@ local_test!(task_manager_rejects_missing_secret_reference, {
             }),
         }],
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
         target_node: None,

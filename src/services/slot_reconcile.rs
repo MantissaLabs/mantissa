@@ -1,13 +1,13 @@
 use super::ownership::{
-    ReplicaSlot, SlotKey, build_replica_slots, compute_slot_targets, select_slot_owner,
-    select_task_owner,
+    ReplicaSlot, SlotKey, build_replica_slots, select_slot_owner, select_task_owner,
 };
 use super::{
     SERVICE_ENABLE_PROACTIVE_REBALANCE, SERVICE_REBALANCE_COOLDOWN_SECS,
     SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController, ServiceTaskSnapshot, TaskInventory,
-    deploying_assignment_incomplete, expected_task_id_count, make_replica_request, node_is_down,
-    should_restart_missing_slot_immediately, task_age_allows_cleanup, task_age_allows_rebalance,
-    task_state_healthy, task_state_rebalanceable,
+    compute_effective_slot_targets, deploying_assignment_incomplete, expected_task_id_count,
+    make_replica_request, node_is_down, should_restart_missing_slot_immediately,
+    task_age_allows_cleanup, task_age_allows_rebalance, task_state_healthy,
+    task_state_rebalanceable,
 };
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
 use crate::task::types::TaskSpec;
@@ -54,7 +54,12 @@ impl ServiceController {
         }
 
         let slots = build_replica_slots(&spec);
-        let slot_targets = compute_slot_targets(spec.id, &spec.tasks, eligible_nodes);
+        let slot_targets = compute_effective_slot_targets(
+            spec.id,
+            &spec.tasks,
+            eligible_nodes,
+            &self.volume_registry,
+        )?;
         let desired_ids: HashSet<Uuid> = slots.iter().filter_map(|slot| slot.task_id).collect();
         let service_tasks = inventory.service_task_snapshot(&spec.service_name, desired_ids);
         let service_degraded = slots.iter().any(|slot| {

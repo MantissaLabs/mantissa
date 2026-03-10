@@ -548,9 +548,20 @@ impl volumes::Server for VolumesRpc {
 
         let node_id = read_uuid(request.get_node_id()?, "node id")?;
         let path = Self::read_non_empty_text(request.get_path()?, "path")?;
-        if !Path::new(&path).is_absolute() {
+        let import_path = Path::new(&path);
+        if !import_path.is_absolute() {
             return Err(Error::failed(
                 "imported volume path must be absolute".to_string(),
+            ));
+        }
+        if !import_path.exists() {
+            return Err(Error::failed(
+                "imported volume path must already exist".to_string(),
+            ));
+        }
+        if !import_path.is_dir() {
+            return Err(Error::failed(
+                "imported volume path must be a directory".to_string(),
             ));
         }
 

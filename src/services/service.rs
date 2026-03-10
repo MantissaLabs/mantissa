@@ -8,7 +8,8 @@ use crate::services::types::{
     ServiceUpdateStrategyMode,
 };
 use crate::task::capnp_codec::{
-    decode_env_vars, decode_secret_files, encode_env_vars, encode_secret_files,
+    decode_env_vars, decode_secret_files, decode_volume_mounts, encode_env_vars,
+    encode_secret_files, encode_volume_mounts,
 };
 use crate::topology::Topology;
 use capnp::Error;
@@ -323,6 +324,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
 
     let env = decode_env_vars(reader.get_env()?)?;
     let secret_files = decode_secret_files(reader.get_secret_files()?)?;
+    let volumes = decode_volume_mounts(reader.get_volumes()?)?;
 
     let mut networks = Vec::new();
     let mut seen_networks = HashSet::new();
@@ -415,6 +417,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         pre_stop_command,
         env,
         secret_files,
+        volumes,
         networks,
         health_port,
         health_command,
@@ -621,6 +624,8 @@ fn write_task_template(
         .reborrow()
         .init_secret_files(task.secret_files.len() as u32);
     encode_secret_files(&mut files_builder, &task.secret_files);
+    let mut volume_builder = builder.reborrow().init_volumes(task.volumes.len() as u32);
+    encode_volume_mounts(&mut volume_builder, &task.volumes);
 
     builder.set_health_port(task.health_port().unwrap_or(0));
     let cmd = task.health_command();

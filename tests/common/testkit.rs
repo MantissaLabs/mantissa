@@ -357,6 +357,7 @@ impl TestNode {
             gossip_channel_capacity,
             task_runtime,
             container_manager: None,
+            local_volume_root: None,
         }
     }
 

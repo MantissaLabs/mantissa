@@ -1,5 +1,6 @@
 use crate::task::capnp_codec::{
-    decode_env_vars, decode_secret_files, encode_env_vars, encode_secret_files,
+    decode_env_vars, decode_secret_files, decode_volume_mounts, encode_env_vars,
+    encode_secret_files, encode_volume_mounts,
 };
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
@@ -207,6 +208,8 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
         .reborrow()
         .init_secret_files(spec.secret_files.len() as u32);
     encode_secret_files(&mut files_builder, &spec.secret_files);
+    let mut volume_builder = builder.reborrow().init_volumes(spec.volumes.len() as u32);
+    encode_volume_mounts(&mut volume_builder, &spec.volumes);
 
     if let Some(meta) = spec.service_metadata.as_ref() {
         let mut meta_builder = builder.reborrow().init_service_metadata();
@@ -283,6 +286,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
 
     let env = decode_env_vars(reader.get_env()?)?;
     let secret_files = decode_secret_files(reader.get_secret_files()?)?;
+    let volumes = decode_volume_mounts(reader.get_volumes()?)?;
 
     let mut networks = Vec::new();
     for entry in reader.get_networks()?.iter() {
@@ -345,6 +349,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         pre_stop_command,
         env,
         secret_files,
+        volumes,
         networks,
         service_metadata,
         task_epoch,
@@ -434,6 +439,7 @@ impl task::Server for TaskService {
         };
         let env = decode_env_vars(req.get_env()?)?;
         let secret_files = decode_secret_files(req.get_secret_files()?)?;
+        let volumes = decode_volume_mounts(req.get_volumes()?)?;
 
         let mut networks = Vec::new();
         for entry in req.get_networks()?.iter() {
@@ -461,6 +467,7 @@ impl task::Server for TaskService {
             pre_stop_command,
             env,
             secret_files,
+            volumes,
             networks,
             service_metadata: None,
             target_node: None,
@@ -527,6 +534,7 @@ impl task::Server for TaskService {
 
             let env = decode_env_vars(entry.get_env()?)?;
             let secret_files = decode_secret_files(entry.get_secret_files()?)?;
+            let volumes = decode_volume_mounts(entry.get_volumes()?)?;
 
             let mut networks = Vec::new();
             for net in entry.get_networks()?.iter() {
@@ -576,6 +584,7 @@ impl task::Server for TaskService {
                 pre_stop_command,
                 env,
                 secret_files,
+                volumes,
                 networks,
                 service_metadata: None,
                 target_node: None,

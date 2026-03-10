@@ -30,6 +30,20 @@ struct SecretFile {
   # POSIX file mode, 0 = default 0o600.
 }
 
+struct VolumeMount {
+  volumeId @0 :Data;
+  # Referenced volume UUID as 16 bytes.
+
+  volumeName @1 :Text;
+  # Logical volume name for operator-facing diagnostics.
+
+  target @2 :Text;
+  # Container filesystem path where the volume should be mounted.
+
+  readOnly @3 :Bool;
+  # Mount the volume read-only inside the container.
+}
+
 struct TaskSpec {
   id @0 :Data;
   # Task UUID v4 as 16 bytes.
@@ -111,6 +125,9 @@ struct TaskSpec {
 
   preStopCommand @26 :List(Text);
   # Optional command executed inside the container before termination begins.
+
+  volumes @27 :List(VolumeMount);
+  # Named volumes mounted into the task runtime.
 }
 
 struct ServiceMetadata {
@@ -166,6 +183,9 @@ struct TaskStartRequest {
 
   preStopCommand @14 :List(Text);
   # Optional command executed inside the container before termination begins.
+
+  volumes @15 :List(VolumeMount);
+  # Named volumes mounted into the task runtime.
 }
 
 struct TaskStopRequest {

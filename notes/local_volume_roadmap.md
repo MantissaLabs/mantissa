@@ -742,6 +742,10 @@ Completed on March 10, 2026.
 
 Make local volumes affect placement and mount into tasks.
 
+### Status
+
+Completed on March 10, 2026.
+
 ### Scope
 
 1. add local volume root config,

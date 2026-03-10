@@ -23,8 +23,15 @@ use crate::store::scheduler_store::open_scheduler_store;
 use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
+use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
 use crate::task::types::{TaskRestartPolicyKind, TaskStateKind, TaskValue, TaskValueDraft};
 use crate::topology::peers::PeerSchedulingState;
+use crate::volumes::VolumeRegistry;
+use crate::volumes::local::managed_volume_data_path;
+use crate::volumes::types::{
+    LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+    VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
+};
 use ::health::HealthMonitor;
 use anyhow::{Result, anyhow};
 use async_channel::bounded;
@@ -58,6 +65,7 @@ struct MockContainerManager {
     stop_timeouts: Arc<AsyncMutex<Vec<Option<std::time::Duration>>>>,
     stop_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
     limits: Arc<AsyncMutex<Vec<crate::task::docker::ResourceLimits>>>,
+    volume_mounts: Arc<AsyncMutex<Vec<Vec<String>>>>,
     inspect: Arc<AsyncMutex<HashMap<String, bollard::service::ContainerInspectResponse>>>,
     inspect_calls: Arc<AsyncMutex<Vec<String>>>,
     listed: Arc<AsyncMutex<Vec<crate::task::docker::ContainerInfo>>>,
@@ -77,10 +85,12 @@ impl ContainerManager for MockContainerManager {
         }
 
         let resource_limits = request.resource_limits;
+        let volumes = request.volumes.unwrap_or_default();
         let mut guard = self.created.lock().await;
         let id = format!("container-{}", guard.len());
         guard.push(id.clone());
         self.limits.lock().await.push(resource_limits);
+        self.volume_mounts.lock().await.push(volumes);
 
         let mut inspect = self.inspect.lock().await;
         let state = bollard::models::ContainerState {
@@ -465,6 +475,20 @@ async fn setup_manager_with_forwarding(
         .await
         .expect("rebuild secret store");
     let secret_registry = SecretRegistry::new(secret_store);
+    let (volume_db, _volume_dir) = temp_db("volumes");
+    let volume_spec_store =
+        open_volume_spec_store(volume_db.clone(), actor).expect("open volume spec store");
+    volume_spec_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume spec store");
+    let volume_node_store =
+        open_volume_node_store(volume_db.clone(), actor).expect("open volume node store");
+    volume_node_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume node store");
+    let volume_registry = VolumeRegistry::new(volume_spec_store, volume_node_store);
     let (master_db, _master_dir) = temp_db("master");
     let master_store = SecretMasterStore::new(master_db.clone()).expect("open master store");
     let master_record = master_store
@@ -500,6 +524,9 @@ async fn setup_manager_with_forwarding(
     let attachment = attachment_override.unwrap_or_else(|| {
         Arc::new(FakeAttachmentProvisioner::default()) as Arc<dyn AttachmentProvisionerApi>
     });
+    let local_volume_root =
+        std::env::temp_dir().join(format!("mantissa-task-manager-volumes-{actor}"));
+    std::fs::create_dir_all(&local_volume_root).expect("create local volume root");
 
     let manager = TaskManager::new(TaskManagerConfig {
         store: task_store,
@@ -511,11 +538,13 @@ async fn setup_manager_with_forwarding(
         container_manager: mock_cm.clone(),
         registry,
         network_registry: network_registry.clone(),
+        volume_registry,
         secret_registry,
         secret_keyring: secret_keyring.clone(),
         forwarding_events,
         attachment_override: Some(attachment),
         runtime_config: None,
+        local_volume_root,
     });
 
     (manager, scheduler, mock_cm, network_registry)
@@ -546,6 +575,64 @@ async fn set_local_drain_requested(
         .upsert_self_scheduling(scheduling)
         .await
         .expect("upsert local drain state");
+}
+
+/// Stores one managed local volume spec in the registry so task tests can exercise locality.
+async fn create_managed_local_volume(
+    manager: &TaskManager,
+    name: &str,
+    binding_mode: VolumeBindingMode,
+    bound_node_id: Option<Uuid>,
+    bound_node_name: Option<&str>,
+) -> VolumeSpecValue {
+    let spec = VolumeSpecValue::new(VolumeSpecDraft {
+        name: name.to_string(),
+        driver: VolumeDriver::Local(LocalVolumeSpec {
+            source: LocalVolumeSource::Managed,
+        }),
+        access_mode: VolumeAccessMode::ReadWriteOnce,
+        binding_mode,
+        reclaim_policy: VolumeReclaimPolicy::Retain,
+        requested_bytes: None,
+        labels: Vec::new(),
+        bound_node_id,
+        bound_node_name: bound_node_name.map(str::to_string),
+    });
+    manager
+        .volume_registry
+        .upsert_spec(spec.clone())
+        .await
+        .expect("upsert managed local volume");
+    spec
+}
+
+/// Builds one standalone task request that mounts a single resolved volume reference.
+fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> TaskStartRequest {
+    TaskStartRequest {
+        name: "volume-task".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 200,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        id: None,
+        slot_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: vec![crate::task::types::TaskVolumeMount {
+            volume_id: volume.id,
+            volume_name: volume.name.clone(),
+            target: target.to_string(),
+            read_only: false,
+        }],
+        networks: Vec::new(),
+        service_metadata: None,
+        target_node: None,
+    }
 }
 
 #[tokio::test]
@@ -615,6 +702,7 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: Some(TaskServiceMetadata::new("svc", "api")),
         task_epoch: 0,
@@ -678,6 +766,7 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: Some(TaskServiceMetadata::new("svc", "api")),
         task_epoch: 0,
@@ -737,6 +826,7 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
         task_epoch: 0,
@@ -803,6 +893,7 @@ async fn reconcile_rejects_missing_slot_assignments() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
         task_epoch: 0,
@@ -855,6 +946,7 @@ async fn reconcile_pending_task_reserves_assigned_slots_before_launch() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
         task_epoch: 0,
@@ -919,6 +1011,7 @@ async fn reconcile_uses_latest_persisted_slot_assignment() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
         task_epoch: 0,
@@ -1037,6 +1130,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: None,
         task_epoch: 2,
         phase_version: 7,
@@ -1066,6 +1160,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: None,
         task_epoch: 1,
         phase_version: 99,
@@ -1099,6 +1194,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: None,
         task_epoch: 2,
         phase_version: 6,
@@ -1132,6 +1228,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: None,
         task_epoch: 3,
         phase_version: 0,
@@ -1172,6 +1269,7 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: None,
         task_epoch: 0,
         phase_version: 4,
@@ -1201,6 +1299,7 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: None,
         task_epoch: 0,
         phase_version: 3,
@@ -1729,6 +1828,7 @@ async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
         task_epoch: 0,
@@ -2351,6 +2451,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                volumes: Vec::new(),
                 networks: Vec::new(),
                 service_metadata: None,
                 target_node: None,
@@ -2370,6 +2471,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                volumes: Vec::new(),
                 networks: Vec::new(),
                 service_metadata: None,
                 target_node: None,
@@ -2424,6 +2526,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
             pre_stop_command: None,
             env: Vec::new(),
             secret_files: Vec::new(),
+            volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: None,
             target_node: None,
@@ -2485,6 +2588,7 @@ async fn task_owned_locally_detects_remote_entries() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: None,
         task_epoch: 0,
         phase_version: 0,
@@ -2542,6 +2646,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                volumes: Vec::new(),
                 networks: Vec::new(),
                 service_metadata: None,
                 target_node: None,
@@ -2561,6 +2666,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 pre_stop_command: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
+                volumes: Vec::new(),
                 networks: Vec::new(),
                 service_metadata: None,
                 target_node: None,
@@ -2640,6 +2746,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
@@ -2736,6 +2843,7 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: vec![spec.id],
         service_metadata: Some(TaskServiceMetadata::new("svc", "backend")),
         target_node: None,
@@ -2795,6 +2903,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: Some(TaskServiceMetadata::new("svc", "backend")),
         task_epoch: 0,
         phase_version: 0,
@@ -2869,6 +2978,7 @@ async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachme
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: Some(TaskServiceMetadata::new("svc", "backend")),
         task_epoch: 0,
         phase_version: 0,
@@ -2977,6 +3087,7 @@ async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
@@ -3088,6 +3199,7 @@ async fn request_task_stop_cleans_up_after_teardown_failure() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
@@ -3452,6 +3564,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: None,
         task_epoch: original.task_epoch,
         phase_version: original.phase_version,
@@ -3525,6 +3638,7 @@ fn build_remote_task_spec(
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
         task_epoch,
@@ -3620,6 +3734,7 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: None,
         task_epoch: gossip_running.task_epoch,
         phase_version: gossip_running.phase_version.saturating_sub(1),
@@ -3753,6 +3868,7 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         service_metadata: None,
         task_epoch: 0,
         phase_version: 0,
@@ -3856,6 +3972,7 @@ async fn attachment_ready_triggers_forwarding_event() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
@@ -3955,6 +4072,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: vec![spec_a.id, spec_b.id],
         service_metadata: None,
         target_node: None,
@@ -4051,6 +4169,7 @@ async fn runtime_attachments_retry_transient_provision_errors() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
@@ -4151,6 +4270,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
@@ -4207,6 +4327,7 @@ fn scheduling_retry_budget_stays_wide_for_untargeted_starts() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
         target_node: None,
@@ -4233,10 +4354,231 @@ fn scheduling_retry_budget_is_shorter_for_targeted_starts() {
         pre_stop_command: None,
         env: Vec::new(),
         secret_files: Vec::new(),
+        volumes: Vec::new(),
         networks: Vec::new(),
         service_metadata: None,
         target_node: Some(Uuid::new_v4()),
     }];
 
     assert_eq!(scheduling_retry_max_attempts_for_intents(&intents), 8);
+}
+
+#[tokio::test]
+async fn local_volume_wait_for_first_consumer_binds_on_first_start() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let volume = create_managed_local_volume(
+        &manager,
+        "local-data",
+        VolumeBindingMode::WaitForFirstConsumer,
+        None,
+        None,
+    )
+    .await;
+
+    let mut started = manager
+        .start_tasks_batch(vec![standalone_volume_task_request(
+            &volume,
+            "/var/lib/data",
+        )])
+        .await
+        .expect("start volume-backed task");
+    let spec = started.pop().expect("started task");
+
+    let bound = manager
+        .volume_registry
+        .get_spec(volume.id)
+        .expect("load bound volume")
+        .expect("volume should exist");
+    assert_eq!(bound.bound_node_id, Some(manager.local_node_id));
+    assert_eq!(
+        bound.bound_node_name.as_deref(),
+        Some(manager.local_node_name.as_str())
+    );
+    assert!(
+        matches!(
+            bound.status,
+            VolumeStatus::Bound | VolumeStatus::Ready | VolumeStatus::InUse
+        ),
+        "volume should be durably bound before publication, got {:?}",
+        bound.status
+    );
+
+    let node_state = manager
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("load local volume node state")
+        .expect("node-local volume state should exist");
+    let expected_path = managed_volume_data_path(&manager.local_volume_root, volume.id);
+    assert_eq!(
+        node_state.local_path.as_deref(),
+        Some(expected_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(node_state.published_task_ids, vec![spec.id]);
+    assert!(
+        matches!(node_state.state, VolumeNodeState::Published),
+        "volume node state should be published while the task is running, got {:?}",
+        node_state.state
+    );
+    assert!(
+        expected_path.is_dir(),
+        "managed local volume path should exist at {}",
+        expected_path.display()
+    );
+
+    let volume_mounts = mock_cm.volume_mounts.lock().await.clone();
+    assert_eq!(volume_mounts.len(), 1, "expected one container create call");
+    assert_eq!(
+        volume_mounts[0],
+        vec![format!("{}:/var/lib/data:rw", expected_path.display())]
+    );
+}
+
+#[tokio::test]
+async fn task_restart_preserves_local_volume_mount() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let volume = create_managed_local_volume(
+        &manager,
+        "restart-data",
+        VolumeBindingMode::WaitForFirstConsumer,
+        None,
+        None,
+    )
+    .await;
+
+    let mut started = manager
+        .start_tasks_batch(vec![standalone_volume_task_request(&volume, "/srv/data")])
+        .await
+        .expect("start initial volume-backed task");
+    let spec = started.pop().expect("started task");
+
+    let initial_mounts = mock_cm.volume_mounts.lock().await.clone();
+    assert_eq!(
+        initial_mounts.len(),
+        1,
+        "expected first launch to record mounts"
+    );
+
+    {
+        let mut inspect = mock_cm.inspect.lock().await;
+        inspect.clear();
+    }
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("reconcile should recreate the missing runtime");
+
+    let volume_mounts = mock_cm.volume_mounts.lock().await.clone();
+    assert_eq!(
+        volume_mounts.len(),
+        2,
+        "expected the task runtime to relaunch"
+    );
+    assert_eq!(
+        volume_mounts[0], volume_mounts[1],
+        "restarted task should reuse the same local volume mount"
+    );
+
+    let node_state = manager
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("load volume node state after restart")
+        .expect("volume node state should exist after restart");
+    assert_eq!(
+        node_state.local_path.as_deref(),
+        Some(
+            managed_volume_data_path(&manager.local_volume_root, volume.id)
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    assert_eq!(
+        node_state.published_task_ids,
+        vec![spec.id],
+        "restart should preserve the same published task consumer"
+    );
+}
+
+#[tokio::test]
+async fn multi_volume_bound_node_conflict_rejected() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let other_node = Uuid::new_v4();
+
+    let left = create_managed_local_volume(
+        &manager,
+        "left-volume",
+        VolumeBindingMode::Immediate,
+        Some(manager.local_node_id),
+        Some("local-node"),
+    )
+    .await;
+    let right = create_managed_local_volume(
+        &manager,
+        "right-volume",
+        VolumeBindingMode::Immediate,
+        Some(other_node),
+        Some("remote-node"),
+    )
+    .await;
+
+    let err = manager
+        .start_tasks_batch(vec![TaskStartRequest {
+            name: "conflict".into(),
+            image: "img".into(),
+            command: Vec::new(),
+            cpu_millis: 100,
+            memory_bytes: 64 * 1_024 * 1_024,
+            gpu_count: 0,
+            gpu_device_ids: Vec::new(),
+            id: None,
+            slot_ids: Vec::new(),
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: vec![
+                crate::task::types::TaskVolumeMount {
+                    volume_id: left.id,
+                    volume_name: left.name.clone(),
+                    target: "/left".into(),
+                    read_only: false,
+                },
+                crate::task::types::TaskVolumeMount {
+                    volume_id: right.id,
+                    volume_name: right.name.clone(),
+                    target: "/right".into(),
+                    read_only: false,
+                },
+            ],
+            networks: Vec::new(),
+            service_metadata: None,
+            target_node: None,
+        }])
+        .await
+        .expect_err("scheduler should reject tasks whose mounted volumes disagree on locality");
+
+    assert!(
+        err.to_string()
+            .contains("references volumes bound to different nodes"),
+        "unexpected error text: {err:#}"
+    );
 }
