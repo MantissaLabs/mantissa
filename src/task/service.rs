@@ -43,10 +43,10 @@ fn state_from_str(input: &str) -> ContainerState {
         "failed" => ContainerState::Failed,
         "unknown" => ContainerState::Unknown,
         other => {
-            if let Some(code) = other.strip_prefix("exited:") {
-                if let Ok(code) = code.parse::<i32>() {
-                    return ContainerState::Exited(code);
-                }
+            if let Some(code) = other.strip_prefix("exited:")
+                && let Ok(code) = code.parse::<i32>()
+            {
+                return ContainerState::Exited(code);
             }
             ContainerState::Unknown
         }

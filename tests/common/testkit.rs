@@ -256,7 +256,7 @@ enum ContainerManagerOverrideEntry {
 
 thread_local! {
     static TEST_CONTAINER_MANAGER_STACK: RefCell<Vec<ContainerManagerOverrideEntry>> =
-        RefCell::new(Vec::new());
+        const { RefCell::new(Vec::new()) };
 }
 
 fn current_container_manager_override() -> Option<ContainerManagerOverrideEntry> {
@@ -454,13 +454,13 @@ impl TestNode {
         let req = self.node.topology_client.list_request();
         let resp = req.send().promise.await.expect("list send");
         let get_resp = resp.get().expect("list get");
-        let nodes = get_resp.get_nodes().unwrap();
-        let list = nodes.get_nodes().unwrap();
+        let nodes = get_resp.get_nodes().expect("list nodes result");
+        let list = nodes.get_nodes().expect("list nodes payload");
 
         let mut out = Vec::with_capacity(list.len() as usize);
         for i in 0..list.len() {
             let ni = list.get(i);
-            let id = node::id::read_node_id(ni.get_id().unwrap()).expect("node id");
+            let id = node::id::read_node_id(ni.get_id().expect("node id bytes")).expect("node id");
             out.push(id);
         }
         out.sort();
@@ -761,7 +761,7 @@ impl TestNode {
         let list = resp.get()?.get_nodes()?;
         for n in list.get_nodes()?.iter() {
             let id_bytes = n.get_id()?.get_bytes()?;
-            let id = uuid::Uuid::from_slice(id_bytes).unwrap();
+            let id = uuid::Uuid::from_slice(id_bytes).expect("uuid from node id bytes");
             if id == target {
                 return Ok(Some(n.get_health()?));
             }
@@ -778,7 +778,7 @@ impl TestNode {
         let mut out = HashMap::new();
         for n in list.get_nodes()?.iter() {
             let id_bytes = n.get_id()?.get_bytes()?;
-            let id = uuid::Uuid::from_slice(id_bytes).unwrap();
+            let id = uuid::Uuid::from_slice(id_bytes).expect("uuid from node id bytes");
             out.insert(id, n.get_health()?);
         }
         Ok(out)

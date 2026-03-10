@@ -3,6 +3,7 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -117,7 +118,7 @@ async fn accept_loop(
     server_handle: protocol::server::server::Client,
     noise_keys: Arc<crate::noise::NoiseKeys>,
     psk_provider: Arc<dyn NoisePskProvider>,
-    peer_verifier: Arc<dyn NoisePeerVerifier>,
+    peer_verifier: Rc<dyn NoisePeerVerifier>,
 ) {
     let handshake_limit = resolve_handshake_limit();
     let handshake_semaphore = Arc::new(Semaphore::new(handshake_limit));
@@ -308,7 +309,7 @@ pub async fn start_tcp_secure_listener(
     server_handle: protocol::server::server::Client,
     noise_keys: Arc<crate::noise::NoiseKeys>,
     psk_provider: Arc<dyn NoisePskProvider>,
-    peer_verifier: Arc<dyn NoisePeerVerifier>,
+    peer_verifier: Rc<dyn NoisePeerVerifier>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&listen_addr).await?;
     let bound = listener.local_addr()?;
@@ -333,7 +334,7 @@ pub async fn start_tcp_secure_listener_nonblocking_with_ready(
     server_handle: protocol::server::server::Client,
     noise_keys: Arc<crate::noise::NoiseKeys>,
     psk_provider: Arc<dyn NoisePskProvider>,
-    peer_verifier: Arc<dyn NoisePeerVerifier>,
+    peer_verifier: Rc<dyn NoisePeerVerifier>,
 ) -> Result<
     (
         tokio::task::JoinHandle<()>,

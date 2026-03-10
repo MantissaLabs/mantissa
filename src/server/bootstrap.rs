@@ -32,7 +32,7 @@ use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::{SecretStore, open_secret_store};
 use crate::store::service_store::{ServiceStore, open_service_store};
 use crate::store::task_store::{TaskStore, open_task_store};
-use crate::sync::SyncService;
+use crate::sync::{SyncService, SyncStores};
 use crate::task::docker::{self, ContainerManager, DockerContainerManager};
 use crate::task::manager::{TaskManager, TaskManagerConfig, TaskRuntimeConfig};
 use crate::task::service::TaskService;
@@ -484,14 +484,16 @@ impl Bootstrap {
         // sync capability
         let sync_service = SyncService::new(
             cluster_view,
-            topology_stores.peers.clone(),
-            stores.tasks.clone(),
-            stores.services.clone(),
-            stores.secrets.clone(),
-            stores.networks.clone(),
-            stores.network_peers.clone(),
-            stores.network_attachments.clone(),
-            stores.cluster_view.cluster_view_domain_store(),
+            SyncStores {
+                peers: topology_stores.peers.clone(),
+                tasks: stores.tasks.clone(),
+                services: stores.services.clone(),
+                secrets: stores.secrets.clone(),
+                networks: stores.networks.clone(),
+                network_peers: stores.network_peers.clone(),
+                network_attachments: stores.network_attachments.clone(),
+                cluster_views: stores.cluster_view.cluster_view_domain_store(),
+            },
         );
         let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
 

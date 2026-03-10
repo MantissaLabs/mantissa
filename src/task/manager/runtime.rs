@@ -211,16 +211,14 @@ impl TaskManager {
             });
 
             let mut needs_refresh = missing;
-            if !needs_refresh {
-                if let Some(revision) = task_revision_timestamp(&value) {
-                    for network_id in &value.networks {
-                        let observed = known
-                            .and_then(|map| map.get(network_id))
-                            .and_then(|entry| entry.1.as_deref());
-                        if observed != Some(revision.as_str()) {
-                            needs_refresh = true;
-                            break;
-                        }
+            if !needs_refresh && let Some(revision) = task_revision_timestamp(&value) {
+                for network_id in &value.networks {
+                    let observed = known
+                        .and_then(|map| map.get(network_id))
+                        .and_then(|entry| entry.1.as_deref());
+                    if observed != Some(revision.as_str()) {
+                        needs_refresh = true;
+                        break;
                     }
                 }
             }
@@ -475,26 +473,25 @@ impl TaskManager {
                     .store
                     .get_snapshot(&UuidKey::from(spec.id))
                     .map_err(|e| anyhow::anyhow!("task lookup failed before upsert apply: {e}"))?
+                    && let Some(current) = select_best_task_value(snapshot.as_slice())
                 {
-                    if let Some(current) = select_best_task_value(snapshot.as_slice()) {
-                        let ordering = compare_task_causality(&current, &incoming);
-                        if !ordering.is_gt() {
-                            self.record_causal_conflict_telemetry(&current, &incoming, ordering)
-                                .await;
-                            debug!(
-                                target: "task",
-                                task = %spec.id,
-                                current_epoch = current.task_epoch,
-                                current_phase_version = current.phase_version,
-                                incoming_epoch = incoming.task_epoch,
-                                incoming_phase_version = incoming.phase_version,
-                                current_state = ?current.state,
-                                incoming_state = ?incoming.state,
-                                relation = %Self::causal_order_label(ordering),
-                                "ignoring stale or duplicate task upsert by causal ordering"
-                            );
-                            return Ok(());
-                        }
+                    let ordering = compare_task_causality(&current, &incoming);
+                    if !ordering.is_gt() {
+                        self.record_causal_conflict_telemetry(&current, &incoming, ordering)
+                            .await;
+                        debug!(
+                            target: "task",
+                            task = %spec.id,
+                            current_epoch = current.task_epoch,
+                            current_phase_version = current.phase_version,
+                            incoming_epoch = incoming.task_epoch,
+                            incoming_phase_version = incoming.phase_version,
+                            current_state = ?current.state,
+                            incoming_state = ?incoming.state,
+                            relation = %Self::causal_order_label(ordering),
+                            "ignoring stale or duplicate task upsert by causal ordering"
+                        );
+                        return Ok(());
                     }
                 }
                 let belongs = spec.node_id == self.local_node_id;
@@ -672,23 +669,23 @@ impl TaskManager {
                         location_changed = true;
                     }
 
-                    if value.service_name.is_none() {
-                        if let Some((service, _)) = &service_labels {
-                            value.service_name = Some(service.clone());
-                            label_changed = true;
-                        }
+                    if value.service_name.is_none()
+                        && let Some((service, _)) = &service_labels
+                    {
+                        value.service_name = Some(service.clone());
+                        label_changed = true;
                     }
-                    if value.template_name.is_none() {
-                        if let Some((_, template)) = &service_labels {
-                            value.template_name = Some(template.clone());
-                            label_changed = true;
-                        }
+                    if value.template_name.is_none()
+                        && let Some((_, template)) = &service_labels
+                    {
+                        value.template_name = Some(template.clone());
+                        label_changed = true;
                     }
-                    if let Some(revision) = task_revision.as_deref() {
-                        if value.task_updated_at.as_deref() != Some(revision) {
-                            value.task_updated_at = Some(revision.to_string());
-                            label_changed = true;
-                        }
+                    if let Some(revision) = task_revision.as_deref()
+                        && value.task_updated_at.as_deref() != Some(revision)
+                    {
+                        value.task_updated_at = Some(revision.to_string());
+                        label_changed = true;
                     }
 
                     (
@@ -990,14 +987,13 @@ impl TaskManager {
             let task_state = task_value.as_ref().map(|value| value.state.clone());
             let task_revision = task_value.as_ref().and_then(task_revision_timestamp);
 
-            let should_remove = match task_state {
-                None => true,
-                Some(ContainerState::Stopped)
-                | Some(ContainerState::Failed)
-                | Some(ContainerState::Exited(_))
-                | Some(ContainerState::Unknown) => true,
-                _ => false,
-            };
+            let should_remove = matches!(
+                task_state,
+                None | Some(ContainerState::Stopped)
+                    | Some(ContainerState::Failed)
+                    | Some(ContainerState::Exited(_))
+                    | Some(ContainerState::Unknown)
+            );
 
             if !should_remove {
                 continue;
@@ -1025,10 +1021,10 @@ impl TaskManager {
             }
 
             let mut removing = attachment.clone();
-            if let Some(revision) = task_revision.as_deref() {
-                if removing.task_updated_at.as_deref() != Some(revision) {
-                    removing.task_updated_at = Some(revision.to_string());
-                }
+            if let Some(revision) = task_revision.as_deref()
+                && removing.task_updated_at.as_deref() != Some(revision)
+            {
+                removing.task_updated_at = Some(revision.to_string());
             }
             removing.set_state(NetworkAttachmentState::Removing, None);
             if let Err(err) = self.network_registry.upsert_attachment(removing).await {
@@ -1040,19 +1036,18 @@ impl TaskManager {
                 continue;
             }
 
-            if attachment.node_id == self.local_node_id {
-                if let Err(err) = self
+            if attachment.node_id == self.local_node_id
+                && let Err(err) = self
                     .attachment_provisioner
                     .teardown_attachment(attachment.id)
                     .await
-                {
-                    warn!(
-                        target: "task",
-                        attachment = %attachment.id,
-                        error = %err,
-                        "failed to teardown orphaned attachment interface"
-                    );
-                }
+            {
+                warn!(
+                    target: "task",
+                    attachment = %attachment.id,
+                    error = %err,
+                    "failed to teardown orphaned attachment interface"
+                );
             }
         }
 

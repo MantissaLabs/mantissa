@@ -309,7 +309,7 @@ impl TaskManager {
 
     /// Returns true when one telemetry counter sample should emit a diagnostic log.
     fn should_emit_diag_sample(count: u64) -> bool {
-        count <= 3 || count.is_power_of_two() || count % 100 == 0
+        count <= 3 || count.is_power_of_two() || count.is_multiple_of(100)
     }
 
     /// Records one stale upsert drop caused by the remove-watermark guard.
@@ -1132,10 +1132,10 @@ pub(super) fn append_nvidia_visible_devices(
 
 fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
     let mut slot_ids = value.slot_ids;
-    if slot_ids.is_empty() {
-        if let Some(slot_id) = value.slot_id {
-            slot_ids.push(slot_id);
-        }
+    if slot_ids.is_empty()
+        && let Some(slot_id) = value.slot_id
+    {
+        slot_ids.push(slot_id);
     }
     let slot_id = slot_ids.first().copied();
 

@@ -49,6 +49,12 @@ pub struct NodePortManager {
     inner: Arc<AsyncMutex<PlatformNodePortManager>>,
 }
 
+impl Default for NodePortManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NodePortManager {
     /// Build a nodeport manager using environment configuration for external interfaces.
     pub fn new() -> Self {
@@ -281,13 +287,12 @@ mod platform {
                 };
                 update_elem(host_fd, &overlay_ifindex, &value)
                     .context("program nodeport host attachment")?;
-            } else if had_ports {
-                if let Ok(overlay_ifindex) = overlay_ifindex(network_id) {
-                    if let Ok(host_map) = open_map(&base, "NODEPORT_HOST") {
-                        let host_fd = host_map.fd().as_fd().as_raw_fd();
-                        let _ = delete_elem(host_fd, &overlay_ifindex);
-                    }
-                }
+            } else if had_ports
+                && let Ok(overlay_ifindex) = overlay_ifindex(network_id)
+                && let Ok(host_map) = open_map(&base, "NODEPORT_HOST")
+            {
+                let host_fd = host_map.fd().as_fd().as_raw_fd();
+                let _ = delete_elem(host_fd, &overlay_ifindex);
             }
             let overlay_index = if entries.is_empty() {
                 0
@@ -356,13 +361,13 @@ mod platform {
             if self.attachment.is_some() {
                 return Ok(());
             }
-            if self.iface.is_none() || self.node_ip.is_none() {
-                if let Err(err) = self.autodetect_iface().await {
-                    warn!(
-                        target: "network",
-                        "nodeport interface autodetection failed: {err:#}"
-                    );
-                }
+            if (self.iface.is_none() || self.node_ip.is_none())
+                && let Err(err) = self.autodetect_iface().await
+            {
+                warn!(
+                    target: "network",
+                    "nodeport interface autodetection failed: {err:#}"
+                );
             }
 
             let Some(iface) = self.iface.clone() else {
@@ -521,28 +526,28 @@ mod platform {
                 return Ok(());
             }
 
-            if let Some(iface) = self.iface.clone() {
-                if self.node_ip.is_none() {
-                    match detect_iface_ip(&iface).await? {
-                        Some(ip) => {
-                            info!(
-                                target: "network",
-                                iface = %iface,
-                                node_ip = %ip,
-                                "nodeport selected IP on configured interface"
-                            );
-                            self.node_ip = Some(ip);
-                        }
-                        None => {
-                            warn!(
-                                target: "network",
-                                iface = %iface,
-                                "nodeport could not find IPv4 address for configured interface"
-                            );
-                        }
+            if let Some(iface) = self.iface.clone()
+                && self.node_ip.is_none()
+            {
+                match detect_iface_ip(&iface).await? {
+                    Some(ip) => {
+                        info!(
+                            target: "network",
+                            iface = %iface,
+                            node_ip = %ip,
+                            "nodeport selected IP on configured interface"
+                        );
+                        self.node_ip = Some(ip);
                     }
-                    return Ok(());
+                    None => {
+                        warn!(
+                            target: "network",
+                            iface = %iface,
+                            "nodeport could not find IPv4 address for configured interface"
+                        );
+                    }
                 }
+                return Ok(());
             }
 
             if let Some(node_ip) = self.node_ip {

@@ -160,10 +160,10 @@ impl ClusterViewStore {
         cluster_id: ClusterId,
         incoming: &ClusterNameRecord,
     ) -> io::Result<bool> {
-        if let Some(existing) = self.winning_cluster_name_for(cluster_id)? {
-            if !incoming.supersedes(&existing) {
-                return Ok(false);
-            }
+        if let Some(existing) = self.winning_cluster_name_for(cluster_id)?
+            && !incoming.supersedes(&existing)
+        {
+            return Ok(false);
         }
 
         let key = UuidKey::from(cluster_id.to_uuid());

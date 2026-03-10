@@ -58,10 +58,10 @@ impl ServiceRegistry {
         let mut values = Vec::with_capacity(entries.len());
         for (key, snapshot) in entries {
             let id = key.to_uuid();
-            if let Some(value) = select_best_service_spec(snapshot.as_slice()) {
-                if seen.insert(id) {
-                    values.push(value);
-                }
+            if let Some(value) = select_best_service_spec(snapshot.as_slice())
+                && seen.insert(id)
+            {
+                values.push(value);
             }
         }
 

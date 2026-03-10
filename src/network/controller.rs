@@ -1783,19 +1783,18 @@ mod platform {
                             host_ifname, host_index
                         )
                     })?;
-                if let Some(mac) = plan.host_access_mac {
-                    if let Err(err) = self
+                if let Some(mac) = plan.host_access_mac
+                    && let Err(err) = self
                         .announce_host_access_ip(host_index, ip, mac, &host_ifname)
                         .await
-                    {
-                        debug!(
-                            target: "network",
-                            network = %plan.network_id,
-                            iface = %host_ifname,
-                            ip = %ip,
-                            "failed to announce host access ip (continuing): {err:#}"
-                        );
-                    }
+                {
+                    debug!(
+                        target: "network",
+                        network = %plan.network_id,
+                        iface = %host_ifname,
+                        ip = %ip,
+                        "failed to announce host access ip (continuing): {err:#}"
+                    );
                 }
             }
 

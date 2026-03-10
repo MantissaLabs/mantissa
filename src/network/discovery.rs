@@ -644,14 +644,13 @@ async fn answer_query(
         catalog_entry.expose_to_host,
     )
     .await?
+        && programmed
     {
-        if programmed {
-            records.push(Record::from_rdata(
-                query.name().clone(),
-                SERVICE_TTL_SECS,
-                RData::A(vip.into()),
-            ));
-        }
+        records.push(Record::from_rdata(
+            query.name().clone(),
+            SERVICE_TTL_SECS,
+            RData::A(vip.into()),
+        ));
     }
 
     Ok(LookupOutcome::Records(records))
@@ -922,7 +921,7 @@ fn parse_rfc3339(raw: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 /// Sort backend endpoints deterministically so LB programming is stable across refreshes.
-fn sort_backends(backends: &mut Vec<BackendAddress>) {
+fn sort_backends(backends: &mut [BackendAddress]) {
     backends.sort_by(|a, b| {
         let a_ip = u32::from(a.ip);
         let b_ip = u32::from(b.ip);
@@ -1174,6 +1173,10 @@ fn normalize_backend_selection(
 }
 
 /// Actively probe candidate backends so the cached health state and dataplane MACs stay fresh.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "health probing carries one private service refresh context"
+)]
 async fn evaluate_backend_health(
     health: &Arc<AsyncMutex<BackendHealth>>,
     registry: &NetworkRegistry,
@@ -1344,10 +1347,8 @@ async fn resolve_neighbor_mac(network_id: Uuid, ip: Ipv4Addr) -> Option<[u8; 6]>
             }
         }
 
-        if found_ip {
-            if let Some(mac) = found_mac {
-                return Some(mac);
-            }
+        if found_ip && let Some(mac) = found_mac {
+            return Some(mac);
         }
     }
     None
@@ -1364,10 +1365,10 @@ async fn probe_backend(
     http_path: Option<&str>,
     timeout: Duration,
 ) -> bool {
-    if let Some(path) = http_path {
-        if probe_backend_http(ip, port, path, timeout).await {
-            return true;
-        }
+    if let Some(path) = http_path
+        && probe_backend_http(ip, port, path, timeout).await
+    {
+        return true;
     }
     probe_backend_tcp(ip, port, timeout).await
 }
@@ -1380,12 +1381,11 @@ fn service_health_port(service_specs: &[ServiceSpecValue], service_name: &str) -
                     return Some(port);
                 }
                 for env in &task.env {
-                    if env.name.eq_ignore_ascii_case("MANTISSA_HEALTH_PORT") {
-                        if let Some(val) = env.value.as_deref() {
-                            if let Ok(port) = val.parse::<u16>() {
-                                return Some(port);
-                            }
-                        }
+                    if env.name.eq_ignore_ascii_case("MANTISSA_HEALTH_PORT")
+                        && let Some(val) = env.value.as_deref()
+                        && let Ok(port) = val.parse::<u16>()
+                    {
+                        return Some(port);
                     }
                 }
                 return None;
@@ -1440,16 +1440,16 @@ fn service_health_path(service_specs: &[ServiceSpecValue], service_name: &str) -
     for spec in service_specs {
         for task in &spec.tasks {
             if task.name.eq_ignore_ascii_case(service_name) {
-                if let Some(cmd) = task.health_command() {
-                    if let Some(first) = cmd.first() {
-                        return Some(first.clone());
-                    }
+                if let Some(cmd) = task.health_command()
+                    && let Some(first) = cmd.first()
+                {
+                    return Some(first.clone());
                 }
                 for env in &task.env {
-                    if env.name.eq_ignore_ascii_case("MANTISSA_HEALTH_PATH") {
-                        if let Some(val) = env.value.clone() {
-                            return Some(val);
-                        }
+                    if env.name.eq_ignore_ascii_case("MANTISSA_HEALTH_PATH")
+                        && let Some(val) = env.value.clone()
+                    {
+                        return Some(val);
                     }
                 }
             }
@@ -1605,6 +1605,10 @@ fn health_status_discriminant(status: HealthStatus) -> u8 {
 
 /// Periodically refresh health and BPF state for all services attached to a specific network so
 /// dataplane programming keeps up with container restarts even when no DNS queries arrive.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "network refresh keeps one explicit private control-plane context"
+)]
 async fn refresh_network_services(
     registry: &NetworkRegistry,
     tasks: &TaskStore,
@@ -1679,6 +1683,10 @@ fn services_for_network(service_specs: &[ServiceSpecValue], network_id: Uuid) ->
 ///
 /// Returns nodeport mappings when the service is marked public so external listeners can be
 /// reconciled by the caller.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single-service refresh threads one explicit private control-plane context"
+)]
 async fn refresh_single_service(
     registry: &NetworkRegistry,
     bpf: &NetworkBpfManager,
@@ -1738,19 +1746,18 @@ async fn refresh_single_service(
         service.expose_to_host,
     )
     .await?
+        && let Some(port) = service.public_port
     {
-        if let Some(port) = service.public_port {
-            let mut mappings = Vec::new();
-            for protocol in service.public_protocols.clone() {
-                mappings.push(NodePortMapping {
-                    port,
-                    vip,
-                    vip_port: port,
-                    protocol,
-                });
-            }
-            return Ok(mappings);
+        let mut mappings = Vec::new();
+        for protocol in service.public_protocols.clone() {
+            mappings.push(NodePortMapping {
+                port,
+                vip,
+                vip_port: port,
+                protocol,
+            });
         }
+        return Ok(mappings);
     }
 
     Ok(Vec::new())
@@ -1792,6 +1799,10 @@ async fn sync_service_vip_for_backends(
 
 /// Attempt to synchronize VIP metadata into the eBPF maps if they are available, returning whether
 /// the dataplane was programmed successfully. Missing maps are warned once per network.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "vip programming needs the private dataplane and service metadata bundle"
+)]
 async fn program_service_vip(
     bpf_lb: &BpfLoadBalancer,
     bpf: &NetworkBpfManager,
@@ -1806,16 +1817,16 @@ async fn program_service_vip(
 ) -> bool {
     match bpf_lb.sync_vip(network_id, vip, vip_mac, backends) {
         Ok(()) => {
-            if expose_to_host {
-                if let Err(err) = ensure_host_vip_neighbor(network_id, vip, vip_mac).await {
-                    debug!(
-                        target: "network",
-                        network = %network_id,
-                        service = %service_name,
-                        vip = %vip,
-                        "failed to program host neighbour for vip (continuing): {err:#}"
-                    );
-                }
+            if expose_to_host
+                && let Err(err) = ensure_host_vip_neighbor(network_id, vip, vip_mac).await
+            {
+                debug!(
+                    target: "network",
+                    network = %network_id,
+                    service = %service_name,
+                    vip = %vip,
+                    "failed to program host neighbour for vip (continuing): {err:#}"
+                );
             }
             let mut guard = lb_missing.lock().await;
             guard.remove(&network_id);
@@ -1825,16 +1836,16 @@ async fn program_service_vip(
             // Attempt to heal the maps by re-ensuring BPF programs, then retry once.
             let healed = heal_lb_maps(bpf, registry, network_id).await;
             if healed.is_ok() && bpf_lb.sync_vip(network_id, vip, vip_mac, backends).is_ok() {
-                if expose_to_host {
-                    if let Err(err) = ensure_host_vip_neighbor(network_id, vip, vip_mac).await {
-                        debug!(
-                            target: "network",
-                            network = %network_id,
-                            service = %service_name,
-                            vip = %vip,
-                            "failed to program host neighbour for vip after healing (continuing): {err:#}"
-                        );
-                    }
+                if expose_to_host
+                    && let Err(err) = ensure_host_vip_neighbor(network_id, vip, vip_mac).await
+                {
+                    debug!(
+                        target: "network",
+                        network = %network_id,
+                        service = %service_name,
+                        vip = %vip,
+                        "failed to program host neighbour for vip after healing (continuing): {err:#}"
+                    );
                 }
                 let mut guard = lb_missing.lock().await;
                 guard.remove(&network_id);

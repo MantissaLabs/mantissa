@@ -19,6 +19,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+struct SlotReconcileEnv<'a> {
+    inventory: &'a TaskInventory,
+    health_snapshot: &'a HashMap<Uuid, HealthStatus>,
+    slot_targets: &'a HashMap<SlotKey, Uuid>,
+    service_degraded: bool,
+}
+
 impl ServiceController {
     /// Reconciles each replica slot owned by this node so rescheduling is distributed per-slot.
     pub(super) async fn reconcile_service(
@@ -95,11 +102,13 @@ impl ServiceController {
                     &spec,
                     &slot,
                     task_id,
-                    inventory,
-                    health_snapshot,
-                    &slot_targets,
+                    SlotReconcileEnv {
+                        inventory,
+                        health_snapshot,
+                        slot_targets: &slot_targets,
+                        service_degraded,
+                    },
                     &key,
-                    service_degraded,
                 )
                 .await
             {
@@ -156,22 +165,19 @@ impl ServiceController {
         spec: &ServiceSpecValue,
         slot: &ReplicaSlot,
         task_id: Uuid,
-        inventory: &TaskInventory,
-        health_snapshot: &HashMap<Uuid, HealthStatus>,
-        slot_targets: &HashMap<SlotKey, Uuid>,
+        env: SlotReconcileEnv<'_>,
         key: &SlotKey,
-        service_degraded: bool,
     ) -> anyhow::Result<()> {
-        let Some(desired_node) = slot_targets.get(key).copied() else {
+        let Some(desired_node) = env.slot_targets.get(key).copied() else {
             return Ok(());
         };
-        let preferred_node = if node_is_down(desired_node, health_snapshot) {
+        let preferred_node = if node_is_down(desired_node, env.health_snapshot) {
             None
         } else {
             Some(desired_node)
         };
 
-        let task = inventory.by_id.get(&task_id);
+        let task = env.inventory.by_id.get(&task_id);
         let task_on_draining_node = task
             .map(|task| self.node_drain_requested(task.node_id))
             .unwrap_or(false);
@@ -179,7 +185,7 @@ impl ServiceController {
             None => true,
             Some(task) => {
                 task_on_draining_node
-                    || node_is_down(task.node_id, health_snapshot)
+                    || node_is_down(task.node_id, env.health_snapshot)
                     || !task_state_healthy(&task.state)
             }
         };
@@ -212,7 +218,7 @@ impl ServiceController {
 
         if spec.status() == ServiceStatus::Running
             && task_state_healthy(&task.state)
-            && !node_is_down(task.node_id, health_snapshot)
+            && !node_is_down(task.node_id, env.health_snapshot)
         {
             self.publish_running_task_traffic_best_effort(&spec.service_name, task.id)
                 .await;
@@ -232,7 +238,7 @@ impl ServiceController {
             return Ok(());
         }
 
-        if service_degraded {
+        if env.service_degraded {
             return Ok(());
         }
 
@@ -246,7 +252,7 @@ impl ServiceController {
             return Ok(());
         }
 
-        if node_is_down(desired_node, health_snapshot) {
+        if node_is_down(desired_node, env.health_snapshot) {
             return Ok(());
         }
 

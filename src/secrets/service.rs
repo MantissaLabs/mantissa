@@ -483,12 +483,12 @@ impl secrets::Server for SecretsService {
             .ok_or_else(|| Error::failed(format!("secret '{name}' not found")))?;
 
         let version_id = value.current_version.version_id;
-        if let Some(requested) = requested_version {
-            if requested != version_id {
-                return Err(Error::failed(format!(
-                    "secret '{name}' version {requested} not found"
-                )));
-            }
+        if let Some(requested) = requested_version
+            && requested != version_id
+        {
+            return Err(Error::failed(format!(
+                "secret '{name}' version {requested} not found"
+            )));
         }
 
         let plaintext = {
@@ -574,10 +574,10 @@ impl secrets::Server for SecretsService {
                 .map_err(|e| Error::failed(e.to_string()))?;
         }
 
-        if let Some(topology) = topology {
-            if let Err(e) = distribute_master_key(topology, new_record).await {
-                warn!(target: "secrets", "failed to distribute master key v{}: {e}", new_record.version);
-            }
+        if let Some(topology) = topology
+            && let Err(e) = distribute_master_key(topology, new_record).await
+        {
+            warn!(target: "secrets", "failed to distribute master key v{}: {e}", new_record.version);
         }
 
         results.get().set_version(new_record.version);

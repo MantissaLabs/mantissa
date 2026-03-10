@@ -565,10 +565,10 @@ impl HeadlessNode {
                     Ok(list) => {
                         for idx in 0..list.len() {
                             let entry = list.get(idx);
-                            if matches!(entry.get_domain(), Ok(Domain::Peers)) {
-                                if let Ok(text) = entry.get_root_hex() {
-                                    return text.to_string().unwrap_or_default();
-                                }
+                            if matches!(entry.get_domain(), Ok(Domain::Peers))
+                                && let Ok(text) = entry.get_root_hex()
+                            {
+                                return text.to_string().unwrap_or_default();
                             }
                         }
                         String::new()

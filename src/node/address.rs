@@ -43,10 +43,10 @@ pub fn compute_advertise_ip(
     if let Some(ip) = cfg_advertise {
         return Ok(ip);
     }
-    if let Some(a) = anchor {
-        if let Ok(ip) = outbound_ip_for(a) {
-            return Ok(ip);
-        }
+    if let Some(a) = anchor
+        && let Ok(ip) = outbound_ip_for(a)
+    {
+        return Ok(ip);
     }
     outbound_ip_for("8.8.8.8:53")
 }

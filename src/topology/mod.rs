@@ -1223,16 +1223,14 @@ impl Topology {
         .map_err(|e| e.to_string())?;
 
         // If we already know this peer, its signing key is pinned and cannot change.
-        if let Some(snapshot) = self.peer_snapshot().await {
-            if let Some(entry) = snapshot
+        if let Some(snapshot) = self.peer_snapshot().await
+            && let Some(entry) = snapshot
                 .entries
                 .iter()
                 .find(|entry| entry.peer_id == peer_id)
-            {
-                if entry.value.signing_pub != signing_pub.to_bytes() {
-                    return Err("peer signing key does not match existing record".to_string());
-                }
-            }
+            && entry.value.signing_pub != signing_pub.to_bytes()
+        {
+            return Err("peer signing key does not match existing record".to_string());
         }
 
         Ok(())
@@ -1574,11 +1572,11 @@ impl GossipContext for Topology {
 /// Select peers for one sync tick while excluding `local_id`.
 ///
 /// This helper keeps peer sampling logic testable without constructing a full `Topology`.
-fn select_sync_peers_for_node<'a>(
+fn select_sync_peers_for_node(
     local_id: Uuid,
-    entries: &'a [PeerCacheEntry],
+    entries: &[PeerCacheEntry],
     sync_fanout: usize,
-) -> Vec<&'a PeerCacheEntry> {
+) -> Vec<&PeerCacheEntry> {
     // `sync_fanout = 0` preserves the legacy behavior (sync against all peers).
     if sync_fanout == 0 {
         return entries

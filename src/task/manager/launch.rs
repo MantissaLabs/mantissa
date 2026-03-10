@@ -193,18 +193,17 @@ impl TaskManager {
                         request.task_id
                     );
                 } else {
-                    if created_fresh {
-                        if let Err(remove_err) = self
+                    if created_fresh
+                        && let Err(remove_err) = self
                             .container_manager
                             .remove_container(&container_id, true, true)
                             .await
-                        {
-                            warn!(
-                                target: "task",
-                                "failed to remove container {} after start failure: {remove_err}",
-                                container_id
-                            );
-                        }
+                    {
+                        warn!(
+                            target: "task",
+                            "failed to remove container {} after start failure: {remove_err}",
+                            container_id
+                        );
                     }
                     return Err(wrap_start_error(request.task_name, err));
                 }
@@ -230,14 +229,14 @@ fn restart_policy_to_config(policy: &TaskRestartPolicy) -> RestartPolicyConfig {
 
 /// Removes staged secret artifacts produced during one failed launch attempt.
 async fn cleanup_launch_artifacts(task_id: Uuid, resolved: &mut ResolvedTaskSecrets, phase: &str) {
-    if let Some(artifacts) = resolved.artifacts.take() {
-        if let Err(clean_err) = artifacts.cleanup().await {
-            warn!(
-                target: "task",
-                task = %task_id,
-                phase,
-                "failed to cleanup staged secrets after launch failure: {clean_err}"
-            );
-        }
+    if let Some(artifacts) = resolved.artifacts.take()
+        && let Err(clean_err) = artifacts.cleanup().await
+    {
+        warn!(
+            target: "task",
+            task = %task_id,
+            phase,
+            "failed to cleanup staged secrets after launch failure: {clean_err}"
+        );
     }
 }

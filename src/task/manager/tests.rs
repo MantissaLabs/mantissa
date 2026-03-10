@@ -39,11 +39,13 @@ use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::{RwLock, mpsc};
 
+type ExecCall = (String, Vec<String>, Option<std::time::Duration>);
+
 #[derive(Clone, Default)]
 struct MockContainerManager {
     created: Arc<AsyncMutex<Vec<String>>>,
     create_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
-    exec_calls: Arc<AsyncMutex<Vec<(String, Vec<String>, Option<std::time::Duration>)>>>,
+    exec_calls: Arc<AsyncMutex<Vec<ExecCall>>>,
     exec_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
     exec_results: Arc<
         AsyncMutex<

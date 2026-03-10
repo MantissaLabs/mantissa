@@ -109,7 +109,6 @@ impl ServiceController {
                 templates,
                 update_strategy,
                 previous_status,
-                &service_name,
             )
             .await?;
             return Ok(());
@@ -188,7 +187,6 @@ impl ServiceController {
         self.finalize_successful_redeployment(
             manifest_id,
             &manifest_name,
-            &service_name,
             &templates,
             &current_spec,
             update_strategy,
@@ -206,7 +204,6 @@ impl ServiceController {
         templates: Vec<ServiceTaskSpecValue>,
         update_strategy: ServiceUpdateStrategy,
         previous_status: ServiceStatus,
-        service_name: &str,
     ) -> anyhow::Result<()> {
         let mut updated = current_spec.clone();
         updated.manifest_id = manifest_id;
@@ -220,12 +217,16 @@ impl ServiceController {
         tracing::info!(
             target: "services",
             "redeployment for '{}' detected no changes",
-            service_name
+            current_spec.service_name
         );
         Ok(())
     }
 
     /// Logs rollout plan details and publishes initial rolling-forward progress metadata.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "private rollout logging helper keeps the plan metadata explicit"
+    )]
     async fn log_and_persist_rollout_start(
         &self,
         service_name: &str,
@@ -375,6 +376,10 @@ impl ServiceController {
     }
 
     /// Executes batched replacement steps for rolling-forward manifest changes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "replacement phase threads explicit rollout state across retries"
+    )]
     async fn run_replacement_phase(
         &self,
         service_name: &str,
@@ -395,8 +400,8 @@ impl ServiceController {
 
             if matches!(settings.order, ServiceRolloutOrder::StopFirst) {
                 for replacement in replacement_chunk {
-                    if let Some(previous) = replacement.previous.as_ref() {
-                        if let Err(err) = self
+                    if let Some(previous) = replacement.previous.as_ref()
+                        && let Err(err) = self
                             .stop_task_and_track_rollback(
                                 service_name,
                                 previous,
@@ -404,22 +409,21 @@ impl ServiceController {
                                 &mut artifacts.rollback_old_tasks,
                             )
                             .await
+                    {
+                        if self
+                            .record_rollout_failure(
+                                service_id,
+                                manifest_id,
+                                settings,
+                                progress,
+                                &err,
+                            )
+                            .await
                         {
-                            if self
-                                .record_rollout_failure(
-                                    service_id,
-                                    manifest_id,
-                                    settings,
-                                    progress,
-                                    &err,
-                                )
-                                .await
-                            {
-                                return Some(err);
-                            }
-                            replacement_chunk_failed = true;
-                            break;
+                            return Some(err);
                         }
+                        replacement_chunk_failed = true;
+                        break;
                     }
                 }
                 if replacement_chunk_failed {
@@ -515,8 +519,8 @@ impl ServiceController {
 
             if matches!(settings.order, ServiceRolloutOrder::StartFirst) {
                 for replacement in replacement_chunk {
-                    if let Some(previous) = replacement.previous.as_ref() {
-                        if let Err(err) = self
+                    if let Some(previous) = replacement.previous.as_ref()
+                        && let Err(err) = self
                             .stop_task_and_track_rollback(
                                 service_name,
                                 previous,
@@ -524,22 +528,21 @@ impl ServiceController {
                                 &mut artifacts.rollback_old_tasks,
                             )
                             .await
+                    {
+                        if self
+                            .record_rollout_failure(
+                                service_id,
+                                manifest_id,
+                                settings,
+                                progress,
+                                &err,
+                            )
+                            .await
                         {
-                            if self
-                                .record_rollout_failure(
-                                    service_id,
-                                    manifest_id,
-                                    settings,
-                                    progress,
-                                    &err,
-                                )
-                                .await
-                            {
-                                return Some(err);
-                            }
-                            replacement_chunk_failed = true;
-                            break;
+                            return Some(err);
                         }
+                        replacement_chunk_failed = true;
+                        break;
                     }
                 }
                 if replacement_chunk_failed {
@@ -560,6 +563,10 @@ impl ServiceController {
     }
 
     /// Executes batched removals for replicas no longer present in the desired manifest.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "removal phase threads explicit rollout state across retries"
+    )]
     async fn run_removal_phase(
         &self,
         service_name: &str,
@@ -616,12 +623,12 @@ impl ServiceController {
         &self,
         manifest_id: Uuid,
         manifest_name: &str,
-        service_name: &str,
         templates: &[ServiceTaskSpecValue],
         current_spec: &ServiceSpecValue,
         update_strategy: ServiceUpdateStrategy,
         assignment_index: &BTreeMap<(String, u16), Uuid>,
     ) -> anyhow::Result<()> {
+        let service_name = current_spec.service_name.as_str();
         let ordered_task_ids = order_task_ids(service_name, templates, assignment_index);
         let mut next_spec = match self.registry.get(current_spec.id)? {
             Some(spec) if spec.manifest_id == manifest_id => spec,
@@ -943,6 +950,10 @@ impl ServiceController {
     }
 
     /// Handles a failed rolling redeployment by rolling back or failing the active generation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "failure handling needs the full private rollback context"
+    )]
     async fn handle_rollout_failure(
         &self,
         service_name: &str,

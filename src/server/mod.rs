@@ -7,6 +7,7 @@ use crate::topology::Topology;
 use ed25519_dalek::SigningKey;
 use net::noise::NoiseKeys;
 use protocol::server::cluster_session;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
@@ -176,7 +177,7 @@ impl Server {
 
         let psk_provider: Arc<dyn net::noise::NoisePskProvider> =
             Arc::new(self.stores.token_store.clone());
-        let peer_verifier: Arc<dyn net::noise::NoisePeerVerifier> = Arc::new(self.topology.clone());
+        let peer_verifier: Rc<dyn net::noise::NoisePeerVerifier> = Rc::new(self.topology.clone());
 
         // Non-blocking TCP listener with readiness + bound addr.
         let (tcp_task, tcp_ready, bound) =

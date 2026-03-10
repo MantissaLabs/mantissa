@@ -605,34 +605,34 @@ impl Config {
     ///
     /// Validate configuration values so runtime components receive sane inputs.
     pub fn validate(&self) -> Result<()> {
-        if let Some(port) = self.network.wireguard.port {
-            if port == 0 {
-                anyhow::bail!("network.wireguard.port must be non-zero");
-            }
+        if let Some(port) = self.network.wireguard.port
+            && port == 0
+        {
+            anyhow::bail!("network.wireguard.port must be non-zero");
         }
 
-        if let Some(port) = self.network.discovery.health_port {
-            if port == 0 {
-                anyhow::bail!("network.discovery.health_port must be non-zero");
-            }
+        if let Some(port) = self.network.discovery.health_port
+            && port == 0
+        {
+            anyhow::bail!("network.discovery.health_port must be non-zero");
         }
 
-        if let Some(ref ip) = self.network.nodeport.ip {
-            if ip.parse::<Ipv4Addr>().is_err() {
-                anyhow::bail!("network.nodeport.ip must be a valid IPv4 address (got '{ip}')");
-            }
+        if let Some(ref ip) = self.network.nodeport.ip
+            && ip.parse::<Ipv4Addr>().is_err()
+        {
+            anyhow::bail!("network.nodeport.ip must be a valid IPv4 address (got '{ip}')");
         }
 
-        if let Some(ref host) = self.docker.host {
-            if host.trim().is_empty() {
-                anyhow::bail!("docker.host cannot be empty");
-            }
+        if let Some(ref host) = self.docker.host
+            && host.trim().is_empty()
+        {
+            anyhow::bail!("docker.host cannot be empty");
         }
 
-        if let Some(ref overrides) = self.gpu.device_overrides {
-            if overrides.trim().is_empty() {
-                anyhow::bail!("gpu.device_overrides cannot be empty");
-            }
+        if let Some(ref overrides) = self.gpu.device_overrides
+            && overrides.trim().is_empty()
+        {
+            anyhow::bail!("gpu.device_overrides cannot be empty");
         }
 
         if self.health.probe_fanout == 0 {

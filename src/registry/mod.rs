@@ -1325,16 +1325,14 @@ impl Registry {
                     }
                 };
 
-                if let Ok(ni) = r.get_node_info() {
-                    if let Ok(v) = PeerValue::from_node_info(peer_id, ni) {
-                        if let Err(e) = self
-                            .peers
-                            .upsert(&crdt_store::uuid_key::UuidKey::from(peer_id), v)
-                            .await
-                        {
-                            error!(target: "sync", "upsert nodeInfo failed for {peer_id}: {e}");
-                        }
-                    }
+                if let Ok(ni) = r.get_node_info()
+                    && let Ok(v) = PeerValue::from_node_info(peer_id, ni)
+                    && let Err(e) = self
+                        .peers
+                        .upsert(&crdt_store::uuid_key::UuidKey::from(peer_id), v)
+                        .await
+                {
+                    error!(target: "sync", "upsert nodeInfo failed for {peer_id}: {e}");
                 }
 
                 if let Err(e) = self.sessions.put(peer_id, r.get_ticket().ok()?) {
@@ -1356,7 +1354,7 @@ impl Registry {
     ///
     /// Returns true when one telemetry counter sample should emit a diagnostic log.
     fn should_emit_diag_sample(count: u64) -> bool {
-        count <= 3 || count.is_power_of_two() || count % 100 == 0
+        count <= 3 || count.is_power_of_two() || count.is_multiple_of(100)
     }
 
     /// # Description:

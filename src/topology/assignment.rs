@@ -141,10 +141,10 @@ impl Topology {
                 self_entry.cpu_cores = Some(cpu.num_cores as u64);
             }
         }
-        if let Some(memory) = self.node.system_info.info.mem_info.as_ref() {
-            if memory.total > 0 {
-                self_entry.memory_total_kb = Some(memory.total);
-            }
+        if let Some(memory) = self.node.system_info.info.mem_info.as_ref()
+            && memory.total > 0
+        {
+            self_entry.memory_total_kb = Some(memory.total);
         }
         if let Some(gpu) = self.node.system_info.info.gpu_info.as_ref() {
             if !gpu.vendor.is_empty() {
@@ -185,10 +185,10 @@ impl Topology {
             }
 
             let node = session.get_node_request().send().pipeline.get_node();
-            if let Ok(response) = node.info_request().send().promise.await {
-                if let Ok(info_reader) = response.get().and_then(|reader| reader.get_info()) {
-                    Self::apply_split_node_info(candidate, info_reader);
-                }
+            if let Ok(response) = node.info_request().send().promise.await
+                && let Ok(info_reader) = response.get().and_then(|reader| reader.get_info())
+            {
+                Self::apply_split_node_info(candidate, info_reader);
             }
         }
 

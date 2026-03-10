@@ -23,12 +23,19 @@ use super::{TaskManager, TaskStartRequest};
 #[derive(Error, Debug)]
 pub(super) enum SchedulingError {
     #[error("scheduler snapshot unavailable")]
-    SnapshotUnavailable,
+    SnapshotMissing,
     #[error("scheduler reservation failed: networks {networks:?} unavailable on any candidate")]
-    NetworksUnavailable { networks: Vec<Uuid> },
+    NetworksBlocked { networks: Vec<Uuid> },
     #[error("local node lacks required networks for task '{task}'")]
-    LocalNetworksUnavailable { task: String },
+    LocalNetworksBlocked { task: String },
 }
+
+type SeedLocalPlans<'a> = (
+    Assignment,
+    Vec<&'a StartIntent>,
+    Vec<SlotChoice>,
+    Vec<GpuChoice>,
+);
 
 /// Execution plan for a single local task launch, holding the target slots and container metadata.
 #[derive(Clone)]
@@ -394,7 +401,7 @@ impl TaskManager {
             .scheduler
             .snapshot()
             .await
-            .ok_or(SchedulingError::SnapshotUnavailable)?;
+            .ok_or(SchedulingError::SnapshotMissing)?;
 
         let local_version = snapshot.version;
         let readiness_map = self.collect_network_readiness()?;
@@ -449,15 +456,7 @@ impl TaskManager {
         local_ready: &HashSet<Uuid>,
         local_gpu_ready: bool,
         local_gpu_reason: Option<&str>,
-    ) -> Result<
-        (
-            Assignment,
-            Vec<&'a StartIntent>,
-            Vec<SlotChoice>,
-            Vec<GpuChoice>,
-        ),
-        anyhow::Error,
-    > {
+    ) -> Result<SeedLocalPlans<'a>, anyhow::Error> {
         let mut slot_lookup = HashMap::new();
         let mut available_local_slots = Vec::new();
         for slot in snapshot.slots.iter() {
@@ -501,7 +500,7 @@ impl TaskManager {
             }
 
             if !intent.networks.iter().all(|net| local_ready.contains(net)) {
-                return Err(SchedulingError::LocalNetworksUnavailable {
+                return Err(SchedulingError::LocalNetworksBlocked {
                     task: intent.name.clone(),
                 }
                 .into());
@@ -529,12 +528,12 @@ impl TaskManager {
                         ));
                     }
 
-                    if let Some(task_id) = reservation.task_id {
-                        if task_id != intent.id {
-                            return Err(anyhow::anyhow!(
-                                "preassigned slot {slot_id} reserved for task {task_id}"
-                            ));
-                        }
+                    if let Some(task_id) = reservation.task_id
+                        && task_id != intent.id
+                    {
+                        return Err(anyhow::anyhow!(
+                            "preassigned slot {slot_id} reserved for task {task_id}"
+                        ));
                     }
                 }
 
@@ -583,12 +582,12 @@ impl TaskManager {
                             ));
                         }
 
-                        if let Some(reserved_task) = task_id {
-                            if *reserved_task != intent.id {
-                                return Err(anyhow::anyhow!(
-                                    "preassigned gpu device {device_id} reserved for task {reserved_task}"
-                                ));
-                            }
+                        if let Some(reserved_task) = task_id
+                            && *reserved_task != intent.id
+                        {
+                            return Err(anyhow::anyhow!(
+                                "preassigned gpu device {device_id} reserved for task {reserved_task}"
+                            ));
                         }
                     }
 
@@ -670,15 +669,15 @@ impl TaskManager {
         local_ready: &HashSet<Uuid>,
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
-        if self.registry.peer_schedulable(self.local_node_id) {
-            if let Some(local_candidate) = Candidate::new(
+        if self.registry.peer_schedulable(self.local_node_id)
+            && let Some(local_candidate) = Candidate::new(
                 CandidateLocation::Local,
                 local_slots,
                 local_gpus,
                 local_ready.clone(),
-            ) {
-                queue.push_back(local_candidate);
-            }
+            )
+        {
+            queue.push_back(local_candidate);
         }
 
         let peers = self.registry.known_peers()?;
@@ -793,7 +792,7 @@ impl TaskManager {
 
         if !candidate.can_host(&intent.networks) {
             candidates.push_back(candidate);
-            return Err(SchedulingError::NetworksUnavailable {
+            return Err(SchedulingError::NetworksBlocked {
                 networks: intent.networks.clone(),
             }
             .into());
@@ -918,7 +917,7 @@ impl TaskManager {
 
             let Some((location, allocation)) = allocated else {
                 if skipped_for_networks {
-                    return Err(SchedulingError::NetworksUnavailable {
+                    return Err(SchedulingError::NetworksBlocked {
                         networks: intent.networks.clone(),
                     }
                     .into());

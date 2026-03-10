@@ -789,11 +789,11 @@ impl ProcessNode {
 
 impl Drop for ProcessNode {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            if let Ok(None) = child.try_wait() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        if let Some(child) = self.child.as_mut()
+            && let Ok(None) = child.try_wait()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }

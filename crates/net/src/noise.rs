@@ -5,6 +5,7 @@ use getrandom::getrandom;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::{fs, io};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -399,7 +400,7 @@ pub async fn server_handshake_peer_with_first_frame(
     mut wr: tokio::net::tcp::OwnedWriteHalf,
     keys: &crate::noise::NoiseKeys,
     first_frame: &[u8],
-    verifier: Arc<dyn NoisePeerVerifier>,
+    verifier: Rc<dyn NoisePeerVerifier>,
 ) -> Result<tokio::io::DuplexStream, PeerHandshakeError> {
     let pk_bytes = keys.private.to_bytes();
 
@@ -456,7 +457,7 @@ pub async fn server_handshake_select(
     keys: &crate::noise::NoiseKeys,
     psk: &[u8; 32],
     first_frame: &[u8],
-    verifier: Arc<dyn NoisePeerVerifier>,
+    verifier: Rc<dyn NoisePeerVerifier>,
 ) -> Result<ServerHandshake, ServerHandshakeError> {
     let pk_bytes = keys.private.to_bytes();
 

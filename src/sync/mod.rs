@@ -58,19 +58,31 @@ pub struct SyncService {
     cluster_views: ClusterViewDomainStore,
 }
 
+#[derive(Clone)]
+pub struct SyncStores {
+    pub peers: PeersStore,
+    pub tasks: TaskStore,
+    pub services: ServiceStore,
+    pub secrets: SecretStore,
+    pub networks: NetworkSpecStore,
+    pub network_peers: NetworkPeerStore,
+    pub network_attachments: NetworkAttachmentStore,
+    pub cluster_views: ClusterViewDomainStore,
+}
+
 impl SyncService {
     /// Builds a sync service bound to the provided cluster view state and domain stores.
-    pub fn new(
-        cluster_view: ClusterViewState,
-        peers: PeersStore,
-        tasks: TaskStore,
-        services: ServiceStore,
-        secrets: SecretStore,
-        networks: NetworkSpecStore,
-        network_peers: NetworkPeerStore,
-        network_attachments: NetworkAttachmentStore,
-        cluster_views: ClusterViewDomainStore,
-    ) -> Self {
+    pub fn new(cluster_view: ClusterViewState, stores: SyncStores) -> Self {
+        let SyncStores {
+            peers,
+            tasks,
+            services,
+            secrets,
+            networks,
+            network_peers,
+            network_attachments,
+            cluster_views,
+        } = stores;
         Self {
             cluster_view,
             peers,

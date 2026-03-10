@@ -297,13 +297,16 @@ pub async fn ensure_wireguard_underlay(
         );
     }
 
-    if published && cluster_ready_for_encryption && peer_count > 0 && !prefer_underlay {
-        if let Err(err) = net::wireguard::persist_wireguard_underlay_preference(true) {
-            tracing::warn!(
-                target: "network",
-                "failed to persist wireguard underlay preference; may not survive restarts: {err}"
-            );
-        }
+    if published
+        && cluster_ready_for_encryption
+        && peer_count > 0
+        && !prefer_underlay
+        && let Err(err) = net::wireguard::persist_wireguard_underlay_preference(true)
+    {
+        tracing::warn!(
+            target: "network",
+            "failed to persist wireguard underlay preference; may not survive restarts: {err}"
+        );
     }
 
     let mut desired_tunnel_routes = HashSet::with_capacity(peer_configs.len() + 1);

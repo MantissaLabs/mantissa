@@ -560,12 +560,11 @@ impl Scheduler {
         if let Some(snapshot) = self.snapshot().await {
             if snapshot.gpu_devices.is_empty() {
                 let gpu_specs = Self::derive_gpu_specs(node);
-                if !gpu_specs.is_empty() {
-                    if let Ok(updated) =
+                if !gpu_specs.is_empty()
+                    && let Ok(updated) =
                         self.populate_gpu_devices(snapshot.version, gpu_specs).await
-                    {
-                        return Ok(updated);
-                    }
+                {
+                    return Ok(updated);
                 }
             }
             return Ok(snapshot);

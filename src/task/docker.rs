@@ -636,20 +636,20 @@ impl ContainerManager for DockerContainerManager {
             host_config.cpu_shares = Some(cpu_shares);
         }
 
-        if let Some(device_ids) = gpu_device_ids {
-            if !device_ids.is_empty() {
-                host_config.device_requests = Some(vec![DeviceRequest {
-                    driver: Some("nvidia".to_string()),
-                    count: None,
-                    device_ids: Some(device_ids),
-                    capabilities: Some(vec![vec![
-                        "gpu".to_string(),
-                        "compute".to_string(),
-                        "utility".to_string(),
-                    ]]),
-                    options: None,
-                }]);
-            }
+        if let Some(device_ids) = gpu_device_ids
+            && !device_ids.is_empty()
+        {
+            host_config.device_requests = Some(vec![DeviceRequest {
+                driver: Some("nvidia".to_string()),
+                count: None,
+                device_ids: Some(device_ids),
+                capabilities: Some(vec![vec![
+                    "gpu".to_string(),
+                    "compute".to_string(),
+                    "utility".to_string(),
+                ]]),
+                options: None,
+            }]);
         }
 
         // Set volumes if provided
@@ -971,13 +971,12 @@ impl ContainerManager for DockerContainerManager {
                     .and_then(|value| value.parse::<i32>().ok())
                     .unwrap_or(1);
 
-                if let Some(task_id) = task_id {
-                    if events_tx
+                if let Some(task_id) = task_id
+                    && events_tx
                         .send(ContainerRuntimeEvent::TaskExited { task_id, exit_code })
                         .is_err()
-                    {
-                        return Ok(());
-                    }
+                {
+                    return Ok(());
                 }
             }
 

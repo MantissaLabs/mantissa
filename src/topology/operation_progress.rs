@@ -151,7 +151,7 @@ impl Topology {
     ) -> Result<(), capnp::Error> {
         let active_view = self.active_cluster_view();
         let allowed_views = Self::commit_precondition_views(operation)?;
-        if allowed_views.iter().any(|view| *view == active_view) {
+        if allowed_views.contains(&active_view) {
             return Ok(());
         }
 

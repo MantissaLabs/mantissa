@@ -54,6 +54,8 @@ mod operation_rpc;
 #[path = "split_selector.rs"]
 mod split_selector;
 
+use self::operation_rpc::SplitOperationBuildInput;
+
 #[derive(Clone)]
 struct JoinPayload {
     id: Uuid,
@@ -1912,16 +1914,16 @@ impl topology::Server for Topology {
         let split_assignments = self
             .build_split_assignments(source_view, &target_specs)
             .await?;
-        let operation = self.build_split_operation_record(
+        let operation = self.build_split_operation_record(SplitOperationBuildInput {
             source_view,
             dry_run,
             split_service_policy,
             split_network_policy,
-            &target_specs,
+            target_specs: &target_specs,
             target_views,
             detail_targets,
             split_assignments,
-        );
+        });
         self.persist_and_dispatch_operation(&operation).await?;
 
         info!(

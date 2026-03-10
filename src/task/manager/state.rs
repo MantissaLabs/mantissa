@@ -1715,28 +1715,26 @@ impl TaskManager {
                 guard.insert(task_id, container_id.clone());
             }
 
-            if matches!(value.state, ContainerState::Running) && !value.networks.is_empty() {
-                if self
+            if matches!(value.state, ContainerState::Running)
+                && !value.networks.is_empty()
+                && self
                     .attachments_need_refresh(task_id, &value.networks, task_revision(value))
                     .await?
-                {
-                    if let Err(err) = self
-                        .ensure_runtime_attachments(
-                            task_id,
-                            &container_id,
-                            &value.networks,
-                            value.service_metadata.as_ref(),
-                        )
-                        .await
-                    {
-                        warn!(
-                            target: "task",
-                            task = %task_id,
-                            container = %container_id,
-                            "failed to refresh attachments while adopting container: {err:#}"
-                        );
-                    }
-                }
+                && let Err(err) = self
+                    .ensure_runtime_attachments(
+                        task_id,
+                        &container_id,
+                        &value.networks,
+                        value.service_metadata.as_ref(),
+                    )
+                    .await
+            {
+                warn!(
+                    target: "task",
+                    task = %task_id,
+                    container = %container_id,
+                    "failed to refresh attachments while adopting container: {err:#}"
+                );
             }
         }
 
@@ -1772,10 +1770,10 @@ impl TaskManager {
             ) {
                 return Ok(true);
             }
-            if let Some(revision) = revision {
-                if attachment.task_updated_at.as_deref() != Some(revision) {
-                    return Ok(true);
-                }
+            if let Some(revision) = revision
+                && attachment.task_updated_at.as_deref() != Some(revision)
+            {
+                return Ok(true);
             }
         }
 
@@ -2002,10 +2000,10 @@ impl TaskManager {
             let guard = self.local_containers.lock().await;
             guard.get(&spec.id).cloned()
         };
-        if let Some(container_id) = cached {
-            if runtime_inventory.container_ids.contains(&container_id) {
-                return true;
-            }
+        if let Some(container_id) = cached
+            && runtime_inventory.container_ids.contains(&container_id)
+        {
+            return true;
         }
 
         false
@@ -2476,10 +2474,10 @@ fn pick_conflict_task_winner(
     tasks: &HashMap<Uuid, TaskValue>,
     reserved_owner: Option<Uuid>,
 ) -> Uuid {
-    if let Some(owner) = reserved_owner {
-        if owner == current || owner == candidate {
-            return owner;
-        }
+    if let Some(owner) = reserved_owner
+        && (owner == current || owner == candidate)
+    {
+        return owner;
     }
 
     let Some(current_value) = tasks.get(&current) else {

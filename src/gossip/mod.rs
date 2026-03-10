@@ -684,26 +684,26 @@ pub(crate) async fn start<C>(
                 }
 
                 let (view_scoped, global_metadata) = split_messages_by_plane(pending);
+                let options = DispatchOptions {
+                    fanout,
+                    rpc_batch_max,
+                    send_parallelism,
+                    send_timeout,
+                };
                 dispatch_gossip_plane(
                     &context,
                     view_scoped,
                     GossipPlane::ViewScoped,
-                    fanout,
                     &mut fanout_cursor,
-                    rpc_batch_max,
-                    send_parallelism,
-                    send_timeout,
+                    options,
                 )
                 .await;
                 dispatch_gossip_plane(
                     &context,
                     global_metadata,
                     GossipPlane::GlobalMetadata,
-                    fanout,
                     &mut fanout_cursor,
-                    rpc_batch_max,
-                    send_parallelism,
-                    send_timeout,
+                    options,
                 )
                 .await;
                 buffer = Vec::new();
@@ -740,6 +740,14 @@ fn split_messages_by_plane(pending: Vec<Message>) -> (Vec<Message>, Vec<Message>
     (view_scoped, global_metadata)
 }
 
+#[derive(Clone, Copy)]
+struct DispatchOptions {
+    fanout: Option<usize>,
+    rpc_batch_max: usize,
+    send_parallelism: usize,
+    send_timeout: Option<Duration>,
+}
+
 /// Dispatches one plane-specific outbound gossip batch to the selected peers.
 ///
 /// The plane controls both peer selection (view-scoped vs unscoped) and capability
@@ -748,11 +756,8 @@ async fn dispatch_gossip_plane<C>(
     context: &C,
     pending: Vec<Message>,
     plane: GossipPlane,
-    fanout: Option<usize>,
     fanout_cursor: &mut usize,
-    rpc_batch_max: usize,
-    send_parallelism: usize,
-    send_timeout: Option<Duration>,
+    options: DispatchOptions,
 ) where
     C: GossipContext + ?Sized,
 {
@@ -761,14 +766,14 @@ async fn dispatch_gossip_plane<C>(
     }
 
     let peers = match plane {
-        GossipPlane::ViewScoped => match fanout {
+        GossipPlane::ViewScoped => match options.fanout {
             Some(0) => context.get_peers().await,
             Some(n) => fanout_sample(context, n, fanout_cursor).await,
             None => fanout_sample(context, DEFAULT_FANOUT, fanout_cursor).await,
         },
         GossipPlane::GlobalMetadata => {
             let peer_population = context.get_peers_unscoped().await;
-            match fanout {
+            match options.fanout {
                 Some(0) => peer_population,
                 Some(n) => select_fanout_window(peer_population, n, fanout_cursor),
                 None => select_fanout_window(peer_population, DEFAULT_FANOUT, fanout_cursor),
@@ -820,12 +825,12 @@ async fn dispatch_gossip_plane<C>(
                 outbound,
                 peer,
                 context,
-                rpc_batch_max,
-                send_timeout,
+                options.rpc_batch_max,
+                options.send_timeout,
                 cluster_view,
                 plane,
             ));
-            if inflight.len() >= send_parallelism {
+            if inflight.len() >= options.send_parallelism {
                 let _ = inflight.next().await;
             }
         }
@@ -1052,7 +1057,7 @@ fn is_disconnected_capnp(error: &capnp::Error) -> bool {
 
 /// Returns true when one telemetry counter sample should emit a diagnostic log.
 fn should_emit_diag_sample(count: u64) -> bool {
-    count <= 3 || count.is_power_of_two() || count % 100 == 0
+    count <= 3 || count.is_power_of_two() || count.is_multiple_of(100)
 }
 
 // Return true when the gossip message is about the provided peer identifier.

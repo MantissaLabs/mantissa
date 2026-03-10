@@ -11,6 +11,19 @@ use std::collections::HashSet;
 use tracing::warn;
 use uuid::Uuid;
 
+type ParsedSplitTargets = (Vec<SplitTargetSpec>, Vec<ClusterViewId>, Vec<String>);
+
+pub(super) struct SplitOperationBuildInput<'a> {
+    pub source_view: ClusterViewId,
+    pub dry_run: bool,
+    pub split_service_policy: SplitServicePolicy,
+    pub split_network_policy: SplitNetworkPolicy,
+    pub target_specs: &'a [SplitTargetSpec],
+    pub target_views: Vec<ClusterViewId>,
+    pub detail_targets: Vec<String>,
+    pub split_assignments: Vec<SplitNodeAssignment>,
+}
+
 impl Topology {
     /// Converts the merge request policy from the Cap'n Proto enum into local durable policy state.
     pub(super) fn merge_service_policy_from_capnp(
@@ -47,7 +60,7 @@ impl Topology {
         &self,
         source_view: ClusterViewId,
         targets: capnp::struct_list::Reader<'_, protocol::topology::split_target::Owned>,
-    ) -> Result<(Vec<SplitTargetSpec>, Vec<ClusterViewId>, Vec<String>), capnp::Error> {
+    ) -> Result<ParsedSplitTargets, capnp::Error> {
         if targets.is_empty() {
             return Err(capnp::Error::failed(
                 "split request requires at least one target".into(),
@@ -158,15 +171,18 @@ impl Topology {
     /// Builds the durable split operation record including assignment coverage diagnostics.
     pub(super) fn build_split_operation_record(
         &self,
-        source_view: ClusterViewId,
-        dry_run: bool,
-        split_service_policy: SplitServicePolicy,
-        split_network_policy: SplitNetworkPolicy,
-        target_specs: &[SplitTargetSpec],
-        target_views: Vec<ClusterViewId>,
-        detail_targets: Vec<String>,
-        split_assignments: Vec<SplitNodeAssignment>,
+        input: SplitOperationBuildInput<'_>,
     ) -> ClusterOperationRecord {
+        let SplitOperationBuildInput {
+            source_view,
+            dry_run,
+            split_service_policy,
+            split_network_policy,
+            target_specs,
+            target_views,
+            detail_targets,
+            split_assignments,
+        } = input;
         let mut assignments_per_target = vec![0usize; target_views.len()];
         for assignment in &split_assignments {
             if let Some(slot) = assignments_per_target.get_mut(assignment.target_index) {
@@ -274,19 +290,18 @@ impl Topology {
             }
             ClusterOperationStage::Finalized => {
                 let target = self.local_target_view_for_operation(&merged)?;
-                if merged.kind == ClusterOperationKind::Merge
-                    || self.active_cluster_view() != target
+                if (merged.kind == ClusterOperationKind::Merge
+                    || self.active_cluster_view() != target)
+                    && let Err(err) = self.apply_committed_operation_side_effects(&merged).await
                 {
-                    if let Err(err) = self.apply_committed_operation_side_effects(&merged).await {
-                        if Self::is_commit_precondition_failure(&err) {
-                            warn!(
-                                target: "cluster_view",
-                                operation_id = %merged.id,
-                                "skipped finalized operation side effects due to commit precondition mismatch: {err}"
-                            );
-                        } else {
-                            return Err(err);
-                        }
+                    if Self::is_commit_precondition_failure(&err) {
+                        warn!(
+                            target: "cluster_view",
+                            operation_id = %merged.id,
+                            "skipped finalized operation side effects due to commit precondition mismatch: {err}"
+                        );
+                    } else {
+                        return Err(err);
                     }
                 }
             }

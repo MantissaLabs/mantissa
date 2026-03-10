@@ -196,13 +196,13 @@ impl TaskManager {
         }
 
         let root_dir = self.secret_runtime_root.join(task_id.to_string());
-        if let Err(err) = fs::remove_dir_all(&root_dir).await {
-            if err.kind() != ErrorKind::NotFound {
-                return Err(anyhow!(
-                    "failed to reset secret staging directory {}: {err}",
-                    root_dir.display()
-                ));
-            }
+        if let Err(err) = fs::remove_dir_all(&root_dir).await
+            && err.kind() != ErrorKind::NotFound
+        {
+            return Err(anyhow!(
+                "failed to reset secret staging directory {}: {err}",
+                root_dir.display()
+            ));
         }
 
         fs::create_dir_all(&root_dir).await.with_context(|| {

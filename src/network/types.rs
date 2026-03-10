@@ -139,10 +139,10 @@ impl BpfProgramSpec {
 
     /// Rehydrate a program spec from its wire representation for Cap'n Proto compatibility.
     pub fn from_wire(name: &str) -> Self {
-        if let Some((program, attach)) = name.rsplit_once('@') {
-            if let Some(point) = BpfAttachPoint::from_token(attach) {
-                return Self::with_attach_point(program, point);
-            }
+        if let Some((program, attach)) = name.rsplit_once('@')
+            && let Some(point) = BpfAttachPoint::from_token(attach)
+        {
+            return Self::with_attach_point(program, point);
         }
         Self::new(name)
     }

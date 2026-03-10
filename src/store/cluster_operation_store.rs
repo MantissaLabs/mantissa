@@ -69,7 +69,7 @@ impl ClusterOperationStore {
         with_write_tx(&self.db, |tx| {
             let mut removed = 0usize;
             let mut table = tx.open_table(T_CLUSTER_OPERATIONS).map_err(into_io)?;
-            for id in ids.iter().copied() {
+            for id in ids {
                 if table.remove(*id.as_bytes()).map_err(into_io)?.is_some() {
                     removed = removed.saturating_add(1);
                 }

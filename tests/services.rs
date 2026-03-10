@@ -1006,7 +1006,7 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
         "all nodes should participate in hosting replicas after scale-out"
     );
     let max_per_node = counts.values().copied().max().unwrap_or(0);
-    let ideal = (expected_replicas + cluster.len() - 1) / cluster.len();
+    let ideal = expected_replicas.div_ceil(cluster.len());
     assert!(
         max_per_node <= ideal + 1,
         "scale-out placement skew is too high: max={max_per_node}, ideal={ideal}"
@@ -4159,9 +4159,7 @@ async fn collect_published_service_attachment_snapshot(
             return None;
         }
 
-        let Some(attachment) = by_task.get(&task.id) else {
-            return None;
-        };
+        let attachment = by_task.get(&task.id)?;
 
         if attachment.node_id != task.node_id
             || attachment.state != NetworkAttachmentState::Ready
@@ -4522,13 +4520,13 @@ impl ContainerManager for ExitSignalContainerManager {
             .await
             .get(container_id)
             .copied();
-        if let Some(task_id) = task_id {
-            if let Some(sender) = self.runtime_events_tx.lock().await.clone() {
-                let _ = sender.send(ContainerRuntimeEvent::TaskExited {
-                    task_id,
-                    exit_code: 255,
-                });
-            }
+        if let Some(task_id) = task_id
+            && let Some(sender) = self.runtime_events_tx.lock().await.clone()
+        {
+            let _ = sender.send(ContainerRuntimeEvent::TaskExited {
+                task_id,
+                exit_code: 255,
+            });
         }
 
         Ok(())

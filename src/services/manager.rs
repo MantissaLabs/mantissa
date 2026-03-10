@@ -131,14 +131,13 @@ impl ServiceController {
                 }
                 message = self.gossip_rx.recv() => {
                     let Ok(message) = message else { break; };
-                    if let Message::Service { event, .. } = message {
-                        if let Err(err) = self.handle_event(event).await {
+                    if let Message::Service { event, .. } = message
+                        && let Err(err) = self.handle_event(event).await {
                             tracing::warn!(
                                 target: "services",
                                 "failed to apply service gossip event: {err}"
                             );
                         }
-                    }
                 }
             }
         }

@@ -215,16 +215,12 @@ pub struct ServiceTaskSpecValue {
 /// Supported transport protocols for publicly exposed service ports.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ServicePortProtocol {
+    #[default]
     Tcp,
     Udp,
     TcpUdp,
-}
-
-impl Default for ServicePortProtocol {
-    fn default() -> Self {
-        ServicePortProtocol::Tcp
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]

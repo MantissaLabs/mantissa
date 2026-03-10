@@ -758,7 +758,7 @@ local_test!(cluster_view_split_resource_selector_assigns_peers, {
         let mut clause_b = clauses_b.reborrow().get(0);
         clause_b.set_key("node.id");
         clause_b.set_op(protocol::topology::split_selector_clause::Operator::Eq);
-        clause_b.set_value(&joiner.id().to_string());
+        clause_b.set_value(joiner.id().to_string());
         let mut explicit_b = selector_b.reborrow().init_explicit_nodes(1);
         set_node_id(explicit_b.reborrow().get(0), &joiner.id());
 
@@ -2496,7 +2496,7 @@ local_test!(cluster_view_split_selector_with_fallback_target, {
         let mut clause = clauses.reborrow().get(0);
         clause.set_key("node.id");
         clause.set_op(protocol::topology::split_selector_clause::Operator::Eq);
-        clause.set_value(&joiner.id().to_string());
+        clause.set_value(joiner.id().to_string());
         selector_a.reborrow().init_explicit_nodes(0);
 
         let mut fallback = targets.reborrow().get(1);

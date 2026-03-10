@@ -229,10 +229,10 @@ impl NetworkRegistry {
         let mut specs = Vec::with_capacity(entries.len());
         for (key, snapshot) in entries {
             let id = key.to_uuid();
-            if let Some(value) = snapshot.as_slice().last().cloned() {
-                if seen.insert(id) {
-                    specs.push(value);
-                }
+            if let Some(value) = snapshot.as_slice().last().cloned()
+                && seen.insert(id)
+            {
+                specs.push(value);
             }
         }
 

@@ -118,9 +118,7 @@ fn parse_override_action(raw: &str) -> Option<GpuDeviceOverrideAction> {
         return Some(GpuDeviceOverrideAction::Disable);
     }
 
-    let Some(rest) = action.strip_prefix("id:") else {
-        return None;
-    };
+    let rest = action.strip_prefix("id:")?;
 
     let trimmed = rest.trim();
     if trimmed.is_empty() {

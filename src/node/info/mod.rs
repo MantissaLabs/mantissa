@@ -321,7 +321,7 @@ fn collect_nvidia_gpus() -> Option<GpuInfo> {
         let compute_capability = None;
 
         devices.push(GpuDevice {
-            index: index as u32,
+            index,
             uuid,
             pci_bus_id,
             name,

@@ -9,7 +9,7 @@ use net::noise::{
 };
 use snow::params::NoiseParams;
 use std::io::ErrorKind;
-use std::sync::Arc;
+use std::rc::Rc;
 use tokio::io;
 use tokio::time::{Duration, timeout};
 use tokio::{
@@ -244,7 +244,7 @@ async fn noise_ik_peer_handshake_and_echo() {
             wr,
             &server_keys,
             &first[..nread],
-            Arc::new(AllowPeer(client_pk)),
+            Rc::new(AllowPeer(client_pk)),
         )
         .await
         .unwrap()
@@ -291,7 +291,7 @@ async fn noise_join_probe_negotiation_enabled() {
             &server_keys,
             &psk,
             &first[..nread],
-            Arc::new(DenyPeer),
+            Rc::new(DenyPeer),
         )
         .await
         .unwrap();
@@ -372,7 +372,7 @@ async fn noise_join_probe_legacy_client_no_hello() {
             &server_keys,
             &psk,
             &first[..nread],
-            Arc::new(DenyPeer),
+            Rc::new(DenyPeer),
         )
         .await
         .unwrap();
