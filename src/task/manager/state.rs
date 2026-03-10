@@ -1614,6 +1614,13 @@ impl TaskManager {
 
         if !has_container {
             self.cleanup_secret_artifacts(spec.id).await;
+            if let Err(err) = self.unpublish_task_volume_mounts(&spec).await {
+                warn!(
+                    target: "task",
+                    task = %spec.id,
+                    "failed to unpublish local volume mounts for containerless task: {err:#}"
+                );
+            }
             if let Err(err) = self
                 .teardown_runtime_attachments(spec.id, HashSet::new(), false)
                 .await
@@ -1736,6 +1743,19 @@ impl TaskManager {
             {
                 let mut guard = self.local_containers.lock().await;
                 guard.insert(task_id, container_id.clone());
+            }
+
+            if matches!(value.state, ContainerState::Running)
+                && !value.volumes.is_empty()
+                && let Err(err) = self
+                    .publish_task_volume_mounts_for_task(task_id, &value.volumes)
+                    .await
+            {
+                warn!(
+                    target: "task",
+                    task = %task_id,
+                    "failed to republish local volume mounts while adopting container: {err:#}"
+                );
             }
 
             if matches!(value.state, ContainerState::Running)
@@ -1867,6 +1887,18 @@ impl TaskManager {
         }
 
         self.cleanup_secret_artifacts(task_id).await;
+        if let Some(value) = task_value
+            && !value.volumes.is_empty()
+            && let Err(err) = self
+                .unpublish_task_volume_mounts_for_task(task_id, &value.volumes)
+                .await
+        {
+            warn!(
+                target: "task",
+                task = %task_id,
+                "failed to unpublish local volume mounts while stopping unowned runtime: {err:#}"
+            );
+        }
         if remove_attachments {
             if let Err(err) = self
                 .teardown_runtime_attachments(task_id, HashSet::new(), true)
@@ -2016,6 +2048,15 @@ impl TaskManager {
         if let Some(container_id) = runtime_inventory.task_containers.get(&spec.id).cloned() {
             let mut guard = self.local_containers.lock().await;
             guard.insert(spec.id, container_id);
+            if !spec.volumes.is_empty()
+                && let Err(err) = self.publish_task_volume_mounts(spec).await
+            {
+                warn!(
+                    target: "task",
+                    task = %spec.id,
+                    "failed to republish local volume mounts from runtime inventory: {err:#}"
+                );
+            }
             return true;
         }
 
@@ -2026,6 +2067,15 @@ impl TaskManager {
         if let Some(container_id) = cached
             && runtime_inventory.container_ids.contains(&container_id)
         {
+            if !spec.volumes.is_empty()
+                && let Err(err) = self.publish_task_volume_mounts(spec).await
+            {
+                warn!(
+                    target: "task",
+                    task = %spec.id,
+                    "failed to republish local volume mounts from cached runtime inventory: {err:#}"
+                );
+            }
             return true;
         }
 

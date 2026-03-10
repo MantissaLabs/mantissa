@@ -204,12 +204,40 @@ impl TaskManager {
 
     /// Marks the task as an active consumer on each referenced local volume after a successful launch.
     pub(super) async fn publish_task_volume_mounts(&self, spec: &TaskSpec) -> Result<()> {
-        self.update_task_volume_publication(spec, true).await
+        self.publish_task_volume_mounts_for_task(spec.id, &spec.volumes)
+            .await
     }
 
     /// Removes the task from the active consumer set for each referenced local volume.
     pub(super) async fn unpublish_task_volume_mounts(&self, spec: &TaskSpec) -> Result<()> {
-        self.update_task_volume_publication(spec, false).await
+        self.unpublish_task_volume_mounts_for_task(spec.id, &spec.volumes)
+            .await
+    }
+
+    /// Marks one task identifier as an active consumer on each referenced local volume.
+    ///
+    /// Runtime adoption and restart repair paths call this helper directly because they may only
+    /// have the persisted mount list available instead of the full task object.
+    pub(super) async fn publish_task_volume_mounts_for_task(
+        &self,
+        task_id: Uuid,
+        mounts: &[TaskVolumeMount],
+    ) -> Result<()> {
+        self.update_task_volume_publication(task_id, mounts, true)
+            .await
+    }
+
+    /// Removes one task identifier from the active consumer set on each referenced local volume.
+    ///
+    /// Stale-runtime cleanup calls this helper directly when the current task assignment no longer
+    /// belongs to the local node but its persisted volume mount list is still known.
+    pub(super) async fn unpublish_task_volume_mounts_for_task(
+        &self,
+        task_id: Uuid,
+        mounts: &[TaskVolumeMount],
+    ) -> Result<()> {
+        self.update_task_volume_publication(task_id, mounts, false)
+            .await
     }
 
     /// Ensures the node-local volume row exists, is realized on disk, and reports a ready state.
@@ -255,8 +283,13 @@ impl TaskManager {
     }
 
     /// Updates the published-task set on each mounted local volume to reflect runtime ownership.
-    async fn update_task_volume_publication(&self, spec: &TaskSpec, published: bool) -> Result<()> {
-        for volume_id in unique_volume_ids(&spec.volumes) {
+    async fn update_task_volume_publication(
+        &self,
+        task_id: Uuid,
+        mounts: &[TaskVolumeMount],
+        published: bool,
+    ) -> Result<()> {
+        for volume_id in unique_volume_ids(mounts) {
             let volume = self
                 .volume_registry
                 .get_spec(volume_id)?
@@ -272,17 +305,17 @@ impl TaskManager {
                 continue;
             };
 
-            let had_task = state.published_task_ids.contains(&spec.id);
+            let had_task = state.published_task_ids.contains(&task_id);
             if published {
                 if had_task {
                     continue;
                 }
-                state.published_task_ids.push(spec.id);
+                state.published_task_ids.push(task_id);
                 state.published_task_ids.sort_unstable();
             } else if had_task {
                 state
                     .published_task_ids
-                    .retain(|task_id| *task_id != spec.id);
+                    .retain(|published_task_id| *published_task_id != task_id);
             } else {
                 continue;
             }

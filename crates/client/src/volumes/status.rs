@@ -1,4 +1,4 @@
-use super::types::{VolumeInspect, format_bytes};
+use super::types::{VolumeInspect, format_bytes, format_task_ids};
 use crate::config::ClientConfig;
 use crate::connection;
 use crate::output;
@@ -38,6 +38,16 @@ pub async fn status(cfg: &ClientConfig, selector: &str) -> Result<()> {
         "  Capacity: {}",
         format_bytes(volume.spec.requested_bytes)
     )?;
+    writeln!(
+        &mut rendered,
+        "  Reason: {}",
+        volume.spec.reason.as_deref().unwrap_or("-")
+    )?;
+    writeln!(
+        &mut rendered,
+        "  Message: {}",
+        volume.spec.message.as_deref().unwrap_or("-")
+    )?;
     writeln!(&mut rendered, "  Node states:")?;
     if volume.node_states.is_empty() {
         writeln!(&mut rendered, "    -")?;
@@ -67,7 +77,7 @@ pub async fn status(cfg: &ClientConfig, selector: &str) -> Result<()> {
             writeln!(
                 &mut rendered,
                 "      Published tasks: {}",
-                state.published_task_ids.len()
+                format_task_ids(&state.published_task_ids)
             )?;
             writeln!(
                 &mut rendered,

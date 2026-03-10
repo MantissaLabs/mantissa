@@ -6,16 +6,19 @@ use bollard::service::ContainerInspectResponse;
 use common::convergence::wait_until;
 use common::testkit::{ClusterConfig, TestNode};
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
+use mantissa::store::volume_store::{open_volume_node_store, open_volume_spec_store};
 use mantissa::task::docker::{
     ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager,
     new_in_memory_container_manager,
 };
 use mantissa::task::manager::{TaskRuntimeConfig, TaskStartRequest};
 use mantissa::task::types::TaskVolumeMount;
+use mantissa::volumes::registry::VolumeRegistry;
 use mantissa::volumes::types::{
     LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
     VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
 };
+use protocol::topology::topology;
 use protocol::volumes::{LocalVolumeSourceKind, volumes};
 use std::collections::HashMap;
 use std::fs;
@@ -202,7 +205,12 @@ fn headless_config_with_in_memory_runtime() -> HeadlessConfig {
     }
 }
 
-async fn create_managed_volume(client: &volumes::Client, name: &str) -> Uuid {
+async fn create_managed_volume_with(
+    client: &volumes::Client,
+    name: &str,
+    binding_mode: protocol::volumes::VolumeBindingMode,
+    reclaim_policy: protocol::volumes::VolumeReclaimPolicy,
+) -> Uuid {
     let mut request = client.create_request();
     {
         let mut inner = request.get().init_request();
@@ -212,8 +220,8 @@ async fn create_managed_volume(client: &volumes::Client, name: &str) -> Uuid {
         local.set_source_kind(LocalVolumeSourceKind::Managed);
         local.set_imported_path("");
         inner.set_access_mode(protocol::volumes::VolumeAccessMode::ReadWriteOnce);
-        inner.set_binding_mode(protocol::volumes::VolumeBindingMode::WaitForFirstConsumer);
-        inner.set_reclaim_policy(protocol::volumes::VolumeReclaimPolicy::Retain);
+        inner.set_binding_mode(binding_mode);
+        inner.set_reclaim_policy(reclaim_policy);
         inner.set_requested_bytes(0);
         inner.set_bound_node_id(&[]);
     }
@@ -226,6 +234,16 @@ async fn create_managed_volume(client: &volumes::Client, name: &str) -> Uuid {
         .get_id()
         .expect("volume id");
     Uuid::from_slice(bytes).expect("decode volume id")
+}
+
+async fn create_managed_volume(client: &volumes::Client, name: &str) -> Uuid {
+    create_managed_volume_with(
+        client,
+        name,
+        protocol::volumes::VolumeBindingMode::WaitForFirstConsumer,
+        protocol::volumes::VolumeReclaimPolicy::Retain,
+    )
+    .await
 }
 
 async fn import_local_volume(
@@ -251,6 +269,56 @@ async fn import_local_volume(
         .get_id()
         .expect("volume id");
     Uuid::from_slice(bytes).expect("decode volume id")
+}
+
+#[derive(Debug)]
+struct TestVolumeDeleteResult {
+    preserved_path: Option<String>,
+    deleted_data: bool,
+}
+
+async fn delete_volume(client: &volumes::Client, selector: &str) -> TestVolumeDeleteResult {
+    let mut request = client.delete_request();
+    request.get().set_selector(selector);
+    let response = request.send().promise.await.expect("delete volume send");
+    let result = response
+        .get()
+        .expect("delete volume response")
+        .get_result()
+        .expect("delete volume result");
+    let preserved_path = result
+        .get_preserved_path()
+        .expect("preserved path")
+        .to_str()
+        .expect("preserved path utf8")
+        .trim()
+        .to_string();
+
+    TestVolumeDeleteResult {
+        preserved_path: if preserved_path.is_empty() {
+            None
+        } else {
+            Some(preserved_path)
+        },
+        deleted_data: result.get_deleted_data(),
+    }
+}
+
+async fn drain_node_via_topology(
+    client: &topology::Client,
+    node_id: Uuid,
+    reason: &str,
+) -> Result<(), capnp::Error> {
+    let mut request = client.drain_node_request();
+    let mut params = request.get();
+    params
+        .reborrow()
+        .init_node_id()
+        .set_bytes(node_id.as_bytes());
+    params.set_reason(reason);
+    params.set_task_stop_timeout_secs(0);
+    request.send().promise.await?;
+    Ok(())
 }
 
 async fn wait_for_pairwise_sessions(cluster: &[TestNode]) {
@@ -338,6 +406,50 @@ async fn create_recording_node(
     })
     .await
     .expect("start recording headless node")
+}
+
+async fn create_recording_node_with_parts(
+    db: Arc<redb::Database>,
+    self_id: Uuid,
+    keys: HeadlessKeys,
+    manager: Arc<RecordingContainerManager>,
+    local_volume_root: PathBuf,
+) -> HeadlessNode {
+    HeadlessNode::new_with(
+        db,
+        self_id,
+        keys,
+        HeadlessConfig {
+            container_manager: Some(manager),
+            local_volume_root: Some(local_volume_root),
+            task_runtime: Some(TaskRuntimeConfig {
+                reconcile_tick: Duration::from_millis(50),
+                repair_tick: Duration::from_millis(50),
+                ..TaskRuntimeConfig::default()
+            }),
+            ..HeadlessConfig::default()
+        },
+    )
+    .await
+    .expect("start recording headless node")
+}
+
+async fn wait_for_volume_published_tasks(node: &HeadlessNode, volume_id: Uuid, expected: &[Uuid]) {
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || async {
+                match node.volume_registry.get_node_state(volume_id, node.id) {
+                    Ok(Some(state)) => state.published_task_ids == expected,
+                    _ => false,
+                }
+            }
+        )
+        .await,
+        "volume {volume_id} should expose published task ids {:?}",
+        expected
+    );
 }
 
 local_test!(volumes_create_persists_across_restart, {
@@ -777,5 +889,205 @@ local_test!(bound_local_volume_forces_scheduler_locality, {
         )
         .await,
         "bound node should publish the imported local volume for the scheduled task"
+    );
+});
+
+local_test!(nodes_drain_blocks_on_local_volume_task, {
+    let local_volume_root = tempdir().expect("volume root");
+    let runtime = Arc::new(RecordingContainerManager::default());
+    let node = create_recording_node(runtime, local_volume_root.path().join("volumes")).await;
+
+    let volume_id = create_managed_volume(&node.volumes_client, "drain-data").await;
+    let task = start_standalone_volume_task(&node, volume_id, "drain-data", "/var/lib/data").await;
+    wait_for_volume_published_tasks(&node, volume_id, &[task.id]).await;
+
+    let err = drain_node_via_topology(&node.topology_client, node.id, "maintenance")
+        .await
+        .expect_err("local-volume task should block drain");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("local-volume task") || rendered.contains("local-volume task(s)"),
+        "drain blocker should mention local volumes: {rendered}"
+    );
+    assert!(
+        rendered.contains("drain-data"),
+        "drain blocker should mention the blocking volume name: {rendered}"
+    );
+});
+
+local_test!(volume_delete_retain_preserves_local_path, {
+    let local_volume_root = tempdir().expect("volume root");
+    let runtime = Arc::new(RecordingContainerManager::default());
+    let node = create_recording_node(runtime, local_volume_root.path().join("volumes")).await;
+
+    let volume_id = create_managed_volume(&node.volumes_client, "retain-data").await;
+    let task = start_standalone_volume_task(&node, volume_id, "retain-data", "/var/lib/data").await;
+    wait_for_volume_published_tasks(&node, volume_id, &[task.id]).await;
+
+    let local_path = node
+        .volume_registry
+        .get_node_state(volume_id, node.id)
+        .expect("load node state before retain delete")
+        .expect("node state before retain delete")
+        .local_path
+        .expect("local path before retain delete");
+
+    node.task_manager
+        .request_task_stop(task.id)
+        .await
+        .expect("request task stop");
+    wait_for_volume_published_tasks(&node, volume_id, &[]).await;
+
+    let deleted = delete_volume(&node.volumes_client, "retain-data").await;
+    assert_eq!(deleted.preserved_path.as_deref(), Some(local_path.as_str()));
+    assert!(
+        !deleted.deleted_data,
+        "retain reclaim policy should not delete managed data"
+    );
+    assert!(
+        fs::metadata(&local_path)
+            .expect("retained local path metadata")
+            .is_dir(),
+        "retained local volume path should still exist"
+    );
+    assert!(
+        node.volume_registry
+            .get_spec(volume_id)
+            .expect("volume lookup after retain delete")
+            .is_none(),
+        "volume spec should be removed after delete"
+    );
+});
+
+local_test!(volume_delete_delete_removes_managed_path, {
+    let local_volume_root = tempdir().expect("volume root");
+    let runtime = Arc::new(RecordingContainerManager::default());
+    let node = create_recording_node(runtime, local_volume_root.path().join("volumes")).await;
+
+    let volume_id = create_managed_volume_with(
+        &node.volumes_client,
+        "delete-data",
+        protocol::volumes::VolumeBindingMode::WaitForFirstConsumer,
+        protocol::volumes::VolumeReclaimPolicy::Delete,
+    )
+    .await;
+    let task = start_standalone_volume_task(&node, volume_id, "delete-data", "/var/lib/data").await;
+    wait_for_volume_published_tasks(&node, volume_id, &[task.id]).await;
+
+    let local_path = node
+        .volume_registry
+        .get_node_state(volume_id, node.id)
+        .expect("load node state before delete reclaim")
+        .expect("node state before delete reclaim")
+        .local_path
+        .expect("local path before delete reclaim");
+
+    node.task_manager
+        .request_task_stop(task.id)
+        .await
+        .expect("request task stop");
+    wait_for_volume_published_tasks(&node, volume_id, &[]).await;
+
+    let deleted = delete_volume(&node.volumes_client, "delete-data").await;
+    assert!(
+        deleted.preserved_path.is_none(),
+        "delete reclaim policy should not report a preserved path"
+    );
+    assert!(
+        deleted.deleted_data,
+        "delete reclaim policy should remove managed data"
+    );
+    assert!(
+        fs::metadata(&local_path).is_err(),
+        "managed local volume path should be removed after delete reclaim"
+    );
+    assert!(
+        node.volume_registry
+            .get_spec(volume_id)
+            .expect("volume lookup after delete reclaim")
+            .is_none(),
+        "volume spec should be removed after delete reclaim"
+    );
+});
+
+local_test!(restart_restores_volume_node_state, {
+    let state_dir = tempdir().expect("state dir");
+    let db_path = state_dir.path().join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+    let self_id = Uuid::new_v4();
+    let noise = Arc::new(NoiseKeys::from_private_bytes([0x82; 32]));
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
+    let runtime = Arc::new(RecordingContainerManager::default());
+    let local_volume_root = state_dir.path().join("volumes");
+
+    let mut node = create_recording_node_with_parts(
+        db.clone(),
+        self_id,
+        HeadlessKeys::new(noise.clone(), signing.clone()),
+        runtime.clone(),
+        local_volume_root.clone(),
+    )
+    .await;
+
+    let volume_id = create_managed_volume(&node.volumes_client, "restart-restore").await;
+    let task = start_standalone_volume_task(&node, volume_id, "restart-restore", "/srv/data").await;
+    wait_for_volume_published_tasks(&node, volume_id, &[task.id]).await;
+
+    let local_path = node
+        .volume_registry
+        .get_node_state(volume_id, node.id)
+        .expect("load node state before restart")
+        .expect("node state before restart")
+        .local_path
+        .expect("local path before restart");
+
+    node.stop().await.expect("stop first node");
+    drop(node);
+
+    let registry = VolumeRegistry::new(
+        open_volume_spec_store(db.clone(), self_id).expect("open volume spec store"),
+        open_volume_node_store(db.clone(), self_id).expect("open volume node store"),
+    );
+    let mut stale_state = registry
+        .get_node_state(volume_id, self_id)
+        .expect("load stale node state")
+        .expect("stale node state");
+    stale_state.published_task_ids.clear();
+    stale_state.state = VolumeNodeState::Ready;
+    stale_state.updated_at = chrono::Utc::now().to_rfc3339();
+    registry
+        .upsert_node_state(stale_state)
+        .await
+        .expect("persist stale node state");
+
+    let restarted = create_recording_node_with_parts(
+        db,
+        self_id,
+        HeadlessKeys::new(noise, signing),
+        runtime,
+        local_volume_root,
+    )
+    .await;
+
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || async {
+                match restarted
+                    .volume_registry
+                    .get_node_state(volume_id, restarted.id)
+                {
+                    Ok(Some(state)) => {
+                        state.local_path.as_deref() == Some(local_path.as_str())
+                            && state.published_task_ids == vec![task.id]
+                            && matches!(state.state, VolumeNodeState::Published)
+                    }
+                    _ => false,
+                }
+            }
+        )
+        .await,
+        "startup reconcile should restore published local-volume node state after restart"
     );
 });

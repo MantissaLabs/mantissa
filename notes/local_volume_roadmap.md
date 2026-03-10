@@ -774,6 +774,10 @@ Completed on March 10, 2026.
 
 Make delete, drain, stop, and reconciliation behavior safe for local volumes.
 
+### Status
+
+Completed on March 10, 2026.
+
 ### Scope
 
 1. block drain on active local-volume tasks,

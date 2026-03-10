@@ -1,4 +1,4 @@
-use super::types::{VolumeInspect, format_bytes};
+use super::types::{VolumeInspect, format_bytes, format_task_ids};
 use crate::config::ClientConfig;
 use crate::connection;
 use crate::output;
@@ -66,12 +66,26 @@ pub async fn inspect(cfg: &ClientConfig, selector: &str) -> Result<()> {
     for state in &volume.node_states {
         writeln!(
             &mut rendered,
-            "    {} {} {} {}",
-            state.node_name,
-            state.state,
-            state.local_path.as_deref().unwrap_or("-"),
-            state.updated_at,
+            "    Node: {} ({})",
+            state.node_name, state.node_id
         )?;
+        writeln!(&mut rendered, "      State: {}", state.state)?;
+        writeln!(
+            &mut rendered,
+            "      Local path: {}",
+            state.local_path.as_deref().unwrap_or("-")
+        )?;
+        writeln!(
+            &mut rendered,
+            "      Published tasks: {}",
+            format_task_ids(&state.published_task_ids)
+        )?;
+        writeln!(
+            &mut rendered,
+            "      Last error: {}",
+            state.last_error.as_deref().unwrap_or("-")
+        )?;
+        writeln!(&mut rendered, "      Updated: {}", state.updated_at)?;
     }
     output::emit_block(rendered);
     Ok(())

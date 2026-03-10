@@ -27,6 +27,8 @@ use crate::topology::operation::{
     SplitNetworkPolicy, SplitServicePolicy,
 };
 use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
+use crate::volumes::registry::VolumeRegistry;
+use crate::volumes::types::VolumeDriver;
 use async_trait::async_trait;
 use capnp::Error;
 use capnp::data;
@@ -137,6 +139,12 @@ struct NodeDrainStatusSnapshot {
     reason: Option<String>,
     message: String,
     last_scheduling_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalVolumeDrainBlocker {
+    task_id: Uuid,
+    volume_name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -826,6 +834,72 @@ impl Topology {
         Ok(tasks)
     }
 
+    /// Returns active tasks on the target node that still depend on node-local volume data.
+    ///
+    /// Local-volume tasks cannot be evacuated safely in v1, so node drain must block explicitly
+    /// instead of pretending that service rescheduling can move their state elsewhere.
+    fn local_volume_drain_blockers(
+        &self,
+        node_id: Uuid,
+        tasks: &[TaskValue],
+    ) -> Result<Vec<LocalVolumeDrainBlocker>, capnp::Error> {
+        let volumes = VolumeRegistry::new(self.volumes.clone(), self.volume_nodes.clone());
+        let mut seen = HashSet::new();
+        let mut blockers = Vec::new();
+
+        for task in tasks {
+            for mount in &task.volumes {
+                let Some(spec) = volumes
+                    .get_spec(mount.volume_id)
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?
+                else {
+                    return Err(capnp::Error::failed(format!(
+                        "node {node_id} has active task {} referencing unknown volume '{}'",
+                        task.id, mount.volume_name
+                    )));
+                };
+
+                if !matches!(spec.driver, VolumeDriver::Local(_))
+                    || spec.bound_node_id != Some(node_id)
+                {
+                    continue;
+                }
+
+                if seen.insert((task.id, spec.id)) {
+                    blockers.push(LocalVolumeDrainBlocker {
+                        task_id: task.id,
+                        volume_name: spec.name,
+                    });
+                }
+            }
+        }
+
+        Ok(blockers)
+    }
+
+    /// Renders the operator-facing drain rejection used when local volumes pin active tasks.
+    fn local_volume_drain_message(node_id: Uuid, blockers: &[LocalVolumeDrainBlocker]) -> String {
+        let mut task_ids: Vec<String> = blockers
+            .iter()
+            .map(|blocker| blocker.task_id.to_string())
+            .collect();
+        task_ids.sort();
+        task_ids.dedup();
+
+        let mut volume_names: Vec<String> = blockers
+            .iter()
+            .map(|blocker| blocker.volume_name.clone())
+            .collect();
+        volume_names.sort();
+        volume_names.dedup();
+
+        format!(
+            "node {node_id} has {} active local-volume task(s) using {}; drain requires manual stop first",
+            task_ids.len(),
+            join_human_list(&volume_names)
+        )
+    }
+
     /// Returns true when at least one schedulable node other than the drained target remains.
     ///
     /// The first evacuation cut does not perform deep capacity simulation, but it must reject
@@ -856,6 +930,14 @@ impl Topology {
         let active_tasks = self.active_task_values_on_node(node_id)?;
         if active_tasks.is_empty() {
             return Ok(());
+        }
+
+        let local_volume_blockers = self.local_volume_drain_blockers(node_id, &active_tasks)?;
+        if !local_volume_blockers.is_empty() {
+            return Err(capnp::Error::failed(Self::local_volume_drain_message(
+                node_id,
+                &local_volume_blockers,
+            )));
         }
 
         let standalone: Vec<Uuid> = active_tasks
@@ -1090,6 +1172,7 @@ impl Topology {
         }
 
         let active_tasks = self.active_task_values_on_node(node_id)?;
+        let local_volume_blockers = self.local_volume_drain_blockers(node_id, &active_tasks)?;
         let blocking_standalone_tasks = active_tasks
             .iter()
             .filter(|task| task.service_metadata.is_none())
@@ -1142,7 +1225,8 @@ impl Topology {
                 }
             };
 
-        let state = if blocking_standalone_tasks > 0
+        let state = if !local_volume_blockers.is_empty()
+            || blocking_standalone_tasks > 0
             || rollout_blocker.is_some()
             || replacement_blocker.is_some()
             || capacity_blocker.is_some()
@@ -1158,7 +1242,9 @@ impl Topology {
             DrainStatusState::Draining
         };
 
-        let message = if blocking_standalone_tasks > 0 {
+        let message = if !local_volume_blockers.is_empty() {
+            Self::local_volume_drain_message(node_id, &local_volume_blockers)
+        } else if blocking_standalone_tasks > 0 {
             format!("drain blocked by {blocking_standalone_tasks} active standalone task(s)")
         } else if let Some(message) = rollout_blocker.as_ref() {
             message.clone()

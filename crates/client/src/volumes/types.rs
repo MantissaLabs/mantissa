@@ -375,6 +375,19 @@ pub fn format_bytes(bytes: Option<u64>) -> String {
     }
 }
 
+/// Formats one list of task identifiers for CLI diagnostics.
+pub fn format_task_ids(task_ids: &[Uuid]) -> String {
+    if task_ids.is_empty() {
+        return "-".to_string();
+    }
+
+    task_ids
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Decodes one 16-byte UUID payload from the wire.
 fn read_uuid(bytes: capnp::data::Reader<'_>, field: &str) -> Result<Uuid> {
     let data = bytes.to_owned();
