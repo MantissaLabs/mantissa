@@ -6,8 +6,10 @@ use uuid::Uuid;
 use crate::{
     cluster::ClusterViewId,
     gossip::DEFAULT_FANOUT,
+    network::controller::NetworkController,
     network::registry::NetworkRegistry,
     node,
+    registry::Registry,
     scheduler::Scheduler,
     server::{
         RunHandles, RunMode, Server,
@@ -90,6 +92,8 @@ pub struct HeadlessNode {
     pub service_controller: ServiceController,
     pub task_manager: TaskManager,
     pub network_registry: NetworkRegistry,
+    pub network_controller: NetworkController,
+    pub registry: Registry,
     pub scheduler: Rc<Scheduler>,
 
     // Stores (optional inspection in tests)
@@ -252,6 +256,8 @@ impl HeadlessNode {
             service_controller: comps.service_controller.clone(),
             task_manager: comps.task_manager.clone(),
             network_registry: comps.network_registry.clone(),
+            network_controller: comps.network_controller.clone(),
+            registry: comps.registry.clone(),
             scheduler: comps.scheduler.clone(),
             peers: stores.peers.clone(),
             tasks: stores.tasks.clone(),

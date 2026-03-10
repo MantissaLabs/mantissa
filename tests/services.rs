@@ -16,9 +16,12 @@ use common::testkit::{
 };
 use crdt_store::uuid_key::UuidKey;
 use mantissa::cluster::ClusterViewId;
+use mantissa::config::{
+    Config, ConfigSource, global_config, global_config_source, set_global_config_with_source,
+};
 use mantissa::network::types::{
-    NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver, NetworkPeerState,
-    NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
+    NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver, NetworkSpecDraft,
+    NetworkSpecValue, NetworkStatus,
 };
 use mantissa::node::id::set_node_id;
 use mantissa::scheduler::SlotReservationRequest;
@@ -55,6 +58,39 @@ use std::{
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 use uuid::Uuid;
+
+/// Restores the global Mantissa config after a test-scoped override.
+struct ConfigOverrideGuard {
+    previous: Config,
+    source: ConfigSource,
+}
+
+impl ConfigOverrideGuard {
+    /// Force networking into a control-plane-only mode so logical-network tests do not depend on
+    /// privileged dataplane setup in CI.
+    fn control_plane_network_only() -> Self {
+        let previous = global_config();
+        let source = global_config_source();
+
+        let mut config = previous.clone();
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = false;
+        config.network.nodeport.enabled = false;
+
+        let mut override_source = source.clone();
+        override_source.env_overrides = true;
+        set_global_config_with_source(config, override_source);
+
+        Self { previous, source }
+    }
+}
+
+impl Drop for ConfigOverrideGuard {
+    fn drop(&mut self) {
+        set_global_config_with_source(self.previous.clone(), self.source.clone());
+    }
+}
 
 local_test!(services_gossip_propagates_across_peers, {
     let _guard = ContainerManagerOverrideGuard::install_default();
@@ -2189,6 +2225,7 @@ local_test!(
     services_split_merge_traffic_publication_converges_after_heal,
     {
         let _guard = ContainerManagerOverrideGuard::install_default();
+        let _config_guard = ConfigOverrideGuard::control_plane_network_only();
 
         let cfg = ClusterConfig {
             sync_tick_ms: Some(100),
@@ -2201,6 +2238,13 @@ local_test!(
             .expect("cluster should start");
         TestNode::assert_cluster_size_all(&cluster, 4, "cluster should stabilise to four nodes")
             .await;
+        TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(20))
+            .await
+            .expect("peer roots should converge before networked deployment");
+        assert!(
+            wait_for_cached_cluster_sessions_all(&cluster, Duration::from_secs(30)).await,
+            "cluster should establish pairwise sessions before networked deployment"
+        );
 
         let service_name = "split-merge-traffic";
         let network_id = create_logical_test_network(&cluster, "split-merge-traffic-network").await;
@@ -3884,11 +3928,11 @@ fn demo_networked_backend_task_template(
     template
 }
 
-/// Creates a fully mocked logical overlay network on every test node and seeds peer readiness.
+/// Creates a logical overlay network on every test node and waits for controller-driven readiness.
 ///
-/// CI cannot create real VXLAN devices, so the split/merge publication test seeds the replicated
-/// network spec and ready peer-state rows directly. Task and service controllers still exercise
-/// the real attachment and publication paths, but the network itself remains control-plane only.
+/// The split/merge publication test runs with dataplane features disabled, so the background
+/// network controller can reconcile specs and peer-state readiness without requiring privileged
+/// kernel setup in CI.
 async fn create_logical_test_network(cluster: &[TestNode], name: &str) -> Uuid {
     let network = NetworkSpecValue::new(NetworkSpecDraft {
         name: name.to_string(),
@@ -3913,61 +3957,125 @@ async fn create_logical_test_network(cluster: &[TestNode], name: &str) -> Uuid {
                     node.id()
                 )
             });
-        for peer in cluster {
-            node.node
-                .network_registry
-                .upsert_peer_state(NetworkPeerStateValue::new(
-                    network.id,
-                    peer.id(),
-                    format!("node-{}", peer.id()),
-                    NetworkPeerState::Ready,
-                    None,
-                ))
-                .await
-                .unwrap_or_else(|err| {
-                    panic!(
-                        "seed network peer state for network {} on node {} failed: {err:#}",
-                        network.id,
-                        node.id()
-                    )
-                });
-        }
+        node.node
+            .network_controller
+            .schedule_spec_change(network.id)
+            .await;
     }
 
     assert!(
-        wait_for_logical_network_ready_all(cluster, network.id, Duration::from_secs(20)).await,
+        wait_for_logical_network_ready_all(cluster, network.id, Duration::from_secs(60)).await,
         "logical network {} should become ready on all nodes before deployment",
         network.id
     );
     network.id
 }
 
-/// Waits until every node reports the logical network as ready with peer readiness converged.
+/// Waits until every node reports the logical network as ready with controller-driven peer
+/// readiness converged and stable.
 async fn wait_for_logical_network_ready_all(
     cluster: &[TestNode],
     network_id: Uuid,
     timeout: Duration,
 ) -> bool {
-    wait_until(timeout, Duration::from_millis(100), || async {
+    let deadline = Instant::now() + timeout;
+    let mut stable_rounds = 0usize;
+
+    while Instant::now() < deadline {
+        let mut healthy = true;
         for node in cluster {
-            let Ok(Some(_spec)) = node.node.network_registry.get_spec(network_id) else {
-                return false;
+            let Ok(Some(spec)) = node.node.network_registry.get_spec(network_id) else {
+                healthy = false;
+                break;
             };
+            if spec.status != NetworkStatus::Ready {
+                healthy = false;
+                break;
+            }
 
             let Ok(peers) = node
                 .node
                 .network_registry
                 .list_peer_states(Some(network_id))
             else {
-                return false;
+                healthy = false;
+                break;
             };
             if peers.len() != cluster.len() || peers.iter().any(|peer| !peer.state.is_ready()) {
-                return false;
+                healthy = false;
+                break;
             }
         }
-        true
-    })
-    .await
+
+        if healthy {
+            stable_rounds = stable_rounds.saturating_add(1);
+            if stable_rounds >= 3 {
+                return true;
+            }
+        } else {
+            stable_rounds = 0;
+        }
+
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    false
+}
+
+/// Waits until every node can reuse a cached cluster session for every other peer.
+///
+/// The networked split/merge publication regression deploys immediately after cluster bootstrap.
+/// Pairwise membership convergence is not enough for that path: the initial batch launcher also
+/// needs control-plane sessions to be cached so remote scheduler and task RPCs do not fail
+/// transiently on slow CI workers.
+async fn wait_for_cached_cluster_sessions_all(cluster: &[TestNode], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut stable_rounds = 0usize;
+
+    while Instant::now() < deadline {
+        let mut ready = true;
+
+        for node in cluster {
+            if node.node.registry.connect_known_peers(true).await.is_err() {
+                ready = false;
+                break;
+            }
+
+            for peer in cluster {
+                if node.id() == peer.id() {
+                    continue;
+                }
+
+                if node
+                    .node
+                    .registry
+                    .cached_session_for(peer.id())
+                    .await
+                    .is_none()
+                {
+                    ready = false;
+                    break;
+                }
+            }
+
+            if !ready {
+                break;
+            }
+        }
+
+        if ready {
+            stable_rounds = stable_rounds.saturating_add(1);
+            if stable_rounds >= 3 {
+                return true;
+            }
+        } else {
+            stable_rounds = 0;
+        }
+
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    false
 }
 
 /// Returns true once every node sees the expected active service tasks with published attachments.
