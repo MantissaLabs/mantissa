@@ -36,6 +36,14 @@ struct RecordingContainerManager {
 }
 
 impl RecordingContainerManager {
+    /// Builds the runtime error used when a launch races with an existing container name.
+    fn name_conflict(name: &str) -> ContainerError {
+        ContainerError::DockerAPI(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message: format!("container name '{name}' already in use"),
+        })
+    }
+
     async fn volume_mounts(&self) -> Vec<Vec<String>> {
         self.volumes.lock().await.clone()
     }
@@ -64,6 +72,13 @@ impl ContainerManager for RecordingContainerManager {
         &self,
         request: ContainerCreateRequest,
     ) -> Result<String, ContainerError> {
+        {
+            let names = self.names.lock().await;
+            if names.contains_key(&request.name) {
+                return Err(Self::name_conflict(&request.name));
+            }
+        }
+
         let id = Uuid::new_v4().to_string();
         self.volumes
             .lock()
