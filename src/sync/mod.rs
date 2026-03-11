@@ -181,6 +181,14 @@ enum DomainStoreRef<'a> {
     VolumeNodes(&'a VolumeNodeStore),
 }
 
+/// Static diagnostic metadata associated with one replicated sync domain.
+#[derive(Clone, Copy)]
+struct DomainDebugMeta {
+    domain: Domain,
+    log_label: &'static str,
+    dump_suffix: &'static str,
+}
+
 macro_rules! with_domain_store {
     ($domain_store:expr, |$store:ident| $body:block) => {
         match $domain_store {
@@ -199,68 +207,70 @@ macro_rules! with_domain_store {
 }
 
 impl DomainStoreRef<'_> {
+    /// Returns the static metadata used by protocol responses and sync diagnostics.
+    fn meta(&self) -> DomainDebugMeta {
+        match self {
+            Self::Peers(_) => DomainDebugMeta {
+                domain: Domain::Peers,
+                log_label: "peers",
+                dump_suffix: "peers",
+            },
+            Self::Tasks(_) => DomainDebugMeta {
+                domain: Domain::Tasks,
+                log_label: "tasks",
+                dump_suffix: "tasks",
+            },
+            Self::Services(_) => DomainDebugMeta {
+                domain: Domain::Services,
+                log_label: "services",
+                dump_suffix: "services",
+            },
+            Self::Secrets(_) => DomainDebugMeta {
+                domain: Domain::Secrets,
+                log_label: "secrets",
+                dump_suffix: "secrets",
+            },
+            Self::Networks(_) => DomainDebugMeta {
+                domain: Domain::Networks,
+                log_label: "networks",
+                dump_suffix: "networks",
+            },
+            Self::NetworkPeers(_) => DomainDebugMeta {
+                domain: Domain::NetworkPeers,
+                log_label: "network peers",
+                dump_suffix: "network_peers",
+            },
+            Self::NetworkAttachments(_) => DomainDebugMeta {
+                domain: Domain::NetworkAttachments,
+                log_label: "network attachments",
+                dump_suffix: "network_attachments",
+            },
+            Self::ClusterViews(_) => DomainDebugMeta {
+                domain: Domain::ClusterViews,
+                log_label: "cluster views",
+                dump_suffix: "cluster_views",
+            },
+            Self::Volumes(_) => DomainDebugMeta {
+                domain: Domain::Volumes,
+                log_label: "volumes",
+                dump_suffix: "volumes",
+            },
+            Self::VolumeNodes(_) => DomainDebugMeta {
+                domain: Domain::VolumeNodes,
+                log_label: "volume nodes",
+                dump_suffix: "volume_nodes",
+            },
+        }
+    }
+
     /// Returns the protocol domain represented by this store reference.
     fn domain(&self) -> Domain {
-        match self {
-            Self::Peers(_) => Domain::Peers,
-            Self::Tasks(_) => Domain::Tasks,
-            Self::Services(_) => Domain::Services,
-            Self::Secrets(_) => Domain::Secrets,
-            Self::Networks(_) => Domain::Networks,
-            Self::NetworkPeers(_) => Domain::NetworkPeers,
-            Self::NetworkAttachments(_) => Domain::NetworkAttachments,
-            Self::ClusterViews(_) => Domain::ClusterViews,
-            Self::Volumes(_) => Domain::Volumes,
-            Self::VolumeNodes(_) => Domain::VolumeNodes,
-        }
+        self.meta().domain
     }
 
-    /// Returns the human-readable label used in sync debug logs.
-    fn log_label(&self) -> &'static str {
-        match self {
-            Self::Peers(_) => "peers",
-            Self::Tasks(_) => "tasks",
-            Self::Services(_) => "services",
-            Self::Secrets(_) => "secrets",
-            Self::Networks(_) => "networks",
-            Self::NetworkPeers(_) => "network peers",
-            Self::NetworkAttachments(_) => "network attachments",
-            Self::ClusterViews(_) => "cluster views",
-            Self::Volumes(_) => "volumes",
-            Self::VolumeNodes(_) => "volume nodes",
-        }
-    }
-
-    /// Returns the label used when dumping MST state before range responses.
-    fn ranges_dump_label(&self) -> &'static str {
-        match self {
-            Self::Peers(_) => "server.before.get_ranges",
-            Self::Tasks(_) => "server.before.get_ranges.tasks",
-            Self::Services(_) => "server.before.get_ranges.services",
-            Self::Secrets(_) => "server.before.get_ranges.secrets",
-            Self::Networks(_) => "server.before.get_ranges.networks",
-            Self::NetworkPeers(_) => "server.before.get_ranges.network_peers",
-            Self::NetworkAttachments(_) => "server.before.get_ranges.network_attachments",
-            Self::ClusterViews(_) => "server.before.get_ranges.cluster_views",
-            Self::Volumes(_) => "server.before.get_ranges.volumes",
-            Self::VolumeNodes(_) => "server.before.get_ranges.volume_nodes",
-        }
-    }
-
-    /// Returns the label used when dumping MST state before delta responses.
-    fn delta_dump_label(&self) -> &'static str {
-        match self {
-            Self::Peers(_) => "server.before.open_delta",
-            Self::Tasks(_) => "server.before.open_delta.tasks",
-            Self::Services(_) => "server.before.open_delta.services",
-            Self::Secrets(_) => "server.before.open_delta.secrets",
-            Self::Networks(_) => "server.before.open_delta.networks",
-            Self::NetworkPeers(_) => "server.before.open_delta.network_peers",
-            Self::NetworkAttachments(_) => "server.before.open_delta.network_attachments",
-            Self::ClusterViews(_) => "server.before.open_delta.cluster_views",
-            Self::Volumes(_) => "server.before.open_delta.volumes",
-            Self::VolumeNodes(_) => "server.before.open_delta.volume_nodes",
-        }
+    /// Builds the diagnostic label used when dumping MST state for one sync phase.
+    fn dump_label(&self, prefix: &str) -> String {
+        format!("{prefix}.{}", self.meta().dump_suffix)
     }
 
     /// Reads the current MST root hash for this domain.
@@ -270,11 +280,12 @@ impl DomainStoreRef<'_> {
 
     /// Produces digest ranges for anti-entropy while emitting domain diagnostics.
     async fn page_range_summary(&self) -> Result<Vec<crdt_store::PageDigestRange>, capnp::Error> {
-        debug!("getRangesForView: received ({})", self.log_label());
-        let dump_label = self.ranges_dump_label();
+        let meta = self.meta();
+        debug!("getRangesForView: received ({})", meta.log_label);
+        let dump_label = self.dump_label("server.before.get_ranges");
         with_domain_store!(self, |store| {
-            store.debug_dump_root(dump_label).await;
-            store.debug_dump_ranges(dump_label, 5).await;
+            store.debug_dump_root(&dump_label).await;
+            store.debug_dump_ranges(&dump_label, 5).await;
             store
                 .page_range_summary()
                 .await
@@ -297,15 +308,16 @@ impl DomainStoreRef<'_> {
 
     /// Dumps domain-specific diagnostics for an incoming delta request.
     async fn debug_dump_delta_state(&self) {
+        let meta = self.meta();
         debug!(
             target: "delta",
             "open_delta_for_view: received ({})",
-            self.log_label()
+            meta.log_label
         );
-        let dump_label = self.delta_dump_label();
+        let dump_label = self.dump_label("server.before.open_delta");
         with_domain_store!(self, |store| {
-            store.debug_dump_root(dump_label).await;
-            store.debug_dump_ranges(dump_label, 5).await;
+            store.debug_dump_root(&dump_label).await;
+            store.debug_dump_ranges(&dump_label, 5).await;
         })
     }
 }
