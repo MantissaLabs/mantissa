@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::gossip::Message;
 use crate::task::types::{TaskSpec, TaskVolumeMount};
+use crate::volumes::LocalVolumeAccessError;
 use crate::volumes::local::ensure_local_volume_path;
 use crate::volumes::types::{
     VolumeBindingMode, VolumeEvent, VolumeNodeState, VolumeNodeStateValue, VolumeSpecValue,
@@ -48,11 +49,11 @@ impl TaskManager {
                     },
                     None => {
                         if matches!(spec.binding_mode, VolumeBindingMode::Immediate) {
-                            return Err(anyhow!(
+                            return Err(LocalVolumeAccessError::unavailable(format!(
                                 "task '{}' references immediate volume '{}' before it is bound",
-                                intent.name,
-                                spec.name
-                            ));
+                                intent.name, spec.name
+                            ))
+                            .into());
                         }
                     }
                 }
@@ -186,12 +187,11 @@ impl TaskManager {
                     )
                 })?;
             if spec.bound_node_id != Some(self.local_node_id) {
-                return Err(anyhow!(
+                return Err(LocalVolumeAccessError::unavailable(format!(
                     "volume '{}' is bound to {:?} and cannot be mounted on node {}",
-                    spec.name,
-                    spec.bound_node_id,
-                    self.local_node_id
-                ));
+                    spec.name, spec.bound_node_id, self.local_node_id
+                ))
+                .into());
             }
 
             let path = self.ensure_local_volume_ready(&spec).await?;
@@ -200,6 +200,28 @@ impl TaskManager {
         }
 
         Ok(resolved)
+    }
+
+    /// Validates that every mounted local volume is currently accessible on this node.
+    pub(super) async fn ensure_task_volumes_accessible(
+        &self,
+        mounts: &[TaskVolumeMount],
+    ) -> Result<()> {
+        for volume_id in unique_volume_ids(mounts) {
+            let spec = self
+                .volume_registry
+                .get_spec(volume_id)?
+                .ok_or_else(|| anyhow!("unknown volume {volume_id}"))?;
+            if spec.bound_node_id != Some(self.local_node_id) {
+                return Err(LocalVolumeAccessError::unavailable(format!(
+                    "volume '{}' is bound to {:?} and cannot run on node {}",
+                    spec.name, spec.bound_node_id, self.local_node_id
+                ))
+                .into());
+            }
+            let _ = self.ensure_local_volume_ready(&spec).await?;
+        }
+        Ok(())
     }
 
     /// Marks the task as an active consumer on each referenced local volume after a successful launch.
@@ -245,7 +267,8 @@ impl TaskManager {
         &self,
         spec: &VolumeSpecValue,
     ) -> Result<std::path::PathBuf> {
-        let path = ensure_local_volume_path(&self.local_volume_root, spec)?;
+        let path = ensure_local_volume_path(&self.local_volume_root, spec)
+            .map_err(|err| LocalVolumeAccessError::unavailable(err.to_string()))?;
         let current = self
             .volume_registry
             .get_node_state(spec.id, self.local_node_id)?
@@ -259,6 +282,26 @@ impl TaskManager {
                     spec.requested_bytes,
                 )
             });
+        if matches!(current.state, VolumeNodeState::Error) {
+            let message = current.last_error.clone().unwrap_or_else(|| {
+                format!(
+                    "volume '{}' is unavailable on node {}",
+                    spec.name, self.local_node_name
+                )
+            });
+            return Err(LocalVolumeAccessError::unavailable(message).into());
+        }
+        if self.enforce_local_volume_capacity
+            && let (Some(used_bytes), Some(capacity_bytes)) =
+                (current.used_bytes, current.capacity_bytes)
+            && used_bytes > capacity_bytes
+        {
+            return Err(LocalVolumeAccessError::unavailable(format!(
+                "volume '{}' exceeded requested capacity: used {} bytes, limit {} bytes",
+                spec.name, used_bytes, capacity_bytes
+            ))
+            .into());
+        }
         let path_string = path.to_string_lossy().to_string();
         if current.local_path.as_deref() != Some(path_string.as_str())
             || !matches!(

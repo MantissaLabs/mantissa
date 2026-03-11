@@ -136,16 +136,19 @@ enum ServiceStatus {
   deploying @0;
   # Service is deploying or reconciling.
 
-  running @1;
+  volumeUnavailable @1;
+  # Service is blocked on one or more node-local volumes.
+
+  running @2;
   # Service is healthy and running.
 
-  stopping @2;
+  stopping @3;
   # Service is stopping.
 
-  stopped @3;
+  stopped @4;
   # Service is stopped.
 
-  failed @4;
+  failed @5;
   # Service failed to deploy or reconcile.
 }
 

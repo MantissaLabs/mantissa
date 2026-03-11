@@ -67,6 +67,7 @@ pub enum TaskEvent {
 pub enum TaskStateKind {
     Pending,
     Creating,
+    VolumeUnavailable,
     Running,
     Paused,
     Stopping,
@@ -84,6 +85,7 @@ impl TaskStateKind {
             // Pulling is an in-flight launch phase and should be grouped with creating filters.
             ContainerState::Pulling => TaskStateKind::Creating,
             ContainerState::Creating => TaskStateKind::Creating,
+            ContainerState::VolumeUnavailable => TaskStateKind::VolumeUnavailable,
             ContainerState::Running => TaskStateKind::Running,
             ContainerState::Paused => TaskStateKind::Paused,
             ContainerState::Stopping => TaskStateKind::Stopping,
@@ -118,6 +120,7 @@ impl TaskStateFilter {
         Self::new([
             TaskStateKind::Pending,
             TaskStateKind::Creating,
+            TaskStateKind::VolumeUnavailable,
             TaskStateKind::Running,
             TaskStateKind::Stopping,
         ])
@@ -129,6 +132,7 @@ impl TaskStateFilter {
         Self::new([
             TaskStateKind::Pending,
             TaskStateKind::Creating,
+            TaskStateKind::VolumeUnavailable,
             TaskStateKind::Running,
             TaskStateKind::Paused,
             TaskStateKind::Stopping,

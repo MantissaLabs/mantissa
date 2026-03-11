@@ -22,6 +22,7 @@ fn state_to_str(state: &ContainerState) -> String {
         ContainerState::Pending => "pending".to_string(),
         ContainerState::Pulling => "pulling".to_string(),
         ContainerState::Creating => "creating".to_string(),
+        ContainerState::VolumeUnavailable => "volume_unavailable".to_string(),
         ContainerState::Running => "running".to_string(),
         ContainerState::Paused => "paused".to_string(),
         ContainerState::Stopping => "stopping".to_string(),
@@ -37,6 +38,7 @@ fn state_from_str(input: &str) -> ContainerState {
         "pending" => ContainerState::Pending,
         "pulling" => ContainerState::Pulling,
         "creating" => ContainerState::Creating,
+        "volume_unavailable" => ContainerState::VolumeUnavailable,
         "running" => ContainerState::Running,
         "paused" => ContainerState::Paused,
         "stopping" => ContainerState::Stopping,
@@ -669,6 +671,7 @@ fn list_filter_from_request(request: &task_list_request::Reader) -> Result<TaskS
         let kind = match state {
             CapnpTaskStateFilter::Pending => TaskStateKind::Pending,
             CapnpTaskStateFilter::Creating => TaskStateKind::Creating,
+            CapnpTaskStateFilter::VolumeUnavailable => TaskStateKind::VolumeUnavailable,
             CapnpTaskStateFilter::Running => TaskStateKind::Running,
             CapnpTaskStateFilter::Paused => TaskStateKind::Paused,
             CapnpTaskStateFilter::Stopping => TaskStateKind::Stopping,

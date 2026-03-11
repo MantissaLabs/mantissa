@@ -295,6 +295,7 @@ async fn setup_task_manager() -> TestHarness {
         attachment_override: None,
         runtime_config: None,
         local_volume_root: local_volume_root.path().to_path_buf(),
+        enforce_local_volume_capacity: false,
     });
 
     TestHarness {

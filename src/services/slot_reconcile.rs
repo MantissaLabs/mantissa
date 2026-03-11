@@ -5,9 +5,10 @@ use super::{
     SERVICE_ENABLE_PROACTIVE_REBALANCE, SERVICE_REBALANCE_COOLDOWN_SECS,
     SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController, ServiceTaskSnapshot, TaskInventory,
     compute_effective_slot_targets, deploying_assignment_incomplete, expected_task_id_count,
-    make_replica_request, node_is_down, should_restart_missing_slot_immediately,
-    task_age_allows_cleanup, task_age_allows_rebalance, task_state_healthy,
-    task_state_rebalanceable,
+    is_local_volume_unavailable_error, make_replica_request,
+    mounted_local_volumes_require_pinned_target, node_is_down,
+    should_restart_missing_slot_immediately, task_age_allows_cleanup, task_age_allows_rebalance,
+    task_state_healthy, task_state_rebalanceable,
 };
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
 use crate::task::types::TaskSpec;
@@ -71,6 +72,10 @@ impl ServiceController {
             };
             node_is_down(task.node_id, health_snapshot) || !task_state_healthy(&task.state)
         });
+
+        if spec.status() == ServiceStatus::VolumeUnavailable && !service_degraded {
+            self.restore_volume_available_service(&spec).await?;
+        }
 
         self.reconcile_extra_tasks(&spec, &service_tasks, eligible_nodes)
             .await;
@@ -271,7 +276,7 @@ impl ServiceController {
         Ok(())
     }
 
-    /// Starts or restarts a replica slot on the preferred node, falling back if placement fails.
+    /// Starts or restarts a replica slot on the preferred node, falling back only when safe.
     async fn start_slot_task(
         &self,
         spec: &ServiceSpecValue,
@@ -280,6 +285,15 @@ impl ServiceController {
         preferred_node: Option<Uuid>,
         key: &SlotKey,
     ) -> anyhow::Result<()> {
+        let requires_pinned_target = mounted_local_volumes_require_pinned_target(
+            &self.volume_registry,
+            &slot.template.volumes,
+        )?;
+        if preferred_node.is_none() && requires_pinned_target {
+            self.mark_service_volume_unavailable(spec).await?;
+            return Ok(());
+        }
+
         if let Some(preferred_node) = preferred_node {
             let request = make_replica_request(
                 &spec.service_name,
@@ -312,6 +326,13 @@ impl ServiceController {
                     return Ok(());
                 }
                 Err(err) => {
+                    if requires_pinned_target {
+                        if is_local_volume_unavailable_error(&err) {
+                            self.mark_service_volume_unavailable(spec).await?;
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
                     tracing::debug!(
                         target: "services",
                         "preferred placement failed for '{}' replica {} on {}: {err}",
@@ -321,6 +342,10 @@ impl ServiceController {
                     );
                 }
             }
+        }
+
+        if requires_pinned_target {
+            return Ok(());
         }
 
         let fallback = make_replica_request(
@@ -356,6 +381,45 @@ impl ServiceController {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    /// Marks the current service generation as blocked on node-local volume availability.
+    async fn mark_service_volume_unavailable(&self, spec: &ServiceSpecValue) -> anyhow::Result<()> {
+        let Some(mut current) = self.registry.get(spec.id)? else {
+            return Ok(());
+        };
+        if current.manifest_id != spec.manifest_id {
+            return Ok(());
+        }
+        if current.status() == ServiceStatus::VolumeUnavailable {
+            return Ok(());
+        }
+        current.set_status(ServiceStatus::VolumeUnavailable);
+        self.apply_upsert(current.clone()).await?;
+        self.broadcast(crate::services::types::ServiceEvent::Upsert(current))
+            .await?;
+        Ok(())
+    }
+
+    /// Restores a service to `Running` once every desired task is healthy again.
+    async fn restore_volume_available_service(
+        &self,
+        spec: &ServiceSpecValue,
+    ) -> anyhow::Result<()> {
+        let Some(mut current) = self.registry.get(spec.id)? else {
+            return Ok(());
+        };
+        if current.manifest_id != spec.manifest_id {
+            return Ok(());
+        }
+        if current.status() != ServiceStatus::VolumeUnavailable {
+            return Ok(());
+        }
+        current.set_status(ServiceStatus::Running);
+        self.apply_upsert(current.clone()).await?;
+        self.broadcast(crate::services::types::ServiceEvent::Upsert(current))
+            .await?;
         Ok(())
     }
 

@@ -3678,7 +3678,9 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
         if let Ok(Some(spec)) = node.node.service_controller.registry().get(service_id) {
             match spec.status() {
                 ServiceStatus::Deploying => deploying_seen = true,
-                ServiceStatus::Running | ServiceStatus::Failed => {
+                ServiceStatus::Running
+                | ServiceStatus::Failed
+                | ServiceStatus::VolumeUnavailable => {
                     if deploying_seen {
                         terminal_seen = true;
                     }

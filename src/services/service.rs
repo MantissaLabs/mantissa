@@ -429,6 +429,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
 fn service_status_to_proto(status: ServiceStatus) -> protocol::services::ServiceStatus {
     match status {
         ServiceStatus::Deploying => protocol::services::ServiceStatus::Deploying,
+        ServiceStatus::VolumeUnavailable => protocol::services::ServiceStatus::VolumeUnavailable,
         ServiceStatus::Running => protocol::services::ServiceStatus::Running,
         ServiceStatus::Stopping => protocol::services::ServiceStatus::Stopping,
         ServiceStatus::Stopped => protocol::services::ServiceStatus::Stopped,
@@ -439,6 +440,7 @@ fn service_status_to_proto(status: ServiceStatus) -> protocol::services::Service
 fn proto_to_service_status(status: protocol::services::ServiceStatus) -> ServiceStatus {
     match status {
         protocol::services::ServiceStatus::Deploying => ServiceStatus::Deploying,
+        protocol::services::ServiceStatus::VolumeUnavailable => ServiceStatus::VolumeUnavailable,
         protocol::services::ServiceStatus::Running => ServiceStatus::Running,
         protocol::services::ServiceStatus::Stopping => ServiceStatus::Stopping,
         protocol::services::ServiceStatus::Stopped => ServiceStatus::Stopped,

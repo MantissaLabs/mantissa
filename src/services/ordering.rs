@@ -72,7 +72,10 @@ fn is_immediate_rollback_result(older: &ServiceSpecValue, newer: &ServiceSpecVal
         && newer.status == ServiceStatus::Deploying
         && matches!(
             older.status,
-            ServiceStatus::Running | ServiceStatus::Stopped | ServiceStatus::Failed
+            ServiceStatus::Running
+                | ServiceStatus::Stopped
+                | ServiceStatus::Failed
+                | ServiceStatus::VolumeUnavailable
         )
         && carries_rollout_history(older)
         && compare_timestamps(&older.updated_at, &newer.updated_at).is_gt()
@@ -128,7 +131,7 @@ fn compare_timestamps(left: &str, right: &str) -> Ordering {
 /// Ranks service status values for deterministic selection ordering.
 fn status_rank(status: ServiceStatus) -> u8 {
     match status {
-        ServiceStatus::Deploying | ServiceStatus::Failed => 0,
+        ServiceStatus::Deploying | ServiceStatus::Failed | ServiceStatus::VolumeUnavailable => 0,
         ServiceStatus::Running => 1,
         ServiceStatus::Stopping => 2,
         ServiceStatus::Stopped => 3,

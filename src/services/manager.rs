@@ -16,7 +16,8 @@ use crate::task::types::{
     TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec, TaskStateFilter,
     TaskVolumeMount,
 };
-use crate::volumes::VolumeRegistry;
+use crate::volumes::types::VolumeDriver;
+use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -596,6 +597,8 @@ impl ServiceController {
             service_name,
             requests.len()
         );
+        let desired_task_ids: Vec<Uuid> =
+            requests.iter().filter_map(|request| request.id).collect();
 
         let task_specs = match self
             .start_tasks_with_fallback(requests, &format!("service '{}' deployment", service_name))
@@ -611,11 +614,58 @@ impl ServiceController {
 
                 let service_id = compute_service_id(&service_name);
                 match self.registry.get(service_id) {
+                    Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(&err) => {
+                        persisted_spec.task_ids = desired_task_ids.clone();
+                        persisted_spec.set_rollout(ServiceRolloutState::default());
+                        persisted_spec.set_status(ServiceStatus::VolumeUnavailable);
+                        if let Err(upsert_err) = self.apply_upsert(persisted_spec.clone()).await {
+                            tracing::warn!(
+                                target: "services",
+                                "failed to persist volume-unavailable state for '{}': {upsert_err}",
+                                service_name
+                            );
+                        } else if let Err(broadcast_err) =
+                            self.broadcast(ServiceEvent::Upsert(persisted_spec)).await
+                        {
+                            tracing::warn!(
+                                target: "services",
+                                "failed to broadcast volume-unavailable state for '{}': {broadcast_err}",
+                                service_name
+                            );
+                        }
+                    }
                     Ok(Some(persisted_spec)) => {
                         let controller = self.clone();
                         tokio::task::spawn_local(async move {
                             controller.await_service_readiness(persisted_spec).await;
                         });
+                    }
+                    Ok(None) if is_local_volume_unavailable_error(&err) => {
+                        let mut blocked_spec = ServiceSpecValue::new(
+                            manifest_id,
+                            manifest_name.clone(),
+                            service_name.clone(),
+                            templates.clone(),
+                            desired_task_ids,
+                        );
+                        blocked_spec.update_strategy = update_strategy.clone();
+                        blocked_spec.set_rollout(ServiceRolloutState::default());
+                        blocked_spec.set_status(ServiceStatus::VolumeUnavailable);
+                        if let Err(upsert_err) = self.apply_upsert(blocked_spec.clone()).await {
+                            tracing::warn!(
+                                target: "services",
+                                "failed to persist fallback volume-unavailable state for '{}': {upsert_err}",
+                                service_name
+                            );
+                        } else if let Err(broadcast_err) =
+                            self.broadcast(ServiceEvent::Upsert(blocked_spec)).await
+                        {
+                            tracing::warn!(
+                                target: "services",
+                                "failed to broadcast fallback volume-unavailable state for '{}': {broadcast_err}",
+                                service_name
+                            );
+                        }
                     }
                     Ok(None) => {
                         tracing::warn!(
@@ -849,8 +899,20 @@ impl ServiceController {
         }
 
         let has_targets = requests.iter().any(|request| request.target_node.is_some());
+        let requires_pinned_targets = if has_targets {
+            requests_require_pinned_targets(&self.volume_registry, &requests)?
+        } else {
+            false
+        };
         match self.task_manager.start_tasks_batch(requests.clone()).await {
             Ok(specs) => Ok(specs),
+            Err(err) if has_targets && requires_pinned_targets => {
+                tracing::warn!(
+                    target: "services",
+                    "pinned placement failed for {context}; bound local volumes disable fallback retries: {err:#}"
+                );
+                Err(err)
+            }
             Err(err) if has_targets => {
                 tracing::warn!(
                     target: "services",
@@ -1153,7 +1215,10 @@ fn node_is_down(node_id: Uuid, health_snapshot: &HashMap<Uuid, HealthStatus>) ->
 
 /// Returns true when the service status should participate in slot reconciliation.
 fn should_reconcile_status(status: ServiceStatus) -> bool {
-    matches!(status, ServiceStatus::Running | ServiceStatus::Deploying)
+    matches!(
+        status,
+        ServiceStatus::Running | ServiceStatus::Deploying | ServiceStatus::VolumeUnavailable
+    )
 }
 
 /// Returns true when deployment should bypass missing-slot grace and restart immediately.
@@ -1308,6 +1373,45 @@ fn resolve_template_volume_target(
     Ok(bound_node)
 }
 
+/// Returns true when the mount list includes a bound node-local volume that cannot safely fall back.
+pub(super) fn mounted_local_volumes_require_pinned_target(
+    volume_registry: &VolumeRegistry,
+    mounts: &[TaskVolumeMount],
+) -> anyhow::Result<bool> {
+    for mount in mounts {
+        let spec = volume_registry.get_spec(mount.volume_id)?.ok_or_else(|| {
+            anyhow!(
+                "unknown volume '{}' ({})",
+                mount.volume_name,
+                mount.volume_id
+            )
+        })?;
+        if spec.bound_node_id.is_some() && matches!(spec.driver, VolumeDriver::Local(_)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Returns true when any task request in the batch must preserve its explicit node target.
+fn requests_require_pinned_targets(
+    volume_registry: &VolumeRegistry,
+    requests: &[TaskStartRequest],
+) -> anyhow::Result<bool> {
+    for request in requests {
+        if mounted_local_volumes_require_pinned_target(volume_registry, &request.volumes)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Returns true when the error chain represents a recoverable node-local volume availability issue.
+pub(super) fn is_local_volume_unavailable_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.is::<LocalVolumeAccessError>())
+}
+
 /// Computes the ordered task identifiers for the manifest by iterating template/replica pairs.
 fn order_task_ids(
     service_name: &str,
@@ -1457,8 +1561,96 @@ fn should_stop_tasks(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecV
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
     use crate::task::types::TaskServiceMetadata;
+    use crate::volumes::types::{
+        LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+        VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
+    };
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    struct TestVolumeRegistry {
+        registry: VolumeRegistry,
+        _dir: TempDir,
+    }
+
+    /// Builds one isolated volume registry backed by temporary stores.
+    async fn make_test_volume_registry() -> TestVolumeRegistry {
+        let dir = tempfile::tempdir().expect("create volume tempdir");
+        let db_path = dir.path().join("volumes.redb");
+        let db = Arc::new(redb::Database::create(db_path).expect("create volume db"));
+        let actor = Uuid::new_v4();
+        let spec_store = open_volume_spec_store(db.clone(), actor).expect("open volume spec store");
+        spec_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild volume spec store");
+        let node_store = open_volume_node_store(db, actor).expect("open volume node store");
+        node_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild volume node store");
+        TestVolumeRegistry {
+            registry: VolumeRegistry::new(spec_store, node_store),
+            _dir: dir,
+        }
+    }
+
+    /// Builds one simple local volume spec for fallback-policy tests.
+    fn make_local_volume_spec(name: &str, bound_node_id: Option<Uuid>) -> VolumeSpecValue {
+        VolumeSpecValue::new(VolumeSpecDraft {
+            name: name.to_string(),
+            driver: VolumeDriver::Local(LocalVolumeSpec {
+                source: LocalVolumeSource::Managed,
+            }),
+            access_mode: VolumeAccessMode::ReadWriteOnce,
+            binding_mode: if bound_node_id.is_some() {
+                VolumeBindingMode::Immediate
+            } else {
+                VolumeBindingMode::WaitForFirstConsumer
+            },
+            reclaim_policy: VolumeReclaimPolicy::Retain,
+            requested_bytes: None,
+            labels: Vec::new(),
+            bound_node_id,
+            bound_node_name: bound_node_id.map(|_| "node-a".to_string()),
+        })
+    }
+
+    /// Builds one minimal task start request that mounts exactly one volume.
+    fn make_volume_request(
+        volume_id: Uuid,
+        volume_name: &str,
+        target_node: Option<Uuid>,
+    ) -> TaskStartRequest {
+        TaskStartRequest {
+            name: "demo-task".to_string(),
+            image: "ghcr.io/demo/app:latest".to_string(),
+            command: Vec::new(),
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            gpu_device_ids: Vec::new(),
+            id: Some(Uuid::new_v4()),
+            slot_ids: Vec::new(),
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: vec![TaskVolumeMount {
+                volume_id,
+                volume_name: volume_name.to_string(),
+                target: "/var/lib/app".to_string(),
+                read_only: false,
+            }],
+            networks: Vec::new(),
+            service_metadata: None,
+            target_node,
+        }
+    }
 
     /// Builds a minimal task spec for reschedule planning tests.
     #[allow(dead_code)]
@@ -2281,5 +2473,43 @@ mod tests {
         let mut running = complete.clone();
         running.set_status(ServiceStatus::Running);
         assert!(!deploying_assignment_incomplete(&running));
+    }
+
+    /// Bound local volumes must keep their explicit placement target during fallback handling.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bound_local_volume_requests_disable_target_fallback() {
+        let test_registry = make_test_volume_registry().await;
+        let bound_node_id = Uuid::new_v4();
+        let volume = make_local_volume_spec("pgdata", Some(bound_node_id));
+        test_registry
+            .registry
+            .upsert_spec(volume.clone())
+            .await
+            .expect("persist volume spec");
+
+        let request = make_volume_request(volume.id, &volume.name, Some(bound_node_id));
+        let requires_pinned = requests_require_pinned_targets(&test_registry.registry, &[request])
+            .expect("evaluate fallback policy");
+
+        assert!(requires_pinned);
+    }
+
+    /// Unbound local volumes may still use the generic target-clearing fallback path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unbound_local_volume_requests_allow_target_fallback() {
+        let test_registry = make_test_volume_registry().await;
+        let target_node = Uuid::new_v4();
+        let volume = make_local_volume_spec("cache", None);
+        test_registry
+            .registry
+            .upsert_spec(volume.clone())
+            .await
+            .expect("persist volume spec");
+
+        let request = make_volume_request(volume.id, &volume.name, Some(target_node));
+        let requires_pinned = requests_require_pinned_targets(&test_registry.registry, &[request])
+            .expect("evaluate fallback policy");
+
+        assert!(!requires_pinned);
     }
 }

@@ -303,6 +303,7 @@ pub enum ServiceEvent {
 #[serde(rename_all = "snake_case")]
 pub enum ServiceStatus {
     Deploying,
+    VolumeUnavailable,
     #[default]
     Running,
     Stopping,

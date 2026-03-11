@@ -6,6 +6,7 @@ pub enum ContainerState {
     Pending,
     Pulling,
     Creating,
+    VolumeUnavailable,
     Running,
     Paused,
     Stopping,

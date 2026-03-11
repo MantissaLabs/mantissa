@@ -283,6 +283,7 @@ pub(super) fn classify_readiness_states(
             Some(ContainerState::Pending)
             | Some(ContainerState::Pulling)
             | Some(ContainerState::Creating)
+            | Some(ContainerState::VolumeUnavailable)
             | None => {
                 any_inflight = true;
             }
@@ -339,7 +340,10 @@ async fn poll_service_attempt(
 
         match current.status() {
             ServiceStatus::Running => return ReadinessOutcome::Success(current),
-            ServiceStatus::Stopping | ServiceStatus::Stopped | ServiceStatus::Failed => {
+            ServiceStatus::Stopping
+            | ServiceStatus::Stopped
+            | ServiceStatus::Failed
+            | ServiceStatus::VolumeUnavailable => {
                 tracing::debug!(
                     target: "services",
                     "readiness wait aborted for '{}' due to status {:?}",
@@ -616,6 +620,7 @@ fn format_task_state_summary(states: &[(Uuid, Option<ContainerState>)]) -> Strin
             Some(ContainerState::Pending) => "pending".to_string(),
             Some(ContainerState::Pulling) => "pulling".to_string(),
             Some(ContainerState::Creating) => "creating".to_string(),
+            Some(ContainerState::VolumeUnavailable) => "volume_unavailable".to_string(),
             Some(ContainerState::Running) => "running".to_string(),
             Some(ContainerState::Paused) => "paused".to_string(),
             Some(ContainerState::Stopping) => "stopping".to_string(),

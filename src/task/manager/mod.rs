@@ -105,6 +105,7 @@ pub struct TaskManager {
     forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
     runtime_config: TaskRuntimeConfig,
     local_volume_root: PathBuf,
+    enforce_local_volume_capacity: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +156,7 @@ pub struct TaskManagerConfig {
     pub attachment_override: Option<Arc<dyn AttachmentProvisionerApi>>,
     pub runtime_config: Option<TaskRuntimeConfig>,
     pub local_volume_root: PathBuf,
+    pub enforce_local_volume_capacity: bool,
 }
 
 impl TaskManager {
@@ -176,6 +178,7 @@ impl TaskManager {
             attachment_override,
             runtime_config,
             local_volume_root,
+            enforce_local_volume_capacity,
         } = config;
         let secret_runtime_root = resolve_secret_runtime_root(local_node_id);
 
@@ -219,6 +222,7 @@ impl TaskManager {
             forwarding_events,
             runtime_config: runtime_config.unwrap_or_default(),
             local_volume_root,
+            enforce_local_volume_capacity,
         }
     }
 
@@ -1110,6 +1114,7 @@ fn task_state_rank(state: &ContainerState) -> u8 {
         ContainerState::Running => 6,
         ContainerState::Creating => 5,
         ContainerState::Pulling => 5,
+        ContainerState::VolumeUnavailable => 4,
         ContainerState::Pending => 4,
         ContainerState::Stopping => 3,
         ContainerState::Stopped => 2,

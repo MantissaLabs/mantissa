@@ -302,6 +302,7 @@ fn task_state_rank(state: &ContainerState) -> u8 {
         ContainerState::Running => 6,
         ContainerState::Creating => 5,
         ContainerState::Pulling => 5,
+        ContainerState::VolumeUnavailable => 4,
         ContainerState::Pending => 4,
         ContainerState::Stopping => 3,
         ContainerState::Stopped => 2,

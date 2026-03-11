@@ -12,6 +12,7 @@ use crate::task::types::{TaskEvent, TaskSpec};
 use super::TaskManager;
 use super::launch::ContainerLaunchRequest;
 use super::planner::BatchStartPlan;
+use super::state::is_local_volume_access_error;
 
 impl TaskManager {
     /// Starts every local container in the batch and persists their specs in index order.
@@ -37,7 +38,12 @@ impl TaskManager {
 
         if let Err(err) = self.launch_batch_containers(plans).await {
             self.cleanup_batch(plans).await;
-            self.rollback_pending_specs(&pending_specs).await;
+            if is_local_volume_access_error(&err) {
+                self.persist_pending_volume_unavailable_specs(&pending_specs, &err)
+                    .await;
+            } else {
+                self.rollback_pending_specs(&pending_specs).await;
+            }
             return Err(err);
         }
 
@@ -150,6 +156,43 @@ impl TaskManager {
                     target: "task",
                     "failed to rollback pending task {}: {err}",
                     spec.id
+                );
+            }
+        }
+    }
+
+    /// Persists recoverable volume-blocked state for pending specs so reconciliation can retry.
+    async fn persist_pending_volume_unavailable_specs(
+        &self,
+        specs: &[TaskSpec],
+        error: &anyhow::Error,
+    ) {
+        let reason = error.to_string();
+        for spec in specs {
+            let mut blocked = spec.clone();
+            blocked.phase_version = blocked.phase_version.saturating_add(1);
+            blocked.state = ContainerState::VolumeUnavailable;
+            blocked.phase_reason = Some(reason.clone());
+            blocked.phase_progress = None;
+            blocked.slot_ids.clear();
+            blocked.slot_id = None;
+            blocked.updated_at = Utc::now().to_rfc3339();
+            if let Err(err) = self.persist_spec(&blocked).await {
+                warn!(
+                    target: "task",
+                    "failed to persist volume-unavailable state for pending task {}: {err}",
+                    blocked.id
+                );
+                continue;
+            }
+            if let Err(err) = self
+                .enqueue_gossip(TaskEvent::Upsert(Box::new(blocked.clone())))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to broadcast volume-unavailable state for pending task {}: {err}",
+                    blocked.id
                 );
             }
         }

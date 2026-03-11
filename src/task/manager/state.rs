@@ -21,6 +21,7 @@ use crate::task::docker::{ContainerError, ContainerInfo};
 use crate::task::types::{
     TaskEvent, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec, TaskValue,
 };
+use crate::volumes::LocalVolumeAccessError;
 
 use super::{
     TaskManager, container_remove_in_progress, launch::ContainerLaunchRequest,
@@ -1069,6 +1070,111 @@ impl TaskManager {
         error
     }
 
+    /// Marks a task as blocked on local volume availability and frees any resources it owned.
+    pub(super) async fn mark_task_volume_unavailable(
+        &self,
+        mut spec: TaskSpec,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let task_id = spec.id;
+        let reason = error.to_string();
+        warn!(
+            target: "task",
+            error = %error,
+            error_chain = %format!("{error:#}"),
+            task = %spec.name,
+            task_id = %task_id,
+            "marking task as volume unavailable"
+        );
+
+        let container_id = {
+            let mut guard = self.local_containers.lock().await;
+            guard.remove(&task_id)
+        };
+        if let Some(container_id) = container_id {
+            self.rollback_container_launch(&container_id, "volume unavailable")
+                .await;
+        }
+
+        self.cleanup_secret_artifacts(task_id).await;
+        if let Err(err) = self.unpublish_task_volume_mounts(&spec).await {
+            warn!(
+                target: "task",
+                task = %task_id,
+                "failed to unpublish local volume mounts after volume block: {err:#}"
+            );
+        }
+
+        if let Err(err) = self
+            .teardown_runtime_attachments(task_id, HashSet::new(), false)
+            .await
+        {
+            warn!(
+                target: "task",
+                "failed to teardown attachments after volume block of {}: {err}",
+                task_id
+            );
+        }
+
+        if !spec.slot_ids.is_empty() {
+            for slot_id in &spec.slot_ids {
+                if let Err(err) = self.release_slot(*slot_id).await {
+                    warn!(
+                        target: "task",
+                        "failed to release slot {} after volume block of {}: {err}",
+                        slot_id,
+                        task_id
+                    );
+                }
+            }
+            spec.slot_ids.clear();
+            spec.slot_id = None;
+        }
+
+        if let Ok(current) = self.load_spec(task_id).await {
+            if matches!(current.state, ContainerState::VolumeUnavailable)
+                && current.phase_reason.as_deref() == Some(reason.as_str())
+            {
+                return error;
+            }
+            if current.phase_version > spec.phase_version {
+                spec.phase_version = current.phase_version;
+            }
+            if current.launch_attempt > spec.launch_attempt {
+                spec.launch_attempt = current.launch_attempt;
+            }
+            if spec.last_terminal_observed_launch.is_none() {
+                spec.last_terminal_observed_launch = current.last_terminal_observed_launch;
+            }
+        }
+
+        spec.phase_version = spec.phase_version.saturating_add(1);
+        spec.state = ContainerState::VolumeUnavailable;
+        spec.phase_reason = Some(reason);
+        spec.phase_progress = None;
+        spec.updated_at = Utc::now().to_rfc3339();
+
+        if let Err(err) = self.persist_spec(&spec).await {
+            warn!(
+                target: "task",
+                "failed to persist volume-unavailable state for task {}: {err}",
+                task_id
+            );
+        } else if let Err(err) = self
+            .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+            .await
+        {
+            warn!(
+                target: "task",
+                "failed to broadcast volume-unavailable state for task {}: {err}",
+                task_id
+            );
+        }
+
+        self.cleanup_orphaned_slots().await;
+        error
+    }
+
     pub(super) async fn resolve_dns_servers(
         &self,
         network_ids: &[Uuid],
@@ -1217,6 +1323,14 @@ impl TaskManager {
         if working.node_id != self.local_node_id {
             return Ok(());
         }
+        if let Err(err) = self.ensure_task_volumes_accessible(&working.volumes).await {
+            let err = if is_local_volume_access_error(&err) {
+                self.mark_task_volume_unavailable(working, err).await
+            } else {
+                self.mark_task_failed(working, err).await
+            };
+            return Err(err);
+        }
         if self.reconcile_recorded_running_task(&mut working).await? {
             return Ok(());
         }
@@ -1266,6 +1380,14 @@ impl TaskManager {
             );
             let _ = self.mark_task_failed(working, reason).await;
             return Ok(());
+        }
+        if let Err(err) = self.ensure_task_volumes_accessible(&working.volumes).await {
+            let err = if is_local_volume_access_error(&err) {
+                self.mark_task_volume_unavailable(working, err).await
+            } else {
+                self.mark_task_failed(working, err).await
+            };
+            return Err(err);
         }
         // Re-check after pull because phase updates and concurrent CRDT writes may have changed
         // the persisted assignment while the image was downloading.
@@ -1658,9 +1780,10 @@ impl TaskManager {
     /// Reconciles the desired state of a locally owned task with the actual container state.
     pub(super) async fn reconcile_local_task(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
         match spec.state {
-            ContainerState::Pending | ContainerState::Pulling | ContainerState::Creating => {
-                self.ensure_task_running(spec).await
-            }
+            ContainerState::Pending
+            | ContainerState::Pulling
+            | ContainerState::Creating
+            | ContainerState::VolumeUnavailable => self.ensure_task_running(spec).await,
             ContainerState::Running => self.ensure_task_running(spec).await,
             ContainerState::Stopping | ContainerState::Stopped => {
                 self.ensure_task_stopped(spec).await
@@ -2485,6 +2608,12 @@ impl TaskManager {
     }
 }
 
+/// Returns true when the error chain represents a recoverable local-volume access problem.
+pub(super) fn is_local_volume_access_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.is::<LocalVolumeAccessError>())
+}
+
 /// Returns true when a task value has been updated within the provided grace window.
 fn task_value_recent(value: &TaskValue, grace_secs: i64) -> bool {
     let anchor = chrono::DateTime::parse_from_rfc3339(&value.updated_at)
@@ -2575,7 +2704,7 @@ fn conflict_state_rank(state: &ContainerState) -> u8 {
     match state {
         ContainerState::Running | ContainerState::Paused => 4,
         ContainerState::Creating | ContainerState::Pulling => 3,
-        ContainerState::Pending => 2,
+        ContainerState::VolumeUnavailable | ContainerState::Pending => 2,
         ContainerState::Stopping => 1,
         ContainerState::Stopped
         | ContainerState::Failed

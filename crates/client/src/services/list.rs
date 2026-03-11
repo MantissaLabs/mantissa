@@ -197,6 +197,7 @@ impl ServiceTaskRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServiceStatusRow {
     Deploying,
+    VolumeUnavailable,
     Running,
     Stopping,
     Stopped,
@@ -208,6 +209,7 @@ impl ServiceStatusRow {
     fn from_proto(status: ProtoServiceStatus) -> Self {
         match status {
             ProtoServiceStatus::Deploying => Self::Deploying,
+            ProtoServiceStatus::VolumeUnavailable => Self::VolumeUnavailable,
             ProtoServiceStatus::Running => Self::Running,
             ProtoServiceStatus::Stopping => Self::Stopping,
             ProtoServiceStatus::Stopped => Self::Stopped,
@@ -220,6 +222,7 @@ impl std::fmt::Display for ServiceStatusRow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self {
             ServiceStatusRow::Deploying => "deploying",
+            ServiceStatusRow::VolumeUnavailable => "volume_unavailable",
             ServiceStatusRow::Running => "running",
             ServiceStatusRow::Stopping => "stopping",
             ServiceStatusRow::Stopped => "stopped",

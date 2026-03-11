@@ -205,25 +205,28 @@ enum TaskStateFilter {
   creating @1;
   # Task is being created.
 
-  running @2;
+  volumeUnavailable @2;
+  # Task is blocked on one or more node-local volumes.
+
+  running @3;
   # Task is running.
 
-  stopping @3;
+  stopping @4;
   # Task is stopping.
 
-  paused @4;
+  paused @5;
   # Task is paused.
 
-  stopped @5;
+  stopped @6;
   # Task is stopped.
 
-  failed @6;
+  failed @7;
   # Task failed.
 
-  exited @7;
+  exited @8;
   # Task exited normally.
 
-  unknown @8;
+  unknown @9;
   # Unknown task state.
 }
 
