@@ -1,0 +1,74 @@
+(
+    name: "postgres-local-volume",
+    volumes: [
+        (
+            name: "pgdata",
+            driver: local((
+                source: managed,
+            )),
+            access_mode: read_write_once,
+            binding_mode: wait_for_first_consumer,
+            reclaim_policy: retain,
+            capacity_mb: Some(10240),
+            labels: [
+                (
+                    key: "app",
+                    value: "postgres-local-volume",
+                ),
+            ],
+        ),
+    ],
+    tasks: [
+        (
+            name: "db",
+            image: "postgres:16-alpine",
+            command: [
+                "postgres",
+                "-c",
+                "listen_addresses=*",
+            ],
+            replicas: 1,
+            resources: (
+                cpu_millis: 500,
+                memory_mb: 512,
+            ),
+            restart_policy: Some((
+                name: unless_stopped,
+                max_retry_count: None,
+            )),
+            termination_grace_period_secs: Some(60),
+            env: [
+                (
+                    name: "POSTGRES_DB",
+                    value: Some("app"),
+                    secret: None,
+                ),
+                (
+                    name: "POSTGRES_USER",
+                    value: Some("mantissa"),
+                    secret: None,
+                ),
+                (
+                    name: "POSTGRES_PASSWORD",
+                    value: Some("mantissa-dev-password"),
+                    secret: None,
+                ),
+                (
+                    name: "PGDATA",
+                    value: Some("/var/lib/postgresql/data/pgdata"),
+                    secret: None,
+                ),
+            ],
+            secret_files: [],
+            volumes: [
+                (
+                    source: "pgdata",
+                    target: "/var/lib/postgresql/data",
+                    read_only: false,
+                ),
+            ],
+            networks: ["postgres-demo"],
+            public_port: Some(5432),
+        ),
+    ],
+)

@@ -665,6 +665,33 @@ mod tests {
     }
 
     #[test]
+    fn postgres_local_volume_example_manifest_loads() {
+        let manifest = load_manifest_from_path(&example_manifest("postgresql_local_volume.ron"))
+            .expect("manifest");
+
+        assert_eq!(manifest.name, "postgres-local-volume");
+        assert_eq!(manifest.volumes.len(), 1);
+        assert_eq!(manifest.tasks.len(), 1);
+        assert_eq!(manifest.volumes[0].name, "pgdata");
+        assert_eq!(manifest.tasks[0].name, "db");
+        assert_eq!(manifest.tasks[0].replicas, 1);
+        assert_eq!(manifest.tasks[0].public_port, Some(5432));
+        assert_eq!(manifest.tasks[0].networks, vec!["postgres-demo"]);
+        assert_eq!(manifest.tasks[0].volumes.len(), 1);
+        assert_eq!(manifest.tasks[0].volumes[0].source, "pgdata");
+        assert_eq!(
+            manifest.tasks[0].volumes[0].target,
+            "/var/lib/postgresql/data"
+        );
+        assert!(matches!(
+            manifest.volumes[0].driver,
+            VolumeDriver::Local(LocalVolumeSpec {
+                source: LocalVolumeSource::Managed
+            })
+        ));
+    }
+
+    #[test]
     fn manifest_rejects_empty_pre_stop_command() {
         let manifest = ServiceManifest {
             name: "demo".into(),

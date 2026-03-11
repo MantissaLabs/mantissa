@@ -5,22 +5,24 @@ set -euo pipefail
 COUNT=2
 REPO="${HOME}/dev/mantissa"   # host path to the mantissa repo (mounted at /mantissa)
 ARCH="aarch64"
-CPUS=8
-MEM="16GiB"
+CPUS=10
+MEM="24GiB"
 DISK="100GiB"
 SSH_BASE=7200
 IMAGE_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2"
 CREATED_COUNT=0
 SKIPPED_COUNT=0
+LIMA_ENABLE_VZNAT="${LIMA_ENABLE_VZNAT:-0}"
 
 usage() {
   cat >&2 <<USAGE
 Usage: $0 [-n COUNT] [-r /abs/path/to/mantissa] [-P SSH_BASE] [-c CPUS] [-m MEM] [-d DISK]
-Defaults: COUNT=2, REPO=\$HOME/dev/mantissa, SSH_BASE=7200, CPUS=8, MEM=16GiB, DISK=100GiB
+Defaults: COUNT=2, REPO=\$HOME/dev/mantissa, SSH_BASE=7200, CPUS=10, MEM=24GiB, DISK=100GiB
 Notes:
-  - QEMU + aarch64 + mountType=9p.
+  - Prefers VZ + virtiofs on supported macOS hosts and falls back to QEMU + 9p otherwise.
   - Mounts "~" read-write, and mounts the repo at /mantissa inside each VM.
   - Enables shared VM <-> VM network (user-v2) so VMs can ping each other.
+  - Set LIMA_ENABLE_VZNAT=1 to add a secondary vzNAT interface on supported macOS hosts.
 Examples:
   $0 -n 3
   $0 -n 3 -r /Users/you/dev/mantissa
@@ -50,55 +52,101 @@ if [[ ! -d "$REPO" ]]; then
   exit 1
 fi
 
-# Returns success when the Lima instance directory is already present.
-# This keeps cluster setup idempotent when rerunning with a higher node count.
-vm_exists() {
-  local NAME="$1"
-  [[ -d "${HOME}/.lima/${NAME}" ]]
-}
+# Returns success when the current host can use Lima's VZ + virtiofs stack.
+#
+# Lima documents VZ as supported on macOS 13.0+ and uses it by default on
+# compatible macOS hosts. We keep the check local so the generated YAML stays
+# valid on Linux and older macOS releases.
+host_supports_vz_stack() {
+  local PRODUCT_VERSION
+  local MAJOR
+  local MINOR
+  local REST
 
-# Creates and provisions a single Lima VM for cluster use.
-# Existing instances are skipped so we only create missing nodes.
-start_vm() {
-  local NAME="$1" SSHPORT="$2" TMPYAML
-
-  if vm_exists "${NAME}"; then
-    echo "Skipping ${NAME}: instance already exists."
-    SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-    return 0
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    return 1
   fi
 
-  TMPYAML="$(mktemp -t "${NAME}.yaml.XXXXXX")"
+  PRODUCT_VERSION="$(sw_vers -productVersion 2>/dev/null || true)"
+  if [[ -z "${PRODUCT_VERSION}" ]]; then
+    return 1
+  fi
 
-  {
-    echo "# ${NAME}"
-    echo "arch: \"${ARCH}\""
-    echo "vmType: \"qemu\""
-    echo "cpus: ${CPUS}"
-    echo "memory: \"${MEM}\""
-    echo "disk: \"${DISK}\""
-    echo
-    echo "images:"
-    echo "  - location: \"${IMAGE_URL}\""
-    echo "    arch: \"${ARCH}\""
-    echo
-    # Shared network so VMs can ping each other
-    echo "networks:"
-    echo "  - lima: user-v2"
-    echo
-    echo "mountType: \"9p\""
-    echo "mounts:"
-    echo "  - location: \"~\""
-    echo "    writable: true"
-    echo "  - location: \"${REPO}\""
-    echo "    mountPoint: \"/mantissa\""
-    echo "    writable: true"
-    echo
-    echo "ssh:"
-    echo "  localPort: ${SSHPORT}"
-    echo
-    # Provision block (quoted heredoc -> no host-side $ expansion)
-    cat <<'PROVISION_1'
+  MAJOR="${PRODUCT_VERSION%%.*}"
+  MINOR=0
+  REST=""
+  if [[ "${PRODUCT_VERSION}" == *.* ]]; then
+    REST="${PRODUCT_VERSION#*.}"
+    MINOR="${REST%%.*}"
+  fi
+
+  if (( MAJOR > 13 )); then
+    return 0
+  fi
+  if (( MAJOR == 13 && MINOR >= 0 )); then
+    return 0
+  fi
+  return 1
+}
+
+# Writes the Lima instance YAML using the requested virtualization settings.
+#
+# user-v2 remains the primary network because Lima documents it as the
+# multi-node path for VM-to-VM communication. vzNAT is optional because it
+# changes routing behavior and should be an explicit choice.
+write_vm_yaml() {
+  local NAME
+  local SSHPORT
+  local VM_TYPE
+  local MOUNT_TYPE
+  local ENABLE_VZNAT
+  local DEST
+
+  NAME="$1"
+  SSHPORT="$2"
+  VM_TYPE="$3"
+  MOUNT_TYPE="$4"
+  ENABLE_VZNAT="$5"
+  DEST="$6"
+
+  cat > "${DEST}" <<EOF
+# ${NAME}
+arch: "${ARCH}"
+vmType: "${VM_TYPE}"
+cpus: ${CPUS}
+memory: "${MEM}"
+disk: "${DISK}"
+
+images:
+  - location: "${IMAGE_URL}"
+    arch: "${ARCH}"
+
+# Shared network so VMs can ping each other.
+networks:
+EOF
+
+  if [[ "${ENABLE_VZNAT}" == "1" ]]; then
+    printf '%s\n' '  - vzNAT: true' >> "${DEST}"
+  fi
+
+  cat >> "${DEST}" <<EOF
+  - lima: user-v2
+
+mountType: "${MOUNT_TYPE}"
+mounts:
+  - location: "~"
+    writable: true
+  - location: "${REPO}"
+    mountPoint: "/mantissa"
+    writable: true
+
+ssh:
+  localPort: ${SSHPORT}
+
+EOF
+
+  # Provision block (quoted heredoc -> no host-side $ expansion)
+  cat >> "${DEST}" <<'PROVISION_1'
 provision:
   - mode: user
     script: |
@@ -106,7 +154,7 @@ provision:
       sudo apt-get update && sudo apt-get upgrade -y
 
       # Install docker
-      sudo apt-get install -y ca-certificates curl build-essential git capnproto libcapnp-dev libssl-dev pkg-config iputils-ping linux-perf bpftool wireguard
+      sudo apt-get install -y ca-certificates curl build-essential git capnproto libcapnp-dev libssl-dev pkg-config iputils-ping linux-perf bpftool wireguard ripgrep htop
       sudo install -m 0755 -d /etc/apt/keyrings
       if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
         curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -200,14 +248,85 @@ provision:
         cargo install flamegraph
       fi
 PROVISION_1
-    # Separate step to set hostname with ${NAME} (needs host-side expansion)
-    echo "  - mode: user"
-    echo "    script: |"
-    echo "      set -euxo pipefail"
-    echo "      if command -v hostnamectl >/dev/null 2>&1; then sudo hostnamectl set-hostname ${NAME}; fi"
-  } > "${TMPYAML}"
 
-  echo "Starting ${NAME} (SSH port ${SSHPORT})…"
+  # Separate step to set hostname with ${NAME} (needs host-side expansion)
+  cat >> "${DEST}" <<EOF
+  - mode: user
+    script: |
+      set -euxo pipefail
+      if command -v hostnamectl >/dev/null 2>&1; then sudo hostnamectl set-hostname ${NAME}; fi
+EOF
+}
+
+# Validates one generated Lima YAML before we ask Lima to create the instance.
+#
+# This catches unsupported config keys or incompatible combinations early and
+# lets the script fall back to the conservative QEMU profile when needed.
+validate_vm_yaml() {
+  local YAML_PATH="$1"
+  if ! limactl validate --help >/dev/null 2>&1; then
+    echo "limactl validate is unavailable; skipping template validation." >&2
+    return 1
+  fi
+  limactl validate --fill "${YAML_PATH}" >/dev/null
+}
+
+# Returns success when the Lima instance directory is already present.
+# This keeps cluster setup idempotent when rerunning with a higher node count.
+vm_exists() {
+  local NAME="$1"
+  [[ -d "${HOME}/.lima/${NAME}" ]]
+}
+
+# Creates and provisions a single Lima VM for cluster use.
+# Existing instances are skipped so we only create missing nodes.
+start_vm() {
+  local NAME
+  local SSHPORT
+  local TMPYAML
+  local VM_TYPE
+  local MOUNT_TYPE
+  local ENABLE_VZNAT
+
+  NAME="$1"
+  SSHPORT="$2"
+
+  if vm_exists "${NAME}"; then
+    echo "Skipping ${NAME}: instance already exists."
+    SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+    return 0
+  fi
+
+  TMPYAML="$(mktemp -t "${NAME}.yaml.XXXXXX")"
+
+  if host_supports_vz_stack; then
+    VM_TYPE="vz"
+    MOUNT_TYPE="virtiofs"
+  else
+    VM_TYPE="qemu"
+    MOUNT_TYPE="9p"
+  fi
+
+  ENABLE_VZNAT=0
+  if [[ "${VM_TYPE}" == "vz" && "${LIMA_ENABLE_VZNAT}" == "1" ]]; then
+    ENABLE_VZNAT=1
+  fi
+
+  write_vm_yaml "${NAME}" "${SSHPORT}" "${VM_TYPE}" "${MOUNT_TYPE}" "${ENABLE_VZNAT}" "${TMPYAML}"
+  if ! validate_vm_yaml "${TMPYAML}"; then
+    if [[ "${VM_TYPE}" != "qemu" || "${MOUNT_TYPE}" != "9p" || "${ENABLE_VZNAT}" != "0" ]]; then
+      echo "Preferred Lima config for ${NAME} failed validation; falling back to qemu + 9p + user-v2." >&2
+      VM_TYPE="qemu"
+      MOUNT_TYPE="9p"
+      ENABLE_VZNAT=0
+      write_vm_yaml "${NAME}" "${SSHPORT}" "${VM_TYPE}" "${MOUNT_TYPE}" "${ENABLE_VZNAT}" "${TMPYAML}"
+      if ! validate_vm_yaml "${TMPYAML}"; then
+        echo "Generated fallback Lima config for ${NAME} could not be validated." >&2
+      fi
+    fi
+  fi
+
+  echo "Starting ${NAME} (SSH port ${SSHPORT}, vmType=${VM_TYPE}, mountType=${MOUNT_TYPE}, vzNAT=${ENABLE_VZNAT})..."
   limactl start --name="${NAME}" "${TMPYAML}"
   CREATED_COUNT=$((CREATED_COUNT + 1))
   rm -f "${TMPYAML}"
@@ -228,7 +347,7 @@ for i in $(seq 1 "${COUNT}"); do
 done
 
 echo
-echo "✅ Requested ${COUNT} VM(s): created ${CREATED_COUNT}, already present ${SKIPPED_COUNT}."
+echo "Requested ${COUNT} VM(s): created ${CREATED_COUNT}, already present ${SKIPPED_COUNT}."
 echo
 echo "SSH from host:"
 for i in $(seq 1 "${COUNT}"); do
