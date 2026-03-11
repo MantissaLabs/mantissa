@@ -246,6 +246,38 @@ async fn create_managed_volume(client: &volumes::Client, name: &str) -> Uuid {
     .await
 }
 
+/// Creates one managed local volume that is bound immediately to the selected node.
+async fn create_immediate_managed_volume_on_node(
+    client: &volumes::Client,
+    name: &str,
+    node_id: Uuid,
+    reclaim_policy: protocol::volumes::VolumeReclaimPolicy,
+) -> Uuid {
+    let mut request = client.create_request();
+    {
+        let mut inner = request.get().init_request();
+        inner.set_name(name);
+        let mut driver = inner.reborrow().init_driver();
+        let mut local = driver.reborrow().init_local();
+        local.set_source_kind(LocalVolumeSourceKind::Managed);
+        local.set_imported_path("");
+        inner.set_access_mode(protocol::volumes::VolumeAccessMode::ReadWriteOnce);
+        inner.set_binding_mode(protocol::volumes::VolumeBindingMode::Immediate);
+        inner.set_reclaim_policy(reclaim_policy);
+        inner.set_requested_bytes(0);
+        inner.set_bound_node_id(node_id.as_bytes());
+    }
+
+    let response = request.send().promise.await.expect("create volume send");
+    let reader = response.get().expect("create volume response");
+    let bytes = reader
+        .get_volume()
+        .expect("volume payload")
+        .get_id()
+        .expect("volume id");
+    Uuid::from_slice(bytes).expect("decode volume id")
+}
+
 async fn import_local_volume(
     client: &volumes::Client,
     name: &str,
@@ -576,7 +608,7 @@ local_test!(volumes_import_binds_immediately_to_selected_node, {
     fs::create_dir_all(&imported_path).expect("create imported path");
 
     let volume_id = import_local_volume(
-        &cluster[0].node.volumes_client,
+        &cluster[1].node.volumes_client,
         "pgdata-import",
         cluster[1].id(),
         imported_path.to_str().expect("imported path utf8"),
@@ -629,6 +661,50 @@ local_test!(volumes_import_binds_immediately_to_selected_node, {
         "imported path should be stored on the bound node row"
     );
     assert!(matches!(node_states[0].state, VolumeNodeState::Ready));
+});
+
+local_test!(volumes_import_requires_request_on_target_node, {
+    let cluster = TestNode::new_cluster_inproc_with_config(2, ClusterConfig::default())
+        .await
+        .expect("cluster");
+    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes").await;
+    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(10))
+        .await
+        .expect("peer roots should converge before remote import");
+    wait_for_pairwise_sessions(&cluster).await;
+
+    let temp_dir = tempdir().expect("tempdir");
+    let imported_path = temp_dir.path().join("remote-import-data");
+    fs::create_dir_all(&imported_path).expect("create imported path");
+
+    let mut request = cluster[0].node.volumes_client.import_request();
+    {
+        let mut inner = request.get().init_request();
+        inner.set_name("remote-import");
+        inner.set_node_id(cluster[1].id().as_bytes());
+        inner.set_path(imported_path.to_str().expect("imported path utf8"));
+        inner.set_requested_bytes(0);
+    }
+
+    let err = match request.send().promise.await {
+        Ok(_) => panic!("remote import should be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("must be executed on the target node"),
+        "unexpected remote import error: {err}"
+    );
+
+    assert!(
+        cluster[0]
+            .node
+            .volume_registry
+            .get_spec_by_name("remote-import")
+            .expect("volume lookup after failed import")
+            .is_none(),
+        "failed remote import should not persist a volume object"
+    );
 });
 
 local_test!(local_volume_wait_for_first_consumer_binds_on_first_start, {
@@ -828,7 +904,7 @@ local_test!(bound_local_volume_forces_scheduler_locality, {
     fs::create_dir_all(&imported_path).expect("create imported path");
 
     let volume_id = import_local_volume(
-        &cluster[0].node.volumes_client,
+        &cluster[1].node.volumes_client,
         "remote-volume",
         cluster[1].id(),
         imported_path.to_str().expect("imported path utf8"),
@@ -1007,6 +1083,89 @@ local_test!(volume_delete_delete_removes_managed_path, {
             .expect("volume lookup after delete reclaim")
             .is_none(),
         "volume spec should be removed after delete reclaim"
+    );
+});
+
+local_test!(volume_delete_delete_requires_owning_node, {
+    let cluster = TestNode::new_cluster_inproc_with_config(2, ClusterConfig::default())
+        .await
+        .expect("cluster");
+    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes").await;
+    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(10))
+        .await
+        .expect("peer roots should converge before remote delete");
+    wait_for_pairwise_sessions(&cluster).await;
+
+    let volume_id = create_immediate_managed_volume_on_node(
+        &cluster[0].node.volumes_client,
+        "remote-delete",
+        cluster[1].id(),
+        protocol::volumes::VolumeReclaimPolicy::Delete,
+    )
+    .await;
+
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || async {
+                match cluster[1]
+                    .node
+                    .volume_registry
+                    .get_node_state(volume_id, cluster[1].id())
+                {
+                    Ok(Some(state)) => state.local_path.is_some(),
+                    _ => false,
+                }
+            }
+        )
+        .await,
+        "owning node should realize managed local path before delete"
+    );
+
+    let mut request = cluster[0].node.volumes_client.delete_request();
+    request.get().set_selector("remote-delete");
+    let err = match request.send().promise.await {
+        Ok(_) => panic!("remote destructive delete should be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("must be executed on owning node"),
+        "unexpected remote delete error: {err}"
+    );
+
+    assert!(
+        cluster[0]
+            .node
+            .volume_registry
+            .get_spec(volume_id)
+            .expect("volume lookup after rejected delete")
+            .is_some(),
+        "rejected remote delete should leave the volume object intact"
+    );
+
+    let deleted = delete_volume(&cluster[1].node.volumes_client, "remote-delete").await;
+    assert!(
+        deleted.deleted_data,
+        "owning node delete should remove managed data"
+    );
+
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || async {
+                cluster.iter().all(|node| {
+                    node.node
+                        .volume_registry
+                        .get_spec(volume_id)
+                        .expect("volume lookup after owning-node delete")
+                        .is_none()
+                })
+            }
+        )
+        .await,
+        "owning node delete should remove the volume object cluster-wide"
     );
 });
 

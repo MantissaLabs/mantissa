@@ -84,6 +84,22 @@ impl VolumesRpc {
             .ok_or_else(|| Error::failed(format!("unknown node {node_id}")))?;
         Ok((node_id, peer.hostname))
     }
+
+    /// Rejects node-local mutations that are being attempted from a different node.
+    fn ensure_local_node_execution(
+        &self,
+        target_node_id: Uuid,
+        target_node_name: &str,
+        action: &str,
+    ) -> Result<(), Error> {
+        if target_node_id == self.topology.self_id() {
+            return Ok(());
+        }
+
+        Err(Error::failed(format!(
+            "{action} for node-local volumes must be executed on the target node; retry on node {target_node_name} ({target_node_id})"
+        )))
+    }
 }
 
 /// Converts one generic displayable error into a Cap'n Proto RPC error.
@@ -528,6 +544,9 @@ impl volumes::Server for VolumesRpc {
     }
 
     /// Imports one existing host path as a cluster-scoped volume object.
+    ///
+    /// Imported host paths are node-local state, so the request must run on the
+    /// node that actually hosts the path until remote driver execution exists.
     async fn import(
         self: Rc<Self>,
         params: volumes::ImportParams,
@@ -547,6 +566,9 @@ impl volumes::Server for VolumesRpc {
         }
 
         let node_id = read_uuid(request.get_node_id()?, "node id")?;
+        let (node_id, node_name) = self.resolve_bound_node(node_id)?;
+        self.ensure_local_node_execution(node_id, &node_name, "volume import")?;
+
         let path = Self::read_non_empty_text(request.get_path()?, "path")?;
         let import_path = Path::new(&path);
         if !import_path.is_absolute() {
@@ -565,7 +587,6 @@ impl volumes::Server for VolumesRpc {
             ));
         }
 
-        let (node_id, node_name) = self.resolve_bound_node(node_id)?;
         let requested_bytes = zero_means_none(request.get_requested_bytes());
         let labels = read_labels(request.get_labels()?)?;
         let driver = VolumeDriver::Local(LocalVolumeSpec {
@@ -614,6 +635,9 @@ impl volumes::Server for VolumesRpc {
     }
 
     /// Deletes one volume object by UUID or name when it has no active consumers.
+    ///
+    /// Reclaim=`delete` for managed local volumes is destructive node-local
+    /// work, so operators must execute it on the owning node.
     async fn delete(
         self: Rc<Self>,
         params: volumes::DeleteParams,
@@ -635,6 +659,27 @@ impl volumes::Server for VolumesRpc {
                 "volume '{}' is still in use on node {} by tasks {:?}",
                 spec.name, blocker.node_name, blocker.published_task_ids
             )));
+        }
+
+        if matches!(
+            (&spec.driver, spec.reclaim_policy),
+            (
+                VolumeDriver::Local(LocalVolumeSpec {
+                    source: LocalVolumeSource::Managed,
+                }),
+                VolumeReclaimPolicy::Delete,
+            )
+        ) {
+            let local_node_id = self.topology.self_id();
+            if let Some(owner) = node_states
+                .iter()
+                .find(|state| state.node_id != local_node_id)
+            {
+                return Err(Error::failed(format!(
+                    "destructive delete for managed local volume '{}' must be executed on owning node {} ({})",
+                    spec.name, owner.node_name, owner.node_id
+                )));
+            }
         }
 
         let mut deleted_data = false;

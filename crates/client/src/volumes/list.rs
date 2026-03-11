@@ -41,7 +41,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tDRIVER\tACCESS\tBINDING\tBOUND NODE\tSTATE\tCAPACITY\tIN USE\tRECLAIM\tREASON"
+        "ID\tNAME\tDRIVER\tACCESS\tBINDING\tBOUND NODE\tSTATE\tREQUESTED\tIN USE\tRECLAIM\tREASON"
     )?;
     for volume in volumes {
         writeln!(

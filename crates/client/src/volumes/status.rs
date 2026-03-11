@@ -35,7 +35,7 @@ pub async fn status(cfg: &ClientConfig, selector: &str) -> Result<()> {
     )?;
     writeln!(
         &mut rendered,
-        "  Capacity: {}",
+        "  Requested capacity: {}",
         format_bytes(volume.spec.requested_bytes)
     )?;
     writeln!(
@@ -66,7 +66,7 @@ pub async fn status(cfg: &ClientConfig, selector: &str) -> Result<()> {
             )?;
             writeln!(
                 &mut rendered,
-                "      Capacity: {}",
+                "      Requested capacity: {}",
                 format_bytes(state.capacity_bytes)
             )?;
             writeln!(

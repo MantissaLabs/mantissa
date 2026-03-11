@@ -39,7 +39,7 @@ pub async fn inspect(cfg: &ClientConfig, selector: &str) -> Result<()> {
     )?;
     writeln!(
         &mut rendered,
-        "  Capacity: {}",
+        "  Requested capacity: {}",
         format_bytes(volume.spec.requested_bytes)
     )?;
     writeln!(&mut rendered, "  Created: {}", volume.spec.created_at)?;
