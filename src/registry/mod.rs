@@ -712,6 +712,10 @@ impl Registry {
         }
     }
 
+    /// Resolves the Sync capability only when the peer session matches `expected_view`.
+    ///
+    /// View-scoped anti-entropy must not cross split boundaries, so any cached capability is
+    /// discarded as soon as its backing session reports a different active cluster view.
     pub async fn fetch_sync_capability(
         &self,
         peer_id: Uuid,
@@ -734,6 +738,7 @@ impl Registry {
                 match Self::session_matches_view(&session, expected_view).await {
                     Ok(true) => return Ok(Some(sync_cap)),
                     Ok(false) => {
+                        // Drop the cached handles so the next attempt re-dials with fresh scope.
                         self.invalidate_peer(peer_id, &entry).await;
                         return Ok(None);
                     }
@@ -1216,7 +1221,7 @@ impl Registry {
         resp.get()?.get_gossip()
     }
 
-    /// Returns whether the provided session is scoped to `expected_view`.
+    /// Reads the active cluster view advertised by one established cluster session.
     async fn session_cluster_view(
         session: &cluster_session::Client,
     ) -> Result<ClusterViewId, capnp::Error> {

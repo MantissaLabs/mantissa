@@ -922,6 +922,8 @@ impl Topology {
             self.sync.store_handle(handle);
         }
 
+        // Metadata sync runs on its own loop because it intentionally bypasses view scoping
+        // and only reconciles the lightweight `cluster_views` lineage domain.
         if self.metadata_sync.start_if_idle() {
             let this = self.clone();
             let handle = tokio::task::spawn_local(async move {
@@ -1330,6 +1332,10 @@ impl Topology {
         )
     }
 
+    /// Executes one view-scoped anti-entropy exchange against a selected peer.
+    ///
+    /// This is the main periodic reconciliation path. It only proceeds when the registry can
+    /// prove the peer session is scoped to the same active cluster view as the local node.
     async fn sync_with_peer(&self, entry: &PeerCacheEntry, cluster_view: ClusterViewId) {
         let peer_id = entry.peer_id;
         let value = entry.value.as_ref();
@@ -1462,6 +1468,9 @@ impl Topology {
     }
 
     /// Kick a one-shot sync pass immediately (no waiting for the next interval).
+    ///
+    /// This is used after joins and topology changes to reduce convergence latency before the
+    /// next scheduled background tick fires.
     pub fn sync_once_now(&self) {
         let topo = self.clone();
         tokio::task::spawn_local(async move {

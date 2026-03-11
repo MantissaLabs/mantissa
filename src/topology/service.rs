@@ -1552,6 +1552,8 @@ impl topology::Server for Topology {
             let cluster_view = self.active_cluster_view();
             let trace = sync_trace;
             async move {
+                // Bootstrap immediately from the anchor session so the join path does not wait
+                // for the next periodic tick before the new node has a converged view.
                 sync_all_domains(stores, sync_cap, cluster_view, Some(trace)).await;
             }
         });

@@ -1,6 +1,8 @@
+//! Helpers for converting MST page summaries to and from the sync protocol wire format.
+
 use crdt_store::PageDigestRange;
 
-/// Fill a capnp builder from a slice of page digest ranges.
+/// Encodes one page-summary slice into the Cap'n Proto representation used by sync RPCs.
 pub fn capnp_fill_ranges(
     ranges: &[PageDigestRange],
     mut out: protocol::sync::page_range_summary::Builder,
@@ -15,7 +17,7 @@ pub fn capnp_fill_ranges(
     Ok(())
 }
 
-/// Parse page digest ranges from a capnp reader.
+/// Decodes a Cap'n Proto page summary back into the store-facing range type.
 pub fn page_ranges_from_capnp(
     reader: protocol::sync::page_range_summary::Reader,
 ) -> Result<Vec<PageDigestRange>, capnp::Error> {

@@ -150,21 +150,23 @@ interface DeltaSink {
 
 interface Sync {
   getRoots @0 () -> (roots :List(DomainRoot));
-  # Fetch root hashes for all domains.
+  # Legacy unscoped roots RPC. Runtime rejects this and callers must use
+  # getRootsForView so anti-entropy stays inside one explicit cluster view.
 
   getRanges @1 (domains :List(Domain)) -> (ranges :List(DomainRangeSummary));
-  # Fetch range summaries for selected domains.
+  # Legacy unscoped ranges RPC kept only to preserve protocol numbering.
 
   # Client passes per-domain ranges it wants, and a DeltaSink it implements locally.
   # Server streams domain-tagged chunks into that sink and calls end() when done.
   openDelta @2 (wants :List(DomainWant), sink :DeltaSink);
+  # Legacy unscoped delta RPC kept only to preserve protocol numbering.
 
   getRootsForView @3 (req :ViewRequest) -> (roots :List(DomainRoot));
-  # Fetch root hashes for all domains for a specific cluster view.
+  # Phase 1 of anti-entropy: fetch per-domain MST roots for one explicit view.
 
   getRangesForView @4 (req :ViewRangesRequest) -> (ranges :List(DomainRangeSummary));
-  # Fetch range summaries for selected domains for a specific cluster view.
+  # Phase 2 of anti-entropy: fetch digest summaries only for domains whose roots differ.
 
   openDeltaForView @5 (req :ViewOpenDeltaRequest);
-  # Open a delta stream scoped to a specific cluster view.
+  # Phase 3 of anti-entropy: stream only the ranges the requester proved it is missing.
 }

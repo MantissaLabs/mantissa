@@ -1,3 +1,9 @@
+//! Client side of Mantissa's anti-entropy protocol.
+//!
+//! This module drives the roots -> ranges -> delta handshake against a remote `Sync`
+//! capability and exposes `DeltaSinkImpl`, the local sink used by the remote peer to
+//! stream missing CRDT fragments back into the local stores.
+
 use crate::cluster::ClusterViewId;
 use crate::network::types::{NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue};
 use crate::secrets::types::SecretValue;
@@ -25,6 +31,8 @@ use tracing::{debug, warn};
 
 type RegisterDelta<V> = Vec<(UuidKey, MVReg<V, uuid::Uuid>)>;
 type TombstoneDelta = Vec<(UuidKey, u64)>;
+
+/// Same domain ordering as the server, used when a caller wants a full peer reconciliation.
 const ALL_SYNC_DOMAINS: [Domain; 10] = [
     Domain::Peers,
     Domain::Tasks,
@@ -39,6 +47,7 @@ const ALL_SYNC_DOMAINS: [Domain; 10] = [
 ];
 
 #[derive(Clone)]
+/// Local replicated stores that can participate in one anti-entropy pass.
 pub struct SyncStores {
     pub peers: PeersStore,
     pub tasks: TaskStore,
@@ -61,8 +70,6 @@ pub struct SyncTraceContext {
 }
 
 impl SyncTraceContext {
-    /// # Description:
-    ///
     /// Builds one peer-scoped trace context used by sync diagnostics.
     pub fn peer(peer_id: uuid::Uuid, peer_addr: impl Into<String>, reason: &'static str) -> Self {
         Self {
@@ -74,6 +81,7 @@ impl SyncTraceContext {
 }
 
 impl SyncStores {
+    /// Returns the local MST root hash for one domain so the roots phase can skip matches.
     async fn root_hex(&self, domain: Domain) -> String {
         match domain {
             Domain::Peers => self.peers.root_hex().await,
@@ -89,6 +97,7 @@ impl SyncStores {
         }
     }
 
+    /// Returns the local digest summary for one domain used to compute missing pages.
     async fn page_range_summary(&self, domain: Domain) -> crdt_store::Result<Vec<PageDigestRange>> {
         match domain {
             Domain::Peers => self.peers.page_range_summary().await,
@@ -105,12 +114,17 @@ impl SyncStores {
     }
 }
 
+/// Local sink implementation passed to a remote peer during `open_delta_for_view`.
+///
+/// The remote peer pushes typed delta chunks into this sink, which decodes them and applies
+/// them directly into the appropriate replicated store.
 pub struct DeltaSinkImpl {
     stores: SyncStores,
     expected_view: ClusterViewId,
 }
 
 impl DeltaSinkImpl {
+    /// Builds a sink bound to the local stores and the cluster view negotiated for this sync.
     pub fn new(stores: SyncStores, expected_view: ClusterViewId) -> Self {
         Self {
             stores,
@@ -143,6 +157,7 @@ impl delta_sink::Server for DeltaSinkImpl {
             "received delta chunk"
         );
 
+        // Each domain uses the same transport format but deserializes into a different value type.
         match domain {
             Domain::Peers => {
                 apply_chunk(
@@ -239,6 +254,7 @@ impl delta_sink::Server for DeltaSinkImpl {
     }
 }
 
+/// Decodes one streamed chunk and merges it into the destination store.
 async fn apply_chunk<V, F>(
     store: impl DeltaStore<V>,
     chunk: &delta_chunk::Reader<'_>,
@@ -254,6 +270,7 @@ where
     store.apply_delta(regs, tombs).await.map_err(to_capnp)
 }
 
+/// Extracts tombstone rows from a wire chunk.
 fn collect_tombstones(chunk: &delta_chunk::Reader<'_>) -> Result<TombstoneDelta, capnp::Error> {
     let mut tombs = Vec::new();
     for entry in chunk.get_tombs()?.iter() {
@@ -264,6 +281,7 @@ fn collect_tombstones(chunk: &delta_chunk::Reader<'_>) -> Result<TombstoneDelta,
     Ok(tombs)
 }
 
+/// Deserializes MVReg payloads from one wire chunk for the selected domain value type.
 fn decode_register<V>(chunk: &delta_chunk::Reader<'_>) -> Result<RegisterDelta<V>, capnp::Error>
 where
     V: for<'de> serde::Deserialize<'de>,
@@ -279,10 +297,12 @@ where
     Ok(regs)
 }
 
+/// Normalizes storage/runtime errors into Cap'n Proto failures for RPC propagation.
 fn to_capnp<E: std::fmt::Display>(e: E) -> capnp::Error {
     capnp::Error::failed(e.to_string())
 }
 
+/// Small abstraction over replicated stores that can consume streamed anti-entropy chunks.
 #[async_trait]
 trait DeltaStore<V>: Clone + Send + Sync + 'static {
     async fn apply_delta(self, regs: RegisterDelta<V>, tombs: TombstoneDelta) -> io::Result<()>;
@@ -398,9 +418,7 @@ impl DeltaStore<VolumeNodeStateValue> for VolumeNodeStore {
     }
 }
 
-/// # Description:
-///
-/// Runs anti-entropy for all registered replication domains against one peer.
+/// Runs anti-entropy for every replicated domain against one peer.
 pub async fn sync_all_domains(
     stores: SyncStores,
     sync_cap: sync::Client,
@@ -410,8 +428,6 @@ pub async fn sync_all_domains(
     sync_selected_domains(stores, sync_cap, cluster_view, &ALL_SYNC_DOMAINS, trace).await;
 }
 
-/// # Description:
-///
 /// Runs anti-entropy for one caller-selected domain subset against one peer view.
 ///
 /// This is used by the global metadata loop to sync only `cluster_views` across split
@@ -455,6 +471,7 @@ pub async fn sync_selected_domains(
         }
 
         let mut domains_to_sync = Vec::new();
+        // Root equality lets us skip the more expensive page-summary walk for matched domains.
         for domain in &requested_domains {
             let local_root = stores.root_hex(*domain).await;
             let remote_root = remote_roots
@@ -499,6 +516,7 @@ pub async fn sync_selected_domains(
             let remote_summary = summary.get_summary()?;
             let remote_ranges = page_ranges_from_capnp(remote_summary)?;
             let local_ranges = stores.page_range_summary(domain).await.map_err(to_capnp)?;
+            // Ask the peer only for pages present in its summary but missing locally.
             let want = compute_want_from_have(&remote_ranges, &local_ranges);
             if !want.is_empty() {
                 domains_wants.push((domain, want));
@@ -560,8 +578,6 @@ pub async fn sync_selected_domains(
     }
 }
 
-/// # Description:
-///
 /// Returns true when one Cap'n Proto error corresponds to a disconnected transport path.
 fn is_disconnected_capnp(error: &capnp::Error) -> bool {
     let text = error.to_string();

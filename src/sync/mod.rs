@@ -1,3 +1,15 @@
+//! Server side of Mantissa's view-scoped anti-entropy protocol.
+//!
+//! The sync RPC intentionally runs in three phases so large clusters do not ship full
+//! snapshots on every reconciliation pass:
+//! 1. `get_roots_for_view` compares cheap MST roots per replicated domain.
+//! 2. `get_ranges_for_view` narrows mismatches down to page digest ranges.
+//! 3. `open_delta_for_view` streams only the missing register/tombstone fragments.
+//!
+//! All modern sync traffic is scoped to an explicit `ClusterViewId`. The legacy
+//! non-view-scoped RPCs remain in the protocol only to preserve method numbers and are
+//! rejected at runtime.
+
 use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::store::cluster_view_store::ClusterViewDomainStore;
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
@@ -21,6 +33,9 @@ type EncodedRegisters = Vec<EncodedRegister>;
 type EncodedTombstone = (Vec<u8>, u64);
 type EncodedTombstones = Vec<EncodedTombstone>;
 
+/// Stable ordering of every replicated domain exposed through sync.
+///
+/// Both client and server treat an empty domain list as "all domains in this order".
 const ALL_DOMAINS: [Domain; 10] = [
     Domain::Peers,
     Domain::Tasks,
@@ -52,6 +67,7 @@ fn delta_chunk_max() -> usize {
 }
 
 #[derive(Clone)]
+/// Cap'n Proto server that exposes all replicated stores through one sync interface.
 pub struct SyncService {
     cluster_view: ClusterViewState,
     peers: PeersStore,
@@ -67,6 +83,10 @@ pub struct SyncService {
 }
 
 #[derive(Clone)]
+/// Bundle of replicated stores served through `SyncService`.
+///
+/// Keeping the stores grouped here lets topology bootstrap and tests construct the sync
+/// surface without threading ten separate arguments through every call site.
 pub struct SyncStores {
     pub peers: PeersStore,
     pub tasks: TaskStore,
@@ -408,6 +428,7 @@ impl sync::Server for SyncService {
         let wants_reader = req.get_wants()?;
         let sink = req.get_sink()?;
 
+        // The caller already proved convergence after the roots/ranges phases.
         if wants_reader.is_empty() {
             sink.end_request().send().promise.await?;
             return Ok(());
@@ -433,6 +454,7 @@ impl sync::Server for SyncService {
                 continue;
             }
 
+            // Export only the pages the caller proved it is missing for this domain.
             let store = self.domain_store(domain);
             store.debug_dump_delta_state().await;
             let (regs, tombs) = store.export_delta_encoded(&want_ranges)?;
@@ -450,6 +472,8 @@ impl sync::Server for SyncService {
     }
 }
 
+/// Serializes CRDT register payloads into the on-the-wire bincode representation used by
+/// `DeltaChunk.regs`.
 fn encode_registers<R>(regs: Registers<UuidKey, R>) -> Result<EncodedRegisters, capnp::Error>
 where
     R: serde::Serialize,
@@ -463,6 +487,7 @@ where
     Ok(out)
 }
 
+/// Converts tombstone rows into the compact wire format used by `DeltaChunk.tombs`.
 fn encode_tombstones(tombs: Tombstones<UuidKey>) -> EncodedTombstones {
     tombs
         .into_iter()
@@ -470,6 +495,10 @@ fn encode_tombstones(tombs: Tombstones<UuidKey>) -> EncodedTombstones {
         .collect()
 }
 
+/// Streams one domain delta to the caller in bounded chunks.
+///
+/// Chunking is entry-count based instead of byte-perfect sizing; that keeps the sender
+/// simple while still putting a hard cap on per-message work and memory.
 async fn send_chunks(
     domain: Domain,
     regs_wire: EncodedRegisters,
