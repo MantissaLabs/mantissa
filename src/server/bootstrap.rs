@@ -41,10 +41,7 @@ use crate::task::manager::{TaskManager, TaskManagerConfig, TaskRuntimeConfig};
 use crate::task::service::TaskService;
 use crate::token::TokenStore;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyStores};
-use crate::volumes::{
-    VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc,
-    local_volume_capacity_enforcement_enabled,
-};
+use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
 use crate::{config, node, server};
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use protocol::gossip::gossip::Client as GossipClient;
@@ -555,7 +552,7 @@ impl Bootstrap {
             ctx.self_id,
             local_node_name.clone(),
             local_volume_root.clone(),
-            local_volume_capacity_enforcement_enabled(),
+            config::local_volume_enforce_capacity(),
         );
 
         let container_manager: Arc<dyn ContainerManager + Send + Sync> =
@@ -620,7 +617,7 @@ impl Bootstrap {
             attachment_override: None,
             runtime_config: task_runtime_config,
             local_volume_root,
-            enforce_local_volume_capacity: local_volume_capacity_enforcement_enabled(),
+            enforce_local_volume_capacity: config::local_volume_enforce_capacity(),
         });
 
         let service_controller = ServiceController::new(ServiceControllerConfig {

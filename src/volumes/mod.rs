@@ -11,8 +11,3 @@ pub use errors::LocalVolumeAccessError;
 pub use gossip::VolumeReplicator;
 pub use registry::VolumeRegistry;
 pub use service::VolumesRpc;
-
-/// Returns true when local-volume requested capacity should be enforced by the orchestrator.
-pub fn local_volume_capacity_enforcement_enabled() -> bool {
-    std::env::var_os("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY").is_some()
-}

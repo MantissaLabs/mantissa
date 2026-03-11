@@ -2164,6 +2164,15 @@ impl TaskManager {
         spec: &TaskSpec,
         runtime_inventory: Option<&RuntimeInventory>,
     ) -> bool {
+        if !spec.volumes.is_empty()
+            && self
+                .ensure_task_volumes_accessible(&spec.volumes)
+                .await
+                .is_err()
+        {
+            return false;
+        }
+
         let Some(runtime_inventory) = runtime_inventory else {
             return false;
         };

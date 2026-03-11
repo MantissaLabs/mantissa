@@ -40,14 +40,16 @@ use mantissa::task::docker::{
 use mantissa::task::manager::TaskManager;
 use mantissa::task::types::{
     TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskServiceMetadata, TaskSpec,
-    TaskStateFilter, TaskValue,
+    TaskStateFilter, TaskValue, TaskVolumeMount,
 };
 use mantissa::topology_capnp::topology;
 use protocol::secrets::secrets;
 use protocol::services::services;
 use protocol::topology::{ClusterOperationStage, NodeDrainState};
+use protocol::volumes::volumes;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    fs,
     path::Path,
     sync::{
         Arc,
@@ -55,6 +57,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tempfile::tempdir;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -3809,6 +3812,141 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
     );
 });
 
+local_test!(services_volume_unavailable_enters_and_recovers, {
+    let _guard = ContainerManagerOverrideGuard::install_default();
+
+    let cluster = TestNode::new_cluster_inproc_with_config(1, ClusterConfig::default())
+        .await
+        .expect("cluster should start");
+    let node = &cluster[0];
+
+    let imported = tempdir().expect("create imported volume path");
+    let volume_name = "svc-imported-data";
+    let volume_id = import_local_volume_for_service(
+        &node.node.volumes_client,
+        volume_name,
+        node.id(),
+        imported.path(),
+    )
+    .await;
+
+    let service_name = "volume-unavailable-service";
+    let manifest_name = "volume-unavailable-service";
+    let tasks = vec![ServiceTaskSpecValue {
+        name: "db".into(),
+        image: "postgres:16".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "while true; do sleep 1; done".into(),
+        ],
+        replicas: 1,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: vec![TaskVolumeMount {
+            volume_id,
+            volume_name: volume_name.to_string(),
+            target: "/var/lib/postgresql/data".to_string(),
+            read_only: false,
+        }],
+        networks: Vec::new(),
+        health_port: None,
+        health_command: None,
+        public_port: None,
+        public_protocol: None,
+    }];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks)
+        .await
+        .expect("submit service deployment with imported volume");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "service should reach running while the imported path exists"
+    );
+
+    let running = node
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read running service spec")
+        .expect("running service spec present");
+    let task_id = *running
+        .task_ids
+        .first()
+        .expect("service should own one task id");
+
+    assert!(
+        wait_for_task_state(
+            &node.node.task_manager,
+            task_id,
+            ContainerState::Running,
+            Duration::from_secs(10)
+        )
+        .await,
+        "task should reach running while the imported path exists"
+    );
+
+    fs::remove_dir_all(imported.path()).expect("remove imported volume path");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::VolumeUnavailable
+        )
+        .await,
+        "service should report volume_unavailable after the imported path disappears"
+    );
+    assert!(
+        wait_for_task_state(
+            &node.node.task_manager,
+            task_id,
+            ContainerState::VolumeUnavailable,
+            Duration::from_secs(10)
+        )
+        .await,
+        "task should report volume_unavailable after the imported path disappears"
+    );
+
+    fs::create_dir_all(imported.path()).expect("recreate imported volume path");
+
+    assert!(
+        wait_for_task_state(
+            &node.node.task_manager,
+            task_id,
+            ContainerState::Running,
+            Duration::from_secs(15)
+        )
+        .await,
+        "task should recover once the imported path is restored"
+    );
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "service should recover to running once the imported path is restored"
+    );
+});
+
 local_test!(services_redeploy_rollback_failure_marks_failed, {
     let manager = Arc::new(CreateFailureAfterBaselineContainerManager::default());
     let _guard = ContainerManagerOverrideGuard::install(manager.clone());
@@ -5172,6 +5310,49 @@ async fn wait_for_task_count(manager: &TaskManager, expected: usize, timeout: Du
         false
     })
     .await
+}
+
+async fn wait_for_task_state(
+    manager: &TaskManager,
+    task_id: Uuid,
+    expected: ContainerState,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(50), || async {
+        match manager.inspect_task(task_id).await {
+            Ok(spec) => spec.state == expected,
+            Err(_) => false,
+        }
+    })
+    .await
+}
+
+async fn import_local_volume_for_service(
+    client: &volumes::Client,
+    name: &str,
+    node_id: Uuid,
+    path: &Path,
+) -> Uuid {
+    let mut request = client.import_request();
+    {
+        let mut inner = request.get().init_request();
+        inner.set_name(name);
+        inner.set_node_id(node_id.as_bytes());
+        inner.set_path(
+            path.to_str()
+                .expect("imported volume path should be valid utf8"),
+        );
+        inner.set_requested_bytes(0);
+    }
+
+    let response = request.send().promise.await.expect("import volume send");
+    let reader = response.get().expect("import volume response");
+    let bytes = reader
+        .get_volume()
+        .expect("volume payload")
+        .get_id()
+        .expect("volume id");
+    Uuid::from_slice(bytes).expect("decode volume id")
 }
 
 async fn create_secret(

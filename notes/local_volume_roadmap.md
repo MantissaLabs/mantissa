@@ -79,7 +79,7 @@ A volume has:
 3. access mode: `read_write_once`,
 4. binding mode: `immediate` or `wait_for_first_consumer`,
 5. reclaim policy: `retain` or `delete`,
-6. capacity hint in bytes,
+6. requested capacity in bytes,
 7. placement state: unbound or bound to one node,
 8. health/status fields and operator-visible reason/message.
 
@@ -331,7 +331,7 @@ Suggested output:
 1. volume summary,
 2. local path,
 3. node-local provisioning state,
-4. capacity and disk usage if known,
+4. requested capacity and actual disk usage if known,
 5. current task consumers,
 6. last local error.
 
@@ -505,6 +505,17 @@ Volumes must affect placement before resources are reserved.
    before task placement.
 5. If disk-capacity accounting is enabled, the candidate node must satisfy the
    requested volume bytes in addition to CPU, memory, and GPU constraints.
+
+Current implementation note:
+
+1. `requested_bytes` is always recorded and reconciled into node-local volume
+   state as operator-visible metadata.
+2. `used_bytes` is measured from the realized local path during volume
+   reconciliation.
+3. Requested capacity is enforced only when
+   `storage.local_volume_enforce_capacity=true` or
+   `MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY=1` is set.
+4. That enforcement is an orchestrator cutoff, not a kernel filesystem quota.
 
 ### Binding transaction
 

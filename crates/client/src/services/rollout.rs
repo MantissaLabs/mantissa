@@ -73,6 +73,8 @@ fn classify_rollout_outcome(row: &ServiceRow) -> &'static str {
         ServiceRolloutPhaseRow::Idle => {
             if row.status == ServiceStatusRow::Failed {
                 "failed"
+            } else if row.status == ServiceStatusRow::VolumeUnavailable {
+                "blocked"
             } else if row.rollout.failed_steps > 0 || row.rollout.last_error.is_some() {
                 "rolled-back"
             } else {
@@ -178,5 +180,18 @@ mod tests {
             Some("too many failures"),
         );
         assert_eq!(classify_rollout_outcome(&row), "failed");
+    }
+
+    #[test]
+    /// Ensures idle volume-blocked services are shown as blocked rather than stable.
+    fn classify_idle_volume_unavailable_as_blocked() {
+        let row = test_row(
+            ServiceStatusRow::VolumeUnavailable,
+            ServiceRolloutPhaseRow::Idle,
+            0,
+            3,
+            None,
+        );
+        assert_eq!(classify_rollout_outcome(&row), "blocked");
     }
 }

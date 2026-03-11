@@ -38,6 +38,8 @@ pub struct Config {
 pub struct StorageConfig {
     #[serde(default)]
     pub local_volume_root: Option<String>,
+    #[serde(default)]
+    pub local_volume_enforce_capacity: bool,
 }
 
 /// # Description:
@@ -403,6 +405,13 @@ pub fn local_volume_root() -> Result<PathBuf> {
 
 /// # Description:
 ///
+/// Return whether requested local-volume capacity should be enforced as a runtime cutoff.
+pub fn local_volume_enforce_capacity() -> bool {
+    global_config().storage.local_volume_enforce_capacity
+}
+
+/// # Description:
+///
 /// Render a config snapshot as pretty-printed RON for diagnostics.
 pub fn render_config_ron(config: &Config) -> Result<String> {
     let pretty = ron::ser::PrettyConfig::default();
@@ -633,6 +642,11 @@ impl Config {
             }
         }
 
+        if std::env::var_os("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY").is_some() {
+            applied = true;
+            self.storage.local_volume_enforce_capacity = true;
+        }
+
         applied
     }
 
@@ -830,6 +844,10 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("storage.local_volume_root".to_string());
     }
 
+    if old.storage.local_volume_enforce_capacity != new.storage.local_volume_enforce_capacity {
+        changes.push("storage.local_volume_enforce_capacity".to_string());
+    }
+
     if old.network.nodeport.enabled != new.network.nodeport.enabled {
         changes.push("network.nodeport.enabled".to_string());
     }
@@ -949,6 +967,7 @@ mod tests {
             std::env::set_var("MANTISSA_LB_HEALTH_PORT", "30080");
             std::env::set_var("MANTISSA_DOCKER_HOST", "unix:///var/run/docker.sock");
             std::env::set_var("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc");
+            std::env::set_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY", "1");
         }
 
         let mut config = Config::default();
@@ -968,6 +987,7 @@ mod tests {
             config.gpu.device_overrides.as_deref(),
             Some("uuid:GPU-abc=id:GPU-abc")
         );
+        assert!(config.storage.local_volume_enforce_capacity);
 
         unsafe {
             std::env::remove_var("MANTISSA_WIREGUARD_DISABLE");
@@ -977,6 +997,7 @@ mod tests {
             std::env::remove_var("MANTISSA_LB_HEALTH_PORT");
             std::env::remove_var("MANTISSA_DOCKER_HOST");
             std::env::remove_var("MANTISSA_GPU_DEVICE_OVERRIDES");
+            std::env::remove_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY");
         }
     }
 }
