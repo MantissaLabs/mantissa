@@ -2,11 +2,22 @@
 
 Mantissa is a fully decentralized container orchestration system built for large clusters and
 AI workloads. Every node participates equally in scheduling, state replication, and cluster
-membership — no control-plane masters, and no federation layer required at scale.
+membership. No control-plane masters, and no federation layer required at scale.
 
 Built in Rust with Cap'n Proto RPC, CRDT replication, Merkle Search Trees over Redb, and an
 optional eBPF data path, Mantissa targets low-latency scheduling and fault-tolerant operation
 across tens of thousands of nodes.
+
+## Status
+
+**Experimental**. This project is to show that strong eventual consistency is sufficient for
+sound container orchestration and metadata replication.
+
+This will hardly ever match Kubernetes in terms of feature set or API surface but it is
+intended to be a niche tool for either small clusters or very large clusters where upgrades
+and maintenance are becoming a bottleneck.
+
+_Do not use in Production._
 
 ## Highlights
 
@@ -16,13 +27,18 @@ across tens of thousands of nodes.
 - Designed to scale to tens of thousands of nodes without a federation layer.
 - eBPF-accelerated overlay networking for low-latency service discovery and routing.
 - Durable state via CRDT + MST (Redb) for failure tolerance and convergence.
+- Support for cluster split/merge operations (creating cluster views).
+- Cluster dataplane encryption using Noise, vxlan traffic encrypted via wireguard.
+- No exposed API surface, tightened security model with Capn'proto capabilities.
 
 ## Quickstart (Dev Cluster)
 
 1. Provision a local multi-VM cluster with Lima:
 
+Install lima, clone the mantissa repository and navigate to the project directory, then:
+
 ```bash
-./setup-dev-cluster.sh -n 2 -r $(pwd)
+./setup-dev-cluster.sh -n 3 -r $(pwd)
 ```
 
 2. SSH into each VM (as printed by the script), then build once:
@@ -58,11 +74,6 @@ See `docs/quickstart.md` for the full local and multi-VM workflow.
 - `docs/permissions.md` - running as root vs unprivileged
 - `docs/repo-layout.md` - repository structure
 - `docs/networking-ebpf.md` - eBPF networking details
-
-## Status
-
-Alpha. APIs and schemas will evolve as we push on distributed scheduling, GPU support, and
-large-scale cluster behavior.
 
 ## Contributing
 
