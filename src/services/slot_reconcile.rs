@@ -11,6 +11,7 @@ use super::{
     task_state_healthy, task_state_rebalanceable,
 };
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
+use crate::task::container::ContainerState;
 use crate::task::types::TaskSpec;
 use anyhow::anyhow;
 use health::Status as HealthStatus;
@@ -186,8 +187,23 @@ impl ServiceController {
         } else {
             Some(desired_node)
         };
+        let requires_pinned_target = mounted_local_volumes_require_pinned_target(
+            &self.volume_registry,
+            &slot.template.volumes,
+        )?;
 
         let task = env.inventory.by_id.get(&task_id);
+        if matches!(
+            task.map(|task| &task.state),
+            Some(ContainerState::VolumeUnavailable)
+        ) && requires_pinned_target
+        {
+            // Imported and other pinned local volumes recover in place once the node-local
+            // path returns. Promote the service immediately instead of waiting for a restart
+            // attempt to rediscover the same local volume error.
+            self.mark_service_volume_unavailable(spec).await?;
+            return Ok(());
+        }
         let task_on_draining_node = task
             .map(|task| self.node_drain_requested(task.node_id))
             .unwrap_or(false);

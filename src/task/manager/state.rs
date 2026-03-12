@@ -1091,7 +1091,7 @@ impl TaskManager {
         error
     }
 
-    /// Marks a task as blocked on local volume availability and frees any resources it owned.
+    /// Marks a task as blocked on local volume availability while preserving its reservations.
     pub(super) async fn mark_task_volume_unavailable(
         &self,
         mut spec: TaskSpec,
@@ -1135,21 +1135,6 @@ impl TaskManager {
                 "failed to teardown attachments after volume block of {}: {err}",
                 task_id
             );
-        }
-
-        if !spec.slot_ids.is_empty() {
-            for slot_id in &spec.slot_ids {
-                if let Err(err) = self.release_slot(*slot_id).await {
-                    warn!(
-                        target: "task",
-                        "failed to release slot {} after volume block of {}: {err}",
-                        slot_id,
-                        task_id
-                    );
-                }
-            }
-            spec.slot_ids.clear();
-            spec.slot_id = None;
         }
 
         if let Ok(current) = self.load_spec(task_id).await {
