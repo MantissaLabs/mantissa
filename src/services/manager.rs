@@ -808,6 +808,10 @@ impl ServiceController {
             stages.len()
         );
 
+        let template_replica_counts: HashMap<String, u16> = templates
+            .iter()
+            .map(|template| (template.name.clone(), template.replicas))
+            .collect();
         let mut launched_task_ids: HashMap<String, Vec<Uuid>> = HashMap::new();
         let mut assignments: BTreeMap<(String, u16), Uuid> = BTreeMap::new();
 
@@ -818,6 +822,7 @@ impl ServiceController {
                     .wait_for_template_dependencies_ready(
                         &service_name,
                         &template,
+                        &template_replica_counts,
                         &launched_task_ids,
                         &update_strategy,
                     )
@@ -906,13 +911,18 @@ impl ServiceController {
         Ok(())
     }
 
-    /// Waits until every dependency template for one template is running and, when attached to
-    /// networks, published for service traffic.
-    async fn wait_for_template_dependencies_ready(
+    /// Waits until one template's dependency task ids are running and ready to receive traffic.
+    ///
+    /// Both initial staged deployment and dependency-aware rolling updates use this to keep one
+    /// downstream template from launching before every required upstream replica is actually
+    /// discoverable and dataplane-ready.
+    async fn wait_for_dependency_task_ids_ready(
         &self,
         service_name: &str,
-        template: &ServiceTaskSpecValue,
-        launched_task_ids: &HashMap<String, Vec<Uuid>>,
+        template_name: &str,
+        depends_on: &[String],
+        template_replica_counts: &HashMap<String, u16>,
+        dependency_task_ids: &HashMap<String, Vec<Uuid>>,
         update_strategy: &ServiceUpdateStrategy,
     ) -> anyhow::Result<()> {
         let startup_timeout =
@@ -926,22 +936,33 @@ impl ServiceController {
             if Instant::now() >= deadline {
                 return Err(anyhow!(
                     "timed out waiting for dependencies {:?} of template '{}' in service '{}' to become ready",
-                    template.depends_on,
-                    template.name,
+                    depends_on,
+                    template_name,
                     service_name
                 ));
             }
 
             let mut ready = true;
-            for dependency in &template.depends_on {
-                let dependency_task_ids = launched_task_ids.get(dependency).ok_or_else(|| {
-                    anyhow!(
-                        "template '{}' in service '{}' depends on '{}' before it has launched",
-                        template.name,
-                        service_name,
-                        dependency
-                    )
-                })?;
+            for dependency in depends_on {
+                let expected_replicas = template_replica_counts
+                    .get(dependency)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "template '{}' in service '{}' depends on unknown template '{}'",
+                            template_name,
+                            service_name,
+                            dependency
+                        )
+                    })? as usize;
+                let Some(dependency_task_ids) = dependency_task_ids.get(dependency) else {
+                    ready = false;
+                    continue;
+                };
+                if dependency_task_ids.len() != expected_replicas {
+                    ready = false;
+                    continue;
+                }
 
                 for task_id in dependency_task_ids {
                     let spec = self.task_manager.inspect_task(*task_id).await?;
@@ -992,6 +1013,27 @@ impl ServiceController {
 
             sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
         }
+    }
+
+    /// Waits until every dependency template for one template is running and, when attached to
+    /// networks, published for service traffic.
+    async fn wait_for_template_dependencies_ready(
+        &self,
+        service_name: &str,
+        template: &ServiceTaskSpecValue,
+        template_replica_counts: &HashMap<String, u16>,
+        launched_task_ids: &HashMap<String, Vec<Uuid>>,
+        update_strategy: &ServiceUpdateStrategy,
+    ) -> anyhow::Result<()> {
+        self.wait_for_dependency_task_ids_ready(
+            service_name,
+            &template.name,
+            &template.depends_on,
+            template_replica_counts,
+            launched_task_ids,
+            update_strategy,
+        )
+        .await
     }
 
     /// Persists the current `Deploying` service snapshot with the provided task id set.

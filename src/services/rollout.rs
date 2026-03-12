@@ -54,6 +54,150 @@ struct RolloutArtifacts {
     rollback_old_tasks: HashMap<Uuid, RollbackTaskRecord>,
 }
 
+/// Stores the dependency-stage view of one manifest so rollout phases can honor template order.
+///
+/// Rolling updates need both the topological stage layout and the expected replica count per
+/// template. The stage order keeps dependent templates from rolling ahead of their upstreams,
+/// while replica counts let readiness gating verify that every required upstream replica is still
+/// present and published before the next stage begins.
+struct RolloutTemplateGraph {
+    stages: Vec<TemplateDependencyStage>,
+    replica_counts: HashMap<String, u16>,
+}
+
+impl RolloutTemplateGraph {
+    /// Builds the dependency-stage graph for one manifest template set.
+    fn from_templates(
+        service_name: &str,
+        templates: &[ServiceTaskSpecValue],
+    ) -> anyhow::Result<Self> {
+        let stages = build_template_dependency_stages(templates).map_err(|err| {
+            anyhow!(
+                "invalid task dependency graph for service '{}': {err}",
+                service_name
+            )
+        })?;
+        let replica_counts = templates
+            .iter()
+            .map(|template| (template.name.clone(), template.replicas))
+            .collect();
+        Ok(Self {
+            stages,
+            replica_counts,
+        })
+    }
+
+    /// Groups replacement indices by dependency stage while preserving manifest order.
+    fn replacement_stage_indices(
+        &self,
+        templates: &[ServiceTaskSpecValue],
+        replace: &[ReplicaReplacement],
+    ) -> Vec<Vec<usize>> {
+        let mut by_template: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, replacement) in replace.iter().enumerate() {
+            by_template
+                .entry(replacement.template.name.as_str())
+                .or_default()
+                .push(index);
+        }
+
+        let mut stages = Vec::new();
+        for stage in &self.stages {
+            let mut indices = Vec::new();
+            for template_index in &stage.template_indices {
+                let template_name = templates[*template_index].name.as_str();
+                if let Some(template_indices) = by_template.get(template_name) {
+                    indices.extend(template_indices.iter().copied());
+                }
+            }
+            stages.push(indices);
+        }
+
+        stages
+    }
+
+    /// Groups removals in reverse dependency order so downstream templates drain before upstreams.
+    fn removal_stage_indices(
+        &self,
+        templates: &[ServiceTaskSpecValue],
+        remove: &[ServiceTaskAssignment],
+    ) -> Vec<Vec<usize>> {
+        let mut by_template: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, assignment) in remove.iter().enumerate() {
+            by_template
+                .entry(assignment.template.as_str())
+                .or_default()
+                .push(index);
+        }
+
+        let mut stages = Vec::new();
+        for stage in self.stages.iter().rev() {
+            let mut indices = Vec::new();
+            for template_index in &stage.template_indices {
+                let template_name = templates[*template_index].name.as_str();
+                if let Some(template_indices) = by_template.get(template_name) {
+                    indices.extend(template_indices.iter().copied());
+                }
+            }
+            stages.push(indices);
+        }
+
+        stages
+    }
+
+    /// Orders rollback restart steps in dependency order so upstream templates recover first.
+    fn rollback_steps(
+        &self,
+        templates: &[ServiceTaskSpecValue],
+        rollback_old_tasks: &HashMap<Uuid, RollbackTaskRecord>,
+    ) -> Vec<RollbackTaskRecord> {
+        let mut by_template: HashMap<String, Vec<RollbackTaskRecord>> = HashMap::new();
+        for record in rollback_old_tasks.values().cloned() {
+            by_template
+                .entry(record.template.clone())
+                .or_default()
+                .push(record);
+        }
+
+        let mut ordered = Vec::new();
+        for stage in &self.stages {
+            for template_index in &stage.template_indices {
+                let template_name = &templates[*template_index].name;
+                let Some(mut records) = by_template.remove(template_name) else {
+                    continue;
+                };
+                records.sort_by(|left, right| {
+                    left.replica
+                        .cmp(&right.replica)
+                        .then(left.task_id.cmp(&right.task_id))
+                });
+                ordered.extend(records);
+            }
+        }
+
+        ordered
+    }
+
+    /// Builds the current active task-id view for each template from rollout assignment state.
+    fn active_dependency_task_ids(
+        &self,
+        templates: &[ServiceTaskSpecValue],
+        assignment_index: &BTreeMap<(String, u16), Uuid>,
+    ) -> HashMap<String, Vec<Uuid>> {
+        let mut by_template = HashMap::with_capacity(templates.len());
+        for template in templates {
+            let mut task_ids = Vec::with_capacity(template.replicas as usize);
+            for replica in 1..=template.replicas {
+                if let Some(task_id) = assignment_index.get(&(template.name.clone(), replica)) {
+                    task_ids.push(*task_id);
+                }
+            }
+            by_template.insert(template.name.clone(), task_ids);
+        }
+        by_template
+    }
+}
+
 /// Builds replacement start requests in replica order so step outcomes map deterministically.
 fn build_replacement_requests(
     service_name: &str,
@@ -98,11 +242,15 @@ impl ServiceController {
         } = job;
 
         let previous_status = current_spec.status();
-        let assignments = self
+        let current_assignments = self
             .collect_assignments(&service_name, &current_spec.task_ids)
             .await;
+        let desired_graph = RolloutTemplateGraph::from_templates(&service_name, &templates)?;
+        let current_graph =
+            RolloutTemplateGraph::from_templates(&service_name, &current_spec.tasks)?;
 
-        let plan = compute_change_plan(&current_spec.tasks, &templates, assignments);
+        let plan =
+            compute_change_plan(&current_spec.tasks, &templates, current_assignments.clone());
 
         if plan.is_noop() {
             self.apply_noop_redeployment(
@@ -141,7 +289,7 @@ impl ServiceController {
             &service_name,
             &current_spec,
             &templates,
-            &retain,
+            &current_assignments,
             &replace,
         );
         let mut rollout_error = self
@@ -149,7 +297,10 @@ impl ServiceController {
                 &service_name,
                 current_spec.id,
                 manifest_id,
+                &templates,
+                &desired_graph,
                 &replace,
+                &update_strategy,
                 &settings,
                 &mut progress,
                 &mut artifacts,
@@ -162,6 +313,8 @@ impl ServiceController {
                     &service_name,
                     current_spec.id,
                     manifest_id,
+                    &current_spec.tasks,
+                    &current_graph,
                     &remove,
                     &settings,
                     &mut progress,
@@ -176,6 +329,7 @@ impl ServiceController {
                 manifest_id,
                 &update_strategy,
                 &current_spec,
+                &current_graph,
                 previous_status,
                 &settings,
                 &progress,
@@ -266,7 +420,7 @@ impl ServiceController {
         service_name: &str,
         current_spec: &ServiceSpecValue,
         templates: &[ServiceTaskSpecValue],
-        retain: &[ServiceTaskAssignment],
+        current_assignments: &[ServiceTaskAssignment],
         replace: &[ReplicaReplacement],
     ) -> RolloutArtifacts {
         let eligible_nodes = self.collect_eligible_nodes();
@@ -279,7 +433,7 @@ impl ServiceController {
             &self.volume_registry,
         );
         let mut assignment_index: BTreeMap<(String, u16), Uuid> = BTreeMap::new();
-        for assignment in retain {
+        for assignment in current_assignments {
             assignment_index.insert(
                 (assignment.template.clone(), assignment.replica),
                 assignment.task_id,
@@ -379,6 +533,37 @@ impl ServiceController {
         }
     }
 
+    /// Waits for every dependency of one rollout stage to be running and published before
+    /// replacements for the stage begin.
+    async fn wait_rollout_stage_dependencies_ready(
+        &self,
+        service_name: &str,
+        templates: &[ServiceTaskSpecValue],
+        stage: &TemplateDependencyStage,
+        template_graph: &RolloutTemplateGraph,
+        assignment_index: &BTreeMap<(String, u16), Uuid>,
+        update_strategy: &ServiceUpdateStrategy,
+    ) -> anyhow::Result<()> {
+        let dependency_task_ids =
+            template_graph.active_dependency_task_ids(templates, assignment_index);
+        for template_index in &stage.template_indices {
+            let template = &templates[*template_index];
+            if template.depends_on.is_empty() {
+                continue;
+            }
+            self.wait_for_dependency_task_ids_ready(
+                service_name,
+                &template.name,
+                &template.depends_on,
+                &template_graph.replica_counts,
+                &dependency_task_ids,
+                update_strategy,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Executes batched replacement steps for rolling-forward manifest changes.
     #[expect(
         clippy::too_many_arguments,
@@ -389,150 +574,37 @@ impl ServiceController {
         service_name: &str,
         service_id: Uuid,
         manifest_id: Uuid,
+        templates: &[ServiceTaskSpecValue],
+        template_graph: &RolloutTemplateGraph,
         replace: &[ReplicaReplacement],
+        update_strategy: &ServiceUpdateStrategy,
         settings: &RolloutSettings,
         progress: &mut RolloutProgress,
         artifacts: &mut RolloutArtifacts,
     ) -> Option<anyhow::Error> {
-        let mut replacement_cursor = 0usize;
         let replacement_context = format!("service '{}' rolling replacement", service_name);
-        while replacement_cursor < replace.len() {
-            let end = (replacement_cursor + settings.parallelism).min(replace.len());
-            let replacement_chunk = &replace[replacement_cursor..end];
-            let request_chunk = artifacts.replacement_requests[replacement_cursor..end].to_vec();
-            let mut replacement_chunk_failed = false;
+        let replacement_stage_indices =
+            template_graph.replacement_stage_indices(templates, replace);
 
-            if matches!(settings.order, ServiceRolloutOrder::StopFirst) {
-                for replacement in replacement_chunk {
-                    if let Some(previous) = replacement.previous.as_ref()
-                        && let Err(err) = self
-                            .stop_task_and_track_rollback(
-                                service_name,
-                                previous,
-                                &artifacts.old_templates_by_name,
-                                &mut artifacts.rollback_old_tasks,
-                            )
-                            .await
-                    {
-                        if self
-                            .record_rollout_failure(
-                                service_id,
-                                manifest_id,
-                                settings,
-                                progress,
-                                &err,
-                            )
-                            .await
-                        {
-                            return Some(err);
-                        }
-                        replacement_chunk_failed = true;
-                        break;
-                    }
-                }
-                if replacement_chunk_failed {
-                    sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
-                    continue;
-                }
-            }
-
-            let started_specs = match self
-                .start_tasks_with_fallback(request_chunk, &replacement_context)
-                .await
-            {
-                Ok(specs) => specs,
-                Err(err) => {
-                    if self
-                        .record_rollout_failure(service_id, manifest_id, settings, progress, &err)
-                        .await
-                    {
-                        return Some(err);
-                    }
-                    sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
-                    continue;
-                }
-            };
-
-            if started_specs.len() != replacement_chunk.len() {
-                let err = anyhow!(
-                    "replacement count mismatch for '{}': expected {}, got {}",
-                    service_name,
-                    replacement_chunk.len(),
-                    started_specs.len()
-                );
-                let _ = self
-                    .record_rollout_failure(service_id, manifest_id, settings, progress, &err)
-                    .await;
-                return Some(err);
-            }
-
-            for (replacement, spec) in replacement_chunk.iter().zip(started_specs.iter()) {
-                artifacts.rollback_new_task_ids.insert(spec.id);
-                artifacts.assignment_index.insert(
-                    (replacement.template.name.clone(), replacement.replica),
-                    spec.id,
-                );
-            }
-
-            for spec in &started_specs {
-                if let Err(err) = self
-                    .wait_rollout_task_running(
-                        service_name,
-                        spec.id,
-                        settings.startup_timeout_secs,
-                        settings.monitor_secs,
-                    )
-                    .await
-                {
-                    let failure_budget_exhausted = self
-                        .record_rollout_failure(service_id, manifest_id, settings, progress, &err)
-                        .await;
-                    replacement_chunk_failed = true;
-                    self.stop_unhealthy_replacement_chunk_tasks(service_name, &started_specs)
-                        .await;
-                    if failure_budget_exhausted {
-                        return Some(err);
-                    }
-                    break;
-                }
-
-                if let Err(err) = self
-                    .publish_task_traffic_for_cutover(
-                        service_name,
-                        spec.id,
-                        Duration::from_secs(settings.startup_timeout_secs.max(5) as u64),
-                    )
-                    .await
-                {
-                    let failure_budget_exhausted = self
-                        .record_rollout_failure(service_id, manifest_id, settings, progress, &err)
-                        .await;
-                    replacement_chunk_failed = true;
-                    self.stop_unhealthy_replacement_chunk_tasks(service_name, &started_specs)
-                        .await;
-                    if failure_budget_exhausted {
-                        return Some(err);
-                    }
-                    break;
-                }
-            }
-            if replacement_chunk_failed {
-                sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+        for (stage, stage_indices) in template_graph.stages.iter().zip(replacement_stage_indices) {
+            if stage_indices.is_empty() {
                 continue;
             }
 
-            if matches!(settings.order, ServiceRolloutOrder::StartFirst) {
-                for replacement in replacement_chunk {
-                    if let Some(previous) = replacement.previous.as_ref()
-                        && let Err(err) = self
-                            .stop_task_and_track_rollback(
-                                service_name,
-                                previous,
-                                &artifacts.old_templates_by_name,
-                                &mut artifacts.rollback_old_tasks,
-                            )
-                            .await
-                    {
+            loop {
+                let dependency_gate = self
+                    .wait_rollout_stage_dependencies_ready(
+                        service_name,
+                        templates,
+                        stage,
+                        template_graph,
+                        &artifacts.assignment_index,
+                        update_strategy,
+                    )
+                    .await;
+                match dependency_gate {
+                    Ok(()) => break,
+                    Err(err) => {
                         if self
                             .record_rollout_failure(
                                 service_id,
@@ -545,22 +617,210 @@ impl ServiceController {
                         {
                             return Some(err);
                         }
-                        replacement_chunk_failed = true;
-                        break;
+                    }
+                }
+                sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+            }
+
+            let mut replacement_cursor = 0usize;
+            while replacement_cursor < stage_indices.len() {
+                let end = (replacement_cursor + settings.parallelism).min(stage_indices.len());
+                let replacement_chunk_indices = &stage_indices[replacement_cursor..end];
+                let replacement_chunk: Vec<&ReplicaReplacement> = replacement_chunk_indices
+                    .iter()
+                    .map(|index| &replace[*index])
+                    .collect();
+                let request_chunk: Vec<TaskStartRequest> = replacement_chunk_indices
+                    .iter()
+                    .map(|index| artifacts.replacement_requests[*index].clone())
+                    .collect();
+                let mut replacement_chunk_failed = false;
+
+                if matches!(settings.order, ServiceRolloutOrder::StopFirst) {
+                    for replacement in &replacement_chunk {
+                        if let Some(previous) = replacement.previous.as_ref()
+                            && let Err(err) = self
+                                .stop_task_and_track_rollback(
+                                    service_name,
+                                    previous,
+                                    &artifacts.old_templates_by_name,
+                                    &mut artifacts.rollback_old_tasks,
+                                )
+                                .await
+                        {
+                            if self
+                                .record_rollout_failure(
+                                    service_id,
+                                    manifest_id,
+                                    settings,
+                                    progress,
+                                    &err,
+                                )
+                                .await
+                            {
+                                return Some(err);
+                            }
+                            replacement_chunk_failed = true;
+                            break;
+                        }
                     }
                 }
                 if replacement_chunk_failed {
                     sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
                     continue;
                 }
-            }
 
-            progress.completed_steps = progress
-                .completed_steps
-                .saturating_add(replacement_chunk.len() as u32);
-            self.persist_forward_rollout_state(service_id, manifest_id, settings, progress, None)
+                let started_specs = match self
+                    .start_tasks_with_fallback(request_chunk, &replacement_context)
+                    .await
+                {
+                    Ok(specs) => specs,
+                    Err(err) => {
+                        if self
+                            .record_rollout_failure(
+                                service_id,
+                                manifest_id,
+                                settings,
+                                progress,
+                                &err,
+                            )
+                            .await
+                        {
+                            return Some(err);
+                        }
+                        sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+                        continue;
+                    }
+                };
+
+                if started_specs.len() != replacement_chunk.len() {
+                    let err = anyhow!(
+                        "replacement count mismatch for '{}': expected {}, got {}",
+                        service_name,
+                        replacement_chunk.len(),
+                        started_specs.len()
+                    );
+                    let _ = self
+                        .record_rollout_failure(service_id, manifest_id, settings, progress, &err)
+                        .await;
+                    return Some(err);
+                }
+
+                for (replacement, spec) in replacement_chunk.iter().zip(started_specs.iter()) {
+                    artifacts.rollback_new_task_ids.insert(spec.id);
+                    artifacts.assignment_index.insert(
+                        (replacement.template.name.clone(), replacement.replica),
+                        spec.id,
+                    );
+                }
+
+                for spec in &started_specs {
+                    if let Err(err) = self
+                        .wait_rollout_task_running(
+                            service_name,
+                            spec.id,
+                            settings.startup_timeout_secs,
+                            settings.monitor_secs,
+                        )
+                        .await
+                    {
+                        let failure_budget_exhausted = self
+                            .record_rollout_failure(
+                                service_id,
+                                manifest_id,
+                                settings,
+                                progress,
+                                &err,
+                            )
+                            .await;
+                        replacement_chunk_failed = true;
+                        self.stop_unhealthy_replacement_chunk_tasks(service_name, &started_specs)
+                            .await;
+                        if failure_budget_exhausted {
+                            return Some(err);
+                        }
+                        break;
+                    }
+
+                    if let Err(err) = self
+                        .publish_task_traffic_for_cutover(
+                            service_name,
+                            spec.id,
+                            Duration::from_secs(settings.startup_timeout_secs.max(5) as u64),
+                        )
+                        .await
+                    {
+                        let failure_budget_exhausted = self
+                            .record_rollout_failure(
+                                service_id,
+                                manifest_id,
+                                settings,
+                                progress,
+                                &err,
+                            )
+                            .await;
+                        replacement_chunk_failed = true;
+                        self.stop_unhealthy_replacement_chunk_tasks(service_name, &started_specs)
+                            .await;
+                        if failure_budget_exhausted {
+                            return Some(err);
+                        }
+                        break;
+                    }
+                }
+
+                if replacement_chunk_failed {
+                    sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+                    continue;
+                }
+
+                if matches!(settings.order, ServiceRolloutOrder::StartFirst) {
+                    for replacement in &replacement_chunk {
+                        if let Some(previous) = replacement.previous.as_ref()
+                            && let Err(err) = self
+                                .stop_task_and_track_rollback(
+                                    service_name,
+                                    previous,
+                                    &artifacts.old_templates_by_name,
+                                    &mut artifacts.rollback_old_tasks,
+                                )
+                                .await
+                        {
+                            if self
+                                .record_rollout_failure(
+                                    service_id,
+                                    manifest_id,
+                                    settings,
+                                    progress,
+                                    &err,
+                                )
+                                .await
+                            {
+                                return Some(err);
+                            }
+                            replacement_chunk_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if replacement_chunk_failed {
+                    sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+                    continue;
+                }
+
+                progress.completed_steps = progress
+                    .completed_steps
+                    .saturating_add(replacement_chunk.len() as u32);
+                self.persist_forward_rollout_state(
+                    service_id,
+                    manifest_id,
+                    settings,
+                    progress,
+                    None,
+                )
                 .await;
-            replacement_cursor = end;
+                replacement_cursor = end;
+            }
         }
 
         None
@@ -576,47 +836,64 @@ impl ServiceController {
         service_name: &str,
         service_id: Uuid,
         manifest_id: Uuid,
+        current_templates: &[ServiceTaskSpecValue],
+        template_graph: &RolloutTemplateGraph,
         remove: &[ServiceTaskAssignment],
         settings: &RolloutSettings,
         progress: &mut RolloutProgress,
         artifacts: &mut RolloutArtifacts,
     ) -> Option<anyhow::Error> {
-        let mut remove_cursor = 0usize;
-        while remove_cursor < remove.len() {
-            let end = (remove_cursor + settings.parallelism).min(remove.len());
-            let remove_chunk = &remove[remove_cursor..end];
-            let mut remove_chunk_failed = false;
-            for assignment in remove_chunk {
-                if let Err(err) = self
-                    .stop_task_and_track_rollback(
-                        service_name,
-                        assignment,
-                        &artifacts.old_templates_by_name,
-                        &mut artifacts.rollback_old_tasks,
-                    )
-                    .await
-                {
-                    if self
-                        .record_rollout_failure(service_id, manifest_id, settings, progress, &err)
+        let removal_stage_indices = template_graph.removal_stage_indices(current_templates, remove);
+        for stage_indices in removal_stage_indices {
+            let mut remove_cursor = 0usize;
+            while remove_cursor < stage_indices.len() {
+                let end = (remove_cursor + settings.parallelism).min(stage_indices.len());
+                let remove_chunk_indices = &stage_indices[remove_cursor..end];
+                let mut remove_chunk_failed = false;
+                for assignment in remove_chunk_indices.iter().map(|index| &remove[*index]) {
+                    if let Err(err) = self
+                        .stop_task_and_track_rollback(
+                            service_name,
+                            assignment,
+                            &artifacts.old_templates_by_name,
+                            &mut artifacts.rollback_old_tasks,
+                        )
                         .await
                     {
-                        return Some(err);
+                        if self
+                            .record_rollout_failure(
+                                service_id,
+                                manifest_id,
+                                settings,
+                                progress,
+                                &err,
+                            )
+                            .await
+                        {
+                            return Some(err);
+                        }
+                        remove_chunk_failed = true;
+                        break;
                     }
-                    remove_chunk_failed = true;
-                    break;
                 }
-            }
-            if remove_chunk_failed {
-                sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
-                continue;
-            }
+                if remove_chunk_failed {
+                    sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+                    continue;
+                }
 
-            progress.completed_steps = progress
-                .completed_steps
-                .saturating_add(remove_chunk.len() as u32);
-            self.persist_forward_rollout_state(service_id, manifest_id, settings, progress, None)
+                progress.completed_steps = progress
+                    .completed_steps
+                    .saturating_add(remove_chunk_indices.len() as u32);
+                self.persist_forward_rollout_state(
+                    service_id,
+                    manifest_id,
+                    settings,
+                    progress,
+                    None,
+                )
                 .await;
-            remove_cursor = end;
+                remove_cursor = end;
+            }
         }
 
         None
@@ -772,10 +1049,15 @@ impl ServiceController {
     }
 
     /// Attempts to restore old replicas and stop new ones after a rolling step fails.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "rollback needs the full private restore context to preserve old assignments"
+    )]
     async fn rollback_redeployment_tasks(
         &self,
         service_name: &str,
         current_spec: &ServiceSpecValue,
+        current_graph: &RolloutTemplateGraph,
         startup_timeout_secs: u32,
         monitor_secs: u32,
         rollback_new_task_ids: &HashSet<Uuid>,
@@ -820,16 +1102,7 @@ impl ServiceController {
         )
         .unwrap_or_default();
 
-        let mut rollback_steps: Vec<RollbackTaskRecord> =
-            rollback_old_tasks.values().cloned().collect();
-        rollback_steps.sort_by(|left, right| {
-            left.template
-                .cmp(&right.template)
-                .then(left.replica.cmp(&right.replica))
-                .then(left.task_id.cmp(&right.task_id))
-        });
-
-        for step in rollback_steps {
+        for step in current_graph.rollback_steps(&current_spec.tasks, rollback_old_tasks) {
             let template = old_templates_by_name.get(&step.template).ok_or_else(|| {
                 anyhow!(
                     "rollback template '{}' missing while restoring service '{}'",
@@ -969,6 +1242,7 @@ impl ServiceController {
         manifest_id: Uuid,
         update_strategy: &ServiceUpdateStrategy,
         current_spec: &ServiceSpecValue,
+        current_graph: &RolloutTemplateGraph,
         previous_status: ServiceStatus,
         settings: &RolloutSettings,
         progress: &RolloutProgress,
@@ -1002,6 +1276,7 @@ impl ServiceController {
                 .rollback_redeployment_tasks(
                     service_name,
                     current_spec,
+                    current_graph,
                     settings.startup_timeout_secs,
                     settings.monitor_secs,
                     rollback_new_task_ids,

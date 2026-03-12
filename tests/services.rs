@@ -4200,6 +4200,120 @@ local_test!(services_depends_on_waits_for_dependency_publication, {
     );
 });
 
+local_test!(
+    services_redeploy_depends_on_waits_for_dependency_stage_publication,
+    {
+        let _config_guard = ConfigOverrideGuard::control_plane_network_only();
+        let _guard = ContainerManagerOverrideGuard::install_default();
+
+        let cluster = TestNode::new_cluster_inproc_with_config(1, ClusterConfig::default())
+            .await
+            .expect("cluster should start");
+        let node = &cluster[0];
+        let network_id = create_logical_test_network(&cluster, "depends-on-rollout").await;
+
+        let backend = demo_networked_backend_task_template("backend", 2, network_id);
+        let mut frontend = demo_networked_backend_task_template("frontend", 1, network_id);
+        frontend.depends_on = vec!["backend".to_string()];
+
+        let service_name = "depends-on-rollout";
+        let service_id = node
+            .node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                service_name,
+                service_name,
+                vec![backend.clone(), frontend.clone()],
+            )
+            .await
+            .expect("submit baseline dependency deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "baseline dependency deployment should reach running"
+        );
+
+        let old_backend_task_ids: HashSet<Uuid> =
+            list_active_service_template_tasks(&node.node.task_manager, service_name, "backend")
+                .await
+                .into_iter()
+                .map(|task| task.id)
+                .collect();
+        let old_frontend_task_ids: HashSet<Uuid> =
+            list_active_service_template_tasks(&node.node.task_manager, service_name, "frontend")
+                .await
+                .into_iter()
+                .map(|task| task.id)
+                .collect();
+
+        let mut redeploy_backend = backend;
+        redeploy_backend.command = vec![
+            "-listen".to_string(),
+            ":8000".to_string(),
+            "-text".to_string(),
+            "hello from redeployed backend replica".to_string(),
+        ];
+        let mut redeploy_frontend = frontend;
+        redeploy_frontend.command = vec![
+            "-listen".to_string(),
+            ":8000".to_string(),
+            "-text".to_string(),
+            "hello from redeployed frontend replica".to_string(),
+        ];
+
+        node.node
+            .service_controller
+            .submit_deployment_with_strategy(
+                Uuid::new_v4(),
+                service_name,
+                service_name,
+                vec![redeploy_backend, redeploy_frontend],
+                rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, 1, true),
+            )
+            .await
+            .expect("submit dependency-aware redeployment");
+
+        let ordered = wait_for_template_replacement_after_dependency_publication(
+            node,
+            service_name,
+            &TemplateReplacementPublicationGate {
+                dependency_template: "backend",
+                old_dependency_task_ids: &old_backend_task_ids,
+                dependency_task_count: 2,
+                dependent_template: "frontend",
+                old_dependent_task_ids: &old_frontend_task_ids,
+                network_id,
+            },
+            Duration::from_secs(30),
+        )
+        .await;
+        if !ordered {
+            let debug =
+                collect_service_attachment_publication_debug(&[node], service_name, network_id)
+                    .await;
+            panic!(
+                "frontend replacement should only launch after backend replacements are published; {debug}"
+            );
+        }
+
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "dependency-aware redeployment should converge back to running"
+        );
+    }
+);
+
 /// Creates a logical overlay network on every test node and waits for controller-driven readiness.
 ///
 /// The split/merge publication test runs with dataplane features disabled, so the background
@@ -4634,6 +4748,69 @@ async fn wait_for_template_launch_after_dependency_publication(
             return false;
         }
         if dependency_ready && !dependent_tasks.is_empty() {
+            return true;
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    false
+}
+
+/// Waits until a dependent template replacement appears, failing if it starts before the full
+/// upstream replacement stage is running with published attachments.
+struct TemplateReplacementPublicationGate<'a> {
+    dependency_template: &'a str,
+    old_dependency_task_ids: &'a HashSet<Uuid>,
+    dependency_task_count: usize,
+    dependent_template: &'a str,
+    old_dependent_task_ids: &'a HashSet<Uuid>,
+    network_id: Uuid,
+}
+
+async fn wait_for_template_replacement_after_dependency_publication(
+    node: &TestNode,
+    service_name: &str,
+    gate: &TemplateReplacementPublicationGate<'_>,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let dependency_tasks = list_active_service_template_tasks(
+            &node.node.task_manager,
+            service_name,
+            gate.dependency_template,
+        )
+        .await;
+        let dependency_replaced = dependency_tasks.len() == gate.dependency_task_count
+            && dependency_tasks
+                .iter()
+                .all(|task| !gate.old_dependency_task_ids.contains(&task.id));
+        let dependency_ready = dependency_replaced
+            && template_attachments_published(
+                node,
+                service_name,
+                gate.dependency_template,
+                gate.network_id,
+                gate.dependency_task_count,
+            )
+            .await;
+        let dependent_tasks = list_active_service_template_tasks(
+            &node.node.task_manager,
+            service_name,
+            gate.dependent_template,
+        )
+        .await;
+        let dependent_replaced = !dependent_tasks.is_empty()
+            && dependent_tasks
+                .iter()
+                .all(|task| !gate.old_dependent_task_ids.contains(&task.id));
+
+        if dependent_replaced && !dependency_ready {
+            return false;
+        }
+        if dependency_ready && dependent_replaced {
             return true;
         }
 
