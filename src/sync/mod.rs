@@ -6,9 +6,8 @@
 //! 2. `get_ranges_for_view` narrows mismatches down to page digest ranges.
 //! 3. `open_delta_for_view` streams only the missing register/tombstone fragments.
 //!
-//! All modern sync traffic is scoped to an explicit `ClusterViewId`. The legacy
-//! non-view-scoped RPCs remain in the protocol only to preserve method numbers and are
-//! rejected at runtime.
+//! All sync traffic is scoped to an explicit `ClusterViewId` so anti-entropy stays
+//! inside one control-plane lineage.
 
 use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::store::cluster_view_store::ClusterViewDomainStore;
@@ -128,13 +127,6 @@ impl SyncService {
             volumes,
             volume_nodes,
         }
-    }
-
-    /// Returns an error when a peer requests legacy non-view-scoped sync methods.
-    fn legacy_sync_method_error(method: &str) -> capnp::Error {
-        capnp::Error::failed(format!(
-            "{method} is no longer supported; use the view-scoped sync RPCs"
-        ))
     }
 
     /// Validates that the requested view matches this node's active control-plane view.
@@ -323,30 +315,6 @@ impl DomainStoreRef<'_> {
 }
 
 impl sync::Server for SyncService {
-    async fn get_roots(
-        self: Rc<Self>,
-        _params: sync::GetRootsParams,
-        _results: sync::GetRootsResults,
-    ) -> Result<(), capnp::Error> {
-        Err(Self::legacy_sync_method_error("getRoots"))
-    }
-
-    async fn get_ranges(
-        self: Rc<Self>,
-        _params: sync::GetRangesParams,
-        _results: sync::GetRangesResults,
-    ) -> Result<(), capnp::Error> {
-        Err(Self::legacy_sync_method_error("getRanges"))
-    }
-
-    async fn open_delta(
-        self: Rc<Self>,
-        _params: sync::OpenDeltaParams,
-        _results: sync::OpenDeltaResults,
-    ) -> Result<(), capnp::Error> {
-        Err(Self::legacy_sync_method_error("openDelta"))
-    }
-
     /// Returns domain roots scoped to the caller-provided cluster view.
     async fn get_roots_for_view(
         self: Rc<Self>,

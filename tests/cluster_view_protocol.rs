@@ -115,18 +115,6 @@ local_test!(cluster_view_protocol_strict_inproc, {
         "view-scoped roots should expose all domains"
     );
 
-    let legacy_roots_req = node.node.sync_client.get_roots_request();
-    let legacy_roots_err = match legacy_roots_req.send().promise.await {
-        Ok(_) => panic!("legacy getRoots should be rejected"),
-        Err(err) => err,
-    };
-    let legacy_roots_msg = legacy_roots_err.to_string();
-    assert!(
-        legacy_roots_msg.contains("no longer supported"),
-        "unexpected legacy getRoots error: {}",
-        legacy_roots_msg
-    );
-
     let mut mismatched_roots_req = node.node.sync_client.get_roots_for_view_request();
     {
         let mut req = mismatched_roots_req.get().init_req();
@@ -170,19 +158,6 @@ local_test!(cluster_view_protocol_strict_inproc, {
         ranges.len(),
         VIEW_SCOPED_DOMAIN_COUNT as u32,
         "view-scoped ranges should expose all domains when none requested"
-    );
-
-    let mut legacy_ranges_req = node.node.sync_client.get_ranges_request();
-    legacy_ranges_req.get().init_domains(0);
-    let legacy_ranges_err = match legacy_ranges_req.send().promise.await {
-        Ok(_) => panic!("legacy getRanges should be rejected"),
-        Err(err) => err,
-    };
-    let legacy_ranges_msg = legacy_ranges_err.to_string();
-    assert!(
-        legacy_ranges_msg.contains("no longer supported"),
-        "unexpected legacy getRanges error: {}",
-        legacy_ranges_msg
     );
 
     // Merge should now register a durable operation record.
