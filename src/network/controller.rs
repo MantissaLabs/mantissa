@@ -187,11 +187,97 @@ impl NetworkController {
         }
     }
 
-    /// Reconcile the optional WireGuard underlay used to encrypt VXLAN traffic.
+    /// List every non-deleted network that currently expects a local dataplane reconcile.
     ///
-    /// This is a best-effort step that never blocks overlay provisioning: if WireGuard cannot be
-    /// configured on a node, Mantissa falls back to the existing plaintext underlay.
-    async fn reconcile_wireguard_underlay(&self) {
+    /// WireGuard failures are global to the node, but deployment gating still happens per network
+    /// through `NetworkPeerState`. This helper gives the controller the network identifiers that
+    /// must be marked `Error` when encrypted underlay setup is blocked.
+    fn active_network_ids(&self) -> Result<Vec<Uuid>> {
+        let specs = self
+            .inner
+            .registry
+            .list_specs()
+            .context("list network specs for wireguard scope")?;
+        Ok(specs
+            .into_iter()
+            .filter(|spec| !spec.is_deleted())
+            .map(|spec| spec.id)
+            .collect())
+    }
+
+    /// Snapshot every currently visible cluster peer except the local node.
+    ///
+    /// This acts as a bootstrap fallback while network peer readiness is still converging and the
+    /// scoped WireGuard set has not been derived from shared network state yet.
+    fn visible_cluster_peer_ids(&self) -> Result<HashSet<Uuid>> {
+        let peers = self
+            .inner
+            .cluster_registry
+            .peer_values_snapshot()
+            .context("load cluster peers for wireguard bootstrap")?;
+        Ok(peers
+            .into_iter()
+            .map(|(peer_id, _)| peer_id)
+            .filter(|peer_id| *peer_id != self.inner.node_id)
+            .collect())
+    }
+
+    /// Compute the remote peer set that must participate in the encrypted VXLAN underlay.
+    ///
+    /// Once network peer readiness has converged, the steady-state scope comes from shared Ready
+    /// networks. During bootstrap we fall back to visible cluster peers so multi-node encrypted
+    /// networks can establish WireGuard before any node advertises itself Ready.
+    fn desired_wireguard_peers(&self) -> Result<HashSet<Uuid>> {
+        let scoped = self
+            .inner
+            .registry
+            .wireguard_scope_peers(self.inner.node_id)
+            .context("derive scoped wireguard peers")?;
+        if !config::wireguard_enabled() || !scoped.is_empty() {
+            return Ok(scoped);
+        }
+
+        let active_network_ids = self.active_network_ids()?;
+        if active_network_ids.is_empty() {
+            return Ok(scoped);
+        }
+
+        let bootstrap = self.visible_cluster_peer_ids()?;
+        if !bootstrap.is_empty() {
+            debug!(
+                target: "network",
+                peers = bootstrap.len(),
+                networks = active_network_ids.len(),
+                "bootstrapping wireguard peer scope from visible cluster membership until network readiness converges"
+            );
+        }
+        Ok(bootstrap)
+    }
+
+    /// Reset cached underlay state and mark active networks as blocked by WireGuard.
+    ///
+    /// The controller uses peer-state `Error` rows to keep scheduling and deployment from routing
+    /// traffic onto plaintext or partially configured underlays.
+    async fn fail_wireguard_reconcile(&self, message: &str) -> Result<()> {
+        {
+            let mut guard = self.inner.wireguard.lock().await;
+            *guard = WireGuardUnderlayState::default();
+        }
+
+        for network_id in self.active_network_ids()? {
+            self.update_peer_state_error(network_id, message.to_string())
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Reconcile the mandatory WireGuard underlay used to encrypt VXLAN traffic.
+    ///
+    /// When WireGuard is enabled, a network may not advance to `Ready` until its scoped encrypted
+    /// underlay is available. Any failure here is surfaced through per-network error state instead
+    /// of silently falling back to plaintext.
+    async fn reconcile_wireguard_underlay(&self) -> Result<()> {
         // WireGuard provisioning is expensive (it rewrites interface + routes). The main network
         // reconciliation loop can invoke this helper multiple times per tick (pending specs,
         // pending forwarding, periodic sweep). Debounce here so we only touch kernel WireGuard once
@@ -202,23 +288,17 @@ impl NetworkController {
             if let Some(last) = *guard
                 && now.saturating_duration_since(last) < WIREGUARD_RECONCILE_DEBOUNCE
             {
-                return;
+                return Ok(());
             }
             *guard = Some(now);
         }
 
-        let desired_peer_ids = match self
-            .inner
-            .registry
-            .wireguard_scope_peers(self.inner.node_id)
-        {
+        let desired_peer_ids = match self.desired_wireguard_peers() {
             Ok(peers) => peers,
             Err(err) => {
-                warn!(
-                    target: "network",
-                    "failed to derive scoped wireguard peers; keeping previous underlay state: {err:#}"
-                );
-                return;
+                let message = format!("failed to derive mandatory wireguard peer scope: {err:#}");
+                self.fail_wireguard_reconcile(&message).await?;
+                return Err(err.context("derive mandatory wireguard peer scope"));
             }
         };
 
@@ -227,13 +307,14 @@ impl NetworkController {
             &self.inner.cluster_registry,
             self.inner.node_id,
             &desired_peer_ids,
-            Some(previous.clone()),
+            Some(previous),
         )
         .await
         {
             Ok(state) => {
                 let mut guard = self.inner.wireguard.lock().await;
                 if guard.underlay_active != state.underlay_active
+                    || guard.required_peer_count != state.required_peer_count
                     || guard.tunnel_ip != state.tunnel_ip
                     || guard.ifname != state.ifname
                     || guard.configured_peer_ids != state.configured_peer_ids
@@ -241,6 +322,7 @@ impl NetworkController {
                     debug!(
                         target: "network",
                         underlay_active = state.underlay_active,
+                        required_peers = state.required_peer_count,
                         ifname = %state.ifname,
                         tunnel_ip = ?state.tunnel_ip,
                         peers = state.configured_peer_ids.len(),
@@ -248,14 +330,16 @@ impl NetworkController {
                     );
                 }
                 *guard = state;
+                Ok(())
             }
             Err(err) => {
                 warn!(
                     target: "network",
-                    "wireguard underlay reconcile failed; continuing without encryption: {err:#}"
+                    "wireguard underlay reconcile failed; blocking encrypted network provisioning: {err:#}"
                 );
-                let mut guard = self.inner.wireguard.lock().await;
-                *guard = previous;
+                let message = format!("wireguard underlay reconcile failed: {err:#}");
+                self.fail_wireguard_reconcile(&message).await?;
+                Err(err.context("reconcile mandatory wireguard underlay"))
             }
         }
     }
@@ -323,7 +407,7 @@ impl NetworkController {
             return Ok(());
         }
 
-        self.reconcile_wireguard_underlay().await;
+        self.reconcile_wireguard_underlay().await?;
 
         for network_id in pending {
             let spec_opt = self.inner.registry.get_spec(network_id)?;
@@ -354,7 +438,7 @@ impl NetworkController {
             return Ok(());
         }
 
-        self.reconcile_wireguard_underlay().await;
+        self.reconcile_wireguard_underlay().await?;
 
         for network_id in queued {
             match self.inner.registry.get_spec(network_id) {
@@ -406,7 +490,7 @@ impl NetworkController {
         *guard = Some(root);
         drop(guard);
 
-        self.reconcile_wireguard_underlay().await;
+        self.reconcile_wireguard_underlay().await?;
 
         let specs = self
             .inner
@@ -419,7 +503,7 @@ impl NetworkController {
                 continue;
             }
             let (mut plan, _) = self.prepare_plan(&mut spec)?;
-            self.apply_wireguard_overrides(&mut plan).await;
+            self.apply_wireguard_overrides(&mut plan).await?;
             if let Err(err) = self.reconcile_remote_forwarding(&plan).await {
                 warn!(
                     target: "network",
@@ -459,7 +543,7 @@ impl NetworkController {
     }
 
     async fn reconcile_once(&self) -> Result<()> {
-        self.reconcile_wireguard_underlay().await;
+        self.reconcile_wireguard_underlay().await?;
 
         let specs = self
             .inner
@@ -500,7 +584,7 @@ impl NetworkController {
 
     async fn reconcile_network(&self, mut spec: NetworkSpecValue) -> Result<()> {
         let (mut plan, spec_changed) = self.prepare_plan(&mut spec)?;
-        self.apply_wireguard_overrides(&mut plan).await;
+        self.apply_wireguard_overrides(&mut plan).await?;
         if spec_changed {
             self.inner
                 .registry
@@ -841,10 +925,17 @@ impl NetworkController {
     /// Apply runtime wireguard decisions to the network plan.
     ///
     /// This adjusts MTU and VXLAN underlay selection without mutating the replicated network spec.
-    async fn apply_wireguard_overrides(&self, plan: &mut NetworkPlan) {
+    async fn apply_wireguard_overrides(&self, plan: &mut NetworkPlan) -> Result<()> {
         let state = { self.inner.wireguard.lock().await.clone() };
+        if config::wireguard_enabled() && state.required_peer_count > 0 && !state.underlay_active {
+            anyhow::bail!(
+                "wireguard underlay required for {} scoped peers but is not ready yet",
+                state.required_peer_count
+            );
+        }
+
         if !state.underlay_active {
-            return;
+            return Ok(());
         }
 
         if let Some(underlay_ip) = state.tunnel_ip {
@@ -852,6 +943,8 @@ impl NetworkController {
             plan.underlay_ip = Some(underlay_ip);
             plan.mtu = plan.mtu.min(wireguard::MANTISSA_WIREGUARD_VXLAN_MTU);
         }
+
+        Ok(())
     }
 
     /// Track the current VXLAN interface index for the network and clear forwarding caches when

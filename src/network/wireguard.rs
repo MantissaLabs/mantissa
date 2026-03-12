@@ -44,6 +44,12 @@ pub struct WireGuardUnderlayState {
     /// Whether the controller should use WireGuard for the VXLAN underlay on this node.
     pub underlay_active: bool,
 
+    /// Number of remote peers that currently require an encrypted VXLAN underlay on this node.
+    ///
+    /// When this is non-zero, plaintext fallback is not allowed. The network controller uses this
+    /// to block network readiness until the scoped WireGuard peer set is fully configured.
+    pub required_peer_count: usize,
+
     /// The WireGuard interface name (stable).
     pub ifname: String,
 
@@ -104,6 +110,7 @@ struct LocalWireGuardConfig {
 fn inactive_wireguard_state() -> WireGuardUnderlayState {
     WireGuardUnderlayState {
         underlay_active: false,
+        required_peer_count: 0,
         ifname: MANTISSA_WIREGUARD_IFNAME.to_string(),
         tunnel_ip: None,
         config_hash: None,
@@ -332,7 +339,7 @@ async fn apply_wireguard_interface_config(
         wgapi
             .configure_peer_routing(&peers)
             .context("configure wireguard peer routing")?;
-        ensure_vxlan_firewall_accept(&interface_config.name);
+        ensure_vxlan_firewall_accept(&interface_config.name)?;
         Ok(())
     })
     .await
@@ -371,24 +378,18 @@ async fn reconcile_wireguard_kernel_state(
 /// Publication happens after the local kernel device is configured so remote peers never see an
 /// enabled advertisement for a node that still lacks its interface.
 #[cfg(target_os = "linux")]
-async fn publish_local_wireguard_state(registry: &Registry, local: &LocalWireGuardConfig) -> bool {
-    match registry
+async fn publish_local_wireguard_state(
+    registry: &Registry,
+    local: &LocalWireGuardConfig,
+) -> Result<()> {
+    registry
         .upsert_self_wireguard(WireGuardPeerValue {
             public_key: local.keys.public_bytes(),
             port: local.listen_port,
             enabled: true,
         })
         .await
-    {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::warn!(
-                target: "network",
-                "wireguard configured but could not publish self enabled state yet: {err}"
-            );
-            false
-        }
-    }
+        .context("publish self wireguard state")
 }
 
 /// Report whether the scoped peer set is ready for VXLAN traffic to switch onto the tunnel.
@@ -480,6 +481,7 @@ fn build_wireguard_underlay_state(
         underlay_active: published
             && peer_plan.desired_peer_count > 0
             && scoped_ready_for_encryption,
+        required_peer_count: peer_plan.desired_peer_count,
         ifname,
         tunnel_ip: Some(tunnel_ip),
         config_hash: Some(config_hash),
@@ -496,8 +498,9 @@ fn build_wireguard_underlay_state(
 /// current underlay state decision.
 ///
 /// This function is called by the network controller reconciliation loop. It is designed to be:
-/// - **Best-effort**: failures do not stop the overlay; Mantissa falls back to the plaintext
-///   underlay.
+/// - **Mandatory when scoped peers exist**: once a node must exchange VXLAN traffic with remote
+///   peers, failure to prepare WireGuard aborts network readiness instead of falling back to
+///   plaintext.
 /// - **Idempotent**: repeated calls converge to the same kernel configuration.
 /// - **Self-contained**: requires no external `wg` tooling and uses the Peers CRDT to discover
 ///   peer keys and endpoints for the subset of nodes that currently share a Ready network with the
@@ -509,7 +512,17 @@ pub async fn ensure_wireguard_underlay(
     desired_peer_ids: &HashSet<Uuid>,
     previous: Option<WireGuardUnderlayState>,
 ) -> Result<WireGuardUnderlayState> {
-    if !config::wireguard_enabled() || unsafe { libc::geteuid() } != 0 {
+    if !config::wireguard_enabled() {
+        return Ok(inactive_wireguard_state());
+    }
+
+    let wireguard_required = !desired_peer_ids.is_empty();
+    if unsafe { libc::geteuid() } != 0 {
+        if wireguard_required {
+            anyhow::bail!(
+                "wireguard underlay requires root privileges while encrypted networks are active"
+            );
+        }
         return Ok(inactive_wireguard_state());
     }
 
@@ -518,7 +531,17 @@ pub async fn ensure_wireguard_underlay(
     let peer_plan = load_wireguard_peer_plan(registry, self_id, desired_peer_ids)?;
     let (config_hash, last_configured_at) =
         reconcile_wireguard_kernel_state(&local, &peer_plan, previous.as_ref(), now).await?;
-    let published = publish_local_wireguard_state(registry, &local).await;
+    let published = match publish_local_wireguard_state(registry, &local).await {
+        Ok(()) => true,
+        Err(err) if wireguard_required => return Err(err),
+        Err(err) => {
+            tracing::warn!(
+                target: "network",
+                "wireguard configured but could not publish self enabled state yet: {err:#}"
+            );
+            false
+        }
+    };
 
     // Only switch the VXLAN underlay once every scoped peer has successfully configured its own
     // WireGuard interface. This keeps unrelated cluster members out of the readiness gate while
@@ -614,12 +637,14 @@ fn build_wireguard_endpoint(advertise: &str, listen_port: u16) -> Option<String>
 /// - `wg show` appears healthy
 /// - overlay service discovery / health probes time out across nodes
 ///
-/// We add a minimal INPUT/OUTPUT allow rule for UDP/4789 on the WireGuard interface as a
-/// best-effort step. Failures are logged and do not block networking setup.
+/// We add a minimal INPUT/OUTPUT allow rule for UDP/4789 on the WireGuard interface as part of
+/// mandatory encrypted underlay setup. When firewall management is enabled, failure to install
+/// these rules aborts WireGuard readiness so Mantissa never silently falls back to a broken or
+/// plaintext dataplane.
 #[cfg(target_os = "linux")]
-fn ensure_vxlan_firewall_accept(ifname: &str) {
+fn ensure_vxlan_firewall_accept(ifname: &str) -> Result<()> {
     if !config::wireguard_manage_firewall() {
-        return;
+        return Ok(());
     }
 
     let port = MANTISSA_VXLAN_UDP_PORT.to_string();
@@ -636,21 +661,15 @@ fn ensure_vxlan_firewall_accept(ifname: &str) {
 
     // INPUT chain: admit VXLAN packets arriving from the tunnel.
     if !ip6tables_has_rule("INPUT", &spec) {
-        if let Err(err) = ip6tables_insert_rule("INPUT", &spec) {
-            tracing::debug!(
-                target: "network",
-                ifname,
-                error = %err,
-                "failed to add ip6tables INPUT rule for VXLAN over wireguard"
-            );
-        } else {
-            tracing::debug!(
-                target: "network",
-                ifname,
-                port = MANTISSA_VXLAN_UDP_PORT,
-                "installed ip6tables INPUT accept rule for VXLAN over wireguard"
-            );
-        }
+        ip6tables_insert_rule("INPUT", &spec).with_context(|| {
+            format!("add ip6tables INPUT rule for VXLAN over wireguard on {ifname}")
+        })?;
+        tracing::debug!(
+            target: "network",
+            ifname,
+            port = MANTISSA_VXLAN_UDP_PORT,
+            "installed ip6tables INPUT accept rule for VXLAN over wireguard"
+        );
     }
 
     // OUTPUT chain: admit locally generated VXLAN packets egressing the tunnel (usually already
@@ -666,26 +685,24 @@ fn ensure_vxlan_firewall_accept(ifname: &str) {
         "ACCEPT",
     ];
     if !ip6tables_has_rule("OUTPUT", &output_spec) {
-        if let Err(err) = ip6tables_insert_rule("OUTPUT", &output_spec) {
-            tracing::debug!(
-                target: "network",
-                ifname,
-                error = %err,
-                "failed to add ip6tables OUTPUT rule for VXLAN over wireguard"
-            );
-        } else {
-            tracing::debug!(
-                target: "network",
-                ifname,
-                port = MANTISSA_VXLAN_UDP_PORT,
-                "installed ip6tables OUTPUT accept rule for VXLAN over wireguard"
-            );
-        }
+        ip6tables_insert_rule("OUTPUT", &output_spec).with_context(|| {
+            format!("add ip6tables OUTPUT rule for VXLAN over wireguard on {ifname}")
+        })?;
+        tracing::debug!(
+            target: "network",
+            ifname,
+            port = MANTISSA_VXLAN_UDP_PORT,
+            "installed ip6tables OUTPUT accept rule for VXLAN over wireguard"
+        );
     }
+
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn ensure_vxlan_firewall_accept(_ifname: &str) {}
+fn ensure_vxlan_firewall_accept(_ifname: &str) -> Result<()> {
+    Ok(())
+}
 
 /// Remove stale `/128` tunnel routes from the WireGuard interface.
 ///
