@@ -2,7 +2,7 @@
 name = "mantissa"
 version = "0.1.0"
 authors = ["Alexandre Beslic"]
-license = "MIT/Apache-2.0"
+license = "Apache-2.0"
 description = "Decentralized cluster management"
 homepage = "https://mantissa.io"
 repository = "https://github.com/abronan/mantissa"
@@ -19,6 +19,9 @@ members = [
     "crates/ui",
     "crates/network-ebpf",
 ]
+
+[workspace.package]
+license = "Apache-2.0"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

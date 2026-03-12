@@ -2,7 +2,7 @@
 name = "net"
 version = "0.1.0"
 edition = "2024"
-license = "MIT/Apache-2.0"
+license.workspace = true
 description = "Network and communication utilities"
 
 [lints]

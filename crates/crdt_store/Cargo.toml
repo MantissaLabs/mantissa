@@ -2,7 +2,7 @@
 name = "crdt_store"
 version = "0.1.0"
 edition = "2024"
-license = "MIT/Apache-2.0"
+license.workspace = true
 description = "Generic Redb-backed CRDT store with Merkle Search Tree summaries"
 
 [lints]
