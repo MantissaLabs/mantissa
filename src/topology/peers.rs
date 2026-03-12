@@ -123,8 +123,8 @@ impl PeerSchedulingState {
 
 /// WireGuard configuration advertised by a peer for encrypting the VXLAN underlay.
 ///
-/// This struct is stored in the Peers CRDT so every node can deterministically build
-/// a full mesh WireGuard underlay without any extra out-of-band configuration.
+/// This struct is stored in the Peers CRDT so every node can deterministically build the subset of
+/// WireGuard peers required for the Ready overlay networks it currently shares with remote nodes.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct WireGuardPeerValue {
     /// Curve25519 public key used by WireGuard for this peer.

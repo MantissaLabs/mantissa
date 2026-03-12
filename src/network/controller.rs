@@ -207,10 +207,26 @@ impl NetworkController {
             *guard = Some(now);
         }
 
+        let desired_peer_ids = match self
+            .inner
+            .registry
+            .wireguard_scope_peers(self.inner.node_id)
+        {
+            Ok(peers) => peers,
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    "failed to derive scoped wireguard peers; keeping previous underlay state: {err:#}"
+                );
+                return;
+            }
+        };
+
         let previous = { self.inner.wireguard.lock().await.clone() };
         match wireguard::ensure_wireguard_underlay(
             &self.inner.cluster_registry,
             self.inner.node_id,
+            &desired_peer_ids,
             Some(previous.clone()),
         )
         .await
@@ -220,12 +236,14 @@ impl NetworkController {
                 if guard.underlay_active != state.underlay_active
                     || guard.tunnel_ip != state.tunnel_ip
                     || guard.ifname != state.ifname
+                    || guard.configured_peer_ids != state.configured_peer_ids
                 {
                     debug!(
                         target: "network",
                         underlay_active = state.underlay_active,
                         ifname = %state.ifname,
                         tunnel_ip = ?state.tunnel_ip,
+                        peers = state.configured_peer_ids.len(),
                         "wireguard underlay state updated"
                     );
                 }
@@ -1219,14 +1237,25 @@ impl NetworkController {
 
     /// Resolve the VXLAN underlay destination address to reach `peer_id`.
     ///
-    /// When WireGuard underlay is active, we route VXLAN to the peer's deterministic tunnel IPv6.
-    /// Otherwise we fall back to the peer's advertised RPC address IP (current behavior).
+    /// When WireGuard underlay is active, we only route peers inside the scoped WireGuard set to
+    /// their deterministic tunnel IPv6 addresses. Any peer outside that set is skipped instead of
+    /// falling back to the plaintext address because the local VXLAN device is already pinned to
+    /// the WireGuard interface.
     async fn peer_ip_for_node(&self, peer_id: Uuid) -> Option<IpAddr> {
         if peer_id == self.inner.node_id {
             return None;
         }
 
-        if self.inner.wireguard.lock().await.underlay_active {
+        let state = { self.inner.wireguard.lock().await.clone() };
+        if state.underlay_active {
+            if !state.configured_peer_ids.contains(&peer_id) {
+                debug!(
+                    target: "network",
+                    peer = %peer_id,
+                    "wireguard underlay active but peer is outside the scoped wireguard set; skipping forwarding entry"
+                );
+                return None;
+            }
             if self
                 .inner
                 .cluster_registry

@@ -1,6 +1,6 @@
 use crate::config;
 use crate::registry::Registry;
-use crate::topology::peers::WireGuardPeerValue;
+use crate::topology::peers::{PeerValue, WireGuardPeerValue};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use std::collections::{HashSet, hash_map::DefaultHasher};
@@ -55,6 +55,13 @@ pub struct WireGuardUnderlayState {
 
     /// Timestamp of the last successful WireGuard configuration apply.
     pub last_configured_at: Option<Instant>,
+
+    /// Remote peers currently programmed on the local WireGuard interface.
+    ///
+    /// The controller uses this scoped set to decide which remote VXLAN peers can safely route
+    /// over the tunnel. Any peer outside this set must be skipped while the local VXLAN devices are
+    /// pinned to the WireGuard underlay interface.
+    pub configured_peer_ids: HashSet<Uuid>,
 }
 
 /// Snapshot the per-peer configuration fields that affect the kernel WireGuard interface.
@@ -65,6 +72,18 @@ struct PeerConfigFingerprint {
     endpoint: String,
     allowed_ip: Ipv6Addr,
     keepalive: u16,
+}
+
+/// Pure summary of the remote peers this node should configure on its WireGuard interface.
+///
+/// The controller passes a desired peer scope derived from shared Ready networks. This planner then
+/// intersects that scope with the visible peer metadata snapshot so view-scoped exclusions do not
+/// block local convergence.
+struct WireGuardPeerPlan {
+    peer_configs: Vec<PeerConfigFingerprint>,
+    desired_peer_count: usize,
+    all_desired_peers_advertised: bool,
+    all_desired_peers_enabled: bool,
 }
 
 /// Compute a stable hash for the WireGuard interface configuration so we only reconfigure when needed.
@@ -103,6 +122,65 @@ fn should_reconfigure_wireguard(
     now.saturating_duration_since(last) >= WIREGUARD_FORCE_REFRESH_INTERVAL
 }
 
+/// Build the scoped peer configuration plan for the current node.
+///
+/// Only peers present in both the caller-provided desired scope and the local peer snapshot are
+/// considered. This keeps split-view exclusions from blocking encryption for the peers that remain
+/// visible in the local controller scope.
+fn build_wireguard_peer_plan(
+    peers_snapshot: &[(Uuid, PeerValue)],
+    self_id: Uuid,
+    desired_peer_ids: &HashSet<Uuid>,
+) -> WireGuardPeerPlan {
+    let mut peer_configs = Vec::new();
+    let mut desired_peer_count = 0usize;
+    let mut all_desired_peers_advertised = true;
+    let mut all_desired_peers_enabled = true;
+
+    for (peer_id, peer_value) in peers_snapshot {
+        if *peer_id == self_id || !desired_peer_ids.contains(peer_id) {
+            continue;
+        }
+
+        desired_peer_count += 1;
+        let Some(wg) = peer_value.wireguard.as_ref() else {
+            all_desired_peers_advertised = false;
+            all_desired_peers_enabled = false;
+            continue;
+        };
+
+        if !wg.enabled {
+            all_desired_peers_enabled = false;
+        }
+
+        let endpoint = match build_wireguard_endpoint(&peer_value.address, wg.port) {
+            Some(endpoint) => endpoint,
+            None => {
+                all_desired_peers_advertised = false;
+                all_desired_peers_enabled = false;
+                continue;
+            }
+        };
+
+        peer_configs.push(PeerConfigFingerprint {
+            peer_id: *peer_id,
+            public_key: wg.public_key,
+            endpoint,
+            allowed_ip: net::wireguard::wireguard_tunnel_ipv6(*peer_id),
+            keepalive: 25,
+        });
+    }
+
+    peer_configs.sort_by_key(|peer| peer.peer_id);
+
+    WireGuardPeerPlan {
+        peer_configs,
+        desired_peer_count,
+        all_desired_peers_advertised,
+        all_desired_peers_enabled,
+    }
+}
+
 /// Ensure the Mantissa-managed WireGuard underlay is configured on this node and return the
 /// current underlay state decision.
 ///
@@ -111,11 +189,13 @@ fn should_reconfigure_wireguard(
 ///   underlay.
 /// - **Idempotent**: repeated calls converge to the same kernel configuration.
 /// - **Self-contained**: requires no external `wg` tooling and uses the Peers CRDT to discover
-///   peer keys and endpoints.
+///   peer keys and endpoints for the subset of nodes that currently share a Ready network with the
+///   local node.
 #[cfg(target_os = "linux")]
 pub async fn ensure_wireguard_underlay(
     registry: &Registry,
     self_id: Uuid,
+    desired_peer_ids: &HashSet<Uuid>,
     previous: Option<WireGuardUnderlayState>,
 ) -> Result<WireGuardUnderlayState> {
     if !config::wireguard_enabled() {
@@ -125,6 +205,7 @@ pub async fn ensure_wireguard_underlay(
             tunnel_ip: None,
             config_hash: None,
             last_configured_at: None,
+            configured_peer_ids: HashSet::new(),
         });
     }
 
@@ -135,6 +216,7 @@ pub async fn ensure_wireguard_underlay(
             tunnel_ip: None,
             config_hash: None,
             last_configured_at: None,
+            configured_peer_ids: HashSet::new(),
         });
     }
 
@@ -168,56 +250,17 @@ pub async fn ensure_wireguard_underlay(
     let peers_snapshot = registry
         .peer_values_snapshot()
         .context("load peers snapshot for wireguard")?;
+    let peer_plan = build_wireguard_peer_plan(&peers_snapshot, self_id, desired_peer_ids);
 
-    let mut peer_configs = Vec::new();
-    let mut peer_count = 0usize;
-    let mut all_peers_advertised = true;
-    let mut all_peers_enabled = true;
-
-    for (peer_id, peer_value) in peers_snapshot {
-        if peer_id == self_id {
-            continue;
-        }
-
-        peer_count += 1;
-        let Some(wg) = peer_value.wireguard else {
-            all_peers_advertised = false;
-            all_peers_enabled = false;
-            continue;
-        };
-
-        if !wg.enabled {
-            all_peers_enabled = false;
-        }
-
-        let endpoint = match build_wireguard_endpoint(&peer_value.address, wg.port) {
-            Some(ep) => ep,
-            None => {
-                all_peers_advertised = false;
-                all_peers_enabled = false;
-                continue;
-            }
-        };
-
-        peer_configs.push(PeerConfigFingerprint {
-            peer_id,
-            public_key: wg.public_key,
-            endpoint,
-            allowed_ip: net::wireguard::wireguard_tunnel_ipv6(peer_id),
-            keepalive: 25,
-        });
-    }
-
-    peer_configs.sort_by_key(|peer| peer.peer_id);
-
-    let config_hash = compute_wireguard_config_hash(listen_port, tunnel_ip, &peer_configs);
+    let config_hash =
+        compute_wireguard_config_hash(listen_port, tunnel_ip, &peer_plan.peer_configs);
     let should_configure = should_reconfigure_wireguard(previous.as_ref(), config_hash, now);
 
     let ifname = MANTISSA_WIREGUARD_IFNAME.to_string();
 
     let last_configured_at = if should_configure {
-        let mut peers = Vec::with_capacity(peer_configs.len());
-        for peer_config in &peer_configs {
+        let mut peers = Vec::with_capacity(peer_plan.peer_configs.len());
+        for peer_config in &peer_plan.peer_configs {
             let mut peer = defguard_wireguard_rs::host::Peer::new(
                 defguard_wireguard_rs::key::Key::new(peer_config.public_key),
             );
@@ -284,22 +327,23 @@ pub async fn ensure_wireguard_underlay(
         }
     };
 
-    // Only switch the VXLAN underlay once every peer has successfully configured its own
-    // WireGuard interface (enabled = true). This avoids one node switching early and breaking
-    // cross-node overlay traffic during cluster bootstrap or rolling restarts.
-    let cluster_ready_for_encryption =
-        peer_count == 0 || (all_peers_advertised && all_peers_enabled);
+    // Only switch the VXLAN underlay once every scoped peer has successfully configured its own
+    // WireGuard interface. This keeps unrelated cluster members out of the readiness gate while
+    // still preventing one side of an actively shared network from switching too early.
+    let scoped_ready_for_encryption = peer_plan.desired_peer_count == 0
+        || (peer_plan.all_desired_peers_advertised && peer_plan.all_desired_peers_enabled);
 
-    if prefer_underlay && peer_count > 0 && !cluster_ready_for_encryption {
+    if prefer_underlay && peer_plan.desired_peer_count > 0 && !scoped_ready_for_encryption {
         tracing::debug!(
             target: "network",
-            "wireguard underlay preference set but cluster not ready yet; keeping plaintext underlay"
+            peers = peer_plan.desired_peer_count,
+            "wireguard underlay preference set but scoped peers are not ready yet; keeping plaintext underlay"
         );
     }
 
     if published
-        && cluster_ready_for_encryption
-        && peer_count > 0
+        && scoped_ready_for_encryption
+        && peer_plan.desired_peer_count > 0
         && !prefer_underlay
         && let Err(err) = net::wireguard::persist_wireguard_underlay_preference(true)
     {
@@ -309,9 +353,9 @@ pub async fn ensure_wireguard_underlay(
         );
     }
 
-    let mut desired_tunnel_routes = HashSet::with_capacity(peer_configs.len() + 1);
+    let mut desired_tunnel_routes = HashSet::with_capacity(peer_plan.peer_configs.len() + 1);
     desired_tunnel_routes.insert(tunnel_v6);
-    desired_tunnel_routes.extend(peer_configs.iter().map(|peer| peer.allowed_ip));
+    desired_tunnel_routes.extend(peer_plan.peer_configs.iter().map(|peer| peer.allowed_ip));
     if let Err(err) = prune_stale_wireguard_routes(&ifname, &desired_tunnel_routes).await {
         tracing::warn!(
             target: "network",
@@ -321,11 +365,18 @@ pub async fn ensure_wireguard_underlay(
     }
 
     Ok(WireGuardUnderlayState {
-        underlay_active: published && cluster_ready_for_encryption,
+        underlay_active: published
+            && peer_plan.desired_peer_count > 0
+            && scoped_ready_for_encryption,
         ifname,
         tunnel_ip: Some(tunnel_ip),
         config_hash: Some(config_hash),
         last_configured_at,
+        configured_peer_ids: peer_plan
+            .peer_configs
+            .iter()
+            .map(|peer| peer.peer_id)
+            .collect(),
     })
 }
 
@@ -334,6 +385,7 @@ pub async fn ensure_wireguard_underlay(
 pub async fn ensure_wireguard_underlay(
     _registry: &Registry,
     _self_id: Uuid,
+    _desired_peer_ids: &HashSet<Uuid>,
     _previous: Option<WireGuardUnderlayState>,
 ) -> Result<WireGuardUnderlayState> {
     Ok(WireGuardUnderlayState::default())
@@ -612,4 +664,113 @@ fn ip6tables_insert_rule(chain: &str, spec: &[&str]) -> std::io::Result<()> {
     })?;
     ip6t.insert("filter", chain, &rule, 1)
         .map_err(|err| std::io::Error::other(format!("ip6tables insert failed: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WireGuardPeerPlan, build_wireguard_peer_plan};
+    use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    /// Build one minimal peer value for scoped WireGuard planning tests.
+    fn test_peer_value(address: &str, wireguard: Option<WireGuardPeerValue>) -> PeerValue {
+        PeerValue {
+            address: address.to_string(),
+            hostname: "peer".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard,
+            scheduling: PeerSchedulingState::schedulable_default(Uuid::nil()),
+        }
+    }
+
+    /// Collect peer identifiers from the plan for assertion readability.
+    fn planned_peer_ids(plan: &WireGuardPeerPlan) -> Vec<Uuid> {
+        plan.peer_configs.iter().map(|peer| peer.peer_id).collect()
+    }
+
+    /// Ensure the planner only includes peers inside the caller-provided scope.
+    #[test]
+    fn scoped_plan_ignores_unrelated_peers() {
+        let self_id = Uuid::new_v4();
+        let scoped_peer = Uuid::new_v4();
+        let unrelated_peer = Uuid::new_v4();
+        let desired = HashSet::from([scoped_peer]);
+        let peers = vec![
+            (
+                scoped_peer,
+                test_peer_value(
+                    "10.0.0.2:51820",
+                    Some(WireGuardPeerValue {
+                        public_key: [7u8; 32],
+                        port: 0,
+                        enabled: true,
+                    }),
+                ),
+            ),
+            (
+                unrelated_peer,
+                test_peer_value(
+                    "10.0.0.3:51820",
+                    Some(WireGuardPeerValue {
+                        public_key: [8u8; 32],
+                        port: 0,
+                        enabled: true,
+                    }),
+                ),
+            ),
+        ];
+
+        let plan = build_wireguard_peer_plan(&peers, self_id, &desired);
+
+        assert_eq!(plan.desired_peer_count, 1);
+        assert_eq!(planned_peer_ids(&plan), vec![scoped_peer]);
+        assert!(plan.all_desired_peers_advertised);
+        assert!(plan.all_desired_peers_enabled);
+    }
+
+    /// Ensure unrelated peers do not block scoped readiness, while a scoped peer without metadata
+    /// still does.
+    #[test]
+    fn scoped_plan_only_gates_on_selected_peers() {
+        let self_id = Uuid::new_v4();
+        let ready_peer = Uuid::new_v4();
+        let missing_peer = Uuid::new_v4();
+        let unrelated_peer = Uuid::new_v4();
+        let desired = HashSet::from([ready_peer, missing_peer]);
+        let peers = vec![
+            (
+                ready_peer,
+                test_peer_value(
+                    "10.0.0.2:51820",
+                    Some(WireGuardPeerValue {
+                        public_key: [7u8; 32],
+                        port: 0,
+                        enabled: true,
+                    }),
+                ),
+            ),
+            (missing_peer, test_peer_value("inproc://peer", None)),
+            (
+                unrelated_peer,
+                test_peer_value(
+                    "inproc://peer",
+                    Some(WireGuardPeerValue {
+                        public_key: [9u8; 32],
+                        port: 0,
+                        enabled: true,
+                    }),
+                ),
+            ),
+        ];
+
+        let plan = build_wireguard_peer_plan(&peers, self_id, &desired);
+
+        assert_eq!(plan.desired_peer_count, 2);
+        assert_eq!(planned_peer_ids(&plan), vec![ready_peer]);
+        assert!(!plan.all_desired_peers_advertised);
+        assert!(!plan.all_desired_peers_enabled);
+    }
 }
