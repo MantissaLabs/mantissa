@@ -9,6 +9,7 @@ use crate::gpu::gpu_runtime_status;
 use crate::task::container::ContainerState;
 use crate::task::types::{TaskEvent, TaskSpec};
 
+use super::ReconcileTaskGuard;
 use super::TaskManager;
 use super::launch::ContainerLaunchRequest;
 use super::planner::BatchStartPlan;
@@ -27,6 +28,8 @@ impl TaskManager {
         for plan in plans.iter_mut() {
             plan.container_name = format!("mantissa-{}", plan.id);
         }
+
+        let _launch_guards = self.claim_batch_reconcile_guards(plans).await?;
 
         let pending_specs = match self.persist_pending_batch(plans).await {
             Ok(specs) => specs,
@@ -62,6 +65,35 @@ impl TaskManager {
                 Err(err)
             }
         }
+    }
+
+    /// Claims reconcile guards for every task in the batch so periodic reconcile cannot race
+    /// one explicit launch and start the same task id twice.
+    async fn claim_batch_reconcile_guards(
+        &self,
+        plans: &[BatchStartPlan],
+    ) -> Result<Vec<ReconcileTaskGuard>, anyhow::Error> {
+        let mut guards = Vec::with_capacity(plans.len());
+        let mut seen = HashSet::with_capacity(plans.len());
+
+        for plan in plans {
+            if !seen.insert(plan.id) {
+                return Err(anyhow!(
+                    "duplicate local launch entry for task {} in one batch",
+                    plan.id
+                ));
+            }
+
+            let Some(guard) = self.try_begin_reconcile(plan.id).await else {
+                return Err(anyhow!(
+                    "task {} already has a local reconcile or launch in progress",
+                    plan.id
+                ));
+            };
+            guards.push(guard);
+        }
+
+        Ok(guards)
     }
 
     /// Persists pending task specs before container launch so other nodes see in-flight placement.

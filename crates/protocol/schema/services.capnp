@@ -259,6 +259,9 @@ struct ServiceSpec {
 
   rollout @12 :RolloutState;
   # Rollout progress and last failure diagnostics.
+
+  statusDetail @13 :Text;
+  # Human-readable detail describing why the current lifecycle status is blocked or waiting.
 }
 
 struct ServiceEvent {

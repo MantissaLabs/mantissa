@@ -145,6 +145,7 @@ pub(crate) fn write_service_spec(
         builder.reborrow().init_update_strategy(),
         &value.update_strategy,
     );
+    builder.set_status_detail(value.status_detail.as_deref().unwrap_or(""));
 
     let mut tasks_builder = builder.reborrow().init_tasks(value.tasks.len() as u32);
     for (idx, task) in value.tasks.iter().enumerate() {
@@ -228,6 +229,14 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
         ServiceRolloutState::default()
     };
     value.status = proto_to_service_status(reader.get_status()?);
+    value.status_detail = {
+        let detail = reader.get_status_detail()?.to_str()?.trim().to_string();
+        if detail.is_empty() {
+            None
+        } else {
+            Some(detail)
+        }
+    };
     value.update_strategy = if reader.has_update_strategy() {
         read_update_strategy(reader.get_update_strategy()?)?
     } else {

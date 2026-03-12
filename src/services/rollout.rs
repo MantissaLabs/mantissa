@@ -651,12 +651,16 @@ impl ServiceController {
                 continue;
             }
             self.wait_for_dependency_task_ids_ready(
-                phase.rollout.service_name,
-                &template.name,
-                &template.depends_on,
-                &phase.template_graph.replica_counts,
+                DependencyGateContext {
+                    service_id: phase.rollout.service_id,
+                    manifest_id: phase.rollout.manifest_id,
+                    service_name: phase.rollout.service_name,
+                    template_name: &template.name,
+                    depends_on: &template.depends_on,
+                    template_replica_counts: &phase.template_graph.replica_counts,
+                    update_strategy: phase.update_strategy,
+                },
                 &dependency_task_ids,
-                phase.update_strategy,
             )
             .await?;
         }

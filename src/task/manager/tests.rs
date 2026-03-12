@@ -43,8 +43,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tempfile::tempdir;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 
 type ExecCall = (String, Vec<String>, Option<std::time::Duration>);
 
@@ -356,6 +357,96 @@ impl AttachmentProvisionerApi for RetryingAttachmentProvisioner {
             ));
         }
         drop(remaining);
+
+        let mut guard = self.attachments.lock().await;
+        guard.insert(request.attachment_id);
+        Ok(())
+    }
+
+    async fn teardown_attachment(&self, attachment_id: Uuid) -> Result<()> {
+        let mut guard = self.attachments.lock().await;
+        guard.remove(&attachment_id);
+        Ok(())
+    }
+
+    async fn ensure_remote_fdb(
+        &self,
+        _vxlan_name: &str,
+        _mac: &str,
+        _dst: std::net::IpAddr,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn remove_remote_fdb(
+        &self,
+        _vxlan_name: &str,
+        _mac: &str,
+        _dst: std::net::IpAddr,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn ensure_flood_entry(&self, _vxlan_name: &str, _dst: std::net::IpAddr) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn remove_flood_entry(&self, _vxlan_name: &str, _dst: std::net::IpAddr) -> Result<()> {
+        Ok(())
+    }
+
+    async fn list_remote_fdb(&self, _vxlan_name: &str) -> Result<Vec<(String, std::net::IpAddr)>> {
+        Ok(Vec::new())
+    }
+}
+
+struct BlockingAttachmentProvisioner {
+    attachments: AsyncMutex<HashSet<Uuid>>,
+    entered_count: AtomicUsize,
+    release_ready: AtomicBool,
+    entered: Notify,
+    release: Notify,
+}
+
+impl Default for BlockingAttachmentProvisioner {
+    fn default() -> Self {
+        Self {
+            attachments: AsyncMutex::new(HashSet::new()),
+            entered_count: AtomicUsize::new(0),
+            release_ready: AtomicBool::new(false),
+            entered: Notify::new(),
+            release: Notify::new(),
+        }
+    }
+}
+
+impl BlockingAttachmentProvisioner {
+    async fn wait_for_first_attempt(&self) {
+        while self.entered_count.load(Ordering::SeqCst) == 0 {
+            self.entered.notified().await;
+        }
+    }
+
+    fn release_first_attempt(&self) {
+        self.release_ready.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl AttachmentProvisionerApi for BlockingAttachmentProvisioner {
+    async fn attachment_exists(&self, attachment_id: Uuid) -> Result<bool> {
+        let guard = self.attachments.lock().await;
+        Ok(guard.contains(&attachment_id))
+    }
+
+    async fn ensure_attachment(&self, request: &AttachmentProvisioningRequest<'_>) -> Result<()> {
+        if self.entered_count.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.entered.notify_waiters();
+            while !self.release_ready.load(Ordering::SeqCst) {
+                self.release.notified().await;
+            }
+        }
 
         let mut guard = self.attachments.lock().await;
         guard.insert(request.attachment_id);
@@ -1436,6 +1527,92 @@ async fn reconcile_stale_pending_input_does_not_repull_running_task() {
         matches!(refreshed.state, ContainerState::Running),
         "task should remain running after stale reconcile input"
     );
+}
+
+#[tokio::test]
+async fn reconcile_local_tasks_does_not_duplicate_batch_launch_in_progress() {
+    let attachment = Arc::new(BlockingAttachmentProvisioner::default());
+    let (manager, scheduler, mock_cm, network_registry) =
+        setup_manager_with_forwarding(None, Some(attachment.clone())).await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "race-net".to_string(),
+        description: "batch launch race".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.47.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
+    network_registry
+        .upsert_spec(spec.clone())
+        .await
+        .expect("upsert network spec");
+    network_registry
+        .upsert_peer_state(NetworkPeerStateValue::new(
+            spec.id,
+            manager.local_node_id,
+            "local-node",
+            NetworkPeerState::Ready,
+            None,
+        ))
+        .await
+        .expect("upsert local network peer state");
+
+    let request = TaskStartRequest {
+        name: "launch-race".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        cpu_millis: 200,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        id: None,
+        slot_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: vec![spec.id],
+        service_metadata: None,
+        target_node: None,
+    };
+
+    let reconcile_manager = manager.clone();
+    let attachment_for_wait = attachment.clone();
+    let (launch_result, ()) = tokio::join!(
+        async move { manager.start_tasks_batch(vec![request]).await },
+        async move {
+            attachment_for_wait.wait_for_first_attempt().await;
+            reconcile_manager
+                .reconcile_local_tasks()
+                .await
+                .expect("reconcile during launch should succeed");
+            attachment_for_wait.release_first_attempt();
+        }
+    );
+
+    let mut specs = launch_result.expect("batch launch should complete");
+    assert_eq!(specs.len(), 1, "batch launch should still return one task");
+
+    let created = mock_cm.created.lock().await.clone();
+    assert_eq!(
+        created.len(),
+        1,
+        "reconcile must not create a duplicate container while the batch launch is in progress"
+    );
+
+    let task_spec = specs.remove(0);
+    assert_eq!(task_spec.networks, vec![spec.id]);
 }
 
 #[tokio::test]

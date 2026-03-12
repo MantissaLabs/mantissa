@@ -4155,6 +4155,16 @@ local_test!(services_depends_on_waits_for_dependency_publication, {
         .await
         .expect("submit dependency-ordered deployment");
 
+    assert!(
+        wait_for_service_status_detail(
+            &node.node.service_controller,
+            service_id,
+            "waiting for dependency template 'backend'"
+        )
+        .await,
+        "dependency gate should publish a human-readable wait reason while frontend is blocked"
+    );
+
     let ordered = wait_for_template_launch_after_dependency_publication(
         node,
         "depends-on-publication",
@@ -5486,6 +5496,28 @@ async fn wait_for_service_status(
     .await
 }
 
+/// Waits until the replicated service spec exposes a lifecycle detail containing the substring.
+async fn wait_for_service_status_detail(
+    manager: &ServiceController,
+    service_id: Uuid,
+    expected_substring: &str,
+) -> bool {
+    wait_until(
+        Duration::from_secs(20),
+        Duration::from_millis(50),
+        || async {
+            match manager.registry().get(service_id) {
+                Ok(Some(spec)) => spec
+                    .status_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains(expected_substring)),
+                _ => false,
+            }
+        },
+    )
+    .await
+}
+
 async fn wait_for_service_spec_all(
     cluster: &[TestNode],
     service_id: Uuid,
@@ -5650,6 +5682,7 @@ fn service_spec_matches_expected(actual: &ServiceSpecValue, expected: &ServiceSp
         && actual.phase_version == expected.phase_version
         && actual.rollout == expected.rollout
         && actual.status == expected.status
+        && actual.status_detail == expected.status_detail
         && actual.reschedule_lock == expected.reschedule_lock
 }
 

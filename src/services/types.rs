@@ -25,10 +25,13 @@ pub struct ServiceSpecValue {
     #[serde(default)]
     pub status: ServiceStatus,
     #[serde(default)]
+    pub status_detail: Option<String>,
+    #[serde(default)]
     pub reschedule_lock: Option<ServiceRescheduleLock>,
 }
 
 impl ServiceSpecValue {
+    /// Builds one replicated service spec value with default lifecycle metadata.
     pub fn new(
         manifest_id: Uuid,
         manifest_name: impl Into<String>,
@@ -53,29 +56,48 @@ impl ServiceSpecValue {
             phase_version: 0,
             rollout: ServiceRolloutState::default(),
             status: ServiceStatus::Running,
+            status_detail: None,
             reschedule_lock: None,
         }
     }
 
+    /// Refreshes the logical update timestamp after one in-memory mutation.
     pub fn touch(&mut self) {
         self.updated_at = current_timestamp();
     }
 
+    /// Starts one new deployment generation and resets per-generation phase ordering.
     pub fn start_new_generation(&mut self) {
         self.service_epoch = self.service_epoch.saturating_add(1);
         self.phase_version = 0;
         self.touch();
     }
 
+    /// Returns the current coarse lifecycle status for callers that only need the enum state.
     pub fn status(&self) -> ServiceStatus {
         self.status
     }
 
+    /// Updates the coarse lifecycle status and clears any detail attached to the previous state.
     pub fn set_status(&mut self, status: ServiceStatus) {
-        if self.status != status {
+        if self.status != status || self.status_detail.is_some() {
             self.phase_version = self.phase_version.saturating_add(1);
         }
         self.status = status;
+        self.status_detail = None;
+        self.touch();
+    }
+
+    /// Updates the human-readable lifecycle detail shown while a service stays in one status.
+    pub fn set_status_detail(&mut self, detail: Option<String>) {
+        let detail = detail.and_then(|detail| {
+            let trimmed = detail.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+        if self.status_detail != detail {
+            self.phase_version = self.phase_version.saturating_add(1);
+        }
+        self.status_detail = detail;
         self.touch();
     }
 

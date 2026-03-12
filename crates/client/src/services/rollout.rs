@@ -49,6 +49,12 @@ fn render_rollout_status(row: &ServiceRow) -> String {
     let phase = rollout_phase_label(row.rollout.phase);
     let progress = rollout_progress_label(&row.rollout);
     let failures = rollout_failures_label(&row.rollout);
+    let status_detail = row
+        .status_detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|msg| !msg.is_empty())
+        .unwrap_or("-");
     let last_error = row
         .rollout
         .last_error
@@ -58,7 +64,7 @@ fn render_rollout_status(row: &ServiceRow) -> String {
         .unwrap_or("-");
 
     format!(
-        "service: {}\nid: {}\nstatus: {}\nrollout outcome: {outcome}\nrollout phase: {phase}\nrollout progress: {progress}\nrollout failures: {failures}\nlast error: {last_error}\nupdated: {}",
+        "service: {}\nid: {}\nstatus: {}\nstatus detail: {status_detail}\nrollout outcome: {outcome}\nrollout phase: {phase}\nrollout progress: {progress}\nrollout failures: {failures}\nlast error: {last_error}\nupdated: {}",
         row.service_name, row.id, row.status, row.updated_at,
     )
 }
@@ -122,6 +128,7 @@ mod tests {
         phase: ServiceRolloutPhaseRow,
         failed_steps: u32,
         max_failures: u16,
+        status_detail: Option<&str>,
         last_error: Option<&str>,
     ) -> ServiceRow {
         ServiceRow {
@@ -131,6 +138,7 @@ mod tests {
             updated_at: "2026-03-07T00:00:00Z".to_string(),
             task_ids: Vec::new(),
             status,
+            status_detail: status_detail.map(str::to_string),
             rollout: ServiceRolloutRow {
                 phase,
                 total_steps: 4,
@@ -152,6 +160,7 @@ mod tests {
             0,
             3,
             None,
+            None,
         );
         assert_eq!(classify_rollout_outcome(&row), "stable");
     }
@@ -164,6 +173,7 @@ mod tests {
             ServiceRolloutPhaseRow::Idle,
             1,
             3,
+            None,
             Some("new image failed"),
         );
         assert_eq!(classify_rollout_outcome(&row), "rolled-back");
@@ -177,6 +187,7 @@ mod tests {
             ServiceRolloutPhaseRow::Failed,
             3,
             3,
+            None,
             Some("too many failures"),
         );
         assert_eq!(classify_rollout_outcome(&row), "failed");
@@ -191,7 +202,24 @@ mod tests {
             0,
             3,
             None,
+            None,
         );
         assert_eq!(classify_rollout_outcome(&row), "blocked");
+    }
+
+    #[test]
+    /// Ensures rollout status output includes the current lifecycle detail when one exists.
+    fn render_rollout_status_includes_status_detail() {
+        let row = test_row(
+            ServiceStatusRow::Deploying,
+            ServiceRolloutPhaseRow::Idle,
+            0,
+            3,
+            Some("waiting for backend to publish traffic"),
+            None,
+        );
+
+        let rendered = render_rollout_status(&row);
+        assert!(rendered.contains("status detail: waiting for backend to publish traffic"));
     }
 }

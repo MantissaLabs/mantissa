@@ -820,11 +820,10 @@ impl ServiceController {
             if !template.depends_on.is_empty()
                 && let Err(err) = self
                     .wait_for_template_dependencies_ready(
-                        &service_name,
+                        &deployment,
                         &template,
                         &template_replica_counts,
                         &launched_task_ids,
-                        &update_strategy,
                     )
                     .await
             {
@@ -896,6 +895,8 @@ impl ServiceController {
                 ordered_known_task_ids(&templates, &assignments),
             )
             .await?;
+        self.update_service_status_detail_if_current(service_id, manifest_id, None)
+            .await;
 
         let controller = self.clone();
         tokio::task::spawn_local(async move {
@@ -916,99 +917,227 @@ impl ServiceController {
     /// Both initial staged deployment and dependency-aware rolling updates use this to keep one
     /// downstream template from launching before every required upstream replica is actually
     /// discoverable and dataplane-ready.
-    async fn wait_for_dependency_task_ids_ready(
+    async fn update_service_status_detail_if_current(
+        &self,
+        service_id: Uuid,
+        manifest_id: Uuid,
+        detail: Option<String>,
+    ) {
+        let detail = detail.and_then(|detail| {
+            let trimmed = detail.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+
+        let current = match self.registry.get(service_id) {
+            Ok(Some(spec)) if spec.manifest_id == manifest_id => spec,
+            Ok(Some(_)) | Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(
+                    target: "services",
+                    "failed to load service {service_id} while updating status detail: {err}"
+                );
+                return;
+            }
+        };
+
+        if current.status() != ServiceStatus::Deploying || current.status_detail == detail {
+            return;
+        }
+
+        let mut updated = current;
+        updated.set_status_detail(detail);
+        if let Err(err) = self.apply_upsert(updated.clone()).await {
+            tracing::warn!(
+                target: "services",
+                "failed to persist status detail for service '{}': {err}",
+                updated.service_name
+            );
+            return;
+        }
+        if let Err(err) = self.broadcast(ServiceEvent::Upsert(updated.clone())).await {
+            tracing::warn!(
+                target: "services",
+                "failed to broadcast status detail for service '{}': {err}",
+                updated.service_name
+            );
+        }
+    }
+
+    /// Computes the next dependency-gate wait reason, if any, for one downstream template.
+    async fn dependency_gate_wait_detail(
         &self,
         service_name: &str,
         template_name: &str,
         depends_on: &[String],
         template_replica_counts: &HashMap<String, u16>,
         dependency_task_ids: &HashMap<String, Vec<Uuid>>,
-        update_strategy: &ServiceUpdateStrategy,
+    ) -> anyhow::Result<Option<String>> {
+        for dependency in depends_on {
+            let expected_replicas = template_replica_counts
+                .get(dependency)
+                .copied()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "template '{}' in service '{}' depends on unknown template '{}'",
+                        template_name,
+                        service_name,
+                        dependency
+                    )
+                })? as usize;
+            let Some(dependency_task_ids) = dependency_task_ids.get(dependency) else {
+                return Ok(Some(format_dependency_gate_wait_detail(
+                    service_name,
+                    template_name,
+                    dependency,
+                    DependencyGateBlock::Assigned,
+                    0,
+                    expected_replicas,
+                )));
+            };
+            if dependency_task_ids.len() != expected_replicas {
+                return Ok(Some(format_dependency_gate_wait_detail(
+                    service_name,
+                    template_name,
+                    dependency,
+                    DependencyGateBlock::Assigned,
+                    dependency_task_ids.len(),
+                    expected_replicas,
+                )));
+            }
+
+            let mut running_replicas = 0usize;
+            let mut published_replicas = 0usize;
+            for task_id in dependency_task_ids {
+                let spec = self.task_manager.inspect_task(*task_id).await?;
+                match spec.state {
+                    ContainerState::Running => {
+                        running_replicas = running_replicas.saturating_add(1);
+                        if self
+                            .task_manager
+                            .ensure_task_service_traffic_ready(*task_id)
+                            .await?
+                        {
+                            published_replicas = published_replicas.saturating_add(1);
+                        }
+                    }
+                    ContainerState::Failed
+                    | ContainerState::Stopped
+                    | ContainerState::Exited(_) => {
+                        return Err(anyhow!(
+                            "dependency task {} for template '{}' in service '{}' entered terminal state {:?}",
+                            task_id,
+                            dependency,
+                            service_name,
+                            spec.state
+                        ));
+                    }
+                    ContainerState::Pending
+                    | ContainerState::Pulling
+                    | ContainerState::Creating
+                    | ContainerState::VolumeUnavailable
+                    | ContainerState::Paused
+                    | ContainerState::Stopping
+                    | ContainerState::Unknown => {}
+                }
+            }
+
+            if running_replicas != expected_replicas {
+                return Ok(Some(format_dependency_gate_wait_detail(
+                    service_name,
+                    template_name,
+                    dependency,
+                    DependencyGateBlock::Running,
+                    running_replicas,
+                    expected_replicas,
+                )));
+            }
+            if published_replicas != expected_replicas {
+                return Ok(Some(format_dependency_gate_wait_detail(
+                    service_name,
+                    template_name,
+                    dependency,
+                    DependencyGateBlock::Published,
+                    published_replicas,
+                    expected_replicas,
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Waits for dependency templates to be assigned, running, traffic-published, and stable.
+    async fn wait_for_dependency_task_ids_ready(
+        &self,
+        gate: DependencyGateContext<'_>,
+        dependency_task_ids: &HashMap<String, Vec<Uuid>>,
     ) -> anyhow::Result<()> {
         let startup_timeout =
-            Duration::from_secs(update_strategy.rolling.startup_timeout_secs.max(1) as u64);
+            Duration::from_secs(gate.update_strategy.rolling.startup_timeout_secs.max(1) as u64);
         let monitor_window =
-            Duration::from_secs(update_strategy.rolling.monitor_secs.max(1) as u64);
+            Duration::from_secs(gate.update_strategy.rolling.monitor_secs.max(1) as u64);
         let deadline = Instant::now() + startup_timeout;
         let mut stable_since: Option<Instant> = None;
+        let mut last_detail: Option<String> = None;
 
         loop {
             if Instant::now() >= deadline {
                 return Err(anyhow!(
                     "timed out waiting for dependencies {:?} of template '{}' in service '{}' to become ready",
-                    depends_on,
-                    template_name,
-                    service_name
+                    gate.depends_on,
+                    gate.template_name,
+                    gate.service_name
                 ));
             }
 
-            let mut ready = true;
-            for dependency in depends_on {
-                let expected_replicas = template_replica_counts
-                    .get(dependency)
-                    .copied()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "template '{}' in service '{}' depends on unknown template '{}'",
-                            template_name,
-                            service_name,
-                            dependency
-                        )
-                    })? as usize;
-                let Some(dependency_task_ids) = dependency_task_ids.get(dependency) else {
-                    ready = false;
-                    continue;
-                };
-                if dependency_task_ids.len() != expected_replicas {
-                    ready = false;
-                    continue;
-                }
-
-                for task_id in dependency_task_ids {
-                    let spec = self.task_manager.inspect_task(*task_id).await?;
-                    match spec.state {
-                        ContainerState::Running => {
-                            if !self
-                                .task_manager
-                                .ensure_task_service_traffic_ready(*task_id)
-                                .await?
-                            {
-                                ready = false;
-                            }
-                        }
-                        ContainerState::Failed
-                        | ContainerState::Stopped
-                        | ContainerState::Exited(_) => {
-                            return Err(anyhow!(
-                                "dependency task {} for template '{}' in service '{}' entered terminal state {:?}",
-                                task_id,
-                                dependency,
-                                service_name,
-                                spec.state
-                            ));
-                        }
-                        ContainerState::Pending
-                        | ContainerState::Pulling
-                        | ContainerState::Creating
-                        | ContainerState::VolumeUnavailable
-                        | ContainerState::Paused
-                        | ContainerState::Stopping => {
-                            ready = false;
-                        }
-                        ContainerState::Unknown => {
-                            ready = false;
-                        }
-                    }
-                }
-            }
-
-            if ready {
-                let stable_at = stable_since.get_or_insert_with(Instant::now);
-                if stable_at.elapsed() >= monitor_window {
-                    return Ok(());
+            if let Some(detail) = self
+                .dependency_gate_wait_detail(
+                    gate.service_name,
+                    gate.template_name,
+                    gate.depends_on,
+                    gate.template_replica_counts,
+                    dependency_task_ids,
+                )
+                .await?
+            {
+                stable_since = None;
+                if last_detail.as_deref() != Some(detail.as_str()) {
+                    self.update_service_status_detail_if_current(
+                        gate.service_id,
+                        gate.manifest_id,
+                        Some(detail.clone()),
+                    )
+                    .await;
+                    last_detail = Some(detail);
                 }
             } else {
-                stable_since = None;
+                let stable_at = stable_since.get_or_insert_with(Instant::now);
+                if stable_at.elapsed() >= monitor_window {
+                    if last_detail.is_some() {
+                        self.update_service_status_detail_if_current(
+                            gate.service_id,
+                            gate.manifest_id,
+                            None,
+                        )
+                        .await;
+                    }
+                    return Ok(());
+                }
+
+                let detail = format_dependency_gate_stability_detail(
+                    gate.service_name,
+                    gate.template_name,
+                    gate.depends_on,
+                );
+                if last_detail.as_deref() != Some(detail.as_str()) {
+                    self.update_service_status_detail_if_current(
+                        gate.service_id,
+                        gate.manifest_id,
+                        Some(detail.clone()),
+                    )
+                    .await;
+                    last_detail = Some(detail);
+                }
             }
 
             sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
@@ -1019,19 +1148,22 @@ impl ServiceController {
     /// networks, published for service traffic.
     async fn wait_for_template_dependencies_ready(
         &self,
-        service_name: &str,
+        deployment: &ServiceDeploymentContext<'_>,
         template: &ServiceTaskSpecValue,
         template_replica_counts: &HashMap<String, u16>,
         launched_task_ids: &HashMap<String, Vec<Uuid>>,
-        update_strategy: &ServiceUpdateStrategy,
     ) -> anyhow::Result<()> {
         self.wait_for_dependency_task_ids_ready(
-            service_name,
-            &template.name,
-            &template.depends_on,
-            template_replica_counts,
+            DependencyGateContext {
+                service_id: compute_service_id(deployment.service_name),
+                manifest_id: deployment.manifest_id,
+                service_name: deployment.service_name,
+                template_name: &template.name,
+                depends_on: &template.depends_on,
+                template_replica_counts,
+                update_strategy: deployment.update_strategy,
+            },
             launched_task_ids,
-            update_strategy,
         )
         .await
     }
@@ -1765,6 +1897,60 @@ struct ServiceRedeploymentJob {
     templates: Vec<ServiceTaskSpecValue>,
     current_spec: ServiceSpecValue,
     update_strategy: ServiceUpdateStrategy,
+}
+
+/// Bundles immutable metadata for one dependency gate while a downstream template is blocked.
+#[derive(Clone, Copy)]
+struct DependencyGateContext<'a> {
+    service_id: Uuid,
+    manifest_id: Uuid,
+    service_name: &'a str,
+    template_name: &'a str,
+    depends_on: &'a [String],
+    template_replica_counts: &'a HashMap<String, u16>,
+    update_strategy: &'a ServiceUpdateStrategy,
+}
+
+/// Distinguishes the dependency-gate phase that is currently blocking one downstream template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DependencyGateBlock {
+    Assigned,
+    Running,
+    Published,
+}
+
+/// Formats one human-readable dependency wait reason for persisted service status details.
+fn format_dependency_gate_wait_detail(
+    service_name: &str,
+    template_name: &str,
+    dependency_name: &str,
+    block: DependencyGateBlock,
+    ready_replicas: usize,
+    expected_replicas: usize,
+) -> String {
+    match block {
+        DependencyGateBlock::Assigned => format!(
+            "service '{service_name}' waiting for dependency template '{dependency_name}' before launching template '{template_name}' ({ready_replicas}/{expected_replicas} replicas assigned)"
+        ),
+        DependencyGateBlock::Running => format!(
+            "service '{service_name}' waiting for dependency template '{dependency_name}' before launching template '{template_name}' ({ready_replicas}/{expected_replicas} replicas running)"
+        ),
+        DependencyGateBlock::Published => format!(
+            "service '{service_name}' waiting for dependency template '{dependency_name}' before launching template '{template_name}' ({ready_replicas}/{expected_replicas} replicas traffic-published)"
+        ),
+    }
+}
+
+/// Formats the stability-window message shown after dependencies become ready but before cutover.
+fn format_dependency_gate_stability_detail(
+    service_name: &str,
+    template_name: &str,
+    depends_on: &[String],
+) -> String {
+    let dependency_summary = depends_on.join(", ");
+    format!(
+        "service '{service_name}' monitoring dependency readiness before launching template '{template_name}' ({dependency_summary})"
+    )
 }
 
 /// Builds the individual task start requests for every replica defined in the service manifest.
