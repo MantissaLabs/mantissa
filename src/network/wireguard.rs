@@ -86,6 +86,32 @@ struct WireGuardPeerPlan {
     all_desired_peers_enabled: bool,
 }
 
+/// Local inputs required to reconcile the Mantissa-managed kernel WireGuard interface.
+///
+/// Keeping the node-local values together makes the main reconcile path read as:
+/// load local identity -> compute remote peer plan -> apply/publish/prune.
+#[cfg(target_os = "linux")]
+struct LocalWireGuardConfig {
+    ifname: String,
+    keys: net::wireguard::WireGuardKeys,
+    listen_port: u16,
+    tunnel_v6: Ipv6Addr,
+    tunnel_ip: IpAddr,
+    prefer_underlay: bool,
+}
+
+/// Return the inert underlay state used when WireGuard is disabled or unsupported on this host.
+fn inactive_wireguard_state() -> WireGuardUnderlayState {
+    WireGuardUnderlayState {
+        underlay_active: false,
+        ifname: MANTISSA_WIREGUARD_IFNAME.to_string(),
+        tunnel_ip: None,
+        config_hash: None,
+        last_configured_at: None,
+        configured_peer_ids: HashSet::new(),
+    }
+}
+
 /// Compute a stable hash for the WireGuard interface configuration so we only reconfigure when needed.
 fn compute_wireguard_config_hash(
     listen_port: u16,
@@ -120,6 +146,51 @@ fn should_reconfigure_wireguard(
     };
 
     now.saturating_duration_since(last) >= WIREGUARD_FORCE_REFRESH_INTERVAL
+}
+
+/// Load the persisted preference for using WireGuard as the VXLAN underlay.
+///
+/// Preference read failures should not disable networking, so this helper logs and falls back to
+/// plaintext underlay selection.
+#[cfg(target_os = "linux")]
+fn load_wireguard_underlay_preference_or_default() -> bool {
+    match net::wireguard::load_wireguard_underlay_preference() {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                target: "network",
+                "failed to read wireguard underlay preference; defaulting to plaintext: {err}"
+            );
+            false
+        }
+    }
+}
+
+/// Load the local WireGuard identity, port, and deterministic tunnel address for this node.
+///
+/// These inputs are stable across reconciliations and are shared by every later step.
+#[cfg(target_os = "linux")]
+fn load_local_wireguard_config(self_id: Uuid) -> Result<LocalWireGuardConfig> {
+    let keys_path =
+        net::wireguard::resolve_wireguard_key_path().context("resolve wireguard key path")?;
+    let keys = net::wireguard::load_or_generate_wireguard_keys(keys_path)
+        .context("load wireguard keys")?;
+    let listen_port =
+        net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
+            None,
+            config::wireguard_port_override(),
+        )
+        .context("load wireguard listen port")?;
+    let tunnel_v6 = net::wireguard::wireguard_tunnel_ipv6(self_id);
+
+    Ok(LocalWireGuardConfig {
+        ifname: MANTISSA_WIREGUARD_IFNAME.to_string(),
+        keys,
+        listen_port,
+        tunnel_v6,
+        tunnel_ip: IpAddr::V6(tunnel_v6),
+        prefer_underlay: load_wireguard_underlay_preference_or_default(),
+    })
 }
 
 /// Build the scoped peer configuration plan for the current node.
@@ -181,6 +252,246 @@ fn build_wireguard_peer_plan(
     }
 }
 
+/// Load the peer snapshot and build the scoped remote configuration plan for this node.
+///
+/// The desired peer scope comes from the network controller and already excludes unrelated
+/// cluster members. This helper only intersects that scope with the current peer metadata.
+#[cfg(target_os = "linux")]
+fn load_wireguard_peer_plan(
+    registry: &Registry,
+    self_id: Uuid,
+    desired_peer_ids: &HashSet<Uuid>,
+) -> Result<WireGuardPeerPlan> {
+    let peers_snapshot = registry
+        .peer_values_snapshot()
+        .context("load peers snapshot for wireguard")?;
+    Ok(build_wireguard_peer_plan(
+        &peers_snapshot,
+        self_id,
+        desired_peer_ids,
+    ))
+}
+
+/// Convert the scoped peer plan into kernel WireGuard peer objects.
+///
+/// Keeping the protocol-facing peer fingerprint separate from the kernel object creation keeps
+/// the planner pure and the kernel apply code focused on translation.
+#[cfg(target_os = "linux")]
+fn build_kernel_wireguard_peers(
+    peer_plan: &WireGuardPeerPlan,
+) -> Result<Vec<defguard_wireguard_rs::host::Peer>> {
+    let mut peers = Vec::with_capacity(peer_plan.peer_configs.len());
+    for peer_config in &peer_plan.peer_configs {
+        let mut peer = defguard_wireguard_rs::host::Peer::new(
+            defguard_wireguard_rs::key::Key::new(peer_config.public_key),
+        );
+        peer.set_allowed_ips(vec![defguard_wireguard_rs::net::IpAddrMask::host(
+            IpAddr::V6(peer_config.allowed_ip),
+        )]);
+        peer.persistent_keepalive_interval = Some(peer_config.keepalive);
+        peer.set_endpoint(&peer_config.endpoint)
+            .with_context(|| format!("set wireguard endpoint for peer {}", peer_config.peer_id))?;
+        peers.push(peer);
+    }
+    Ok(peers)
+}
+
+/// Apply the desired WireGuard interface and peer routing state to the kernel.
+///
+/// This is the expensive part of reconciliation, so callers should only invoke it after the
+/// configuration hash says a refresh is necessary.
+#[cfg(target_os = "linux")]
+async fn apply_wireguard_interface_config(
+    local: &LocalWireGuardConfig,
+    peer_plan: &WireGuardPeerPlan,
+) -> Result<()> {
+    let peers = build_kernel_wireguard_peers(peer_plan)?;
+    let interface_config = defguard_wireguard_rs::InterfaceConfiguration {
+        name: local.ifname.clone(),
+        prvkey: BASE64_STANDARD.encode(local.keys.to_private_bytes()),
+        addresses: vec![defguard_wireguard_rs::net::IpAddrMask::host(
+            local.tunnel_ip,
+        )],
+        port: local.listen_port,
+        peers: peers.clone(),
+        mtu: Some(MANTISSA_WIREGUARD_MTU),
+    };
+    let ifname_for_blocking = local.ifname.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi};
+
+        let mut wgapi =
+            WGApi::<Kernel>::new(ifname_for_blocking).context("create WGApi<Kernel>")?;
+        wgapi
+            .create_interface()
+            .context("create wireguard interface")?;
+        wgapi
+            .configure_interface(&interface_config)
+            .context("configure wireguard interface")?;
+        wgapi
+            .configure_peer_routing(&peers)
+            .context("configure wireguard peer routing")?;
+        ensure_vxlan_firewall_accept(&interface_config.name);
+        Ok(())
+    })
+    .await
+    .context("wireguard configuration task panicked")??;
+
+    Ok(())
+}
+
+/// Reconcile the kernel WireGuard device when the computed configuration differs from the last apply.
+///
+/// The returned hash/timestamp pair is persisted in controller state so later reconciliations can
+/// skip expensive rewrites while still forcing a periodic refresh for external drift.
+#[cfg(target_os = "linux")]
+async fn reconcile_wireguard_kernel_state(
+    local: &LocalWireGuardConfig,
+    peer_plan: &WireGuardPeerPlan,
+    previous: Option<&WireGuardUnderlayState>,
+    now: Instant,
+) -> Result<(u64, Option<Instant>)> {
+    let config_hash =
+        compute_wireguard_config_hash(local.listen_port, local.tunnel_ip, &peer_plan.peer_configs);
+
+    if should_reconfigure_wireguard(previous, config_hash, now) {
+        apply_wireguard_interface_config(local, peer_plan).await?;
+        return Ok((config_hash, Some(now)));
+    }
+
+    Ok((
+        config_hash,
+        previous.and_then(|state| state.last_configured_at),
+    ))
+}
+
+/// Publish this node's WireGuard advertisement back into the Peers CRDT.
+///
+/// Publication happens after the local kernel device is configured so remote peers never see an
+/// enabled advertisement for a node that still lacks its interface.
+#[cfg(target_os = "linux")]
+async fn publish_local_wireguard_state(registry: &Registry, local: &LocalWireGuardConfig) -> bool {
+    match registry
+        .upsert_self_wireguard(WireGuardPeerValue {
+            public_key: local.keys.public_bytes(),
+            port: local.listen_port,
+            enabled: true,
+        })
+        .await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                target: "network",
+                "wireguard configured but could not publish self enabled state yet: {err}"
+            );
+            false
+        }
+    }
+}
+
+/// Report whether the scoped peer set is ready for VXLAN traffic to switch onto the tunnel.
+///
+/// Nodes with no shared encrypted peers keep the underlay inactive. Otherwise every scoped peer
+/// must advertise WireGuard metadata and mark itself enabled.
+#[cfg(target_os = "linux")]
+fn scoped_wireguard_peers_ready(peer_plan: &WireGuardPeerPlan) -> bool {
+    peer_plan.desired_peer_count == 0
+        || (peer_plan.all_desired_peers_advertised && peer_plan.all_desired_peers_enabled)
+}
+
+/// Log when a persisted underlay preference exists but the scoped peer set is not ready yet.
+///
+/// This makes delayed encryption activation easier to understand without burying the main
+/// reconcile flow in logging-specific conditionals.
+#[cfg(target_os = "linux")]
+fn log_unready_wireguard_preference(
+    prefer_underlay: bool,
+    peer_plan: &WireGuardPeerPlan,
+    ready: bool,
+) {
+    if prefer_underlay && peer_plan.desired_peer_count > 0 && !ready {
+        tracing::debug!(
+            target: "network",
+            peers = peer_plan.desired_peer_count,
+            "wireguard underlay preference set but scoped peers are not ready yet; keeping plaintext underlay"
+        );
+    }
+}
+
+/// Persist the underlay preference once every scoped peer is ready for encrypted VXLAN.
+///
+/// Mantissa only flips this sticky preference after the local node is configured and every remote
+/// peer in scope has published an enabled advertisement.
+#[cfg(target_os = "linux")]
+fn persist_wireguard_underlay_preference_if_ready(
+    prefer_underlay: bool,
+    published: bool,
+    peer_plan: &WireGuardPeerPlan,
+    ready: bool,
+) {
+    if published
+        && ready
+        && peer_plan.desired_peer_count > 0
+        && !prefer_underlay
+        && let Err(err) = net::wireguard::persist_wireguard_underlay_preference(true)
+    {
+        tracing::warn!(
+            target: "network",
+            "failed to persist wireguard underlay preference; may not survive restarts: {err}"
+        );
+    }
+}
+
+/// Prune stale tunnel routes that no longer belong to the local node or its scoped peers.
+///
+/// Route cleanup is best-effort because stale peer routes should not block overlay reconciliation.
+#[cfg(target_os = "linux")]
+async fn prune_wireguard_tunnel_routes(
+    local: &LocalWireGuardConfig,
+    peer_plan: &WireGuardPeerPlan,
+) {
+    let mut desired_tunnel_routes = HashSet::with_capacity(peer_plan.peer_configs.len() + 1);
+    desired_tunnel_routes.insert(local.tunnel_v6);
+    desired_tunnel_routes.extend(peer_plan.peer_configs.iter().map(|peer| peer.allowed_ip));
+
+    if let Err(err) = prune_stale_wireguard_routes(&local.ifname, &desired_tunnel_routes).await {
+        tracing::warn!(
+            target: "network",
+            ifname = local.ifname,
+            "failed to prune stale wireguard tunnel routes: {err:#}"
+        );
+    }
+}
+
+/// Build the controller-facing underlay state snapshot from the latest reconcile results.
+#[cfg(target_os = "linux")]
+fn build_wireguard_underlay_state(
+    ifname: String,
+    tunnel_ip: IpAddr,
+    config_hash: u64,
+    last_configured_at: Option<Instant>,
+    published: bool,
+    peer_plan: &WireGuardPeerPlan,
+    scoped_ready_for_encryption: bool,
+) -> WireGuardUnderlayState {
+    WireGuardUnderlayState {
+        underlay_active: published
+            && peer_plan.desired_peer_count > 0
+            && scoped_ready_for_encryption,
+        ifname,
+        tunnel_ip: Some(tunnel_ip),
+        config_hash: Some(config_hash),
+        last_configured_at,
+        configured_peer_ids: peer_plan
+            .peer_configs
+            .iter()
+            .map(|peer| peer.peer_id)
+            .collect(),
+    }
+}
+
 /// Ensure the Mantissa-managed WireGuard underlay is configured on this node and return the
 /// current underlay state decision.
 ///
@@ -198,186 +509,43 @@ pub async fn ensure_wireguard_underlay(
     desired_peer_ids: &HashSet<Uuid>,
     previous: Option<WireGuardUnderlayState>,
 ) -> Result<WireGuardUnderlayState> {
-    if !config::wireguard_enabled() {
-        return Ok(WireGuardUnderlayState {
-            underlay_active: false,
-            ifname: MANTISSA_WIREGUARD_IFNAME.to_string(),
-            tunnel_ip: None,
-            config_hash: None,
-            last_configured_at: None,
-            configured_peer_ids: HashSet::new(),
-        });
-    }
-
-    if unsafe { libc::geteuid() } != 0 {
-        return Ok(WireGuardUnderlayState {
-            underlay_active: false,
-            ifname: MANTISSA_WIREGUARD_IFNAME.to_string(),
-            tunnel_ip: None,
-            config_hash: None,
-            last_configured_at: None,
-            configured_peer_ids: HashSet::new(),
-        });
+    if !config::wireguard_enabled() || unsafe { libc::geteuid() } != 0 {
+        return Ok(inactive_wireguard_state());
     }
 
     let now = Instant::now();
-    let prefer_underlay = match net::wireguard::load_wireguard_underlay_preference() {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(
-                target: "network",
-                "failed to read wireguard underlay preference; defaulting to plaintext: {err}"
-            );
-            false
-        }
-    };
-
-    let keys_path =
-        net::wireguard::resolve_wireguard_key_path().context("resolve wireguard key path")?;
-    let keys = net::wireguard::load_or_generate_wireguard_keys(keys_path)
-        .context("load wireguard keys")?;
-
-    let listen_port =
-        net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
-            None,
-            config::wireguard_port_override(),
-        )
-        .context("load wireguard listen port")?;
-
-    let tunnel_v6 = net::wireguard::wireguard_tunnel_ipv6(self_id);
-    let tunnel_ip = IpAddr::V6(tunnel_v6);
-
-    let peers_snapshot = registry
-        .peer_values_snapshot()
-        .context("load peers snapshot for wireguard")?;
-    let peer_plan = build_wireguard_peer_plan(&peers_snapshot, self_id, desired_peer_ids);
-
-    let config_hash =
-        compute_wireguard_config_hash(listen_port, tunnel_ip, &peer_plan.peer_configs);
-    let should_configure = should_reconfigure_wireguard(previous.as_ref(), config_hash, now);
-
-    let ifname = MANTISSA_WIREGUARD_IFNAME.to_string();
-
-    let last_configured_at = if should_configure {
-        let mut peers = Vec::with_capacity(peer_plan.peer_configs.len());
-        for peer_config in &peer_plan.peer_configs {
-            let mut peer = defguard_wireguard_rs::host::Peer::new(
-                defguard_wireguard_rs::key::Key::new(peer_config.public_key),
-            );
-            peer.set_allowed_ips(vec![defguard_wireguard_rs::net::IpAddrMask::host(
-                IpAddr::V6(peer_config.allowed_ip),
-            )]);
-            peer.persistent_keepalive_interval = Some(peer_config.keepalive);
-            peer.set_endpoint(&peer_config.endpoint).with_context(|| {
-                format!("set wireguard endpoint for peer {}", peer_config.peer_id)
-            })?;
-            peers.push(peer);
-        }
-
-        let prvkey_b64 = BASE64_STANDARD.encode(keys.to_private_bytes());
-        let interface_config = defguard_wireguard_rs::InterfaceConfiguration {
-            name: ifname.clone(),
-            prvkey: prvkey_b64,
-            addresses: vec![defguard_wireguard_rs::net::IpAddrMask::host(tunnel_ip)],
-            port: listen_port,
-            peers: peers.clone(),
-            mtu: Some(MANTISSA_WIREGUARD_MTU),
-        };
-
-        let ifname_for_blocking = ifname.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            use defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi};
-
-            let mut wgapi =
-                WGApi::<Kernel>::new(ifname_for_blocking).context("create WGApi<Kernel>")?;
-            wgapi
-                .create_interface()
-                .context("create wireguard interface")?;
-            wgapi
-                .configure_interface(&interface_config)
-                .context("configure wireguard interface")?;
-            wgapi
-                .configure_peer_routing(&peers)
-                .context("configure wireguard peer routing")?;
-            ensure_vxlan_firewall_accept(&interface_config.name);
-            Ok(())
-        })
-        .await
-        .context("wireguard configuration task panicked")??;
-        Some(now)
-    } else {
-        previous.as_ref().and_then(|state| state.last_configured_at)
-    };
-
-    let published = match registry
-        .upsert_self_wireguard(WireGuardPeerValue {
-            public_key: keys.public_bytes(),
-            port: listen_port,
-            enabled: true,
-        })
-        .await
-    {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::warn!(
-                target: "network",
-                "wireguard configured but could not publish self enabled state yet: {err}"
-            );
-            false
-        }
-    };
+    let local = load_local_wireguard_config(self_id)?;
+    let peer_plan = load_wireguard_peer_plan(registry, self_id, desired_peer_ids)?;
+    let (config_hash, last_configured_at) =
+        reconcile_wireguard_kernel_state(&local, &peer_plan, previous.as_ref(), now).await?;
+    let published = publish_local_wireguard_state(registry, &local).await;
 
     // Only switch the VXLAN underlay once every scoped peer has successfully configured its own
     // WireGuard interface. This keeps unrelated cluster members out of the readiness gate while
     // still preventing one side of an actively shared network from switching too early.
-    let scoped_ready_for_encryption = peer_plan.desired_peer_count == 0
-        || (peer_plan.all_desired_peers_advertised && peer_plan.all_desired_peers_enabled);
+    let scoped_ready_for_encryption = scoped_wireguard_peers_ready(&peer_plan);
+    log_unready_wireguard_preference(
+        local.prefer_underlay,
+        &peer_plan,
+        scoped_ready_for_encryption,
+    );
+    persist_wireguard_underlay_preference_if_ready(
+        local.prefer_underlay,
+        published,
+        &peer_plan,
+        scoped_ready_for_encryption,
+    );
+    prune_wireguard_tunnel_routes(&local, &peer_plan).await;
 
-    if prefer_underlay && peer_plan.desired_peer_count > 0 && !scoped_ready_for_encryption {
-        tracing::debug!(
-            target: "network",
-            peers = peer_plan.desired_peer_count,
-            "wireguard underlay preference set but scoped peers are not ready yet; keeping plaintext underlay"
-        );
-    }
-
-    if published
-        && scoped_ready_for_encryption
-        && peer_plan.desired_peer_count > 0
-        && !prefer_underlay
-        && let Err(err) = net::wireguard::persist_wireguard_underlay_preference(true)
-    {
-        tracing::warn!(
-            target: "network",
-            "failed to persist wireguard underlay preference; may not survive restarts: {err}"
-        );
-    }
-
-    let mut desired_tunnel_routes = HashSet::with_capacity(peer_plan.peer_configs.len() + 1);
-    desired_tunnel_routes.insert(tunnel_v6);
-    desired_tunnel_routes.extend(peer_plan.peer_configs.iter().map(|peer| peer.allowed_ip));
-    if let Err(err) = prune_stale_wireguard_routes(&ifname, &desired_tunnel_routes).await {
-        tracing::warn!(
-            target: "network",
-            ifname,
-            "failed to prune stale wireguard tunnel routes: {err:#}"
-        );
-    }
-
-    Ok(WireGuardUnderlayState {
-        underlay_active: published
-            && peer_plan.desired_peer_count > 0
-            && scoped_ready_for_encryption,
-        ifname,
-        tunnel_ip: Some(tunnel_ip),
-        config_hash: Some(config_hash),
+    Ok(build_wireguard_underlay_state(
+        local.ifname,
+        local.tunnel_ip,
+        config_hash,
         last_configured_at,
-        configured_peer_ids: peer_plan
-            .peer_configs
-            .iter()
-            .map(|peer| peer.peer_id)
-            .collect(),
-    })
+        published,
+        &peer_plan,
+        scoped_ready_for_encryption,
+    ))
 }
 
 /// Non-Linux builds do not provision the kernel underlay. They always fall back to plaintext.
