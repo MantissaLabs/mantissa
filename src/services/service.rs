@@ -296,6 +296,25 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         command.push(arg?.to_str()?.to_string());
     }
 
+    let mut depends_on = Vec::new();
+    let mut seen_dependencies = HashSet::new();
+    for entry in reader.get_depends_on()?.iter() {
+        let raw = entry?.to_str()?.trim().to_string();
+        if raw.is_empty() {
+            return Err(Error::failed(
+                "depends_on entries must be non-empty".to_string(),
+            ));
+        }
+
+        if !seen_dependencies.insert(raw.clone()) {
+            return Err(Error::failed(format!(
+                "duplicate depends_on entry '{raw}' in task template"
+            )));
+        }
+
+        depends_on.push(raw);
+    }
+
     let restart_policy = if reader.has_restart_policy() {
         let policy = reader.get_restart_policy()?;
         let kind = match policy.get_name()? {
@@ -405,6 +424,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         name: reader.get_name()?.to_str()?.to_string(),
         image: reader.get_image()?.to_str()?.to_string(),
         command,
+        depends_on,
         replicas: reader.get_replicas(),
         cpu_millis: reader.get_cpu_millis(),
         memory_bytes: reader.get_memory_bytes(),
@@ -596,6 +616,13 @@ fn write_task_template(
     let mut cmd_builder = builder.reborrow().init_command(task.command.len() as u32);
     for (idx, arg) in task.command.iter().enumerate() {
         cmd_builder.set(idx as u32, arg);
+    }
+
+    let mut depends_on_builder = builder
+        .reborrow()
+        .init_depends_on(task.depends_on.len() as u32);
+    for (idx, dependency) in task.depends_on.iter().enumerate() {
+        depends_on_builder.set(idx as u32, dependency);
     }
 
     if let Some(policy) = &task.restart_policy {

@@ -27,6 +27,7 @@
         (
             name: "frontend",
             image: "curlimages/curl:8.9.1",
+            depends_on: ["backend"],
             command: [
                 "sh",
                 "-c",

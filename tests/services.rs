@@ -149,6 +149,7 @@ local_test!(services_gossip_propagates_across_peers, {
                 name: "web".into(),
                 image: "ghcr.io/mantissa/demo:web".into(),
                 command: vec!["--serve".into()],
+                depends_on: Vec::new(),
                 replicas: 1,
                 cpu_millis: 0,
                 memory_bytes: 0,
@@ -249,6 +250,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
         name: "web".into(),
         image: "ghcr.io/mantissa/demo:web".into(),
         command: vec!["--serve".into()],
+        depends_on: Vec::new(),
         replicas: 1,
         cpu_millis: 0,
         memory_bytes: 0,
@@ -339,6 +341,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                 name: "heavy".into(),
                 image: "ghcr.io/mantissa/demo:web".into(),
                 command: vec!["--serve".into()],
+                depends_on: Vec::new(),
                 replicas: 1,
                 cpu_millis: 500_000, // intentionally exceeds any single-node capacity
                 memory_bytes: 8 * 1024 * 1024 * 1024, // 8 GiB to force allocation failure
@@ -413,6 +416,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                 name: "heavy".into(),
                 image: "ghcr.io/mantissa/demo:web".into(),
                 command: vec!["--serve".into()],
+                depends_on: Vec::new(),
                 replicas: 1,
                 cpu_millis: 200,
                 memory_bytes: 128 * 1024 * 1024,
@@ -481,6 +485,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
                     "-c".into(),
                     "while true; do sleep 1; done".into(),
                 ],
+                depends_on: Vec::new(),
                 replicas: 1,
                 cpu_millis: 100,
                 memory_bytes: 64 * 1024 * 1024,
@@ -2879,6 +2884,7 @@ local_test!(services_redeploy_scales_replicas, {
             "-c".into(),
             "while true; do sleep 1; done".into(),
         ],
+        depends_on: Vec::new(),
         replicas: 1,
         cpu_millis: 100,
         memory_bytes: 32 * 1024 * 1024,
@@ -3006,6 +3012,7 @@ local_test!(services_redeploy_updates_resources, {
             "-c".into(),
             "while true; do sleep 1; done".into(),
         ],
+        depends_on: Vec::new(),
         replicas: 1,
         cpu_millis: 100,
         memory_bytes: 64 * 1024 * 1024,
@@ -3142,6 +3149,7 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
             "-c".into(),
             "while true; do sleep 1; done".into(),
         ],
+        depends_on: Vec::new(),
         replicas: 1,
         cpu_millis: 100,
         memory_bytes: 32 * 1024 * 1024,
@@ -3264,6 +3272,7 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
             "-c".into(),
             "while true; do sleep 1; done".into(),
         ],
+        depends_on: Vec::new(),
         replicas: 1,
         cpu_millis: 100,
         memory_bytes: 64 * 1024 * 1024,
@@ -3360,6 +3369,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
             "-c".into(),
             "while true; do sleep 1; done".into(),
         ],
+        depends_on: Vec::new(),
         replicas: 1,
         cpu_millis: 100,
         memory_bytes: 64 * 1024 * 1024,
@@ -3489,6 +3499,7 @@ local_test!(
                 "-c".into(),
                 "while true; do sleep 1; done".into(),
             ],
+            depends_on: Vec::new(),
             replicas: 1,
             cpu_millis: 100,
             memory_bytes: 64 * 1024 * 1024,
@@ -3624,6 +3635,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
             "-c".into(),
             "while true; do sleep 1; done".into(),
         ],
+        depends_on: Vec::new(),
         replicas: 4,
         cpu_millis: 0,
         memory_bytes: 0,
@@ -3732,6 +3744,7 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
             "-c".into(),
             "while true; do sleep 1; done".into(),
         ],
+        depends_on: Vec::new(),
         replicas: 1,
         cpu_millis: 100,
         memory_bytes: 64 * 1024 * 1024,
@@ -3840,6 +3853,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
             "-c".into(),
             "while true; do sleep 1; done".into(),
         ],
+        depends_on: Vec::new(),
         replicas: 1,
         cpu_millis: 100,
         memory_bytes: 64 * 1024 * 1024,
@@ -3963,6 +3977,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
             "-c".into(),
             "while true; do sleep 1; done".into(),
         ],
+        depends_on: Vec::new(),
         replicas: 1,
         cpu_millis: 100,
         memory_bytes: 64 * 1024 * 1024,
@@ -4054,6 +4069,7 @@ fn demo_backend_task_template(name: &str, replicas: u16) -> ServiceTaskSpecValue
             "-text".to_string(),
             "hello from backend replica".to_string(),
         ],
+        depends_on: Vec::new(),
         replicas,
         cpu_millis: 200,
         memory_bytes: 64 * 1024 * 1024,
@@ -4082,6 +4098,107 @@ fn demo_networked_backend_task_template(
     template.networks = vec![ServiceTaskNetworkRequirement::new("default", network_id)];
     template
 }
+
+local_test!(
+    services_submit_deployment_rejects_unknown_template_dependency,
+    {
+        let _guard = ContainerManagerOverrideGuard::install_default();
+        let node = TestNode::new().await;
+
+        let mut frontend = demo_backend_task_template("frontend", 1);
+        frontend.depends_on = vec!["backend".to_string()];
+
+        let error = node
+            .node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                "invalid-depends-on",
+                "invalid-depends-on",
+                vec![frontend],
+            )
+            .await
+            .expect_err("unknown template dependency must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("depends on unknown template 'backend'"),
+            "deployment rejection should explain the invalid dependency graph: {error:#}"
+        );
+    }
+);
+
+local_test!(services_depends_on_waits_for_dependency_publication, {
+    let _config_guard = ConfigOverrideGuard::control_plane_network_only();
+    let _guard = ContainerManagerOverrideGuard::install_default();
+
+    let cluster = TestNode::new_cluster_inproc_with_config(1, ClusterConfig::default())
+        .await
+        .expect("cluster should start");
+    let node = &cluster[0];
+    let network_id = create_logical_test_network(&cluster, "depends-on-publication").await;
+
+    let backend = demo_networked_backend_task_template("backend", 2, network_id);
+    let mut frontend = demo_networked_backend_task_template("frontend", 1, network_id);
+    frontend.depends_on = vec!["backend".to_string()];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            "depends-on-publication",
+            "depends-on-publication",
+            vec![backend, frontend],
+        )
+        .await
+        .expect("submit dependency-ordered deployment");
+
+    let ordered = wait_for_template_launch_after_dependency_publication(
+        node,
+        "depends-on-publication",
+        "backend",
+        2,
+        "frontend",
+        network_id,
+        Duration::from_secs(30),
+    )
+    .await;
+    if !ordered {
+        let debug = collect_service_attachment_publication_debug(
+            &[node],
+            "depends-on-publication",
+            network_id,
+        )
+        .await;
+        panic!(
+            "frontend template should only launch after backend attachments are published; {debug}"
+        );
+    }
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "dependency-ordered deployment should still converge to running"
+    );
+
+    let frontend_tasks = list_active_service_template_tasks(
+        &node.node.task_manager,
+        "depends-on-publication",
+        "frontend",
+    )
+    .await;
+    assert_eq!(
+        frontend_tasks.len(),
+        1,
+        "frontend template should launch exactly once after dependency readiness"
+    );
+});
 
 /// Creates a logical overlay network on every test node and waits for controller-driven readiness.
 ///
@@ -4428,6 +4545,102 @@ async fn list_active_service_tasks(manager: &TaskManager, service_name: &str) ->
                 .unwrap_or(false)
         })
         .collect()
+}
+
+/// Lists active tasks for one service template so tests can assert template-level launch order.
+async fn list_active_service_template_tasks(
+    manager: &TaskManager,
+    service_name: &str,
+    template_name: &str,
+) -> Vec<TaskSpec> {
+    list_active_service_tasks(manager, service_name)
+        .await
+        .into_iter()
+        .filter(|task| {
+            task.service_metadata
+                .as_ref()
+                .map(|meta| meta.template == template_name)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Returns true when every replica of one service template is running with a ready, published
+/// attachment on the provided logical network.
+async fn template_attachments_published(
+    node: &TestNode,
+    service_name: &str,
+    template_name: &str,
+    network_id: Uuid,
+    expected_task_count: usize,
+) -> bool {
+    let tasks =
+        list_active_service_template_tasks(&node.node.task_manager, service_name, template_name)
+            .await;
+    if tasks.len() != expected_task_count {
+        return false;
+    }
+
+    let Ok(attachments) = node
+        .node
+        .network_registry
+        .list_attachments(Some(network_id))
+    else {
+        return false;
+    };
+    let mut by_task = HashMap::with_capacity(attachments.len());
+    for attachment in attachments {
+        by_task.entry(attachment.task_id).or_insert(attachment);
+    }
+
+    tasks.iter().all(|task| {
+        matches!(task.state, ContainerState::Running)
+            && by_task.get(&task.id).is_some_and(|attachment| {
+                attachment.state == NetworkAttachmentState::Ready && attachment.traffic_published
+            })
+    })
+}
+
+/// Waits until the dependent template launches, failing if it appears before its dependency
+/// template has published ready attachments.
+async fn wait_for_template_launch_after_dependency_publication(
+    node: &TestNode,
+    service_name: &str,
+    dependency_template: &str,
+    dependency_task_count: usize,
+    dependent_template: &str,
+    network_id: Uuid,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let dependency_ready = template_attachments_published(
+            node,
+            service_name,
+            dependency_template,
+            network_id,
+            dependency_task_count,
+        )
+        .await;
+        let dependent_tasks = list_active_service_template_tasks(
+            &node.node.task_manager,
+            service_name,
+            dependent_template,
+        )
+        .await;
+
+        if !dependent_tasks.is_empty() && !dependency_ready {
+            return false;
+        }
+        if dependency_ready && !dependent_tasks.is_empty() {
+            return true;
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    false
 }
 
 /// Lists active tasks for one service that are assigned to a specific node id.
@@ -5164,6 +5377,7 @@ fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskS
                 name: task.name.clone(),
                 image: task.image.clone(),
                 command: task.command.clone(),
+                depends_on: task.depends_on.clone(),
                 replicas: task.replicas,
                 cpu_millis: task.resources.cpu_millis,
                 memory_bytes: task.resources.memory_bytes(),

@@ -1,5 +1,6 @@
 use crate::gossip::Message;
 use crate::registry::Registry;
+use crate::services::dependencies::{TemplateDependencyStage, build_template_dependency_stages};
 use crate::services::ordering::should_accept_service_update;
 use crate::services::reconcile::{
     ReplicaReplacement, ServiceTaskAssignment, compute_change_plan, parse_template_and_replica,
@@ -274,6 +275,12 @@ impl ServiceController {
     ) -> anyhow::Result<ServiceDeploymentSubmission> {
         let manifest_name = manifest_name.into();
         let service_name = service_name.into();
+        build_template_dependency_stages(&tasks).map_err(|err| {
+            anyhow!(
+                "invalid task dependency graph for service '{}': {err}",
+                service_name
+            )
+        })?;
         let service_id = compute_service_id(&service_name);
 
         if let Some(existing) = self.registry.get(service_id)? {
@@ -553,6 +560,22 @@ impl ServiceController {
     /// Executes the deployment workflow in the background by starting tasks via the task manager
     /// and persisting the resulting service specification into the replicated registry.
     async fn execute_deployment(self, job: ServiceDeploymentJob) -> anyhow::Result<()> {
+        let stages = build_template_dependency_stages(&job.templates).map_err(|err| {
+            anyhow!(
+                "invalid task dependency graph for service '{}': {err}",
+                job.service_name
+            )
+        })?;
+        if stages.len() <= 1 {
+            return self.execute_flat_deployment(job).await;
+        }
+
+        self.execute_dependency_ordered_deployment(job, stages)
+            .await
+    }
+
+    /// Launches a service whose templates do not declare cross-template dependencies.
+    async fn execute_flat_deployment(self, job: ServiceDeploymentJob) -> anyhow::Result<()> {
         let ServiceDeploymentJob {
             manifest_id,
             manifest_name,
@@ -746,6 +769,405 @@ impl ServiceController {
             service_name
         );
 
+        Ok(())
+    }
+
+    /// Launches service templates in deterministic dependency order, waiting for each upstream
+    /// template to become discoverable before starting the templates that depend on it.
+    async fn execute_dependency_ordered_deployment(
+        self,
+        job: ServiceDeploymentJob,
+        stages: Vec<TemplateDependencyStage>,
+    ) -> anyhow::Result<()> {
+        let ServiceDeploymentJob {
+            manifest_id,
+            manifest_name,
+            service_name,
+            templates,
+            update_strategy,
+        } = job;
+
+        let service_id = compute_service_id(&service_name);
+        let eligible_nodes = self.collect_eligible_nodes();
+        let deployment = ServiceDeploymentContext {
+            manifest_id,
+            manifest_name: &manifest_name,
+            service_name: &service_name,
+            templates: &templates,
+            update_strategy: &update_strategy,
+        };
+        let ordered_indices: Vec<usize> = stages
+            .iter()
+            .flat_map(|stage| stage.template_indices.iter().copied())
+            .collect();
+
+        tracing::info!(
+            target: "services",
+            "starting dependency-ordered deployment for service '{}' across {} template stage(s)",
+            service_name,
+            stages.len()
+        );
+
+        let mut launched_task_ids: HashMap<String, Vec<Uuid>> = HashMap::new();
+        let mut assignments: BTreeMap<(String, u16), Uuid> = BTreeMap::new();
+
+        for template_index in ordered_indices {
+            let template = templates[template_index].clone();
+            if !template.depends_on.is_empty()
+                && let Err(err) = self
+                    .wait_for_template_dependencies_ready(
+                        &service_name,
+                        &template,
+                        &launched_task_ids,
+                        &update_strategy,
+                    )
+                    .await
+            {
+                tracing::warn!(
+                    target: "services",
+                    "dependency gate for service '{}' failed before launching template '{}': {err:#}",
+                    service_name,
+                    template.name
+                );
+                self.mark_deployment_failed(&deployment, Some(err.to_string()))
+                    .await?;
+                return Ok(());
+            }
+
+            let requests = build_start_requests(
+                &service_name,
+                service_id,
+                std::slice::from_ref(&template),
+                &eligible_nodes,
+                &self.volume_registry,
+            );
+            if requests.is_empty() {
+                continue;
+            }
+
+            let desired_task_ids: Vec<Uuid> =
+                requests.iter().filter_map(|request| request.id).collect();
+            let context = format!(
+                "service '{}' deployment for template '{}'",
+                service_name, template.name
+            );
+            let task_specs = match self.start_tasks_with_fallback(requests, &context).await {
+                Ok(specs) => specs,
+                Err(err) if launched_task_ids.is_empty() => {
+                    self.handle_initial_deployment_launch_failure(
+                        &deployment,
+                        &desired_task_ids,
+                        &err,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "services",
+                        "dependency-ordered launch for service '{}' failed on template '{}': {err:#}",
+                        service_name,
+                        template.name
+                    );
+                    self.mark_deployment_failed(&deployment, Some(err.to_string()))
+                        .await?;
+                    return Ok(());
+                }
+            };
+
+            let stage_ids: Vec<Uuid> = task_specs.iter().map(|spec| spec.id).collect();
+            launched_task_ids.insert(template.name.clone(), stage_ids);
+            record_task_assignments(&service_name, &task_specs, &mut assignments);
+
+            let ordered_task_ids = ordered_known_task_ids(&templates, &assignments);
+            let _ = self
+                .persist_deploying_task_ids(&deployment, ordered_task_ids)
+                .await?;
+        }
+
+        let readiness_spec = self
+            .persist_deploying_task_ids(
+                &deployment,
+                ordered_known_task_ids(&templates, &assignments),
+            )
+            .await?;
+
+        let controller = self.clone();
+        tokio::task::spawn_local(async move {
+            controller.await_service_readiness(readiness_spec).await;
+        });
+
+        tracing::info!(
+            target: "services",
+            "service '{}' dependency-ordered deployment submitted; tasks launching asynchronously",
+            service_name
+        );
+
+        Ok(())
+    }
+
+    /// Waits until every dependency template for one template is running and, when attached to
+    /// networks, published for service traffic.
+    async fn wait_for_template_dependencies_ready(
+        &self,
+        service_name: &str,
+        template: &ServiceTaskSpecValue,
+        launched_task_ids: &HashMap<String, Vec<Uuid>>,
+        update_strategy: &ServiceUpdateStrategy,
+    ) -> anyhow::Result<()> {
+        let startup_timeout =
+            Duration::from_secs(update_strategy.rolling.startup_timeout_secs.max(1) as u64);
+        let monitor_window =
+            Duration::from_secs(update_strategy.rolling.monitor_secs.max(1) as u64);
+        let deadline = Instant::now() + startup_timeout;
+        let mut stable_since: Option<Instant> = None;
+
+        loop {
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "timed out waiting for dependencies {:?} of template '{}' in service '{}' to become ready",
+                    template.depends_on,
+                    template.name,
+                    service_name
+                ));
+            }
+
+            let mut ready = true;
+            for dependency in &template.depends_on {
+                let dependency_task_ids = launched_task_ids.get(dependency).ok_or_else(|| {
+                    anyhow!(
+                        "template '{}' in service '{}' depends on '{}' before it has launched",
+                        template.name,
+                        service_name,
+                        dependency
+                    )
+                })?;
+
+                for task_id in dependency_task_ids {
+                    let spec = self.task_manager.inspect_task(*task_id).await?;
+                    match spec.state {
+                        ContainerState::Running => {
+                            if !self
+                                .task_manager
+                                .ensure_task_service_traffic_ready(*task_id)
+                                .await?
+                            {
+                                ready = false;
+                            }
+                        }
+                        ContainerState::Failed
+                        | ContainerState::Stopped
+                        | ContainerState::Exited(_) => {
+                            return Err(anyhow!(
+                                "dependency task {} for template '{}' in service '{}' entered terminal state {:?}",
+                                task_id,
+                                dependency,
+                                service_name,
+                                spec.state
+                            ));
+                        }
+                        ContainerState::Pending
+                        | ContainerState::Pulling
+                        | ContainerState::Creating
+                        | ContainerState::VolumeUnavailable
+                        | ContainerState::Paused
+                        | ContainerState::Stopping => {
+                            ready = false;
+                        }
+                        ContainerState::Unknown => {
+                            ready = false;
+                        }
+                    }
+                }
+            }
+
+            if ready {
+                let stable_at = stable_since.get_or_insert_with(Instant::now);
+                if stable_at.elapsed() >= monitor_window {
+                    return Ok(());
+                }
+            } else {
+                stable_since = None;
+            }
+
+            sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+        }
+    }
+
+    /// Persists the current `Deploying` service snapshot with the provided task id set.
+    async fn persist_deploying_task_ids(
+        &self,
+        deployment: &ServiceDeploymentContext<'_>,
+        task_ids: Vec<Uuid>,
+    ) -> anyhow::Result<ServiceSpecValue> {
+        let service_id = compute_service_id(deployment.service_name);
+        let mut spec = match self.registry.get(service_id)? {
+            Some(spec) if spec.manifest_id == deployment.manifest_id => spec,
+            _ => ServiceSpecValue::new(
+                deployment.manifest_id,
+                deployment.manifest_name.to_string(),
+                deployment.service_name.to_string(),
+                deployment.templates.to_vec(),
+                Vec::new(),
+            ),
+        };
+        spec.manifest_id = deployment.manifest_id;
+        spec.manifest_name = deployment.manifest_name.to_string();
+        spec.service_name = deployment.service_name.to_string();
+        spec.tasks = deployment.templates.to_vec();
+        spec.task_ids = task_ids;
+        spec.update_strategy = deployment.update_strategy.clone();
+        spec.set_rollout(ServiceRolloutState::default());
+        spec.set_status(ServiceStatus::Deploying);
+        self.apply_upsert(spec.clone()).await?;
+        self.broadcast(ServiceEvent::Upsert(spec.clone())).await?;
+        Ok(spec)
+    }
+
+    /// Handles the initial launch failure path before any dependency-ordered templates have been
+    /// started, preserving the existing volume-unavailable recovery behavior.
+    async fn handle_initial_deployment_launch_failure(
+        &self,
+        deployment: &ServiceDeploymentContext<'_>,
+        desired_task_ids: &[Uuid],
+        err: &anyhow::Error,
+    ) {
+        tracing::warn!(
+            target: "services",
+            "initial task launch for service '{}' failed: {err:#}",
+            deployment.service_name
+        );
+
+        let service_id = compute_service_id(deployment.service_name);
+        match self.registry.get(service_id) {
+            Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(err) => {
+                persisted_spec.task_ids = desired_task_ids.to_vec();
+                persisted_spec.set_rollout(ServiceRolloutState::default());
+                persisted_spec.set_status(ServiceStatus::VolumeUnavailable);
+                if let Err(upsert_err) = self.apply_upsert(persisted_spec.clone()).await {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to persist volume-unavailable state for '{}': {upsert_err}",
+                        deployment.service_name
+                    );
+                } else if let Err(broadcast_err) =
+                    self.broadcast(ServiceEvent::Upsert(persisted_spec)).await
+                {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to broadcast volume-unavailable state for '{}': {broadcast_err}",
+                        deployment.service_name
+                    );
+                }
+            }
+            Ok(Some(persisted_spec)) => {
+                let controller = self.clone();
+                tokio::task::spawn_local(async move {
+                    controller.await_service_readiness(persisted_spec).await;
+                });
+            }
+            Ok(None) if is_local_volume_unavailable_error(err) => {
+                let mut blocked_spec = ServiceSpecValue::new(
+                    deployment.manifest_id,
+                    deployment.manifest_name.to_string(),
+                    deployment.service_name.to_string(),
+                    deployment.templates.to_vec(),
+                    desired_task_ids.to_vec(),
+                );
+                blocked_spec.update_strategy = deployment.update_strategy.clone();
+                blocked_spec.set_rollout(ServiceRolloutState::default());
+                blocked_spec.set_status(ServiceStatus::VolumeUnavailable);
+                if let Err(upsert_err) = self.apply_upsert(blocked_spec.clone()).await {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to persist fallback volume-unavailable state for '{}': {upsert_err}",
+                        deployment.service_name
+                    );
+                } else if let Err(broadcast_err) =
+                    self.broadcast(ServiceEvent::Upsert(blocked_spec)).await
+                {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to broadcast fallback volume-unavailable state for '{}': {broadcast_err}",
+                        deployment.service_name
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    target: "services",
+                    "unable to schedule deployment retry for '{}' because the service spec is missing; marking service failed",
+                    deployment.service_name
+                );
+                let mut failed_spec = ServiceSpecValue::new(
+                    deployment.manifest_id,
+                    deployment.manifest_name.to_string(),
+                    deployment.service_name.to_string(),
+                    deployment.templates.to_vec(),
+                    Vec::new(),
+                );
+                failed_spec.update_strategy = deployment.update_strategy.clone();
+                failed_spec.set_rollout(ServiceRolloutState::default());
+                failed_spec.set_status(ServiceStatus::Failed);
+                if let Err(upsert_err) = self.apply_upsert(failed_spec.clone()).await {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to persist fallback failed state for '{}': {upsert_err}",
+                        deployment.service_name
+                    );
+                } else if let Err(broadcast_err) =
+                    self.broadcast(ServiceEvent::Upsert(failed_spec)).await
+                {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to broadcast fallback failed state for '{}': {broadcast_err}",
+                        deployment.service_name
+                    );
+                }
+            }
+            Err(fetch_err) => {
+                tracing::warn!(
+                    target: "services",
+                    "unable to load service '{}' spec for retry: {fetch_err}",
+                    deployment.service_name
+                );
+            }
+        }
+    }
+
+    /// Marks the active deployment manifest as failed and stops any partially launched tasks so a
+    /// dependency-ordered deployment cannot leave a half-started service behind.
+    async fn mark_deployment_failed(
+        &self,
+        deployment: &ServiceDeploymentContext<'_>,
+        reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        let service_id = compute_service_id(deployment.service_name);
+        let mut failed_spec = match self.registry.get(service_id)? {
+            Some(current) if current.manifest_id == deployment.manifest_id => current,
+            Some(_) => return Ok(()),
+            None => ServiceSpecValue::new(
+                deployment.manifest_id,
+                deployment.manifest_name.to_string(),
+                deployment.service_name.to_string(),
+                deployment.templates.to_vec(),
+                Vec::new(),
+            ),
+        };
+        failed_spec.manifest_name = deployment.manifest_name.to_string();
+        failed_spec.service_name = deployment.service_name.to_string();
+        failed_spec.tasks = deployment.templates.to_vec();
+        failed_spec.update_strategy = deployment.update_strategy.clone();
+        failed_spec.set_rollout(ServiceRolloutState {
+            last_error: reason,
+            ..ServiceRolloutState::default()
+        });
+        failed_spec.task_ids.clear();
+        failed_spec.set_status(ServiceStatus::Failed);
+        self.apply_upsert(failed_spec.clone()).await?;
+        self.broadcast(ServiceEvent::Upsert(failed_spec.clone()))
+            .await?;
+        self.stop_tasks(&failed_spec).await;
         Ok(())
     }
 
@@ -1281,6 +1703,19 @@ struct ServiceDeploymentJob {
     update_strategy: ServiceUpdateStrategy,
 }
 
+/// Bundles immutable deployment manifest context shared across dependency-order helpers.
+///
+/// Passing one borrowed context keeps the staged deployment helpers aligned on the same manifest
+/// generation without repeatedly threading the same identifiers and template vectors through
+/// every failure and persistence path.
+struct ServiceDeploymentContext<'a> {
+    manifest_id: Uuid,
+    manifest_name: &'a str,
+    service_name: &'a str,
+    templates: &'a [ServiceTaskSpecValue],
+    update_strategy: &'a ServiceUpdateStrategy,
+}
+
 struct ServiceRedeploymentJob {
     manifest_id: Uuid,
     manifest_name: String,
@@ -1410,6 +1845,44 @@ fn requests_require_pinned_targets(
 pub(super) fn is_local_volume_unavailable_error(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.is::<LocalVolumeAccessError>())
+}
+
+/// Records launched task ids back into the `(template, replica)` assignment index used to build
+/// ordered service task id lists during dependency-ordered deployment.
+fn record_task_assignments(
+    service_name: &str,
+    task_specs: &[TaskSpec],
+    assignments: &mut BTreeMap<(String, u16), Uuid>,
+) {
+    for spec in task_specs {
+        let Some((template, replica)) = parse_template_and_replica(service_name, &spec.name) else {
+            tracing::warn!(
+                target: "services",
+                "unable to map dependency-ordered task '{}' back to service '{}' template metadata",
+                spec.name,
+                service_name
+            );
+            continue;
+        };
+        assignments.insert((template, replica), spec.id);
+    }
+}
+
+/// Returns the currently known task ids in manifest template/replica order without warning about
+/// later templates that have not launched yet.
+fn ordered_known_task_ids(
+    templates: &[ServiceTaskSpecValue],
+    assignments: &BTreeMap<(String, u16), Uuid>,
+) -> Vec<Uuid> {
+    let mut ids = Vec::new();
+    for template in templates {
+        for replica in 1..=template.replicas {
+            if let Some(task_id) = assignments.get(&(template.name.clone(), replica)) {
+                ids.push(*task_id);
+            }
+        }
+    }
+    ids
 }
 
 /// Computes the ordered task identifiers for the manifest by iterating template/replica pairs.
@@ -1702,6 +2175,7 @@ mod tests {
             name: "api".into(),
             image: "ghcr.io/demo/api:latest".into(),
             command: Vec::new(),
+            depends_on: Vec::new(),
             replicas: 1,
             cpu_millis: 0,
             memory_bytes: 0,
@@ -1741,6 +2215,7 @@ mod tests {
                     name: "api".into(),
                     image: "ghcr.io/demo/api:latest".into(),
                     command: Vec::new(),
+                    depends_on: Vec::new(),
                     replicas: 2,
                     cpu_millis: 0,
                     memory_bytes: 0,
@@ -1761,6 +2236,7 @@ mod tests {
                     name: "web".into(),
                     image: "ghcr.io/demo/web:latest".into(),
                     command: Vec::new(),
+                    depends_on: Vec::new(),
                     replicas: 1,
                     cpu_millis: 0,
                     memory_bytes: 0,
@@ -1838,6 +2314,7 @@ mod tests {
                 name: "backend".into(),
                 image: "ghcr.io/demo/backend:latest".into(),
                 command: Vec::new(),
+                depends_on: Vec::new(),
                 replicas: 2,
                 cpu_millis: 0,
                 memory_bytes: 0,
@@ -1858,6 +2335,7 @@ mod tests {
                 name: "curl".into(),
                 image: "curlimages/curl:latest".into(),
                 command: Vec::new(),
+                depends_on: Vec::new(),
                 replicas: 1,
                 cpu_millis: 0,
                 memory_bytes: 0,
@@ -1896,6 +2374,7 @@ mod tests {
                 name: "backend".into(),
                 image: "ghcr.io/demo/backend:latest".into(),
                 command: Vec::new(),
+                depends_on: Vec::new(),
                 replicas: 2,
                 cpu_millis: 0,
                 memory_bytes: 0,
@@ -1916,6 +2395,7 @@ mod tests {
                 name: "curl".into(),
                 image: "curlimages/curl:latest".into(),
                 command: Vec::new(),
+                depends_on: Vec::new(),
                 replicas: 1,
                 cpu_millis: 0,
                 memory_bytes: 0,
@@ -1977,6 +2457,7 @@ mod tests {
             name: "api".into(),
             image: "ghcr.io/demo/api:latest".into(),
             command: Vec::new(),
+            depends_on: Vec::new(),
             replicas: 1,
             cpu_millis: 0,
             memory_bytes: 0,
@@ -2026,6 +2507,7 @@ mod tests {
             name: "api".into(),
             image: "ghcr.io/demo/api:latest".into(),
             command: Vec::new(),
+            depends_on: Vec::new(),
             replicas: 1,
             cpu_millis: 0,
             memory_bytes: 0,
@@ -2432,6 +2914,7 @@ mod tests {
             name: "api".into(),
             image: "ghcr.io/demo/api:latest".into(),
             command: Vec::new(),
+            depends_on: Vec::new(),
             replicas: 3,
             cpu_millis: 0,
             memory_bytes: 0,

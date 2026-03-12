@@ -2224,6 +2224,7 @@ mod tests {
                 name: "backend".to_string(),
                 image: "hashicorp/http-echo:1.0.0".to_string(),
                 command: Vec::new(),
+                depends_on: Vec::new(),
                 replicas: task_ids.len() as u16,
                 cpu_millis: 100,
                 memory_bytes: 64 * 1024 * 1024,

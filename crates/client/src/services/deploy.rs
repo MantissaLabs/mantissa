@@ -398,6 +398,13 @@ fn write_task(
         cmd_builder.set(idx as u32, arg);
     }
 
+    let mut depends_on_builder = builder
+        .reborrow()
+        .init_depends_on(task.depends_on.len() as u32);
+    for (idx, dependency) in task.depends_on.iter().enumerate() {
+        depends_on_builder.set(idx as u32, dependency);
+    }
+
     if let Some(policy) = &task.restart_policy {
         let mut policy_builder = builder.reborrow().init_restart_policy();
         let name = match policy.name {

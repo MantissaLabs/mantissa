@@ -117,6 +117,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
                 "-text".to_string(),
                 "hello from stress replica".to_string(),
             ],
+            depends_on: Vec::new(),
             replicas,
             resources: TaskResources {
                 cpu_millis: STRESS_TASK_CPU_MILLIS,

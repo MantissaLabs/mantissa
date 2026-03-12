@@ -185,6 +185,9 @@ pub struct ServiceTaskSpecValue {
     pub name: String,
     pub image: String,
     pub command: Vec<String>,
+    /// Template names within the same service that must be ready before this template starts.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     pub replicas: u16,
     pub cpu_millis: u64,
     pub memory_bytes: u64,

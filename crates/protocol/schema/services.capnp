@@ -12,6 +12,9 @@ struct TaskTemplate {
   command @2 :List(Text);
   # Container command/args, each entry a UTF-8 string
 
+  dependsOn @18 :List(Text);
+  # Template names within the same service that must become ready before this template starts.
+
   replicas @3 :UInt16;
   # Desired replica count for this task
 

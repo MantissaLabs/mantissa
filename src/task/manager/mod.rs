@@ -775,6 +775,43 @@ impl TaskManager {
         }
     }
 
+    /// Returns true once every declared network attachment is ready and published for service
+    /// traffic, publishing attachment rows as soon as they exist.
+    ///
+    /// Staged service deployment uses this to avoid launching downstream templates until the
+    /// upstream template can actually participate in service discovery and dataplane forwarding.
+    pub async fn ensure_task_service_traffic_ready(
+        &self,
+        task_id: Uuid,
+    ) -> Result<bool, anyhow::Error> {
+        let spec = self.load_spec(task_id).await?;
+        if spec.networks.is_empty() {
+            return Ok(true);
+        }
+
+        let expected = spec.networks.len();
+        let attachments = self
+            .network_registry
+            .list_attachments_for_task(task_id)
+            .context("list attachments while checking task traffic readiness")?;
+        if attachments.len() < expected {
+            return Ok(false);
+        }
+
+        let ready = attachments.iter().all(|attachment| {
+            attachment.state == crate::network::types::NetworkAttachmentState::Ready
+        });
+        let published = attachments
+            .iter()
+            .all(|attachment| attachment.traffic_published);
+        if !published {
+            self.set_task_traffic_published(task_id, true).await?;
+            return Ok(false);
+        }
+
+        Ok(ready)
+    }
+
     async fn ensure_remote_secret_availability(
         &self,
         plans: &[RemoteStartPlan],

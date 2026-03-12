@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use uuid::Uuid;
@@ -154,6 +154,9 @@ pub struct TaskSpec {
     pub image: String,
     #[serde(default)]
     pub command: Vec<String>,
+    /// Task template names within the same manifest that must be ready before this task starts.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     #[serde(default = "default_replicas")]
     pub replicas: u16,
     #[serde(default)]
@@ -233,6 +236,7 @@ pub struct ServiceUpdateStrategy {
 }
 
 impl ServiceManifest {
+    /// Validates one service manifest before it is sent to the coordinator.
     pub fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             return Err(anyhow!("service manifest must set a non-empty name"));
@@ -545,6 +549,8 @@ impl ServiceManifest {
             }
         }
 
+        validate_task_dependencies(&self.tasks)?;
+
         if self.update.rolling.parallelism == 0 {
             return Err(anyhow!(
                 "service manifest must set update.rolling.parallelism to at least 1"
@@ -565,6 +571,90 @@ impl ServiceManifest {
 
         Ok(())
     }
+}
+
+/// Validates same-manifest task dependencies and rejects invalid graphs early.
+fn validate_task_dependencies(tasks: &[TaskSpec]) -> Result<()> {
+    let mut name_to_index = HashMap::with_capacity(tasks.len());
+    for (index, task) in tasks.iter().enumerate() {
+        if name_to_index.insert(task.name.clone(), index).is_some() {
+            return Err(anyhow!(
+                "task '{}' is declared multiple times in the manifest",
+                task.name
+            ));
+        }
+    }
+
+    let mut indegree = vec![0usize; tasks.len()];
+    let mut adjacency = vec![Vec::new(); tasks.len()];
+
+    for (index, task) in tasks.iter().enumerate() {
+        let mut seen_dependencies = HashSet::new();
+        for dependency in &task.depends_on {
+            let dependency_name = dependency.trim();
+            if dependency_name.is_empty() {
+                return Err(anyhow!(
+                    "task '{}' contains an empty depends_on entry",
+                    task.name
+                ));
+            }
+            if dependency_name == task.name {
+                return Err(anyhow!("task '{}' cannot depend on itself", task.name));
+            }
+            if !seen_dependencies.insert(dependency_name.to_string()) {
+                return Err(anyhow!(
+                    "task '{}' depends on '{}' more than once",
+                    task.name,
+                    dependency_name
+                ));
+            }
+
+            let Some(&dependency_index) = name_to_index.get(dependency_name) else {
+                return Err(anyhow!(
+                    "task '{}' depends on unknown task '{}'",
+                    task.name,
+                    dependency_name
+                ));
+            };
+
+            adjacency[dependency_index].push(index);
+            indegree[index] = indegree[index].saturating_add(1);
+        }
+    }
+
+    let mut current: Vec<usize> = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect();
+    let mut visited = 0usize;
+
+    while !current.is_empty() {
+        visited = visited.saturating_add(current.len());
+        let mut next_ready = vec![false; tasks.len()];
+        for index in &current {
+            for dependent in &adjacency[*index] {
+                indegree[*dependent] = indegree[*dependent].saturating_sub(1);
+                if indegree[*dependent] == 0 {
+                    next_ready[*dependent] = true;
+                }
+            }
+        }
+
+        current = next_ready
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, ready)| ready.then_some(index))
+            .collect();
+    }
+
+    if visited != tasks.len() {
+        return Err(anyhow!(
+            "task depends_on graph contains a cycle and cannot be ordered"
+        ));
+    }
+
+    Ok(())
 }
 
 pub fn load_manifest_from_path(path: &Path) -> Result<ServiceManifest> {
@@ -692,6 +782,16 @@ mod tests {
     }
 
     #[test]
+    fn service_discovery_example_manifest_loads_depends_on() {
+        let manifest = load_manifest_from_path(&example_manifest("service_discovery_demo.ron"))
+            .expect("manifest");
+
+        assert_eq!(manifest.tasks.len(), 2);
+        assert_eq!(manifest.tasks[1].name, "frontend");
+        assert_eq!(manifest.tasks[1].depends_on, vec!["backend"]);
+    }
+
+    #[test]
     fn manifest_rejects_empty_pre_stop_command() {
         let manifest = ServiceManifest {
             name: "demo".into(),
@@ -700,6 +800,7 @@ mod tests {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
                 command: Vec::new(),
+                depends_on: Vec::new(),
                 replicas: 1,
                 resources: TaskResources::default(),
                 restart_policy: None,
@@ -733,6 +834,7 @@ mod tests {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
                 command: Vec::new(),
+                depends_on: Vec::new(),
                 replicas: 1,
                 resources: TaskResources::default(),
                 restart_policy: None,
@@ -782,6 +884,7 @@ mod tests {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
                 command: Vec::new(),
+                depends_on: Vec::new(),
                 replicas: 2,
                 resources: TaskResources::default(),
                 restart_policy: None,
@@ -810,5 +913,57 @@ mod tests {
                 .to_string()
                 .contains("cannot use read_write_once volume 'pgdata' with replicas > 1")
         );
+    }
+
+    #[test]
+    fn manifest_rejects_cyclic_depends_on_graph() {
+        let manifest = ServiceManifest {
+            name: "demo".into(),
+            volumes: Vec::new(),
+            tasks: vec![
+                TaskSpec {
+                    name: "backend".into(),
+                    image: "ghcr.io/demo/backend:latest".into(),
+                    command: Vec::new(),
+                    depends_on: vec!["frontend".into()],
+                    replicas: 1,
+                    resources: TaskResources::default(),
+                    restart_policy: None,
+                    termination_grace_period_secs: None,
+                    pre_stop_command: None,
+                    env: Vec::new(),
+                    secret_files: Vec::new(),
+                    volumes: Vec::new(),
+                    networks: Vec::new(),
+                    health_port: None,
+                    health_command: None,
+                    public_port: None,
+                },
+                TaskSpec {
+                    name: "frontend".into(),
+                    image: "ghcr.io/demo/frontend:latest".into(),
+                    command: Vec::new(),
+                    depends_on: vec!["backend".into()],
+                    replicas: 1,
+                    resources: TaskResources::default(),
+                    restart_policy: None,
+                    termination_grace_period_secs: None,
+                    pre_stop_command: None,
+                    env: Vec::new(),
+                    secret_files: Vec::new(),
+                    volumes: Vec::new(),
+                    networks: Vec::new(),
+                    health_port: None,
+                    health_command: None,
+                    public_port: None,
+                },
+            ],
+            update: ServiceUpdateStrategy::default(),
+        };
+
+        let error = manifest
+            .validate()
+            .expect_err("cyclic dependency graph must fail");
+        assert!(error.to_string().contains("contains a cycle"));
     }
 }
