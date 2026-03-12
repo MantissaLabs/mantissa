@@ -69,6 +69,7 @@ struct MockContainerManager {
     inspect: Arc<AsyncMutex<HashMap<String, bollard::service::ContainerInspectResponse>>>,
     inspect_calls: Arc<AsyncMutex<Vec<String>>>,
     listed: Arc<AsyncMutex<Vec<crate::task::docker::ContainerInfo>>>,
+    present_images: Arc<AsyncMutex<HashSet<String>>>,
     pull_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
     pull_calls: Arc<AsyncMutex<Vec<String>>>,
     pull_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
@@ -184,6 +185,10 @@ impl ContainerManager for MockContainerManager {
             .get(container_id)
             .cloned()
             .ok_or_else(|| crate::task::docker::ContainerError::NotFound(container_id.into()))
+    }
+
+    async fn image_present(&self, image: &str) -> crate::task::docker::ContainerResult<bool> {
+        Ok(self.present_images.lock().await.contains(image))
     }
 
     async fn pull_image(&self, image: &str) -> crate::task::docker::ContainerResult<()> {
@@ -865,6 +870,69 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
     );
     assert_eq!(refreshed.phase_progress.as_deref(), Some("3/3"));
     assert_eq!(refreshed.phase_reason.as_deref(), Some("pulling image"));
+}
+
+#[tokio::test]
+async fn pull_image_for_task_skips_pull_when_image_exists_locally() {
+    let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let spec = TaskSpec {
+        id: Uuid::new_v4(),
+        name: "pull-skip".into(),
+        image: "img".into(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: Vec::new(),
+        node_id: manager.local_node_id,
+        node_name: "local-node".into(),
+        slot_ids: vec![1],
+        slot_id: Some(1),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
+    };
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    mock_cm
+        .present_images
+        .lock()
+        .await
+        .insert(spec.image.clone());
+
+    manager
+        .pull_image_for_task(spec.id, &spec.image)
+        .await
+        .expect("pull should be skipped when image exists locally");
+
+    let pull_calls = mock_cm.pull_calls.lock().await.clone();
+    assert!(
+        pull_calls.is_empty(),
+        "existing local image should not trigger docker pull"
+    );
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load refreshed task");
+    assert_eq!(refreshed.state, ContainerState::Pending);
+    assert!(refreshed.phase_reason.is_none());
+    assert!(refreshed.phase_progress.is_none());
 }
 
 #[tokio::test]

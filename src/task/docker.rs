@@ -17,7 +17,8 @@ use bollard::container::{
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    DeviceRequest, EventMessageTypeEnum, HostConfig, RestartPolicy, RestartPolicyNameEnum,
+    CreateImageInfo, DeviceRequest, EventMessageTypeEnum, HostConfig, RestartPolicy,
+    RestartPolicyNameEnum,
 };
 use bollard::service::ContainerInspectResponse;
 use bollard::system::EventsOptions;
@@ -139,6 +140,14 @@ pub trait ContainerManager {
         container_id: &str,
     ) -> ContainerResult<ContainerInspectResponse>;
 
+    /// Returns whether the named image is already present in the local runtime image store.
+    ///
+    /// The default falls back to `false` so tests and alternate runtimes can opt in only when they
+    /// track an image cache explicitly.
+    async fn image_present(&self, _image: &str) -> ContainerResult<bool> {
+        Ok(false)
+    }
+
     // Pull an image
     async fn pull_image(&self, image: &str) -> ContainerResult<()>;
 
@@ -250,6 +259,14 @@ pub struct DockerContainerManager {
     docker: Docker,
 }
 
+/// Snapshot of one pull-stream update used to suppress duplicate log spam.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PullProgressLogState {
+    status: Option<String>,
+    current: Option<i64>,
+    total: Option<i64>,
+}
+
 impl DockerContainerManager {
     /// Create a new Docker container manager
     pub async fn new() -> ContainerResult<Self> {
@@ -313,6 +330,56 @@ impl DockerContainerManager {
         self.run_container_call(container_id, call).await?;
         info!("{success_message}: {container_id}");
         Ok(())
+    }
+
+    /// Build a stable dedupe key for one image-pull stream update.
+    fn pull_progress_log_state(update: &CreateImageInfo) -> PullProgressLogState {
+        let (current, total) = update
+            .progress_detail
+            .as_ref()
+            .map(|detail| (detail.current, detail.total))
+            .unwrap_or((None, None));
+        PullProgressLogState {
+            status: update.status.clone(),
+            current,
+            total,
+        }
+    }
+
+    /// Format one image-pull update for logs without repeating Docker's full JSON payload.
+    fn format_pull_status(update: &CreateImageInfo) -> Option<String> {
+        let status = update.status.as_deref()?;
+        let id = update.id.as_deref();
+        let (current, total) = update
+            .progress_detail
+            .as_ref()
+            .map(|detail| (detail.current, detail.total))
+            .unwrap_or((None, None));
+
+        match (id, current, total) {
+            (Some(id), Some(current), Some(total)) => {
+                Some(format!("{status} {id} ({current}/{total})"))
+            }
+            (Some(id), _, _) => Some(format!("{status} {id}")),
+            (None, Some(current), Some(total)) => Some(format!("{status} ({current}/{total})")),
+            (None, _, _) => Some(status.to_string()),
+        }
+    }
+
+    /// Decide whether the next pull-stream update is new enough to log.
+    fn should_log_pull_update(
+        last_updates: &mut HashMap<Option<String>, PullProgressLogState>,
+        update: &CreateImageInfo,
+    ) -> bool {
+        let key = update.id.clone();
+        let state = Self::pull_progress_log_state(update);
+        match last_updates.get(&key) {
+            Some(previous) if previous == &state => false,
+            _ => {
+                last_updates.insert(key, state);
+                true
+            }
+        }
     }
 
     /// Converts an optional duration to Docker's timeout seconds format with a default.
@@ -889,6 +956,17 @@ impl ContainerManager for DockerContainerManager {
         .await
     }
 
+    async fn image_present(&self, image: &str) -> ContainerResult<bool> {
+        trace!("Inspecting image: {}", image);
+        match self.docker.inspect_image(image).await {
+            Ok(_) => Ok(true),
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(err) => Err(ContainerError::DockerAPI(err)),
+        }
+    }
+
     async fn pull_image(&self, image: &str) -> ContainerResult<()> {
         debug!("Pulling image: {}", image);
 
@@ -898,12 +976,15 @@ impl ContainerManager for DockerContainerManager {
         });
 
         let mut stream = self.docker.create_image(options, None, None);
+        let mut last_updates: HashMap<Option<String>, PullProgressLogState> = HashMap::new();
 
         // Process the stream of updates
         while let Some(result) = stream.next().await {
             match result {
                 Ok(update) => {
-                    if let Some(status) = update.status {
+                    if Self::should_log_pull_update(&mut last_updates, &update)
+                        && let Some(status) = Self::format_pull_status(&update)
+                    {
                         debug!("Pull status: {status}");
                     }
                     if let Some(error) = update.error {
@@ -1018,6 +1099,61 @@ mod tests {
                 status_code: 409,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn deduplicates_identical_pull_updates() {
+        let mut updates = HashMap::new();
+        let update = CreateImageInfo {
+            id: Some("layer-a".to_string()),
+            status: Some("Downloading".to_string()),
+            progress_detail: Some(bollard::models::ProgressDetail {
+                current: Some(1024),
+                total: Some(2048),
+            }),
+            ..Default::default()
+        };
+
+        assert!(DockerContainerManager::should_log_pull_update(
+            &mut updates,
+            &update
+        ));
+        assert!(!DockerContainerManager::should_log_pull_update(
+            &mut updates,
+            &update
+        ));
+    }
+
+    #[test]
+    fn pull_update_logs_when_progress_changes() {
+        let mut updates = HashMap::new();
+        let first = CreateImageInfo {
+            id: Some("layer-a".to_string()),
+            status: Some("Downloading".to_string()),
+            progress_detail: Some(bollard::models::ProgressDetail {
+                current: Some(1024),
+                total: Some(2048),
+            }),
+            ..Default::default()
+        };
+        let second = CreateImageInfo {
+            id: Some("layer-a".to_string()),
+            status: Some("Downloading".to_string()),
+            progress_detail: Some(bollard::models::ProgressDetail {
+                current: Some(2048),
+                total: Some(2048),
+            }),
+            ..Default::default()
+        };
+
+        assert!(DockerContainerManager::should_log_pull_update(
+            &mut updates,
+            &first
+        ));
+        assert!(DockerContainerManager::should_log_pull_update(
+            &mut updates,
+            &second
         ));
     }
 }

@@ -491,6 +491,27 @@ impl TaskManager {
         task_id: Uuid,
         image: &str,
     ) -> Result<(), anyhow::Error> {
+        match self.container_manager.image_present(image).await {
+            Ok(true) => {
+                debug!(
+                    target: "task",
+                    task = %task_id,
+                    image,
+                    "skipping image pull because image already exists locally"
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    target: "task",
+                    task = %task_id,
+                    image,
+                    "failed to inspect local image cache before pull; falling back to pull: {err}"
+                );
+            }
+        }
+
         let _permit = self
             .pull_limiter
             .clone()
