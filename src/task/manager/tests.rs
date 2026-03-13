@@ -604,7 +604,7 @@ async fn setup_manager_with_forwarding(
         signing_key,
         noise_keys.clone(),
         actor,
-        HealthMonitor::new(),
+        HealthMonitor::new(actor),
     );
 
     let scheduler = Rc::new(

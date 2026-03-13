@@ -97,7 +97,7 @@ async fn setup_discovery_harness(dns_port: u16) -> DiscoveryHarness {
         tasks.clone(),
         services.clone(),
         mantissa::network::bpf::NetworkBpfManager::unavailable(),
-        health::HealthMonitor::new(),
+        health::HealthMonitor::new(Uuid::nil()),
         dns_port,
     );
 

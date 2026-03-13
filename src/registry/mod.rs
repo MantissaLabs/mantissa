@@ -642,7 +642,7 @@ impl Registry {
             self.store_session(peer_id, session.clone()).await;
 
             let _ = session.ping_request().send().promise.await.map(|_| {
-                self.health_monitor.observe_seen(peer_id);
+                let _ = self.health_monitor.record_observation(peer_id);
             });
         }
 
@@ -695,7 +695,7 @@ impl Registry {
                                 self.attach_handle_only(peer_id, client.clone()).await;
                                 self.store_session(peer_id, session.clone()).await;
                                 let _ = session.ping_request().send().promise.await.map(|_| {
-                                    self.health_monitor.observe_seen(peer_id);
+                                    let _ = self.health_monitor.record_observation(peer_id);
                                 });
 
                                 println!("Session established with peer {peer_id} @ {addr}");

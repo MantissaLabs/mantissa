@@ -264,7 +264,7 @@ async fn setup_task_manager() -> TestHarness {
         signing_key,
         noise_keys.clone(),
         actor,
-        ::health::HealthMonitor::new(),
+        ::health::HealthMonitor::new(actor),
     );
 
     let scheduler = Rc::new(

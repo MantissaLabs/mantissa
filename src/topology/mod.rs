@@ -48,7 +48,6 @@ use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
 use self::peer_snapshot::{PeerCacheEntry, PeerSnapshot, PeerSnapshotCache};
-use self::swim::SwimState;
 
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
     match mutex.lock() {
@@ -397,9 +396,6 @@ pub struct Topology {
 
     /// Runtime health tuning used by SWIM-style probing loops.
     runtime_health: config::RuntimeHealthConfig,
-
-    /// SWIM failure detector state tracking incarnation and suspect/down transitions.
-    swim: SwimState,
 }
 
 pub struct TopologyConfig {
@@ -454,8 +450,6 @@ impl Topology {
             noise_public_key,
             signing_key,
         } = crypto;
-        let local_id = node.id;
-
         let topology = Self {
             node,
             cluster_view,
@@ -493,7 +487,6 @@ impl Topology {
             secret_keyring,
             health_monitor,
             runtime_health,
-            swim: SwimState::new(local_id),
         };
 
         info!(
@@ -599,8 +592,6 @@ impl Topology {
         let local_id = self.node.id;
         let public_key = self.public_key;
         let verifying_key = self.signing_key.verifying_key();
-        let health = self.health_monitor.clone();
-        let swim_peers = self.swim.peers.clone();
         let local_incarnation = self.swim_local_incarnation();
         // Precompute the identity signature so the async task doesn't capture `self`.
         let identity_sig = crate::node::identity::sign_peer_identity(
@@ -692,17 +683,7 @@ impl Topology {
             log::warn!("failed to upsert self peer: {e}");
         }
 
-        {
-            let mut states = swim_peers.lock().await;
-            let state = states.entry(local_id).or_default();
-            state.incarnation = state.incarnation.max(local_incarnation);
-            state.status = ::health::Status::Alive;
-            state.first_failed_at = None;
-            state.suspect_deadline = None;
-        }
-
-        // mark self as alive in health (passive observation)
-        health.observe_seen(local_id);
+        self.health_monitor.record_join(local_id, local_incarnation);
 
         Ok(())
     }
@@ -994,7 +975,7 @@ impl Topology {
                                 error!("Failed to register peer: {e}");
                                 continue;
                             }
-                            self.swim_record_join(id, incarnation).await;
+                            self.swim_record_join(id, incarnation);
                         }
 
                         TopologyEvent::Leave { id } => {
@@ -1162,9 +1143,7 @@ impl Topology {
             eprintln!("Could not remove peer: {e}");
         }
         self.registry.remove_peer(id).await;
-        self.health_monitor
-            .set_status(id, ::health::Status::Unknown);
-        self.swim.peers.lock().await.remove(&id);
+        self.health_monitor.remove_peer(id);
         Ok(())
     }
 

@@ -1115,7 +1115,7 @@ mod tests {
         let session_store =
             LocalSessionStore::open(db.clone(), &noise_keys).expect("open local session store");
 
-        let health_monitor = HealthMonitor::new();
+        let health_monitor = HealthMonitor::new(actor);
 
         let registry = Registry::new(
             peers_store,

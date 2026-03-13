@@ -147,8 +147,7 @@ impl protocol::server::Server for Server {
             .await
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         self.topology
-            .swim_record_join(joiner_id, joiner_incarnation)
-            .await;
+            .swim_record_join(joiner_id, joiner_incarnation);
 
         // Issue session ticket.
         let ticket = self

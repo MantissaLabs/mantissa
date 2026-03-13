@@ -406,7 +406,7 @@ impl Bootstrap {
         // topology object + client
         // Health settings are read once and passed into SWIM runtime loops.
         let runtime_health = config::health_runtime_config();
-        let health_monitor = health::HealthMonitor::new();
+        let health_monitor = health::HealthMonitor::new(ctx.self_id);
 
         let topology_stores = TopologyStores {
             credentials: stores.local_creds.clone(),
