@@ -36,11 +36,11 @@ struct TaskTemplate {
   networks @9 :List(Text);
   # Required overlay network names
 
-  healthPort @10 :UInt16;
-  # Optional health probe port (0 disables probing)
+  readiness @10 :ReadinessProbe;
+  # Optional distributed readiness probe used to admit service backends.
 
-  healthCommand @11 :List(Text);
-  # Optional health command (first element may be HTTP path); empty disables
+  liveness @11 :LivenessProbe;
+  # Optional local liveness probe used to restart unhealthy containers.
 
   publicPort @12 :UInt16;
   # Optional host-facing service port (0 disables public exposure)
@@ -59,6 +59,51 @@ struct TaskTemplate {
 
   volumes @17 :List(TaskSchema.VolumeMount);
   # Named volumes mounted into each replica of this template.
+}
+
+enum ReadinessProbeKind {
+  http @0;
+  # Probe the backend over HTTP and require a 2xx response.
+
+  tcp @1;
+  # Probe the backend by establishing a TCP connection.
+}
+
+struct ReadinessProbe {
+  kind @0 :ReadinessProbeKind;
+  # Transport style used by distributed discovery probes.
+
+  port @1 :UInt16;
+  # Backend port probed from discovery.
+
+  path @2 :Text;
+  # HTTP request path, ignored for TCP probes and "/" when empty.
+
+  intervalMs @3 :UInt64;
+  # Probe cadence in milliseconds.
+
+  timeoutMs @4 :UInt64;
+  # Per-attempt timeout in milliseconds.
+
+  failureThreshold @5 :UInt32;
+  # Consecutive failures required before the backend is withdrawn.
+}
+
+struct LivenessProbe {
+  command @0 :List(Text);
+  # Command executed inside the running container.
+
+  intervalMs @1 :UInt64;
+  # Probe cadence in milliseconds.
+
+  timeoutMs @2 :UInt64;
+  # Per-attempt timeout in milliseconds.
+
+  failureThreshold @3 :UInt32;
+  # Consecutive failures required before restart.
+
+  startPeriodMs @4 :UInt64;
+  # Warm-up delay before failures count.
 }
 
 enum PublicProtocol {

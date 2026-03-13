@@ -148,6 +148,70 @@ pub struct VolumeMount {
     pub read_only: bool,
 }
 
+fn default_readiness_interval_ms() -> u64 {
+    2_000
+}
+
+fn default_readiness_timeout_ms() -> u64 {
+    300
+}
+
+fn default_readiness_failure_threshold() -> u32 {
+    1
+}
+
+fn default_liveness_interval_ms() -> u64 {
+    10_000
+}
+
+fn default_liveness_timeout_ms() -> u64 {
+    3_000
+}
+
+fn default_liveness_failure_threshold() -> u32 {
+    3
+}
+
+fn default_liveness_start_period_ms() -> u64 {
+    30_000
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessKind {
+    #[default]
+    Http,
+    Tcp,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ReadinessProbe {
+    #[serde(default)]
+    pub kind: ReadinessKind,
+    pub port: u16,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default = "default_readiness_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_readiness_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_readiness_failure_threshold")]
+    pub failure_threshold: u32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LivenessProbe {
+    pub command: Vec<String>,
+    #[serde(default = "default_liveness_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_liveness_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_liveness_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_liveness_start_period_ms")]
+    pub start_period_ms: u64,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct TaskSpec {
     pub name: String,
@@ -176,9 +240,9 @@ pub struct TaskSpec {
     #[serde(default)]
     pub networks: Vec<String>,
     #[serde(default)]
-    pub health_port: Option<u16>,
+    pub readiness: Option<ReadinessProbe>,
     #[serde(default)]
-    pub health_command: Option<Vec<String>>,
+    pub liveness: Option<LivenessProbe>,
     #[serde(default)]
     pub public_port: Option<u16>,
 }
@@ -318,9 +382,68 @@ impl ServiceManifest {
                 ));
             }
 
-            if matches!(task.health_port, Some(0)) {
+            if let Some(readiness) = task.readiness.as_ref()
+                && readiness.port == 0
+            {
                 return Err(anyhow!(
-                    "task '{}' must set health_port to a non-zero value when provided",
+                    "task '{}' must set readiness.port to a non-zero value when provided",
+                    task.name
+                ));
+            }
+            if let Some(readiness) = task.readiness.as_ref()
+                && readiness.interval_ms == 0
+            {
+                return Err(anyhow!(
+                    "task '{}' must set readiness.interval_ms to a value greater than zero",
+                    task.name
+                ));
+            }
+            if let Some(readiness) = task.readiness.as_ref()
+                && readiness.timeout_ms == 0
+            {
+                return Err(anyhow!(
+                    "task '{}' must set readiness.timeout_ms to a value greater than zero",
+                    task.name
+                ));
+            }
+            if let Some(readiness) = task.readiness.as_ref()
+                && readiness.failure_threshold == 0
+            {
+                return Err(anyhow!(
+                    "task '{}' must set readiness.failure_threshold to a value greater than zero",
+                    task.name
+                ));
+            }
+
+            if let Some(liveness) = task.liveness.as_ref()
+                && liveness.command.is_empty()
+            {
+                return Err(anyhow!(
+                    "task '{}' must set liveness.command to a non-empty command when provided",
+                    task.name
+                ));
+            }
+            if let Some(liveness) = task.liveness.as_ref()
+                && liveness.interval_ms == 0
+            {
+                return Err(anyhow!(
+                    "task '{}' must set liveness.interval_ms to a value greater than zero",
+                    task.name
+                ));
+            }
+            if let Some(liveness) = task.liveness.as_ref()
+                && liveness.timeout_ms == 0
+            {
+                return Err(anyhow!(
+                    "task '{}' must set liveness.timeout_ms to a value greater than zero",
+                    task.name
+                ));
+            }
+            if let Some(liveness) = task.liveness.as_ref()
+                && liveness.failure_threshold == 0
+            {
+                return Err(anyhow!(
+                    "task '{}' must set liveness.failure_threshold to a value greater than zero",
                     task.name
                 ));
             }
@@ -810,8 +933,8 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
-                health_port: None,
-                health_command: None,
+                readiness: None,
+                liveness: None,
                 public_port: None,
             }],
             update: ServiceUpdateStrategy::default(),
@@ -822,6 +945,91 @@ mod tests {
             error
                 .to_string()
                 .contains("pre_stop_command must contain at least one argument")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_zero_readiness_interval() {
+        let manifest = ServiceManifest {
+            name: "demo".into(),
+            volumes: Vec::new(),
+            tasks: vec![TaskSpec {
+                name: "api".into(),
+                image: "ghcr.io/demo/api:latest".into(),
+                command: Vec::new(),
+                depends_on: Vec::new(),
+                replicas: 1,
+                resources: TaskResources::default(),
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+                readiness: Some(ReadinessProbe {
+                    kind: ReadinessKind::Http,
+                    port: 8080,
+                    path: Some("/healthz".into()),
+                    interval_ms: 0,
+                    timeout_ms: 300,
+                    failure_threshold: 1,
+                }),
+                liveness: None,
+                public_port: None,
+            }],
+            update: ServiceUpdateStrategy::default(),
+        };
+
+        let error = manifest
+            .validate()
+            .expect_err("zero readiness interval must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("readiness.interval_ms to a value greater than zero")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_zero_liveness_interval() {
+        let manifest = ServiceManifest {
+            name: "demo".into(),
+            volumes: Vec::new(),
+            tasks: vec![TaskSpec {
+                name: "api".into(),
+                image: "ghcr.io/demo/api:latest".into(),
+                command: Vec::new(),
+                depends_on: Vec::new(),
+                replicas: 1,
+                resources: TaskResources::default(),
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+                readiness: None,
+                liveness: Some(LivenessProbe {
+                    command: vec!["/bin/check".into()],
+                    interval_ms: 0,
+                    timeout_ms: 3_000,
+                    failure_threshold: 3,
+                    start_period_ms: 30_000,
+                }),
+                public_port: None,
+            }],
+            update: ServiceUpdateStrategy::default(),
+        };
+
+        let error = manifest
+            .validate()
+            .expect_err("zero liveness interval must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("liveness.interval_ms to a value greater than zero")
         );
     }
 
@@ -848,8 +1056,8 @@ mod tests {
                     read_only: false,
                 }],
                 networks: Vec::new(),
-                health_port: None,
-                health_command: None,
+                readiness: None,
+                liveness: None,
                 public_port: None,
             }],
             update: ServiceUpdateStrategy::default(),
@@ -898,8 +1106,8 @@ mod tests {
                     read_only: false,
                 }],
                 networks: Vec::new(),
-                health_port: None,
-                health_command: None,
+                readiness: None,
+                liveness: None,
                 public_port: None,
             }],
             update: ServiceUpdateStrategy::default(),
@@ -935,8 +1143,8 @@ mod tests {
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: Vec::new(),
-                    health_port: None,
-                    health_command: None,
+                    readiness: None,
+                    liveness: None,
                     public_port: None,
                 },
                 TaskSpec {
@@ -953,8 +1161,8 @@ mod tests {
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: Vec::new(),
-                    health_port: None,
-                    health_command: None,
+                    readiness: None,
+                    liveness: None,
                     public_port: None,
                 },
             ],

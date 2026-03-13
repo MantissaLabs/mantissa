@@ -7,15 +7,15 @@ use crate::services::reconcile::{
 };
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServiceEvent, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue,
-    ServiceStatus, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
-    ServiceUpdateStrategy, compute_service_id,
+    ServiceEvent, ServiceLivenessProbe, ServiceRolloutOrder, ServiceRolloutPhase,
+    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
+    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy, compute_service_id,
 };
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest, TaskTrafficPublicationUpdate};
 use crate::task::types::{
-    TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec, TaskStateFilter,
-    TaskVolumeMount,
+    TaskLivenessProbe, TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec,
+    TaskStateFilter, TaskVolumeMount,
 };
 use crate::volumes::types::VolumeDriver;
 use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
@@ -2182,6 +2182,7 @@ fn make_replica_request(
         restart_policy: template.restart_policy.as_ref().map(map_restart_policy),
         termination_grace_period_secs: template.termination_grace_period_secs,
         pre_stop_command: template.pre_stop_command.clone(),
+        liveness: template.liveness.as_ref().map(map_liveness_probe),
         env: template.env.clone(),
         secret_files: template.secret_files.clone(),
         volumes: template.volumes.clone(),
@@ -2239,6 +2240,17 @@ fn map_restart_policy(policy: &ServiceTaskRestartPolicy) -> TaskRestartPolicy {
     TaskRestartPolicy {
         name,
         max_retry_count: policy.max_retry_count,
+    }
+}
+
+/// Converts the service liveness probe into the runtime-owned task liveness shape.
+fn map_liveness_probe(probe: &ServiceLivenessProbe) -> TaskLivenessProbe {
+    TaskLivenessProbe {
+        command: probe.command.clone(),
+        interval_ms: probe.interval_ms,
+        timeout_ms: probe.timeout_ms,
+        failure_threshold: probe.failure_threshold,
+        start_period_ms: probe.start_period_ms,
     }
 }
 
@@ -2360,6 +2372,7 @@ mod tests {
             restart_policy: None,
             termination_grace_period_secs: None,
             pre_stop_command: None,
+            liveness: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             volumes: vec![TaskVolumeMount {
@@ -2404,6 +2417,7 @@ mod tests {
             restart_policy: None,
             termination_grace_period_secs: None,
             pre_stop_command: None,
+            liveness: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             volumes: Vec::new(),
@@ -2436,8 +2450,8 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
-            health_port: None,
-            health_command: None,
+            readiness: None,
+            liveness: None,
             public_port: None,
             public_protocol: None,
         };
@@ -2476,8 +2490,8 @@ mod tests {
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: Vec::new(),
-                    health_port: None,
-                    health_command: None,
+                    readiness: None,
+                    liveness: None,
                     public_port: None,
                     public_protocol: None,
                 },
@@ -2497,8 +2511,8 @@ mod tests {
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: Vec::new(),
-                    health_port: None,
-                    health_command: None,
+                    readiness: None,
+                    liveness: None,
                     public_port: None,
                     public_protocol: None,
                 },
@@ -2575,8 +2589,8 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
-                health_port: None,
-                health_command: None,
+                readiness: None,
+                liveness: None,
                 public_port: None,
                 public_protocol: None,
             },
@@ -2596,8 +2610,8 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
-                health_port: None,
-                health_command: None,
+                readiness: None,
+                liveness: None,
                 public_port: None,
                 public_protocol: None,
             },
@@ -2635,8 +2649,8 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
-                health_port: None,
-                health_command: None,
+                readiness: None,
+                liveness: None,
                 public_port: None,
                 public_protocol: None,
             },
@@ -2656,8 +2670,8 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
-                health_port: None,
-                health_command: None,
+                readiness: None,
+                liveness: None,
                 public_port: None,
                 public_protocol: None,
             },
@@ -2740,8 +2754,8 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
-            health_port: None,
-            health_command: None,
+            readiness: None,
+            liveness: None,
             public_port: None,
             public_protocol: None,
         }];
@@ -2790,8 +2804,8 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
-            health_port: None,
-            health_command: None,
+            readiness: None,
+            liveness: None,
             public_port: None,
             public_protocol: None,
         }];
@@ -3197,8 +3211,8 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
-            health_port: None,
-            health_command: None,
+            readiness: None,
+            liveness: None,
             public_port: None,
             public_protocol: None,
         }];

@@ -24,7 +24,9 @@ use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
 use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
-use crate::task::types::{TaskRestartPolicyKind, TaskStateKind, TaskValue, TaskValueDraft};
+use crate::task::types::{
+    TaskLivenessProbe, TaskRestartPolicyKind, TaskStateKind, TaskValue, TaskValueDraft,
+};
 use crate::topology::peers::PeerSchedulingState;
 use crate::volumes::VolumeRegistry;
 use crate::volumes::local::managed_volume_data_path;
@@ -718,6 +720,7 @@ fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> Tas
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: vec![crate::task::types::TaskVolumeMount {
@@ -797,6 +800,7 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
         }),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -861,6 +865,7 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
         }),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -921,6 +926,7 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -988,6 +994,7 @@ async fn pull_image_for_task_skips_pull_when_image_exists_locally() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -1051,6 +1058,7 @@ async fn reconcile_rejects_missing_slot_assignments() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -1104,6 +1112,7 @@ async fn reconcile_pending_task_reserves_assigned_slots_before_launch() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -1169,6 +1178,7 @@ async fn reconcile_uses_latest_persisted_slot_assignment() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -1288,6 +1298,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -1318,6 +1329,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -1352,6 +1364,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -1386,6 +1399,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -1427,6 +1441,7 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -1457,6 +1472,7 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -1579,6 +1595,7 @@ async fn reconcile_local_tasks_does_not_duplicate_batch_launch_in_progress() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -1843,6 +1860,251 @@ async fn reconcile_running_task_keeps_running_when_list_finds_container() {
 }
 
 #[tokio::test]
+async fn reconcile_running_task_executes_liveness_probe_once_per_interval() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    let mut probed = manager.load_spec(spec.id).await.expect("load running task");
+    probed.liveness = Some(TaskLivenessProbe {
+        command: vec!["/bin/check".to_string(), "--ready".to_string()],
+        interval_ms: 60_000,
+        timeout_ms: 750,
+        failure_threshold: 2,
+        start_period_ms: 0,
+    });
+    manager
+        .persist_spec(&probed)
+        .await
+        .expect("persist liveness probe");
+
+    let mut first = manager
+        .load_spec(spec.id)
+        .await
+        .expect("reload running task for first probe");
+    let short_circuit = manager
+        .reconcile_recorded_running_task(&mut first)
+        .await
+        .expect("reconcile first liveness probe");
+    assert!(
+        short_circuit,
+        "healthy liveness probe should keep task running"
+    );
+
+    let exec_calls = mock_cm.exec_calls.lock().await.clone();
+    assert_eq!(
+        exec_calls.len(),
+        1,
+        "first reconcile should execute probe once"
+    );
+    assert_eq!(exec_calls[0].0, "container-0");
+    assert_eq!(
+        exec_calls[0].1,
+        vec!["/bin/check".to_string(), "--ready".to_string()]
+    );
+    assert_eq!(exec_calls[0].2, Some(std::time::Duration::from_millis(750)));
+
+    let entry = manager
+        .liveness_probes
+        .lock()
+        .await
+        .get(&spec.id)
+        .copied()
+        .expect("cached liveness entry");
+    assert_eq!(entry.launch_attempt, first.launch_attempt);
+    assert_eq!(entry.consecutive_failures, 0);
+
+    let mut second = manager
+        .load_spec(spec.id)
+        .await
+        .expect("reload running task for cached probe");
+    let short_circuit = manager
+        .reconcile_recorded_running_task(&mut second)
+        .await
+        .expect("reconcile cached liveness probe");
+    assert!(
+        short_circuit,
+        "cached healthy probe should keep task running"
+    );
+    assert_eq!(
+        mock_cm.exec_calls.lock().await.len(),
+        1,
+        "probe interval cache should suppress an immediate second exec"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_running_task_skips_liveness_probe_during_start_period() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    let mut probed = manager.load_spec(spec.id).await.expect("load running task");
+    probed.updated_at = Utc::now().to_rfc3339();
+    probed.liveness = Some(TaskLivenessProbe {
+        command: vec!["/bin/check".to_string()],
+        interval_ms: 0,
+        timeout_ms: 500,
+        failure_threshold: 1,
+        start_period_ms: 60_000,
+    });
+    manager
+        .persist_spec(&probed)
+        .await
+        .expect("persist liveness probe");
+
+    let mut working = manager
+        .load_spec(spec.id)
+        .await
+        .expect("reload running task");
+    let short_circuit = manager
+        .reconcile_recorded_running_task(&mut working)
+        .await
+        .expect("reconcile running task inside start period");
+    assert!(short_circuit, "start period should keep task running");
+    assert!(
+        mock_cm.exec_calls.lock().await.is_empty(),
+        "start period should suppress local exec probes"
+    );
+    assert!(
+        manager.liveness_probes.lock().await.get(&spec.id).is_none(),
+        "start period should not create a cached probe entry before the first probe runs"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    let mut probed = manager.load_spec(spec.id).await.expect("load running task");
+    probed.liveness = Some(TaskLivenessProbe {
+        command: vec!["/bin/check".to_string()],
+        interval_ms: 0,
+        timeout_ms: 500,
+        failure_threshold: 2,
+        start_period_ms: 0,
+    });
+    manager
+        .persist_spec(&probed)
+        .await
+        .expect("persist liveness probe");
+
+    {
+        let mut results = mock_cm.exec_results.lock().await;
+        results.push_back(Ok(crate::task::docker::ContainerExecResult {
+            exit_code: Some(7),
+        }));
+        results.push_back(Ok(crate::task::docker::ContainerExecResult {
+            exit_code: Some(7),
+        }));
+    }
+
+    let mut first = manager
+        .load_spec(spec.id)
+        .await
+        .expect("reload running task for first failure");
+    let short_circuit = manager
+        .reconcile_recorded_running_task(&mut first)
+        .await
+        .expect("reconcile first liveness failure");
+    assert!(
+        short_circuit,
+        "task should remain running until the failure threshold is reached"
+    );
+
+    let after_first = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load task after first liveness failure");
+    assert_eq!(after_first.state, ContainerState::Running);
+    assert_eq!(
+        manager
+            .liveness_probes
+            .lock()
+            .await
+            .get(&spec.id)
+            .map(|entry| entry.consecutive_failures),
+        Some(1),
+        "first failure should be cached for threshold accounting"
+    );
+
+    let mut second = manager
+        .load_spec(spec.id)
+        .await
+        .expect("reload running task for threshold failure");
+    let short_circuit = manager
+        .reconcile_recorded_running_task(&mut second)
+        .await
+        .expect("reconcile threshold liveness failure");
+    assert!(
+        !short_circuit,
+        "threshold failure should hand control back to the pending restart path"
+    );
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load task after threshold failure");
+    assert_eq!(refreshed.state, ContainerState::Pending);
+    assert_eq!(
+        refreshed.phase_reason.as_deref(),
+        Some("liveness probe exited with status code 7")
+    );
+    assert_eq!(
+        refreshed.last_terminal_observed_launch,
+        Some(refreshed.launch_attempt),
+        "threshold failure should record a terminal observation for the current launch"
+    );
+    assert!(
+        manager
+            .local_containers
+            .lock()
+            .await
+            .get(&spec.id)
+            .is_none(),
+        "threshold failure should evict the cached local container id"
+    );
+    assert!(
+        manager.liveness_probes.lock().await.get(&spec.id).is_none(),
+        "threshold failure should clear cached liveness accounting"
+    );
+    assert_eq!(
+        mock_cm.stopped.lock().await.as_slice(),
+        ["container-0"],
+        "threshold failure should stop the unhealthy container before restart"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_running_task_retries_create_after_stale_name_conflict() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
@@ -2072,6 +2334,7 @@ async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -2695,6 +2958,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
+                liveness: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
@@ -2715,6 +2979,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
+                liveness: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
@@ -2770,6 +3035,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
             restart_policy: None,
             termination_grace_period_secs: None,
             pre_stop_command: None,
+            liveness: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             volumes: Vec::new(),
@@ -2832,6 +3098,7 @@ async fn task_owned_locally_detects_remote_entries() {
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -2890,6 +3157,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
+                liveness: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
@@ -2910,6 +3178,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
+                liveness: None,
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
@@ -2990,6 +3259,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -3087,6 +3357,7 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -3147,6 +3418,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -3222,6 +3494,7 @@ async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachme
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -3331,6 +3604,7 @@ async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -3443,6 +3717,7 @@ async fn request_task_stop_cleans_up_after_teardown_failure() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -3808,6 +4083,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -3882,6 +4158,7 @@ fn build_remote_task_spec(
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -3978,6 +4255,7 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -4112,6 +4390,7 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
         gpu_device_ids: Vec::new(),
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -4216,6 +4495,7 @@ async fn attachment_ready_triggers_forwarding_event() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -4316,6 +4596,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -4413,6 +4694,7 @@ async fn runtime_attachments_retry_transient_provision_errors() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -4514,6 +4796,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -4571,6 +4854,7 @@ fn scheduling_retry_budget_stays_wide_for_untargeted_starts() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -4598,6 +4882,7 @@ fn scheduling_retry_budget_is_shorter_for_targeted_starts() {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
@@ -4799,6 +5084,7 @@ async fn multi_volume_bound_node_conflict_rejected() {
             restart_policy: None,
             termination_grace_period_secs: None,
             pre_stop_command: None,
+            liveness: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             volumes: vec![

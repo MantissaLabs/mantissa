@@ -1,6 +1,7 @@
 use super::manifest::{
-    EnvironmentVariable, RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference,
-    ServiceManifest, ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskSpec, VolumeMount,
+    EnvironmentVariable, LivenessProbe, ReadinessKind, ReadinessProbe, RestartPolicyName,
+    RolloutOrder, SecretFileProjection, SecretReference, ServiceManifest, ServiceUpdateStrategy,
+    ServiceUpdateStrategyMode, TaskSpec, VolumeMount,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -429,17 +430,13 @@ fn write_task(
         networks_builder.set(idx as u32, network.trim());
     }
 
-    builder.set_health_port(task.health_port.unwrap_or(0));
-    let mut health_builder = builder.reborrow().init_health_command(
-        task.health_command
-            .as_ref()
-            .map(|cmd| cmd.len() as u32)
-            .unwrap_or(0),
-    );
-    if let Some(cmd) = &task.health_command {
-        for (idx, arg) in cmd.iter().enumerate() {
-            health_builder.set(idx as u32, arg);
-        }
+    if let Some(readiness) = task.readiness.as_ref() {
+        let builder = builder.reborrow().init_readiness();
+        write_readiness_probe(builder, readiness);
+    }
+    if let Some(liveness) = task.liveness.as_ref() {
+        let builder = builder.reborrow().init_liveness();
+        write_liveness_probe(builder, liveness);
     }
 
     builder.set_public_port(task.public_port.unwrap_or(0));
@@ -457,6 +454,38 @@ fn write_task(
     )?;
 
     Ok(())
+}
+
+/// Writes one readiness probe into the service deployment payload.
+fn write_readiness_probe(
+    mut builder: protocol::services::readiness_probe::Builder<'_>,
+    probe: &ReadinessProbe,
+) {
+    let kind = match probe.kind {
+        ReadinessKind::Http => protocol::services::ReadinessProbeKind::Http,
+        ReadinessKind::Tcp => protocol::services::ReadinessProbeKind::Tcp,
+    };
+    builder.set_kind(kind);
+    builder.set_port(probe.port);
+    builder.set_path(probe.path.as_deref().unwrap_or(""));
+    builder.set_interval_ms(probe.interval_ms);
+    builder.set_timeout_ms(probe.timeout_ms);
+    builder.set_failure_threshold(probe.failure_threshold);
+}
+
+/// Writes one local liveness probe into the service deployment payload.
+fn write_liveness_probe(
+    mut builder: protocol::services::liveness_probe::Builder<'_>,
+    probe: &LivenessProbe,
+) {
+    let mut command_builder = builder.reborrow().init_command(probe.command.len() as u32);
+    for (idx, arg) in probe.command.iter().enumerate() {
+        command_builder.set(idx as u32, arg);
+    }
+    builder.set_interval_ms(probe.interval_ms);
+    builder.set_timeout_ms(probe.timeout_ms);
+    builder.set_failure_threshold(probe.failure_threshold);
+    builder.set_start_period_ms(probe.start_period_ms);
 }
 
 /// Writes resolved named volume mounts into the task template builder for service deployment.

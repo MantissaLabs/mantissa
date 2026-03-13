@@ -133,8 +133,8 @@ fn template_attributes_changed(
         || current.secret_files != desired.secret_files
         || current.volumes != desired.volumes
         || current.networks != desired.networks
-        || current.health_port != desired.health_port
-        || current.health_command != desired.health_command
+        || current.readiness != desired.readiness
+        || current.liveness != desired.liveness
         || current.public_port != desired.public_port
         || current.public_protocol != desired.public_protocol
 }

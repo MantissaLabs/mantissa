@@ -42,9 +42,6 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
             iface: "eth0",
             ip: "192.168.1.10",
         ),
-        discovery: (
-            health_port: 30080,
-        ),
     ),
     health: (
         probe_fanout: 5,
@@ -74,7 +71,6 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `network.nodeport.enabled` (legacy: disabled when BPF attach is disabled)
 - `network.nodeport.iface` (legacy: `MANTISSA_NODEPORT_IFACE`)
 - `network.nodeport.ip` (legacy: `MANTISSA_NODEPORT_IP`)
-- `network.discovery.health_port` (legacy: `MANTISSA_LB_HEALTH_PORT`)
 - `health.probe_fanout`
 - `health.probe_interval_ms`
 - `health.probe_timeout_ms`

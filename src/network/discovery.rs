@@ -1,4 +1,3 @@
-use crate::config;
 use crate::network::allocator::parse_ipv4_cidr;
 use crate::network::attachment::{bridge_name, host_access_host_iface_name, vxlan_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
@@ -9,7 +8,9 @@ use crate::network::types::{
     BpfAttachPoint, BpfProgramSpec, NetworkAttachmentState, NetworkSpecValue,
 };
 use crate::services::registry::ServiceRegistry;
-use crate::services::types::{ServicePortProtocol, ServiceSpecValue};
+use crate::services::types::{
+    ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
+};
 use crate::store::task_store::TaskStore;
 use crate::task::container::ContainerState;
 use crate::task::manager::select_best_task_value;
@@ -37,10 +38,6 @@ const SERVICE_TTL_SECS: u32 = 5;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 // Keep cached health around for roughly one DNS TTL to avoid stale blackholes.
 const HEALTH_CACHE_STALE_AFTER: Duration = Duration::from_secs(SERVICE_TTL_SECS as u64);
-// Recheck healthy backends periodically so we refresh MACs without probing on every tick.
-const HEALTH_HEALTHY_RECHECK: Duration = Duration::from_secs(2);
-// Back off unhealthy probes to reduce repeated timeouts while an endpoint is down.
-const HEALTH_UNHEALTHY_RECHECK: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct ServiceDiscovery {
@@ -53,8 +50,6 @@ pub struct ServiceDiscovery {
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
     dns_port: u16,
-    health_port: Option<u16>,
-    health_timeout: Duration,
     bpf_lb: BpfLoadBalancer,
     nodeport: NodePortManager,
     missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
@@ -82,8 +77,7 @@ struct NetworkBackendCatalog {
 struct ServiceBackendCatalogEntry {
     service_name: String,
     candidates: Vec<BackendAddress>,
-    health_port: Option<u16>,
-    health_path: Option<String>,
+    readiness: Option<ServiceReadinessProbe>,
     expose_to_host: bool,
     public_port: Option<u16>,
     public_protocols: Vec<NodePortProtocol>,
@@ -112,7 +106,6 @@ impl ServiceDiscovery {
         health_monitor: Arc<HealthMonitor>,
         dns_port: u16,
     ) -> Self {
-        let health_port = config::discovery_health_port();
         Self {
             registry,
             tasks,
@@ -123,8 +116,6 @@ impl ServiceDiscovery {
             load_balancer: Arc::new(AsyncMutex::new(ServiceLoadBalancer::default())),
             health: Arc::new(AsyncMutex::new(BackendHealth::default())),
             dns_port,
-            health_port,
-            health_timeout: Duration::from_millis(300),
             bpf_lb: BpfLoadBalancer::new(),
             nodeport: NodePortManager::new(),
             missing_lb_maps: Arc::new(AsyncMutex::new(HashSet::new())),
@@ -163,8 +154,6 @@ impl ServiceDiscovery {
             self.load_balancer.clone(),
             self.health.clone(),
             self.dns_port,
-            self.health_port,
-            self.health_timeout,
             self.bpf_lb.clone(),
             self.nodeport.clone(),
             self.missing_lb_maps.clone(),
@@ -222,8 +211,6 @@ async fn spawn_dns_server(
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
     dns_port: u16,
-    health_port: Option<u16>,
-    health_timeout: Duration,
     bpf_lb: BpfLoadBalancer,
     nodeport: NodePortManager,
     missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
@@ -255,8 +242,6 @@ async fn spawn_dns_server(
         &bpf_manager,
         network_id,
         &health,
-        health_port,
-        health_timeout,
         &lb_manager,
         &nodeport,
         &lb_missing,
@@ -299,8 +284,6 @@ async fn spawn_dns_server(
                         &refresh_bpf_manager,
                         network_id,
                         &refresh_health,
-                        health_port,
-                        health_timeout,
                         &refresh_lb_manager,
                         &refresh_nodeport,
                         &refresh_lb_missing,
@@ -353,7 +336,6 @@ async fn spawn_dns_server(
                                 &network_name,
                                 &dns_load_balancer,
                                 &dns_health,
-                                health_port,
                                 &dns_lb_manager,
                                 &dns_lb_missing,
                                 &dns_health_monitor,
@@ -409,7 +391,6 @@ async fn handle_datagram(
     network_name: &str,
     load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: &Arc<AsyncMutex<BackendHealth>>,
-    health_port: Option<u16>,
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
     health_monitor: &Arc<HealthMonitor>,
@@ -466,7 +447,6 @@ async fn handle_datagram(
         services,
         network_id,
         &health_snapshot,
-        health_port,
     )
     .await
     {
@@ -575,7 +555,7 @@ async fn answer_query(
     };
 
     let candidates = catalog_entry.candidates.clone();
-    let mut backends = if catalog_entry.health_port.is_some() {
+    let mut backends = if catalog_entry.readiness.is_some() {
         let guard = health.lock().await;
         filter_cached_backends(&guard, network_id, &service_name, candidates.clone())
     } else {
@@ -594,7 +574,7 @@ async fn answer_query(
         &service_name,
         candidates,
         backends,
-        catalog_entry.health_port.is_some(),
+        catalog_entry.readiness.is_some(),
         "dns",
     );
 
@@ -1062,6 +1042,7 @@ struct BackendHealth {
 }
 
 impl BackendHealth {
+    /// Returns the cached readiness entry for one backend, if discovery has probed it before.
     fn get_entry(
         &self,
         network_id: Uuid,
@@ -1074,23 +1055,17 @@ impl BackendHealth {
             .and_then(|svc| svc.get(&backend).copied())
     }
 
-    /// Select only backends currently marked healthy (or unknown) to prepare for active probing.
-    fn set_health(
+    /// Persists the latest readiness observation for one backend.
+    fn set_entry(
         &mut self,
         network_id: Uuid,
         service_name: &str,
         backend: Ipv4Addr,
-        state: HealthState,
+        entry_state: HealthEntry,
     ) {
         let key = (network_id, service_name.to_ascii_lowercase());
         let entry = self.statuses.entry(key).or_default();
-        entry.insert(
-            backend,
-            HealthEntry {
-                state,
-                checked_at: Instant::now(),
-            },
-        );
+        entry.insert(backend, entry_state);
     }
 }
 
@@ -1098,6 +1073,42 @@ impl BackendHealth {
 struct HealthEntry {
     state: HealthState,
     checked_at: Instant,
+    consecutive_failures: u32,
+}
+
+/// Computes the next cached backend readiness state after one active probe attempt.
+fn next_health_entry(
+    previous: Option<HealthEntry>,
+    probe: &ServiceReadinessProbe,
+    probe_ok: bool,
+) -> HealthEntry {
+    let checked_at = Instant::now();
+    if probe_ok {
+        return HealthEntry {
+            state: HealthState::Healthy,
+            checked_at,
+            consecutive_failures: 0,
+        };
+    }
+
+    let failures = previous
+        .map(|entry| entry.consecutive_failures)
+        .unwrap_or_default()
+        .saturating_add(1);
+    let previous_state = previous
+        .map(|entry| entry.state)
+        .unwrap_or(HealthState::Unknown);
+    let state = match previous_state {
+        HealthState::Healthy if failures < probe.failure_threshold() => HealthState::Healthy,
+        _ if failures >= probe.failure_threshold() => HealthState::Unhealthy,
+        _ => HealthState::Unknown,
+    };
+
+    HealthEntry {
+        state,
+        checked_at,
+        consecutive_failures: failures,
+    }
 }
 
 /// Filter candidate backends using cached health without performing probes.
@@ -1120,7 +1131,11 @@ fn filter_cached_backends(
                 let is_stale =
                     now.saturating_duration_since(entry.checked_at) >= HEALTH_CACHE_STALE_AFTER;
                 match entry.state {
-                    HealthState::Healthy | HealthState::Unknown => preferred.push(backend),
+                    HealthState::Healthy => preferred.push(backend),
+                    HealthState::Unknown if entry.consecutive_failures == 0 => {
+                        preferred.push(backend)
+                    }
+                    HealthState::Unknown => {}
                     HealthState::Unhealthy => {
                         // Keep stale unhealthy endpoints out of normal DNS responses whenever at
                         // least one non-unhealthy endpoint exists. This avoids periodic latency
@@ -1173,22 +1188,17 @@ fn normalize_backend_selection(
 }
 
 /// Actively probe candidate backends so the cached health state and dataplane MACs stay fresh.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "health probing carries one private service refresh context"
-)]
 async fn evaluate_backend_health(
     health: &Arc<AsyncMutex<BackendHealth>>,
     registry: &NetworkRegistry,
     network_id: Uuid,
     service_name: &str,
     backends: Vec<BackendAddress>,
-    port: Option<u16>,
-    http_path: Option<String>,
-    timeout: Duration,
+    probe: Option<ServiceReadinessProbe>,
 ) -> Vec<BackendAddress> {
-    // Health probing is opt-in. When no port is provided we keep current behavior and return all backends.
-    let Some(port) = port else { return backends };
+    // Readiness probing is opt-in. When no probe is provided we keep current behavior and return
+    // all backends derived from ready attachments.
+    let Some(probe) = probe else { return backends };
 
     let mut healthy = Vec::with_capacity(backends.len());
     for backend in backends {
@@ -1197,16 +1207,16 @@ async fn evaluate_backend_health(
             guard.get_entry(network_id, service_name, backend.ip)
         };
         let now = Instant::now();
-        let state = entry.map(|e| e.state).unwrap_or(HealthState::Unknown);
-        let checked_at = entry.map(|e| e.checked_at).unwrap_or(now);
-        let recheck_after = match state {
-            HealthState::Healthy => HEALTH_HEALTHY_RECHECK,
-            HealthState::Unknown => Duration::from_secs(0),
-            HealthState::Unhealthy => HEALTH_UNHEALTHY_RECHECK,
-        };
+        let state = entry
+            .map(|value| value.state)
+            .unwrap_or(HealthState::Unknown);
+        let checked_at = entry.map(|value| value.checked_at).unwrap_or(now);
+        let recheck_after = entry
+            .map(|_| probe.interval())
+            .unwrap_or(Duration::from_secs(0));
         let is_stale = now.saturating_duration_since(checked_at) >= recheck_after;
 
-        // Respect cached health until the recheck interval expires.
+        // Respect cached readiness until the configured recheck interval expires.
         if matches!(state, HealthState::Healthy) && !is_stale {
             healthy.push(backend);
             continue;
@@ -1214,23 +1224,26 @@ async fn evaluate_backend_health(
         if matches!(state, HealthState::Unhealthy) && !is_stale {
             continue;
         }
+        if matches!(state, HealthState::Unknown) && !is_stale {
+            continue;
+        }
 
         let mut backend = backend;
-        let probe_ok = probe_backend(&backend.ip, port, http_path.as_deref(), timeout).await;
+        let probe_ok = probe_backend(&backend.ip, &probe).await;
         let refreshed_mac = if probe_ok {
             refresh_backend_mac(registry, network_id, backend.ip).await
         } else {
             None
         };
+        let next_entry = next_health_entry(entry, &probe, probe_ok);
         let mut guard = health.lock().await;
-        if probe_ok {
+        guard.set_entry(network_id, service_name, backend.ip, next_entry);
+        if matches!(next_entry.state, HealthState::Healthy) {
             if let Some(mac) = refreshed_mac {
                 backend.mac = mac;
             }
-            guard.set_health(network_id, service_name, backend.ip, HealthState::Healthy);
             healthy.push(backend);
         } else {
-            guard.set_health(network_id, service_name, backend.ip, HealthState::Unhealthy);
             tracing::debug!(
                 target: "network",
                 network = %network_id,
@@ -1238,7 +1251,9 @@ async fn evaluate_backend_health(
                 backend = %backend.ip,
                 state = ?state,
                 stale = is_stale,
-                "backend failed health check"
+                failures = next_entry.consecutive_failures,
+                threshold = probe.failure_threshold(),
+                "backend failed readiness probe"
             );
         }
     }
@@ -1359,60 +1374,34 @@ async fn resolve_neighbor_mac(_network_id: Uuid, _ip: Ipv4Addr) -> Option<[u8; 6
     None
 }
 
-async fn probe_backend(
-    ip: &Ipv4Addr,
-    port: u16,
-    http_path: Option<&str>,
-    timeout: Duration,
-) -> bool {
-    if let Some(path) = http_path
-        && probe_backend_http(ip, port, path, timeout).await
-    {
-        return true;
+async fn probe_backend(ip: &Ipv4Addr, probe: &ServiceReadinessProbe) -> bool {
+    match probe.kind {
+        ServiceReadinessProbeKind::Http => {
+            probe_backend_http(
+                ip,
+                probe.port,
+                probe.http_path().unwrap_or("/"),
+                probe.timeout(),
+            )
+            .await
+        }
+        ServiceReadinessProbeKind::Tcp => probe_backend_tcp(ip, probe.port, probe.timeout()).await,
     }
-    probe_backend_tcp(ip, port, timeout).await
 }
 
-fn service_health_port(service_specs: &[ServiceSpecValue], service_name: &str) -> Option<u16> {
+/// Resolves one service's readiness probe configuration from the current service specs.
+fn service_readiness_probe(
+    service_specs: &[ServiceSpecValue],
+    service_name: &str,
+) -> Option<ServiceReadinessProbe> {
     for spec in service_specs {
         for task in &spec.tasks {
             if task.name.eq_ignore_ascii_case(service_name) {
-                if let Some(port) = task.health_port() {
-                    return Some(port);
-                }
-                for env in &task.env {
-                    if env.name.eq_ignore_ascii_case("MANTISSA_HEALTH_PORT")
-                        && let Some(val) = env.value.as_deref()
-                        && let Ok(port) = val.parse::<u16>()
-                    {
-                        return Some(port);
-                    }
-                }
-                return None;
+                return task.readiness().cloned();
             }
         }
     }
     None
-}
-
-/// Resolve one service's active backend probe settings while keeping health probing opt-in.
-///
-/// The global discovery health port only fills the port after the service has explicitly declared
-/// backend health metadata through a service port, env override, or HTTP health path.
-fn resolve_service_health_probe(
-    service_specs: &[ServiceSpecValue],
-    service_name: &str,
-    default_health_port: Option<u16>,
-) -> (Option<u16>, Option<String>) {
-    let explicit_port = service_health_port(service_specs, service_name).filter(|port| *port != 0);
-    let health_path = service_health_path(service_specs, service_name);
-    if explicit_port.is_none() && health_path.is_none() {
-        return (None, None);
-    }
-
-    let port = explicit_port.or(default_health_port.filter(|port| *port != 0));
-    let path = if port.is_some() { health_path } else { None };
-    (port, path)
 }
 
 /// Resolve the public nodeport requested by a service template, if any.
@@ -1454,28 +1443,6 @@ fn nodeport_protocol(protocol: ServicePortProtocol) -> NodePortProtocol {
         // TcpUdp is expanded into both entries by ServiceTaskSpecValue::public_protocols.
         ServicePortProtocol::TcpUdp => NodePortProtocol::Tcp,
     }
-}
-
-fn service_health_path(service_specs: &[ServiceSpecValue], service_name: &str) -> Option<String> {
-    for spec in service_specs {
-        for task in &spec.tasks {
-            if task.name.eq_ignore_ascii_case(service_name) {
-                if let Some(cmd) = task.health_command()
-                    && let Some(first) = cmd.first()
-                {
-                    return Some(first.clone());
-                }
-                for env in &task.env {
-                    if env.name.eq_ignore_ascii_case("MANTISSA_HEALTH_PATH")
-                        && let Some(val) = env.value.clone()
-                    {
-                        return Some(val);
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 async fn probe_backend_tcp(ip: &Ipv4Addr, port: u16, timeout: Duration) -> bool {
@@ -1526,7 +1493,6 @@ async fn refresh_backend_catalog_if_needed(
     services: &ServiceRegistry,
     network_id: Uuid,
     health_snapshot: &HashMap<Uuid, HealthStatus>,
-    default_health_port: Option<u16>,
 ) -> Result<()> {
     let attachment_generation = registry.attachment_change_clock();
     let task_generation = tasks.change_clock();
@@ -1560,8 +1526,7 @@ async fn refresh_backend_catalog_if_needed(
             health_snapshot,
         )
         .await?;
-        let (health_port, health_path) =
-            resolve_service_health_probe(&service_specs, &service_name, default_health_port);
+        let readiness = service_readiness_probe(&service_specs, &service_name);
         let public_port = service_public_port(&service_specs, &service_name);
         let public_protocols = if public_port.is_some() {
             service_public_protocols(&service_specs, &service_name)
@@ -1576,8 +1541,7 @@ async fn refresh_backend_catalog_if_needed(
             ServiceBackendCatalogEntry {
                 service_name,
                 candidates,
-                health_port,
-                health_path,
+                readiness,
                 expose_to_host,
                 public_port,
                 public_protocols,
@@ -1634,8 +1598,6 @@ async fn refresh_network_services(
     bpf: &NetworkBpfManager,
     network_id: Uuid,
     health: &Arc<AsyncMutex<BackendHealth>>,
-    health_port: Option<u16>,
-    health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
     nodeport: &NodePortManager,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
@@ -1650,7 +1612,6 @@ async fn refresh_network_services(
         services,
         network_id,
         &health_snapshot,
-        health_port,
     )
     .await?;
     let entries: Vec<ServiceBackendCatalogEntry> = {
@@ -1661,14 +1622,7 @@ async fn refresh_network_services(
 
     for entry in entries {
         let mappings = refresh_single_service(
-            registry,
-            bpf,
-            network_id,
-            &entry,
-            health,
-            health_timeout,
-            bpf_lb,
-            lb_missing,
+            registry, bpf, network_id, &entry, health, bpf_lb, lb_missing,
         )
         .await?;
         nodeport_entries.extend(mappings);
@@ -1701,17 +1655,12 @@ fn services_for_network(service_specs: &[ServiceSpecValue], network_id: Uuid) ->
 ///
 /// Returns nodeport mappings when the service is marked public so external listeners can be
 /// reconciled by the caller.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "single-service refresh threads one explicit private control-plane context"
-)]
 async fn refresh_single_service(
     registry: &NetworkRegistry,
     bpf: &NetworkBpfManager,
     network_id: Uuid,
     service: &ServiceBackendCatalogEntry,
     health: &Arc<AsyncMutex<BackendHealth>>,
-    health_timeout: Duration,
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
 ) -> Result<Vec<NodePortMapping>> {
@@ -1723,9 +1672,7 @@ async fn refresh_single_service(
         network_id,
         service_name,
         candidates.clone(),
-        service.health_port,
-        service.health_path.clone(),
-        health_timeout,
+        service.readiness.clone(),
     )
     .await;
 
@@ -1734,7 +1681,7 @@ async fn refresh_single_service(
         service_name,
         candidates,
         backends,
-        service.health_port.is_some(),
+        service.readiness.is_some(),
         "refresh",
     );
 
@@ -2036,6 +1983,7 @@ mod tests {
             HealthEntry {
                 state: HealthState::Unhealthy,
                 checked_at: Instant::now() - HEALTH_CACHE_STALE_AFTER - Duration::from_secs(1),
+                consecutive_failures: 1,
             },
         );
 
@@ -2066,6 +2014,7 @@ mod tests {
             HealthEntry {
                 state: HealthState::Unhealthy,
                 checked_at: Instant::now() - HEALTH_CACHE_STALE_AFTER - Duration::from_secs(1),
+                consecutive_failures: 1,
             },
         );
 
@@ -2190,6 +2139,7 @@ mod tests {
             gpu_device_ids: Vec::new(),
             termination_grace_period_secs: None,
             pre_stop_command: None,
+            liveness: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             volumes: Vec::new(),
@@ -2234,25 +2184,17 @@ mod tests {
         network_id: Uuid,
         task_ids: Vec<Uuid>,
     ) {
-        upsert_catalog_service_with_health(
-            services,
-            service_name,
-            network_id,
-            task_ids,
-            None,
-            None,
-        )
-        .await;
+        upsert_catalog_service_with_readiness(services, service_name, network_id, task_ids, None)
+            .await;
     }
 
-    /// Writes one service template with optional backend health metadata for catalog tests.
-    async fn upsert_catalog_service_with_health(
+    /// Writes one service template with optional backend readiness metadata for catalog tests.
+    async fn upsert_catalog_service_with_readiness(
         services: &ServiceRegistry,
         service_name: &str,
         network_id: Uuid,
         task_ids: Vec<Uuid>,
-        health_port: Option<u16>,
-        health_command: Option<Vec<String>>,
+        readiness: Option<ServiceReadinessProbe>,
     ) {
         let service = ServiceSpecValue::new(
             Uuid::new_v4(),
@@ -2274,8 +2216,8 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
-                health_port,
-                health_command,
+                readiness,
+                liveness: None,
                 public_port: None,
                 public_protocol: None,
             }],
@@ -2331,7 +2273,6 @@ mod tests {
             &harness.services,
             harness.network.id,
             &health,
-            None,
         )
         .await
         .expect("initial catalog refresh");
@@ -2362,7 +2303,6 @@ mod tests {
             &harness.services,
             harness.network.id,
             &health,
-            None,
         )
         .await
         .expect("refresh after task change");
@@ -2383,7 +2323,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn backend_catalog_refresh_requires_service_health_opt_in() {
+    async fn backend_catalog_refresh_requires_service_readiness_opt_in() {
         let harness = setup_catalog_harness().await;
         upsert_catalog_service(
             &harness.services,
@@ -2401,30 +2341,34 @@ mod tests {
             &harness.services,
             harness.network.id,
             &HashMap::new(),
-            Some(30_080),
         )
         .await
-        .expect("refresh catalog without explicit service health");
+        .expect("refresh catalog without explicit service readiness");
 
         let guard = catalog.lock().await;
         let entry = guard
             .services
             .get("backend")
             .expect("catalog entry for backend");
-        assert_eq!(entry.health_port, None);
-        assert_eq!(entry.health_path, None);
+        assert!(entry.readiness.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn backend_catalog_refresh_uses_default_port_for_explicit_health_path() {
+    async fn backend_catalog_refresh_keeps_explicit_readiness_probe() {
         let harness = setup_catalog_harness().await;
-        upsert_catalog_service_with_health(
+        upsert_catalog_service_with_readiness(
             &harness.services,
             "backend-service",
             harness.network.id,
             vec![Uuid::new_v4()],
-            None,
-            Some(vec!["/healthz".to_string()]),
+            Some(ServiceReadinessProbe {
+                kind: ServiceReadinessProbeKind::Http,
+                port: 8_000,
+                path: Some("/healthz".to_string()),
+                interval_ms: 2_000,
+                timeout_ms: 300,
+                failure_threshold: 2,
+            }),
         )
         .await;
 
@@ -2436,18 +2380,20 @@ mod tests {
             &harness.services,
             harness.network.id,
             &HashMap::new(),
-            Some(30_080),
         )
         .await
-        .expect("refresh catalog with explicit service health path");
+        .expect("refresh catalog with explicit readiness probe");
 
         let guard = catalog.lock().await;
         let entry = guard
             .services
             .get("backend")
             .expect("catalog entry for backend");
-        assert_eq!(entry.health_port, Some(30_080));
-        assert_eq!(entry.health_path.as_deref(), Some("/healthz"));
+        let readiness = entry.readiness.as_ref().expect("readiness probe");
+        assert_eq!(readiness.kind, ServiceReadinessProbeKind::Http);
+        assert_eq!(readiness.port, 8_000);
+        assert_eq!(readiness.path.as_deref(), Some("/healthz"));
+        assert_eq!(readiness.failure_threshold, 2);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::task::container::ContainerState;
@@ -36,6 +37,8 @@ pub struct TaskSpec {
     pub termination_grace_period_secs: Option<u32>,
     #[serde(default)]
     pub pre_stop_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub liveness: Option<TaskLivenessProbe>,
     #[serde(default)]
     pub env: Vec<TaskEnvironmentVariable>,
     #[serde(default)]
@@ -183,6 +186,8 @@ pub struct TaskValue {
     #[serde(default)]
     pub pre_stop_command: Option<Vec<String>>,
     #[serde(default)]
+    pub liveness: Option<TaskLivenessProbe>,
+    #[serde(default)]
     pub env: Vec<TaskEnvironmentVariable>,
     #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,
@@ -223,6 +228,7 @@ pub struct TaskValueDraft {
     pub gpu_device_ids: Vec<String>,
     pub termination_grace_period_secs: Option<u32>,
     pub pre_stop_command: Option<Vec<String>>,
+    pub liveness: Option<TaskLivenessProbe>,
     pub env: Vec<TaskEnvironmentVariable>,
     pub secret_files: Vec<TaskSecretFile>,
     pub volumes: Vec<TaskVolumeMount>,
@@ -258,6 +264,7 @@ impl TaskValue {
             restart_policy: None,
             termination_grace_period_secs: draft.termination_grace_period_secs,
             pre_stop_command: draft.pre_stop_command,
+            liveness: draft.liveness,
             env: draft.env,
             secret_files: draft.secret_files,
             volumes: draft.volumes,
@@ -267,6 +274,62 @@ impl TaskValue {
             launch_attempt: draft.launch_attempt,
             last_terminal_observed_launch: draft.last_terminal_observed_launch,
         }
+    }
+}
+
+/// Default liveness probe interval in milliseconds.
+fn default_liveness_interval_ms() -> u64 {
+    10_000
+}
+
+/// Default liveness probe timeout in milliseconds.
+fn default_liveness_timeout_ms() -> u64 {
+    3_000
+}
+
+/// Default liveness probe failure threshold before the runtime restarts a task.
+fn default_liveness_failure_threshold() -> u32 {
+    3
+}
+
+/// Default warm-up delay before liveness failures are enforced.
+fn default_liveness_start_period_ms() -> u64 {
+    30_000
+}
+
+/// Exec-based liveness probe evaluated by the local runtime for one running task.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskLivenessProbe {
+    pub command: Vec<String>,
+    #[serde(default = "default_liveness_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_liveness_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_liveness_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_liveness_start_period_ms")]
+    pub start_period_ms: u64,
+}
+
+impl TaskLivenessProbe {
+    /// Returns the effective local liveness probe period.
+    pub fn interval(&self) -> Duration {
+        Duration::from_millis(self.interval_ms)
+    }
+
+    /// Returns the maximum execution time allowed for one liveness probe.
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
+
+    /// Returns the normalized consecutive failure threshold.
+    pub fn failure_threshold(&self) -> u32 {
+        self.failure_threshold.max(1)
+    }
+
+    /// Returns the delay before liveness failures start counting after a task reaches running.
+    pub fn start_period(&self) -> Duration {
+        Duration::from_millis(self.start_period_ms)
     }
 }
 

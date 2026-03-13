@@ -11,8 +11,8 @@ use crate::task::container::ContainerState;
 use crate::task::docker::ContainerError;
 use crate::task::docker::ContainerManager;
 use crate::task::types::{
-    TaskEnvironmentVariable, TaskEvent, TaskRestartPolicy, TaskSecretFile, TaskServiceMetadata,
-    TaskSpec, TaskStateFilter, TaskValue, TaskValueDraft, TaskVolumeMount,
+    TaskEnvironmentVariable, TaskEvent, TaskLivenessProbe, TaskRestartPolicy, TaskSecretFile,
+    TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskValue, TaskValueDraft, TaskVolumeMount,
 };
 use crate::volumes::VolumeRegistry;
 use anyhow::{Context, anyhow};
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore, mpsc::UnboundedSender};
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -59,6 +59,13 @@ struct RemoveTombstone {
     max_epoch: u64,
 }
 
+#[derive(Clone, Copy)]
+struct LivenessProbeEntry {
+    launch_attempt: u64,
+    checked_at: Instant,
+    consecutive_failures: u32,
+}
+
 /// Runtime loop cadence configuration for the task manager reconciliation workers.
 #[derive(Clone, Copy, Debug)]
 pub struct TaskRuntimeConfig {
@@ -88,6 +95,7 @@ pub struct TaskManager {
     scheduler: Rc<Scheduler>,
     container_manager: Arc<dyn ContainerManager + Send + Sync>,
     local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
+    liveness_probes: Arc<AsyncMutex<HashMap<Uuid, LivenessProbeEntry>>>,
     inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
     inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
     removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, RemoveTombstone>>>,
@@ -129,6 +137,7 @@ pub struct TaskStartRequest {
     pub restart_policy: Option<TaskRestartPolicy>,
     pub termination_grace_period_secs: Option<u32>,
     pub pre_stop_command: Option<Vec<String>>,
+    pub liveness: Option<TaskLivenessProbe>,
     pub env: Vec<TaskEnvironmentVariable>,
     pub secret_files: Vec<TaskSecretFile>,
     pub volumes: Vec<TaskVolumeMount>,
@@ -205,6 +214,7 @@ impl TaskManager {
             scheduler,
             container_manager,
             local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
+            liveness_probes: Arc::new(AsyncMutex::new(HashMap::new())),
             inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
             inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
             removed_task_watermarks: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -424,6 +434,7 @@ impl TaskManager {
             restart_policy,
             termination_grace_period_secs: None,
             pre_stop_command: None,
+            liveness: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             volumes: Vec::new(),
@@ -1219,6 +1230,7 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         restart_policy: value.restart_policy,
         termination_grace_period_secs: value.termination_grace_period_secs,
         pre_stop_command: value.pre_stop_command,
+        liveness: value.liveness,
         env: value.env,
         secret_files: value.secret_files,
         volumes: value.volumes,
@@ -1253,6 +1265,7 @@ pub(crate) fn spec_to_value(spec: &TaskSpec) -> TaskValue {
         gpu_device_ids: spec.gpu_device_ids.clone(),
         termination_grace_period_secs: spec.termination_grace_period_secs,
         pre_stop_command: spec.pre_stop_command.clone(),
+        liveness: spec.liveness.clone(),
         env: spec.env.clone(),
         secret_files: spec.secret_files.clone(),
         volumes: spec.volumes.clone(),

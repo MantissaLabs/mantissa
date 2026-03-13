@@ -390,6 +390,7 @@ fn standalone_volume_task_request(
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: vec![TaskVolumeMount {
@@ -859,6 +860,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
             restart_policy: None,
             termination_grace_period_secs: None,
             pre_stop_command: None,
+            liveness: None,
             env: Vec::new(),
             secret_files: Vec::new(),
             volumes: vec![

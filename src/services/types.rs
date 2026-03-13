@@ -1,5 +1,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskVolumeMount};
@@ -202,6 +203,107 @@ impl Default for ServiceRolloutState {
     }
 }
 
+/// Default readiness probe interval in milliseconds.
+fn default_readiness_interval_ms() -> u64 {
+    2_000
+}
+
+/// Default readiness probe timeout in milliseconds.
+fn default_readiness_timeout_ms() -> u64 {
+    300
+}
+
+/// Default readiness failure threshold before a backend is removed from service.
+fn default_readiness_failure_threshold() -> u32 {
+    1
+}
+
+/// Default liveness probe interval in milliseconds.
+fn default_liveness_interval_ms() -> u64 {
+    10_000
+}
+
+/// Default liveness probe timeout in milliseconds.
+fn default_liveness_timeout_ms() -> u64 {
+    3_000
+}
+
+/// Default liveness failure threshold before the local runtime restarts a task.
+fn default_liveness_failure_threshold() -> u32 {
+    3
+}
+
+/// Default warm-up delay before liveness failures are enforced.
+fn default_liveness_start_period_ms() -> u64 {
+    30_000
+}
+
+/// Transport style used by distributed readiness probing.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceReadinessProbeKind {
+    #[default]
+    Http,
+    Tcp,
+}
+
+/// Declarative readiness probe consumed by service discovery to admit or remove backends.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceReadinessProbe {
+    #[serde(default)]
+    pub kind: ServiceReadinessProbeKind,
+    pub port: u16,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default = "default_readiness_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_readiness_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_readiness_failure_threshold")]
+    pub failure_threshold: u32,
+}
+
+impl ServiceReadinessProbe {
+    /// Returns the effective readiness probe period used by discovery refresh and DNS filtering.
+    pub fn interval(&self) -> Duration {
+        Duration::from_millis(self.interval_ms)
+    }
+
+    /// Returns the maximum probe runtime used for one readiness check attempt.
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
+
+    /// Returns the HTTP path to probe when HTTP readiness is selected.
+    pub fn http_path(&self) -> Option<&str> {
+        match self.kind {
+            ServiceReadinessProbeKind::Http => Some(self.path.as_deref().unwrap_or("/")),
+            ServiceReadinessProbeKind::Tcp => None,
+        }
+    }
+
+    /// Returns the normalized failure threshold, never allowing a zero threshold.
+    pub fn failure_threshold(&self) -> u32 {
+        self.failure_threshold.max(1)
+    }
+}
+
+/// Declarative liveness probe consumed by the local runtime to restart unhealthy containers.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceLivenessProbe {
+    pub command: Vec<String>,
+    #[serde(default = "default_liveness_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_liveness_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_liveness_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_liveness_start_period_ms")]
+    pub start_period_ms: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServiceTaskSpecValue {
     pub name: String,
@@ -230,9 +332,9 @@ pub struct ServiceTaskSpecValue {
     #[serde(default)]
     pub networks: Vec<ServiceTaskNetworkRequirement>,
     #[serde(default)]
-    pub health_port: Option<u16>,
+    pub readiness: Option<ServiceReadinessProbe>,
     #[serde(default)]
-    pub health_command: Option<Vec<String>>,
+    pub liveness: Option<ServiceLivenessProbe>,
     #[serde(default)]
     pub public_port: Option<u16>,
     #[serde(default)]
@@ -266,19 +368,21 @@ impl ServiceTaskNetworkRequirement {
 }
 
 impl ServiceTaskSpecValue {
+    /// Returns the distributed readiness probe, if the template declares one.
+    pub fn readiness(&self) -> Option<&ServiceReadinessProbe> {
+        self.readiness.as_ref()
+    }
+
+    /// Returns the local liveness probe, if the template declares one.
+    pub fn liveness(&self) -> Option<&ServiceLivenessProbe> {
+        self.liveness.as_ref()
+    }
+
     pub fn required_network_ids(&self) -> Vec<Uuid> {
         self.networks
             .iter()
             .map(|network| network.network_id)
             .collect()
-    }
-
-    pub fn health_port(&self) -> Option<u16> {
-        self.health_port
-    }
-
-    pub fn health_command(&self) -> Option<&[String]> {
-        self.health_command.as_deref()
     }
 
     /// Return the port that should be reachable from the host via the network VIP, if one was

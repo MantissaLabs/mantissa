@@ -128,6 +128,9 @@ struct TaskSpec {
 
   volumes @27 :List(VolumeMount);
   # Named volumes mounted into the task runtime.
+
+  liveness @28 :LivenessProbe;
+  # Optional local liveness probe executed by the hosting runtime.
 }
 
 struct ServiceMetadata {
@@ -186,6 +189,26 @@ struct TaskStartRequest {
 
   volumes @15 :List(VolumeMount);
   # Named volumes mounted into the task runtime.
+
+  liveness @16 :LivenessProbe;
+  # Optional local liveness probe executed by the hosting runtime.
+}
+
+struct LivenessProbe {
+  command @0 :List(Text);
+  # Command executed inside the running container.
+
+  intervalMs @1 :UInt64;
+  # Probe cadence in milliseconds.
+
+  timeoutMs @2 :UInt64;
+  # Per-attempt timeout in milliseconds.
+
+  failureThreshold @3 :UInt32;
+  # Consecutive failures required before restart.
+
+  startPeriodMs @4 :UInt64;
+  # Warm-up delay before failures count.
 }
 
 struct TaskStopRequest {

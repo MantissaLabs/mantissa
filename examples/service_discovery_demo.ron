@@ -18,10 +18,11 @@
             networks: ["discovery-demo"],
             env: [],
             secret_files: [],
-            health_port: Some(8000),
-            health_command: Some([
-                "/",
-            ]),
+            readiness: Some((
+                kind: http,
+                port: 8000,
+                path: Some("/"),
+            )),
             public_port: Some(8000),
         ),
         (

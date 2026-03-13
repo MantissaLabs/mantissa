@@ -5,8 +5,8 @@ use crate::task::capnp_codec::{
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
-    TaskEvent, TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec,
-    TaskStateFilter, TaskStateKind,
+    TaskEvent, TaskLivenessProbe, TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata,
+    TaskSpec, TaskStateFilter, TaskStateKind,
 };
 use crate::topology::Topology;
 use capnp::Error;
@@ -54,6 +54,42 @@ fn state_from_str(input: &str) -> ContainerState {
             ContainerState::Unknown
         }
     }
+}
+
+/// Encodes one local liveness probe into the task wire payload.
+fn write_liveness_probe(
+    mut builder: protocol::task::liveness_probe::Builder<'_>,
+    probe: &TaskLivenessProbe,
+) {
+    let mut command_builder = builder.reborrow().init_command(probe.command.len() as u32);
+    for (idx, arg) in probe.command.iter().enumerate() {
+        command_builder.set(idx as u32, arg);
+    }
+    builder.set_interval_ms(probe.interval_ms);
+    builder.set_timeout_ms(probe.timeout_ms);
+    builder.set_failure_threshold(probe.failure_threshold);
+    builder.set_start_period_ms(probe.start_period_ms);
+}
+
+/// Decodes one local liveness probe from the task wire payload.
+fn read_liveness_probe(
+    reader: protocol::task::liveness_probe::Reader<'_>,
+) -> Result<TaskLivenessProbe, Error> {
+    let mut command = Vec::new();
+    for arg in reader.get_command()?.iter() {
+        let text = arg?.to_str()?.to_string();
+        if !text.is_empty() {
+            command.push(text);
+        }
+    }
+
+    Ok(TaskLivenessProbe {
+        command,
+        interval_ms: reader.get_interval_ms(),
+        timeout_ms: reader.get_timeout_ms(),
+        failure_threshold: reader.get_failure_threshold(),
+        start_period_ms: reader.get_start_period_ms(),
+    })
 }
 
 fn encode_restart_policy(
@@ -186,6 +222,10 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     for (idx, arg) in pre_stop.iter().enumerate() {
         pre_stop_builder.set(idx as u32, arg);
     }
+    if let Some(liveness) = spec.liveness.as_ref() {
+        let builder = builder.reborrow().init_liveness();
+        write_liveness_probe(builder, liveness);
+    }
     let mut gpu_builder = builder
         .reborrow()
         .init_gpu_device_ids(spec.gpu_device_ids.len() as u32);
@@ -273,6 +313,11 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     } else {
         Some(pre_stop_cmds)
     };
+    let liveness = if reader.has_liveness() {
+        Some(read_liveness_probe(reader.get_liveness()?)?)
+    } else {
+        None
+    };
     let mut gpu_device_ids = Vec::new();
     for entry in reader.get_gpu_device_ids()?.iter() {
         gpu_device_ids.push(entry?.to_str()?.to_string());
@@ -349,6 +394,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         restart_policy,
         termination_grace_period_secs,
         pre_stop_command,
+        liveness,
         env,
         secret_files,
         volumes,
@@ -439,6 +485,11 @@ impl task::Server for TaskService {
         } else {
             Some(pre_stop_command)
         };
+        let liveness = if req.has_liveness() {
+            Some(read_liveness_probe(req.get_liveness()?)?)
+        } else {
+            None
+        };
         let env = decode_env_vars(req.get_env()?)?;
         let secret_files = decode_secret_files(req.get_secret_files()?)?;
         let volumes = decode_volume_mounts(req.get_volumes()?)?;
@@ -467,6 +518,7 @@ impl task::Server for TaskService {
             restart_policy,
             termination_grace_period_secs,
             pre_stop_command,
+            liveness,
             env,
             secret_files,
             volumes,
@@ -570,6 +622,11 @@ impl task::Server for TaskService {
             } else {
                 Some(pre_stop_command)
             };
+            let liveness = if entry.has_liveness() {
+                Some(read_liveness_probe(entry.get_liveness()?)?)
+            } else {
+                None
+            };
 
             requests.push(TaskStartRequest {
                 name,
@@ -584,6 +641,7 @@ impl task::Server for TaskService {
                 restart_policy,
                 termination_grace_period_secs,
                 pre_stop_command,
+                liveness,
                 env,
                 secret_files,
                 volumes,

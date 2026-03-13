@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use async_channel::{Sender, TrySendError};
@@ -7,7 +7,7 @@ use bollard::models::ContainerStateStatusEnum;
 use chrono::Utc;
 use crdt_store::uuid_key::UuidKey;
 use rand::Rng;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -62,8 +62,9 @@ impl TaskManager {
         match self.resolve_live_container_id_for_task(working).await {
             Ok(Some(container_id)) => {
                 let mut guard = self.local_containers.lock().await;
-                guard.insert(working.id, container_id);
-                Ok(true)
+                guard.insert(working.id, container_id.clone());
+                drop(guard);
+                self.reconcile_liveness_probe(working, &container_id).await
             }
             Ok(None) => {
                 if let Some((exit_code, exit_error)) =
@@ -182,6 +183,157 @@ impl TaskManager {
             Err(err) => Err(anyhow::Error::from(err)
                 .context(format!("inspect running container for task {}", working.id))),
         }
+    }
+
+    /// Applies the configured local liveness probe to a running task when its interval expires.
+    ///
+    /// This keeps liveness enforcement local to the hosting runtime, with cached consecutive
+    /// failure accounting so the reconcile loop does not `exec` on every tick.
+    async fn reconcile_liveness_probe(
+        &self,
+        working: &mut TaskSpec,
+        container_id: &str,
+    ) -> Result<bool, anyhow::Error> {
+        let Some(probe) = working.liveness.clone() else {
+            self.liveness_probes.lock().await.remove(&working.id);
+            return Ok(true);
+        };
+        if probe.command.is_empty() {
+            self.liveness_probes.lock().await.remove(&working.id);
+            return Ok(true);
+        }
+
+        if let Some(running_since) =
+            super::parse_task_timestamp(&working.updated_at, &working.created_at)
+        {
+            let elapsed = Utc::now().signed_duration_since(running_since);
+            if let Ok(elapsed) = elapsed.to_std()
+                && elapsed < probe.start_period()
+            {
+                return Ok(true);
+            }
+        }
+
+        let cached = {
+            let guard = self.liveness_probes.lock().await;
+            guard
+                .get(&working.id)
+                .copied()
+                .filter(|entry| entry.launch_attempt == working.launch_attempt)
+        };
+        if let Some(entry) = cached
+            && Instant::now().saturating_duration_since(entry.checked_at) < probe.interval()
+        {
+            return Ok(true);
+        }
+
+        let failure_reason = match self
+            .container_manager
+            .exec_container(container_id, &probe.command, Some(probe.timeout()))
+            .await
+        {
+            Ok(result) if matches!(result.exit_code, Some(0)) => {
+                let mut guard = self.liveness_probes.lock().await;
+                guard.insert(
+                    working.id,
+                    super::LivenessProbeEntry {
+                        launch_attempt: working.launch_attempt,
+                        checked_at: Instant::now(),
+                        consecutive_failures: 0,
+                    },
+                );
+                return Ok(true);
+            }
+            Ok(result) => match result.exit_code {
+                Some(code) => format!("liveness probe exited with status code {code}"),
+                None => "liveness probe completed without an exit status".to_string(),
+            },
+            Err(ContainerError::Timeout) => "liveness probe timed out".to_string(),
+            Err(ContainerError::NotFound(_)) => {
+                "task container disappeared while executing liveness probe".to_string()
+            }
+            Err(err) => format!("liveness probe failed: {err}"),
+        };
+
+        let next_failures = cached
+            .map(|entry| entry.consecutive_failures)
+            .unwrap_or_default()
+            .saturating_add(1);
+        {
+            let mut guard = self.liveness_probes.lock().await;
+            guard.insert(
+                working.id,
+                super::LivenessProbeEntry {
+                    launch_attempt: working.launch_attempt,
+                    checked_at: Instant::now(),
+                    consecutive_failures: next_failures,
+                },
+            );
+        }
+
+        if next_failures < probe.failure_threshold() {
+            warn!(
+                target: "task",
+                task = %working.id,
+                failures = next_failures,
+                threshold = probe.failure_threshold(),
+                "{failure_reason}"
+            );
+            return Ok(true);
+        }
+
+        self.liveness_probes.lock().await.remove(&working.id);
+        self.local_containers.lock().await.remove(&working.id);
+        self.rollback_container_launch(container_id, "liveness probe failure")
+            .await;
+        if let Err(err) = self
+            .record_terminal_observation_for_current_launch(
+                working.id,
+                Some(failure_reason.clone()),
+            )
+            .await
+        {
+            warn!(
+                target: "task",
+                task = %working.id,
+                "failed to persist liveness terminal observation: {err:#}"
+            );
+        }
+
+        if let Ok(latest) = self.load_spec(working.id).await {
+            *working = latest;
+            if working.node_id != self.local_node_id {
+                return Ok(true);
+            }
+            if !matches!(working.state, ContainerState::Running) {
+                return Ok(true);
+            }
+        }
+
+        warn!(
+            target: "task",
+            task = %working.id,
+            failures = next_failures,
+            threshold = probe.failure_threshold(),
+            "{failure_reason}; restarting task runtime"
+        );
+        working.phase_version = working.phase_version.saturating_add(1);
+        working.state = ContainerState::Pending;
+        working.phase_reason = Some(failure_reason);
+        working.phase_progress = None;
+        working.updated_at = Utc::now().to_rfc3339();
+        self.persist_spec(working).await?;
+        if let Err(err) = self
+            .enqueue_gossip(TaskEvent::Upsert(Box::new(working.clone())))
+            .await
+        {
+            warn!(
+                target: "task",
+                task = %working.id,
+                "failed to broadcast pending restart after liveness failure: {err}"
+            );
+        }
+        Ok(false)
     }
 
     /// Ensures the provided task has non-empty slot assignments and that each slot is reserved
@@ -770,6 +922,7 @@ impl TaskManager {
             let mut guard = self.local_containers.lock().await;
             guard.remove(&id)
         };
+        self.liveness_probes.lock().await.remove(&id);
 
         let (container_identifier, from_cache) = match identifier_entry {
             Some(value) => (value, true),
@@ -1658,6 +1811,7 @@ impl TaskManager {
     /// Best-effort rollback when startup raced with a newer stop/remove intent.
     async fn abort_launched_container(&self, task_id: Uuid, container_id: &str) {
         self.local_containers.lock().await.remove(&task_id);
+        self.liveness_probes.lock().await.remove(&task_id);
         self.rollback_container_launch(container_id, "launch aborted")
             .await;
     }
@@ -1799,6 +1953,7 @@ impl TaskManager {
             | ContainerState::Exited(_)
             | ContainerState::Unknown => {
                 self.local_containers.lock().await.remove(&spec.id);
+                self.liveness_probes.lock().await.remove(&spec.id);
                 Ok(())
             }
         }

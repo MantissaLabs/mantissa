@@ -1,7 +1,8 @@
 use crate::network::types::compute_network_id;
 use crate::services::manager::{ServiceController, ServiceDeploymentOutcome};
 use crate::services::types::{
-    ServiceEvent, ServicePortProtocol, ServiceRescheduleLock, ServiceRescheduleReason,
+    ServiceEvent, ServiceLivenessProbe, ServicePortProtocol, ServiceReadinessProbe,
+    ServiceReadinessProbeKind, ServiceRescheduleLock, ServiceRescheduleReason,
     ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
     ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
     ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy,
@@ -299,6 +300,47 @@ fn read_rollout_state(
     })
 }
 
+/// Decodes one readiness probe definition from the service wire payload.
+fn read_readiness_probe(
+    reader: protocol::services::readiness_probe::Reader<'_>,
+) -> Result<ServiceReadinessProbe, Error> {
+    let kind = match reader.get_kind()? {
+        protocol::services::ReadinessProbeKind::Http => ServiceReadinessProbeKind::Http,
+        protocol::services::ReadinessProbeKind::Tcp => ServiceReadinessProbeKind::Tcp,
+    };
+    let path = reader.get_path()?.to_str()?.trim().to_string();
+
+    Ok(ServiceReadinessProbe {
+        kind,
+        port: reader.get_port(),
+        path: (!path.is_empty()).then_some(path),
+        interval_ms: reader.get_interval_ms(),
+        timeout_ms: reader.get_timeout_ms(),
+        failure_threshold: reader.get_failure_threshold(),
+    })
+}
+
+/// Decodes one local liveness probe definition from the service wire payload.
+fn read_liveness_probe(
+    reader: protocol::services::liveness_probe::Reader<'_>,
+) -> Result<ServiceLivenessProbe, Error> {
+    let mut command = Vec::new();
+    for arg in reader.get_command()?.iter() {
+        let text = arg?.to_str()?.to_string();
+        if !text.is_empty() {
+            command.push(text);
+        }
+    }
+
+    Ok(ServiceLivenessProbe {
+        command,
+        interval_ms: reader.get_interval_ms(),
+        timeout_ms: reader.get_timeout_ms(),
+        failure_threshold: reader.get_failure_threshold(),
+        start_period_ms: reader.get_start_period_ms(),
+    })
+}
+
 fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSpecValue, Error> {
     let mut command = Vec::new();
     for arg in reader.get_command()?.iter() {
@@ -372,25 +414,15 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         networks.push(ServiceTaskNetworkRequirement::new(raw, network_id));
     }
     networks.sort_by(|a, b| a.network_id.cmp(&b.network_id));
-
-    let raw_health = reader.get_health_port();
-    let health_port = if raw_health == 0 {
-        None
+    let readiness = if reader.has_readiness() {
+        Some(read_readiness_probe(reader.get_readiness()?)?)
     } else {
-        Some(raw_health)
+        None
     };
-
-    let mut health_cmds = Vec::new();
-    for arg in reader.get_health_command()?.iter() {
-        let text = arg?.to_str()?.to_string();
-        if !text.is_empty() {
-            health_cmds.push(text);
-        }
-    }
-    let health_command = if health_cmds.is_empty() {
-        None
+    let liveness = if reader.has_liveness() {
+        Some(read_liveness_probe(reader.get_liveness()?)?)
     } else {
-        Some(health_cmds)
+        None
     };
 
     let mut pre_stop_cmds = Vec::new();
@@ -448,8 +480,8 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         secret_files,
         volumes,
         networks,
-        health_port,
-        health_command,
+        readiness,
+        liveness,
         public_port,
         public_protocol,
     })
@@ -665,15 +697,13 @@ fn write_task_template(
     let mut volume_builder = builder.reborrow().init_volumes(task.volumes.len() as u32);
     encode_volume_mounts(&mut volume_builder, &task.volumes);
 
-    builder.set_health_port(task.health_port().unwrap_or(0));
-    let cmd = task.health_command();
-    let mut health_builder = builder
-        .reborrow()
-        .init_health_command(cmd.map(|args| args.len() as u32).unwrap_or(0));
-    if let Some(args) = cmd {
-        for (idx, arg) in args.iter().enumerate() {
-            health_builder.set(idx as u32, arg);
-        }
+    if let Some(readiness) = task.readiness() {
+        let builder = builder.reborrow().init_readiness();
+        write_readiness_probe(builder, readiness);
+    }
+    if let Some(liveness) = task.liveness() {
+        let builder = builder.reborrow().init_liveness();
+        write_liveness_probe(builder, liveness);
     }
 
     builder.set_public_port(task.public_port().unwrap_or(0));
@@ -686,6 +716,38 @@ fn write_task_template(
     builder.set_public_protocol(proto);
 
     Ok(())
+}
+
+/// Encodes one readiness probe into the service wire payload.
+fn write_readiness_probe(
+    mut builder: protocol::services::readiness_probe::Builder<'_>,
+    probe: &ServiceReadinessProbe,
+) {
+    let kind = match probe.kind {
+        ServiceReadinessProbeKind::Http => protocol::services::ReadinessProbeKind::Http,
+        ServiceReadinessProbeKind::Tcp => protocol::services::ReadinessProbeKind::Tcp,
+    };
+    builder.set_kind(kind);
+    builder.set_port(probe.port);
+    builder.set_path(probe.path.as_deref().unwrap_or(""));
+    builder.set_interval_ms(probe.interval_ms);
+    builder.set_timeout_ms(probe.timeout_ms);
+    builder.set_failure_threshold(probe.failure_threshold);
+}
+
+/// Encodes one local liveness probe into the service wire payload.
+fn write_liveness_probe(
+    mut builder: protocol::services::liveness_probe::Builder<'_>,
+    probe: &ServiceLivenessProbe,
+) {
+    let mut command_builder = builder.reborrow().init_command(probe.command.len() as u32);
+    for (idx, arg) in probe.command.iter().enumerate() {
+        command_builder.set(idx as u32, arg);
+    }
+    builder.set_interval_ms(probe.interval_ms);
+    builder.set_timeout_ms(probe.timeout_ms);
+    builder.set_failure_threshold(probe.failure_threshold);
+    builder.set_start_period_ms(probe.start_period_ms);
 }
 
 fn read_optional_uuid(data: capnp::data::Reader<'_>) -> Option<Uuid> {

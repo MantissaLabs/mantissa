@@ -368,6 +368,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: vec![TaskEnvironmentVariable {
             name: "DB_PASSWORD".into(),
             value: None,
@@ -507,6 +508,7 @@ local_test!(task_manager_rejects_missing_secret_reference, {
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: vec![TaskEnvironmentVariable {
             name: "API_KEY".into(),
             value: None,

@@ -53,8 +53,6 @@ pub struct NetworkConfig {
     pub bpf: BpfConfig,
     #[serde(default)]
     pub nodeport: NodePortConfig,
-    #[serde(default)]
-    pub discovery: DiscoveryConfig,
 }
 
 /// # Description:
@@ -130,15 +128,6 @@ impl Default for NodePortConfig {
             ip: None,
         }
     }
-}
-
-/// # Description:
-///
-/// Service discovery and health probing configuration.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct DiscoveryConfig {
-    #[serde(default)]
-    pub health_port: Option<u16>,
 }
 
 /// # Description:
@@ -337,13 +326,6 @@ pub fn bpf_attach_enabled() -> bool {
 /// Resolve the configured BPF artifact directory, if provided.
 pub fn bpf_artifact_dir() -> Option<PathBuf> {
     global_config().network.bpf.artifact_dir.map(PathBuf::from)
-}
-
-/// # Description:
-///
-/// Resolve the configured service discovery health port, if provided.
-pub fn discovery_health_port() -> Option<u16> {
-    global_config().network.discovery.health_port
 }
 
 /// # Description:
@@ -607,17 +589,6 @@ impl Config {
             }
         }
 
-        if let Ok(raw) = std::env::var("MANTISSA_LB_HEALTH_PORT") {
-            applied = true;
-            match raw.trim().parse::<u16>() {
-                Ok(port) if port > 0 => self.network.discovery.health_port = Some(port),
-                _ => warn!(
-                    target: "config",
-                    "ignoring invalid MANTISSA_LB_HEALTH_PORT '{raw}'"
-                ),
-            }
-        }
-
         if let Ok(host) = std::env::var("MANTISSA_DOCKER_HOST") {
             applied = true;
             let host = host.trim();
@@ -658,12 +629,6 @@ impl Config {
             && port == 0
         {
             anyhow::bail!("network.wireguard.port must be non-zero");
-        }
-
-        if let Some(port) = self.network.discovery.health_port
-            && port == 0
-        {
-            anyhow::bail!("network.discovery.health_port must be non-zero");
         }
 
         if let Some(ref ip) = self.network.nodeport.ip
@@ -913,13 +878,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_health_port() {
-        let mut config = Config::default();
-        config.network.discovery.health_port = Some(0);
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
     fn rejects_invalid_nodeport_ip() {
         let mut config = Config::default();
         config.network.nodeport.ip = Some("not-an-ip".to_string());
@@ -964,7 +922,6 @@ mod tests {
             std::env::set_var("MANTISSA_WIREGUARD_PORT", "51820");
             std::env::set_var("MANTISSA_BPF_NO_ATTACH", "1");
             std::env::set_var("MANTISSA_NODEPORT_IFACE", "eth0");
-            std::env::set_var("MANTISSA_LB_HEALTH_PORT", "30080");
             std::env::set_var("MANTISSA_DOCKER_HOST", "unix:///var/run/docker.sock");
             std::env::set_var("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc");
             std::env::set_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY", "1");
@@ -978,7 +935,6 @@ mod tests {
         assert!(!config.network.bpf.attach);
         assert!(!config.network.nodeport.enabled);
         assert_eq!(config.network.nodeport.iface.as_deref(), Some("eth0"));
-        assert_eq!(config.network.discovery.health_port, Some(30080));
         assert_eq!(
             config.docker.host.as_deref(),
             Some("unix:///var/run/docker.sock")
@@ -994,7 +950,6 @@ mod tests {
             std::env::remove_var("MANTISSA_WIREGUARD_PORT");
             std::env::remove_var("MANTISSA_BPF_NO_ATTACH");
             std::env::remove_var("MANTISSA_NODEPORT_IFACE");
-            std::env::remove_var("MANTISSA_LB_HEALTH_PORT");
             std::env::remove_var("MANTISSA_DOCKER_HOST");
             std::env::remove_var("MANTISSA_GPU_DEVICE_OVERRIDES");
             std::env::remove_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY");

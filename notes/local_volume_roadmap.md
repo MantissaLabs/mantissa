@@ -169,7 +169,7 @@ Proposed shape:
         ),
       ],
       networks: ["backend"],
-      health_port: 5432,
+      readiness: Some((kind: tcp, port: 5432)),
     ),
   ],
 )
