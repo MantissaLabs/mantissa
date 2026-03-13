@@ -483,7 +483,8 @@ impl ServiceController {
 
         let inventory = Arc::new(self.collect_task_inventory().await?);
         let health_snapshot = Arc::new(self.health_monitor.snapshot());
-        let eligible_nodes = Arc::new(self.collect_eligible_nodes());
+        let eligible_nodes =
+            Arc::new(self.collect_eligible_nodes_from_snapshot(health_snapshot.as_ref()));
 
         for spec in specs {
             if should_reconcile_status(spec.status()) {
@@ -533,15 +534,34 @@ impl ServiceController {
 
     /// Builds the deterministic set of nodes eligible to host service replicas from peer metadata.
     fn collect_eligible_nodes(&self) -> Vec<Uuid> {
+        let health_snapshot = self.health_monitor.snapshot();
+        self.collect_eligible_nodes_from_snapshot(&health_snapshot)
+    }
+
+    /// Builds the deterministic set of nodes eligible to host service replicas from peer metadata.
+    ///
+    /// Down nodes are excluded so deterministic slot ownership and repair placement stay on live
+    /// peers after SWIM marks a member unavailable.
+    fn collect_eligible_nodes_from_snapshot(
+        &self,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
+    ) -> Vec<Uuid> {
         let peer_states = self
             .cluster_registry
             .known_peers()
             .unwrap_or_default()
             .into_iter()
-            .map(|peer_id| (peer_id, self.cluster_registry.peer_schedulable(peer_id)));
+            .map(|peer_id| {
+                (
+                    peer_id,
+                    self.cluster_registry.peer_schedulable(peer_id),
+                    node_is_down(peer_id, health_snapshot),
+                )
+            });
         build_eligible_nodes(
             self.local_node_id,
             self.cluster_registry.peer_schedulable(self.local_node_id),
+            node_is_down(self.local_node_id, health_snapshot),
             peer_states,
         )
     }
@@ -2187,18 +2207,19 @@ fn short_id(id: &Uuid) -> String {
 fn build_eligible_nodes<I>(
     local_node_id: Uuid,
     local_schedulable: bool,
+    local_down: bool,
     peer_states: I,
 ) -> Vec<Uuid>
 where
-    I: IntoIterator<Item = (Uuid, bool)>,
+    I: IntoIterator<Item = (Uuid, bool, bool)>,
 {
     let mut nodes: BTreeSet<Uuid> = BTreeSet::new();
-    if local_schedulable {
+    if local_schedulable && !local_down {
         nodes.insert(local_node_id);
     }
 
-    for (peer_id, schedulable) in peer_states {
-        if schedulable {
+    for (peer_id, schedulable, down) in peer_states {
+        if schedulable && !down {
             nodes.insert(peer_id);
         }
     }
@@ -2661,7 +2682,12 @@ mod tests {
         let draining = Uuid::from_bytes([2u8; 16]);
         let peer = Uuid::from_bytes([3u8; 16]);
 
-        let eligible = build_eligible_nodes(local, true, [(draining, false), (peer, true)]);
+        let eligible = build_eligible_nodes(
+            local,
+            true,
+            false,
+            [(draining, false, false), (peer, true, false)],
+        );
 
         assert_eq!(eligible, vec![local, peer]);
     }
@@ -2672,9 +2698,26 @@ mod tests {
         let local = Uuid::from_bytes([1u8; 16]);
         let peer = Uuid::from_bytes([2u8; 16]);
 
-        let eligible = build_eligible_nodes(local, false, [(peer, true)]);
+        let eligible = build_eligible_nodes(local, false, false, [(peer, true, false)]);
 
         assert_eq!(eligible, vec![peer]);
+    }
+
+    /// Down peers must not remain eligible because no live node can execute their slot repairs.
+    #[test]
+    fn eligible_nodes_exclude_down_peers() {
+        let local = Uuid::from_bytes([1u8; 16]);
+        let down_peer = Uuid::from_bytes([2u8; 16]);
+        let healthy_peer = Uuid::from_bytes([3u8; 16]);
+
+        let eligible = build_eligible_nodes(
+            local,
+            true,
+            false,
+            [(down_peer, true, true), (healthy_peer, true, false)],
+        );
+
+        assert_eq!(eligible, vec![local, healthy_peer]);
     }
 
     /// Ensure service stop progression does not launch duplicate local stop waves.

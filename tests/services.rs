@@ -43,6 +43,7 @@ use mantissa::task::types::{
     TaskStateFilter, TaskValue, TaskVolumeMount,
 };
 use mantissa::topology_capnp::topology;
+use protocol::health::NodeStatus;
 use protocol::secrets::secrets;
 use protocol::services::services;
 use protocol::topology::{ClusterOperationStage, NodeDrainState};
@@ -93,6 +94,17 @@ impl Drop for ConfigOverrideGuard {
     fn drop(&mut self) {
         set_global_config_with_source(self.previous.clone(), self.source.clone());
     }
+}
+
+/// Computes a deterministic timeout budget for SWIM down transitions in service tests.
+fn down_transition_timeout() -> Duration {
+    let health = mantissa::config::health_runtime_config();
+    health
+        .probe_interval
+        .saturating_add(health.suspect_after)
+        .saturating_add(health.down_after)
+        .saturating_add(health.probe_timeout)
+        .saturating_add(Duration::from_millis(2_000))
 }
 
 local_test!(services_gossip_propagates_across_peers, {
@@ -1643,6 +1655,96 @@ local_test!(services_node_drain_migrates_multi_replica_service, {
     assert!(
         evacuated,
         "multi-replica service should evacuate all replicas from the drained node"
+    );
+});
+
+local_test!(services_node_down_reschedules_multi_replica_service, {
+    let _guard = ContainerManagerOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let mut cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
+
+    let service_name = "node-down-reschedule";
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![demo_backend_task_template("backend", 3)],
+        )
+        .await
+        .expect("submit multi-replica deployment");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "multi-replica service should reach running before node failure"
+    );
+    assert!(
+        wait_for_min_local_service_task_count(&cluster, service_name, 1, Duration::from_secs(15))
+            .await,
+        "service should spread at least one replica per node before node failure"
+    );
+
+    let down_node_id = cluster[2].id();
+    cluster[2].stop().await.expect("stop failed node");
+
+    cluster[0]
+        .wait_status_of(down_node_id, NodeStatus::Down, down_transition_timeout())
+        .await
+        .expect("cluster should mark failed node as down");
+
+    let rescheduled = wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async {
+            for node in &cluster[..2] {
+                let tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
+                if tasks.len() != 3
+                    || tasks.iter().any(|task| {
+                        task.node_id == down_node_id || task.state != ContainerState::Running
+                    })
+                {
+                    return false;
+                }
+            }
+
+            let local_tasks_left = list_local_active_service_tasks(
+                &cluster[0].node.task_manager,
+                service_name,
+                cluster[0].id(),
+            )
+            .await
+            .len();
+            let local_tasks_right = list_local_active_service_tasks(
+                &cluster[1].node.task_manager,
+                service_name,
+                cluster[1].id(),
+            )
+            .await
+            .len();
+
+            local_tasks_left + local_tasks_right == 3
+        },
+    )
+    .await;
+    assert!(
+        rescheduled,
+        "remaining live nodes should reschedule replicas away from the down node"
     );
 });
 
