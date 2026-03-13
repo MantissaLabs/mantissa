@@ -7,15 +7,16 @@ use crate::services::reconcile::{
 };
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServiceEvent, ServiceLivenessProbe, ServiceRolloutOrder, ServiceRolloutPhase,
-    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceTaskRestartPolicy,
-    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy, compute_service_id,
+    ServiceEvent, ServiceLivenessProbe, ServiceLivenessProbeKind, ServiceRolloutOrder,
+    ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
+    ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
+    ServiceUpdateStrategy, compute_service_id,
 };
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest, TaskTrafficPublicationUpdate};
 use crate::task::types::{
-    TaskLivenessProbe, TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec,
-    TaskStateFilter, TaskVolumeMount,
+    TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicy, TaskRestartPolicyKind,
+    TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskVolumeMount,
 };
 use crate::volumes::types::VolumeDriver;
 use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
@@ -2246,7 +2247,14 @@ fn map_restart_policy(policy: &ServiceTaskRestartPolicy) -> TaskRestartPolicy {
 /// Converts the service liveness probe into the runtime-owned task liveness shape.
 fn map_liveness_probe(probe: &ServiceLivenessProbe) -> TaskLivenessProbe {
     TaskLivenessProbe {
+        kind: match probe.kind {
+            ServiceLivenessProbeKind::Exec => TaskLivenessProbeKind::Exec,
+            ServiceLivenessProbeKind::Http => TaskLivenessProbeKind::Http,
+            ServiceLivenessProbeKind::Tcp => TaskLivenessProbeKind::Tcp,
+        },
         command: probe.command.clone(),
+        port: probe.port,
+        path: probe.path.clone(),
         interval_ms: probe.interval_ms,
         timeout_ms: probe.timeout_ms,
         failure_threshold: probe.failure_threshold,

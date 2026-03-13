@@ -1,12 +1,12 @@
 use crate::network::types::compute_network_id;
 use crate::services::manager::{ServiceController, ServiceDeploymentOutcome};
 use crate::services::types::{
-    ServiceEvent, ServiceLivenessProbe, ServicePortProtocol, ServiceReadinessProbe,
-    ServiceReadinessProbeKind, ServiceRescheduleLock, ServiceRescheduleReason,
-    ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
-    ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
-    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy,
-    ServiceUpdateStrategyMode,
+    ServiceEvent, ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePortProtocol,
+    ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceRescheduleLock,
+    ServiceRescheduleReason, ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase,
+    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement,
+    ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
+    ServiceUpdateStrategy, ServiceUpdateStrategyMode,
 };
 use crate::task::capnp_codec::{
     decode_env_vars, decode_secret_files, decode_volume_mounts, encode_env_vars,
@@ -324,6 +324,11 @@ fn read_readiness_probe(
 fn read_liveness_probe(
     reader: protocol::services::liveness_probe::Reader<'_>,
 ) -> Result<ServiceLivenessProbe, Error> {
+    let kind = match reader.get_kind()? {
+        protocol::services::LivenessProbeKind::Exec => ServiceLivenessProbeKind::Exec,
+        protocol::services::LivenessProbeKind::Http => ServiceLivenessProbeKind::Http,
+        protocol::services::LivenessProbeKind::Tcp => ServiceLivenessProbeKind::Tcp,
+    };
     let mut command = Vec::new();
     for arg in reader.get_command()?.iter() {
         let text = arg?.to_str()?.to_string();
@@ -331,9 +336,13 @@ fn read_liveness_probe(
             command.push(text);
         }
     }
+    let path = reader.get_path()?.to_str()?.trim().to_string();
 
     Ok(ServiceLivenessProbe {
+        kind,
         command,
+        port: reader.get_port(),
+        path: (!path.is_empty()).then_some(path),
         interval_ms: reader.get_interval_ms(),
         timeout_ms: reader.get_timeout_ms(),
         failure_threshold: reader.get_failure_threshold(),
@@ -740,10 +749,18 @@ fn write_liveness_probe(
     mut builder: protocol::services::liveness_probe::Builder<'_>,
     probe: &ServiceLivenessProbe,
 ) {
+    let kind = match probe.kind {
+        ServiceLivenessProbeKind::Exec => protocol::services::LivenessProbeKind::Exec,
+        ServiceLivenessProbeKind::Http => protocol::services::LivenessProbeKind::Http,
+        ServiceLivenessProbeKind::Tcp => protocol::services::LivenessProbeKind::Tcp,
+    };
+    builder.set_kind(kind);
     let mut command_builder = builder.reborrow().init_command(probe.command.len() as u32);
     for (idx, arg) in probe.command.iter().enumerate() {
         command_builder.set(idx as u32, arg);
     }
+    builder.set_port(probe.port);
+    builder.set_path(probe.path.as_deref().unwrap_or(""));
     builder.set_interval_ms(probe.interval_ms);
     builder.set_timeout_ms(probe.timeout_ms);
     builder.set_failure_threshold(probe.failure_threshold);

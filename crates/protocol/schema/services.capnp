@@ -90,20 +90,40 @@ struct ReadinessProbe {
 }
 
 struct LivenessProbe {
-  command @0 :List(Text);
-  # Command executed inside the running container.
+  kind @0 :LivenessProbeKind;
+  # Local liveness probe transport kind.
 
-  intervalMs @1 :UInt64;
+  command @1 :List(Text);
+  # Command executed inside the running container for exec probes.
+
+  port @2 :UInt16;
+  # Local container port checked by HTTP/TCP probes.
+
+  path @3 :Text;
+  # HTTP request path, ignored for exec/TCP probes and "/" when empty.
+
+  intervalMs @4 :UInt64;
   # Probe cadence in milliseconds.
 
-  timeoutMs @2 :UInt64;
+  timeoutMs @5 :UInt64;
   # Per-attempt timeout in milliseconds.
 
-  failureThreshold @3 :UInt32;
+  failureThreshold @6 :UInt32;
   # Consecutive failures required before restart.
 
-  startPeriodMs @4 :UInt64;
+  startPeriodMs @7 :UInt64;
   # Warm-up delay before failures count.
+}
+
+enum LivenessProbeKind {
+  exec @0;
+  # Execute one command inside the running container.
+
+  http @1;
+  # Probe the container over HTTP and require a 2xx response.
+
+  tcp @2;
+  # Probe the container by establishing a TCP connection.
 }
 
 enum PublicProtocol {

@@ -5,8 +5,8 @@ use crate::task::capnp_codec::{
 use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
-    TaskEvent, TaskLivenessProbe, TaskRestartPolicy, TaskRestartPolicyKind, TaskServiceMetadata,
-    TaskSpec, TaskStateFilter, TaskStateKind,
+    TaskEvent, TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicy, TaskRestartPolicyKind,
+    TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStateKind,
 };
 use crate::topology::Topology;
 use capnp::Error;
@@ -61,10 +61,18 @@ fn write_liveness_probe(
     mut builder: protocol::task::liveness_probe::Builder<'_>,
     probe: &TaskLivenessProbe,
 ) {
+    let kind = match probe.kind {
+        TaskLivenessProbeKind::Exec => protocol::task::LivenessProbeKind::Exec,
+        TaskLivenessProbeKind::Http => protocol::task::LivenessProbeKind::Http,
+        TaskLivenessProbeKind::Tcp => protocol::task::LivenessProbeKind::Tcp,
+    };
+    builder.set_kind(kind);
     let mut command_builder = builder.reborrow().init_command(probe.command.len() as u32);
     for (idx, arg) in probe.command.iter().enumerate() {
         command_builder.set(idx as u32, arg);
     }
+    builder.set_port(probe.port);
+    builder.set_path(probe.path.as_deref().unwrap_or(""));
     builder.set_interval_ms(probe.interval_ms);
     builder.set_timeout_ms(probe.timeout_ms);
     builder.set_failure_threshold(probe.failure_threshold);
@@ -75,6 +83,11 @@ fn write_liveness_probe(
 fn read_liveness_probe(
     reader: protocol::task::liveness_probe::Reader<'_>,
 ) -> Result<TaskLivenessProbe, Error> {
+    let kind = match reader.get_kind()? {
+        protocol::task::LivenessProbeKind::Exec => TaskLivenessProbeKind::Exec,
+        protocol::task::LivenessProbeKind::Http => TaskLivenessProbeKind::Http,
+        protocol::task::LivenessProbeKind::Tcp => TaskLivenessProbeKind::Tcp,
+    };
     let mut command = Vec::new();
     for arg in reader.get_command()?.iter() {
         let text = arg?.to_str()?.to_string();
@@ -82,9 +95,13 @@ fn read_liveness_probe(
             command.push(text);
         }
     }
+    let path = reader.get_path()?.to_str()?.trim().to_string();
 
     Ok(TaskLivenessProbe {
+        kind,
         command,
+        port: reader.get_port(),
+        path: (!path.is_empty()).then_some(path),
         interval_ms: reader.get_interval_ms(),
         timeout_ms: reader.get_timeout_ms(),
         failure_threshold: reader.get_failure_threshold(),

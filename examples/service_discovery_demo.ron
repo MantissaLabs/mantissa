@@ -23,6 +23,15 @@
                 port: 8000,
                 path: Some("/"),
             )),
+            liveness: Some((
+                kind: http,
+                port: 8000,
+                path: Some("/"),
+                interval_ms: 2000,
+                timeout_ms: 1000,
+                failure_threshold: 2,
+                start_period_ms: 1000,
+            )),
             public_port: Some(8000),
         ),
         (

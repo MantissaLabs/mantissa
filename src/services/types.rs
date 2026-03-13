@@ -290,10 +290,29 @@ impl ServiceReadinessProbe {
     }
 }
 
+/// Transport style used by local liveness probing.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceLivenessProbeKind {
+    #[default]
+    Exec,
+    Http,
+    Tcp,
+}
+
 /// Declarative liveness probe consumed by the local runtime to restart unhealthy containers.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServiceLivenessProbe {
+    #[serde(default)]
+    pub kind: ServiceLivenessProbeKind,
+    #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default = "default_liveness_interval_ms")]
     pub interval_ms: u64,
     #[serde(default = "default_liveness_timeout_ms")]

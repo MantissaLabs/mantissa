@@ -297,10 +297,29 @@ fn default_liveness_start_period_ms() -> u64 {
     30_000
 }
 
-/// Exec-based liveness probe evaluated by the local runtime for one running task.
+/// Transport style used by local liveness probing.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLivenessProbeKind {
+    #[default]
+    Exec,
+    Http,
+    Tcp,
+}
+
+/// Liveness probe evaluated by the local runtime for one running task.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskLivenessProbe {
+    #[serde(default)]
+    pub kind: TaskLivenessProbeKind,
+    #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default = "default_liveness_interval_ms")]
     pub interval_ms: u64,
     #[serde(default = "default_liveness_timeout_ms")]
@@ -330,6 +349,14 @@ impl TaskLivenessProbe {
     /// Returns the delay before liveness failures start counting after a task reaches running.
     pub fn start_period(&self) -> Duration {
         Duration::from_millis(self.start_period_ms)
+    }
+
+    /// Returns the HTTP path to probe when HTTP liveness is selected.
+    pub fn http_path(&self) -> Option<&str> {
+        match self.kind {
+            TaskLivenessProbeKind::Http => Some(self.path.as_deref().unwrap_or("/")),
+            TaskLivenessProbeKind::Exec | TaskLivenessProbeKind::Tcp => None,
+        }
     }
 }
 

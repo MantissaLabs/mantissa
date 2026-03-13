@@ -201,7 +201,14 @@ pub struct ReadinessProbe {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LivenessProbe {
+    #[serde(default)]
+    pub kind: LivenessKind,
+    #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default = "default_liveness_interval_ms")]
     pub interval_ms: u64,
     #[serde(default = "default_liveness_timeout_ms")]
@@ -210,6 +217,15 @@ pub struct LivenessProbe {
     pub failure_threshold: u32,
     #[serde(default = "default_liveness_start_period_ms")]
     pub start_period_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LivenessKind {
+    #[default]
+    Exec,
+    Http,
+    Tcp,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -415,13 +431,56 @@ impl ServiceManifest {
                 ));
             }
 
-            if let Some(liveness) = task.liveness.as_ref()
-                && liveness.command.is_empty()
-            {
-                return Err(anyhow!(
-                    "task '{}' must set liveness.command to a non-empty command when provided",
-                    task.name
-                ));
+            if let Some(liveness) = task.liveness.as_ref() {
+                match liveness.kind {
+                    LivenessKind::Exec if liveness.command.is_empty() => {
+                        return Err(anyhow!(
+                            "task '{}' must set liveness.command to a non-empty command when liveness.kind is exec",
+                            task.name
+                        ));
+                    }
+                    LivenessKind::Http | LivenessKind::Tcp if liveness.port == 0 => {
+                        return Err(anyhow!(
+                            "task '{}' must set liveness.port to a non-zero value when liveness.kind is {}",
+                            task.name,
+                            match liveness.kind {
+                                LivenessKind::Http => "http",
+                                LivenessKind::Tcp => "tcp",
+                                LivenessKind::Exec => unreachable!("exec handled above"),
+                            }
+                        ));
+                    }
+                    LivenessKind::Exec if liveness.port != 0 => {
+                        return Err(anyhow!(
+                            "task '{}' cannot set liveness.port when liveness.kind is exec",
+                            task.name
+                        ));
+                    }
+                    LivenessKind::Exec if liveness.path.is_some() => {
+                        return Err(anyhow!(
+                            "task '{}' cannot set liveness.path when liveness.kind is exec",
+                            task.name
+                        ));
+                    }
+                    LivenessKind::Tcp if liveness.path.is_some() => {
+                        return Err(anyhow!(
+                            "task '{}' cannot set liveness.path when liveness.kind is tcp",
+                            task.name
+                        ));
+                    }
+                    LivenessKind::Http | LivenessKind::Tcp if !liveness.command.is_empty() => {
+                        return Err(anyhow!(
+                            "task '{}' cannot set liveness.command when liveness.kind is {}",
+                            task.name,
+                            match liveness.kind {
+                                LivenessKind::Http => "http",
+                                LivenessKind::Tcp => "tcp",
+                                LivenessKind::Exec => unreachable!("exec handled above"),
+                            }
+                        ));
+                    }
+                    _ => {}
+                }
             }
             if let Some(liveness) = task.liveness.as_ref()
                 && liveness.interval_ms == 0
@@ -910,6 +969,13 @@ mod tests {
             .expect("manifest");
 
         assert_eq!(manifest.tasks.len(), 2);
+        assert_eq!(manifest.tasks[0].name, "backend");
+        assert_eq!(manifest.tasks[0].image, "hashicorp/http-echo:1.0.0");
+        assert!(manifest.tasks[0].readiness.is_some());
+        assert!(matches!(
+            manifest.tasks[0].liveness.as_ref().map(|probe| probe.kind),
+            Some(LivenessKind::Http)
+        ));
         assert_eq!(manifest.tasks[1].name, "frontend");
         assert_eq!(manifest.tasks[1].depends_on, vec!["backend"]);
     }
@@ -1012,7 +1078,10 @@ mod tests {
                 networks: Vec::new(),
                 readiness: None,
                 liveness: Some(LivenessProbe {
+                    kind: LivenessKind::Exec,
                     command: vec!["/bin/check".into()],
+                    port: 0,
+                    path: None,
                     interval_ms: 0,
                     timeout_ms: 3_000,
                     failure_threshold: 3,

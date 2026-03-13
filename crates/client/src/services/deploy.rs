@@ -1,7 +1,7 @@
 use super::manifest::{
-    EnvironmentVariable, LivenessProbe, ReadinessKind, ReadinessProbe, RestartPolicyName,
-    RolloutOrder, SecretFileProjection, SecretReference, ServiceManifest, ServiceUpdateStrategy,
-    ServiceUpdateStrategyMode, TaskSpec, VolumeMount,
+    EnvironmentVariable, LivenessKind, LivenessProbe, ReadinessKind, ReadinessProbe,
+    RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference, ServiceManifest,
+    ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskSpec, VolumeMount,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -478,10 +478,18 @@ fn write_liveness_probe(
     mut builder: protocol::services::liveness_probe::Builder<'_>,
     probe: &LivenessProbe,
 ) {
+    let kind = match probe.kind {
+        LivenessKind::Exec => protocol::services::LivenessProbeKind::Exec,
+        LivenessKind::Http => protocol::services::LivenessProbeKind::Http,
+        LivenessKind::Tcp => protocol::services::LivenessProbeKind::Tcp,
+    };
+    builder.set_kind(kind);
     let mut command_builder = builder.reborrow().init_command(probe.command.len() as u32);
     for (idx, arg) in probe.command.iter().enumerate() {
         command_builder.set(idx as u32, arg);
     }
+    builder.set_port(probe.port);
+    builder.set_path(probe.path.as_deref().unwrap_or(""));
     builder.set_interval_ms(probe.interval_ms);
     builder.set_timeout_ms(probe.timeout_ms);
     builder.set_failure_threshold(probe.failure_threshold);

@@ -24,7 +24,8 @@ use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
 use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
 use crate::task::types::{
-    TaskLivenessProbe, TaskRestartPolicyKind, TaskStateKind, TaskValue, TaskValueDraft,
+    TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicyKind, TaskStateKind, TaskValue,
+    TaskValueDraft,
 };
 use crate::topology::peers::PeerSchedulingState;
 use crate::volumes::VolumeRegistry;
@@ -1875,7 +1876,10 @@ async fn reconcile_running_task_executes_liveness_probe_once_per_interval() {
 
     let mut probed = manager.load_spec(spec.id).await.expect("load running task");
     probed.liveness = Some(TaskLivenessProbe {
+        kind: TaskLivenessProbeKind::Exec,
         command: vec!["/bin/check".to_string(), "--ready".to_string()],
+        port: 0,
+        path: None,
         interval_ms: 60_000,
         timeout_ms: 750,
         failure_threshold: 2,
@@ -1942,6 +1946,169 @@ async fn reconcile_running_task_executes_liveness_probe_once_per_interval() {
 }
 
 #[tokio::test]
+async fn reconcile_running_task_executes_http_liveness_probe_without_container_exec() {
+    let (manager, scheduler, mock_cm, network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind http liveness listener");
+    let port = listener.local_addr().expect("listener addr").port();
+    let network_id = Uuid::new_v4();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut stream, _) = listener.accept().await.expect("accept http probe");
+        let mut buf = [0u8; 256];
+        let _ = stream.read(&mut buf).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .expect("write probe response");
+    });
+
+    network_registry
+        .upsert_attachment(NetworkAttachmentValue::new(NetworkAttachmentDraft {
+            id: crate::network::types::compute_network_attachment_id(spec.id, network_id),
+            task_id: spec.id,
+            node_id: manager.local_node_id,
+            container_id: "container-0".to_string(),
+            network_id,
+            task_updated_at: Some(Utc::now().to_rfc3339()),
+            requested_ip: Some("127.0.0.1".to_string()),
+            assigned_ip: Some("127.0.0.1".to_string()),
+            mac: Some("02:11:22:33:44:55".to_string()),
+            state: NetworkAttachmentState::Ready,
+            error: None,
+            traffic_published: true,
+            service_name: None,
+            template_name: None,
+        }))
+        .await
+        .expect("insert local attachment target");
+
+    let mut probed = manager.load_spec(spec.id).await.expect("load running task");
+    probed.liveness = Some(TaskLivenessProbe {
+        kind: TaskLivenessProbeKind::Http,
+        command: Vec::new(),
+        port,
+        path: Some("/".to_string()),
+        interval_ms: 60_000,
+        timeout_ms: 1_000,
+        failure_threshold: 2,
+        start_period_ms: 0,
+    });
+    manager
+        .persist_spec(&probed)
+        .await
+        .expect("persist http liveness probe");
+
+    let mut working = manager
+        .load_spec(spec.id)
+        .await
+        .expect("reload running task");
+    let short_circuit = manager
+        .reconcile_recorded_running_task(&mut working)
+        .await
+        .expect("reconcile http liveness probe");
+    assert!(
+        short_circuit,
+        "healthy http liveness probe should keep task running"
+    );
+    assert!(
+        mock_cm.exec_calls.lock().await.is_empty(),
+        "http liveness should not use container exec"
+    );
+    server.await.expect("join http probe server");
+}
+
+#[tokio::test]
+async fn reconcile_running_task_executes_tcp_liveness_probe_without_container_exec() {
+    let (manager, scheduler, mock_cm, network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind tcp liveness listener");
+    let port = listener.local_addr().expect("listener addr").port();
+    let network_id = Uuid::new_v4();
+
+    network_registry
+        .upsert_attachment(NetworkAttachmentValue::new(NetworkAttachmentDraft {
+            id: crate::network::types::compute_network_attachment_id(spec.id, network_id),
+            task_id: spec.id,
+            node_id: manager.local_node_id,
+            container_id: "container-0".to_string(),
+            network_id,
+            task_updated_at: Some(Utc::now().to_rfc3339()),
+            requested_ip: Some("127.0.0.1".to_string()),
+            assigned_ip: Some("127.0.0.1".to_string()),
+            mac: Some("02:11:22:33:44:66".to_string()),
+            state: NetworkAttachmentState::Ready,
+            error: None,
+            traffic_published: true,
+            service_name: None,
+            template_name: None,
+        }))
+        .await
+        .expect("insert local attachment target");
+
+    let mut probed = manager.load_spec(spec.id).await.expect("load running task");
+    probed.liveness = Some(TaskLivenessProbe {
+        kind: TaskLivenessProbeKind::Tcp,
+        command: Vec::new(),
+        port,
+        path: None,
+        interval_ms: 60_000,
+        timeout_ms: 1_000,
+        failure_threshold: 2,
+        start_period_ms: 0,
+    });
+    manager
+        .persist_spec(&probed)
+        .await
+        .expect("persist tcp liveness probe");
+
+    let mut working = manager
+        .load_spec(spec.id)
+        .await
+        .expect("reload running task");
+    let short_circuit = manager
+        .reconcile_recorded_running_task(&mut working)
+        .await
+        .expect("reconcile tcp liveness probe");
+    assert!(
+        short_circuit,
+        "healthy tcp liveness probe should keep task running"
+    );
+    assert!(
+        mock_cm.exec_calls.lock().await.is_empty(),
+        "tcp liveness should not use container exec"
+    );
+    drop(listener);
+}
+
+#[tokio::test]
 async fn reconcile_running_task_skips_liveness_probe_during_start_period() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
@@ -1959,7 +2126,10 @@ async fn reconcile_running_task_skips_liveness_probe_during_start_period() {
     let mut probed = manager.load_spec(spec.id).await.expect("load running task");
     probed.updated_at = Utc::now().to_rfc3339();
     probed.liveness = Some(TaskLivenessProbe {
+        kind: TaskLivenessProbeKind::Exec,
         command: vec!["/bin/check".to_string()],
+        port: 0,
+        path: None,
         interval_ms: 0,
         timeout_ms: 500,
         failure_threshold: 1,
@@ -2006,7 +2176,10 @@ async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
 
     let mut probed = manager.load_spec(spec.id).await.expect("load running task");
     probed.liveness = Some(TaskLivenessProbe {
+        kind: TaskLivenessProbeKind::Exec,
         command: vec!["/bin/check".to_string()],
+        port: 0,
+        path: None,
         interval_ms: 0,
         timeout_ms: 500,
         failure_threshold: 2,

@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -19,7 +20,8 @@ use crate::scheduler::{
 use crate::task::container::ContainerState;
 use crate::task::docker::{ContainerError, ContainerInfo};
 use crate::task::types::{
-    TaskEvent, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec, TaskValue,
+    TaskEvent, TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicyKind,
+    TaskServiceMetadata, TaskSpec, TaskValue,
 };
 use crate::volumes::LocalVolumeAccessError;
 
@@ -198,9 +200,27 @@ impl TaskManager {
             self.liveness_probes.lock().await.remove(&working.id);
             return Ok(true);
         };
-        if probe.command.is_empty() {
-            self.liveness_probes.lock().await.remove(&working.id);
-            return Ok(true);
+        match probe.kind {
+            TaskLivenessProbeKind::Exec if probe.command.is_empty() => {
+                self.liveness_probes.lock().await.remove(&working.id);
+                warn!(
+                    target: "task",
+                    task = %working.id,
+                    "ignoring malformed exec liveness probe with empty command"
+                );
+                return Ok(true);
+            }
+            TaskLivenessProbeKind::Http | TaskLivenessProbeKind::Tcp if probe.port == 0 => {
+                self.liveness_probes.lock().await.remove(&working.id);
+                warn!(
+                    target: "task",
+                    task = %working.id,
+                    kind = ?probe.kind,
+                    "ignoring malformed socket liveness probe with port 0"
+                );
+                return Ok(true);
+            }
+            _ => {}
         }
 
         if let Some(running_since) =
@@ -228,11 +248,10 @@ impl TaskManager {
         }
 
         let failure_reason = match self
-            .container_manager
-            .exec_container(container_id, &probe.command, Some(probe.timeout()))
+            .execute_liveness_probe(working.id, container_id, &probe)
             .await
         {
-            Ok(result) if matches!(result.exit_code, Some(0)) => {
+            Ok(()) => {
                 let mut guard = self.liveness_probes.lock().await;
                 guard.insert(
                     working.id,
@@ -244,15 +263,7 @@ impl TaskManager {
                 );
                 return Ok(true);
             }
-            Ok(result) => match result.exit_code {
-                Some(code) => format!("liveness probe exited with status code {code}"),
-                None => "liveness probe completed without an exit status".to_string(),
-            },
-            Err(ContainerError::Timeout) => "liveness probe timed out".to_string(),
-            Err(ContainerError::NotFound(_)) => {
-                "task container disappeared while executing liveness probe".to_string()
-            }
-            Err(err) => format!("liveness probe failed: {err}"),
+            Err(reason) => reason,
         };
 
         let next_failures = cached
@@ -334,6 +345,116 @@ impl TaskManager {
             );
         }
         Ok(false)
+    }
+
+    /// Executes the configured liveness probe using the transport selected by the task spec.
+    async fn execute_liveness_probe(
+        &self,
+        task_id: Uuid,
+        container_id: &str,
+        probe: &TaskLivenessProbe,
+    ) -> Result<(), String> {
+        match probe.kind {
+            TaskLivenessProbeKind::Exec => {
+                if probe.command.is_empty() {
+                    return Err("liveness exec probe is missing a command".to_string());
+                }
+                match self
+                    .container_manager
+                    .exec_container(container_id, &probe.command, Some(probe.timeout()))
+                    .await
+                {
+                    Ok(result) if matches!(result.exit_code, Some(0)) => Ok(()),
+                    Ok(result) => match result.exit_code {
+                        Some(code) => Err(format!("liveness probe exited with status code {code}")),
+                        None => Err("liveness probe completed without an exit status".to_string()),
+                    },
+                    Err(ContainerError::Timeout) => Err("liveness probe timed out".to_string()),
+                    Err(ContainerError::NotFound(_)) => {
+                        Err("task container disappeared while executing liveness probe".to_string())
+                    }
+                    Err(err) => Err(format!("liveness probe failed: {err}")),
+                }
+            }
+            TaskLivenessProbeKind::Http => {
+                let targets = self
+                    .resolve_liveness_probe_targets(task_id, container_id)
+                    .await?;
+                if targets.is_empty() {
+                    return Err("liveness http probe has no local target address".to_string());
+                }
+                let path = probe.http_path().unwrap_or("/");
+                if probe_liveness_http(&targets, probe.port, path, probe.timeout()).await {
+                    Ok(())
+                } else {
+                    let targets = format_liveness_targets(&targets, probe.port);
+                    Err(format!(
+                        "liveness http probe failed for {targets} path {path}"
+                    ))
+                }
+            }
+            TaskLivenessProbeKind::Tcp => {
+                let targets = self
+                    .resolve_liveness_probe_targets(task_id, container_id)
+                    .await?;
+                if targets.is_empty() {
+                    return Err("liveness tcp probe has no local target address".to_string());
+                }
+                if probe_liveness_tcp(&targets, probe.port, probe.timeout()).await {
+                    Ok(())
+                } else {
+                    let targets = format_liveness_targets(&targets, probe.port);
+                    Err(format!("liveness tcp probe failed for {targets}"))
+                }
+            }
+        }
+    }
+
+    /// Resolves local IPv4 targets for HTTP/TCP liveness probes from runtime attachments first
+    /// and Docker inspect fallback data second.
+    async fn resolve_liveness_probe_targets(
+        &self,
+        task_id: Uuid,
+        container_id: &str,
+    ) -> Result<Vec<Ipv4Addr>, String> {
+        let mut targets = BTreeSet::new();
+        let attachments = self
+            .network_registry
+            .list_attachments_for_task(task_id)
+            .map_err(|err| {
+                format!("failed to load task attachments for liveness probe: {err:#}")
+            })?;
+        for attachment in attachments {
+            if attachment.node_id != self.local_node_id {
+                continue;
+            }
+            if !matches!(
+                attachment.state,
+                NetworkAttachmentState::Ready | NetworkAttachmentState::Configuring
+            ) {
+                continue;
+            }
+            push_liveness_target(&mut targets, attachment.assigned_ip.as_deref());
+        }
+        if !targets.is_empty() {
+            return Ok(targets.into_iter().collect());
+        }
+
+        let inspect = self
+            .container_manager
+            .inspect_container(container_id)
+            .await
+            .map_err(|err| format!("failed to inspect task container for liveness probe: {err}"))?;
+        if let Some(network_settings) = inspect.network_settings.as_ref() {
+            push_liveness_target(&mut targets, network_settings.ip_address.as_deref());
+            if let Some(networks) = network_settings.networks.as_ref() {
+                for endpoint in networks.values() {
+                    push_liveness_target(&mut targets, endpoint.ip_address.as_deref());
+                }
+            }
+        }
+
+        Ok(targets.into_iter().collect())
     }
 
     /// Ensures the provided task has non-empty slot assignments and that each slot is reserved
@@ -2946,4 +3067,97 @@ fn terminal_exit_from_inspect(
         .unwrap_or(1);
     let exit_error = state.error.clone().filter(|value| !value.trim().is_empty());
     Some((exit_code, exit_error))
+}
+
+/// Parses one optional textual IPv4 address into the deterministic probe target set.
+/// Adds one parsed IPv4 target to the deduplicated liveness probe target set.
+fn push_liveness_target(targets: &mut BTreeSet<Ipv4Addr>, raw: Option<&str>) {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if let Ok(ip) = raw.parse::<Ipv4Addr>() {
+        targets.insert(ip);
+    }
+}
+
+/// Renders one operator-facing list of local probe targets.
+/// Renders probe targets into a stable string for diagnostics and probe errors.
+fn format_liveness_targets(targets: &[Ipv4Addr], port: u16) -> String {
+    targets
+        .iter()
+        .map(|ip| format!("{ip}:{port}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Returns true when any resolved local target answers the TCP liveness probe.
+/// Attempts the TCP liveness probe against each local task address until one succeeds.
+async fn probe_liveness_tcp(targets: &[Ipv4Addr], port: u16, timeout_budget: Duration) -> bool {
+    for ip in targets {
+        if probe_liveness_tcp_target(*ip, port, timeout_budget).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true when any resolved local target answers the HTTP liveness probe.
+/// Attempts the HTTP liveness probe against each local task address until one succeeds.
+async fn probe_liveness_http(
+    targets: &[Ipv4Addr],
+    port: u16,
+    path: &str,
+    timeout_budget: Duration,
+) -> bool {
+    for ip in targets {
+        if probe_liveness_http_target(*ip, port, path, timeout_budget).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Probes one local TCP endpoint for liveness by attempting a connection within the timeout.
+/// Performs one bounded TCP connect probe against a specific task address.
+async fn probe_liveness_tcp_target(ip: Ipv4Addr, port: u16, timeout_budget: Duration) -> bool {
+    let addr = SocketAddr::new(IpAddr::V4(ip), port);
+    matches!(
+        timeout(timeout_budget, tokio::net::TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
+}
+
+/// Probes one local HTTP endpoint for liveness by requiring a 2xx response within the timeout.
+/// Performs one bounded HTTP GET probe against a specific task address and path.
+async fn probe_liveness_http_target(
+    ip: Ipv4Addr,
+    port: u16,
+    path: &str,
+    timeout_budget: Duration,
+) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let addr = SocketAddr::new(IpAddr::V4(ip), port);
+    let path = if path.is_empty() { "/" } else { path };
+    let mut stream = match timeout(timeout_budget, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        _ => return false,
+    };
+
+    let request = format!("GET {path} HTTP/1.0\r\nHost: {ip}\r\n\r\n");
+    if timeout(timeout_budget, stream.write_all(request.as_bytes()))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut buf = [0u8; 128];
+    match timeout(timeout_budget, stream.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => {
+            let prefix = &buf[..n];
+            prefix.starts_with(b"HTTP/1.1 2") || prefix.starts_with(b"HTTP/1.0 2")
+        }
+        _ => false,
+    }
 }
