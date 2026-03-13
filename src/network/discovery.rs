@@ -1395,6 +1395,26 @@ fn service_health_port(service_specs: &[ServiceSpecValue], service_name: &str) -
     None
 }
 
+/// Resolve one service's active backend probe settings while keeping health probing opt-in.
+///
+/// The global discovery health port only fills the port after the service has explicitly declared
+/// backend health metadata through a service port, env override, or HTTP health path.
+fn resolve_service_health_probe(
+    service_specs: &[ServiceSpecValue],
+    service_name: &str,
+    default_health_port: Option<u16>,
+) -> (Option<u16>, Option<String>) {
+    let explicit_port = service_health_port(service_specs, service_name).filter(|port| *port != 0);
+    let health_path = service_health_path(service_specs, service_name);
+    if explicit_port.is_none() && health_path.is_none() {
+        return (None, None);
+    }
+
+    let port = explicit_port.or(default_health_port.filter(|port| *port != 0));
+    let path = if port.is_some() { health_path } else { None };
+    (port, path)
+}
+
 /// Resolve the public nodeport requested by a service template, if any.
 fn service_public_port(service_specs: &[ServiceSpecValue], service_name: &str) -> Option<u16> {
     for spec in service_specs {
@@ -1540,16 +1560,14 @@ async fn refresh_backend_catalog_if_needed(
             health_snapshot,
         )
         .await?;
-        let health_port = default_health_port
-            .or_else(|| service_health_port(&service_specs, &service_name))
-            .and_then(|port| if port == 0 { None } else { Some(port) });
+        let (health_port, health_path) =
+            resolve_service_health_probe(&service_specs, &service_name, default_health_port);
         let public_port = service_public_port(&service_specs, &service_name);
         let public_protocols = if public_port.is_some() {
             service_public_protocols(&service_specs, &service_name)
         } else {
             Vec::new()
         };
-        let health_path = service_health_path(&service_specs, &service_name);
         let expose_to_host = service_is_public(&service_specs, network_id, &service_name);
         let service_key = service_name.to_ascii_lowercase();
 
@@ -2216,6 +2234,26 @@ mod tests {
         network_id: Uuid,
         task_ids: Vec<Uuid>,
     ) {
+        upsert_catalog_service_with_health(
+            services,
+            service_name,
+            network_id,
+            task_ids,
+            None,
+            None,
+        )
+        .await;
+    }
+
+    /// Writes one service template with optional backend health metadata for catalog tests.
+    async fn upsert_catalog_service_with_health(
+        services: &ServiceRegistry,
+        service_name: &str,
+        network_id: Uuid,
+        task_ids: Vec<Uuid>,
+        health_port: Option<u16>,
+        health_command: Option<Vec<String>>,
+    ) {
         let service = ServiceSpecValue::new(
             Uuid::new_v4(),
             "catalog-test-manifest",
@@ -2236,8 +2274,8 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
-                health_port: None,
-                health_command: None,
+                health_port,
+                health_command,
                 public_port: None,
                 public_protocol: None,
             }],
@@ -2342,6 +2380,74 @@ mod tests {
                 .unwrap_or_default(),
             0
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_catalog_refresh_requires_service_health_opt_in() {
+        let harness = setup_catalog_harness().await;
+        upsert_catalog_service(
+            &harness.services,
+            "backend-service",
+            harness.network.id,
+            vec![Uuid::new_v4()],
+        )
+        .await;
+
+        let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
+        refresh_backend_catalog_if_needed(
+            &catalog,
+            &harness.registry,
+            &harness.tasks,
+            &harness.services,
+            harness.network.id,
+            &HashMap::new(),
+            Some(30_080),
+        )
+        .await
+        .expect("refresh catalog without explicit service health");
+
+        let guard = catalog.lock().await;
+        let entry = guard
+            .services
+            .get("backend")
+            .expect("catalog entry for backend");
+        assert_eq!(entry.health_port, None);
+        assert_eq!(entry.health_path, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_catalog_refresh_uses_default_port_for_explicit_health_path() {
+        let harness = setup_catalog_harness().await;
+        upsert_catalog_service_with_health(
+            &harness.services,
+            "backend-service",
+            harness.network.id,
+            vec![Uuid::new_v4()],
+            None,
+            Some(vec!["/healthz".to_string()]),
+        )
+        .await;
+
+        let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
+        refresh_backend_catalog_if_needed(
+            &catalog,
+            &harness.registry,
+            &harness.tasks,
+            &harness.services,
+            harness.network.id,
+            &HashMap::new(),
+            Some(30_080),
+        )
+        .await
+        .expect("refresh catalog with explicit service health path");
+
+        let guard = catalog.lock().await;
+        let entry = guard
+            .services
+            .get("backend")
+            .expect("catalog entry for backend");
+        assert_eq!(entry.health_port, Some(30_080));
+        assert_eq!(entry.health_path.as_deref(), Some("/healthz"));
     }
 
     #[test]
