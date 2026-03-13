@@ -104,8 +104,8 @@ pub struct HeadlessNode {
     pub peers: crate::store::peer_store::PeersStore,
     pub tasks: crate::store::task_store::TaskStore,
     pub services: crate::store::service_store::ServiceStore,
-    pub local_sessions: crate::store::local_session_store::LocalSessionStore,
-    pub local_creds: crate::store::local_credential_store::LocalCredentialStore,
+    pub local_sessions: crate::store::local::LocalSessionStore,
+    pub local_creds: crate::store::local::LocalCredentialStore,
 
     // Keep resources alive
     _db: Arc<redb::Database>,

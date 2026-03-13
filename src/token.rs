@@ -5,7 +5,7 @@ use redb::Database;
 use std::{io, sync::Arc};
 use tokio::sync::RwLock;
 
-use crate::store::local_token_store::LocalTokenStore;
+use crate::store::local::LocalTokenStore;
 
 const TOKEN_PREFIX: &str = "MNTISA-1-";
 
@@ -150,7 +150,7 @@ impl net::noise::NoisePskProvider for TokenStore {
 
 #[cfg(test)]
 mod tests {
-    use crate::{store::local_token_store::LocalTokenStore, token::TokenStore};
+    use crate::{store::local::LocalTokenStore, token::TokenStore};
     use redb::Database;
     use std::sync::Arc;
     use tempfile::tempdir;

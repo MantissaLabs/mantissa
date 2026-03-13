@@ -1,15 +1,11 @@
 pub mod cluster_operation_store;
 pub mod cluster_view_store;
 pub mod local;
-pub mod local_credential_store;
-pub mod local_session_store;
-pub mod local_token_store;
 pub mod network_store;
 pub mod open;
 pub mod path;
 pub mod peer_store;
 pub mod scheduler_store;
-pub mod secret_master_store;
 pub mod secret_store;
 pub mod service_store;
 pub mod task_store;

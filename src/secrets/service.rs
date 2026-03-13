@@ -4,7 +4,7 @@ use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::{
     SecretCiphertext, SecretEvent, SecretMetadata, SecretValue, SecretVersion, compute_secret_id,
 };
-use crate::store::secret_master_store::{MasterKeyRecord, SecretMasterStore};
+use crate::store::local::{MasterKeyRecord, SecretMasterStore};
 use crate::topology::Topology;
 use capnp::Error;
 use capnp::struct_list;

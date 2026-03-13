@@ -15,13 +15,12 @@ use mantissa::secrets::gossip::SecretReplicator;
 use mantissa::secrets::registry::SecretRegistry;
 use mantissa::secrets::service::SecretsService;
 use mantissa::secrets::types::{SecretMetadata, SecretValue, SecretVersion, compute_secret_id};
-use mantissa::store::local_session_store::LocalSessionStore;
+use mantissa::store::local::{LocalSessionStore, SecretMasterStore};
 use mantissa::store::network_store::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
 use mantissa::store::peer_store::open_peers_store;
 use mantissa::store::scheduler_store::open_scheduler_store;
-use mantissa::store::secret_master_store::SecretMasterStore;
 use mantissa::store::secret_store::open_secret_store;
 use mantissa::store::task_store::open_task_store;
 use mantissa::store::volume_store::{open_volume_node_store, open_volume_spec_store};

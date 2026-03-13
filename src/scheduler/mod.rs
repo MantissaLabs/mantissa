@@ -1083,7 +1083,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::store::local_session_store::LocalSessionStore;
+    use crate::store::local::LocalSessionStore;
     use crate::store::peer_store::open_peers_store;
     use crate::store::scheduler_store::open_scheduler_store;
     use ::health::HealthMonitor;

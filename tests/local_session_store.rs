@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
-use mantissa::store::local_session_store::LocalSessionStore;
+use mantissa::store::local::LocalSessionStore;
 use uuid::Uuid;
 
 mod common;

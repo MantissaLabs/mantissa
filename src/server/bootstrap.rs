@@ -18,9 +18,9 @@ use crate::server::{Server, ServerClients, ServerStores};
 use crate::services::{ServiceController, ServiceControllerConfig, ServiceRegistry, ServicesRPC};
 use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::cluster_view_store::ClusterViewStore;
-use crate::store::local::load_or_create_node_id;
-use crate::store::local_credential_store::LocalCredentialStore;
-use crate::store::local_session_store::LocalSessionStore;
+use crate::store::local::{
+    LocalCredentialStore, LocalSessionStore, SecretMasterStore, load_or_create_node_id,
+};
 use crate::store::network_store::{
     NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore, open_network_attachment_store,
     open_network_peer_store, open_network_spec_store,
@@ -28,7 +28,6 @@ use crate::store::network_store::{
 use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
 use crate::store::scheduler_store::{SchedulerStore, open_scheduler_store};
-use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::{SecretStore, open_secret_store};
 use crate::store::service_store::{ServiceStore, open_service_store};
 use crate::store::task_store::{TaskStore, open_task_store};

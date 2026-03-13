@@ -1,5 +1,5 @@
 use crate::secrets::types::SecretCiphertext;
-use crate::store::secret_master_store::{MasterKeyRecord, SecretMasterStore};
+use crate::store::local::{MasterKeyRecord, SecretMasterStore};
 use blake3::Hash;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
@@ -176,7 +176,7 @@ impl SecretKeyring {
 #[cfg(test)]
 mod tests {
     use super::SecretKeyring;
-    use crate::store::secret_master_store::SecretMasterStore;
+    use crate::store::local::SecretMasterStore;
     use redb::Database;
     use std::sync::Arc;
     use tempfile::tempdir;

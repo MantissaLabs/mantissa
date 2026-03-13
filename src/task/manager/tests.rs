@@ -14,13 +14,12 @@ use crate::registry::Registry;
 use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
-use crate::store::local_session_store::LocalSessionStore;
+use crate::store::local::{LocalSessionStore, SecretMasterStore};
 use crate::store::network_store::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
 use crate::store::peer_store::open_peers_store;
 use crate::store::scheduler_store::open_scheduler_store;
-use crate::store::secret_master_store::SecretMasterStore;
 use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
 use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
