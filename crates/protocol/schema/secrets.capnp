@@ -1,5 +1,31 @@
 @0xd7f4ffbce9f9a5dd;
 
+interface Secrets {
+  list @0 () -> (secrets :List(SecretSpec));
+  # List secret specifications (no plaintext).
+
+  create @1 (request :SecretUpsertRequest) -> (secret :SecretSpec);
+  # Create a new secret and return its spec.
+
+  update @2 (request :SecretUpsertRequest) -> (secret :SecretSpec);
+  # Update a secret by creating a new version.
+
+  delete @3 (names :List(Text));
+  # Delete secrets by name.
+
+  get @4 (name :Text, versionId :Data) -> (version :SecretVersionData);
+  # Fetch a secret version (plaintext returned to authorized caller).
+
+  getMasterKey @5 () -> (envelope :SecretMasterKey);
+  # Fetch the current cluster master key envelope.
+
+  installMasterKey @6 (envelope :SecretMasterKey);
+  # Install or replace the cluster master key envelope.
+
+  rotateMasterKey @7 () -> (version :UInt64);
+  # Rotate the master key and return the new version.
+}
+
 struct SecretMetadataEntry {
   key @0 :Text;
   # Metadata key name.
@@ -113,30 +139,4 @@ struct SecretEvent {
     remove @1 :Data;
     # 16-byte UUID for the secret identifier.
   }
-}
-
-interface Secrets {
-  list @0 () -> (secrets :List(SecretSpec));
-  # List secret specifications (no plaintext).
-
-  create @1 (request :SecretUpsertRequest) -> (secret :SecretSpec);
-  # Create a new secret and return its spec.
-
-  update @2 (request :SecretUpsertRequest) -> (secret :SecretSpec);
-  # Update a secret by creating a new version.
-
-  delete @3 (names :List(Text));
-  # Delete secrets by name.
-
-  get @4 (name :Text, versionId :Data) -> (version :SecretVersionData);
-  # Fetch a secret version (plaintext returned to authorized caller).
-
-  getMasterKey @5 () -> (envelope :SecretMasterKey);
-  # Fetch the current cluster master key envelope.
-
-  installMasterKey @6 (envelope :SecretMasterKey);
-  # Install or replace the cluster master key envelope.
-
-  rotateMasterKey @7 () -> (version :UInt64);
-  # Rotate the master key and return the new version.
 }

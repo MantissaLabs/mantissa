@@ -2,6 +2,21 @@
 
 using TaskSchema = import "task.capnp";
 
+interface Services {
+  list @0 () -> (services :List(ServiceSpec));
+  # List all services with their current specs.
+
+  delete @1 (ids :List(Data)); # Each entry is a 16-byte service UUID
+  # Delete services by UUID.
+
+  deploy @2 (spec :ServiceDeploySpec) -> (
+    serviceId :Data,
+    outcome :DeployOutcome,
+    detail :Text
+  );
+  # Deploy or update a service and return the resolved outcome.
+}
+
 struct TaskTemplate {
   name @0 :Text;
   # Logical task name (free-form string)
@@ -360,21 +375,6 @@ struct ServiceDeploySpec {
 
   updateStrategy @4 :UpdateStrategy;
   # Desired rollout strategy for this deployment generation.
-}
-
-interface Services {
-  list @0 () -> (services :List(ServiceSpec));
-  # List all services with their current specs.
-
-  delete @1 (ids :List(Data)); # Each entry is a 16-byte service UUID
-  # Delete services by UUID.
-
-  deploy @2 (spec :ServiceDeploySpec) -> (
-    serviceId :Data,
-    outcome :DeployOutcome,
-    detail :Text
-  );
-  # Deploy or update a service and return the resolved outcome.
 }
 
 enum DeployOutcome {

@@ -2,6 +2,30 @@
 
 using import "topology.capnp".ClusterViewId;
 
+interface Sync {
+  getRootsForView @0 (req :ViewRequest) -> (roots :List(DomainRoot));
+  # Phase 1 of anti-entropy: fetch per-domain MST roots for one explicit view.
+
+  getRangesForView @1 (req :ViewRangesRequest) -> (ranges :List(DomainRangeSummary));
+  # Phase 2 of anti-entropy: fetch digest summaries only for domains whose roots differ.
+
+  openDeltaForView @2 (req :ViewOpenDeltaRequest);
+  # Phase 3 of anti-entropy: stream only the ranges the requester proved it is missing.
+  # Client passes per-domain ranges it wants, and a DeltaSink it implements locally.
+  # Server streams domain-tagged chunks into that sink and calls end() when done.
+}
+
+interface DeltaSink {
+  pushChunk @0 (chunk :DeltaChunk) -> stream;
+  # Server pushes chunks to this sink, library enforces backpressure.
+  # Reconstructs or merges the stream into the local CRDT/MST structure.
+
+  end @1 ();
+  # Indicates that no more chunks will be written.
+  # Once end() is received, it rehashes that subtree and re-evaluates
+  # its cluster root.
+}
+
 enum Domain {
   peers @0;
   # Peer registry domain.
@@ -135,28 +159,4 @@ struct ViewOpenDeltaRequest {
 
   sink  @2 :DeltaSink;
   # Sink receiving the streamed delta.
-}
-
-interface DeltaSink {
-  pushChunk @0 (chunk :DeltaChunk) -> stream;
-  # Server pushes chunks to this sink, library enforces backpressure.
-  # Reconstructs or merges the stream into the local CRDT/MST structure.
-
-  end @1 ();
-  # Indicates that no more chunks will be written.
-  # Once end() is received, it rehashes that subtree and re-evaluates
-  # its cluster root.
-}
-
-interface Sync {
-  getRootsForView @0 (req :ViewRequest) -> (roots :List(DomainRoot));
-  # Phase 1 of anti-entropy: fetch per-domain MST roots for one explicit view.
-
-  getRangesForView @1 (req :ViewRangesRequest) -> (ranges :List(DomainRangeSummary));
-  # Phase 2 of anti-entropy: fetch digest summaries only for domains whose roots differ.
-
-  openDeltaForView @2 (req :ViewOpenDeltaRequest);
-  # Phase 3 of anti-entropy: stream only the ranges the requester proved it is missing.
-  # Client passes per-domain ranges it wants, and a DeltaSink it implements locally.
-  # Server streams domain-tagged chunks into that sink and calls end() when done.
 }

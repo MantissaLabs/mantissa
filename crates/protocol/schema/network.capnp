@@ -1,5 +1,25 @@
 @0xc1f4bf349cfd3cb7;
 
+interface Networks {
+  create @0 (spec :NetworkCreateSpec) -> (networkId :Data);
+  # Create a network and return its 16-byte UUID.
+
+  delete @1 (ids :List(Data));
+  # Delete networks by UUID.
+
+  list @2 () -> (networks :List(NetworkSummary));
+  # List networks with summary information.
+
+  inspect @3 (id :Data) -> (network :NetworkInspect);
+  # Fetch full details for a single network.
+
+  peerStatus @4 (id :Data) -> (peers :List(NetworkPeerStatus));
+  # List peer status entries for the network.
+
+  attachments @5 (id :Data) -> (attachments :List(NetworkAttachmentSpec));
+  # List attachment specs for the network.
+}
+
 enum NetworkDriver {
   vxlan @0;
   # VXLAN-based overlay network.
@@ -250,24 +270,4 @@ struct NetworkEvent {
     peerRemove @2;
     # Peer state removal.
   }
-}
-
-interface Networks {
-  create @0 (spec :NetworkCreateSpec) -> (networkId :Data);
-  # Create a network and return its 16-byte UUID.
-
-  delete @1 (ids :List(Data));
-  # Delete networks by UUID.
-
-  list @2 () -> (networks :List(NetworkSummary));
-  # List networks with summary information.
-
-  inspect @3 (id :Data) -> (network :NetworkInspect);
-  # Fetch full details for a single network.
-
-  peerStatus @4 (id :Data) -> (peers :List(NetworkPeerStatus));
-  # List peer status entries for the network.
-
-  attachments @5 (id :Data) -> (attachments :List(NetworkAttachmentSpec));
-  # List attachment specs for the network.
 }

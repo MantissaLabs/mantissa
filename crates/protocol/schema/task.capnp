@@ -1,5 +1,19 @@
 @0xc040d5aebc3fbc7e;
 
+interface Task {
+  start @0 (request :TaskStartRequest) -> (spec :TaskSpec);
+  # Start a new task and return its spec.
+
+  list @1 (request :TaskListRequest) -> (tasks :List(TaskSpec));
+  # List tasks matching the provided state filters.
+
+  stop @2 (request :TaskStopRequest) -> (spec :TaskSpec);
+  # Stop a task and return its final spec.
+
+  startMany @3 (requests :List(TaskStartRequest)) -> (specs :List(TaskSpec));
+  # Start multiple tasks in a batch.
+}
+
 struct SecretRef {
   name @0 :Text;
   # Logical secret name.
@@ -287,20 +301,6 @@ struct TaskEvent {
     remove @1;
     # Task removed.
   }
-}
-
-interface Task {
-  start @0 (request :TaskStartRequest) -> (spec :TaskSpec);
-  # Start a new task and return its spec.
-
-  list @1 (request :TaskListRequest) -> (tasks :List(TaskSpec));
-  # List tasks matching the provided state filters.
-
-  stop @2 (request :TaskStopRequest) -> (spec :TaskSpec);
-  # Stop a task and return its final spec.
-
-  startMany @3 (requests :List(TaskStartRequest)) -> (specs :List(TaskSpec));
-  # Start multiple tasks in a batch.
 }
 
 enum RestartPolicyName {

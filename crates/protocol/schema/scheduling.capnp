@@ -1,5 +1,16 @@
 @0x8923d9579cd1b4be;
 
+interface Scheduler {
+  summary @0 (request :SummaryRequest) -> (summary :Summary);
+  # Fetch a scheduling summary for a node, optionally with details.
+
+  reserveSlots @1 (request :ReserveSlotsRequest) -> (response :ReserveSlotsResponse);
+  # Reserve a set of slots using optimistic version checks.
+
+  releaseSlots @2 (request :ReleaseSlotsRequest) -> (response :ReleaseSlotsResponse);
+  # Release reserved slots using optimistic version checks.
+}
+
 enum SlotState {
   free @0;
   # Slot is available for reservation.
@@ -176,15 +187,4 @@ struct ReleaseSlotsRequest {
 struct ReleaseSlotsResponse {
   newVersion @0 :UInt64;
   # Updated scheduler version after releasing reservations.
-}
-
-interface Scheduler {
-  summary @0 (request :SummaryRequest) -> (summary :Summary);
-  # Fetch a scheduling summary for a node, optionally with details.
-
-  reserveSlots @1 (request :ReserveSlotsRequest) -> (response :ReserveSlotsResponse);
-  # Reserve a set of slots using optimistic version checks.
-
-  releaseSlots @2 (request :ReleaseSlotsRequest) -> (response :ReleaseSlotsResponse);
-  # Release reserved slots using optimistic version checks.
 }

@@ -1,5 +1,25 @@
 @0x98629ea0f957ea77;
 
+interface Volumes {
+  create @0 (request :VolumeCreateRequest) -> (volume :VolumeSpec);
+  # Create a new volume object.
+
+  import @1 (request :VolumeImportRequest) -> (volume :VolumeSpec);
+  # Import an existing local host path as a volume object.
+
+  delete @2 (selector :Text) -> (result :VolumeDeleteResult);
+  # Delete a volume by UUID or name.
+
+  list @3 () -> (volumes :List(VolumeSummary));
+  # List volume summaries.
+
+  get @4 (selector :Text) -> (volume :VolumeInspect);
+  # Fetch the canonical volume object and its node rows.
+
+  getStatus @5 (selector :Text) -> (volume :VolumeInspect);
+  # Fetch node-local realization status for the volume.
+}
+
 enum VolumeAccessMode {
   readWriteOnce @0;
   # One writer on one node at a time.
@@ -317,24 +337,4 @@ struct VolumeEvent {
     nodeRemove @3;
     # Node-state row removal.
   }
-}
-
-interface Volumes {
-  create @0 (request :VolumeCreateRequest) -> (volume :VolumeSpec);
-  # Create a new volume object.
-
-  import @1 (request :VolumeImportRequest) -> (volume :VolumeSpec);
-  # Import an existing local host path as a volume object.
-
-  delete @2 (selector :Text) -> (result :VolumeDeleteResult);
-  # Delete a volume by UUID or name.
-
-  list @3 () -> (volumes :List(VolumeSummary));
-  # List volume summaries.
-
-  get @4 (selector :Text) -> (volume :VolumeInspect);
-  # Fetch the canonical volume object and its node rows.
-
-  getStatus @5 (selector :Text) -> (volume :VolumeInspect);
-  # Fetch node-local realization status for the volume.
 }
