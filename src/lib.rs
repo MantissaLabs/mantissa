@@ -1,10 +1,12 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub use crate::app::{run_cli, run_cli_with_args};
 pub use protocol::{
     gossip_capnp, health_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
     topology_capnp, volumes_capnp,
 };
 
+mod app;
 pub mod cli;
 pub mod cluster;
 pub mod config;

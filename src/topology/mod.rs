@@ -75,7 +75,7 @@ const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// Default number of peers sampled per anti-entropy sync tick.
 const DEFAULT_SYNC_FANOUT: usize = 8;
 /// Default maximum number of peers synchronized concurrently within one tick.
-const DEFAULT_SYNC_PARALLELISM: usize = 1;
+const DEFAULT_SYNC_PARALLELISM: usize = 3;
 
 /// Default anti-entropy interval for cross-view cluster metadata sync.
 const DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL: Duration = Duration::from_secs(5);

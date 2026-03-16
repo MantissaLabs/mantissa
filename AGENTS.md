@@ -52,7 +52,7 @@ The system needs to be:
 - Framework: Tokio (`#[tokio::test]`) with helpers in `tests/common/testkit.rs` and `local_test!` macro.
 - Add new integration tests under `tests/` (e.g., `tests/<area>_*.rs`). Keep tests deterministic; avoid arbitrary sleeps: use helpers like `wait_roots_equal` and `assert_cluster_size` to check convergence.
 - Scope tests by name: `cargo test register_node_tcp`.
-- Always run tests sequentially. Don't trigger cargo locks by attempting to run tests in parallel.
+- Never trigger multiple test runs (ie. multiple instances of `cargo test`) at the same time.
 
 ## Commit & Pull Request Guidelines
 
