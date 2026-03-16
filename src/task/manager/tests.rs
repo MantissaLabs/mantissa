@@ -649,6 +649,26 @@ async fn setup_manager_with_forwarding(
     (manager, scheduler, mock_cm, network_registry)
 }
 
+/// Ensures task-manager teardown always removes node-scoped secret staging directories.
+#[tokio::test]
+async fn task_manager_drop_cleans_secret_runtime_root() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let runtime_root = manager.secret_runtime_root.clone();
+    std::fs::create_dir_all(runtime_root.join("leftover")).expect("create staged marker");
+    assert!(
+        runtime_root.exists(),
+        "expected secret runtime root to exist before drop"
+    );
+
+    drop(manager);
+
+    assert!(
+        !runtime_root.exists(),
+        "task manager drop should remove secret runtime root {}",
+        runtime_root.display()
+    );
+}
+
 /// Writes the local peer scheduling row used by task-manager drain-aware reconciliation tests.
 async fn set_local_drain_requested(
     manager: &TaskManager,

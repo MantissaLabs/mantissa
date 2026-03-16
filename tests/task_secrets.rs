@@ -144,6 +144,53 @@ struct TestHarness {
     node_id: Uuid,
 }
 
+struct SecretRuntimeCleanupGuard {
+    node_id: Uuid,
+}
+
+impl SecretRuntimeCleanupGuard {
+    fn new(node_id: Uuid) -> Self {
+        Self { node_id }
+    }
+}
+
+impl Drop for SecretRuntimeCleanupGuard {
+    fn drop(&mut self) {
+        cleanup_secret_runtime_roots_for_node(self.node_id);
+    }
+}
+
+fn cleanup_secret_runtime_roots_for_node(node_id: Uuid) {
+    let node = node_id.to_string();
+    let tmp_root = std::env::temp_dir();
+    let mut roots = vec![
+        tmp_root.join("mantissa").join("secrets").join(&node),
+        tmp_root
+            .join(format!("mantissa-pid-{}", std::process::id()))
+            .join("secrets")
+            .join(&node),
+    ];
+
+    if let Ok(user) = std::env::var("USER").or_else(|_| std::env::var("USERNAME"))
+        && !user.is_empty()
+    {
+        roots.push(
+            tmp_root
+                .join(format!("mantissa-{user}"))
+                .join("secrets")
+                .join(&node),
+        );
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd.join("tmp").join("mantissa").join("secrets").join(node));
+    }
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 async fn setup_task_manager() -> TestHarness {
     let actor = Uuid::new_v4();
 
@@ -310,6 +357,8 @@ async fn setup_task_manager() -> TestHarness {
 }
 
 local_test!(task_manager_stages_secret_env_and_files, {
+    let harness = setup_task_manager().await;
+    let _secret_runtime_cleanup = SecretRuntimeCleanupGuard::new(harness.node_id);
     let TestHarness {
         manager,
         scheduler,
@@ -319,7 +368,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
         secret_keyring,
         secret_keyring_handle: _,
         node_id,
-    } = setup_task_manager().await;
+    } = harness;
 
     let slot = SlotSpec::new(1, SlotCapacity::new(500, 256 * 1_024 * 1_024, 0));
     scheduler
@@ -481,12 +530,14 @@ local_test!(task_manager_stages_secret_env_and_files, {
 });
 
 local_test!(task_manager_rejects_missing_secret_reference, {
+    let harness = setup_task_manager().await;
+    let _secret_runtime_cleanup = SecretRuntimeCleanupGuard::new(harness.node_id);
     let TestHarness {
         manager,
         scheduler,
         container_manager,
         ..
-    } = setup_task_manager().await;
+    } = harness;
 
     let slot = SlotSpec::new(1, SlotCapacity::new(500, 256 * 1_024 * 1_024, 0));
     scheduler
@@ -541,13 +592,15 @@ local_test!(task_manager_rejects_missing_secret_reference, {
 });
 
 local_test!(rotate_master_key_rewraps_secrets, {
+    let harness = setup_task_manager().await;
+    let _secret_runtime_cleanup = SecretRuntimeCleanupGuard::new(harness.node_id);
     let TestHarness {
         secret_registry,
         secret_master_store,
         secret_keyring,
         secret_keyring_handle,
         ..
-    } = setup_task_manager().await;
+    } = harness;
 
     let secret_name = "db-password";
     let secret_plaintext = b"rotate-me";

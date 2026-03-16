@@ -652,6 +652,7 @@ impl HeadlessNode {
 
 impl Drop for HeadlessNode {
     fn drop(&mut self) {
+        crate::task::manager::cleanup_secret_runtime_roots_for_node(self.id);
         if let Some(dir) = self._tmp_dir.take() {
             let _ = std::fs::remove_dir_all(dir);
         }

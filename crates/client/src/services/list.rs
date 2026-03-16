@@ -465,55 +465,6 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Builds a minimal service row so reason rendering can be tested without RPC payloads.
-    fn test_row(status_detail: Option<&str>, rollout_error: Option<&str>) -> ServiceRow {
-        ServiceRow {
-            id: Uuid::nil().to_string(),
-            service_name: "svc".to_string(),
-            tasks: Vec::new(),
-            updated_at: "2026-03-12T00:00:00Z".to_string(),
-            task_ids: Vec::new(),
-            status: ServiceStatusRow::Deploying,
-            status_detail: status_detail.map(str::to_string),
-            rollout: ServiceRolloutRow {
-                phase: ServiceRolloutPhaseRow::Idle,
-                total_steps: 0,
-                completed_steps: 0,
-                failed_steps: u32::from(rollout_error.is_some()),
-                max_failures: 1,
-                last_error: rollout_error.map(str::to_string),
-            },
-            public_endpoints: Vec::new(),
-        }
-    }
-
-    #[test]
-    /// Ensures the services list reason column prefers the current lifecycle detail over rollout history.
-    fn rollout_reason_summary_prefers_status_detail() {
-        let row = test_row(
-            Some("waiting for dependency template 'backend' before launching template 'frontend'"),
-            Some("old rollout failure"),
-        );
-
-        assert!(
-            row.rollout_reason_summary()
-                .contains("waiting for dependency template")
-        );
-    }
-
-    #[test]
-    /// Ensures the services list still falls back to rollout failure details when no status detail exists.
-    fn rollout_reason_summary_falls_back_to_rollout_error() {
-        let row = test_row(None, Some("old rollout failure"));
-
-        assert_eq!(row.rollout_reason_summary(), "old rollout failure");
-    }
-}
-
 /// Map template names to their task identifiers based on the ordered `taskIds` list returned by the
 /// service registry so we can select the correct backend attachments for VIP collision avoidance.
 fn build_template_task_ids(
@@ -597,4 +548,53 @@ fn parse_ipv4_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
     }
     let base_ip: Ipv4Addr = base_text.parse().ok()?;
     Some((base_ip, prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a minimal service row so reason rendering can be tested without RPC payloads.
+    fn test_row(status_detail: Option<&str>, rollout_error: Option<&str>) -> ServiceRow {
+        ServiceRow {
+            id: Uuid::nil().to_string(),
+            service_name: "svc".to_string(),
+            tasks: Vec::new(),
+            updated_at: "2026-03-12T00:00:00Z".to_string(),
+            task_ids: Vec::new(),
+            status: ServiceStatusRow::Deploying,
+            status_detail: status_detail.map(str::to_string),
+            rollout: ServiceRolloutRow {
+                phase: ServiceRolloutPhaseRow::Idle,
+                total_steps: 0,
+                completed_steps: 0,
+                failed_steps: u32::from(rollout_error.is_some()),
+                max_failures: 1,
+                last_error: rollout_error.map(str::to_string),
+            },
+            public_endpoints: Vec::new(),
+        }
+    }
+
+    #[test]
+    /// Ensures the services list reason column prefers the current lifecycle detail over rollout history.
+    fn rollout_reason_summary_prefers_status_detail() {
+        let row = test_row(
+            Some("waiting for dependency template 'backend' before launching template 'frontend'"),
+            Some("old rollout failure"),
+        );
+
+        assert!(
+            row.rollout_reason_summary()
+                .contains("waiting for dependency template")
+        );
+    }
+
+    #[test]
+    /// Ensures the services list still falls back to rollout failure details when no status detail exists.
+    fn rollout_reason_summary_falls_back_to_rollout_error() {
+        let row = test_row(None, Some("old rollout failure"));
+
+        assert_eq!(row.rollout_reason_summary(), "old rollout failure");
+    }
 }

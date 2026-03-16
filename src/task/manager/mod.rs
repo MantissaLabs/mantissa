@@ -916,6 +916,17 @@ impl TaskManager {
     }
 }
 
+#[cfg(test)]
+impl Drop for TaskManager {
+    /// Cleans test-created secret staging roots when the last TaskManager clone is released.
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.secret_artifacts) != 1 {
+            return;
+        }
+        cleanup_secret_runtime_root(&self.secret_runtime_root);
+    }
+}
+
 /// Identify scheduling errors that should be retried because prerequisites are still converging.
 fn is_retryable_scheduling_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| cause.is::<SchedulingError>())
@@ -945,6 +956,21 @@ fn scheduling_retry_backoff(attempt: usize) -> Duration {
 
 fn resolve_secret_runtime_root(local_node_id: Uuid) -> PathBuf {
     let tmp_root = std::env::temp_dir();
+    for base in secret_runtime_base_candidates() {
+        if ensure_dir_writable(&base).is_ok() {
+            return base.join(local_node_id.to_string());
+        }
+    }
+
+    let fallback_base = tmp_root.join(format!("mantissa-fallback-{}", Uuid::new_v4()));
+    ensure_dir_writable(&fallback_base)
+        .expect("unable to provision writable secret staging base directory");
+    fallback_base.join(local_node_id.to_string())
+}
+
+/// Returns the candidate base directories used for node-scoped secret staging.
+fn secret_runtime_base_candidates() -> Vec<PathBuf> {
+    let tmp_root = std::env::temp_dir();
     let mut bases: Vec<PathBuf> = Vec::new();
     bases.push(tmp_root.join("mantissa").join("secrets"));
     if let Some(user_tag) = temp_user_tag() {
@@ -962,17 +988,56 @@ fn resolve_secret_runtime_root(local_node_id: Uuid) -> PathBuf {
     if let Ok(cwd) = std::env::current_dir() {
         bases.push(cwd.join("tmp").join("mantissa").join("secrets"));
     }
+    bases
+}
 
-    for base in bases {
-        if ensure_dir_writable(&base).is_ok() {
-            return base.join(local_node_id.to_string());
+/// Removes all candidate secret runtime directories associated with one node id.
+pub(crate) fn cleanup_secret_runtime_roots_for_node(local_node_id: Uuid) {
+    let node_dir = local_node_id.to_string();
+    for base in secret_runtime_base_candidates() {
+        cleanup_secret_runtime_root(&base.join(&node_dir));
+    }
+}
+
+/// Removes one node-scoped secret runtime directory and prunes empty parent folders.
+fn cleanup_secret_runtime_root(root: &Path) {
+    match fs::remove_dir_all(root) {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            warn!(
+                target: "task",
+                "failed to remove secret runtime root {}: {err}",
+                root.display()
+            );
         }
     }
 
-    let fallback_base = tmp_root.join(format!("mantissa-fallback-{}", Uuid::new_v4()));
-    ensure_dir_writable(&fallback_base)
-        .expect("unable to provision writable secret staging base directory");
-    fallback_base.join(local_node_id.to_string())
+    if let Some(parent) = root.parent() {
+        remove_empty_dir_if_possible(parent);
+        if let Some(grand_parent) = parent.parent() {
+            remove_empty_dir_if_possible(grand_parent);
+        }
+    }
+}
+
+/// Removes a directory only when it is empty, ignoring common non-empty and not-found states.
+fn remove_empty_dir_if_possible(path: &Path) {
+    match fs::remove_dir(path) {
+        Ok(_) => {}
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(err) => {
+            warn!(
+                target: "task",
+                "failed to prune empty directory {}: {err}",
+                path.display()
+            );
+        }
+    }
 }
 
 fn temp_user_tag() -> Option<String> {
@@ -984,7 +1049,7 @@ fn temp_user_tag() -> Option<String> {
 
 fn ensure_dir_writable(base: &Path) -> io::Result<()> {
     fs::create_dir_all(base)?;
-    let probe = base.join(".write_check");
+    let probe = base.join(format!(".write_check-{}", Uuid::new_v4()));
     match OpenOptions::new()
         .create(true)
         .write(true)
@@ -992,7 +1057,11 @@ fn ensure_dir_writable(base: &Path) -> io::Result<()> {
         .open(&probe)
     {
         Ok(_) => {
-            fs::remove_file(&probe)?;
+            match fs::remove_file(&probe) {
+                Ok(_) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
             Ok(())
         }
         Err(err) if err.kind() == ErrorKind::PermissionDenied => Err(err),
