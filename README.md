@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://mantissa.io"><img alt="Mantissa logo" src="logo.png" width="40%"></a>
+  <a href="https://mantissa.io"><img alt="Mantissa logo" src="logo.png" width=40%"></a>
 </p>
 
 ---
