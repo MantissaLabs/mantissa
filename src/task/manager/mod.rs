@@ -924,6 +924,17 @@ impl Drop for TaskManager {
             return;
         }
         cleanup_secret_runtime_root(&self.secret_runtime_root);
+        match fs::remove_dir_all(&self.local_volume_root) {
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                warn!(
+                    target: "task",
+                    "failed to remove local volume root {}: {err}",
+                    self.local_volume_root.display()
+                );
+            }
+        }
     }
 }
 

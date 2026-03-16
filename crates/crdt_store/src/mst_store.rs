@@ -1134,7 +1134,7 @@ mod tests {
     use crate::hash::XXHash128;
     use crate::uuid_key::UuidKey;
     use std::sync::Arc;
-    use uuid::Uuid;
+    use tempfile::TempDir;
 
     // Use the production hasher from the crate for tests
 
@@ -1148,9 +1148,10 @@ mod tests {
 
     type Adapter = MvRegAdapterSorted<UuidKey, String, u8>;
 
-    fn temp_db() -> Arc<redb::Database> {
-        let path = std::env::temp_dir().join(format!("mst-test-{}.redb", Uuid::new_v4()));
-        Arc::new(redb::Database::create(path).unwrap())
+    fn temp_db() -> (TempDir, Arc<redb::Database>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mst.redb");
+        (dir, Arc::new(redb::Database::create(path).unwrap()))
     }
 
     fn key(n: u8) -> UuidKey {
@@ -1161,7 +1162,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_and_remove_and_rebuild() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
             CrdtMstStore::open(db, 1u8).unwrap();
 
@@ -1183,7 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn root_digest_matches_hex() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
             CrdtMstStore::open(db, 1u8).unwrap();
 
@@ -1201,7 +1202,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_snapshot_returns_current_value() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
             CrdtMstStore::open(db, 1u8).unwrap();
 
@@ -1218,7 +1219,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_register_clears_tombstone() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
             CrdtMstStore::open(db, 1u8).unwrap();
 
@@ -1239,7 +1240,7 @@ mod tests {
 
     #[tokio::test]
     async fn export_page_ranges_delta_optimized() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
             CrdtMstStore::open(db, 1u8).unwrap();
 
@@ -1288,7 +1289,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_tombstone_uses_monotonic_ts_in_mst() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
             CrdtMstStore::open(db, 1u8).unwrap();
         let k = key(1);
@@ -1309,7 +1310,7 @@ mod tests {
 
     #[tokio::test]
     async fn export_overlap_ranges_are_deduped() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
             CrdtMstStore::open(db, 1u8).unwrap();
 
@@ -1345,8 +1346,8 @@ mod tests {
 
     #[tokio::test]
     async fn delta_apply_session_commit_rebuilds_once() {
-        let db_src = temp_db();
-        let db_dst = temp_db();
+        let (_src_dir, db_src) = temp_db();
+        let (_dst_dir, db_dst) = temp_db();
         let src: CrdtMstStore<Adapter, XXHash128, TestTables> =
             CrdtMstStore::open(db_src, 1u8).unwrap();
         let dst: CrdtMstStore<Adapter, XXHash128, TestTables> =
@@ -1374,7 +1375,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_delta_chunk_update_mst_keeps_tree_fresh() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let src: CrdtMstStore<Adapter, XXHash128, TestTables> =
             CrdtMstStore::open(db.clone(), 1u8).unwrap();
         let dst: CrdtMstStore<Adapter, XXHash128, TestTables> =
