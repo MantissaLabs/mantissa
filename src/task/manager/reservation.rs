@@ -48,12 +48,17 @@ impl TaskManager {
         const MAX_ATTEMPTS: usize = 10;
 
         for _ in 0..MAX_ATTEMPTS {
-            let snapshot = match self.scheduler.snapshot().await {
+            let snapshot = match self.core.scheduler.snapshot().await {
                 Some(s) => s,
                 None => return Err(anyhow::anyhow!("scheduler snapshot unavailable")),
             };
 
-            match self.scheduler.free_slots(snapshot.version, [slot_id]).await {
+            match self
+                .core
+                .scheduler
+                .free_slots(snapshot.version, [slot_id])
+                .await
+            {
                 Ok(_) => return Ok(()),
                 Err(SchedulerError::SnapshotMismatch { .. }) => continue,
                 Err(SchedulerError::UnknownSlots { .. })
@@ -117,6 +122,7 @@ impl TaskManager {
         }
 
         match self
+            .core
             .scheduler
             .reserve_resources(expected_version, slot_requests, gpu_requests)
             .await
@@ -163,7 +169,7 @@ impl TaskManager {
         const MAX_ATTEMPTS: usize = 10;
 
         for _ in 0..MAX_ATTEMPTS {
-            let expected_version = match self.scheduler.snapshot().await {
+            let expected_version = match self.core.scheduler.snapshot().await {
                 Some(snapshot) => snapshot.version,
                 None => {
                     warn!(
@@ -175,6 +181,7 @@ impl TaskManager {
             };
 
             match self
+                .core
                 .scheduler
                 .free_resources(expected_version, slots.clone(), gpu_device_ids.clone())
                 .await
@@ -426,7 +433,8 @@ impl TaskManager {
         &self,
         peer_id: Uuid,
     ) -> Result<cluster_session::Client, anyhow::Error> {
-        self.registry
+        self.core
+            .registry
             .session_for_peer(peer_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("no active session for peer {peer_id}"))
@@ -527,6 +535,7 @@ impl TaskManager {
             }
 
             let node_name = self
+                .core
                 .registry
                 .peer_hostname(plan.peer_id)
                 .unwrap_or_else(|| plan.peer_id.to_string());

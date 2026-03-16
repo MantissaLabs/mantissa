@@ -374,6 +374,7 @@ impl TaskManager {
         }
 
         let snapshot = self
+            .core
             .scheduler
             .snapshot()
             .await
@@ -406,6 +407,7 @@ impl TaskManager {
         for plan in plans {
             if let Some(container_id) = plan.container_id.as_ref() {
                 if let Err(err) = self
+                    .runtime
                     .container_manager
                     .stop_container(container_id, Some(Duration::from_secs(10)))
                     .await
@@ -418,6 +420,7 @@ impl TaskManager {
                 }
 
                 if let Err(err) = self
+                    .runtime
                     .container_manager
                     .remove_container(container_id, true, true)
                     .await
@@ -429,7 +432,7 @@ impl TaskManager {
                     );
                 }
 
-                let mut guard = self.local_containers.lock().await;
+                let mut guard = self.local_state.local_containers.lock().await;
                 guard.remove(&plan.id);
             }
 

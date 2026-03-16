@@ -407,6 +407,7 @@ impl TaskManager {
         }
 
         let snapshot = self
+            .core
             .scheduler
             .snapshot()
             .await
@@ -680,7 +681,7 @@ impl TaskManager {
         local_ready: &HashSet<Uuid>,
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
-        if self.registry.peer_schedulable(self.local_node_id)
+        if self.core.registry.peer_schedulable(self.local_node_id)
             && let Some(local_candidate) = Candidate::new(
                 CandidateLocation::Local,
                 local_slots,
@@ -691,17 +692,22 @@ impl TaskManager {
             queue.push_back(local_candidate);
         }
 
-        let peers = self.registry.known_peers()?;
+        let peers = self.core.registry.known_peers()?;
         let mut remote_candidates = Vec::new();
         for peer_id in peers {
             if peer_id == self.local_node_id {
                 continue;
             }
-            if !self.registry.peer_schedulable(peer_id) {
+            if !self.core.registry.peer_schedulable(peer_id) {
                 continue;
             }
 
-            let summary = match self.scheduler.fetch_remote_summary(peer_id, true).await {
+            let summary = match self
+                .core
+                .scheduler
+                .fetch_remote_summary(peer_id, true)
+                .await
+            {
                 Ok(summary) => summary,
                 Err(err) => {
                     debug!(

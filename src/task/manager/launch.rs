@@ -135,6 +135,7 @@ impl TaskManager {
         let retry_create_request = create_request.clone();
 
         let (container_id, created_fresh) = match self
+            .runtime
             .container_manager
             .create_container(create_request)
             .await
@@ -155,6 +156,7 @@ impl TaskManager {
                                 "name conflict had no resolvable existing container; retrying create once"
                             );
                             match self
+                                .runtime
                                 .container_manager
                                 .create_container(retry_create_request)
                                 .await
@@ -191,7 +193,12 @@ impl TaskManager {
             }
         };
 
-        match self.container_manager.start_container(&container_id).await {
+        match self
+            .runtime
+            .container_manager
+            .start_container(&container_id)
+            .await
+        {
             Ok(_) => {}
             Err(err) => {
                 if container_already_running(&err) {
@@ -204,6 +211,7 @@ impl TaskManager {
                 } else {
                     if created_fresh
                         && let Err(remove_err) = self
+                            .runtime
                             .container_manager
                             .remove_container(&container_id, true, true)
                             .await

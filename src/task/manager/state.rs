@@ -63,7 +63,7 @@ impl TaskManager {
 
         match self.resolve_live_container_id_for_task(working).await {
             Ok(Some(container_id)) => {
-                let mut guard = self.local_containers.lock().await;
+                let mut guard = self.local_state.local_containers.lock().await;
                 guard.insert(working.id, container_id.clone());
                 drop(guard);
                 self.reconcile_liveness_probe(working, &container_id).await
@@ -197,12 +197,20 @@ impl TaskManager {
         container_id: &str,
     ) -> Result<bool, anyhow::Error> {
         let Some(probe) = working.liveness.clone() else {
-            self.liveness_probes.lock().await.remove(&working.id);
+            self.local_state
+                .liveness_probes
+                .lock()
+                .await
+                .remove(&working.id);
             return Ok(true);
         };
         match probe.kind {
             TaskLivenessProbeKind::Exec if probe.command.is_empty() => {
-                self.liveness_probes.lock().await.remove(&working.id);
+                self.local_state
+                    .liveness_probes
+                    .lock()
+                    .await
+                    .remove(&working.id);
                 warn!(
                     target: "task",
                     task = %working.id,
@@ -211,7 +219,11 @@ impl TaskManager {
                 return Ok(true);
             }
             TaskLivenessProbeKind::Http | TaskLivenessProbeKind::Tcp if probe.port == 0 => {
-                self.liveness_probes.lock().await.remove(&working.id);
+                self.local_state
+                    .liveness_probes
+                    .lock()
+                    .await
+                    .remove(&working.id);
                 warn!(
                     target: "task",
                     task = %working.id,
@@ -235,7 +247,7 @@ impl TaskManager {
         }
 
         let cached = {
-            let guard = self.liveness_probes.lock().await;
+            let guard = self.local_state.liveness_probes.lock().await;
             guard
                 .get(&working.id)
                 .copied()
@@ -252,7 +264,7 @@ impl TaskManager {
             .await
         {
             Ok(()) => {
-                let mut guard = self.liveness_probes.lock().await;
+                let mut guard = self.local_state.liveness_probes.lock().await;
                 guard.insert(
                     working.id,
                     super::LivenessProbeEntry {
@@ -271,7 +283,7 @@ impl TaskManager {
             .unwrap_or_default()
             .saturating_add(1);
         {
-            let mut guard = self.liveness_probes.lock().await;
+            let mut guard = self.local_state.liveness_probes.lock().await;
             guard.insert(
                 working.id,
                 super::LivenessProbeEntry {
@@ -293,8 +305,16 @@ impl TaskManager {
             return Ok(true);
         }
 
-        self.liveness_probes.lock().await.remove(&working.id);
-        self.local_containers.lock().await.remove(&working.id);
+        self.local_state
+            .liveness_probes
+            .lock()
+            .await
+            .remove(&working.id);
+        self.local_state
+            .local_containers
+            .lock()
+            .await
+            .remove(&working.id);
         self.rollback_container_launch(container_id, "liveness probe failure")
             .await;
         if let Err(err) = self
@@ -360,6 +380,7 @@ impl TaskManager {
                     return Err("liveness exec probe is missing a command".to_string());
                 }
                 match self
+                    .runtime
                     .container_manager
                     .exec_container(container_id, &probe.command, Some(probe.timeout()))
                     .await
@@ -419,6 +440,7 @@ impl TaskManager {
     ) -> Result<Vec<Ipv4Addr>, String> {
         let mut targets = BTreeSet::new();
         let attachments = self
+            .networking
             .network_registry
             .list_attachments_for_task(task_id)
             .map_err(|err| {
@@ -441,6 +463,7 @@ impl TaskManager {
         }
 
         let inspect = self
+            .runtime
             .container_manager
             .inspect_container(container_id)
             .await
@@ -486,6 +509,7 @@ impl TaskManager {
         const MAX_ATTEMPTS: usize = 10;
         for _ in 0..MAX_ATTEMPTS {
             let snapshot = self
+                .core
                 .scheduler
                 .snapshot()
                 .await
@@ -533,6 +557,7 @@ impl TaskManager {
             }
 
             match self
+                .core
                 .scheduler
                 .reserve_resources(snapshot.version, requests, Vec::new())
                 .await
@@ -556,7 +581,8 @@ impl TaskManager {
     pub(super) async fn persist_spec(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
         let value = spec_to_value(spec);
 
-        self.store
+        self.core
+            .store
             .upsert(&UuidKey::from(spec.id), value)
             .await
             .map_err(|e| anyhow::anyhow!("task upsert failed: {e}"))
@@ -571,12 +597,14 @@ impl TaskManager {
     ) -> Result<u64, anyhow::Error> {
         let key = UuidKey::from(id);
         let snapshot = self
+            .core
             .store
             .get_snapshot(&key)
             .map_err(|e| anyhow::anyhow!("task lookup failed for assignment epoch: {e}"))?;
 
         let Some(snapshot) = snapshot else {
             if let Some(max_epoch) = self
+                .local_state
                 .removed_task_watermarks
                 .lock()
                 .await
@@ -585,7 +613,7 @@ impl TaskManager {
             {
                 return Ok(max_epoch.saturating_add(1));
             }
-            let has_tombstone = self.store.has_tombstone(&key).map_err(|e| {
+            let has_tombstone = self.core.store.has_tombstone(&key).map_err(|e| {
                 anyhow::anyhow!("task tombstone lookup failed for assignment epoch: {e}")
             })?;
             return Ok(if has_tombstone { 1 } else { 0 });
@@ -615,7 +643,8 @@ impl TaskManager {
             .map(|spec| (UuidKey::from(spec.id), spec_to_value(spec)))
             .collect();
 
-        self.store
+        self.core
+            .store
             .upsert_many(entries)
             .await
             .map_err(|e| anyhow::anyhow!("task batch upsert failed: {e}"))
@@ -625,10 +654,11 @@ impl TaskManager {
     pub(super) async fn remove_spec(&self, id: Uuid) -> Result<(), anyhow::Error> {
         let key = UuidKey::from(id);
         let prior_max_epoch = {
-            let guard = self.removed_task_watermarks.lock().await;
+            let guard = self.local_state.removed_task_watermarks.lock().await;
             guard.get(&id).map(|tombstone| tombstone.max_epoch)
         };
         let (watermark, max_epoch) = self
+            .core
             .store
             .get_snapshot(&key)
             .map_err(|e| anyhow::anyhow!("task lookup failed before remove: {e}"))?
@@ -644,7 +674,8 @@ impl TaskManager {
             // existing watermark epoch instead of poisoning the id with an unbounded epoch.
             .unwrap_or_else(|| (Utc::now(), prior_max_epoch.unwrap_or(0)));
 
-        self.store
+        self.core
+            .store
             .remove(&key)
             .await
             .map_err(|e| anyhow::anyhow!("task remove failed: {e}"))?;
@@ -763,7 +794,7 @@ impl TaskManager {
         task_id: Uuid,
         image: &str,
     ) -> Result<(), anyhow::Error> {
-        match self.container_manager.image_present(image).await {
+        match self.runtime.container_manager.image_present(image).await {
             Ok(true) => {
                 debug!(
                     target: "task",
@@ -785,6 +816,7 @@ impl TaskManager {
         }
 
         let _permit = self
+            .runtime
             .pull_limiter
             .clone()
             .acquire_owned()
@@ -803,7 +835,12 @@ impl TaskManager {
                 )
                 .await;
 
-            match timeout(IMAGE_PULL_TIMEOUT, self.container_manager.pull_image(image)).await {
+            match timeout(
+                IMAGE_PULL_TIMEOUT,
+                self.runtime.container_manager.pull_image(image),
+            )
+            .await
+            {
                 Ok(Ok(())) => return Ok(()),
                 Ok(Err(err)) => {
                     last_error = Some(anyhow::Error::new(err));
@@ -836,7 +873,7 @@ impl TaskManager {
     }
 
     fn tx(&self) -> Sender<Message> {
-        self.tx.clone()
+        self.core.tx.clone()
     }
 
     /// Ensures that slots that no longer correspond to running containers are released.
@@ -844,7 +881,7 @@ impl TaskManager {
         const MAX_ATTEMPTS: usize = 5;
 
         for _ in 0..MAX_ATTEMPTS {
-            let snapshot = match self.scheduler.snapshot().await {
+            let snapshot = match self.core.scheduler.snapshot().await {
                 Some(snapshot) => snapshot,
                 None => return,
             };
@@ -914,6 +951,7 @@ impl TaskManager {
             }
 
             match self
+                .core
                 .scheduler
                 .free_resources(snapshot.version, to_free.clone(), gpu_to_free.clone())
                 .await
@@ -938,6 +976,7 @@ impl TaskManager {
     /// Collects the set of slot IDs that belong to tasks owned by this node.
     pub(super) async fn collect_local_slot_ids(&self) -> Result<HashSet<SlotId>, anyhow::Error> {
         let (actives, _) = self
+            .core
             .store
             .load_all()
             .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
@@ -970,6 +1009,7 @@ impl TaskManager {
         &self,
     ) -> Result<HashSet<String>, anyhow::Error> {
         let (actives, _) = self
+            .core
             .store
             .load_all()
             .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
@@ -1039,10 +1079,10 @@ impl TaskManager {
             return Ok(spec);
         };
         let identifier_entry = {
-            let mut guard = self.local_containers.lock().await;
+            let mut guard = self.local_state.local_containers.lock().await;
             guard.remove(&id)
         };
-        self.liveness_probes.lock().await.remove(&id);
+        self.local_state.liveness_probes.lock().await.remove(&id);
 
         let (container_identifier, from_cache) = match identifier_entry {
             Some(value) => (value, true),
@@ -1077,6 +1117,7 @@ impl TaskManager {
             .await;
 
         match self
+            .runtime
             .container_manager
             .stop_container(
                 &container_identifier,
@@ -1104,6 +1145,7 @@ impl TaskManager {
         }
 
         if let Err(e) = self
+            .runtime
             .container_manager
             .remove_container(&container_identifier, false, true)
             .await
@@ -1204,6 +1246,7 @@ impl TaskManager {
         }
 
         match self
+            .runtime
             .container_manager
             .exec_container(container_identifier, command, Some(remaining))
             .await
@@ -1251,6 +1294,7 @@ impl TaskManager {
     /// application default.
     fn effective_task_stop_timeout(&self, task_grace_period_secs: Option<u32>) -> Duration {
         if let Some(override_secs) = self
+            .core
             .registry
             .peer_scheduling(self.local_node_id)
             .filter(|state| state.drain_requested)
@@ -1279,7 +1323,7 @@ impl TaskManager {
         );
 
         {
-            let mut guard = self.local_containers.lock().await;
+            let mut guard = self.local_state.local_containers.lock().await;
             guard.remove(&task_id);
         }
 
@@ -1382,7 +1426,7 @@ impl TaskManager {
         );
 
         let container_id = {
-            let mut guard = self.local_containers.lock().await;
+            let mut guard = self.local_state.local_containers.lock().await;
             guard.remove(&task_id)
         };
         if let Some(container_id) = container_id {
@@ -1466,7 +1510,7 @@ impl TaskManager {
         let mut seen = HashSet::new();
 
         for network_id in network_ids {
-            match self.network_registry.get_spec(*network_id) {
+            match self.networking.network_registry.get_spec(*network_id) {
                 Ok(Some(spec)) => {
                     match crate::network::allocator::resolver_ipv4_address(
                         &spec,
@@ -1518,7 +1562,7 @@ impl TaskManager {
     ) -> Result<Option<(i32, Option<String>)>, ContainerError> {
         let desired_name = format!("mantissa-{}", spec.id);
         let candidate = {
-            let guard = self.local_containers.lock().await;
+            let guard = self.local_state.local_containers.lock().await;
             guard
                 .get(&spec.id)
                 .cloned()
@@ -1532,7 +1576,12 @@ impl TaskManager {
         }
 
         for target in inspect_targets {
-            match self.container_manager.inspect_container(&target).await {
+            match self
+                .runtime
+                .container_manager
+                .inspect_container(&target)
+                .await
+            {
                 Ok(info) => return Ok(terminal_exit_from_inspect(&info)),
                 Err(ContainerError::NotFound(_)) => continue,
                 Err(err) => return Err(err),
@@ -1552,7 +1601,7 @@ impl TaskManager {
     ) -> Result<Option<String>, ContainerError> {
         let desired_name = format!("mantissa-{}", spec.id);
         let candidate = {
-            let guard = self.local_containers.lock().await;
+            let guard = self.local_state.local_containers.lock().await;
             guard
                 .get(&spec.id)
                 .cloned()
@@ -1576,10 +1625,16 @@ impl TaskManager {
                 .unwrap_or_else(|| Some(fallback))
         };
 
-        match self.container_manager.inspect_container(&candidate).await {
+        match self
+            .runtime
+            .container_manager
+            .inspect_container(&candidate)
+            .await
+        {
             Ok(info) => Ok(resolve_id(candidate, info)),
             Err(ContainerError::NotFound(_)) if candidate != desired_name => {
                 match self
+                    .runtime
                     .container_manager
                     .inspect_container(&desired_name)
                     .await
@@ -1724,7 +1779,7 @@ impl TaskManager {
         };
 
         {
-            let mut guard = self.local_containers.lock().await;
+            let mut guard = self.local_state.local_containers.lock().await;
             guard.insert(working.id, container_id.clone());
         }
 
@@ -1849,7 +1904,7 @@ impl TaskManager {
             }
 
             if update_container_cache {
-                let mut guard = self.local_containers.lock().await;
+                let mut guard = self.local_state.local_containers.lock().await;
                 guard.insert(spec.id, container_id.to_string());
             }
         }
@@ -1903,6 +1958,7 @@ impl TaskManager {
     /// Stops and removes a launched container best-effort when one launch stage must roll back.
     pub(super) async fn rollback_container_launch(&self, container_id: &str, reason: &str) {
         if let Err(stop_err) = self
+            .runtime
             .container_manager
             .stop_container(container_id, Some(Duration::from_secs(10)))
             .await
@@ -1915,6 +1971,7 @@ impl TaskManager {
             );
         }
         if let Err(remove_err) = self
+            .runtime
             .container_manager
             .remove_container(container_id, true, true)
             .await
@@ -1930,8 +1987,16 @@ impl TaskManager {
 
     /// Best-effort rollback when startup raced with a newer stop/remove intent.
     async fn abort_launched_container(&self, task_id: Uuid, container_id: &str) {
-        self.local_containers.lock().await.remove(&task_id);
-        self.liveness_probes.lock().await.remove(&task_id);
+        self.local_state
+            .local_containers
+            .lock()
+            .await
+            .remove(&task_id);
+        self.local_state
+            .liveness_probes
+            .lock()
+            .await
+            .remove(&task_id);
         self.rollback_container_launch(container_id, "launch aborted")
             .await;
     }
@@ -1946,6 +2011,7 @@ impl TaskManager {
         }
 
         match self
+            .runtime
             .container_manager
             .inspect_container(container_name)
             .await
@@ -1967,6 +2033,7 @@ impl TaskManager {
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("name".to_string(), vec![container_name.to_string()]);
         let candidates = self
+            .runtime
             .container_manager
             .list_containers(Some(filters))
             .await?;
@@ -1984,7 +2051,7 @@ impl TaskManager {
     /// Ensures that a locally tracked task has completely stopped and released resources.
     pub(super) async fn ensure_task_stopped(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
         let mut has_container = {
-            let guard = self.local_containers.lock().await;
+            let guard = self.local_state.local_containers.lock().await;
             guard.contains_key(&spec.id)
         };
 
@@ -1993,13 +2060,14 @@ impl TaskManager {
             // before declaring the task containerless.
             let container_name = format!("mantissa-{}", spec.id);
             match self
+                .runtime
                 .container_manager
                 .inspect_container(&container_name)
                 .await
             {
                 Ok(info) => {
                     let resolved = info.id.unwrap_or(container_name);
-                    let mut guard = self.local_containers.lock().await;
+                    let mut guard = self.local_state.local_containers.lock().await;
                     guard.insert(spec.id, resolved);
                     has_container = true;
                 }
@@ -2072,8 +2140,16 @@ impl TaskManager {
             | ContainerState::Failed
             | ContainerState::Exited(_)
             | ContainerState::Unknown => {
-                self.local_containers.lock().await.remove(&spec.id);
-                self.liveness_probes.lock().await.remove(&spec.id);
+                self.local_state
+                    .local_containers
+                    .lock()
+                    .await
+                    .remove(&spec.id);
+                self.local_state
+                    .liveness_probes
+                    .lock()
+                    .await
+                    .remove(&spec.id);
                 Ok(())
             }
         }
@@ -2083,6 +2159,7 @@ impl TaskManager {
     pub(super) async fn load_spec(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
         let key = UuidKey::from(id);
         let snapshot = self
+            .core
             .store
             .get_snapshot(&key)
             .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?
@@ -2102,8 +2179,9 @@ impl TaskManager {
     pub(super) async fn reconcile_local_container_inventory(&self) -> Result<(), anyhow::Error> {
         const UNOWNED_TASK_GRACE_SECS: i64 = 5;
 
-        let containers = self.container_manager.list_containers(None).await?;
+        let containers = self.runtime.container_manager.list_containers(None).await?;
         let (entries, _) = self
+            .core
             .store
             .load_all()
             .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
@@ -2145,7 +2223,7 @@ impl TaskManager {
                 container.id.clone()
             };
             {
-                let mut guard = self.local_containers.lock().await;
+                let mut guard = self.local_state.local_containers.lock().await;
                 guard.insert(task_id, container_id.clone());
             }
 
@@ -2196,6 +2274,7 @@ impl TaskManager {
         revision: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let existing = self
+            .networking
             .network_registry
             .list_attachments_for_task(task_id)
             .context("list attachments for inventory refresh")?;
@@ -2243,7 +2322,7 @@ impl TaskManager {
         };
 
         {
-            let mut guard = self.local_containers.lock().await;
+            let mut guard = self.local_state.local_containers.lock().await;
             guard.remove(&task_id);
         }
 
@@ -2256,6 +2335,7 @@ impl TaskManager {
         }
 
         match self
+            .runtime
             .container_manager
             .stop_container(
                 &identifier,
@@ -2276,6 +2356,7 @@ impl TaskManager {
         }
 
         if let Err(err) = self
+            .runtime
             .container_manager
             .remove_container(&identifier, false, true)
             .await
@@ -2344,6 +2425,7 @@ impl TaskManager {
         };
 
         let (actives, _) = self
+            .core
             .store
             .load_all()
             .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
@@ -2404,6 +2486,7 @@ impl TaskManager {
     /// Lists runtime containers once so reconcile can avoid per-task inspect calls.
     async fn list_runtime_inventory(&self) -> Result<RuntimeInventory, anyhow::Error> {
         let containers = self
+            .runtime
             .container_manager
             .list_containers(None)
             .await
@@ -2459,7 +2542,7 @@ impl TaskManager {
         };
 
         if let Some(container_id) = runtime_inventory.task_containers.get(&spec.id).cloned() {
-            let mut guard = self.local_containers.lock().await;
+            let mut guard = self.local_state.local_containers.lock().await;
             guard.insert(spec.id, container_id);
             if !spec.volumes.is_empty()
                 && let Err(err) = self.publish_task_volume_mounts(spec).await
@@ -2474,7 +2557,7 @@ impl TaskManager {
         }
 
         let cached = {
-            let guard = self.local_containers.lock().await;
+            let guard = self.local_state.local_containers.lock().await;
             guard.get(&spec.id).cloned()
         };
         if let Some(container_id) = cached
@@ -2520,12 +2603,13 @@ impl TaskManager {
 
         let mut attempt = 0usize;
         loop {
-            let snapshot = match self.scheduler.snapshot().await {
+            let snapshot = match self.core.scheduler.snapshot().await {
                 Some(snapshot) => snapshot,
                 None => return Ok(()),
             };
 
             let (actives, _) = self
+                .core
                 .store
                 .load_all()
                 .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
@@ -2695,6 +2779,7 @@ impl TaskManager {
 
             if !release_slots.is_empty() || !release_gpus.is_empty() {
                 match self
+                    .core
                     .scheduler
                     .free_resources(
                         snapshot.version,
@@ -2791,6 +2876,7 @@ impl TaskManager {
             }
 
             match self
+                .core
                 .scheduler
                 .reserve_resources(snapshot.version, requests, gpu_requests)
                 .await

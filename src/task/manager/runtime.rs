@@ -43,6 +43,7 @@ impl TaskManager {
             .context("cleanup orphaned network attachments")?;
 
         let attachments = self
+            .networking
             .network_registry
             .list_attachments(None)
             .context("list attachments for repair")?;
@@ -72,6 +73,7 @@ impl TaskManager {
             }
 
             if self
+                .networking
                 .attachment_provisioner
                 .attachment_exists(attachment.id)
                 .await
@@ -102,7 +104,7 @@ impl TaskManager {
 
             let desired_name = format!("mantissa-{}", spec.id);
             let mut container_id = {
-                let guard = self.local_containers.lock().await;
+                let guard = self.local_state.local_containers.lock().await;
                 guard
                     .get(&spec.id)
                     .cloned()
@@ -114,6 +116,7 @@ impl TaskManager {
             }
 
             let inspect = match self
+                .runtime
                 .container_manager
                 .inspect_container(&container_id)
                 .await
@@ -122,6 +125,7 @@ impl TaskManager {
                 Err(first_err) => {
                     if container_id != desired_name {
                         match self
+                            .runtime
                             .container_manager
                             .inspect_container(&desired_name)
                             .await
@@ -157,7 +161,7 @@ impl TaskManager {
             }
 
             {
-                let mut guard = self.local_containers.lock().await;
+                let mut guard = self.local_state.local_containers.lock().await;
                 guard.insert(spec.id, container_id.clone());
             }
 
@@ -181,6 +185,7 @@ impl TaskManager {
         }
 
         let (entries, _) = self
+            .core
             .store
             .load_all()
             .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
@@ -228,7 +233,7 @@ impl TaskManager {
             }
 
             let container_id = {
-                let guard = self.local_containers.lock().await;
+                let guard = self.local_state.local_containers.lock().await;
                 guard
                     .get(&value.id)
                     .cloned()
@@ -264,6 +269,7 @@ impl TaskManager {
         }
 
         if let Err(err) = self
+            .networking
             .attachment_provisioner
             .teardown_attachment(attachment.id)
             .await
@@ -275,7 +281,12 @@ impl TaskManager {
             );
         }
 
-        if let Err(err) = self.network_registry.remove_attachment(attachment.id).await {
+        if let Err(err) = self
+            .networking
+            .network_registry
+            .remove_attachment(attachment.id)
+            .await
+        {
             warn!(
                 target: "task",
                 attachment = %attachment.id,
@@ -286,13 +297,13 @@ impl TaskManager {
 
     /// Main gossip processing loop for the task manager.
     pub async fn run(&mut self) {
-        let mut repair_tick = interval(self.runtime_config.repair_tick);
-        let mut reconcile_tick = interval(self.runtime_config.reconcile_tick);
-        let mut runtime_event_tick = interval(self.runtime_config.runtime_event_debounce);
+        let mut repair_tick = interval(self.runtime.runtime_config.repair_tick);
+        let mut reconcile_tick = interval(self.runtime.runtime_config.reconcile_tick);
+        let mut runtime_event_tick = interval(self.runtime.runtime_config.runtime_event_debounce);
         runtime_event_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut runtime_reconcile_pending = false;
         let (runtime_events_tx, mut runtime_events_rx) = unbounded_channel();
-        let mut runtime_events_enabled = self.container_manager.supports_runtime_events();
+        let mut runtime_events_enabled = self.runtime.container_manager.supports_runtime_events();
         if runtime_events_enabled {
             let manager = self.clone();
             tokio::task::spawn_local(async move {
@@ -346,7 +357,7 @@ impl TaskManager {
                         warn!(target: "task", "failed to reconcile local tasks from runtime events: {err:#}");
                     }
                 }
-                message = self.rx.recv() => {
+                message = self.core.rx.recv() => {
                     let Ok(message) = message else { break; };
                     match message {
                         Message::Task { event, .. } => {
@@ -428,6 +439,7 @@ impl TaskManager {
     async fn watch_runtime_event_stream(&self, events_tx: UnboundedSender<ContainerRuntimeEvent>) {
         loop {
             let result = self
+                .runtime
                 .container_manager
                 .watch_runtime_events(events_tx.clone())
                 .await;
@@ -468,6 +480,7 @@ impl TaskManager {
                 }
                 let incoming = spec_to_value(&spec);
                 if let Some(snapshot) = self
+                    .core
                     .store
                     .get_snapshot(&UuidKey::from(spec.id))
                     .map_err(|e| anyhow::anyhow!("task lookup failed before upsert apply: {e}"))?
@@ -512,7 +525,11 @@ impl TaskManager {
                         }
                     });
                 } else if !matches!(spec.state, ContainerState::Running) {
-                    self.local_containers.lock().await.remove(&spec.id);
+                    self.local_state
+                        .local_containers
+                        .lock()
+                        .await
+                        .remove(&spec.id);
                 }
 
                 Ok(())
@@ -540,7 +557,7 @@ impl TaskManager {
                     }
                 }
 
-                self.local_containers.lock().await.remove(&id);
+                self.local_state.local_containers.lock().await.remove(&id);
                 if let Err(err) = self
                     .teardown_runtime_attachments(id, HashSet::new(), true)
                     .await
@@ -587,6 +604,7 @@ impl TaskManager {
         // initial creation (before we persist the TaskSpec) this would incorrectly delete
         // attachments we just created for earlier tasks in the same batch.
         let snapshot = self
+            .core
             .store
             .get_snapshot(&UuidKey::from(task_id))
             .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?;
@@ -624,6 +642,7 @@ impl TaskManager {
 
         let desired: HashSet<Uuid> = network_ids.iter().copied().collect();
         let existing_list = self
+            .networking
             .network_registry
             .list_attachments_for_task(task_id)
             .context("failed to list existing network attachments")?;
@@ -720,6 +739,7 @@ impl TaskManager {
             };
 
             let spec = self
+                .networking
                 .network_registry
                 .get_spec(*network_id)
                 .context("failed to load network specification")?
@@ -746,6 +766,7 @@ impl TaskManager {
             let metadata_changed = location_changed || label_changed;
 
             let provisioned = self
+                .networking
                 .attachment_provisioner
                 .attachment_exists(attachment.id)
                 .await
@@ -766,7 +787,8 @@ impl TaskManager {
                 );
 
                 attachment.set_state(NetworkAttachmentState::Configuring, None);
-                self.network_registry
+                self.networking
+                    .network_registry
                     .upsert_attachment(attachment.clone())
                     .await
                     .context("persist configuring attachment state")?;
@@ -798,7 +820,11 @@ impl TaskManager {
                     let mut errored = attachment.clone();
                     let err_string = err.to_string();
                     errored.set_state(NetworkAttachmentState::Error, Some(err_string));
-                    let _ = self.network_registry.upsert_attachment(errored).await;
+                    let _ = self
+                        .networking
+                        .network_registry
+                        .upsert_attachment(errored)
+                        .await;
                     let err = err.context(format!(
                         "ensure attachment {} for network {} on bridge {}",
                         attachment.id, spec.id, bridge
@@ -815,7 +841,8 @@ impl TaskManager {
                 assignment_changed || location_changed || !was_ready || !provisioned;
 
             if should_persist {
-                self.network_registry
+                self.networking
+                    .network_registry
                     .upsert_attachment(attachment)
                     .await
                     .context("failed to persist runtime attachment state")?;
@@ -826,7 +853,7 @@ impl TaskManager {
             }
         }
 
-        if let Some(sender) = &self.forwarding_events {
+        if let Some(sender) = &self.networking.forwarding_events {
             for network_id in touched_networks {
                 // Forwarding refresh is best-effort; ignore send failures if the controller
                 // has already shut down.
@@ -852,6 +879,7 @@ impl TaskManager {
         container_id: &str,
     ) -> Result<Option<i32>> {
         let inspect = self
+            .runtime
             .container_manager
             .inspect_container(container_id)
             .await
@@ -912,6 +940,7 @@ impl TaskManager {
             };
 
             match self
+                .networking
                 .attachment_provisioner
                 .ensure_attachment(&provisioning)
                 .await
@@ -969,12 +998,14 @@ impl TaskManager {
         const ORPHAN_ATTACHMENT_GRACE_SECS: i64 = 30;
 
         let attachments = self
+            .networking
             .network_registry
             .list_attachments(None)
             .context("list attachments for orphan cleanup")?;
 
         for attachment in attachments {
             let task_value = self
+                .core
                 .store
                 .get_snapshot(&UuidKey::from(attachment.task_id))
                 .with_context(|| format!("lookup task {}", attachment.task_id))?
@@ -1001,11 +1032,17 @@ impl TaskManager {
             if matches!(attachment.state, NetworkAttachmentState::Removing) {
                 if attachment.node_id == self.local_node_id {
                     let _ = self
+                        .networking
                         .attachment_provisioner
                         .teardown_attachment(attachment.id)
                         .await;
                 }
-                if let Err(err) = self.network_registry.remove_attachment(attachment.id).await {
+                if let Err(err) = self
+                    .networking
+                    .network_registry
+                    .remove_attachment(attachment.id)
+                    .await
+                {
                     warn!(
                         target: "task",
                         attachment = %attachment.id,
@@ -1022,7 +1059,12 @@ impl TaskManager {
                 removing.task_updated_at = Some(revision.to_string());
             }
             removing.set_state(NetworkAttachmentState::Removing, None);
-            if let Err(err) = self.network_registry.upsert_attachment(removing).await {
+            if let Err(err) = self
+                .networking
+                .network_registry
+                .upsert_attachment(removing)
+                .await
+            {
                 warn!(
                     target: "task",
                     attachment = %attachment.id,
@@ -1033,6 +1075,7 @@ impl TaskManager {
 
             if attachment.node_id == self.local_node_id
                 && let Err(err) = self
+                    .networking
                     .attachment_provisioner
                     .teardown_attachment(attachment.id)
                     .await
@@ -1052,6 +1095,7 @@ impl TaskManager {
     /// Remove only local attachment records for a task while preserving remote ownership rows.
     pub(super) async fn teardown_local_attachment_records(&self, task_id: Uuid) -> Result<()> {
         let attachments = self
+            .networking
             .network_registry
             .list_attachments_for_task(task_id)
             .context("failed to list task attachments for local record teardown")?;
@@ -1076,6 +1120,7 @@ impl TaskManager {
                 Ok(spec) if spec.node_id == self.local_node_id
             );
         let attachments = self
+            .networking
             .network_registry
             .list_attachments_for_task(task_id)
             .context("failed to list task attachments for teardown")?;
@@ -1087,6 +1132,7 @@ impl TaskManager {
 
             if !allow_registry_updates {
                 let _ = self
+                    .networking
                     .attachment_provisioner
                     .teardown_attachment(attachment.id)
                     .await;
@@ -1094,6 +1140,7 @@ impl TaskManager {
             }
 
             match self
+                .networking
                 .attachment_provisioner
                 .teardown_attachment(attachment.id)
                 .await
@@ -1110,7 +1157,12 @@ impl TaskManager {
 
             // Explicit teardown requests should remove the attachment record immediately so
             // callers (and tests) observe prompt cleanup without waiting for the orphan GC loop.
-            if let Err(err) = self.network_registry.remove_attachment(attachment.id).await {
+            if let Err(err) = self
+                .networking
+                .network_registry
+                .remove_attachment(attachment.id)
+                .await
+            {
                 warn!(
                     target: "task",
                     attachment = %attachment.id,

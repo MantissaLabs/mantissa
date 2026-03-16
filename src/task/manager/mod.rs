@@ -84,31 +84,91 @@ impl Default for TaskRuntimeConfig {
 }
 
 #[derive(Clone)]
-pub struct TaskManager {
+struct TaskManagerCore {
+    // Durable task state backing store used for upsert/remove/load operations.
     store: TaskStore,
+    // Outbound gossip/event queue used to broadcast task and volume changes.
     tx: Sender<Message>,
+    // Inbound task event stream consumed by the runtime loop.
     rx: Receiver<Message>,
-    local_node_id: Uuid,
-    local_node_name: String,
-    scheduler: Rc<Scheduler>,
-    container_manager: Arc<dyn ContainerManager + Send + Sync>,
-    local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
-    liveness_probes: Arc<AsyncMutex<HashMap<Uuid, LivenessProbeEntry>>>,
-    inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
-    inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
-    removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, RemoveTombstone>>>,
-    pull_limiter: Arc<Semaphore>,
+    // Cluster registry used for peer metadata and scheduling/drain lookups.
     registry: Registry,
-    secret_registry: SecretRegistry,
-    secret_keyring: Arc<RwLock<SecretKeyring>>,
-    secret_runtime_root: PathBuf,
-    network_registry: NetworkRegistry,
-    volume_registry: VolumeRegistry,
-    attachment_provisioner: Arc<dyn AttachmentProvisionerApi>,
-    forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
+    // Distributed scheduler handle used for slot snapshots/reservations.
+    scheduler: Rc<Scheduler>,
+}
+
+#[derive(Clone)]
+struct TaskManagerRuntime {
+    // Container runtime abstraction used for create/start/stop/inspect/pull flows.
+    container_manager: Arc<dyn ContainerManager + Send + Sync>,
+    // Node-local semaphore that bounds concurrent image pulls.
+    pull_limiter: Arc<Semaphore>,
+    // Runtime worker cadence configuration (repair/reconcile/debounce ticks).
     runtime_config: TaskRuntimeConfig,
+}
+
+#[derive(Clone)]
+struct TaskManagerLocalState {
+    // Best-effort mapping from task id to current container identifier.
+    local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
+    // Per-task liveness probe bookkeeping used by reconciliation.
+    liveness_probes: Arc<AsyncMutex<HashMap<Uuid, LivenessProbeEntry>>>,
+    // Stop deduplication guard so only one stop workflow runs per task.
+    inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
+    // Reconcile deduplication guard so only one reconcile workflow runs per task.
+    inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
+    // Short-lived remove tombstones used to reject stale post-remove upserts.
+    removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, RemoveTombstone>>>,
+}
+
+#[derive(Clone)]
+struct TaskManagerSecrets {
+    // Secret metadata/value source used to resolve task secret references.
+    secret_registry: SecretRegistry,
+    // In-memory decryption keys used while resolving runtime secret material.
+    secret_keyring: Arc<RwLock<SecretKeyring>>,
+    // Root directory for deterministic per-task secret staging.
+    secret_runtime_root: PathBuf,
+}
+
+#[derive(Clone)]
+struct TaskManagerNetworking {
+    // Network registry handle for attachment state and network specs.
+    network_registry: NetworkRegistry,
+    // Runtime attachment provisioner responsible for endpoint setup/teardown.
+    attachment_provisioner: Arc<dyn AttachmentProvisionerApi>,
+    // Optional best-effort signal channel for forwarding refresh events.
+    forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
+}
+
+#[derive(Clone)]
+struct TaskManagerVolumes {
+    // Volume registry handle for spec/node-state reconciliation.
+    volume_registry: VolumeRegistry,
+    // Local filesystem root for mounted node-local volume paths.
     local_volume_root: PathBuf,
+    // Enables/disables local capacity enforcement for node-local volumes.
     enforce_local_volume_capacity: bool,
+}
+
+#[derive(Clone)]
+pub struct TaskManager {
+    // Stable local node identifier used for ownership checks and placements.
+    local_node_id: Uuid,
+    // Human-facing local node name persisted into task/volume metadata.
+    local_node_name: String,
+    // Core persistence and message dependencies.
+    core: TaskManagerCore,
+    // Runtime backend and loop timing configuration.
+    runtime: TaskManagerRuntime,
+    // In-memory per-task runtime tracking and in-flight guards.
+    local_state: TaskManagerLocalState,
+    // Secret resolution dependencies and staging root.
+    secrets: TaskManagerSecrets,
+    // Network registry/provisioning dependencies.
+    networking: TaskManagerNetworking,
+    // Volume registry and local capacity settings.
+    volumes: TaskManagerVolumes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,56 +261,68 @@ impl TaskManager {
         };
 
         Self {
-            store,
-            tx,
-            rx,
             local_node_id,
             local_node_name,
-            scheduler,
-            container_manager,
-            local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
-            liveness_probes: Arc::new(AsyncMutex::new(HashMap::new())),
-            inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
-            inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
-            removed_task_watermarks: Arc::new(AsyncMutex::new(HashMap::new())),
-            pull_limiter: Arc::new(Semaphore::new(IMAGE_PULL_MAX_CONCURRENCY)),
-            registry,
-            network_registry,
-            volume_registry,
-            secret_registry,
-            secret_keyring,
-            secret_runtime_root,
-            attachment_provisioner,
-            forwarding_events,
-            runtime_config: runtime_config.unwrap_or_default(),
-            local_volume_root,
-            enforce_local_volume_capacity,
+            core: TaskManagerCore {
+                store,
+                tx,
+                rx,
+                registry,
+                scheduler,
+            },
+            runtime: TaskManagerRuntime {
+                container_manager,
+                pull_limiter: Arc::new(Semaphore::new(IMAGE_PULL_MAX_CONCURRENCY)),
+                runtime_config: runtime_config.unwrap_or_default(),
+            },
+            local_state: TaskManagerLocalState {
+                local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
+                liveness_probes: Arc::new(AsyncMutex::new(HashMap::new())),
+                inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
+                inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
+                removed_task_watermarks: Arc::new(AsyncMutex::new(HashMap::new())),
+            },
+            secrets: TaskManagerSecrets {
+                secret_registry,
+                secret_keyring,
+                secret_runtime_root,
+            },
+            networking: TaskManagerNetworking {
+                network_registry,
+                attachment_provisioner,
+                forwarding_events,
+            },
+            volumes: TaskManagerVolumes {
+                volume_registry,
+                local_volume_root,
+                enforce_local_volume_capacity,
+            },
         }
     }
 
     /// Claims a local in-flight marker so only one stop workflow executes per task at a time.
     async fn try_begin_stop(&self, task_id: Uuid) -> Option<StopTaskGuard> {
-        let mut guard = self.inflight_stops.lock().await;
+        let mut guard = self.local_state.inflight_stops.lock().await;
         if guard.contains(&task_id) {
             return None;
         }
         guard.insert(task_id);
         Some(StopTaskGuard {
             task_id,
-            inflight: self.inflight_stops.clone(),
+            inflight: self.local_state.inflight_stops.clone(),
         })
     }
 
     /// Claims a local in-flight marker so only one reconcile workflow executes per task at a time.
     async fn try_begin_reconcile(&self, task_id: Uuid) -> Option<ReconcileTaskGuard> {
-        let mut guard = self.inflight_reconciles.lock().await;
+        let mut guard = self.local_state.inflight_reconciles.lock().await;
         if guard.contains(&task_id) {
             return None;
         }
         guard.insert(task_id);
         Some(ReconcileTaskGuard {
             task_id,
-            inflight: self.inflight_reconciles.clone(),
+            inflight: self.local_state.inflight_reconciles.clone(),
         })
     }
 
@@ -262,6 +334,7 @@ impl TaskManager {
         spec.node_id == self.local_node_id
             && spec.service_metadata.is_some()
             && self
+                .core
                 .registry
                 .peer_scheduling(self.local_node_id)
                 .map(|state| state.drain_requested)
@@ -275,7 +348,7 @@ impl TaskManager {
         watermark: DateTime<Utc>,
         max_epoch: u64,
     ) {
-        let mut guard = self.removed_task_watermarks.lock().await;
+        let mut guard = self.local_state.removed_task_watermarks.lock().await;
         let cutoff = Utc::now() - chrono::Duration::seconds(REMOVE_WATERMARK_RETENTION_SECS);
         guard.retain(|_, tombstone| tombstone.watermark >= cutoff);
         match guard.get_mut(&task_id) {
@@ -299,13 +372,17 @@ impl TaskManager {
 
     /// Clears the remove watermark once a fresh task incarnation has been accepted.
     async fn clear_remove_watermark(&self, task_id: Uuid) {
-        self.removed_task_watermarks.lock().await.remove(&task_id);
+        self.local_state
+            .removed_task_watermarks
+            .lock()
+            .await
+            .remove(&task_id);
     }
 
     /// Returns true when an inbound upsert should be ignored because it predates a known remove.
     async fn should_ignore_removed_upsert(&self, spec: &TaskSpec) -> bool {
         let tombstone = {
-            let guard = self.removed_task_watermarks.lock().await;
+            let guard = self.local_state.removed_task_watermarks.lock().await;
             guard.get(&spec.id).cloned()
         };
 
@@ -536,6 +613,7 @@ impl TaskManager {
         filter: &TaskStateFilter,
     ) -> Result<Vec<TaskSpec>, anyhow::Error> {
         let (actives, _) = self
+            .core
             .store
             .load_all()
             .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
@@ -563,6 +641,7 @@ impl TaskManager {
         for id in ids {
             let key = UuidKey::from(*id);
             let snapshot = self
+                .core
                 .store
                 .get_snapshot(&key)
                 .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?;
@@ -634,6 +713,7 @@ impl TaskManager {
         traffic_published: bool,
     ) -> Result<TaskTrafficPublicationUpdate, anyhow::Error> {
         let attachments = self
+            .networking
             .network_registry
             .list_attachments_for_task(task_id)
             .context("list attachments for traffic publication update")?;
@@ -647,7 +727,8 @@ impl TaskManager {
                 continue;
             }
             attachment.set_traffic_published(traffic_published);
-            self.network_registry
+            self.networking
+                .network_registry
                 .upsert_attachment(attachment)
                 .await
                 .context("persist attachment traffic publication update")?;
@@ -680,6 +761,7 @@ impl TaskManager {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let attachments = self
+                .networking
                 .network_registry
                 .list_attachments_for_task(task_id)
                 .context("list attachments while waiting for publishable task traffic")?;
@@ -715,6 +797,7 @@ impl TaskManager {
 
         let expected = spec.networks.len();
         let attachments = self
+            .networking
             .network_registry
             .list_attachments_for_task(task_id)
             .context("list attachments while checking task traffic readiness")?;
@@ -763,6 +846,7 @@ impl TaskManager {
             }
 
             let session = self
+                .core
                 .registry
                 .session_for_peer(*peer_id)
                 .await
@@ -812,6 +896,7 @@ impl TaskManager {
     fn collect_network_readiness(&self) -> Result<HashMap<Uuid, HashSet<Uuid>>, anyhow::Error> {
         let mut readiness: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
         let states = self
+            .networking
             .network_registry
             .list_peer_states(None)
             .map_err(|e| anyhow!("failed to load network peer states: {e}"))?;
@@ -833,18 +918,18 @@ impl TaskManager {
 impl Drop for TaskManager {
     /// Cleans test-created secret staging roots when the last TaskManager clone is released.
     fn drop(&mut self) {
-        if Arc::strong_count(&self.local_containers) != 1 {
+        if Arc::strong_count(&self.local_state.local_containers) != 1 {
             return;
         }
-        cleanup_secret_runtime_root(&self.secret_runtime_root);
-        match fs::remove_dir_all(&self.local_volume_root) {
+        cleanup_secret_runtime_root(&self.secrets.secret_runtime_root);
+        match fs::remove_dir_all(&self.volumes.local_volume_root) {
             Ok(_) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => {
                 warn!(
                     target: "task",
                     "failed to remove local volume root {}: {err}",
-                    self.local_volume_root.display()
+                    self.volumes.local_volume_root.display()
                 );
             }
         }

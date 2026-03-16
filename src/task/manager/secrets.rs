@@ -69,7 +69,7 @@ impl TaskManager {
         // Clear any stale staging content in case a previous attempt failed.
         self.cleanup_secret_artifacts(task_id).await;
 
-        let keyring = { self.secret_keyring.read().await.clone() };
+        let keyring = { self.secrets.secret_keyring.read().await.clone() };
         let mut value_cache: HashMap<String, SecretValue> = HashMap::new();
         let mut plaintext_cache: HashMap<Uuid, Arc<[u8]>> = HashMap::new();
 
@@ -104,7 +104,7 @@ impl TaskManager {
     ///
     /// This is used when tasks stop or fail so we do not leave decrypted material behind.
     pub(super) async fn cleanup_secret_artifacts(&self, task_id: Uuid) {
-        let root_dir = self.secret_runtime_root.join(task_id.to_string());
+        let root_dir = self.secrets.secret_runtime_root.join(task_id.to_string());
         match fs::remove_dir_all(&root_dir).await {
             Ok(_) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {}
@@ -179,7 +179,7 @@ impl TaskManager {
             return Ok((Vec::new(), None));
         }
 
-        let root_dir = self.secret_runtime_root.join(task_id.to_string());
+        let root_dir = self.secrets.secret_runtime_root.join(task_id.to_string());
         if let Err(err) = fs::remove_dir_all(&root_dir).await
             && err.kind() != ErrorKind::NotFound
         {
@@ -329,7 +329,8 @@ impl TaskManager {
             return Err(anyhow!("secret reference name cannot be empty"));
         }
 
-        self.secret_registry
+        self.secrets
+            .secret_registry
             .get_by_name(name)
             .map_err(|e| anyhow!("failed to lookup secret '{name}': {e}"))?
             .ok_or_else(|| anyhow!("secret '{name}' not found"))

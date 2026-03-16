@@ -26,6 +26,7 @@ impl TaskManager {
             let mut required_node: Option<Uuid> = None;
             for mount in &intent.volumes {
                 let spec = self
+                    .volumes
                     .volume_registry
                     .get_spec(mount.volume_id)?
                     .ok_or_else(|| {
@@ -114,6 +115,7 @@ impl TaskManager {
             };
             for volume_id in unique_volume_ids(&intent.volumes) {
                 let mut spec = self
+                    .volumes
                     .volume_registry
                     .get_spec(volume_id)?
                     .ok_or_else(|| anyhow!("unknown volume {volume_id}"))?;
@@ -148,6 +150,7 @@ impl TaskManager {
                 self.upsert_volume_spec(spec.clone()).await?;
 
                 if self
+                    .volumes
                     .volume_registry
                     .get_node_state(spec.id, planned_node)?
                     .is_none()
@@ -177,6 +180,7 @@ impl TaskManager {
         let mut resolved = Vec::with_capacity(mounts.len());
         for mount in mounts {
             let spec = self
+                .volumes
                 .volume_registry
                 .get_spec(mount.volume_id)?
                 .ok_or_else(|| {
@@ -209,6 +213,7 @@ impl TaskManager {
     ) -> Result<()> {
         for volume_id in unique_volume_ids(mounts) {
             let spec = self
+                .volumes
                 .volume_registry
                 .get_spec(volume_id)?
                 .ok_or_else(|| anyhow!("unknown volume {volume_id}"))?;
@@ -267,9 +272,10 @@ impl TaskManager {
         &self,
         spec: &VolumeSpecValue,
     ) -> Result<std::path::PathBuf> {
-        let path = ensure_local_volume_path(&self.local_volume_root, spec)
+        let path = ensure_local_volume_path(&self.volumes.local_volume_root, spec)
             .map_err(|err| LocalVolumeAccessError::unavailable(err.to_string()))?;
         let current = self
+            .volumes
             .volume_registry
             .get_node_state(spec.id, self.local_node_id)?
             .unwrap_or_else(|| {
@@ -291,7 +297,7 @@ impl TaskManager {
             });
             return Err(LocalVolumeAccessError::unavailable(message).into());
         }
-        if self.enforce_local_volume_capacity
+        if self.volumes.enforce_local_volume_capacity
             && let (Some(used_bytes), Some(capacity_bytes)) =
                 (current.used_bytes, current.capacity_bytes)
             && used_bytes > capacity_bytes
@@ -334,6 +340,7 @@ impl TaskManager {
     ) -> Result<()> {
         for volume_id in unique_volume_ids(mounts) {
             let volume = self
+                .volumes
                 .volume_registry
                 .get_spec(volume_id)?
                 .ok_or_else(|| anyhow!("unknown volume {volume_id}"))?;
@@ -342,6 +349,7 @@ impl TaskManager {
             }
             let _ = self.ensure_local_volume_ready(&volume).await?;
             let Some(mut state) = self
+                .volumes
                 .volume_registry
                 .get_node_state(volume.id, self.local_node_id)?
             else {
@@ -377,8 +385,12 @@ impl TaskManager {
 
     /// Stores and broadcasts one volume spec update without routing through the RPC surface.
     async fn upsert_volume_spec(&self, spec: VolumeSpecValue) -> Result<()> {
-        self.volume_registry.upsert_spec(spec.clone()).await?;
-        self.tx
+        self.volumes
+            .volume_registry
+            .upsert_spec(spec.clone())
+            .await?;
+        self.core
+            .tx
             .send(Message::Volume {
                 id: Uuid::new_v4(),
                 event: VolumeEvent::Upsert(Box::new(spec)),
@@ -390,10 +402,12 @@ impl TaskManager {
 
     /// Stores and broadcasts one volume node-state update without routing through the RPC surface.
     async fn upsert_volume_node_state(&self, state: VolumeNodeStateValue) -> Result<()> {
-        self.volume_registry
+        self.volumes
+            .volume_registry
             .upsert_node_state(state.clone())
             .await?;
-        self.tx
+        self.core
+            .tx
             .send(Message::Volume {
                 id: Uuid::new_v4(),
                 event: VolumeEvent::NodeUpsert(Box::new(state)),
@@ -408,7 +422,8 @@ impl TaskManager {
         if node_id == self.local_node_id {
             self.local_node_name.clone()
         } else {
-            self.registry
+            self.core
+                .registry
                 .peer_hostname(node_id)
                 .unwrap_or_else(|| node_id.to_string())
         }

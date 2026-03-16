@@ -653,7 +653,7 @@ async fn setup_manager_with_forwarding(
 #[tokio::test]
 async fn task_manager_drop_cleans_secret_runtime_root() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
-    let runtime_root = manager.secret_runtime_root.clone();
+    let runtime_root = manager.secrets.secret_runtime_root.clone();
     std::fs::create_dir_all(runtime_root.join("leftover")).expect("create staged marker");
     assert!(
         runtime_root.exists(),
@@ -690,6 +690,7 @@ async fn set_local_drain_requested(
     };
 
     manager
+        .core
         .registry
         .upsert_self_scheduling(scheduling)
         .await
@@ -718,6 +719,7 @@ async fn create_managed_local_volume(
         bound_node_name: bound_node_name.map(str::to_string),
     });
     manager
+        .volumes
         .volume_registry
         .upsert_spec(spec.clone())
         .await
@@ -1937,6 +1939,7 @@ async fn reconcile_running_task_executes_liveness_probe_once_per_interval() {
     assert_eq!(exec_calls[0].2, Some(std::time::Duration::from_millis(750)));
 
     let entry = manager
+        .local_state
         .liveness_probes
         .lock()
         .await
@@ -2174,7 +2177,13 @@ async fn reconcile_running_task_skips_liveness_probe_during_start_period() {
         "start period should suppress local exec probes"
     );
     assert!(
-        manager.liveness_probes.lock().await.get(&spec.id).is_none(),
+        manager
+            .local_state
+            .liveness_probes
+            .lock()
+            .await
+            .get(&spec.id)
+            .is_none(),
         "start period should not create a cached probe entry before the first probe runs"
     );
 }
@@ -2240,6 +2249,7 @@ async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
     assert_eq!(after_first.state, ContainerState::Running);
     assert_eq!(
         manager
+            .local_state
             .liveness_probes
             .lock()
             .await
@@ -2278,6 +2288,7 @@ async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
     );
     assert!(
         manager
+            .local_state
             .local_containers
             .lock()
             .await
@@ -2286,7 +2297,13 @@ async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
         "threshold failure should evict the cached local container id"
     );
     assert!(
-        manager.liveness_probes.lock().await.get(&spec.id).is_none(),
+        manager
+            .local_state
+            .liveness_probes
+            .lock()
+            .await
+            .get(&spec.id)
+            .is_none(),
         "threshold failure should clear cached liveness accounting"
     );
     assert_eq!(
@@ -2867,7 +2884,12 @@ async fn request_task_stop_uses_container_name_when_cache_missing() {
         .await
         .expect("start container");
 
-    manager.local_containers.lock().await.remove(&spec.id);
+    manager
+        .local_state
+        .local_containers
+        .lock()
+        .await
+        .remove(&spec.id);
 
     spec.state = ContainerState::Running;
     manager.persist_spec(&spec).await.expect("persist update");
@@ -3301,7 +3323,7 @@ async fn task_owned_locally_detects_remote_entries() {
         last_terminal_observed_launch: None,
     });
 
-    let store = manager.store.clone();
+    let store = manager.core.store.clone();
     store
         .upsert(&UuidKey::from(remote_id), remote_value)
         .await
@@ -3621,6 +3643,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
         last_terminal_observed_launch: None,
     });
     manager
+        .core
         .store
         .upsert(&UuidKey::from(task_id), value)
         .await
@@ -3697,6 +3720,7 @@ async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachme
         last_terminal_observed_launch: None,
     });
     manager
+        .core
         .store
         .upsert(&UuidKey::from(task_id), value)
         .await
@@ -4305,6 +4329,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         .export_page_ranges_delta(&remote_ranges)
         .expect("export remote delta");
     manager
+        .core
         .store
         .apply_delta_chunk_update_mst(regs, tombs)
         .await
@@ -4476,6 +4501,7 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         .export_page_ranges_delta(&remote_ranges)
         .expect("export remote delta");
     manager
+        .core
         .store
         .apply_delta_chunk_update_mst(regs, tombs)
         .await
@@ -4593,6 +4619,7 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
         last_terminal_observed_launch: None,
     });
     manager
+        .core
         .store
         .upsert(&UuidKey::from(task_id), remote_value)
         .await
@@ -4806,7 +4833,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         .expect("task created with two network attachments");
 
     let container_id = {
-        let guard = manager.local_containers.lock().await;
+        let guard = manager.local_state.local_containers.lock().await;
         guard
             .get(&task_spec.id)
             .cloned()
@@ -5117,6 +5144,7 @@ async fn local_volume_wait_for_first_consumer_binds_on_first_start() {
     let spec = started.pop().expect("started task");
 
     let bound = manager
+        .volumes
         .volume_registry
         .get_spec(volume.id)
         .expect("load bound volume")
@@ -5136,11 +5164,12 @@ async fn local_volume_wait_for_first_consumer_binds_on_first_start() {
     );
 
     let node_state = manager
+        .volumes
         .volume_registry
         .get_node_state(volume.id, manager.local_node_id)
         .expect("load local volume node state")
         .expect("node-local volume state should exist");
-    let expected_path = managed_volume_data_path(&manager.local_volume_root, volume.id);
+    let expected_path = managed_volume_data_path(&manager.volumes.local_volume_root, volume.id);
     assert_eq!(
         node_state.local_path.as_deref(),
         Some(expected_path.to_string_lossy().as_ref())
@@ -5221,6 +5250,7 @@ async fn task_restart_preserves_local_volume_mount() {
     );
 
     let node_state = manager
+        .volumes
         .volume_registry
         .get_node_state(volume.id, manager.local_node_id)
         .expect("load volume node state after restart")
@@ -5228,7 +5258,7 @@ async fn task_restart_preserves_local_volume_mount() {
     assert_eq!(
         node_state.local_path.as_deref(),
         Some(
-            managed_volume_data_path(&manager.local_volume_root, volume.id)
+            managed_volume_data_path(&manager.volumes.local_volume_root, volume.id)
                 .to_string_lossy()
                 .as_ref()
         )
