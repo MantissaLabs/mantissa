@@ -1,4 +1,8 @@
-# Mantissa
+<p align="center">
+  <a href="https://mantissa.io"><img alt="Mantissa logo" src="logo.png" width="40%"></a>
+</p>
+
+---
 
 Mantissa is a fully decentralized container orchestration system built for large clusters and
 AI workloads. Every node participates equally in scheduling, state replication, and cluster
