@@ -458,8 +458,6 @@ impl TaskManager {
             TaskEvent::Upsert(spec_box) => {
                 let spec = *spec_box;
                 if self.should_ignore_removed_upsert(&spec).await {
-                    self.record_stale_upsert_drop_telemetry(&spec, "remove_watermark")
-                        .await;
                     debug!(
                         target: "task",
                         task = %spec.id,
@@ -477,8 +475,6 @@ impl TaskManager {
                 {
                     let ordering = compare_task_causality(&current, &incoming);
                     if !ordering.is_gt() {
-                        self.record_causal_conflict_telemetry(&current, &incoming, ordering)
-                            .await;
                         debug!(
                             target: "task",
                             task = %spec.id,
@@ -488,7 +484,6 @@ impl TaskManager {
                             incoming_phase_version = incoming.phase_version,
                             current_state = ?current.state,
                             incoming_state = ?incoming.state,
-                            relation = %Self::causal_order_label(ordering),
                             "ignoring stale or duplicate task upsert by causal ordering"
                         );
                         return Ok(());

@@ -45,8 +45,6 @@ mod tests;
 
 use self::planner::{RemoteStartPlan, SchedulingError};
 use self::reservation::{ExecutionError, RemoteReservation, ReservedResources};
-use self::secrets::TaskSecretArtifacts;
-
 /// Maximum number of concurrent image pulls executed per node.
 const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
 /// Retention window for remove watermarks used to suppress stale upsert replay.
@@ -99,13 +97,10 @@ pub struct TaskManager {
     inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
     inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
     removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, RemoveTombstone>>>,
-    stale_upsert_drop_stats: Arc<AsyncMutex<HashMap<Uuid, u64>>>,
-    causal_conflict_stats: Arc<AsyncMutex<HashMap<Uuid, u64>>>,
     pull_limiter: Arc<Semaphore>,
     registry: Registry,
     secret_registry: SecretRegistry,
     secret_keyring: Arc<RwLock<SecretKeyring>>,
-    secret_artifacts: Arc<AsyncMutex<HashMap<Uuid, TaskSecretArtifacts>>>,
     secret_runtime_root: PathBuf,
     network_registry: NetworkRegistry,
     volume_registry: VolumeRegistry,
@@ -218,15 +213,12 @@ impl TaskManager {
             inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
             inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
             removed_task_watermarks: Arc::new(AsyncMutex::new(HashMap::new())),
-            stale_upsert_drop_stats: Arc::new(AsyncMutex::new(HashMap::new())),
-            causal_conflict_stats: Arc::new(AsyncMutex::new(HashMap::new())),
             pull_limiter: Arc::new(Semaphore::new(IMAGE_PULL_MAX_CONCURRENCY)),
             registry,
             network_registry,
             volume_registry,
             secret_registry,
             secret_keyring,
-            secret_artifacts: Arc::new(AsyncMutex::new(HashMap::new())),
             secret_runtime_root,
             attachment_provisioner,
             forwarding_events,
@@ -330,85 +322,6 @@ impl TaskManager {
         // causal detail to safely reject one future incarnation forever. Once the watermark
         // window elapses we must allow upserts again so split/merge convergence can recover.
         false
-    }
-
-    /// Returns true when one telemetry counter sample should emit a diagnostic log.
-    fn should_emit_diag_sample(count: u64) -> bool {
-        count <= 3 || count.is_power_of_two() || count.is_multiple_of(100)
-    }
-
-    /// Records one stale upsert drop caused by the remove-watermark guard.
-    async fn record_stale_upsert_drop_telemetry(&self, spec: &TaskSpec, reason: &str) {
-        let count = {
-            let mut stats = self.stale_upsert_drop_stats.lock().await;
-            let entry = stats.entry(spec.id).or_insert(0);
-            *entry = entry.saturating_add(1);
-            *entry
-        };
-
-        if !Self::should_emit_diag_sample(count) {
-            return;
-        }
-
-        warn!(
-            target: "diag.task.upsert",
-            task = %spec.id,
-            node = %spec.node_id,
-            state = ?spec.state,
-            reason = %reason,
-            count,
-            incoming_epoch = spec.task_epoch,
-            incoming_phase_version = spec.phase_version,
-            "stale task upsert dropped"
-        );
-    }
-
-    /// Records one causal ordering rejection for an inbound upsert.
-    async fn record_causal_conflict_telemetry(
-        &self,
-        current: &TaskValue,
-        incoming: &TaskValue,
-        ordering: std::cmp::Ordering,
-    ) {
-        let count = {
-            let mut stats = self.causal_conflict_stats.lock().await;
-            let entry = stats.entry(incoming.id).or_insert(0);
-            *entry = entry.saturating_add(1);
-            *entry
-        };
-
-        if !Self::should_emit_diag_sample(count) {
-            return;
-        }
-
-        warn!(
-            target: "diag.task.causal",
-            task = %incoming.id,
-            count,
-            relation = %Self::causal_order_label(ordering),
-            current_epoch = current.task_epoch,
-            current_phase_version = current.phase_version,
-            current_state = ?current.state,
-            incoming_epoch = incoming.task_epoch,
-            incoming_phase_version = incoming.phase_version,
-            incoming_state = ?incoming.state,
-            "task upsert rejected by causal ordering"
-        );
-    }
-
-    /// Renders one causal ordering relation for diagnostic output.
-    fn causal_order_label(ordering: std::cmp::Ordering) -> &'static str {
-        match ordering {
-            std::cmp::Ordering::Less => "stale",
-            std::cmp::Ordering::Equal => "duplicate",
-            std::cmp::Ordering::Greater => "newer",
-        }
-    }
-
-    /// Clears per-task diagnostic counters to bound in-memory telemetry cardinality.
-    async fn clear_task_diag_stats(&self, task_id: Uuid) {
-        self.stale_upsert_drop_stats.lock().await.remove(&task_id);
-        self.causal_conflict_stats.lock().await.remove(&task_id);
     }
 
     #[allow(dead_code)]
@@ -920,7 +833,7 @@ impl TaskManager {
 impl Drop for TaskManager {
     /// Cleans test-created secret staging roots when the last TaskManager clone is released.
     fn drop(&mut self) {
-        if Arc::strong_count(&self.secret_artifacts) != 1 {
+        if Arc::strong_count(&self.local_containers) != 1 {
             return;
         }
         cleanup_secret_runtime_root(&self.secret_runtime_root);

@@ -104,31 +104,15 @@ impl TaskManager {
     ///
     /// This is used when tasks stop or fail so we do not leave decrypted material behind.
     pub(super) async fn cleanup_secret_artifacts(&self, task_id: Uuid) {
-        let artifacts = {
-            let mut guard = self.secret_artifacts.lock().await;
-            guard.remove(&task_id)
-        };
-
-        if let Some(artifacts) = artifacts {
-            if let Err(err) = artifacts.cleanup().await {
-                warn!(
-                    target: "task",
-                    "failed to cleanup secret artifacts for task {}: {err}",
-                    task_id
-                );
-            }
-            return;
-        }
-
-        let fallback_root = self.secret_runtime_root.join(task_id.to_string());
-        match fs::remove_dir_all(&fallback_root).await {
+        let root_dir = self.secret_runtime_root.join(task_id.to_string());
+        match fs::remove_dir_all(&root_dir).await {
             Ok(_) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => {
                 warn!(
                     target: "task",
-                    "failed to cleanup fallback secret staging directory {} for task {}: {err}",
-                    fallback_root.display(),
+                    "failed to cleanup secret staging directory {} for task {}: {err}",
+                    root_dir.display(),
                     task_id
                 );
             }

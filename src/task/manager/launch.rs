@@ -191,11 +191,6 @@ impl TaskManager {
             }
         };
 
-        if let Some(artifacts) = resolved.artifacts.take() {
-            let mut guard = self.secret_artifacts.lock().await;
-            guard.insert(request.task_id, artifacts);
-        }
-
         match self.container_manager.start_container(&container_id).await {
             Ok(_) => {}
             Err(err) => {
