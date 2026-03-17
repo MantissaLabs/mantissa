@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [build-dependencies]
-capnpc = "0.23"
+capnpc = { workspace = true }
 
 [dependencies]
-capnp = "0.23"
+capnp = { workspace = true }

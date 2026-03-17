@@ -23,6 +23,12 @@ members = [
 [workspace.package]
 license = "Apache-2.0"
 
+[workspace.dependencies]
+capnp = "0.25"
+capnp-rpc = "0.25"
+capnp-futures = "0.25"
+capnpc = "0.25"
+
 [workspace.lints.clippy]
 unwrap_used = "deny"
 
@@ -86,9 +92,9 @@ hickory-proto = "0.25.2"
 notify = "6.1.1"
 
 # capnproto
-capnp = "0.23"
-capnp-rpc = "0.23"
-capnp-futures = "0.23"
+capnp = { workspace = true }
+capnp-rpc = { workspace = true }
+capnp-futures = { workspace = true }
 
 sysinfo = "0.36.1"
 dirs = "5.0.1"
