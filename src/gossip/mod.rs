@@ -13,9 +13,9 @@ use crate::secrets::service::{read_secret_event, write_secret_event};
 use crate::secrets::types::SecretEvent;
 use crate::services::service::{read_service_event, write_service_event};
 use crate::services::types::ServiceEvent;
-use crate::task::container::ContainerState;
+use crate::task::causality::should_accept_task_spec;
 use crate::task::service as task_service;
-use crate::task::types::{TaskEvent, TaskSpec};
+use crate::task::types::TaskEvent;
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
@@ -24,12 +24,10 @@ use crate::volumes::types::VolumeEvent;
 use async_channel::{Receiver, Sender, TrySendError};
 use async_trait::async_trait;
 use capnp::Error;
-use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use protocol::gossip;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::gossip::gossip_message::Which::*;
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::rc::Rc;
@@ -241,73 +239,6 @@ fn should_replace_task_message(current: &Message, candidate: &Message) -> bool {
         (TaskEvent::Upsert(current_spec), TaskEvent::Upsert(candidate_spec)) => {
             should_accept_task_spec(current_spec, candidate_spec)
         }
-    }
-}
-
-/// Returns true when one candidate task specification is causally newer than the current one.
-fn should_accept_task_spec(current: &TaskSpec, candidate: &TaskSpec) -> bool {
-    compare_task_spec_causality(current, candidate).is_gt()
-}
-
-/// Compares two task specifications by causal ordering used for outbound gossip coalescing.
-fn compare_task_spec_causality(current: &TaskSpec, candidate: &TaskSpec) -> Ordering {
-    match candidate.task_epoch.cmp(&current.task_epoch) {
-        Ordering::Equal => {}
-        order => return order,
-    }
-    match candidate.phase_version.cmp(&current.phase_version) {
-        Ordering::Equal => {}
-        order => return order,
-    }
-
-    match (
-        parse_task_timestamp(&current.updated_at, &current.created_at),
-        parse_task_timestamp(&candidate.updated_at, &candidate.created_at),
-    ) {
-        (Some(current_ts), Some(candidate_ts)) => {
-            if candidate_ts > current_ts {
-                return Ordering::Greater;
-            } else if candidate_ts < current_ts {
-                return Ordering::Less;
-            }
-        }
-        (None, Some(_)) => return Ordering::Greater,
-        (Some(_), None) => return Ordering::Less,
-        (None, None) => {}
-    }
-
-    let current_rank = task_state_rank(&current.state);
-    let candidate_rank = task_state_rank(&candidate.state);
-    match candidate_rank.cmp(&current_rank) {
-        Ordering::Equal => candidate.node_id.cmp(&current.node_id),
-        order => order,
-    }
-}
-
-/// Parses the freshest available timestamp from one task spec for causal comparisons.
-fn parse_task_timestamp(updated_at: &str, created_at: &str) -> Option<DateTime<Utc>> {
-    parse_timestamp(updated_at).or_else(|| parse_timestamp(created_at))
-}
-
-/// Parses one RFC3339 timestamp into UTC.
-fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&Utc))
-        .ok()
-}
-
-/// Ranks task states by lifecycle progression when epoch/version/timestamp are tied.
-fn task_state_rank(state: &ContainerState) -> u8 {
-    match state {
-        ContainerState::Running => 6,
-        ContainerState::Creating => 5,
-        ContainerState::Pulling => 5,
-        ContainerState::VolumeUnavailable => 4,
-        ContainerState::Pending => 4,
-        ContainerState::Stopping => 3,
-        ContainerState::Stopped => 2,
-        ContainerState::Paused => 1,
-        ContainerState::Failed | ContainerState::Exited(_) | ContainerState::Unknown => 0,
     }
 }
 

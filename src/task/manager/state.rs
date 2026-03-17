@@ -17,6 +17,7 @@ use crate::network::types::{NetworkAttachmentState, NetworkAttachmentValue};
 use crate::scheduler::{
     GpuReservationRequest, SchedulerError, SlotId, SlotReservationRequest, SlotState,
 };
+use crate::task::causality::parse_task_timestamp;
 use crate::task::container::ContainerState;
 use crate::task::docker::{ContainerError, ContainerInfo};
 use crate::task::types::{
@@ -235,8 +236,7 @@ impl TaskManager {
             _ => {}
         }
 
-        if let Some(running_since) =
-            super::parse_task_timestamp(&working.updated_at, &working.created_at)
+        if let Some(running_since) = parse_task_timestamp(&working.updated_at, &working.created_at)
         {
             let elapsed = Utc::now().signed_duration_since(running_since);
             if let Ok(elapsed) = elapsed.to_std()
@@ -665,7 +665,7 @@ impl TaskManager {
             .and_then(|snapshot| select_best_task_value(snapshot.as_slice()))
             .map(|value| {
                 (
-                    super::parse_task_timestamp(&value.updated_at, &value.created_at)
+                    parse_task_timestamp(&value.updated_at, &value.created_at)
                         .unwrap_or_else(Utc::now),
                     value.task_epoch,
                 )

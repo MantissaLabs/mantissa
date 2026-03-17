@@ -19,12 +19,13 @@ use crate::network::types::{
     compute_network_attachment_id,
 };
 use crate::network::wireguard;
+use crate::task::causality::compare_task_causality;
 use crate::task::container::ContainerState;
 use crate::task::docker::ContainerRuntimeEvent;
 use crate::task::types::{TaskEvent, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec};
 
 use super::TaskManager;
-use super::{compare_task_causality, select_best_task_value, spec_to_value};
+use super::{select_best_task_value, spec_to_value};
 
 /// Maximum attempts when provisioning one runtime attachment.
 const ATTACHMENT_PROVISION_MAX_ATTEMPTS: usize = 4;

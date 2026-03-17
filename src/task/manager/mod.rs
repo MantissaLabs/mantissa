@@ -7,6 +7,7 @@ use crate::scheduler::{Scheduler, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::store::task_store::TaskStore;
+use crate::task::causality::compare_task_causality;
 use crate::task::container::ContainerState;
 use crate::task::docker::ContainerError;
 use crate::task::docker::ContainerManager;
@@ -1187,66 +1188,6 @@ fn should_prefer_task_value(current: &TaskValue, candidate: &TaskValue) -> bool 
     }
 
     candidate.node_id > current.node_id
-}
-
-/// Compares two task values by their causal ordering tuple.
-///
-/// The tuple is `(task_epoch, phase_version, timestamp, state_rank)` where larger is newer.
-pub(crate) fn compare_task_causality(
-    current: &TaskValue,
-    candidate: &TaskValue,
-) -> std::cmp::Ordering {
-    match candidate.task_epoch.cmp(&current.task_epoch) {
-        std::cmp::Ordering::Equal => {}
-        order => return order,
-    }
-    match candidate.phase_version.cmp(&current.phase_version) {
-        std::cmp::Ordering::Equal => {}
-        order => return order,
-    }
-    match (
-        parse_task_timestamp(&current.updated_at, &current.created_at),
-        parse_task_timestamp(&candidate.updated_at, &candidate.created_at),
-    ) {
-        (Some(current_ts), Some(candidate_ts)) => {
-            if candidate_ts > current_ts {
-                return std::cmp::Ordering::Greater;
-            } else if candidate_ts < current_ts {
-                return std::cmp::Ordering::Less;
-            }
-        }
-        (None, Some(_)) => return std::cmp::Ordering::Greater,
-        (Some(_), None) => return std::cmp::Ordering::Less,
-        (None, None) => {}
-    }
-
-    let current_rank = task_state_rank(&current.state);
-    let candidate_rank = task_state_rank(&candidate.state);
-    candidate_rank.cmp(&current_rank)
-}
-
-fn parse_task_timestamp(updated_at: &str, created_at: &str) -> Option<DateTime<Utc>> {
-    parse_timestamp(updated_at).or_else(|| parse_timestamp(created_at))
-}
-
-fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&Utc))
-        .ok()
-}
-
-fn task_state_rank(state: &ContainerState) -> u8 {
-    match state {
-        ContainerState::Running => 6,
-        ContainerState::Creating => 5,
-        ContainerState::Pulling => 5,
-        ContainerState::VolumeUnavailable => 4,
-        ContainerState::Pending => 4,
-        ContainerState::Stopping => 3,
-        ContainerState::Stopped => 2,
-        ContainerState::Paused => 1,
-        ContainerState::Failed | ContainerState::Exited(_) | ContainerState::Unknown => 0,
-    }
 }
 
 /// Ensures GPU-bound containers see the selected devices by injecting the
