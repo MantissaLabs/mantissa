@@ -10,18 +10,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::Docker;
-use bollard::container::{
-    Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
-    RemoveContainerOptions, RestartContainerOptions, StartContainerOptions, StopContainerOptions,
-};
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    CreateImageInfo, DeviceRequest, EventMessageTypeEnum, HostConfig, RestartPolicy,
-    RestartPolicyNameEnum,
+    ContainerCreateBody, CreateImageInfo, DeviceRequest, EventMessageTypeEnum, HostConfig,
+    RestartPolicy, RestartPolicyNameEnum,
+};
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptions, EventsOptions, InspectContainerOptions,
+    ListContainersOptions, RemoveContainerOptions, RestartContainerOptions, StartContainerOptions,
+    StopContainerOptions,
 };
 use bollard::service::ContainerInspectResponse;
-use bollard::system::EventsOptions;
 
 use crate::config;
 use async_trait::async_trait;
@@ -383,9 +383,9 @@ impl DockerContainerManager {
     }
 
     /// Converts an optional duration to Docker's timeout seconds format with a default.
-    fn timeout_seconds_or_default(timeout: Option<Duration>, default_secs: i64) -> i64 {
+    fn timeout_seconds_or_default(timeout: Option<Duration>, default_secs: i32) -> i32 {
         timeout
-            .map(|value| value.as_secs() as i64)
+            .map(|value| value.as_secs().min(i32::MAX as u64) as i32)
             .unwrap_or(default_secs)
     }
 
@@ -735,28 +735,19 @@ impl ContainerManager for DockerContainerManager {
         }
 
         // Create container config
-        let config = Config {
+        let config = ContainerCreateBody {
             image: Some(image.clone()),
             env: env_vars,
             cmd: command,
-            exposed_ports: if let Some(ports_map) = ports {
-                // Convert from HashMap<String, Vec<HashMap<String, String>>> to HashMap<String, HashMap<(), ()>>
-                let mut exposed = HashMap::new();
-                for port in ports_map.keys() {
-                    exposed.insert(port.clone(), HashMap::new());
-                }
-                Some(exposed)
-            } else {
-                None
-            },
+            exposed_ports: ports.map(|ports_map| ports_map.into_keys().collect()),
             host_config: Some(host_config),
             ..Default::default()
         };
 
         // Set container name options
         let options = Some(CreateContainerOptions {
-            name: &name,
-            platform: None,
+            name: Some(name.clone()),
+            ..Default::default()
         });
 
         debug!("Creating container '{}' with image '{}'", name, image);
@@ -786,7 +777,7 @@ impl ContainerManager for DockerContainerManager {
             container_id,
             "Container started",
             self.docker
-                .start_container(container_id, None::<StartContainerOptions<String>>),
+                .start_container(container_id, None::<StartContainerOptions>),
         )
         .await
     }
@@ -809,7 +800,8 @@ impl ContainerManager for DockerContainerManager {
             self.docker.stop_container(
                 container_id,
                 Some(StopContainerOptions {
-                    t: effective_seconds,
+                    t: Some(effective_seconds),
+                    ..Default::default()
                 }),
             ),
         )
@@ -861,7 +853,8 @@ impl ContainerManager for DockerContainerManager {
             self.docker.restart_container(
                 container_id,
                 Some(RestartContainerOptions {
-                    t: effective_seconds as isize,
+                    t: Some(effective_seconds),
+                    ..Default::default()
                 }),
             ),
         )
@@ -902,7 +895,7 @@ impl ContainerManager for DockerContainerManager {
 
         let options = ListContainersOptions {
             all: true,
-            filters: filters.unwrap_or_default(),
+            filters,
             ..Default::default()
         };
 
@@ -926,7 +919,7 @@ impl ContainerManager for DockerContainerManager {
                     .to_string();
                 let image = c.image.unwrap_or_default();
                 let status = c.status.unwrap_or_default();
-                let state = c.state.unwrap_or_default();
+                let state = c.state.map(|value| value.to_string()).unwrap_or_default();
                 let created = c.created.unwrap_or_default();
 
                 ContainerInfo {
@@ -970,8 +963,8 @@ impl ContainerManager for DockerContainerManager {
     async fn pull_image(&self, image: &str) -> ContainerResult<()> {
         debug!("Pulling image: {}", image);
 
-        let options = Some(bollard::image::CreateImageOptions {
-            from_image: image,
+        let options = Some(CreateImageOptions {
+            from_image: Some(image.to_string()),
             ..Default::default()
         });
 
@@ -987,8 +980,12 @@ impl ContainerManager for DockerContainerManager {
                     {
                         debug!("Pull status: {status}");
                     }
-                    if let Some(error) = update.error {
-                        return Err(ContainerError::OperationFailed(error));
+                    if let Some(error) = update
+                        .error_detail
+                        .as_ref()
+                        .and_then(|detail| detail.message.as_deref())
+                    {
+                        return Err(ContainerError::OperationFailed(error.to_string()));
                     }
                 }
                 Err(err) => return Err(ContainerError::DockerAPI(err)),
@@ -1009,10 +1006,10 @@ impl ContainerManager for DockerContainerManager {
     ) -> ContainerResult<()> {
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("type".to_string(), vec!["container".to_string()]);
-        let options = EventsOptions::<String> {
+        let options = EventsOptions {
             since: None,
             until: None,
-            filters,
+            filters: Some(filters),
         };
 
         let mut stream = self.docker.events(Some(options));

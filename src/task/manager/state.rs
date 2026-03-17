@@ -468,12 +468,11 @@ impl TaskManager {
             .inspect_container(container_id)
             .await
             .map_err(|err| format!("failed to inspect task container for liveness probe: {err}"))?;
-        if let Some(network_settings) = inspect.network_settings.as_ref() {
-            push_liveness_target(&mut targets, network_settings.ip_address.as_deref());
-            if let Some(networks) = network_settings.networks.as_ref() {
-                for endpoint in networks.values() {
-                    push_liveness_target(&mut targets, endpoint.ip_address.as_deref());
-                }
+        if let Some(network_settings) = inspect.network_settings.as_ref()
+            && let Some(networks) = network_settings.networks.as_ref()
+        {
+            for endpoint in networks.values() {
+                push_liveness_target(&mut targets, endpoint.ip_address.as_deref());
             }
         }
 

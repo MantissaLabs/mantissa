@@ -61,7 +61,7 @@ ed25519-dalek = { version = "2", default-features = false, features = [
 getrandom = "0.2"
 
 # Container / MicroVMs / Task management
-bollard = "0.18.1"
+bollard = "0.20.2"
 
 # boringtun is used for inter-cluster communication via wireguard.
 snow = "0.9.6"
