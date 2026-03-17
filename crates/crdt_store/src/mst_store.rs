@@ -10,7 +10,7 @@
 // base64 used only in debug helpers/tests; prefer fully-qualified calls to avoid unused imports.
 use merkle_search_tree::digest::Hasher as MstHasher;
 use merkle_search_tree::{MerkleSearchTree, builder::Builder};
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;

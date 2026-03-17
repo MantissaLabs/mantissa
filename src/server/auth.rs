@@ -1,5 +1,5 @@
 use crate::crypto::rand;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use std::{io, sync::Arc};
 use uuid::Uuid;
 

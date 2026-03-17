@@ -1,4 +1,4 @@
-use redb::{Database, ReadTransaction, WriteTransaction};
+use redb::{Database, ReadTransaction, ReadableDatabase, WriteTransaction};
 use std::io;
 
 /// Maps Redb and serialization errors into `io::Error` for store APIs.
