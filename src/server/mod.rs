@@ -126,7 +126,8 @@ impl Server {
     }
 
     fn new_session_client(&self) -> cluster_session::Client {
-        let health_srv = crate::topology::health::Health::new(self.topology.clone());
+        let health_srv =
+            crate::topology::health::Health::new(self.topology.clone(), self.online.clone());
         let health_client: HealthClient = capnp_rpc::new_client(health_srv);
 
         let session_clients = ClusterSessionClients {

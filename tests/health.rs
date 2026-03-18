@@ -3,6 +3,7 @@
 #[macro_use]
 mod common;
 
+use common::convergence::current_cluster_view;
 use common::testkit::{ContainerManagerOverrideGuard, TestNode};
 use protocol::health::NodeStatus;
 use std::time::Duration;
@@ -126,4 +127,52 @@ local_test!(health_alive_then_down_tcp, {
         )
         .await
         .expect("Node should be marked as alive");
+});
+
+local_test!(health_cached_capability_respects_stop_inproc, {
+    let _guard = ContainerManagerOverrideGuard::install_default();
+
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let mut joiner = TestNode::new_with_tick_ms(100).await;
+
+    joiner
+        .join(&anchor)
+        .await
+        .expect("join should happen successfully");
+
+    anchor
+        .wait_status_of(
+            joiner.id(),
+            NodeStatus::Alive,
+            std::time::Duration::from_millis(5000),
+        )
+        .await
+        .expect("Node should be marked as alive");
+
+    let cluster_view = current_cluster_view(&anchor.topology()).await;
+    let health_cap = anchor
+        .node
+        .registry
+        .fetch_health_capability(joiner.id(), cluster_view)
+        .await
+        .expect("health capability fetch should not fail")
+        .expect("joined node should expose a health capability");
+
+    health_cap
+        .ping_request()
+        .send()
+        .promise
+        .await
+        .expect("cached health capability should answer before stop");
+
+    joiner.stop().await.expect("stop joiner");
+
+    let err = match health_cap.ping_request().send().promise.await {
+        Ok(_) => panic!("cached health capability should reject requests after stop"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("server offline"),
+        "stopped node should reject cached health pings as offline, got {err}"
+    );
 });

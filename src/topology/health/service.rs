@@ -9,6 +9,7 @@ impl health::Server for Health {
         _params: health::PingParams,
         mut results: health::PingResults,
     ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
         let topo = self.clone_topology();
 
         let now = SystemTime::now()
@@ -31,6 +32,7 @@ impl health::Server for Health {
         params: health::IndirectPingParams,
         mut results: health::IndirectPingResults,
     ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
         let topo = self.clone_topology();
         let request = params.get()?;
         let target_id = request.get_target_id()?;
