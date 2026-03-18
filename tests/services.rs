@@ -9,7 +9,8 @@ use client::services::manifest::{
     load_manifest_from_path,
 };
 use common::convergence::{
-    current_cluster_view, wait_for_cluster_view, wait_for_operation_stage, wait_until,
+    current_cluster_view, swim_down_transition_timeout, wait_for_cluster_view,
+    wait_for_operation_stage, wait_until,
 };
 use common::testkit::{
     ClusterConfig, ContainerManagerOverrideGuard, InMemoryContainerManager, TestNode,
@@ -53,7 +54,7 @@ use std::{
     fs,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -67,12 +68,22 @@ use uuid::Uuid;
 struct ConfigOverrideGuard {
     previous: Config,
     source: ConfigSource,
+    _lock: MutexGuard<'static, ()>,
+}
+
+/// Returns the global mutex used to serialize test-scoped config overrides.
+fn config_override_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 impl ConfigOverrideGuard {
     /// Force networking into a control-plane-only mode so logical-network tests do not depend on
     /// privileged dataplane setup in CI.
     fn control_plane_network_only() -> Self {
+        let lock = config_override_lock()
+            .lock()
+            .expect("config override lock should not be poisoned");
         let previous = global_config();
         let source = global_config_source();
 
@@ -86,7 +97,11 @@ impl ConfigOverrideGuard {
         override_source.env_overrides = true;
         set_global_config_with_source(config, override_source);
 
-        Self { previous, source }
+        Self {
+            previous,
+            source,
+            _lock: lock,
+        }
     }
 }
 
@@ -94,17 +109,6 @@ impl Drop for ConfigOverrideGuard {
     fn drop(&mut self) {
         set_global_config_with_source(self.previous.clone(), self.source.clone());
     }
-}
-
-/// Computes a deterministic timeout budget for SWIM down transitions in service tests.
-fn down_transition_timeout() -> Duration {
-    let health = mantissa::config::health_runtime_config();
-    health
-        .probe_interval
-        .saturating_add(health.suspect_after)
-        .saturating_add(health.down_after)
-        .saturating_add(health.probe_timeout)
-        .saturating_add(Duration::from_millis(2_000))
 }
 
 local_test!(services_gossip_propagates_across_peers, {
@@ -1704,7 +1708,11 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
     cluster[2].stop().await.expect("stop failed node");
 
     cluster[0]
-        .wait_status_of(down_node_id, NodeStatus::Down, down_transition_timeout())
+        .wait_status_of(
+            down_node_id,
+            NodeStatus::Down,
+            swim_down_transition_timeout(2),
+        )
         .await
         .expect("cluster should mark failed node as down");
 

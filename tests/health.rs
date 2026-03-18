@@ -3,30 +3,9 @@
 #[macro_use]
 mod common;
 
-use common::convergence::current_cluster_view;
+use common::convergence::{current_cluster_view, swim_down_transition_timeout};
 use common::testkit::{ContainerManagerOverrideGuard, TestNode};
 use protocol::health::NodeStatus;
-use std::time::Duration;
-
-/// # Description:
-///
-/// Computes a deterministic timeout budget for SWIM down transitions in tests.
-///
-/// The transition can consume:
-/// - one probe interval before the first failed observation is recorded,
-/// - `suspect_after` before escalating to Suspect,
-/// - `down_after` before promoting to Down,
-/// - one probe timeout for an in-flight ping,
-/// - and a small scheduler/polling margin.
-fn down_transition_timeout() -> Duration {
-    let health = mantissa::config::health_runtime_config();
-    health
-        .probe_interval
-        .saturating_add(health.suspect_after)
-        .saturating_add(health.down_after)
-        .saturating_add(health.probe_timeout)
-        .saturating_add(Duration::from_millis(2_000))
-}
 
 local_test!(health_alive_then_down_inproc, {
     let _guard = ContainerManagerOverrideGuard::install_default();
@@ -54,7 +33,11 @@ local_test!(health_alive_then_down_inproc, {
     joiner.stop().await.unwrap();
 
     anchor
-        .wait_status_of(joiner.id(), NodeStatus::Down, down_transition_timeout())
+        .wait_status_of(
+            joiner.id(),
+            NodeStatus::Down,
+            swim_down_transition_timeout(1),
+        )
         .await
         .expect("Node should be marked as down");
 
@@ -112,7 +95,11 @@ local_test!(health_alive_then_down_tcp, {
     joiner.stop().await.unwrap();
 
     anchor
-        .wait_status_of(joiner.id(), NodeStatus::Down, down_transition_timeout())
+        .wait_status_of(
+            joiner.id(),
+            NodeStatus::Down,
+            swim_down_transition_timeout(1),
+        )
         .await
         .expect("Node should be marked as down");
 

@@ -793,18 +793,18 @@ impl TestNode {
         timeout: Duration,
     ) -> Result<(), capnp::Error> {
         let deadline = Instant::now() + timeout;
+        let mut last_seen = self.list_status_of(target).await?;
         loop {
-            if let Some(s) = self.list_status_of(target).await?
-                && s == expect
-            {
+            if last_seen == Some(expect) {
                 return Ok(());
             }
             if Instant::now() > deadline {
                 return Err(capnp::Error::failed(format!(
-                    "timeout waiting for {expect:?} on {target}"
+                    "timeout waiting for {expect:?} on {target}; last_seen={last_seen:?}"
                 )));
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
+            last_seen = self.list_status_of(target).await?;
         }
     }
 }

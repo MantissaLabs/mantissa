@@ -105,3 +105,27 @@ pub async fn current_cluster_view(
         .expect("view payload");
     ClusterViewId::from_capnp(view).expect("decode current view")
 }
+
+/// Returns a conservative timeout for SWIM down transitions with `candidate_count` probe targets.
+///
+/// The detector probes one target per interval in round-robin order, so a specific failed peer may
+/// only be revisited every `candidate_count * probe_interval`. We budget for:
+/// - one full target cadence to observe the first failed probe,
+/// - one more full target cadence before the same peer is retried and can cross `suspect_after`,
+/// - the configured `down_after` window while the peer remains suspect,
+/// - one extra probe interval so `expire_suspicions` can promote Suspect to Down,
+/// - one direct probe timeout,
+/// - and a small scheduler margin.
+pub fn swim_down_transition_timeout(candidate_count: usize) -> Duration {
+    let health = mantissa::config::health_runtime_config();
+    let cadence = health
+        .probe_interval
+        .saturating_mul(u32::try_from(candidate_count.max(1)).unwrap_or(u32::MAX));
+    cadence
+        .saturating_add(cadence)
+        .saturating_add(health.suspect_after)
+        .saturating_add(health.down_after)
+        .saturating_add(health.probe_timeout)
+        .saturating_add(health.probe_interval)
+        .saturating_add(Duration::from_secs(2))
+}
