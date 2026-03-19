@@ -93,8 +93,12 @@ const DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_GLOBAL_METADATA_SYNC_FANOUT: usize = 8;
 /// Default maximum concurrent cross-view metadata sync operations per tick.
 const DEFAULT_GLOBAL_METADATA_SYNC_PARALLELISM: usize = 1;
+/// Number of peers targeted by the low-rate task-only repair path on each sync tick.
+const DEFAULT_TASK_REPAIR_FANOUT: usize = 1;
 /// Cross-view domains synchronized by the global metadata anti-entropy loop.
 const GLOBAL_METADATA_SYNC_DOMAINS: [Domain; 1] = [Domain::ClusterViews];
+/// Selected domains synchronized by the targeted task-only repair path.
+const TASK_REPAIR_SYNC_DOMAINS: [Domain; 1] = [Domain::Tasks];
 
 /// Reads the optional per-tick sync parallelism override from the environment.
 fn sync_parallelism_from_env(default: usize) -> usize {
@@ -392,6 +396,9 @@ pub struct Topology {
     /// Runtime state for background sync loop management.
     sync: SyncState,
 
+    /// Rotating cursor used by task-only repair to deterministically cover all in-view peers.
+    task_repair_cursor: Arc<Mutex<usize>>,
+
     /// Runtime state for cross-view cluster metadata anti-entropy management.
     metadata_sync: SyncState,
 
@@ -496,6 +503,7 @@ impl Topology {
             public_key: noise_public_key,
             signing_key,
             sync: SyncState::new(DEFAULT_SYNC_INTERVAL, DEFAULT_SYNC_FANOUT),
+            task_repair_cursor: Arc::new(Mutex::new(0)),
             metadata_sync: SyncState::new(
                 global_metadata_sync_interval_from_env(DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL),
                 global_metadata_sync_fanout_from_env(DEFAULT_GLOBAL_METADATA_SYNC_FANOUT),
@@ -1371,6 +1379,8 @@ impl Topology {
         );
 
         let selected_entries = self.select_sync_peers(entries, sync_fanout);
+        let selected_peer_ids: HashSet<Uuid> =
+            selected_entries.iter().map(|entry| entry.peer_id).collect();
         let sync_parallelism = sync_parallelism_from_env(DEFAULT_SYNC_PARALLELISM);
         let mut inflight = FuturesUnordered::new();
         for entry in selected_entries {
@@ -1383,6 +1393,13 @@ impl Topology {
             }
         }
         while inflight.next().await.is_some() {}
+
+        for entry in self.select_task_repair_peers(entries, &selected_peer_ids) {
+            if excluded_peers.contains(&entry.peer_id) {
+                continue;
+            }
+            self.sync_tasks_with_peer(entry, cluster_view).await;
+        }
     }
 
     /// Select peers to target during one view-scoped anti-entropy tick.
@@ -1395,6 +1412,26 @@ impl Topology {
         sync_fanout: usize,
     ) -> Vec<&'a PeerCacheEntry> {
         select_sync_peers_for_node(self.node.id, entries, sync_fanout)
+    }
+
+    /// Select peers to target during one low-rate task-only repair tick.
+    ///
+    /// This keeps task repair deterministic and bounded while avoiding peers already chosen for
+    /// the full all-domain sync pass during the same tick.
+    fn select_task_repair_peers<'a>(
+        &self,
+        entries: &'a [PeerCacheEntry],
+        already_selected: &HashSet<Uuid>,
+    ) -> Vec<&'a PeerCacheEntry> {
+        select_sync_peers_round_robin_for_node(
+            self.node.id,
+            entries,
+            DEFAULT_TASK_REPAIR_FANOUT,
+            &self.task_repair_cursor,
+        )
+        .into_iter()
+        .filter(|entry| !already_selected.contains(&entry.peer_id))
+        .collect()
     }
 
     /// Select peers to target during one cross-view metadata anti-entropy tick.
@@ -1450,6 +1487,51 @@ impl Topology {
 
         let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic");
         sync_all_domains(stores, sync_cap, cluster_view, Some(trace)).await;
+    }
+
+    /// Executes one targeted task-only repair exchange against a selected peer.
+    ///
+    /// This supplements the full random all-domain sync pass with one deterministic task-domain
+    /// repair so tail task divergence is repaired without broadening the all-domain sync hot path.
+    async fn sync_tasks_with_peer(&self, entry: &PeerCacheEntry, cluster_view: ClusterViewId) {
+        let peer_id = entry.peer_id;
+        let value = entry.value.as_ref();
+
+        let sync_cap = match self
+            .registry
+            .fetch_sync_capability(peer_id, cluster_view)
+            .await
+        {
+            Ok(Some(cap)) => cap,
+            Ok(None) => return,
+            Err(e) => {
+                error!(target: "sync", "get_sync failed for {}: {e}", value.address);
+                return;
+            }
+        };
+
+        let stores = SyncStores {
+            peers: self.peers.clone(),
+            tasks: self.tasks.clone(),
+            services: self.services.clone(),
+            secrets: self.secrets.clone(),
+            networks: self.networks.clone(),
+            network_peers: self.network_peers.clone(),
+            network_attachments: self.network_attachments.clone(),
+            cluster_views: self.cluster_view_store.cluster_view_domain_store(),
+            volumes: self.volumes.clone(),
+            volume_nodes: self.volume_nodes.clone(),
+        };
+
+        let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic-task-repair");
+        sync_selected_domains(
+            stores,
+            sync_cap,
+            cluster_view,
+            &TASK_REPAIR_SYNC_DOMAINS,
+            Some(trace),
+        )
+        .await;
     }
 
     /// Runs one unscoped metadata anti-entropy exchange against a peer.
@@ -1680,9 +1762,9 @@ impl GossipContext for Topology {
     }
 }
 
-/// Select peers for one sync tick while excluding `local_id`.
+/// Select peers for one deterministic sync sweep while excluding `local_id`.
 ///
-/// This helper keeps peer sampling logic testable without constructing a full `Topology`.
+/// The rotating cursor ensures bounded convergence coverage instead of probabilistic sampling.
 fn select_sync_peers_for_node(
     local_id: Uuid,
     entries: &[PeerCacheEntry],
@@ -1717,8 +1799,6 @@ fn select_sync_peers_for_node(
         }
     }
 
-    // If `self` was selected (or duplicate protection reduced candidates), top up from
-    // remaining indices without scanning or shuffling the entire peer list.
     while selected_entries.len() < target && selected_indices.len() < entries.len() {
         let idx = rng.random_range(0..entries.len());
         if !selected_indices.insert(idx) {
@@ -1872,7 +1952,7 @@ mod tests {
     use super::{
         PeerCacheEntry, PeerHandle, PeerSchedulingState, PeerValue, gossip_warm_target,
         rebuild_gossip_warm_set, refill_gossip_warm_set, rotate_gossip_warm_set,
-        select_sync_peers_for_node, select_sync_peers_round_robin_for_node,
+        select_sync_peers_round_robin_for_node,
     };
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
@@ -1907,7 +1987,7 @@ mod tests {
 
     /// `fanout = 0` should keep legacy behavior: return every peer except self.
     #[test]
-    fn select_sync_peers_fanout_zero_returns_all_except_self() {
+    fn select_sync_peers_round_robin_fanout_zero_returns_all_except_self() {
         let local_id = Uuid::new_v4();
         let peer_ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
         let mut entries = vec![make_entry(local_id, 0)];
@@ -1915,7 +1995,8 @@ mod tests {
             entries.push(make_entry(peer_id, idx + 1));
         }
 
-        let selected = select_sync_peers_for_node(local_id, &entries, 0);
+        let cursor = Arc::new(Mutex::new(0usize));
+        let selected = select_sync_peers_round_robin_for_node(local_id, &entries, 0, &cursor);
         assert_eq!(selected.len(), peer_ids.len());
         assert!(selected.iter().all(|entry| entry.peer_id != local_id));
 
@@ -1924,9 +2005,9 @@ mod tests {
         assert_eq!(selected_ids, expected_ids);
     }
 
-    /// Selected peers should never include self and should never exceed `fanout`.
+    /// Round-robin selection should never include self and should never exceed `fanout`.
     #[test]
-    fn select_sync_peers_bounds_count_and_excludes_self() {
+    fn select_sync_peers_round_robin_bounds_count_and_excludes_self() {
         let local_id = Uuid::new_v4();
         let mut entries = vec![make_entry(local_id, 0)];
         for idx in 0..32 {
@@ -1934,8 +2015,10 @@ mod tests {
         }
 
         let fanout = 8;
+        let cursor = Arc::new(Mutex::new(0usize));
         for _ in 0..64 {
-            let selected = select_sync_peers_for_node(local_id, &entries, fanout);
+            let selected =
+                select_sync_peers_round_robin_for_node(local_id, &entries, fanout, &cursor);
             assert_eq!(selected.len(), fanout);
             assert!(selected.iter().all(|entry| entry.peer_id != local_id));
 
@@ -1946,14 +2029,15 @@ mod tests {
 
     /// When `fanout` is larger than available peers, return all non-self peers.
     #[test]
-    fn select_sync_peers_fanout_above_population_returns_all_non_self() {
+    fn select_sync_peers_round_robin_fanout_above_population_returns_all_non_self() {
         let local_id = Uuid::new_v4();
         let mut entries = vec![make_entry(local_id, 0)];
         for idx in 0..4 {
             entries.push(make_entry(Uuid::new_v4(), idx + 1));
         }
 
-        let selected = select_sync_peers_for_node(local_id, &entries, 32);
+        let cursor = Arc::new(Mutex::new(0usize));
+        let selected = select_sync_peers_round_robin_for_node(local_id, &entries, 32, &cursor);
         assert_eq!(selected.len(), 4);
         assert!(selected.iter().all(|entry| entry.peer_id != local_id));
     }
