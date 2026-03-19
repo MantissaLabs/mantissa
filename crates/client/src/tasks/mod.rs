@@ -8,4 +8,4 @@ pub use list::{TasksListOptions, TasksListOutput, TasksListState, list};
 pub use logs::{TaskLogsOptions, logs};
 pub use start::{TaskStartOptions, start};
 pub use stop::stop;
-pub(crate) use util::{resolve_task_id, uuid_from_data, uuid_short, uuid_to_string};
+pub(crate) use util::{uuid_from_data, uuid_short, uuid_to_string};

@@ -471,7 +471,8 @@ impl TaskManager {
         let mut stop_req = task_client.stop_request();
         {
             let mut request = stop_req.get().init_request();
-            request.set_id(spec.id.as_bytes());
+            let selector = spec.id.to_string();
+            request.set_selector(&selector);
         }
         let response = stop_req
             .send()

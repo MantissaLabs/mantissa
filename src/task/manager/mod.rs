@@ -741,6 +741,31 @@ impl TaskManager {
         Ok(specs)
     }
 
+    /// Resolves one operator-provided task identifier as a full UUID or unique visible prefix.
+    pub async fn resolve_task_id(&self, selector: &str) -> Result<Uuid, anyhow::Error> {
+        let trimmed = selector.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("task id must not be empty"));
+        }
+
+        if let Ok(id) = Uuid::parse_str(trimmed) {
+            return Ok(id);
+        }
+
+        let (actives, _) = self
+            .core
+            .store
+            .load_all()
+            .map_err(|e| anyhow!("task store load_all failed: {e}"))?;
+
+        match_task_id_prefix(
+            trimmed,
+            actives.into_iter().filter_map(|(key, snapshot)| {
+                select_best_task_value(snapshot.as_slice()).map(|_| key.to_uuid())
+            }),
+        )
+    }
+
     /// Returns the replicated container state for each provided task identifier so higher level
     /// controllers can determine whether a rollout has converged cluster-wide yet.
     pub async fn task_state_snapshot(
@@ -1241,6 +1266,47 @@ fn wrap_existing_inspect_error(task_name: &str, err: ContainerError) -> anyhow::
 
 fn wrap_start_error(task_name: &str, err: ContainerError) -> anyhow::Error {
     anyhow::Error::new(err).context(format!("docker start failed for task {task_name}"))
+}
+
+/// Matches one task identifier or prefix against a visible task-id set and returns a unique UUID.
+fn match_task_id_prefix(
+    raw: &str,
+    ids: impl IntoIterator<Item = Uuid>,
+) -> Result<Uuid, anyhow::Error> {
+    let canonical_prefix = raw.trim().to_ascii_lowercase();
+    let compact_prefix = canonical_prefix.replace('-', "");
+    if compact_prefix.is_empty() {
+        return Err(anyhow!("task id must not be empty"));
+    }
+
+    let mut matches = Vec::new();
+    for id in ids {
+        let full = id.to_string();
+        let compact = full.replace('-', "");
+        if full.starts_with(&canonical_prefix) || compact.starts_with(&compact_prefix) {
+            matches.push(id);
+        }
+    }
+
+    matches.sort_unstable();
+    matches.dedup();
+
+    match matches.len() {
+        0 => Err(anyhow!(
+            "unknown task id or prefix '{raw}'; use `mantissa tasks list --no-trunc` to inspect full ids"
+        )),
+        1 => Ok(matches[0]),
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow!(
+                "task id prefix '{raw}' is ambiguous; matches: {candidates}"
+            ))
+        }
+    }
 }
 
 fn is_name_conflict(err: &ContainerError) -> bool {

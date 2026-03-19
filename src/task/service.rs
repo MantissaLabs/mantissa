@@ -835,7 +835,11 @@ impl task::Server for TaskService {
             .ensure_no_active_cluster_operation("stop tasks")?;
 
         let req = params.get()?.get_request()?;
-        let id = read_id_from_data(req.get_id()?)?;
+        let id = self
+            .manager
+            .resolve_task_id(req.get_selector()?.to_str()?)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
 
         let spec = self
             .manager
@@ -855,7 +859,11 @@ impl task::Server for TaskService {
         _results: task::LogsResults,
     ) -> Result<(), Error> {
         let request = params.get()?.get_request()?;
-        let id = read_id_from_data(request.get_id()?)?;
+        let id = self
+            .manager
+            .resolve_task_id(request.get_selector()?.to_str()?)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
         let options = read_logs_options(request.get_options()?)?;
         let sink = request.get_sink()?;
         let spec = self
@@ -869,7 +877,8 @@ impl task::Server for TaskService {
             let mut request = remote.logs_request();
             {
                 let mut builder = request.get().init_request();
-                builder.set_id(id.as_bytes());
+                let id_selector = id.to_string();
+                builder.set_selector(&id_selector);
                 write_logs_options(builder.reborrow().init_options(), &options);
                 builder.set_sink(sink);
             }

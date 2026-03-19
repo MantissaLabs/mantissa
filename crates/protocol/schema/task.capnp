@@ -26,8 +26,8 @@ interface TaskLogSink {
 }
 
 struct TaskLogsRequest {
-  id @0 :Data;
-  # Task UUID v4 as 16 bytes.
+  selector @0 :Text;
+  # Task UUID or unique prefix.
 
   options @1 :TaskLogsOptions;
   # Stream options mirroring the Docker logs API.
@@ -346,8 +346,8 @@ enum LivenessProbeKind {
 }
 
 struct TaskStopRequest {
-  id @0 :Data;
-  # Task UUID (16 bytes).
+  selector @0 :Text;
+  # Task UUID or unique prefix.
 }
 
 struct TaskListRequest {

@@ -3384,6 +3384,79 @@ async fn list_tasks_respects_filters() {
 }
 
 #[tokio::test]
+async fn resolve_task_id_accepts_unique_short_prefix() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let id = Uuid::parse_str("956bc5ba-0f2c-4d3f-8a07-fd9f1f72b8c1").expect("uuid");
+    let spec = build_remote_task_spec(
+        id,
+        Uuid::new_v4(),
+        ContainerState::Running,
+        1,
+        1,
+        Utc::now().to_rfc3339(),
+    );
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    let resolved = manager
+        .resolve_task_id("956bc5ba")
+        .await
+        .expect("resolve prefix");
+
+    assert_eq!(resolved, id);
+}
+
+#[tokio::test]
+async fn resolve_task_id_accepts_compact_prefix_across_hyphen_boundary() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let id = Uuid::parse_str("956bc5ba-0f2c-4d3f-8a07-fd9f1f72b8c1").expect("uuid");
+    let spec = build_remote_task_spec(
+        id,
+        Uuid::new_v4(),
+        ContainerState::Running,
+        1,
+        1,
+        Utc::now().to_rfc3339(),
+    );
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    let resolved = manager
+        .resolve_task_id("956bc5ba0f2c")
+        .await
+        .expect("resolve prefix");
+
+    assert_eq!(resolved, id);
+}
+
+#[tokio::test]
+async fn resolve_task_id_rejects_ambiguous_prefix() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let a = Uuid::parse_str("956bc5ba-0f2c-4d3f-8a07-fd9f1f72b8c1").expect("uuid");
+    let b = Uuid::parse_str("956bc5ba-11aa-4d3f-8a07-fd9f1f72b8c2").expect("uuid");
+    let now = Utc::now().to_rfc3339();
+    let first = build_remote_task_spec(
+        a,
+        Uuid::new_v4(),
+        ContainerState::Running,
+        1,
+        1,
+        now.clone(),
+    );
+    let second = build_remote_task_spec(b, Uuid::new_v4(), ContainerState::Running, 1, 1, now);
+    manager.persist_spec(&first).await.expect("persist first");
+    manager.persist_spec(&second).await.expect("persist second");
+
+    let error = manager
+        .resolve_task_id("956bc5ba")
+        .await
+        .expect_err("ambiguous prefix should fail");
+
+    assert!(error.to_string().contains("ambiguous"));
+}
+
+#[tokio::test]
 async fn start_container_fails_when_no_matching_slot() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 

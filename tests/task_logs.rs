@@ -264,10 +264,16 @@ local_test!(task_logs_relay_over_tcp_sessions, {
     let sink = CollectingTaskLogSink::default();
     let sink_frames = sink.frames.clone();
     let sink_client = capnp_new_client(sink);
+    let selector = task_id
+        .to_string()
+        .split('-')
+        .next()
+        .expect("uuid prefix")
+        .to_string();
     let mut request = requester.node.task_client.logs_request();
     {
         let mut builder = request.get().init_request();
-        builder.set_id(task_id.as_bytes());
+        builder.set_selector(&selector);
         let mut options = builder.reborrow().init_options();
         options.set_follow(true);
         options.set_stdout(true);

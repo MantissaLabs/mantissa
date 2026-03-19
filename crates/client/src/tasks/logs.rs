@@ -1,6 +1,5 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::tasks::resolve_task_id;
 use anyhow::{Result, anyhow};
 use capnp_rpc::new_client;
 use protocol::task::{TaskLogStream, task_log_sink};
@@ -108,7 +107,6 @@ impl task_log_sink::Server for CliTaskLogSink {
 
 /// Streams task logs from the local node or the current remote owner.
 pub async fn logs(cfg: &ClientConfig, id: &str, options: &TaskLogsOptions<'_>) -> Result<()> {
-    let id = resolve_task_id(cfg, id).await?;
     let options = options.normalized()?;
     let client = connection::get_local_session(cfg).await?;
 
@@ -118,7 +116,7 @@ pub async fn logs(cfg: &ClientConfig, id: &str, options: &TaskLogsOptions<'_>) -
     let mut request = task.logs_request();
     {
         let mut builder = request.get().init_request();
-        builder.set_id(id.as_bytes());
+        builder.set_selector(id);
         let mut options_builder = builder.reborrow().init_options();
         options_builder.set_follow(options.follow);
         options_builder.set_stdout(options.stdout);
