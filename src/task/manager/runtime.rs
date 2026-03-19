@@ -343,9 +343,14 @@ impl TaskManager {
                     gossip_flush_pending = true;
                 }
                 _ = gossip_flush_tick.tick(), if gossip_flush_pending => {
-                    gossip_flush_pending = false;
-                    if let Err(err) = self.flush_dirty_gossip_events().await {
-                        warn!(target: "task", "failed to flush dirty task gossip: {err:#}");
+                    match self.flush_dirty_gossip_events().await {
+                        Ok(has_pending) => {
+                            gossip_flush_pending = has_pending;
+                        }
+                        Err(err) => {
+                            gossip_flush_pending = false;
+                            warn!(target: "task", "failed to flush dirty task gossip: {err:#}");
+                        }
                     }
                 }
                 event = runtime_events_rx.recv(), if runtime_events_enabled => {

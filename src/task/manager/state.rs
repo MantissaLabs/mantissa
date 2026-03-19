@@ -691,6 +691,11 @@ impl TaskManager {
     }
 
     /// Updates one task lifecycle state/phase snapshot and gossips it when changed.
+    ///
+    /// Repeated in-flight progress changes remain locally persisted on the owner, but they are
+    /// not broadcast as new logical gossip updates once the task is already in `Pulling` or
+    /// `Creating`. Only lifecycle transitions are cluster-visible; dissemination breadth is then
+    /// handled by the dirty gossip buffer retaining the latest transition for a few fanout rounds.
     pub(super) async fn update_task_phase(
         &self,
         task_id: Uuid,
@@ -735,17 +740,19 @@ impl TaskManager {
         spec.phase_progress = next_progress;
         spec.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(&spec).await?;
-        let event = if state_changed {
-            TaskEvent::UpsertSpec(Box::new(spec.clone()))
-        } else {
-            TaskEvent::UpsertStatus(Box::new(spec_to_status(&spec)))
-        };
-        if let Err(err) = self.enqueue_gossip_best_effort(event).await {
-            warn!(
-                target: "task",
-                task = %task_id,
-                "failed to record task phase gossip: {err}"
-            );
+        if should_gossip_task_phase_update(state_changed, &spec.state) {
+            let event = if state_changed {
+                TaskEvent::UpsertSpec(Box::new(spec.clone()))
+            } else {
+                TaskEvent::UpsertStatus(Box::new(spec_to_status(&spec)))
+            };
+            if let Err(err) = self.enqueue_gossip_best_effort(event).await {
+                warn!(
+                    target: "task",
+                    task = %task_id,
+                    "failed to record task phase gossip: {err}"
+                );
+            }
         }
         Ok(spec)
     }
@@ -887,17 +894,21 @@ impl TaskManager {
     }
 
     /// Drains the current dirty gossip buffer into the shared outbound gossip queue.
-    pub(super) async fn flush_dirty_gossip_events(&self) -> Result<(), anyhow::Error> {
+    ///
+    /// Each logical update survives a small bounded number of fanout rounds so one transition can
+    /// cover more than one peer sample without turning back into an unbounded relay flood.
+    pub(super) async fn flush_dirty_gossip_events(&self) -> Result<bool, anyhow::Error> {
         let pending = {
             let mut dirty = self.local_state.dirty_gossip_tasks.lock().await;
             std::mem::take(&mut *dirty)
         };
         if pending.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
-        for record in pending.into_values() {
-            for event in record.into_events() {
+        let mut retained = HashMap::new();
+        for (task_id, mut record) in pending {
+            for event in record.events() {
                 let message = Message::Task {
                     id: Uuid::new_v4(),
                     event,
@@ -907,9 +918,17 @@ impl TaskManager {
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to flush task gossip: {e}"))?;
             }
+            if record.retain_after_flush() {
+                retained.insert(task_id, record);
+            }
         }
 
-        Ok(())
+        let mut dirty = self.local_state.dirty_gossip_tasks.lock().await;
+        for (task_id, record) in retained {
+            dirty.entry(task_id).or_insert(record);
+        }
+
+        Ok(!dirty.is_empty())
     }
 
     /// Ensures that slots that no longer correspond to running containers are released.
@@ -3047,19 +3066,55 @@ fn task_requires_slots(state: &ContainerState) -> bool {
 
 /// Returns true when a requested phase update would regress lifecycle state due to stale work.
 fn is_stale_phase_regression(current: &ContainerState, requested: &ContainerState) -> bool {
-    matches!(
-        requested,
-        ContainerState::Pending | ContainerState::Pulling | ContainerState::Creating
-    ) && matches!(
-        current,
-        ContainerState::Running
-            | ContainerState::Paused
-            | ContainerState::Stopping
-            | ContainerState::Stopped
-            | ContainerState::Failed
-            | ContainerState::Exited(_)
-            | ContainerState::Unknown
-    )
+    match requested {
+        ContainerState::Pending => matches!(
+            current,
+            ContainerState::Pulling
+                | ContainerState::Creating
+                | ContainerState::Running
+                | ContainerState::Paused
+                | ContainerState::Stopping
+                | ContainerState::Stopped
+                | ContainerState::Failed
+                | ContainerState::Exited(_)
+                | ContainerState::Unknown
+        ),
+        ContainerState::Pulling => matches!(
+            current,
+            ContainerState::Creating
+                | ContainerState::Running
+                | ContainerState::Paused
+                | ContainerState::Stopping
+                | ContainerState::Stopped
+                | ContainerState::Failed
+                | ContainerState::Exited(_)
+                | ContainerState::Unknown
+        ),
+        ContainerState::Creating => matches!(
+            current,
+            ContainerState::Running
+                | ContainerState::Paused
+                | ContainerState::Stopping
+                | ContainerState::Stopped
+                | ContainerState::Failed
+                | ContainerState::Exited(_)
+                | ContainerState::Unknown
+        ),
+        _ => false,
+    }
+}
+
+/// Returns whether one task phase update should become a new cluster-visible gossip event.
+///
+/// The first transition into `Pulling` / `Creating` must still propagate so remote readiness sees
+/// that launch work has started. Later same-state progress updates remain local-only because the
+/// dirty gossip buffer already keeps the latest transition alive across several fanout rounds.
+fn should_gossip_task_phase_update(state_changed: bool, state: &ContainerState) -> bool {
+    if state_changed {
+        return true;
+    }
+
+    !matches!(state, ContainerState::Pulling | ContainerState::Creating)
 }
 
 /// Selects one deterministic winner between two local tasks that currently claim the same

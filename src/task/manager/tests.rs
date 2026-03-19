@@ -992,6 +992,166 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
 }
 
 #[tokio::test]
+async fn same_state_pulling_progress_stays_local_only() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let spec = TaskSpec {
+        id: Uuid::new_v4(),
+        name: "pull-local-only".into(),
+        image: "img".into(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: Vec::new(),
+        node_id: manager.local_node_id,
+        node_name: "local-node".into(),
+        slot_ids: vec![1],
+        slot_id: Some(1),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
+    };
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    manager
+        .update_task_phase(
+            spec.id,
+            ContainerState::Pulling,
+            Some("pulling image".to_string()),
+            Some("1/3".to_string()),
+        )
+        .await
+        .expect("record initial pulling phase");
+    manager
+        .update_task_phase(
+            spec.id,
+            ContainerState::Pulling,
+            Some("pull retry backoff".to_string()),
+            Some("2/3".to_string()),
+        )
+        .await
+        .expect("record pulling progress locally");
+
+    let first_round_pending = manager
+        .flush_dirty_gossip_events()
+        .await
+        .expect("flush buffered gossip");
+    assert!(
+        first_round_pending,
+        "initial pulling transition should stay dirty for wider fanout coverage"
+    );
+
+    let outbound = manager
+        .core
+        .rx
+        .recv()
+        .await
+        .expect("receive initial pulling transition");
+    match outbound {
+        Message::Task {
+            event: TaskEvent::UpsertSpec(outbound_spec),
+            ..
+        } => {
+            assert_eq!(outbound_spec.id, spec.id);
+            assert_eq!(outbound_spec.state, ContainerState::Pulling);
+        }
+        _ => panic!("unexpected outbound message for pulling transition"),
+    }
+
+    let next =
+        tokio::time::timeout(std::time::Duration::from_millis(20), manager.core.rx.recv()).await;
+    assert!(
+        next.is_err(),
+        "same-state pulling progress should not enqueue a second logical gossip event"
+    );
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("reload task after local-only pulling progress");
+    assert_eq!(refreshed.state, ContainerState::Pulling);
+    assert_eq!(
+        refreshed.phase_reason.as_deref(),
+        Some("pull retry backoff")
+    );
+    assert_eq!(refreshed.phase_progress.as_deref(), Some("2/3"));
+}
+
+#[tokio::test]
+async fn dirty_gossip_flush_retries_latest_event_for_bounded_coverage_rounds() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let remote_node = Uuid::new_v4();
+    let now = Utc::now();
+
+    let spec = build_remote_task_spec(
+        task_id,
+        remote_node,
+        ContainerState::Running,
+        2,
+        4,
+        now.to_rfc3339(),
+    );
+    manager
+        .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+        .await
+        .expect("buffer running task");
+
+    for round in 0..TASK_GOSSIP_COVERAGE_ROUNDS {
+        let has_pending = manager
+            .flush_dirty_gossip_events()
+            .await
+            .expect("flush dirty gossip round");
+        assert_eq!(
+            has_pending,
+            round + 1 < TASK_GOSSIP_COVERAGE_ROUNDS,
+            "dirty task retention should expire after the configured coverage rounds"
+        );
+
+        let outbound = manager
+            .core
+            .rx
+            .recv()
+            .await
+            .expect("receive running task gossip");
+        match outbound {
+            Message::Task {
+                event: TaskEvent::UpsertSpec(outbound_spec),
+                ..
+            } => {
+                assert_eq!(outbound_spec.id, task_id);
+                assert_eq!(outbound_spec.state, ContainerState::Running);
+            }
+            _ => panic!("unexpected outbound message for running task"),
+        }
+    }
+
+    let next =
+        tokio::time::timeout(std::time::Duration::from_millis(20), manager.core.rx.recv()).await;
+    assert!(
+        next.is_err(),
+        "coverage rounds should stop once the bounded dirty budget is exhausted"
+    );
+}
+
+#[tokio::test]
 async fn pull_image_for_task_skips_pull_when_image_exists_locally() {
     let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
 
@@ -1291,6 +1451,67 @@ async fn update_task_phase_ignores_stale_regression_from_running() {
         .expect("load refreshed task");
     assert!(matches!(refreshed.state, ContainerState::Running));
     assert_eq!(mock_cm.created.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn update_task_phase_ignores_stale_regression_from_creating_to_pulling() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let spec = TaskSpec {
+        id: Uuid::new_v4(),
+        name: "phase-order".into(),
+        image: "img".into(),
+        state: ContainerState::Creating,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: Vec::new(),
+        node_id: manager.local_node_id,
+        node_name: "local-node".into(),
+        slot_ids: vec![1],
+        slot_id: Some(1),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 1,
+        launch_attempt: 1,
+        last_terminal_observed_launch: None,
+    };
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    let updated = manager
+        .update_task_phase(
+            spec.id,
+            ContainerState::Pulling,
+            Some("pull retry backoff".to_string()),
+            Some("2/3".to_string()),
+        )
+        .await
+        .expect("stale pulling update should not fail");
+
+    assert_eq!(updated.state, ContainerState::Creating);
+    assert_eq!(updated.phase_reason, spec.phase_reason);
+    assert_eq!(updated.phase_progress, spec.phase_progress);
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("reload task after stale pulling update");
+    assert_eq!(refreshed.state, ContainerState::Creating);
+    assert!(refreshed.phase_reason.is_none());
+    assert!(refreshed.phase_progress.is_none());
 }
 
 #[test]
@@ -4577,7 +4798,7 @@ async fn dirty_gossip_flush_keeps_definition_and_latest_status() {
         .await
         .expect("buffer latest task status");
 
-    manager
+    let _ = manager
         .flush_dirty_gossip_events()
         .await
         .expect("flush dirty gossip");

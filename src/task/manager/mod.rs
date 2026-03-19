@@ -53,6 +53,8 @@ const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
 const REMOVE_WATERMARK_RETENTION_SECS: i64 = 30 * 60;
 /// Maximum time one dirty task update may wait before it is flushed into the shared gossip queue.
 const TASK_GOSSIP_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+/// Number of fanout rounds one logical task update should survive before it ages out.
+const TASK_GOSSIP_COVERAGE_ROUNDS: usize = 3;
 
 /// Remove tombstone metadata used to suppress stale task upsert replay.
 #[derive(Clone)]
@@ -66,6 +68,7 @@ struct RemoveTombstone {
 struct DirtyTaskGossipRecord {
     definition: Option<TaskSpec>,
     latest: TaskEvent,
+    remaining_rounds: usize,
 }
 
 impl DirtyTaskGossipRecord {
@@ -78,6 +81,7 @@ impl DirtyTaskGossipRecord {
         Self {
             definition,
             latest: event,
+            remaining_rounds: TASK_GOSSIP_COVERAGE_ROUNDS,
         }
     }
 
@@ -112,22 +116,32 @@ impl DirtyTaskGossipRecord {
                 }
             }
         }
+        self.remaining_rounds = TASK_GOSSIP_COVERAGE_ROUNDS;
     }
 
     /// Expands the buffered outbound state into the concrete events that should be flushed.
-    fn into_events(self) -> Vec<TaskEvent> {
-        match self.latest {
-            TaskEvent::Remove { id } => vec![TaskEvent::Remove { id }],
+    fn events(&self) -> Vec<TaskEvent> {
+        match &self.latest {
+            TaskEvent::Remove { id } => vec![TaskEvent::Remove { id: *id }],
             TaskEvent::UpsertStatus(status) => {
                 let mut events = Vec::with_capacity(2);
-                if let Some(spec) = self.definition {
-                    events.push(TaskEvent::UpsertSpec(Box::new(spec)));
+                if let Some(spec) = self.definition.as_ref() {
+                    events.push(TaskEvent::UpsertSpec(Box::new(spec.clone())));
                 }
-                events.push(TaskEvent::UpsertStatus(status));
+                events.push(TaskEvent::UpsertStatus(status.clone()));
                 events
             }
-            TaskEvent::UpsertSpec(spec) => vec![TaskEvent::UpsertSpec(spec)],
+            TaskEvent::UpsertSpec(spec) => vec![TaskEvent::UpsertSpec(spec.clone())],
         }
+    }
+
+    /// Records one completed flush round and returns true when this logical update needs
+    /// additional fanout rounds for cluster coverage.
+    fn retain_after_flush(&mut self) -> bool {
+        if self.remaining_rounds > 0 {
+            self.remaining_rounds -= 1;
+        }
+        self.remaining_rounds > 0
     }
 }
 
