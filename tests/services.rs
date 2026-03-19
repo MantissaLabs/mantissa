@@ -5206,6 +5206,7 @@ struct ExitSignalContainerManager {
     task_ids_by_container: AsyncMutex<HashMap<String, Uuid>>,
     runtime_events_tx:
         AsyncMutex<Option<tokio::sync::mpsc::UnboundedSender<ContainerRuntimeEvent>>>,
+    pending_runtime_events: AsyncMutex<Vec<ContainerRuntimeEvent>>,
 }
 
 #[async_trait]
@@ -5237,13 +5238,17 @@ impl ContainerManager for ExitSignalContainerManager {
             .await
             .get(container_id)
             .copied();
-        if let Some(task_id) = task_id
-            && let Some(sender) = self.runtime_events_tx.lock().await.clone()
-        {
-            let _ = sender.send(ContainerRuntimeEvent::TaskExited {
+        if let Some(task_id) = task_id {
+            let event = ContainerRuntimeEvent::TaskExited {
                 task_id,
                 exit_code: 255,
-            });
+            };
+            let sender = self.runtime_events_tx.lock().await.clone();
+            if let Some(sender) = sender {
+                let _ = sender.send(event);
+            } else {
+                self.pending_runtime_events.lock().await.push(event);
+            }
         }
 
         Ok(())
@@ -5303,7 +5308,14 @@ impl ContainerManager for ExitSignalContainerManager {
         &self,
         events_tx: tokio::sync::mpsc::UnboundedSender<ContainerRuntimeEvent>,
     ) -> Result<(), ContainerError> {
+        let pending = {
+            let mut pending = self.pending_runtime_events.lock().await;
+            std::mem::take(&mut *pending)
+        };
         *self.runtime_events_tx.lock().await = Some(events_tx.clone());
+        for event in pending {
+            let _ = events_tx.send(event);
+        }
         while !events_tx.is_closed() {
             sleep(Duration::from_millis(50)).await;
         }
