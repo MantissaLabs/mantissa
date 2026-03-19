@@ -50,6 +50,7 @@ use tempfile::tempdir;
 use tokio::sync::{Notify, RwLock, mpsc};
 
 type ExecCall = (String, Vec<String>, Option<std::time::Duration>);
+type LogCall = (String, crate::task::docker::ContainerLogsOptions);
 
 #[derive(Clone, Default)]
 struct MockContainerManager {
@@ -72,6 +73,9 @@ struct MockContainerManager {
     inspect: Arc<AsyncMutex<HashMap<String, bollard::service::ContainerInspectResponse>>>,
     inspect_calls: Arc<AsyncMutex<Vec<String>>>,
     listed: Arc<AsyncMutex<Vec<crate::task::docker::ContainerInfo>>>,
+    log_calls: Arc<AsyncMutex<Vec<LogCall>>>,
+    log_frames: Arc<AsyncMutex<HashMap<String, Vec<crate::task::docker::ContainerLogFrame>>>>,
+    log_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
     present_images: Arc<AsyncMutex<HashSet<String>>>,
     pull_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
     pull_calls: Arc<AsyncMutex<Vec<String>>>,
@@ -203,6 +207,36 @@ impl ContainerManager for MockContainerManager {
         if let Some(err) = self.pull_errors.lock().await.pop_front() {
             return Err(err);
         }
+        Ok(())
+    }
+
+    async fn stream_container_logs(
+        &self,
+        container_id: &str,
+        options: &crate::task::docker::ContainerLogsOptions,
+        logs_tx: tokio::sync::mpsc::Sender<crate::task::docker::ContainerLogFrame>,
+    ) -> crate::task::docker::ContainerResult<()> {
+        self.log_calls
+            .lock()
+            .await
+            .push((container_id.to_string(), options.clone()));
+        if let Some(err) = self.log_errors.lock().await.pop_front() {
+            return Err(err);
+        }
+
+        let frames = self
+            .log_frames
+            .lock()
+            .await
+            .get(container_id)
+            .cloned()
+            .unwrap_or_default();
+        for frame in frames {
+            if logs_tx.send(frame).await.is_err() {
+                return Ok(());
+            }
+        }
+
         Ok(())
     }
 }
@@ -3555,6 +3589,95 @@ async fn task_owned_locally_detects_remote_entries() {
             .task_owned_locally(remote_id)
             .await
             .expect("remote ownership check")
+    );
+}
+
+#[tokio::test]
+async fn stream_local_task_logs_forwards_frames_and_options() {
+    let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let spec = TaskSpec {
+        id: task_id,
+        name: "loggable".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Failed,
+        phase_reason: Some("crashed".to_string()),
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: vec!["/bin/demo".to_string()],
+        node_id: manager.local_node_id,
+        node_name: manager.local_node_name.clone(),
+        slot_ids: Vec::new(),
+        slot_id: None,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 1,
+        last_terminal_observed_launch: None,
+    };
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    let container_name = format!("mantissa-{task_id}");
+    mock_cm.log_frames.lock().await.insert(
+        container_name.clone(),
+        vec![
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::StdOut,
+                message: b"hello stdout\n".to_vec(),
+            },
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::StdErr,
+                message: b"hello stderr\n".to_vec(),
+            },
+        ],
+    );
+
+    let options = crate::task::docker::ContainerLogsOptions {
+        follow: true,
+        stdout: true,
+        stderr: true,
+        timestamps: true,
+        tail: "25".to_string(),
+    };
+    let (logs_tx, mut logs_rx) = tokio::sync::mpsc::channel(8);
+    manager
+        .stream_local_task_logs(task_id, &options, logs_tx)
+        .await
+        .expect("stream local logs");
+
+    let mut frames = Vec::new();
+    while let Some(frame) = logs_rx.recv().await {
+        frames.push(frame);
+    }
+
+    let log_calls = mock_cm.log_calls.lock().await.clone();
+    assert_eq!(log_calls, vec![(container_name, options.clone())]);
+    assert_eq!(
+        frames,
+        vec![
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::StdOut,
+                message: b"hello stdout\n".to_vec(),
+            },
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::StdErr,
+                message: b"hello stderr\n".to_vec(),
+            },
+        ]
     );
 }
 

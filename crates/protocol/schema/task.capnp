@@ -12,6 +12,59 @@ interface Task {
 
   startMany @3 (requests :List(TaskStartRequest)) -> (specs :List(TaskSpec));
   # Start multiple tasks in a batch.
+
+  logs @4 (request :TaskLogsRequest);
+  # Stream one task's container logs into the caller-provided sink.
+}
+
+interface TaskLogSink {
+  pushFrame @0 (frame :TaskLogFrame) -> stream;
+  # Push one ordered log frame while preserving backpressure end to end.
+
+  end @1 ();
+  # Indicates that the requested log stream has finished.
+}
+
+struct TaskLogsRequest {
+  id @0 :Data;
+  # Task UUID v4 as 16 bytes.
+
+  options @1 :TaskLogsOptions;
+  # Stream options mirroring the Docker logs API.
+
+  sink @2 :TaskLogSink;
+  # Sink receiving streamed log frames.
+}
+
+struct TaskLogsOptions {
+  follow @0 :Bool;
+  # Keep the stream open and continue following future log output.
+
+  stdout @1 :Bool;
+  # Include stdout frames in the stream.
+
+  stderr @2 :Bool;
+  # Include stderr frames in the stream.
+
+  timestamps @3 :Bool;
+  # Ask the runtime to prefix each log line with its timestamp when supported.
+
+  tail @4 :Text;
+  # Number of trailing lines to return, or "all".
+}
+
+enum TaskLogStream {
+  stdout @0;
+  stderr @1;
+  console @2;
+}
+
+struct TaskLogFrame {
+  stream @0 :TaskLogStream;
+  # Logical output stream for this frame.
+
+  data @1 :Data;
+  # Raw bytes emitted by the runtime.
 }
 
 struct SecretRef {

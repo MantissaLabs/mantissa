@@ -1,0 +1,305 @@
+#[macro_use]
+mod common;
+
+use async_trait::async_trait;
+use capnp_rpc::new_client as capnp_new_client;
+use chrono::Utc;
+use common::testkit::{ContainerManagerOverrideGuard, TestNode};
+use crdt_store::uuid_key::UuidKey;
+use mantissa::task::container::ContainerState;
+use mantissa::task::docker::{
+    ContainerCreateRequest, ContainerError, ContainerInfo, ContainerLogFrame, ContainerLogStream,
+    ContainerLogsOptions, ContainerManager,
+};
+use mantissa::task::types::{TaskValue, TaskValueDraft};
+use protocol::task::task_log_sink;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
+use uuid::Uuid;
+
+type LogCall = (String, ContainerLogsOptions);
+type CapturedTaskLogFrames = Arc<AsyncMutex<Vec<(String, Vec<u8>)>>>;
+
+#[derive(Clone, Default)]
+struct StaticLogsContainerManager {
+    frames: Arc<AsyncMutex<HashMap<String, Vec<ContainerLogFrame>>>>,
+    calls: Arc<AsyncMutex<Vec<LogCall>>>,
+}
+
+#[async_trait]
+impl ContainerManager for StaticLogsContainerManager {
+    async fn create_container(
+        &self,
+        _request: ContainerCreateRequest,
+    ) -> Result<String, ContainerError> {
+        Ok(Uuid::new_v4().to_string())
+    }
+
+    async fn start_container(&self, _container_id: &str) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    async fn stop_container(
+        &self,
+        _container_id: &str,
+        _timeout: Option<Duration>,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    async fn restart_container(
+        &self,
+        _container_id: &str,
+        _timeout: Option<Duration>,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    async fn remove_container(
+        &self,
+        _container_id: &str,
+        _force: bool,
+        _remove_volumes: bool,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    async fn list_containers(
+        &self,
+        _filters: Option<HashMap<String, Vec<String>>>,
+    ) -> Result<Vec<ContainerInfo>, ContainerError> {
+        Ok(Vec::new())
+    }
+
+    async fn inspect_container(
+        &self,
+        container_id: &str,
+    ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
+        Err(ContainerError::NotFound(container_id.to_string()))
+    }
+
+    async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    async fn stream_container_logs(
+        &self,
+        container_id: &str,
+        options: &ContainerLogsOptions,
+        logs_tx: tokio::sync::mpsc::Sender<ContainerLogFrame>,
+    ) -> Result<(), ContainerError> {
+        self.calls
+            .lock()
+            .await
+            .push((container_id.to_string(), options.clone()));
+
+        let frames = self
+            .frames
+            .lock()
+            .await
+            .get(container_id)
+            .cloned()
+            .unwrap_or_default();
+        for frame in frames {
+            if logs_tx.send(frame).await.is_err() {
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct CollectingTaskLogSink {
+    frames: CapturedTaskLogFrames,
+}
+
+impl task_log_sink::Server for CollectingTaskLogSink {
+    async fn push_frame(
+        self: std::rc::Rc<Self>,
+        params: task_log_sink::PushFrameParams,
+    ) -> Result<(), capnp::Error> {
+        let frame = params.get()?.get_frame()?;
+        let stream = frame
+            .get_stream()
+            .map_err(|_| capnp::Error::failed("unknown task log stream".into()))?;
+        let bytes = frame.get_data()?.to_owned();
+        let label = match stream {
+            protocol::task::TaskLogStream::Stdout => "stdout",
+            protocol::task::TaskLogStream::Stderr => "stderr",
+            protocol::task::TaskLogStream::Console => "console",
+        };
+        self.frames
+            .lock()
+            .await
+            .push((label.to_string(), bytes.as_slice().to_vec()));
+        Ok(())
+    }
+
+    async fn end(
+        self: std::rc::Rc<Self>,
+        _params: task_log_sink::EndParams,
+        _results: task_log_sink::EndResults,
+    ) -> Result<(), capnp::Error> {
+        Ok(())
+    }
+}
+
+/// Builds a stable replicated task value owned by `owner_id` for RPC relay tests.
+fn replicated_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str) -> TaskValue {
+    TaskValue::new(TaskValueDraft {
+        id: task_id,
+        name: "demo-task".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Failed,
+        phase_reason: Some("completed".to_string()),
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: vec!["/bin/demo".to_string()],
+        node_id: owner_id,
+        node_name: owner_name.to_string(),
+        slot_ids: Vec::new(),
+        networks: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 1,
+        last_terminal_observed_launch: Some(1),
+    })
+}
+
+local_test!(task_logs_relay_over_tcp_sessions, {
+    let owner_manager = Arc::new(StaticLogsContainerManager::default());
+    let requester_manager = Arc::new(StaticLogsContainerManager::default());
+    let install_index = Arc::new(AtomicUsize::new(0));
+    let owner_for_factory = owner_manager.clone();
+    let requester_for_factory = requester_manager.clone();
+    let index_for_factory = install_index.clone();
+    let _guard = ContainerManagerOverrideGuard::install_factory(Arc::new(move || {
+        match index_for_factory.fetch_add(1, Ordering::SeqCst) {
+            0 => owner_for_factory.clone() as Arc<dyn ContainerManager + Send + Sync>,
+            1 => requester_for_factory.clone() as Arc<dyn ContainerManager + Send + Sync>,
+            _ => Arc::new(StaticLogsContainerManager::default()),
+        }
+    }));
+
+    let owner = match TestNode::try_new_tcp_with_tick_ms(100).await {
+        Ok(node) => node,
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("Operation not permitted") {
+                eprintln!("skipping task_logs_relay_over_tcp_sessions: {msg}");
+                return;
+            }
+            panic!("failed to start owner node: {msg}");
+        }
+    };
+    let requester = match TestNode::try_new_tcp_with_tick_ms(100).await {
+        Ok(node) => node,
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("Operation not permitted") {
+                eprintln!("skipping task_logs_relay_over_tcp_sessions: {msg}");
+                return;
+            }
+            panic!("failed to start requester node: {msg}");
+        }
+    };
+
+    requester
+        .join(&owner)
+        .await
+        .expect("join requester to owner");
+    owner
+        .assert_cluster_size(2, "owner should see requester")
+        .await;
+    requester
+        .assert_cluster_size(2, "requester should see owner")
+        .await;
+
+    let task_id = Uuid::new_v4();
+    let task_value = replicated_task_value(task_id, owner.id(), "owner-node");
+    owner
+        .node
+        .tasks
+        .upsert(&UuidKey::from(task_id), task_value.clone())
+        .await
+        .expect("seed owner task store");
+    requester
+        .node
+        .tasks
+        .upsert(&UuidKey::from(task_id), task_value)
+        .await
+        .expect("seed requester task store");
+
+    owner_manager.frames.lock().await.insert(
+        format!("mantissa-{task_id}"),
+        vec![
+            ContainerLogFrame {
+                stream: ContainerLogStream::StdOut,
+                message: b"first line\n".to_vec(),
+            },
+            ContainerLogFrame {
+                stream: ContainerLogStream::StdErr,
+                message: b"second line\n".to_vec(),
+            },
+        ],
+    );
+
+    let sink = CollectingTaskLogSink::default();
+    let sink_frames = sink.frames.clone();
+    let sink_client = capnp_new_client(sink);
+    let mut request = requester.node.task_client.logs_request();
+    {
+        let mut builder = request.get().init_request();
+        builder.set_id(task_id.as_bytes());
+        let mut options = builder.reborrow().init_options();
+        options.set_follow(true);
+        options.set_stdout(true);
+        options.set_stderr(true);
+        options.set_timestamps(true);
+        options.set_tail("5");
+        builder.set_sink(sink_client);
+    }
+    request
+        .send()
+        .promise
+        .await
+        .expect("relay log request should succeed");
+
+    assert_eq!(
+        owner_manager.calls.lock().await.clone(),
+        vec![(
+            format!("mantissa-{task_id}"),
+            ContainerLogsOptions {
+                follow: true,
+                stdout: true,
+                stderr: true,
+                timestamps: true,
+                tail: "5".to_string(),
+            },
+        )]
+    );
+    assert_eq!(
+        sink_frames.lock().await.clone(),
+        vec![
+            ("stdout".to_string(), b"first line\n".to_vec()),
+            ("stderr".to_string(), b"second line\n".to_vec()),
+        ]
+    );
+});

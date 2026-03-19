@@ -150,6 +150,21 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     ))
                     .await?;
             }
+            TasksCommand::Logs(args) => {
+                local
+                    .run_until(client::tasks::logs(
+                        &cfg,
+                        &args.id,
+                        &client::tasks::TaskLogsOptions {
+                            follow: args.follow,
+                            tail: &args.tail,
+                            stdout: args.stdout,
+                            stderr: args.stderr,
+                            timestamps: args.timestamps,
+                        },
+                    ))
+                    .await?;
+            }
             TasksCommand::Start(args) => {
                 local
                     .run_until(client::tasks::start(

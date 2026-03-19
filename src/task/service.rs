@@ -1,8 +1,10 @@
+use crate::registry::Registry;
 use crate::task::capnp_codec::{
     decode_env_vars, decode_secret_files, decode_volume_mounts, encode_env_vars,
     encode_secret_files, encode_volume_mounts,
 };
 use crate::task::container::ContainerState;
+use crate::task::docker::{ContainerLogFrame, ContainerLogStream, ContainerLogsOptions};
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
     TaskEvent, TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicy, TaskRestartPolicyKind,
@@ -12,8 +14,8 @@ use crate::topology::Topology;
 use capnp::Error;
 use protocol::gossip::gossip_message;
 use protocol::task::{
-    TaskStateFilter as CapnpTaskStateFilter, task, task_event, task_list_request, task_spec,
-    task_status,
+    TaskLogStream as CapnpTaskLogStream, TaskStateFilter as CapnpTaskStateFilter, task, task_event,
+    task_list_request, task_log_sink, task_logs_options, task_spec, task_status,
 };
 use std::rc::Rc;
 use uuid::Uuid;
@@ -513,15 +515,85 @@ fn read_id_from_data(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
     Ok(Uuid::from_bytes(slice))
 }
 
+/// Encodes task log request options into the wire format shared by local and relayed RPCs.
+fn write_logs_options(mut builder: task_logs_options::Builder<'_>, options: &ContainerLogsOptions) {
+    builder.set_follow(options.follow);
+    builder.set_stdout(options.stdout);
+    builder.set_stderr(options.stderr);
+    builder.set_timestamps(options.timestamps);
+    builder.set_tail(&options.tail);
+}
+
+/// Decodes and validates task log request options from the wire format.
+fn read_logs_options(reader: task_logs_options::Reader<'_>) -> Result<ContainerLogsOptions, Error> {
+    let tail = reader.get_tail()?.to_str()?.trim().to_string();
+    if !tail.eq_ignore_ascii_case("all") && tail.parse::<u64>().is_err() {
+        return Err(Error::failed(format!(
+            "invalid log tail '{tail}': expected a non-negative integer or 'all'"
+        )));
+    }
+
+    let stdout = reader.get_stdout();
+    let stderr = reader.get_stderr();
+
+    Ok(ContainerLogsOptions {
+        follow: reader.get_follow(),
+        stdout: stdout || !stderr,
+        stderr: stderr || !stdout,
+        timestamps: reader.get_timestamps(),
+        tail: if tail.is_empty() || tail.eq_ignore_ascii_case("all") {
+            "all".to_string()
+        } else {
+            tail
+        },
+    })
+}
+
+/// Pushes one runtime log frame into the caller-provided Cap'n Proto sink.
+async fn push_log_frame(
+    sink: &task_log_sink::Client,
+    frame: ContainerLogFrame,
+) -> Result<(), Error> {
+    let mut request = sink.push_frame_request();
+    {
+        let mut builder = request.get().init_frame();
+        builder.set_stream(match frame.stream {
+            ContainerLogStream::StdOut => CapnpTaskLogStream::Stdout,
+            ContainerLogStream::StdErr => CapnpTaskLogStream::Stderr,
+            ContainerLogStream::Console => CapnpTaskLogStream::Console,
+        });
+        builder.set_data(&frame.message);
+    }
+    request.send().await?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct TaskService {
     manager: TaskManager,
     topology: Topology,
+    registry: Registry,
 }
 
 impl TaskService {
-    pub fn new(manager: TaskManager, topology: Topology) -> Self {
-        Self { manager, topology }
+    pub fn new(manager: TaskManager, topology: Topology, registry: Registry) -> Self {
+        Self {
+            manager,
+            topology,
+            registry,
+        }
+    }
+
+    /// Resolves the task capability for a remote peer so ownership-based relays reuse Noise
+    /// protected cluster sessions instead of opening an out-of-band transport.
+    async fn remote_task_client(&self, peer_id: Uuid) -> Result<task::Client, Error> {
+        let session = self
+            .registry
+            .session_for_peer(peer_id)
+            .await
+            .ok_or_else(|| Error::failed(format!("no active session for peer {peer_id}")))?;
+        let response = session.get_task_request().send().promise.await?;
+        response.get()?.get_task()
     }
 }
 
@@ -774,6 +846,59 @@ impl task::Server for TaskService {
         let mut out = results.get();
         let spec_builder = out.reborrow().init_spec();
         write_spec(spec_builder, &spec);
+        Ok(())
+    }
+
+    async fn logs(
+        self: Rc<Self>,
+        params: task::LogsParams,
+        _results: task::LogsResults,
+    ) -> Result<(), Error> {
+        let request = params.get()?.get_request()?;
+        let id = read_id_from_data(request.get_id()?)?;
+        let options = read_logs_options(request.get_options()?)?;
+        let sink = request.get_sink()?;
+        let spec = self
+            .manager
+            .inspect_task(id)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+
+        if spec.node_id != self.manager.local_node_id() {
+            let remote = self.remote_task_client(spec.node_id).await?;
+            let mut request = remote.logs_request();
+            {
+                let mut builder = request.get().init_request();
+                builder.set_id(id.as_bytes());
+                write_logs_options(builder.reborrow().init_options(), &options);
+                builder.set_sink(sink);
+            }
+            request.send().promise.await?;
+            return Ok(());
+        }
+
+        let (logs_tx, mut logs_rx) = tokio::sync::mpsc::channel(1);
+        let manager = self.manager.clone();
+        let options_for_task = options.clone();
+        let producer = tokio::task::spawn_local(async move {
+            manager
+                .stream_local_task_logs(id, &options_for_task, logs_tx)
+                .await
+        });
+
+        while let Some(frame) = logs_rx.recv().await {
+            if let Err(err) = push_log_frame(&sink, frame).await {
+                producer.abort();
+                return Err(err);
+            }
+        }
+
+        producer
+            .await
+            .map_err(|err| Error::failed(format!("task log worker failed: {err}")))?
+            .map_err(|err| Error::failed(err.to_string()))?;
+
+        sink.end_request().send().promise.await?;
         Ok(())
     }
 

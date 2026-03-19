@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::Docker;
+use bollard::container::LogOutput;
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
@@ -18,8 +19,8 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, EventsOptions, InspectContainerOptions,
-    ListContainersOptions, RemoveContainerOptions, RestartContainerOptions, StartContainerOptions,
-    StopContainerOptions,
+    ListContainersOptions, LogsOptionsBuilder, RemoveContainerOptions, RestartContainerOptions,
+    StartContainerOptions, StopContainerOptions,
 };
 use bollard::service::ContainerInspectResponse;
 
@@ -29,7 +30,10 @@ use futures::StreamExt;
 use log::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, mpsc::UnboundedSender};
+use tokio::sync::{
+    Mutex as AsyncMutex,
+    mpsc::{Sender as MpscSender, UnboundedSender},
+};
 
 /// Errors that can occur during container operations
 #[derive(Error, Debug)]
@@ -56,6 +60,63 @@ pub type ContainerResult<T> = Result<T, ContainerError>;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContainerExecResult {
     pub exit_code: Option<i64>,
+}
+
+/// Stream selector used by runtime log frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerLogStream {
+    StdOut,
+    StdErr,
+    Console,
+}
+
+/// One ordered chunk returned by the runtime log stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerLogFrame {
+    pub stream: ContainerLogStream,
+    pub message: Vec<u8>,
+}
+
+/// Request options supported by task/container log streaming.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerLogsOptions {
+    pub follow: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+    pub timestamps: bool,
+    pub tail: String,
+}
+
+impl Default for ContainerLogsOptions {
+    /// Builds Docker-compatible defaults for task log streaming.
+    fn default() -> Self {
+        Self {
+            follow: false,
+            stdout: true,
+            stderr: true,
+            timestamps: false,
+            tail: "all".to_string(),
+        }
+    }
+}
+
+impl ContainerLogsOptions {
+    /// Normalizes operator input so runtimes always receive explicit stream selection.
+    pub fn normalized(&self) -> Self {
+        let mut normalized = self.clone();
+        if !normalized.stdout && !normalized.stderr {
+            normalized.stdout = true;
+            normalized.stderr = true;
+        }
+
+        let tail = normalized.tail.trim();
+        normalized.tail = if tail.is_empty() {
+            "all".to_string()
+        } else {
+            tail.to_string()
+        };
+        normalized
+    }
 }
 
 /// Normalizes low-level Docker API errors into stable container error variants.
@@ -108,6 +169,18 @@ pub trait ContainerManager {
     ) -> ContainerResult<ContainerExecResult> {
         Err(ContainerError::OperationFailed(
             "container exec is not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// Stream ordered container log frames into the provided bounded channel.
+    async fn stream_container_logs(
+        &self,
+        _container_id: &str,
+        _options: &ContainerLogsOptions,
+        _logs_tx: MpscSender<ContainerLogFrame>,
+    ) -> ContainerResult<()> {
+        Err(ContainerError::OperationFailed(
+            "container log streaming is not supported by this runtime".to_string(),
         ))
     }
 
@@ -654,6 +727,20 @@ impl ContainerManager for InMemoryContainerManager {
     async fn pull_image(&self, _image: &str) -> ContainerResult<()> {
         Ok(())
     }
+
+    /// Streams the in-memory runtime's synthetic logs for local test harnesses.
+    async fn stream_container_logs(
+        &self,
+        container_id: &str,
+        _options: &ContainerLogsOptions,
+        _logs_tx: MpscSender<ContainerLogFrame>,
+    ) -> ContainerResult<()> {
+        let Some(_id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -993,6 +1080,49 @@ impl ContainerManager for DockerContainerManager {
         }
 
         info!("Image pulled: {}", image);
+        Ok(())
+    }
+
+    /// Streams Docker log frames while preserving stream identity and follow semantics.
+    async fn stream_container_logs(
+        &self,
+        container_id: &str,
+        options: &ContainerLogsOptions,
+        logs_tx: MpscSender<ContainerLogFrame>,
+    ) -> ContainerResult<()> {
+        let options = options.normalized();
+        let mut stream = self.docker.logs(
+            container_id,
+            Some(
+                LogsOptionsBuilder::new()
+                    .follow(options.follow)
+                    .stdout(options.stdout)
+                    .stderr(options.stderr)
+                    .timestamps(options.timestamps)
+                    .tail(&options.tail)
+                    .build(),
+            ),
+        );
+
+        while let Some(next) = stream.next().await {
+            let frame = next.map_err(|err| classify_container_error(container_id, err))?;
+            let (stream, message) = match frame {
+                LogOutput::StdOut { message } => (ContainerLogStream::StdOut, message.to_vec()),
+                LogOutput::StdErr { message } => (ContainerLogStream::StdErr, message.to_vec()),
+                LogOutput::StdIn { message } | LogOutput::Console { message } => {
+                    (ContainerLogStream::Console, message.to_vec())
+                }
+            };
+
+            if logs_tx
+                .send(ContainerLogFrame { stream, message })
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+
         Ok(())
     }
 

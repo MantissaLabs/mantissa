@@ -1,13 +1,12 @@
 use crate::config::ClientConfig;
 use crate::connection;
 use crate::output;
-use crate::tasks::uuid_from_data;
-use anyhow::{Result, anyhow};
+use crate::tasks::{resolve_task_id, uuid_from_data};
+use anyhow::Result;
 use std::io::Write;
-use uuid::Uuid;
 
 pub async fn stop(cfg: &ClientConfig, id: &str) -> Result<()> {
-    let id = Uuid::parse_str(id).map_err(|e| anyhow!("invalid task id: {e}"))?;
+    let id = resolve_task_id(cfg, id).await?;
 
     let client = connection::get_local_session(cfg).await?;
 

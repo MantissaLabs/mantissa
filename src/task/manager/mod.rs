@@ -9,8 +9,9 @@ use crate::secrets::registry::SecretRegistry;
 use crate::store::task_store::TaskStore;
 use crate::task::causality::{compare_task_causality, should_replace_task_event};
 use crate::task::container::ContainerState;
-use crate::task::docker::ContainerError;
-use crate::task::docker::ContainerManager;
+use crate::task::docker::{
+    ContainerError, ContainerLogFrame, ContainerLogsOptions, ContainerManager,
+};
 use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskLivenessProbe, TaskRestartPolicy, TaskSecretFile,
     TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStatus, TaskValue, TaskValueDraft,
@@ -28,7 +29,10 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, Semaphore, mpsc::UnboundedSender};
+use tokio::sync::{
+    Mutex as AsyncMutex, Notify, RwLock, Semaphore,
+    mpsc::{Sender as MpscSender, UnboundedSender},
+};
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -766,10 +770,48 @@ impl TaskManager {
         self.load_spec(id).await
     }
 
+    /// Returns the stable local node identifier used by ownership-sensitive task workflows.
+    pub fn local_node_id(&self) -> Uuid {
+        self.local_node_id
+    }
+
     #[allow(dead_code)]
     pub async fn task_owned_locally(&self, id: Uuid) -> Result<bool, anyhow::Error> {
         let spec = self.load_spec(id).await?;
         Ok(spec.node_id == self.local_node_id)
+    }
+
+    /// Streams log frames for one locally owned task into the provided bounded channel.
+    ///
+    /// The RPC layer uses this to connect a local runtime log stream to a Cap'n Proto sink
+    /// without exposing transport-specific concerns to the runtime abstraction.
+    pub async fn stream_local_task_logs(
+        &self,
+        id: Uuid,
+        options: &ContainerLogsOptions,
+        logs_tx: MpscSender<ContainerLogFrame>,
+    ) -> Result<(), anyhow::Error> {
+        let spec = self.load_spec(id).await?;
+        if spec.node_id != self.local_node_id {
+            return Err(anyhow!(
+                "task {id} is owned by remote node {}",
+                spec.node_id
+            ));
+        }
+
+        let container_identifier = {
+            let guard = self.local_state.local_containers.lock().await;
+            guard
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("mantissa-{id}"))
+        };
+
+        self.runtime
+            .container_manager
+            .stream_container_logs(&container_identifier, options, logs_tx)
+            .await
+            .map_err(|err| anyhow!("task log stream failed for {id}: {err}"))
     }
 
     /// Requests a task transition into `Stopping` and broadcasts the desired state.

@@ -45,6 +45,23 @@ fn parse_cli_duration(raw: &str) -> Result<Duration, String> {
     }
 }
 
+/// Parses `docker logs`-style tail values (`all` or a non-negative integer).
+fn parse_log_tail(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("tail must not be empty".to_string());
+    }
+
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok("all".to_string());
+    }
+
+    trimmed
+        .parse::<u64>()
+        .map(|_| trimmed.to_string())
+        .map_err(|err| format!("invalid tail '{raw}': {err}"))
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "mantissa",
@@ -320,6 +337,9 @@ pub enum TasksCommand {
     #[command(alias = "ls")]
     List(TasksListArgs),
 
+    /// Stream logs for a task
+    Logs(TasksLogsArgs),
+
     /// Start a container task
     #[command(alias = "run")]
     Start(TasksStartArgs),
@@ -394,8 +414,41 @@ pub struct TasksStartArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct TasksLogsArgs {
+    /// Task ID or unique prefix to stream logs for
+    #[arg(index = 1, value_name = "ID")]
+    pub id: String,
+
+    /// Follow the log stream until the task/container stops
+    #[arg(short = 'f', long = "follow", action = ArgAction::SetTrue)]
+    pub follow: bool,
+
+    /// Number of lines to show from the end of the log, or `all`
+    #[arg(
+        short = 'n',
+        long = "tail",
+        value_name = "LINES",
+        default_value = "all",
+        value_parser = parse_log_tail
+    )]
+    pub tail: String,
+
+    /// Include stdout log frames
+    #[arg(long = "stdout", action = ArgAction::SetTrue)]
+    pub stdout: bool,
+
+    /// Include stderr log frames
+    #[arg(long = "stderr", action = ArgAction::SetTrue)]
+    pub stderr: bool,
+
+    /// Prefix each log line with its timestamp when supported by the runtime
+    #[arg(long = "timestamps", action = ArgAction::SetTrue)]
+    pub timestamps: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct TasksStopArgs {
-    /// Task ID to stop (UUID)
+    /// Task ID or unique prefix to stop
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
 }

@@ -185,6 +185,7 @@ pub(crate) struct Components {
     pub sync_client: protocol::sync::sync::Client,
     pub runtime_health: config::RuntimeHealthConfig,
     pub task_manager: TaskManager,
+    pub task_client: protocol::task::task::Client,
     pub service_controller: ServiceController,
     pub scheduler: Rc<Scheduler>,
     pub scheduler_client: SchedulerClient,
@@ -618,6 +619,9 @@ impl Bootstrap {
             local_volume_root,
             enforce_local_volume_capacity: config::local_volume_enforce_capacity(),
         });
+        let task_service =
+            TaskService::new(task_manager.clone(), topology.clone(), registry.clone());
+        let task_client = capnp_rpc::new_client(task_service);
 
         let service_controller = ServiceController::new(ServiceControllerConfig {
             registry: service_registry.clone(),
@@ -668,6 +672,7 @@ impl Bootstrap {
                 sync_client,
                 runtime_health,
                 task_manager,
+                task_client,
                 service_controller,
                 scheduler,
                 scheduler_client: scheduler_client_cap,
@@ -696,16 +701,12 @@ impl Bootstrap {
         let config = config.with_listen_addr(ctx.listen_addr.clone()).build();
         let topology = comps.topology.clone();
 
-        let task_manager = comps.task_manager.clone();
-        let task_service = TaskService::new(task_manager.clone(), topology.clone());
-        let task_client = capnp_rpc::new_client(task_service);
-
         let clients = ServerClients {
             topology_client: comps.topology_client.clone(),
             gossip_client: comps.gossip_client.clone(),
             sync_client: comps.sync_client.clone(),
             node_client: ctx.node_client.clone(),
-            task_client,
+            task_client: comps.task_client.clone(),
             scheduler_client: comps.scheduler_client.clone(),
             services_client: comps.services_client.clone(),
             secrets_client: comps.secrets_client.clone(),
