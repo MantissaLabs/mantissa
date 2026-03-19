@@ -4539,6 +4539,93 @@ async fn late_full_spec_fills_definition_after_status_placeholder() {
 }
 
 #[tokio::test]
+async fn dirty_gossip_flush_keeps_definition_and_latest_status() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let remote_node = Uuid::new_v4();
+    let now = Utc::now();
+
+    let mut pulling = build_remote_task_spec(
+        task_id,
+        remote_node,
+        ContainerState::Pulling,
+        6,
+        3,
+        now.to_rfc3339(),
+    );
+    pulling.command = vec!["pull".to_string(), "image".to_string()];
+
+    let mut status = build_remote_task_status(&pulling);
+    status.phase_progress = Some("retry 1/2".to_string());
+    status.updated_at = (now + chrono::Duration::seconds(10)).to_rfc3339();
+
+    let mut newer_status = status.clone();
+    newer_status.phase_progress = Some("retry 2/2".to_string());
+    newer_status.updated_at = (now + chrono::Duration::seconds(20)).to_rfc3339();
+
+    manager
+        .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(pulling.clone())))
+        .await
+        .expect("buffer full task definition");
+    manager
+        .enqueue_gossip_best_effort(TaskEvent::UpsertStatus(Box::new(status)))
+        .await
+        .expect("buffer intermediate task status");
+    manager
+        .enqueue_gossip_best_effort(TaskEvent::UpsertStatus(Box::new(newer_status.clone())))
+        .await
+        .expect("buffer latest task status");
+
+    manager
+        .flush_dirty_gossip_events()
+        .await
+        .expect("flush dirty gossip");
+
+    let first = manager
+        .core
+        .rx
+        .recv()
+        .await
+        .expect("receive buffered definition");
+    let second = manager
+        .core
+        .rx
+        .recv()
+        .await
+        .expect("receive buffered latest status");
+
+    match first {
+        Message::Task {
+            event: TaskEvent::UpsertSpec(spec),
+            ..
+        } => {
+            assert_eq!(spec.id, task_id);
+            assert_eq!(spec.command, vec!["pull".to_string(), "image".to_string()]);
+        }
+        _ => panic!("unexpected first flushed message"),
+    }
+
+    match second {
+        Message::Task {
+            event: TaskEvent::UpsertStatus(status),
+            ..
+        } => {
+            assert_eq!(status.id, task_id);
+            assert_eq!(status.phase_progress.as_deref(), Some("retry 2/2"));
+        }
+        _ => panic!("unexpected second flushed message"),
+    }
+
+    let third =
+        tokio::time::timeout(std::time::Duration::from_millis(20), manager.core.rx.recv()).await;
+    assert!(
+        third.is_err(),
+        "dirty gossip flush should collapse intermediate task updates"
+    );
+}
+
+#[tokio::test]
 async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
 

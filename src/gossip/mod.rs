@@ -13,10 +13,7 @@ use crate::secrets::service::{read_secret_event, write_secret_event};
 use crate::secrets::types::SecretEvent;
 use crate::services::service::{read_service_event, write_service_event};
 use crate::services::types::ServiceEvent;
-use crate::task::causality::{
-    should_accept_task_spec, should_accept_task_spec_from_status, should_accept_task_status,
-    should_accept_task_status_from_spec,
-};
+use crate::task::causality::{should_replace_task_event, task_event_id};
 use crate::task::service as task_service;
 use crate::task::types::TaskEvent;
 use crate::topology;
@@ -212,11 +209,7 @@ fn coalesce_pending_messages(pending: Vec<Message>) -> (Vec<Message>, usize) {
 /// Returns the logical task identifier for one gossip message when it carries a task event.
 fn task_message_task_id(message: &Message) -> Option<Uuid> {
     match message {
-        Message::Task { event, .. } => Some(match event {
-            TaskEvent::UpsertSpec(spec) => spec.id,
-            TaskEvent::UpsertStatus(status) => status.id,
-            TaskEvent::Remove { id } => *id,
-        }),
+        Message::Task { event, .. } => Some(task_event_id(event)),
         _ => None,
     }
 }
@@ -237,22 +230,7 @@ fn should_replace_task_message(current: &Message, candidate: &Message) -> bool {
         return false;
     };
 
-    match (current_event, candidate_event) {
-        (TaskEvent::Remove { .. }, TaskEvent::UpsertSpec(_) | TaskEvent::UpsertStatus(_)) => false,
-        (_, TaskEvent::Remove { .. }) => true,
-        (TaskEvent::UpsertSpec(current_spec), TaskEvent::UpsertSpec(candidate_spec)) => {
-            should_accept_task_spec(current_spec, candidate_spec)
-        }
-        (TaskEvent::UpsertSpec(current_spec), TaskEvent::UpsertStatus(candidate_status)) => {
-            should_accept_task_status_from_spec(current_spec, candidate_status)
-        }
-        (TaskEvent::UpsertStatus(current_status), TaskEvent::UpsertSpec(candidate_spec)) => {
-            should_accept_task_spec_from_status(current_status, candidate_spec)
-        }
-        (TaskEvent::UpsertStatus(current_status), TaskEvent::UpsertStatus(candidate_status)) => {
-            should_accept_task_status(current_status, candidate_status)
-        }
-    }
+    should_replace_task_event(current_event, candidate_event)
 }
 
 /// Reads the optional outbound gossip RPC batch cap from the environment.

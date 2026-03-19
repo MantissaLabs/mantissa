@@ -28,8 +28,8 @@ use crate::task::types::{
 
 use super::TaskManager;
 use super::{
-    merge_definition_into_value, merge_status_into_value, select_best_task_value, spec_to_value,
-    value_to_spec,
+    TASK_GOSSIP_FLUSH_INTERVAL, merge_definition_into_value, merge_status_into_value,
+    select_best_task_value, spec_to_value, value_to_spec,
 };
 
 /// Maximum attempts when provisioning one runtime attachment.
@@ -306,8 +306,11 @@ impl TaskManager {
         let mut repair_tick = interval(self.runtime.runtime_config.repair_tick);
         let mut reconcile_tick = interval(self.runtime.runtime_config.reconcile_tick);
         let mut runtime_event_tick = interval(self.runtime.runtime_config.runtime_event_debounce);
+        let mut gossip_flush_tick = interval(TASK_GOSSIP_FLUSH_INTERVAL);
         runtime_event_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        gossip_flush_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut runtime_reconcile_pending = false;
+        let mut gossip_flush_pending = false;
         let (runtime_events_tx, mut runtime_events_rx) = unbounded_channel();
         let mut runtime_events_enabled = self.runtime.container_manager.supports_runtime_events();
         if runtime_events_enabled {
@@ -334,6 +337,15 @@ impl TaskManager {
                 _ = reconcile_tick.tick() => {
                     if let Err(err) = self.reconcile_local_tasks().await {
                         warn!(target: "task", "failed to reconcile local tasks: {err:#}");
+                    }
+                }
+                _ = self.local_state.dirty_gossip_notify.notified() => {
+                    gossip_flush_pending = true;
+                }
+                _ = gossip_flush_tick.tick(), if gossip_flush_pending => {
+                    gossip_flush_pending = false;
+                    if let Err(err) = self.flush_dirty_gossip_events().await {
+                        warn!(target: "task", "failed to flush dirty task gossip: {err:#}");
                     }
                 }
                 event = runtime_events_rx.recv(), if runtime_events_enabled => {

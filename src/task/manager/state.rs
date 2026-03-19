@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use async_channel::{Sender, TrySendError};
+use async_channel::Sender;
 use bollard::models::ContainerStateStatusEnum;
 use chrono::Utc;
 use crdt_store::uuid_key::UuidKey;
@@ -17,7 +17,7 @@ use crate::network::types::{NetworkAttachmentState, NetworkAttachmentValue};
 use crate::scheduler::{
     GpuReservationRequest, SchedulerError, SlotId, SlotReservationRequest, SlotState,
 };
-use crate::task::causality::parse_task_timestamp;
+use crate::task::causality::{parse_task_timestamp, task_event_id};
 use crate::task::container::ContainerState;
 use crate::task::docker::{ContainerError, ContainerInfo};
 use crate::task::types::{
@@ -740,22 +740,12 @@ impl TaskManager {
         } else {
             TaskEvent::UpsertStatus(Box::new(spec_to_status(&spec)))
         };
-        match self.enqueue_gossip_best_effort(event) {
-            Ok(true) => {}
-            Ok(false) => {
-                debug!(
-                    target: "task",
-                    task = %task_id,
-                    "dropping task phase gossip due full queue; anti-entropy will reconcile"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    target: "task",
-                    task = %task_id,
-                    "failed to enqueue task phase gossip: {err}"
-                );
-            }
+        if let Err(err) = self.enqueue_gossip_best_effort(event).await {
+            warn!(
+                target: "task",
+                task = %task_id,
+                "failed to record task phase gossip: {err}"
+            );
         }
         Ok(spec)
     }
@@ -781,24 +771,15 @@ impl TaskManager {
         spec.phase_progress = None;
         spec.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(&spec).await?;
-        match self
+        if let Err(err) = self
             .enqueue_gossip_best_effort(TaskEvent::UpsertStatus(Box::new(spec_to_status(&spec))))
+            .await
         {
-            Ok(true) => {}
-            Ok(false) => {
-                debug!(
-                    target: "task",
-                    task = %task_id,
-                    "dropping terminal observation gossip due full queue; anti-entropy will reconcile"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    target: "task",
-                    task = %task_id,
-                    "failed to enqueue terminal observation gossip: {err}"
-                );
-            }
+            warn!(
+                target: "task",
+                task = %task_id,
+                "failed to record terminal observation gossip: {err}"
+            );
         }
         Ok(spec)
     }
@@ -889,6 +870,46 @@ impl TaskManager {
 
     fn tx(&self) -> Sender<Message> {
         self.core.tx.clone()
+    }
+
+    /// Records the latest outbound gossip event for one task id inside the local dirty buffer.
+    async fn buffer_gossip_event(&self, event: TaskEvent) {
+        let task_id = task_event_id(&event);
+        let mut dirty = self.local_state.dirty_gossip_tasks.lock().await;
+        match dirty.get_mut(&task_id) {
+            Some(current) => current.merge(event),
+            None => {
+                dirty.insert(task_id, super::DirtyTaskGossipRecord::new(event));
+            }
+        }
+        drop(dirty);
+        self.local_state.dirty_gossip_notify.notify_one();
+    }
+
+    /// Drains the current dirty gossip buffer into the shared outbound gossip queue.
+    pub(super) async fn flush_dirty_gossip_events(&self) -> Result<(), anyhow::Error> {
+        let pending = {
+            let mut dirty = self.local_state.dirty_gossip_tasks.lock().await;
+            std::mem::take(&mut *dirty)
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        for record in pending.into_values() {
+            for event in record.into_events() {
+                let message = Message::Task {
+                    id: Uuid::new_v4(),
+                    event,
+                };
+                self.tx()
+                    .send(message)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to flush task gossip: {e}"))?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Ensures that slots that no longer correspond to running containers are released.
@@ -1048,31 +1069,17 @@ impl TaskManager {
 
     /// Pushes a gossip event into the dispatcher queue.
     pub(super) async fn enqueue_gossip(&self, event: TaskEvent) -> Result<(), anyhow::Error> {
-        let id = Uuid::new_v4();
-        let message = Message::Task { id, event };
-        self.tx()
-            .send(message)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to enqueue task gossip: {e}"))
+        self.buffer_gossip_event(event).await;
+        Ok(())
     }
 
-    /// Attempts to enqueue a task gossip event without waiting when the queue is full.
-    ///
-    /// Returns `Ok(true)` when enqueued, `Ok(false)` when dropped due a full queue, and an
-    /// error only when the queue is closed.
-    pub(super) fn enqueue_gossip_best_effort(
+    /// Records one task gossip event without waiting on the shared outbound queue.
+    pub(super) async fn enqueue_gossip_best_effort(
         &self,
         event: TaskEvent,
-    ) -> Result<bool, anyhow::Error> {
-        let id = Uuid::new_v4();
-        let message = Message::Task { id, event };
-        match self.tx().try_send(message) {
-            Ok(()) => Ok(true),
-            Err(TrySendError::Full(_)) => Ok(false),
-            Err(TrySendError::Closed(_)) => Err(anyhow::anyhow!(
-                "failed to enqueue task gossip: queue closed"
-            )),
-        }
+    ) -> Result<(), anyhow::Error> {
+        self.buffer_gossip_event(event).await;
+        Ok(())
     }
 
     /// Performs a graceful stop of a locally owned task and tears down its container.
@@ -1876,19 +1883,17 @@ impl TaskManager {
         container_id: Option<&str>,
         best_effort_gossip: bool,
         update_container_cache: bool,
-    ) -> bool {
-        let mut dropped = false;
+    ) {
         if best_effort_gossip {
-            match self.enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone()))) {
-                Ok(true) => {}
-                Ok(false) => dropped = true,
-                Err(err) => {
-                    warn!(
-                        target: "task",
-                        "failed to enqueue task gossip for {}: {err}",
-                        spec.name
-                    );
-                }
+            if let Err(err) = self
+                .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to record task gossip for {}: {err}",
+                    spec.name
+                );
             }
         } else if let Err(err) = self
             .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(spec.clone())))
@@ -1931,8 +1936,6 @@ impl TaskManager {
                 "failed to publish local volume mounts after running commit: {err:#}"
             );
         }
-
-        dropped
     }
 
     /// Ensures runtime attachments exist for one launched task or rolls back container runtime.

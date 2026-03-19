@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use chrono::Utc;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::gpu::gpu_runtime_status;
 use crate::task::container::ContainerState;
@@ -155,27 +155,17 @@ impl TaskManager {
             .await
             .context("failed to persist pending task specs before launch")?;
 
-        let mut dropped = 0usize;
         for spec in &specs {
-            match self.enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone()))) {
-                Ok(true) => {}
-                Ok(false) => dropped += 1,
-                Err(err) => {
-                    warn!(
-                        target: "task",
-                        "failed to enqueue pending task gossip for {}: {err}",
-                        spec.name
-                    );
-                }
+            if let Err(err) = self
+                .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to record pending task gossip for {}: {err}",
+                    spec.name
+                );
             }
-        }
-        if dropped > 0 {
-            debug!(
-                target: "task",
-                dropped,
-                total = specs.len(),
-                "dropped pending task gossip updates due full queue; anti-entropy will reconcile"
-            );
         }
 
         Ok(specs)
@@ -343,22 +333,9 @@ impl TaskManager {
             .await
             .context("failed to persist committed task specs")?;
 
-        let mut dropped = 0usize;
         for (plan, spec) in plans.iter().zip(specs.iter()) {
-            if self
-                .finalize_running_task_post_commit(spec, plan.container_id.as_deref(), true, true)
-                .await
-            {
-                dropped += 1;
-            }
-        }
-        if dropped > 0 {
-            debug!(
-                target: "task",
-                dropped,
-                total = specs.len(),
-                "dropped committed task gossip updates due full queue; anti-entropy will reconcile"
-            );
+            self.finalize_running_task_post_commit(spec, plan.container_id.as_deref(), true, true)
+                .await;
         }
 
         Ok(specs)

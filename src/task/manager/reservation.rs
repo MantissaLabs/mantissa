@@ -586,27 +586,17 @@ impl TaskManager {
             ));
         }
 
-        let mut dropped = 0usize;
         for (_, spec) in &results {
-            match self.enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone()))) {
-                Ok(true) => {}
-                Ok(false) => dropped += 1,
-                Err(err) => {
-                    warn!(
-                        target: "task",
-                        "failed to enqueue task gossip for {}: {err}",
-                        spec.name
-                    );
-                }
+            if let Err(err) = self
+                .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to record task gossip for {}: {err}",
+                    spec.name
+                );
             }
-        }
-        if dropped > 0 {
-            warn!(
-                target: "task",
-                dropped,
-                total = results.len(),
-                "dropped remote task gossip updates due full queue; anti-entropy will reconcile"
-            );
         }
 
         Ok(results)

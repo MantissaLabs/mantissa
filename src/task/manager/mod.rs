@@ -7,7 +7,7 @@ use crate::scheduler::{Scheduler, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::store::task_store::TaskStore;
-use crate::task::causality::compare_task_causality;
+use crate::task::causality::{compare_task_causality, should_replace_task_event};
 use crate::task::container::ContainerState;
 use crate::task::docker::ContainerError;
 use crate::task::docker::ContainerManager;
@@ -28,7 +28,7 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore, mpsc::UnboundedSender};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, Semaphore, mpsc::UnboundedSender};
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -51,12 +51,84 @@ use self::reservation::{ExecutionError, RemoteReservation, ReservedResources};
 const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
 /// Retention window for remove watermarks used to suppress stale upsert replay.
 const REMOVE_WATERMARK_RETENTION_SECS: i64 = 30 * 60;
+/// Maximum time one dirty task update may wait before it is flushed into the shared gossip queue.
+const TASK_GOSSIP_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Remove tombstone metadata used to suppress stale task upsert replay.
 #[derive(Clone)]
 struct RemoveTombstone {
     watermark: DateTime<Utc>,
     max_epoch: u64,
+}
+
+/// Buffered outbound gossip state for one task id before it enters the shared gossip queue.
+#[derive(Clone)]
+struct DirtyTaskGossipRecord {
+    definition: Option<TaskSpec>,
+    latest: TaskEvent,
+}
+
+impl DirtyTaskGossipRecord {
+    /// Builds one dirty gossip record from the first task event seen for a task id.
+    fn new(event: TaskEvent) -> Self {
+        let definition = match &event {
+            TaskEvent::UpsertSpec(spec) => Some((**spec).clone()),
+            _ => None,
+        };
+        Self {
+            definition,
+            latest: event,
+        }
+    }
+
+    /// Merges one later task event into the buffered outbound state for the same task id.
+    fn merge(&mut self, event: TaskEvent) {
+        match &event {
+            TaskEvent::Remove { .. } => {
+                self.definition = None;
+                self.latest = event;
+            }
+            TaskEvent::UpsertSpec(spec) => {
+                if let Some(current) = self.definition.as_ref() {
+                    let current = TaskEvent::UpsertSpec(Box::new(current.clone()));
+                    if should_replace_task_event(&current, &event) {
+                        self.definition = Some((**spec).clone());
+                    }
+                } else {
+                    self.definition = Some((**spec).clone());
+                }
+
+                if matches!(self.latest, TaskEvent::Remove { .. })
+                    || should_replace_task_event(&self.latest, &event)
+                {
+                    self.latest = event;
+                }
+            }
+            TaskEvent::UpsertStatus(_) => {
+                if matches!(self.latest, TaskEvent::Remove { .. })
+                    || should_replace_task_event(&self.latest, &event)
+                {
+                    self.latest = event;
+                }
+            }
+        }
+    }
+
+    /// Expands the buffered outbound state into the concrete events that should be flushed.
+    fn into_events(self) -> Vec<TaskEvent> {
+        match self.latest {
+            TaskEvent::Remove { id } => vec![TaskEvent::Remove { id }],
+            TaskEvent::UpsertStatus(status) => {
+                let mut events = Vec::with_capacity(2);
+                if let Some(spec) = self.definition {
+                    events.push(TaskEvent::UpsertSpec(Box::new(spec)));
+                }
+                events.push(TaskEvent::UpsertStatus(status));
+                events
+            }
+            TaskEvent::UpsertSpec(spec) => vec![TaskEvent::UpsertSpec(spec)],
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -121,6 +193,10 @@ struct TaskManagerLocalState {
     inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
     // Short-lived remove tombstones used to reject stale post-remove upserts.
     removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, RemoveTombstone>>>,
+    // Per-task dirty gossip buffer collapsed before updates enter the shared gossip queue.
+    dirty_gossip_tasks: Arc<AsyncMutex<HashMap<Uuid, DirtyTaskGossipRecord>>>,
+    // Wake signal used by the runtime loop to flush dirty task gossip promptly.
+    dirty_gossip_notify: Arc<Notify>,
 }
 
 #[derive(Clone)]
@@ -283,6 +359,8 @@ impl TaskManager {
                 inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
                 inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
                 removed_task_watermarks: Arc::new(AsyncMutex::new(HashMap::new())),
+                dirty_gossip_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
+                dirty_gossip_notify: Arc::new(Notify::new()),
             },
             secrets: TaskManagerSecrets {
                 secret_registry,

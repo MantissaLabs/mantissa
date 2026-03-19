@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 use crate::task::container::ContainerState;
-use crate::task::types::{TaskSpec, TaskStatus, TaskValue};
+use crate::task::types::{TaskEvent, TaskSpec, TaskStatus, TaskValue};
 
 /// Holds the task fields that participate in shared causal ordering decisions.
 struct TaskCausalityRecord<'a> {
@@ -148,6 +149,35 @@ pub(crate) fn should_accept_task_status(current: &TaskStatus, candidate: &TaskSt
         task_status_causality_record(candidate),
     )
     .is_gt()
+}
+
+/// Returns the logical task identifier for one task gossip event.
+pub(crate) fn task_event_id(event: &TaskEvent) -> Uuid {
+    match event {
+        TaskEvent::UpsertSpec(spec) => spec.id,
+        TaskEvent::UpsertStatus(status) => status.id,
+        TaskEvent::Remove { id } => *id,
+    }
+}
+
+/// Returns true when a candidate task event should replace the current retained event.
+pub(crate) fn should_replace_task_event(current: &TaskEvent, candidate: &TaskEvent) -> bool {
+    match (current, candidate) {
+        (TaskEvent::Remove { .. }, TaskEvent::UpsertSpec(_) | TaskEvent::UpsertStatus(_)) => false,
+        (_, TaskEvent::Remove { .. }) => true,
+        (TaskEvent::UpsertSpec(current_spec), TaskEvent::UpsertSpec(candidate_spec)) => {
+            should_accept_task_spec(current_spec, candidate_spec)
+        }
+        (TaskEvent::UpsertSpec(current_spec), TaskEvent::UpsertStatus(candidate_status)) => {
+            should_accept_task_status_from_spec(current_spec, candidate_status)
+        }
+        (TaskEvent::UpsertStatus(current_status), TaskEvent::UpsertSpec(candidate_spec)) => {
+            should_accept_task_spec_from_status(current_status, candidate_spec)
+        }
+        (TaskEvent::UpsertStatus(current_status), TaskEvent::UpsertStatus(candidate_status)) => {
+            should_accept_task_status(current_status, candidate_status)
+        }
+    }
 }
 
 /// Parses the freshest available task timestamp for lifecycle ordering decisions.
