@@ -1782,81 +1782,133 @@ local_test!(services_node_drain_blocks_on_standalone_task, {
     );
 });
 
-local_test!(services_node_drain_blocks_while_service_is_deploying, {
-    let _guard = ContainerManagerOverrideGuard::install_factory(Arc::new(
-        || -> Arc<dyn ContainerManager + Send + Sync> {
-            Arc::new(SlowCreateContainerManager::default())
-        },
-    ));
+local_test!(
+    services_node_drain_while_service_is_deploying_converges_evacuation,
+    {
+        let _guard = ContainerManagerOverrideGuard::install_factory(Arc::new(
+            || -> Arc<dyn ContainerManager + Send + Sync> {
+                Arc::new(SlowCreateContainerManager::default())
+            },
+        ));
 
-    let cfg = ClusterConfig {
-        sync_tick_ms: Some(100),
-        gossip_tick_ms: Some(100),
-        gossip_fanout: Some(2),
-        ..ClusterConfig::default()
-    };
-    let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
-        .await
-        .expect("cluster should start");
-    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes").await;
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
+            .await;
 
-    let service_name = "drain-deploying";
-    let service_id = cluster[0]
-        .node
-        .service_controller
-        .submit_deployment(
-            Uuid::new_v4(),
-            service_name,
-            service_name,
-            vec![demo_backend_task_template("backend", 1)],
-        )
-        .await
-        .expect("submit slow deployment");
-
-    let deploying_deadline = Instant::now() + Duration::from_secs(10);
-    let mut deployment_target = None;
-    while Instant::now() < deploying_deadline {
-        if let Some(spec) = cluster[0]
+        let service_name = "drain-deploying";
+        let service_id = cluster[0]
             .node
             .service_controller
-            .registry()
-            .get(service_id)
-            .expect("load slow service")
-            && spec.status() == ServiceStatus::Deploying
-            && let Some(task_id) = spec.task_ids.first().copied()
-            && let Ok(task) = cluster[0].node.task_manager.inspect_task(task_id).await
-        {
-            deployment_target = Some((task.node_id, task_id));
-            break;
+            .submit_deployment(
+                Uuid::new_v4(),
+                service_name,
+                service_name,
+                vec![demo_backend_task_template("backend", 1)],
+            )
+            .await
+            .expect("submit slow deployment");
+
+        let deploying_deadline = Instant::now() + Duration::from_secs(10);
+        let mut deployment_target = None;
+        while Instant::now() < deploying_deadline {
+            if let Some(spec) = cluster[0]
+                .node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("load slow service")
+                && spec.status() == ServiceStatus::Deploying
+                && let Some(task_id) = spec.task_ids.first().copied()
+                && let Ok(task) = cluster[0].node.task_manager.inspect_task(task_id).await
+            {
+                deployment_target = Some((task.node_id, task_id));
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
         }
-        sleep(Duration::from_millis(100)).await;
-    }
-    let (drained_node_id, task_id) = deployment_target
-        .expect("service should remain deploying long enough to test drain blocker");
+        let (drained_node_id, task_id) = deployment_target
+            .expect("service should remain deploying long enough to test drain convergence");
+        let drain_requester = if drained_node_id == cluster[0].id() {
+            &cluster[1]
+        } else {
+            &cluster[0]
+        };
 
-    let err = drain_node_via_topology(
-        &cluster[1].topology(),
-        drained_node_id,
-        "deploying maintenance",
-    )
-    .await
-    .expect_err("drain should reject deploying service");
-    assert!(
-        err.to_string().contains("cannot drain while service"),
-        "deploying drain blocker should explain the rejection: {err}"
-    );
-
-    let task = cluster[0]
-        .node
-        .task_manager
-        .inspect_task(task_id)
+        drain_node_via_topology(
+            &drain_requester.topology(),
+            drained_node_id,
+            "deploying maintenance",
+        )
         .await
-        .expect("inspect deploying task after rejected drain");
-    assert_eq!(
-        task.node_id, drained_node_id,
-        "rejected drain should leave the deploying task assignment unchanged"
-    );
-});
+        .expect("drain should be accepted and converge while deployment is still active");
+        let fenced = wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            || async {
+                matches!(
+                    drain_status_via_topology(&drain_requester.topology(), drained_node_id)
+                        .await
+                        .ok(),
+                    Some(status) if status.drain_requested && !status.schedulable
+                )
+            },
+        )
+        .await;
+        assert!(
+            fenced,
+            "drain should fence the target node even when submitted during deployment"
+        );
+
+        let drained_node = cluster
+            .iter()
+            .find(|node| node.id() == drained_node_id)
+            .expect("drained node should belong to cluster");
+        let evacuated = wait_until(
+            Duration::from_secs(20),
+            Duration::from_millis(100),
+            || async {
+                let task = cluster[0]
+                    .node
+                    .task_manager
+                    .inspect_task(task_id)
+                    .await
+                    .ok();
+                let local_drained = list_local_active_service_tasks(
+                    &drained_node.node.task_manager,
+                    service_name,
+                    drained_node_id,
+                )
+                .await
+                .is_empty();
+
+                matches!(task, Some(task) if task.node_id != drained_node_id && local_drained)
+            },
+        )
+        .await;
+        assert!(
+            evacuated,
+            "draining during deployment should evacuate the task away from the drained node"
+        );
+
+        assert!(
+            wait_for_service_status(
+                &cluster[0].node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "service should still converge to running after the deploy-time drain"
+        );
+    }
+);
 
 local_test!(services_node_drain_reports_capacity_blocker, {
     let _guard = ContainerManagerOverrideGuard::install_default();

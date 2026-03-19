@@ -918,8 +918,8 @@ impl Topology {
     /// Rejects drain requests that the current service/task control plane cannot evacuate safely.
     ///
     /// Milestone 2 supports service-managed evacuation only. Standalone tasks, orphaned service
-    /// metadata, and active service transitions must fail fast so operators do not strand work on
-    /// a fenced node.
+    /// metadata, and service shutdown workflows still fail fast so operators do not strand work on
+    /// a fenced node while the cluster is trying to stop it.
     fn validate_node_drain_request(&self, node_id: Uuid) -> Result<(), capnp::Error> {
         if self.registry.peer_value_unscoped(node_id).is_none() {
             return Err(capnp::Error::failed(format!("unknown node {node_id}")));
@@ -970,10 +970,7 @@ impl Topology {
                     task.id, meta.service_name
                 )));
             };
-            if matches!(
-                spec.status(),
-                ServiceStatus::Deploying | ServiceStatus::Stopping
-            ) {
+            if matches!(spec.status(), ServiceStatus::Stopping) {
                 return Err(capnp::Error::failed(format!(
                     "node {node_id} cannot drain while service '{}' is {:?}",
                     spec.service_name,
@@ -1055,10 +1052,7 @@ impl Topology {
                     task.id, meta.service_name
                 ));
             };
-            if matches!(
-                spec.status(),
-                ServiceStatus::Deploying | ServiceStatus::Stopping
-            ) {
+            if matches!(spec.status(), ServiceStatus::Stopping) {
                 return Some(format!(
                     "drain blocked because service '{}' is {:?}",
                     spec.service_name,
