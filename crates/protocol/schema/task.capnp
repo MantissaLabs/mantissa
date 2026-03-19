@@ -147,6 +147,53 @@ struct TaskSpec {
   # Optional local liveness probe executed by the hosting runtime.
 }
 
+struct TaskStatus {
+  id @0 :Data;
+  # Task UUID v4 as 16 bytes.
+
+  name @1 :Text;
+  # Human-readable task name.
+
+  image @2 :Text;
+  # Container image or binary identifier.
+
+  state @3 :Text;
+  # Current runtime state label.
+
+  createdAt @4 :Text;
+  # RFC3339 timestamp when the task was created.
+
+  updatedAt @5 :Text;
+  # RFC3339 timestamp when the task was last updated.
+
+  nodeId @6 :Data;
+  # 16-byte UUID of the node hosting the task.
+
+  nodeName @7 :Text;
+  # Human-readable name of the hosting node.
+
+  serviceMetadata @8 :ServiceMetadata;
+  # Optional service ownership metadata.
+
+  phaseReason @9 :Text;
+  # Optional current lifecycle phase reason.
+
+  phaseProgress @10 :Text;
+  # Optional current lifecycle phase progress marker.
+
+  taskEpoch @11 :UInt64;
+  # Assignment generation for this task identity.
+
+  phaseVersion @12 :UInt64;
+  # Monotonic lifecycle version incremented on each task state transition.
+
+  launchAttempt @13 :UInt64;
+  # Monotonic launch attempt for this task incarnation.
+
+  lastTerminalObservedLaunch @14 :UInt64;
+  # Last launch attempt observed as terminal, 0 means unset.
+}
+
 struct ServiceMetadata {
   serviceName @0 :Text;
   # Name of the service that owns the task.
@@ -292,13 +339,22 @@ struct TaskEvent {
   # Type of task event.
 
   spec @1 :TaskSpec;
-  # Task specification payload.
+  # Full task definition payload.
+
+  status @2 :TaskStatus;
+  # Compact task lifecycle status payload.
+
+  id @3 :Data;
+  # Task identifier for remove events.
 
   enum EventType {
-    upsert @0;
-    # Task created or updated.
+    upsertSpec @0;
+    # Task created or updated with the full task definition.
 
-    remove @1;
+    upsertStatus @1;
+    # Task lifecycle update carrying only the mutable status fields.
+
+    remove @2;
     # Task removed.
   }
 }

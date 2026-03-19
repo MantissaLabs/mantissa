@@ -60,8 +60,59 @@ pub struct TaskSpec {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskStatus {
+    pub id: Uuid,
+    pub name: String,
+    pub image: String,
+    pub state: ContainerState,
+    #[serde(default)]
+    pub phase_reason: Option<String>,
+    #[serde(default)]
+    pub phase_progress: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    pub node_id: Uuid,
+    pub node_name: String,
+    #[serde(default)]
+    pub service_metadata: Option<TaskServiceMetadata>,
+    #[serde(default)]
+    pub task_epoch: u64,
+    #[serde(default)]
+    pub phase_version: u64,
+    #[serde(default)]
+    pub launch_attempt: u64,
+    #[serde(default)]
+    pub last_terminal_observed_launch: Option<u64>,
+}
+
+impl TaskStatus {
+    /// Builds the compact lifecycle payload used for hot task-state gossip updates.
+    pub fn from_spec(spec: &TaskSpec) -> Self {
+        Self {
+            id: spec.id,
+            name: spec.name.clone(),
+            image: spec.image.clone(),
+            state: spec.state.clone(),
+            phase_reason: spec.phase_reason.clone(),
+            phase_progress: spec.phase_progress.clone(),
+            created_at: spec.created_at.clone(),
+            updated_at: spec.updated_at.clone(),
+            node_id: spec.node_id,
+            node_name: spec.node_name.clone(),
+            service_metadata: spec.service_metadata.clone(),
+            task_epoch: spec.task_epoch,
+            phase_version: spec.phase_version,
+            launch_attempt: spec.launch_attempt,
+            last_terminal_observed_launch: spec.last_terminal_observed_launch,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TaskEvent {
-    Upsert(Box<TaskSpec>),
+    UpsertSpec(Box<TaskSpec>),
+    UpsertStatus(Box<TaskStatus>),
     Remove { id: Uuid },
 }
 
@@ -205,6 +256,8 @@ pub struct TaskValue {
     pub launch_attempt: u64,
     #[serde(default)]
     pub last_terminal_observed_launch: Option<u64>,
+    #[serde(default = "default_task_value_definition_complete")]
+    pub definition_complete: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -273,8 +326,14 @@ impl TaskValue {
             phase_version: draft.phase_version,
             launch_attempt: draft.launch_attempt,
             last_terminal_observed_launch: draft.last_terminal_observed_launch,
+            definition_complete: true,
         }
     }
+}
+
+/// Returns the persisted default for task values that were written from a full task definition.
+fn default_task_value_definition_complete() -> bool {
+    true
 }
 
 /// Default liveness probe interval in milliseconds.

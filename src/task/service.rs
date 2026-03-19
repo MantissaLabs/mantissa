@@ -6,13 +6,14 @@ use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
     TaskEvent, TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicy, TaskRestartPolicyKind,
-    TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStateKind,
+    TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStateKind, TaskStatus,
 };
 use crate::topology::Topology;
 use capnp::Error;
 use protocol::gossip::gossip_message;
 use protocol::task::{
     TaskStateFilter as CapnpTaskStateFilter, task, task_event, task_list_request, task_spec,
+    task_status,
 };
 use std::rc::Rc;
 use uuid::Uuid;
@@ -144,6 +145,34 @@ fn decode_restart_policy(
     })
 }
 
+/// Encodes optional service ownership metadata into a task wire payload.
+fn write_service_metadata(
+    mut builder: protocol::task::service_metadata::Builder<'_>,
+    metadata: Option<&TaskServiceMetadata>,
+) {
+    if let Some(metadata) = metadata {
+        builder.set_service_name(&metadata.service_name);
+        builder.set_template_name(&metadata.template);
+        return;
+    }
+
+    builder.set_service_name("");
+    builder.set_template_name("");
+}
+
+/// Decodes optional service ownership metadata from a task wire payload.
+fn read_service_metadata(
+    reader: protocol::task::service_metadata::Reader<'_>,
+) -> Result<Option<TaskServiceMetadata>, Error> {
+    let service_name = reader.get_service_name()?.to_str()?.to_string();
+    let template = reader.get_template_name()?.to_str()?.to_string();
+    if service_name.is_empty() || template.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(TaskServiceMetadata::new(service_name, template)))
+}
+
 pub fn add_event(
     list: &mut capnp::struct_list::Builder<gossip_message::Owned>,
     index: u32,
@@ -153,54 +182,96 @@ pub fn add_event(
     let mut task = msg.init_task();
 
     match event {
-        TaskEvent::Upsert(spec) => {
-            task.set_event(task_event::EventType::Upsert);
+        TaskEvent::UpsertSpec(spec) => {
+            task.set_event(task_event::EventType::UpsertSpec);
             write_spec(task.reborrow().init_spec(), spec.as_ref());
+        }
+        TaskEvent::UpsertStatus(status) => {
+            task.set_event(task_event::EventType::UpsertStatus);
+            write_status(task.reborrow().init_status(), status.as_ref());
         }
         TaskEvent::Remove { id } => {
             task.set_event(task_event::EventType::Remove);
-            let mut spec_builder = task.reborrow().init_spec();
-            spec_builder.set_id(id.as_bytes());
-            spec_builder.set_name("");
-            spec_builder.set_image("");
-            spec_builder.set_state("unknown");
-            spec_builder.set_created_at("");
-            spec_builder.set_updated_at("");
-            spec_builder.set_phase_reason("");
-            spec_builder.set_phase_progress("");
-            spec_builder.set_task_epoch(0);
-            spec_builder.set_phase_version(0);
-            spec_builder.set_launch_attempt(0);
-            spec_builder.set_last_terminal_observed_launch(0);
-            spec_builder.set_node_id(&[0u8; 16]);
-            spec_builder.set_node_name("");
-            spec_builder.reborrow().init_slot_ids(0);
-            spec_builder.set_cpu_millis(0);
-            spec_builder.set_memory_bytes(0);
-            spec_builder.set_gpu_count(0);
-            spec_builder.reborrow().init_gpu_device_ids(0);
-            spec_builder.reborrow().init_command(0);
-            spec_builder.reborrow().init_env(0);
-            spec_builder.reborrow().init_secret_files(0);
-            spec_builder.reborrow().init_networks(0);
+            task.set_id(id.as_bytes());
         }
     }
 }
 
 pub fn read_event(reader: task_event::Reader) -> Result<TaskEvent, Error> {
     let event = reader.get_event()?;
-    let spec_reader = reader.get_spec()?;
 
     match event {
-        task_event::EventType::Upsert => {
+        task_event::EventType::UpsertSpec => {
+            let spec_reader = reader.get_spec()?;
             let spec = read_spec(spec_reader)?;
-            Ok(TaskEvent::Upsert(Box::new(spec)))
+            Ok(TaskEvent::UpsertSpec(Box::new(spec)))
+        }
+        task_event::EventType::UpsertStatus => {
+            let status_reader = reader.get_status()?;
+            let status = read_status(status_reader)?;
+            Ok(TaskEvent::UpsertStatus(Box::new(status)))
         }
         task_event::EventType::Remove => {
-            let id = read_spec_id(spec_reader)?;
+            let id = read_id_from_data(reader.get_id()?)?;
             Ok(TaskEvent::Remove { id })
         }
     }
+}
+
+/// Encodes one compact task lifecycle status into the task gossip payload.
+pub fn write_status(mut builder: task_status::Builder<'_>, status: &TaskStatus) {
+    builder.set_id(status.id.as_bytes());
+    builder.set_name(&status.name);
+    builder.set_image(&status.image);
+    builder.set_state(state_to_str(&status.state));
+    builder.set_created_at(&status.created_at);
+    builder.set_updated_at(&status.updated_at);
+    builder.set_node_id(status.node_id.as_bytes());
+    builder.set_node_name(&status.node_name);
+    write_service_metadata(
+        builder.reborrow().init_service_metadata(),
+        status.service_metadata.as_ref(),
+    );
+    builder.set_phase_reason(status.phase_reason.as_deref().unwrap_or(""));
+    builder.set_phase_progress(status.phase_progress.as_deref().unwrap_or(""));
+    builder.set_task_epoch(status.task_epoch);
+    builder.set_phase_version(status.phase_version);
+    builder.set_launch_attempt(status.launch_attempt);
+    builder.set_last_terminal_observed_launch(status.last_terminal_observed_launch.unwrap_or(0));
+}
+
+/// Decodes one compact task lifecycle status from the task gossip payload.
+pub fn read_status(reader: task_status::Reader<'_>) -> Result<TaskStatus, Error> {
+    Ok(TaskStatus {
+        id: read_id_from_data(reader.get_id()?)?,
+        name: reader.get_name()?.to_str()?.to_string(),
+        image: reader.get_image()?.to_str()?.to_string(),
+        state: state_from_str(reader.get_state()?.to_str()?),
+        phase_reason: {
+            let reason = reader.get_phase_reason()?.to_str()?.to_string();
+            (!reason.is_empty()).then_some(reason)
+        },
+        phase_progress: {
+            let progress = reader.get_phase_progress()?.to_str()?.to_string();
+            (!progress.is_empty()).then_some(progress)
+        },
+        created_at: reader.get_created_at()?.to_str()?.to_string(),
+        updated_at: reader.get_updated_at()?.to_str()?.to_string(),
+        node_id: read_id_from_data(reader.get_node_id()?)?,
+        node_name: reader.get_node_name()?.to_str()?.to_string(),
+        service_metadata: if reader.has_service_metadata() {
+            read_service_metadata(reader.get_service_metadata()?)?
+        } else {
+            None
+        },
+        task_epoch: reader.get_task_epoch(),
+        phase_version: reader.get_phase_version(),
+        launch_attempt: reader.get_launch_attempt(),
+        last_terminal_observed_launch: match reader.get_last_terminal_observed_launch() {
+            0 => None,
+            value => Some(value),
+        },
+    })
 }
 
 pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {

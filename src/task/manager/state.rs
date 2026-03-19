@@ -28,7 +28,7 @@ use crate::volumes::LocalVolumeAccessError;
 
 use super::{
     TaskManager, container_remove_in_progress, launch::ContainerLaunchRequest,
-    select_best_task_value, spec_to_value, value_to_spec,
+    select_best_task_value, spec_to_status, spec_to_value, value_to_spec,
 };
 
 /// Snapshot of containers currently known by the local runtime.
@@ -172,7 +172,7 @@ impl TaskManager {
                 working.updated_at = Utc::now().to_rfc3339();
                 self.persist_spec(working).await?;
                 if let Err(err) = self
-                    .enqueue_gossip(TaskEvent::Upsert(Box::new(working.clone())))
+                    .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(working.clone())))
                     .await
                 {
                     warn!(
@@ -355,7 +355,7 @@ impl TaskManager {
         working.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(working).await?;
         if let Err(err) = self
-            .enqueue_gossip(TaskEvent::Upsert(Box::new(working.clone())))
+            .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(working.clone())))
             .await
         {
             warn!(
@@ -579,10 +579,18 @@ impl TaskManager {
     /// Persists one task snapshot in the backing store.
     pub(super) async fn persist_spec(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
         let value = spec_to_value(spec);
+        self.persist_value(spec.id, &value).await
+    }
 
+    /// Persists one task CRDT value in the backing store after local or remote merge decisions.
+    pub(super) async fn persist_value(
+        &self,
+        task_id: Uuid,
+        value: &TaskValue,
+    ) -> Result<(), anyhow::Error> {
         self.core
             .store
-            .upsert(&UuidKey::from(spec.id), value)
+            .upsert(&UuidKey::from(task_id), value.clone())
             .await
             .map_err(|e| anyhow::anyhow!("task upsert failed: {e}"))
     }
@@ -714,7 +722,8 @@ impl TaskManager {
             return Ok(spec);
         }
 
-        if spec.state != state {
+        let state_changed = spec.state != state;
+        if state_changed {
             spec.phase_version = spec.phase_version.saturating_add(1);
             if matches!(state, ContainerState::Pulling) {
                 // Pulling marks the start of one concrete launch attempt.
@@ -726,7 +735,12 @@ impl TaskManager {
         spec.phase_progress = next_progress;
         spec.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(&spec).await?;
-        match self.enqueue_gossip_best_effort(TaskEvent::Upsert(Box::new(spec.clone()))) {
+        let event = if state_changed {
+            TaskEvent::UpsertSpec(Box::new(spec.clone()))
+        } else {
+            TaskEvent::UpsertStatus(Box::new(spec_to_status(&spec)))
+        };
+        match self.enqueue_gossip_best_effort(event) {
             Ok(true) => {}
             Ok(false) => {
                 debug!(
@@ -767,7 +781,9 @@ impl TaskManager {
         spec.phase_progress = None;
         spec.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(&spec).await?;
-        match self.enqueue_gossip_best_effort(TaskEvent::Upsert(Box::new(spec.clone()))) {
+        match self
+            .enqueue_gossip_best_effort(TaskEvent::UpsertStatus(Box::new(spec_to_status(&spec))))
+        {
             Ok(true) => {}
             Ok(false) => {
                 debug!(
@@ -1096,7 +1112,7 @@ impl TaskManager {
             updated.phase_progress = None;
             updated.updated_at = Utc::now().to_rfc3339();
             self.persist_spec(&updated).await?;
-            self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
+            self.enqueue_gossip(TaskEvent::UpsertSpec(Box::new(updated.clone())))
                 .await?;
         }
 
@@ -1136,7 +1152,7 @@ impl TaskManager {
                 if updated.state != ContainerState::Stopping {
                     updated.updated_at = Utc::now().to_rfc3339();
                     self.persist_spec(&updated).await?;
-                    self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
+                    self.enqueue_gossip(TaskEvent::UpsertSpec(Box::new(updated.clone())))
                         .await?;
                 }
                 return Err(anyhow::anyhow!("docker stop failed: {e}"));
@@ -1205,7 +1221,7 @@ impl TaskManager {
         }
 
         self.persist_spec(&updated).await?;
-        self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
+        self.enqueue_gossip(TaskEvent::UpsertSpec(Box::new(updated.clone())))
             .await?;
         self.cleanup_orphaned_slots().await;
         self.remove_spec(id).await?;
@@ -1393,7 +1409,7 @@ impl TaskManager {
                 task_id
             );
         } else if let Err(err) = self
-            .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+            .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(spec.clone())))
             .await
         {
             warn!(
@@ -1483,7 +1499,7 @@ impl TaskManager {
                 task_id
             );
         } else if let Err(err) = self
-            .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+            .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(spec.clone())))
             .await
         {
             warn!(
@@ -1738,7 +1754,7 @@ impl TaskManager {
             working.updated_at = Utc::now().to_rfc3339();
             self.persist_spec(&working).await?;
             if let Err(err) = self
-                .enqueue_gossip(TaskEvent::Upsert(Box::new(working.clone())))
+                .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(working.clone())))
                 .await
             {
                 warn!(
@@ -1863,7 +1879,7 @@ impl TaskManager {
     ) -> bool {
         let mut dropped = false;
         if best_effort_gossip {
-            match self.enqueue_gossip_best_effort(TaskEvent::Upsert(Box::new(spec.clone()))) {
+            match self.enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone()))) {
                 Ok(true) => {}
                 Ok(false) => dropped = true,
                 Err(err) => {
@@ -1875,7 +1891,7 @@ impl TaskManager {
                 }
             }
         } else if let Err(err) = self
-            .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+            .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(spec.clone())))
             .await
         {
             warn!(
@@ -2959,7 +2975,7 @@ impl TaskManager {
                 continue;
             }
             if let Err(err) = self
-                .enqueue_gossip(TaskEvent::Upsert(Box::new(spec.clone())))
+                .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(spec.clone())))
                 .await
             {
                 warn!(

@@ -19,13 +19,18 @@ use crate::network::types::{
     compute_network_attachment_id,
 };
 use crate::network::wireguard;
-use crate::task::causality::compare_task_causality;
+use crate::task::causality::{compare_task_causality, compare_task_status_causality};
 use crate::task::container::ContainerState;
 use crate::task::docker::ContainerRuntimeEvent;
-use crate::task::types::{TaskEvent, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec};
+use crate::task::types::{
+    TaskEvent, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec, TaskStatus,
+};
 
 use super::TaskManager;
-use super::{select_best_task_value, spec_to_value};
+use super::{
+    merge_definition_into_value, merge_status_into_value, select_best_task_value, spec_to_value,
+    value_to_spec,
+};
 
 /// Maximum attempts when provisioning one runtime attachment.
 const ATTACHMENT_PROVISION_MAX_ATTEMPTS: usize = 4;
@@ -468,7 +473,7 @@ impl TaskManager {
     /// Handles a gossip event by updating local state and reconciling as needed.
     pub(super) async fn handle_event(&self, event: TaskEvent) -> Result<(), anyhow::Error> {
         match event {
-            TaskEvent::Upsert(spec_box) => {
+            TaskEvent::UpsertSpec(spec_box) => {
                 let spec = *spec_box;
                 if self.should_ignore_removed_upsert(&spec).await {
                     debug!(
@@ -480,6 +485,7 @@ impl TaskManager {
                     return Ok(());
                 }
                 let incoming = spec_to_value(&spec);
+                let mut persisted = incoming.clone();
                 if let Some(snapshot) = self
                     .core
                     .store
@@ -488,7 +494,14 @@ impl TaskManager {
                     && let Some(current) = select_best_task_value(snapshot.as_slice())
                 {
                     let ordering = compare_task_causality(&current, &incoming);
-                    if !ordering.is_gt() {
+                    if ordering.is_gt() {
+                        persisted = incoming;
+                    } else if !current.definition_complete && current.task_epoch == spec.task_epoch
+                    {
+                        // A compact status update may have arrived first. In that case we keep
+                        // its newer lifecycle fields and fill in the missing static definition.
+                        persisted = merge_definition_into_value(&current, &spec);
+                    } else {
                         debug!(
                             target: "task",
                             task = %spec.id,
@@ -503,15 +516,17 @@ impl TaskManager {
                         return Ok(());
                     }
                 }
-                let belongs = spec.node_id == self.local_node_id;
-                self.persist_spec(&spec).await?;
+                let persisted_spec = value_to_spec(spec.id, persisted.clone());
+                let belongs = persisted_spec.node_id == self.local_node_id;
+                self.persist_value(spec.id, &persisted).await?;
 
                 if belongs {
-                    let Some(reconcile_guard) = self.try_begin_reconcile(spec.id).await else {
+                    let Some(reconcile_guard) = self.try_begin_reconcile(persisted_spec.id).await
+                    else {
                         return Ok(());
                     };
                     let manager = self.clone();
-                    let spec_for_reconcile = spec.clone();
+                    let spec_for_reconcile = persisted_spec.clone();
                     tokio::task::spawn_local(async move {
                         let _reconcile_guard = reconcile_guard;
                         if let Err(err) = manager
@@ -525,12 +540,80 @@ impl TaskManager {
                             );
                         }
                     });
-                } else if !matches!(spec.state, ContainerState::Running) {
+                } else if !matches!(persisted_spec.state, ContainerState::Running) {
                     self.local_state
                         .local_containers
                         .lock()
                         .await
-                        .remove(&spec.id);
+                        .remove(&persisted_spec.id);
+                }
+
+                Ok(())
+            }
+            TaskEvent::UpsertStatus(status_box) => {
+                let status: TaskStatus = *status_box;
+                if self.should_ignore_removed_status(&status).await {
+                    debug!(
+                        target: "task",
+                        task = %status.id,
+                        state = ?status.state,
+                        "ignoring stale task status update after remove watermark"
+                    );
+                    return Ok(());
+                }
+                let current = self
+                    .core
+                    .store
+                    .get_snapshot(&UuidKey::from(status.id))
+                    .map_err(|e| anyhow::anyhow!("task lookup failed before status apply: {e}"))?
+                    .and_then(|snapshot| select_best_task_value(snapshot.as_slice()));
+                if let Some(current) = current.as_ref()
+                    && !compare_task_status_causality(current, &status).is_gt()
+                {
+                    debug!(
+                        target: "task",
+                        task = %status.id,
+                        current_epoch = current.task_epoch,
+                        current_phase_version = current.phase_version,
+                        incoming_epoch = status.task_epoch,
+                        incoming_phase_version = status.phase_version,
+                        current_state = ?current.state,
+                        incoming_state = ?status.state,
+                        "ignoring stale or duplicate task status by causal ordering"
+                    );
+                    return Ok(());
+                }
+                let persisted = merge_status_into_value(current.as_ref(), &status);
+                let persisted_spec = value_to_spec(status.id, persisted.clone());
+                let belongs = persisted_spec.node_id == self.local_node_id;
+                self.persist_value(status.id, &persisted).await?;
+
+                if belongs {
+                    let Some(reconcile_guard) = self.try_begin_reconcile(persisted_spec.id).await
+                    else {
+                        return Ok(());
+                    };
+                    let manager = self.clone();
+                    let spec_for_reconcile = persisted_spec.clone();
+                    tokio::task::spawn_local(async move {
+                        let _reconcile_guard = reconcile_guard;
+                        if let Err(err) = manager
+                            .reconcile_local_task(spec_for_reconcile.clone())
+                            .await
+                        {
+                            warn!(
+                                target: "task",
+                                "failed to reconcile task {}: {err}",
+                                spec_for_reconcile.id
+                            );
+                        }
+                    });
+                } else if !matches!(persisted_spec.state, ContainerState::Running) {
+                    self.local_state
+                        .local_containers
+                        .lock()
+                        .await
+                        .remove(&persisted_spec.id);
                 }
 
                 Ok(())

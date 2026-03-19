@@ -588,7 +588,7 @@ impl TaskManager {
 
         let mut dropped = 0usize;
         for (_, spec) in &results {
-            match self.enqueue_gossip_best_effort(TaskEvent::Upsert(Box::new(spec.clone()))) {
+            match self.enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone()))) {
                 Ok(true) => {}
                 Ok(false) => dropped += 1,
                 Err(err) => {

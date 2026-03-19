@@ -13,7 +13,10 @@ use crate::secrets::service::{read_secret_event, write_secret_event};
 use crate::secrets::types::SecretEvent;
 use crate::services::service::{read_service_event, write_service_event};
 use crate::services::types::ServiceEvent;
-use crate::task::causality::should_accept_task_spec;
+use crate::task::causality::{
+    should_accept_task_spec, should_accept_task_spec_from_status, should_accept_task_status,
+    should_accept_task_status_from_spec,
+};
 use crate::task::service as task_service;
 use crate::task::types::TaskEvent;
 use crate::topology;
@@ -210,7 +213,8 @@ fn coalesce_pending_messages(pending: Vec<Message>) -> (Vec<Message>, usize) {
 fn task_message_task_id(message: &Message) -> Option<Uuid> {
     match message {
         Message::Task { event, .. } => Some(match event {
-            TaskEvent::Upsert(spec) => spec.id,
+            TaskEvent::UpsertSpec(spec) => spec.id,
+            TaskEvent::UpsertStatus(status) => status.id,
             TaskEvent::Remove { id } => *id,
         }),
         _ => None,
@@ -234,10 +238,19 @@ fn should_replace_task_message(current: &Message, candidate: &Message) -> bool {
     };
 
     match (current_event, candidate_event) {
-        (TaskEvent::Remove { .. }, TaskEvent::Upsert(_)) => false,
+        (TaskEvent::Remove { .. }, TaskEvent::UpsertSpec(_) | TaskEvent::UpsertStatus(_)) => false,
         (_, TaskEvent::Remove { .. }) => true,
-        (TaskEvent::Upsert(current_spec), TaskEvent::Upsert(candidate_spec)) => {
+        (TaskEvent::UpsertSpec(current_spec), TaskEvent::UpsertSpec(candidate_spec)) => {
             should_accept_task_spec(current_spec, candidate_spec)
+        }
+        (TaskEvent::UpsertSpec(current_spec), TaskEvent::UpsertStatus(candidate_status)) => {
+            should_accept_task_status_from_spec(current_spec, candidate_status)
+        }
+        (TaskEvent::UpsertStatus(current_status), TaskEvent::UpsertSpec(candidate_spec)) => {
+            should_accept_task_spec_from_status(current_status, candidate_spec)
+        }
+        (TaskEvent::UpsertStatus(current_status), TaskEvent::UpsertStatus(candidate_status)) => {
+            should_accept_task_status(current_status, candidate_status)
         }
     }
 }
@@ -1293,11 +1306,11 @@ mod tests {
         let pending = vec![
             Message::Task {
                 id: Uuid::new_v4(),
-                event: TaskEvent::Upsert(Box::new(newer.clone())),
+                event: TaskEvent::UpsertSpec(Box::new(newer.clone())),
             },
             Message::Task {
                 id: Uuid::new_v4(),
-                event: TaskEvent::Upsert(Box::new(stale)),
+                event: TaskEvent::UpsertSpec(Box::new(stale)),
             },
         ];
 
@@ -1306,7 +1319,7 @@ mod tests {
         assert_eq!(coalesced.len(), 1);
         match &coalesced[0] {
             Message::Task {
-                event: TaskEvent::Upsert(spec),
+                event: TaskEvent::UpsertSpec(spec),
                 ..
             } => {
                 assert_eq!(spec.state, ContainerState::Running);
@@ -1357,7 +1370,7 @@ mod tests {
         let pending = vec![
             Message::Task {
                 id: Uuid::new_v4(),
-                event: TaskEvent::Upsert(Box::new(upsert)),
+                event: TaskEvent::UpsertSpec(Box::new(upsert)),
             },
             Message::Task {
                 id: Uuid::new_v4(),
@@ -1430,7 +1443,7 @@ mod tests {
             };
             pending.push(Message::Task {
                 id: Uuid::new_v4(),
-                event: TaskEvent::Upsert(Box::new(spec)),
+                event: TaskEvent::UpsertSpec(Box::new(spec)),
             });
         }
 
@@ -1444,7 +1457,7 @@ mod tests {
             .iter()
             .find_map(|message| match message {
                 Message::Task {
-                    event: TaskEvent::Upsert(spec),
+                    event: TaskEvent::UpsertSpec(spec),
                     ..
                 } => Some(spec),
                 _ => None,

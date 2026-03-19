@@ -13,7 +13,8 @@ use crate::task::docker::ContainerError;
 use crate::task::docker::ContainerManager;
 use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskLivenessProbe, TaskRestartPolicy, TaskSecretFile,
-    TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskValue, TaskValueDraft, TaskVolumeMount,
+    TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStatus, TaskValue, TaskValueDraft,
+    TaskVolumeMount,
 };
 use crate::volumes::VolumeRegistry;
 use anyhow::{Context, anyhow};
@@ -380,16 +381,16 @@ impl TaskManager {
             .remove(&task_id);
     }
 
-    /// Returns true when an inbound upsert should be ignored because it predates a known remove.
-    async fn should_ignore_removed_upsert(&self, spec: &TaskSpec) -> bool {
+    /// Returns true when one inbound task update should be ignored because it predates a known remove.
+    async fn should_ignore_removed_task(&self, task_id: Uuid, task_epoch: u64) -> bool {
         let tombstone = {
             let guard = self.local_state.removed_task_watermarks.lock().await;
-            guard.get(&spec.id).cloned()
+            guard.get(&task_id).cloned()
         };
 
         if let Some(tombstone) = tombstone {
-            if spec.task_epoch > tombstone.max_epoch {
-                self.clear_remove_watermark(spec.id).await;
+            if task_epoch > tombstone.max_epoch {
+                self.clear_remove_watermark(task_id).await;
                 return false;
             }
 
@@ -400,6 +401,18 @@ impl TaskManager {
         // causal detail to safely reject one future incarnation forever. Once the watermark
         // window elapses we must allow upserts again so split/merge convergence can recover.
         false
+    }
+
+    /// Returns true when an inbound full task definition predates a known remove watermark.
+    async fn should_ignore_removed_upsert(&self, spec: &TaskSpec) -> bool {
+        self.should_ignore_removed_task(spec.id, spec.task_epoch)
+            .await
+    }
+
+    /// Returns true when an inbound compact task status predates a known remove watermark.
+    async fn should_ignore_removed_status(&self, status: &TaskStatus) -> bool {
+        self.should_ignore_removed_task(status.id, status.task_epoch)
+            .await
     }
 
     #[allow(dead_code)]
@@ -698,7 +711,7 @@ impl TaskManager {
         updated.phase_progress = None;
         updated.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(&updated).await?;
-        self.enqueue_gossip(TaskEvent::Upsert(Box::new(updated.clone())))
+        self.enqueue_gossip(TaskEvent::UpsertSpec(Box::new(updated.clone())))
             .await?;
         Ok(updated)
     }
@@ -1186,6 +1199,9 @@ fn should_prefer_task_value(current: &TaskValue, candidate: &TaskValue) -> bool 
     if should_accept_incoming_task_value(candidate, current) {
         return false;
     }
+    if candidate.definition_complete != current.definition_complete {
+        return candidate.definition_complete;
+    }
 
     candidate.node_id > current.node_id
 }
@@ -1260,6 +1276,85 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         launch_attempt: value.launch_attempt,
         last_terminal_observed_launch: value.last_terminal_observed_launch,
     }
+}
+
+/// Projects one full task definition into the compact status payload used for hot lifecycle gossip.
+pub(crate) fn spec_to_status(spec: &TaskSpec) -> TaskStatus {
+    TaskStatus::from_spec(spec)
+}
+
+/// Builds one persisted task value by applying a compact status update over the current task row.
+pub(crate) fn merge_status_into_value(
+    current: Option<&TaskValue>,
+    status: &TaskStatus,
+) -> TaskValue {
+    if let Some(current) = current {
+        let mut merged = current.clone();
+        merged.id = status.id;
+        merged.name = status.name.clone();
+        merged.image = status.image.clone();
+        merged.state = status.state.clone();
+        merged.phase_reason = status.phase_reason.clone();
+        merged.phase_progress = status.phase_progress.clone();
+        merged.created_at = status.created_at.clone();
+        merged.updated_at = status.updated_at.clone();
+        merged.node_id = status.node_id;
+        merged.node_name = status.node_name.clone();
+        merged.service_metadata = status.service_metadata.clone();
+        merged.task_epoch = status.task_epoch;
+        merged.phase_version = status.phase_version;
+        merged.launch_attempt = status.launch_attempt;
+        merged.last_terminal_observed_launch = status.last_terminal_observed_launch;
+        return merged;
+    }
+
+    let mut placeholder = TaskValue::new(TaskValueDraft {
+        id: status.id,
+        name: status.name.clone(),
+        image: status.image.clone(),
+        state: status.state.clone(),
+        phase_reason: status.phase_reason.clone(),
+        phase_progress: status.phase_progress.clone(),
+        created_at: status.created_at.clone(),
+        updated_at: status.updated_at.clone(),
+        command: Vec::new(),
+        node_id: status.node_id,
+        node_name: status.node_name.clone(),
+        slot_ids: Vec::new(),
+        networks: Vec::new(),
+        cpu_millis: 0,
+        memory_bytes: 0,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        service_metadata: status.service_metadata.clone(),
+        task_epoch: status.task_epoch,
+        phase_version: status.phase_version,
+        launch_attempt: status.launch_attempt,
+        last_terminal_observed_launch: status.last_terminal_observed_launch,
+    });
+    placeholder.definition_complete = false;
+    placeholder
+}
+
+/// Merges a late full task definition into a causally newer placeholder task row.
+pub(crate) fn merge_definition_into_value(current: &TaskValue, spec: &TaskSpec) -> TaskValue {
+    let mut merged = spec_to_value(spec);
+    merged.state = current.state.clone();
+    merged.phase_reason = current.phase_reason.clone();
+    merged.phase_progress = current.phase_progress.clone();
+    merged.updated_at = current.updated_at.clone();
+    merged.task_epoch = current.task_epoch;
+    merged.phase_version = current.phase_version;
+    merged.launch_attempt = current.launch_attempt;
+    merged.last_terminal_observed_launch = current.last_terminal_observed_launch;
+    merged.definition_complete = true;
+    merged
 }
 
 /// Converts one task specification into its persisted CRDT value representation.

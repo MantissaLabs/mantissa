@@ -5423,6 +5423,7 @@ fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
         phase_version: spec.phase_version,
         launch_attempt: spec.launch_attempt,
         last_terminal_observed_launch: spec.last_terminal_observed_launch,
+        definition_complete: true,
     }
 }
 

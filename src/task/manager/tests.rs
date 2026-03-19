@@ -24,8 +24,8 @@ use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
 use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
 use crate::task::types::{
-    TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicyKind, TaskStateKind, TaskValue,
-    TaskValueDraft,
+    TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicyKind, TaskStateKind, TaskStatus,
+    TaskValue, TaskValueDraft,
 };
 use crate::topology::peers::PeerSchedulingState;
 use crate::volumes::VolumeRegistry;
@@ -4052,7 +4052,7 @@ async fn duplicate_remove_event_does_not_poison_future_epoch_upsert() {
     replacement.phase_version = replacement.phase_version.saturating_add(1);
 
     manager
-        .handle_event(TaskEvent::Upsert(Box::new(replacement.clone())))
+        .handle_event(TaskEvent::UpsertSpec(Box::new(replacement.clone())))
         .await
         .expect("apply replacement upsert");
 
@@ -4183,7 +4183,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
     original.state = ContainerState::Stopping;
 
     manager
-        .handle_event(TaskEvent::Upsert(Box::new(original.clone())))
+        .handle_event(TaskEvent::UpsertSpec(Box::new(original.clone())))
         .await
         .expect("stale upsert should be handled");
     let after_stale = manager
@@ -4201,7 +4201,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
     fresh.task_epoch = fresh.task_epoch.saturating_add(1);
 
     manager
-        .handle_event(TaskEvent::Upsert(Box::new(fresh.clone())))
+        .handle_event(TaskEvent::UpsertSpec(Box::new(fresh.clone())))
         .await
         .expect("fresh upsert should be accepted");
     let after_fresh = manager
@@ -4242,7 +4242,7 @@ async fn upsert_after_remove_without_watermark_is_accepted_for_reconvergence() {
     original.state = ContainerState::Stopping;
 
     manager
-        .handle_event(TaskEvent::Upsert(Box::new(original.clone())))
+        .handle_event(TaskEvent::UpsertSpec(Box::new(original.clone())))
         .await
         .expect("upsert should be handled");
     let after_upsert = manager
@@ -4388,6 +4388,11 @@ fn build_remote_task_spec(
     }
 }
 
+/// Builds a compact remote-owned task status payload for lifecycle gossip tests.
+fn build_remote_task_status(spec: &TaskSpec) -> TaskStatus {
+    TaskStatus::from_spec(spec)
+}
+
 #[tokio::test]
 async fn out_of_order_task_upsert_keeps_newer_running_state() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
@@ -4405,7 +4410,7 @@ async fn out_of_order_task_upsert_keeps_newer_running_state() {
         now.to_rfc3339(),
     );
     manager
-        .handle_event(TaskEvent::Upsert(Box::new(running.clone())))
+        .handle_event(TaskEvent::UpsertSpec(Box::new(running.clone())))
         .await
         .expect("apply running upsert");
 
@@ -4418,7 +4423,7 @@ async fn out_of_order_task_upsert_keeps_newer_running_state() {
         (now + chrono::Duration::seconds(60)).to_rfc3339(),
     );
     manager
-        .handle_event(TaskEvent::Upsert(Box::new(delayed_pending)))
+        .handle_event(TaskEvent::UpsertSpec(Box::new(delayed_pending)))
         .await
         .expect("apply delayed stale pending upsert");
 
@@ -4429,6 +4434,108 @@ async fn out_of_order_task_upsert_keeps_newer_running_state() {
     assert_eq!(resolved.state, ContainerState::Running);
     assert_eq!(resolved.task_epoch, running.task_epoch);
     assert_eq!(resolved.phase_version, running.phase_version);
+}
+
+#[tokio::test]
+async fn compact_status_upsert_updates_existing_task_without_dropping_definition() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let remote_node = Uuid::new_v4();
+    let now = Utc::now();
+
+    let mut pulling = build_remote_task_spec(
+        task_id,
+        remote_node,
+        ContainerState::Pulling,
+        2,
+        5,
+        now.to_rfc3339(),
+    );
+    pulling.command = vec!["sleep".to_string(), "30".to_string()];
+    pulling.cpu_millis = 250;
+    pulling.memory_bytes = 128 * 1_024 * 1_024;
+
+    manager
+        .handle_event(TaskEvent::UpsertSpec(Box::new(pulling.clone())))
+        .await
+        .expect("apply pulling upsert");
+
+    let mut status = build_remote_task_status(&pulling);
+    status.phase_reason = Some("backing off".to_string());
+    status.phase_progress = Some("retry 2/3".to_string());
+    status.updated_at = (now + chrono::Duration::seconds(10)).to_rfc3339();
+
+    manager
+        .handle_event(TaskEvent::UpsertStatus(Box::new(status)))
+        .await
+        .expect("apply compact status update");
+
+    let resolved = manager
+        .load_spec(task_id)
+        .await
+        .expect("load merged pulling task");
+    assert_eq!(resolved.state, ContainerState::Pulling);
+    assert_eq!(resolved.phase_reason.as_deref(), Some("backing off"));
+    assert_eq!(resolved.phase_progress.as_deref(), Some("retry 2/3"));
+    assert_eq!(
+        resolved.command,
+        vec!["sleep".to_string(), "30".to_string()]
+    );
+    assert_eq!(resolved.cpu_millis, 250);
+    assert_eq!(resolved.memory_bytes, 128 * 1_024 * 1_024);
+}
+
+#[tokio::test]
+async fn late_full_spec_fills_definition_after_status_placeholder() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let remote_node = Uuid::new_v4();
+    let now = Utc::now();
+
+    let mut running = build_remote_task_spec(
+        task_id,
+        remote_node,
+        ContainerState::Running,
+        4,
+        7,
+        now.to_rfc3339(),
+    );
+    running.command = vec!["server".to_string(), "--foreground".to_string()];
+    running.cpu_millis = 700;
+    running.memory_bytes = 512 * 1_024 * 1_024;
+
+    let status = build_remote_task_status(&running);
+    manager
+        .handle_event(TaskEvent::UpsertStatus(Box::new(status)))
+        .await
+        .expect("apply compact running status first");
+
+    let placeholder = manager
+        .load_spec(task_id)
+        .await
+        .expect("load placeholder task");
+    assert_eq!(placeholder.state, ContainerState::Running);
+    assert!(placeholder.command.is_empty());
+    assert_eq!(placeholder.cpu_millis, 0);
+
+    manager
+        .handle_event(TaskEvent::UpsertSpec(Box::new(running.clone())))
+        .await
+        .expect("apply late full task definition");
+
+    let resolved = manager
+        .load_spec(task_id)
+        .await
+        .expect("load resolved task");
+    assert_eq!(resolved.state, ContainerState::Running);
+    assert_eq!(
+        resolved.command,
+        vec!["server".to_string(), "--foreground".to_string()]
+    );
+    assert_eq!(resolved.cpu_millis, 700);
+    assert_eq!(resolved.memory_bytes, 512 * 1_024 * 1_024);
 }
 
 #[tokio::test]
@@ -4448,7 +4555,7 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         now.to_rfc3339(),
     );
     manager
-        .handle_event(TaskEvent::Upsert(Box::new(gossip_running.clone())))
+        .handle_event(TaskEvent::UpsertSpec(Box::new(gossip_running.clone())))
         .await
         .expect("apply newer gossip upsert");
 

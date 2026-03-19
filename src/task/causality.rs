@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use chrono::{DateTime, Utc};
 
 use crate::task::container::ContainerState;
-use crate::task::types::{TaskSpec, TaskValue};
+use crate::task::types::{TaskSpec, TaskStatus, TaskValue};
 
 /// Holds the task fields that participate in shared causal ordering decisions.
 struct TaskCausalityRecord<'a> {
@@ -22,6 +22,17 @@ fn task_spec_causality_record(spec: &TaskSpec) -> TaskCausalityRecord<'_> {
         updated_at: &spec.updated_at,
         created_at: &spec.created_at,
         state: &spec.state,
+    }
+}
+
+/// Projects the shared causal fields from one compact task status update.
+fn task_status_causality_record(status: &TaskStatus) -> TaskCausalityRecord<'_> {
+    TaskCausalityRecord {
+        task_epoch: status.task_epoch,
+        phase_version: status.phase_version,
+        updated_at: &status.updated_at,
+        created_at: &status.created_at,
+        state: &status.state,
     }
 }
 
@@ -90,9 +101,53 @@ pub(crate) fn compare_task_spec_causality(current: &TaskSpec, candidate: &TaskSp
     }
 }
 
+/// Compares one task value with one compact task status using the shared lifecycle causal tuple.
+pub(crate) fn compare_task_status_causality(
+    current: &TaskValue,
+    candidate: &TaskStatus,
+) -> Ordering {
+    compare_task_causality_record(
+        task_value_causality_record(current),
+        task_status_causality_record(candidate),
+    )
+}
+
 /// Returns true when a candidate task specification should replace the current gossip update.
 pub(crate) fn should_accept_task_spec(current: &TaskSpec, candidate: &TaskSpec) -> bool {
     compare_task_spec_causality(current, candidate).is_gt()
+}
+
+/// Returns true when a candidate task status should replace the current gossip task update.
+pub(crate) fn should_accept_task_status_from_spec(
+    current: &TaskSpec,
+    candidate: &TaskStatus,
+) -> bool {
+    compare_task_causality_record(
+        task_spec_causality_record(current),
+        task_status_causality_record(candidate),
+    )
+    .is_gt()
+}
+
+/// Returns true when a candidate task specification should replace the current gossip status update.
+pub(crate) fn should_accept_task_spec_from_status(
+    current: &TaskStatus,
+    candidate: &TaskSpec,
+) -> bool {
+    compare_task_causality_record(
+        task_status_causality_record(current),
+        task_spec_causality_record(candidate),
+    )
+    .is_gt()
+}
+
+/// Returns true when a candidate task status should replace the current gossip status update.
+pub(crate) fn should_accept_task_status(current: &TaskStatus, candidate: &TaskStatus) -> bool {
+    compare_task_causality_record(
+        task_status_causality_record(current),
+        task_status_causality_record(candidate),
+    )
+    .is_gt()
 }
 
 /// Parses the freshest available task timestamp for lifecycle ordering decisions.
