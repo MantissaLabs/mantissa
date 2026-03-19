@@ -76,6 +76,16 @@ const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_SYNC_FANOUT: usize = 8;
 /// Default maximum number of peers synchronized concurrently within one tick.
 const DEFAULT_SYNC_PARALLELISM: usize = 3;
+/// Number of view-scoped gossip peers kept warm relative to the hot-path fanout budget.
+const DEFAULT_GOSSIP_WARM_SET_MULTIPLIER: usize = 4;
+/// Hard cap applied to the warm peer set so gossip session reuse stays bounded.
+const DEFAULT_GOSSIP_WARM_SET_MAX: usize = 32;
+/// Number of peers rotated through the warm set on each refresh.
+const DEFAULT_GOSSIP_WARM_ROTATION: usize = 1;
+/// Max idle age before cached sessions and derived capabilities are discarded.
+const DEFAULT_GOSSIP_CAPABILITY_MAX_IDLE: Duration = Duration::from_secs(30);
+/// Hard cap for cached capability entries kept by the registry before idle eviction trims them.
+const DEFAULT_GOSSIP_CAPABILITY_CACHE_MAX: usize = 256;
 
 /// Default anti-entropy interval for cross-view cluster metadata sync.
 const DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -306,6 +316,14 @@ struct ClusterOperationState {
     gate: Arc<AsyncMutex<()>>,
 }
 
+#[derive(Default)]
+struct GossipWarmSetState {
+    source_entries: Option<Arc<Vec<PeerCacheEntry>>>,
+    population: Vec<PeerHandle>,
+    peers: Vec<PeerHandle>,
+    refresh_cursor: usize,
+}
+
 impl ClusterOperationState {
     fn new() -> Self {
         Self {
@@ -343,6 +361,9 @@ pub struct Topology {
 
     /// Cached Peers snapshot to avoid hitting storage on every tick.
     peer_snapshot_cache: Arc<AsyncMutex<PeerSnapshotCache>>,
+
+    /// Bounded warm peer set used by view-scoped gossip to reuse transport state.
+    gossip_warm_set: Arc<AsyncMutex<GossipWarmSetState>>,
 
     /// Peer ids currently excluded from active control-plane loops for the local cluster view.
     excluded_peers: Arc<AsyncMutex<HashSet<Uuid>>>,
@@ -465,6 +486,7 @@ impl Topology {
             volumes,
             volume_nodes,
             peer_snapshot_cache: Arc::new(AsyncMutex::new(PeerSnapshotCache::new())),
+            gossip_warm_set: Arc::new(AsyncMutex::new(GossipWarmSetState::default())),
             excluded_peers: Arc::new(AsyncMutex::new(HashSet::new())),
             local_sessions: sessions,
             local_credential_store: credentials,
@@ -1189,6 +1211,89 @@ impl Topology {
         }
     }
 
+    /// Returns the bounded warm peer population used by view-scoped gossip.
+    ///
+    /// This keeps a small stable set of peers hot in the capability registry while gradually
+    /// rotating new peers through the set so cluster coverage continues to advance over time.
+    async fn warm_gossip_peers(&self, fanout_hint: usize) -> Vec<PeerHandle> {
+        let snapshot = match self.peer_snapshot().await {
+            Some(snapshot) => snapshot,
+            None => return Vec::new(),
+        };
+        let excluded_peers = self.excluded_peers_snapshot().await;
+        let mut population = Vec::with_capacity(snapshot.entries.len());
+        for entry in snapshot.entries.iter() {
+            if entry.peer_id == self.node.id || excluded_peers.contains(&entry.peer_id) {
+                continue;
+            }
+            let value = entry.value.as_ref();
+            population.push(PeerHandle {
+                id: entry.peer_id,
+                address: value.address.clone(),
+                hostname: value.hostname.clone(),
+                noise_static_pub: PublicKey::from(value.noise_static_pub),
+                root_hash: Default::default(),
+            });
+        }
+        population.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let target = gossip_warm_target(population.len(), fanout_hint);
+        if target == 0 {
+            self.registry
+                .evict_idle_capabilities(
+                    DEFAULT_GOSSIP_CAPABILITY_MAX_IDLE,
+                    DEFAULT_GOSSIP_CAPABILITY_CACHE_MAX,
+                )
+                .await;
+            let mut state = self.gossip_warm_set.lock().await;
+            state.source_entries = Some(snapshot.entries.clone());
+            state.population.clear();
+            state.peers.clear();
+            state.refresh_cursor = 0;
+            return Vec::new();
+        }
+
+        let mut state = self.gossip_warm_set.lock().await;
+        let source_changed = state
+            .source_entries
+            .as_ref()
+            .map(|entries| !Arc::ptr_eq(entries, &snapshot.entries))
+            .unwrap_or(true);
+        state.source_entries = Some(snapshot.entries.clone());
+        state.population = population;
+        let population = state.population.clone();
+        let mut refresh_cursor = state.refresh_cursor;
+        let mut warm_peers = std::mem::take(&mut state.peers);
+
+        if source_changed || warm_peers.is_empty() || warm_peers.len() != target {
+            rebuild_gossip_warm_set(self.node.id, &population, target, &mut warm_peers);
+            refresh_cursor = gossip_warm_refresh_seed(self.node.id, population.len(), target);
+            refill_gossip_warm_set(&population, target, &mut refresh_cursor, &mut warm_peers);
+        } else {
+            let population_ids: HashSet<Uuid> = population.iter().map(|peer| peer.id).collect();
+            warm_peers.retain(|peer| population_ids.contains(&peer.id));
+            refill_gossip_warm_set(&population, target, &mut refresh_cursor, &mut warm_peers);
+            rotate_gossip_warm_set(
+                &population,
+                DEFAULT_GOSSIP_WARM_ROTATION,
+                &mut refresh_cursor,
+                &mut warm_peers,
+            );
+        }
+
+        state.refresh_cursor = refresh_cursor;
+        state.peers = warm_peers;
+        let peers = state.peers.clone();
+        drop(state);
+        self.registry
+            .evict_idle_capabilities(
+                DEFAULT_GOSSIP_CAPABILITY_MAX_IDLE,
+                DEFAULT_GOSSIP_CAPABILITY_CACHE_MAX,
+            )
+            .await;
+        peers
+    }
+
     /// Verify a peer identity signature and enforce signing-key pinning for an existing node id.
     /// This prevents gossip updates from swapping a node id onto a new signing key.
     async fn verify_peer_identity_event(
@@ -1522,6 +1627,10 @@ impl GossipContext for Topology {
         Topology::active_cluster_view(self)
     }
 
+    async fn get_warm_peers(&self, fanout: usize) -> Vec<PeerHandle> {
+        self.warm_gossip_peers(fanout).await
+    }
+
     async fn gossip_client_for(
         &self,
         peer: &PeerHandle,
@@ -1664,11 +1773,106 @@ fn select_sync_peers_round_robin_for_node<'a>(
     selected
 }
 
+/// Computes the bounded warm-set size used by view-scoped gossip.
+fn gossip_warm_target(population_len: usize, fanout_hint: usize) -> usize {
+    if population_len == 0 {
+        return 0;
+    }
+    if fanout_hint == 0 {
+        return population_len;
+    }
+
+    population_len.min(
+        fanout_hint
+            .saturating_mul(DEFAULT_GOSSIP_WARM_SET_MULTIPLIER)
+            .clamp(fanout_hint, DEFAULT_GOSSIP_WARM_SET_MAX),
+    )
+}
+
+/// Returns the deterministic starting offset used when warming gossip peers.
+fn gossip_warm_refresh_seed(local_id: Uuid, population_len: usize, warm_target: usize) -> usize {
+    if population_len == 0 {
+        return 0;
+    }
+    ((local_id.as_u128() as usize) + warm_target) % population_len
+}
+
+/// Rebuilds the warm gossip set from the current population snapshot.
+fn rebuild_gossip_warm_set(
+    local_id: Uuid,
+    population: &[PeerHandle],
+    target: usize,
+    warm_peers: &mut Vec<PeerHandle>,
+) {
+    warm_peers.clear();
+    if population.is_empty() || target == 0 {
+        return;
+    }
+
+    let start = (local_id.as_u128() as usize) % population.len();
+    for slot in 0..target {
+        let idx = (start + (slot * population.len()) / target) % population.len();
+        let candidate = population[idx].clone();
+        if warm_peers.iter().any(|peer| peer.id == candidate.id) {
+            continue;
+        }
+        warm_peers.push(candidate);
+    }
+}
+
+/// Tops up the warm gossip set when membership changes removed one or more cached peers.
+fn refill_gossip_warm_set(
+    population: &[PeerHandle],
+    target: usize,
+    refresh_cursor: &mut usize,
+    warm_peers: &mut Vec<PeerHandle>,
+) {
+    if population.is_empty() || target == 0 {
+        warm_peers.clear();
+        *refresh_cursor = 0;
+        return;
+    }
+
+    while warm_peers.len() < target && warm_peers.len() < population.len() {
+        let candidate = population[*refresh_cursor % population.len()].clone();
+        *refresh_cursor = (*refresh_cursor + 1) % population.len();
+        if warm_peers.iter().any(|peer| peer.id == candidate.id) {
+            continue;
+        }
+        warm_peers.push(candidate);
+    }
+}
+
+/// Rotates a few peers through the warm gossip set so long-lived nodes eventually touch the
+/// wider membership without reopening sessions to the full population at once.
+fn rotate_gossip_warm_set(
+    population: &[PeerHandle],
+    rotation: usize,
+    refresh_cursor: &mut usize,
+    warm_peers: &mut [PeerHandle],
+) {
+    if rotation == 0 || warm_peers.is_empty() || warm_peers.len() >= population.len() {
+        return;
+    }
+
+    let mut replace_slot = *refresh_cursor % warm_peers.len();
+    for _ in 0..rotation {
+        let candidate = population[*refresh_cursor % population.len()].clone();
+        *refresh_cursor = (*refresh_cursor + 1) % population.len();
+        if warm_peers.iter().any(|peer| peer.id == candidate.id) {
+            continue;
+        }
+        warm_peers[replace_slot] = candidate;
+        replace_slot = (replace_slot + 1) % warm_peers.len();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PeerCacheEntry, PeerSchedulingState, PeerValue, select_sync_peers_for_node,
-        select_sync_peers_round_robin_for_node,
+        PeerCacheEntry, PeerHandle, PeerSchedulingState, PeerValue, gossip_warm_target,
+        rebuild_gossip_warm_set, refill_gossip_warm_set, rotate_gossip_warm_set,
+        select_sync_peers_for_node, select_sync_peers_round_robin_for_node,
     };
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
@@ -1687,6 +1891,17 @@ mod tests {
                 wireguard: None,
                 scheduling: PeerSchedulingState::schedulable_default(peer_id),
             }),
+        }
+    }
+
+    /// Build one synthetic gossip peer handle for warm-set selection tests.
+    fn make_peer(peer_id: Uuid, idx: usize) -> PeerHandle {
+        PeerHandle {
+            id: peer_id,
+            address: format!("127.0.0.1:{}", 20_000 + idx),
+            hostname: format!("peer-{idx}"),
+            noise_static_pub: x25519_dalek::PublicKey::from([idx as u8; 32]),
+            root_hash: Default::default(),
         }
     }
 
@@ -1763,5 +1978,53 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 5, "round-robin fanout should cover every peer");
+    }
+
+    /// Warm-set sizing should stay bounded while always covering at least the hot-path fanout.
+    #[test]
+    fn gossip_warm_target_stays_bounded() {
+        assert_eq!(gossip_warm_target(0, 5), 0);
+        assert_eq!(gossip_warm_target(3, 5), 3);
+        assert_eq!(gossip_warm_target(30, 5), 20);
+        assert_eq!(gossip_warm_target(500, 8), 32);
+    }
+
+    /// Warm-set rebuild should select unique peers and spread them across the population.
+    #[test]
+    fn rebuild_gossip_warm_set_selects_unique_peers() {
+        let local_id = Uuid::new_v4();
+        let population: Vec<PeerHandle> =
+            (0..30).map(|idx| make_peer(Uuid::new_v4(), idx)).collect();
+        let mut warm_peers = Vec::new();
+
+        rebuild_gossip_warm_set(local_id, &population, 12, &mut warm_peers);
+
+        assert_eq!(warm_peers.len(), 12);
+        let unique_ids: HashSet<Uuid> = warm_peers.iter().map(|peer| peer.id).collect();
+        assert_eq!(unique_ids.len(), warm_peers.len());
+    }
+
+    /// Warm-set rotation should eventually introduce peers outside the original selection.
+    #[test]
+    fn rotate_gossip_warm_set_refreshes_population() {
+        let local_id = Uuid::new_v4();
+        let population: Vec<PeerHandle> =
+            (0..24).map(|idx| make_peer(Uuid::new_v4(), idx)).collect();
+        let mut warm_peers = Vec::new();
+
+        rebuild_gossip_warm_set(local_id, &population, 8, &mut warm_peers);
+        let original_ids: HashSet<Uuid> = warm_peers.iter().map(|peer| peer.id).collect();
+        let mut refresh_cursor = 8;
+        rotate_gossip_warm_set(&population, 3, &mut refresh_cursor, &mut warm_peers);
+        refill_gossip_warm_set(&population, 8, &mut refresh_cursor, &mut warm_peers);
+
+        let refreshed_ids: HashSet<Uuid> = warm_peers.iter().map(|peer| peer.id).collect();
+        assert_eq!(warm_peers.len(), 8);
+        assert!(
+            refreshed_ids
+                .iter()
+                .any(|peer_id| !original_ids.contains(peer_id)),
+            "rotation should introduce at least one new warm peer"
+        );
     }
 }

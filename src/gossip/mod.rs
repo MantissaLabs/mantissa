@@ -61,6 +61,15 @@ pub trait GossipContext: PeerProvider {
         self.get_peers().await
     }
 
+    /// Returns the bounded warm peer population used by view-scoped gossip.
+    ///
+    /// The default implementation reuses the full peer list so non-topology callers preserve the
+    /// existing rotating fanout behavior without implementing warm-set management.
+    async fn get_warm_peers(&self, fanout: usize) -> Vec<PeerHandle> {
+        let _ = fanout;
+        self.get_peers().await
+    }
+
     /// Resolves a gossip capability without enforcing active-view session matching.
     ///
     /// The default implementation keeps existing behavior, but topology can override
@@ -713,8 +722,12 @@ async fn dispatch_gossip_plane<C>(
     let peers = match plane {
         GossipPlane::ViewScoped => match options.fanout {
             Some(0) => context.get_peers().await,
-            Some(n) => fanout_sample(context, n, fanout_cursor).await,
-            None => fanout_sample(context, DEFAULT_FANOUT, fanout_cursor).await,
+            Some(n) => select_fanout_window(context.get_warm_peers(n).await, n, fanout_cursor),
+            None => select_fanout_window(
+                context.get_warm_peers(DEFAULT_FANOUT).await,
+                DEFAULT_FANOUT,
+                fanout_cursor,
+            ),
         },
         GossipPlane::GlobalMetadata => {
             let peer_population = context.get_peers_unscoped().await;

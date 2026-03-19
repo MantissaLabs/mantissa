@@ -67,9 +67,14 @@ struct PeerState {
     sync: Option<sync::Client>,
     health: Option<health::health::Client>,
     gossip: Option<GossipClient>,
+    last_used_at: Option<Instant>,
 }
 
 impl PeerState {
+    fn mark_used(&mut self) {
+        self.last_used_at = Some(Instant::now());
+    }
+
     fn clear_capabilities(&mut self) {
         self.sync = None;
         self.health = None;
@@ -222,6 +227,86 @@ impl Registry {
         self.reconnect_state.lock().await.clear();
         self.invalidation_stats.lock().await.clear();
         self.session_failure_stats.lock().await.clear();
+    }
+
+    /// Evicts cached sessions and derived capabilities that remained idle past `max_idle`.
+    ///
+    /// This bounds active transport state while preserving imported server handles used to
+    /// reconnect peers without re-learning their exported capability tree.
+    pub async fn evict_idle_capabilities(&self, max_idle: Duration, max_entries: usize) {
+        let now = Instant::now();
+        let entries: Vec<(Uuid, PeerEntry)> = {
+            let guard = self.cache.read().await;
+            guard
+                .iter()
+                .map(|(peer_id, entry)| (*peer_id, entry.clone()))
+                .collect()
+        };
+
+        let mut empty_entries = Vec::new();
+        for (peer_id, entry) in &entries {
+            let mut state = entry.lock().await;
+            if let Some(last_used_at) = state.last_used_at
+                && now.saturating_duration_since(last_used_at) >= max_idle
+            {
+                state.clear_session();
+            }
+
+            if state.server.is_none()
+                && state.session.is_none()
+                && state.sync.is_none()
+                && state.health.is_none()
+                && state.gossip.is_none()
+            {
+                empty_entries.push(*peer_id);
+            }
+        }
+
+        if !empty_entries.is_empty() {
+            let empty_entries: HashSet<Uuid> = empty_entries.into_iter().collect();
+            self.cache
+                .write()
+                .await
+                .retain(|peer_id, _| !empty_entries.contains(peer_id));
+        }
+
+        if max_entries == 0 {
+            return;
+        }
+
+        let cached_size = self.cache.read().await.len();
+        if cached_size <= max_entries {
+            return;
+        }
+
+        let entries: Vec<(Uuid, PeerEntry)> = {
+            let guard = self.cache.read().await;
+            guard
+                .iter()
+                .map(|(peer_id, entry)| (*peer_id, entry.clone()))
+                .collect()
+        };
+        let mut removable = Vec::new();
+        for (peer_id, entry) in entries {
+            let state = entry.lock().await;
+            if state.server.is_none() {
+                removable.push((peer_id, state.last_used_at));
+            }
+        }
+        removable.sort_by_key(|(_, last_used_at)| *last_used_at);
+
+        let overflow = cached_size.saturating_sub(max_entries);
+        let to_remove: HashSet<Uuid> = removable
+            .into_iter()
+            .take(overflow)
+            .map(|(peer_id, _)| peer_id)
+            .collect();
+        if !to_remove.is_empty() {
+            self.cache
+                .write()
+                .await
+                .retain(|peer_id, _| !to_remove.contains(peer_id));
+        }
     }
 
     /// Clears any cached capabilities for `peer_id`, forcing a full refresh on next access.
@@ -736,7 +821,10 @@ impl Registry {
             };
             if let Some(session) = cached_session {
                 match Self::session_matches_view(&session, expected_view).await {
-                    Ok(true) => return Ok(Some(sync_cap)),
+                    Ok(true) => {
+                        entry.lock().await.mark_used();
+                        return Ok(Some(sync_cap));
+                    }
                     Ok(false) => {
                         // Drop the cached handles so the next attempt re-dials with fresh scope.
                         self.invalidate_peer(peer_id, &entry).await;
@@ -769,6 +857,7 @@ impl Registry {
             Ok(sync_cap) => {
                 let mut state = entry.lock().await;
                 state.sync = Some(sync_cap.clone());
+                state.mark_used();
                 Ok(Some(sync_cap))
             }
             Err(err) => {
@@ -803,7 +892,10 @@ impl Registry {
             };
             if let Some(session) = cached_session {
                 match Self::session_cluster_view(&session).await {
-                    Ok(peer_view) => return Ok(Some((sync_cap, peer_view))),
+                    Ok(peer_view) => {
+                        entry.lock().await.mark_used();
+                        return Ok(Some((sync_cap, peer_view)));
+                    }
                     Err(_) => {
                         self.invalidate_peer(peer_id, &entry).await;
                     }
@@ -835,6 +927,7 @@ impl Registry {
             Ok(sync_cap) => {
                 let mut state = entry.lock().await;
                 state.sync = Some(sync_cap.clone());
+                state.mark_used();
                 Ok(Some((sync_cap, peer_view)))
             }
             Err(err) => {
@@ -869,7 +962,10 @@ impl Registry {
             };
             if let Some(session) = cached_session {
                 match Self::session_matches_view(&session, expected_view).await {
-                    Ok(true) => return Ok(Some(health_cap)),
+                    Ok(true) => {
+                        entry.lock().await.mark_used();
+                        return Ok(Some(health_cap));
+                    }
                     Ok(false) => {
                         self.invalidate_peer(peer_id, &entry).await;
                         return Ok(None);
@@ -901,6 +997,7 @@ impl Registry {
             Ok(health_cap) => {
                 let mut state = entry.lock().await;
                 state.health = Some(health_cap.clone());
+                state.mark_used();
                 Ok(Some(health_cap))
             }
             Err(err) => {
@@ -935,7 +1032,10 @@ impl Registry {
             };
             if let Some(session) = cached_session {
                 match Self::session_matches_view(&session, expected_view).await {
-                    Ok(true) => return Ok(Some(gossip_cap)),
+                    Ok(true) => {
+                        entry.lock().await.mark_used();
+                        return Ok(Some(gossip_cap));
+                    }
                     Ok(false) => {
                         self.invalidate_peer(peer_id, &entry).await;
                         return Ok(None);
@@ -967,6 +1067,7 @@ impl Registry {
             Ok(gossip_cap) => {
                 let mut state = entry.lock().await;
                 state.gossip = Some(gossip_cap.clone());
+                state.mark_used();
                 Ok(Some(gossip_cap))
             }
             Err(err) => {
@@ -995,6 +1096,7 @@ impl Registry {
             let state = entry.lock().await;
             state.gossip.clone()
         } {
+            entry.lock().await.mark_used();
             return Ok(Some(gossip_cap));
         }
 
@@ -1009,6 +1111,7 @@ impl Registry {
             Ok(gossip_cap) => {
                 let mut state = entry.lock().await;
                 state.gossip = Some(gossip_cap.clone());
+                state.mark_used();
                 Ok(Some(gossip_cap))
             }
             Err(err) => {
