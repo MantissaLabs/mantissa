@@ -3878,6 +3878,20 @@ async fn attach_local_task_forwards_input_output_and_options() {
             },
         ],
     );
+    mock_cm.inspect.lock().await.insert(
+        container_name.clone(),
+        bollard::service::ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                running: Some(true),
+                ..Default::default()
+            }),
+            config: Some(bollard::models::ContainerConfig {
+                tty: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
 
     let options = crate::task::docker::ContainerAttachOptions {
         logs: true,

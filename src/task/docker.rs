@@ -1683,6 +1683,18 @@ mod tests {
         ));
     }
 
+    /// Builds a Docker-backed manager for integration-style tests and skips cleanly when the
+    /// local environment does not expose a reachable Docker daemon.
+    async fn docker_test_manager() -> Option<Arc<DockerContainerManager>> {
+        match DockerContainerManager::new().await {
+            Ok(manager) => Some(Arc::new(manager)),
+            Err(err) => {
+                eprintln!("skipping Docker-backed attach test: {err}");
+                None
+            }
+        }
+    }
+
     #[tokio::test]
     async fn tty_attach_forwards_initial_prompt_without_waiting_for_newline() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1692,11 +1704,42 @@ mod tests {
         let endpoint = format!("http://{address}");
 
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept attach connection");
+            let (mut inspect_socket, _) =
+                listener.accept().await.expect("accept inspect connection");
             let mut request = Vec::new();
             let mut buffer = [0u8; 1024];
             loop {
-                let bytes_read = socket.read(&mut buffer).await.expect("read attach request");
+                let bytes_read = inspect_socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("read inspect request");
+                assert!(bytes_read > 0, "inspect request should not close early");
+                request.extend_from_slice(&buffer[..bytes_read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(
+                request_text.contains("GET /containers/demo-container/json"),
+                "unexpected request: {request_text}"
+            );
+
+            inspect_socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"State\":{\"Running\":true}}",
+                )
+                .await
+                .expect("write inspect response");
+
+            let (mut attach_socket, _) = listener.accept().await.expect("accept attach connection");
+            request.clear();
+            loop {
+                let bytes_read = attach_socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("read attach request");
                 assert!(bytes_read > 0, "attach request should not close early");
                 request.extend_from_slice(&buffer[..bytes_read]);
                 if request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -1710,14 +1753,14 @@ mod tests {
                 "unexpected request: {request_text}"
             );
 
-            socket
+            attach_socket
                 .write_all(
                     b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n/ # ",
                 )
                 .await
                 .expect("write attach upgrade response");
 
-            let bytes_read = socket
+            let bytes_read = attach_socket
                 .read(&mut buffer)
                 .await
                 .expect("read forwarded attach stdin");
@@ -1761,7 +1804,9 @@ mod tests {
 
     #[tokio::test]
     async fn tty_attach_real_docker_emits_prompt_before_input() {
-        let manager = Arc::new(DockerContainerManager::new().await.expect("connect docker"));
+        let Some(manager) = docker_test_manager().await else {
+            return;
+        };
         manager
             .pull_image("busybox:1.36")
             .await
@@ -1834,7 +1879,9 @@ mod tests {
 
     #[tokio::test]
     async fn tty_attach_real_docker_reattach_redraws_prompt_after_disconnect() {
-        let manager = Arc::new(DockerContainerManager::new().await.expect("connect docker"));
+        let Some(manager) = docker_test_manager().await else {
+            return;
+        };
         manager
             .pull_image("busybox:1.36")
             .await
@@ -1936,7 +1983,9 @@ mod tests {
 
     #[tokio::test]
     async fn tty_attach_rejects_exited_container() {
-        let manager = DockerContainerManager::new().await.expect("connect docker");
+        let Some(manager) = docker_test_manager().await else {
+            return;
+        };
         manager
             .pull_image("busybox:1.36")
             .await
