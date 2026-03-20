@@ -567,6 +567,8 @@ fn write_attach_options(
     builder.set_stdout(options.stdout);
     builder.set_stderr(options.stderr);
     builder.set_detach_keys(options.detach_keys.as_deref().unwrap_or(""));
+    builder.set_tty_width(options.tty_width.unwrap_or(0));
+    builder.set_tty_height(options.tty_height.unwrap_or(0));
 }
 
 /// Decodes task attach request options from the wire format.
@@ -581,6 +583,9 @@ fn read_attach_options(
         stdout: reader.get_stdout(),
         stderr: reader.get_stderr(),
         detach_keys: (!detach_keys.is_empty()).then_some(detach_keys),
+        tty: false,
+        tty_width: (reader.get_tty_width() != 0).then(|| reader.get_tty_width()),
+        tty_height: (reader.get_tty_height() != 0).then(|| reader.get_tty_height()),
     })
 }
 
@@ -1026,6 +1031,11 @@ impl task::Server for TaskService {
             return Ok(());
         }
 
+        self.manager
+            .ensure_local_task_attachable(id)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+
         let (output_tx, mut output_rx) = mpsc::channel(1);
         let input_tx = options.stdin.then(|| {
             let (tx, rx) = mpsc::channel(1);
@@ -1044,6 +1054,9 @@ impl task::Server for TaskService {
         let manager = self.manager.clone();
         let options_for_task = options.clone();
         tokio::task::spawn_local(async move {
+            // Let the attach RPC response carrying the session capability flush first so the
+            // caller is ready to receive the initial prompt/output frames immediately.
+            tokio::task::yield_now().await;
             let producer = tokio::task::spawn_local(async move {
                 manager
                     .attach_local_task(id, &options_for_task, output_tx, input_rx)

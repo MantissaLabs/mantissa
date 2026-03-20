@@ -1,4 +1,9 @@
 (
+    // This demo is meant for `mantissa tasks attach`.
+    // Use Ctrl-P, Ctrl-Q to detach and leave the task running.
+    // Ctrl-] also detaches locally if the default sequence is swallowed by the terminal.
+    // Typing `exit` exits the shell entrypoint itself, so the task stops and is later
+    // reconciled back by the service controller, matching `docker attach` semantics.
     name: "attach-shell-demo",
     tasks: [
         (

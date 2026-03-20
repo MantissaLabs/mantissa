@@ -3886,6 +3886,9 @@ async fn attach_local_task_forwards_input_output_and_options() {
         stdout: true,
         stderr: true,
         detach_keys: Some("ctrl-p,ctrl-q".to_string()),
+        tty: false,
+        tty_width: None,
+        tty_height: None,
     };
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(8);
     let (input_tx, input_rx) = tokio::sync::mpsc::channel(8);
@@ -3931,6 +3934,93 @@ async fn attach_local_task_forwards_input_output_and_options() {
                 message: b"warn\n".to_vec(),
             },
         ]
+    );
+}
+
+#[tokio::test]
+async fn attach_local_task_uses_runtime_tty_when_persisted_spec_is_stale() {
+    let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
+    let task_id = Uuid::new_v4();
+    let spec = TaskSpec {
+        id: task_id,
+        name: "demo-task".to_string(),
+        image: "demo:latest".to_string(),
+        state: ContainerState::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: vec!["/bin/demo".to_string()],
+        tty: false,
+        node_id: manager.local_node_id,
+        node_name: manager.local_node_name.clone(),
+        slot_ids: Vec::new(),
+        slot_id: None,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 1,
+        last_terminal_observed_launch: None,
+    };
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    let container_name = format!("mantissa-{task_id}");
+    mock_cm.inspect.lock().await.insert(
+        container_name.clone(),
+        bollard::service::ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                running: Some(true),
+                ..Default::default()
+            }),
+            config: Some(bollard::models::ContainerConfig {
+                tty: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    let options = crate::task::docker::ContainerAttachOptions {
+        logs: false,
+        stream: true,
+        stdin: true,
+        stdout: true,
+        stderr: true,
+        detach_keys: None,
+        tty: false,
+        tty_width: Some(80),
+        tty_height: Some(24),
+    };
+    let (output_tx, _output_rx) = tokio::sync::mpsc::channel(1);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(1);
+    drop(input_tx);
+
+    manager
+        .attach_local_task(task_id, &options, output_tx, input_rx)
+        .await
+        .expect("attach local task");
+
+    assert_eq!(
+        mock_cm.attach_calls.lock().await.clone(),
+        vec![(
+            container_name,
+            crate::task::docker::ContainerAttachOptions {
+                tty: true,
+                ..options
+            }
+        )]
     );
 }
 

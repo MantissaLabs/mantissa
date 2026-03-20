@@ -20,7 +20,8 @@ use bollard::models::{
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptions, CreateImageOptions, EventsOptions,
     InspectContainerOptions, ListContainersOptions, LogsOptionsBuilder, RemoveContainerOptions,
-    RestartContainerOptions, StartContainerOptions, StopContainerOptions,
+    ResizeContainerTTYOptionsBuilder, RestartContainerOptions, StartContainerOptions,
+    StopContainerOptions, WaitContainerOptionsBuilder,
 };
 use bollard::service::ContainerInspectResponse;
 
@@ -78,6 +79,13 @@ pub struct ContainerLogFrame {
     pub message: Vec<u8>,
 }
 
+/// Runtime-owned channels and initial state used while one attach bridge is active.
+struct AttachBridgeIo {
+    output_tx: MpscSender<ContainerLogFrame>,
+    input_rx: MpscReceiver<Vec<u8>>,
+    saw_output: bool,
+}
+
 /// Request options supported by task/container log streaming.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContainerLogsOptions {
@@ -129,6 +137,9 @@ pub struct ContainerAttachOptions {
     pub stdout: bool,
     pub stderr: bool,
     pub detach_keys: Option<String>,
+    pub tty: bool,
+    pub tty_width: Option<u16>,
+    pub tty_height: Option<u16>,
 }
 
 impl Default for ContainerAttachOptions {
@@ -141,6 +152,9 @@ impl Default for ContainerAttachOptions {
             stdout: true,
             stderr: true,
             detach_keys: None,
+            tty: false,
+            tty_width: None,
+            tty_height: None,
         }
     }
 }
@@ -462,6 +476,279 @@ impl DockerContainerManager {
         self.run_container_call(container_id, call).await?;
         info!("{success_message}: {container_id}");
         Ok(())
+    }
+
+    /// Bridges one Docker attach session across bounded output and stdin channels.
+    async fn bridge_attached_io(
+        &self,
+        container_id: &str,
+        output: &mut (impl futures::Stream<Item = Result<LogOutput, BollardError>> + Unpin),
+        input: &mut (impl tokio::io::AsyncWrite + Unpin),
+        options: &ContainerAttachOptions,
+        io: AttachBridgeIo,
+    ) -> ContainerResult<()> {
+        let AttachBridgeIo {
+            output_tx,
+            mut input_rx,
+            mut saw_output,
+        } = io;
+        let output_open = options.stdout || options.stderr;
+        let mut input_open = options.stdin;
+        let mut saw_input = false;
+        let mut wait = self.docker.wait_container(
+            container_id,
+            Some(
+                WaitContainerOptionsBuilder::new()
+                    .condition("not-running")
+                    .build(),
+            ),
+        );
+        loop {
+            tokio::select! {
+                maybe_frame = output.next(), if output_open => {
+                    let Some(frame) = maybe_frame else {
+                        if !saw_output && !saw_input {
+                            return Err(ContainerError::OperationFailed(format!(
+                                "attach stream closed before container {container_id} produced output or accepted input"
+                            )));
+                        }
+                        break;
+                    };
+                    let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
+                    saw_output = true;
+                    if output_tx.send(container_log_frame_from_output(frame)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                maybe_chunk = input_rx.recv(), if input_open => {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            saw_input = true;
+                            input.write_all(&chunk).await.map_err(|err| {
+                                ContainerError::OperationFailed(format!(
+                                    "attach stdin write failed for {container_id}: {err}"
+                                ))
+                            })?;
+                            input.flush().await.map_err(|err| {
+                                ContainerError::OperationFailed(format!(
+                                    "attach stdin flush failed for {container_id}: {err}"
+                                ))
+                            })?;
+                        }
+                        None => {
+                            input.shutdown().await.map_err(|err| {
+                                ContainerError::OperationFailed(format!(
+                                    "attach stdin shutdown failed for {container_id}: {err}"
+                                ))
+                            })?;
+                            input_open = false;
+                            if !output_open {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                maybe_exit = wait.next() => {
+                    match maybe_exit {
+                        Some(Ok(_)) | None => {
+                            if !saw_output && !saw_input {
+                                return Err(ContainerError::OperationFailed(format!(
+                                    "container {container_id} is not running"
+                                )));
+                            }
+                            if input_open {
+                                input.shutdown().await.map_err(|err| {
+                                    ContainerError::OperationFailed(format!(
+                                        "attach stdin shutdown failed for {container_id}: {err}"
+                                    ))
+                                })?;
+                            }
+
+                            if output_open {
+                                let _ = tokio::time::timeout(Duration::from_millis(100), async {
+                                    while let Some(frame) = output.next().await {
+                                        let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
+                                        if output_tx.send(container_log_frame_from_output(frame)).await.is_err() {
+                                            return Ok::<(), ContainerError>(());
+                                        }
+                                    }
+                                    Ok::<(), ContainerError>(())
+                                }).await;
+                            }
+                            return Ok(());
+                        }
+                        Some(Err(err)) => {
+                            return Err(classify_container_error(container_id, err));
+                        }
+                    }
+                }
+                else => break,
+            }
+
+            if !output_open && !input_open {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verifies that the target container is currently running before opening an attach session.
+    async fn ensure_container_running_for_attach(&self, container_id: &str) -> ContainerResult<()> {
+        let info = self
+            .run_container_call(
+                container_id,
+                self.docker
+                    .inspect_container(container_id, None::<InspectContainerOptions>),
+            )
+            .await?;
+        let running = info
+            .state
+            .as_ref()
+            .and_then(|state| state.running)
+            .unwrap_or(false);
+        if running {
+            return Ok(());
+        }
+
+        Err(ContainerError::OperationFailed(format!(
+            "container {container_id} is not running"
+        )))
+    }
+
+    /// Applies the caller's terminal dimensions so Docker TTY attach sessions render a prompt
+    /// immediately instead of waiting for the first interactive input.
+    async fn resize_attached_tty(
+        &self,
+        container_id: &str,
+        options: &ContainerAttachOptions,
+    ) -> ContainerResult<()> {
+        let (Some(width), Some(height)) = (options.tty_width, options.tty_height) else {
+            return Ok(());
+        };
+
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        self.run_container_call(
+            container_id,
+            self.docker.resize_container_tty(
+                container_id,
+                ResizeContainerTTYOptionsBuilder::new()
+                    .w(i32::from(width))
+                    .h(i32::from(height))
+                    .build(),
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Forces one visible prompt refresh for attached TTY shells by delivering a resize event even
+    /// when the caller's current terminal size already matches the container's active TTY size.
+    async fn refresh_attached_tty_prompt(
+        &self,
+        container_id: &str,
+        options: &ContainerAttachOptions,
+    ) -> ContainerResult<()> {
+        let (Some(width), Some(height)) = (options.tty_width, options.tty_height) else {
+            return Ok(());
+        };
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        let mut jiggled = options.clone();
+        if width > 1 {
+            jiggled.tty_width = Some(width - 1);
+        } else if height > 1 {
+            jiggled.tty_height = Some(height - 1);
+        } else {
+            return self.resize_attached_tty(container_id, options).await;
+        }
+
+        self.resize_attached_tty(container_id, &jiggled).await?;
+        self.resize_attached_tty(container_id, options).await
+    }
+
+    /// Waits briefly for natural TTY output before forcing a terminal resize.
+    ///
+    /// Interactive shells may already have a prompt queued as soon as attach starts. Resizing the
+    /// TTY in that case redraws the prompt and makes the initial output look duplicated. A short
+    /// grace window lets the prompt arrive naturally when possible and falls back to a resize only
+    /// when Docker withholds prompt output until the terminal has a concrete size.
+    async fn flush_initial_tty_output(
+        &self,
+        container_id: &str,
+        output: &mut (impl futures::Stream<Item = Result<LogOutput, BollardError>> + Unpin),
+        output_tx: &MpscSender<ContainerLogFrame>,
+        options: &ContainerAttachOptions,
+    ) -> ContainerResult<bool> {
+        match tokio::time::timeout(Duration::from_millis(100), output.next()).await {
+            Ok(Some(frame)) => {
+                let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
+                let frame = container_log_frame_from_output(frame);
+                if output_tx.send(frame).await.is_err() {
+                    return Ok(true);
+                }
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(_) => {
+                self.refresh_attached_tty_prompt(container_id, options)
+                    .await?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Attaches to one TTY-enabled Docker container through Bollard's upgraded connection path.
+    async fn attach_tty_container_raw(
+        &self,
+        container_id: &str,
+        options: &ContainerAttachOptions,
+        output_tx: MpscSender<ContainerLogFrame>,
+        input_rx: MpscReceiver<Vec<u8>>,
+    ) -> ContainerResult<()> {
+        let mut builder = AttachContainerOptionsBuilder::new()
+            .logs(options.logs)
+            .stream(options.stream)
+            .stdin(options.stdin)
+            .stdout(options.stdout)
+            .stderr(options.stderr);
+        if let Some(detach_keys) = options.detach_keys.as_deref() {
+            builder = builder.detach_keys(detach_keys);
+        }
+
+        self.ensure_container_running_for_attach(container_id)
+            .await?;
+        let AttachContainerResults {
+            mut output,
+            mut input,
+        } = self
+            .run_container_call(
+                container_id,
+                self.docker
+                    .attach_container(container_id, Some(builder.build())),
+            )
+            .await?;
+
+        let saw_output = self
+            .flush_initial_tty_output(container_id, &mut output, &output_tx, options)
+            .await?;
+        self.bridge_attached_io(
+            container_id,
+            &mut output,
+            &mut input,
+            options,
+            AttachBridgeIo {
+                output_tx,
+                input_rx,
+                saw_output,
+            },
+        )
+        .await
     }
 
     /// Build a stable dedupe key for one image-pull stream update.
@@ -1187,8 +1474,14 @@ impl ContainerManager for DockerContainerManager {
         container_id: &str,
         options: &ContainerAttachOptions,
         output_tx: MpscSender<ContainerLogFrame>,
-        mut input_rx: MpscReceiver<Vec<u8>>,
+        input_rx: MpscReceiver<Vec<u8>>,
     ) -> ContainerResult<()> {
+        if options.tty {
+            return self
+                .attach_tty_container_raw(container_id, options, output_tx, input_rx)
+                .await;
+        }
+
         let mut builder = AttachContainerOptionsBuilder::new()
             .logs(options.logs)
             .stream(options.stream)
@@ -1199,6 +1492,8 @@ impl ContainerManager for DockerContainerManager {
             builder = builder.detach_keys(detach_keys);
         }
 
+        self.ensure_container_running_for_attach(container_id)
+            .await?;
         let AttachContainerResults {
             mut output,
             mut input,
@@ -1210,51 +1505,18 @@ impl ContainerManager for DockerContainerManager {
             )
             .await?;
 
-        let output_open = options.stdout || options.stderr;
-        let mut input_open = options.stdin;
-
-        loop {
-            tokio::select! {
-                maybe_frame = output.next(), if output_open => {
-                    let Some(frame) = maybe_frame else {
-                        break;
-                    };
-                    let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
-                    if output_tx.send(container_log_frame_from_output(frame)).await.is_err() {
-                        return Ok(());
-                    }
-                }
-                maybe_chunk = input_rx.recv(), if input_open => {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            input.write_all(&chunk).await.map_err(|err| {
-                                ContainerError::OperationFailed(format!(
-                                    "attach stdin write failed for {container_id}: {err}"
-                                ))
-                            })?;
-                        }
-                        None => {
-                            input.shutdown().await.map_err(|err| {
-                                ContainerError::OperationFailed(format!(
-                                    "attach stdin shutdown failed for {container_id}: {err}"
-                                ))
-                            })?;
-                            input_open = false;
-                            if !output_open {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-                else => break,
-            }
-
-            if !output_open && !input_open {
-                break;
-            }
-        }
-
-        Ok(())
+        self.bridge_attached_io(
+            container_id,
+            &mut output,
+            &mut input,
+            options,
+            AttachBridgeIo {
+                output_tx,
+                input_rx,
+                saw_output: false,
+            },
+        )
+        .await
     }
 
     fn supports_runtime_events(&self) -> bool {
@@ -1334,6 +1596,12 @@ impl ContainerManager for DockerContainerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
     #[test]
     fn classify_container_error_maps_404_to_not_found() {
         let error = bollard::errors::Error::DockerResponseServerError {
@@ -1413,5 +1681,320 @@ mod tests {
             &mut updates,
             &second
         ));
+    }
+
+    #[tokio::test]
+    async fn tty_attach_forwards_initial_prompt_without_waiting_for_newline() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tcp listener");
+        let address = listener.local_addr().expect("listener address");
+        let endpoint = format!("http://{address}");
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept attach connection");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let bytes_read = socket.read(&mut buffer).await.expect("read attach request");
+                assert!(bytes_read > 0, "attach request should not close early");
+                request.extend_from_slice(&buffer[..bytes_read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(
+                request_text.contains("POST /containers/demo-container/attach?"),
+                "unexpected request: {request_text}"
+            );
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n/ # ",
+                )
+                .await
+                .expect("write attach upgrade response");
+
+            let bytes_read = socket
+                .read(&mut buffer)
+                .await
+                .expect("read forwarded attach stdin");
+            assert_eq!(&buffer[..bytes_read], b"exit\n");
+        });
+
+        let manager = DockerContainerManager {
+            docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
+                .expect("construct docker http client"),
+        };
+        let options = ContainerAttachOptions {
+            tty: true,
+            ..Default::default()
+        };
+        let (output_tx, mut output_rx) = mpsc::channel(8);
+        let (input_tx, input_rx) = mpsc::channel(8);
+
+        let attach = tokio::spawn(async move {
+            manager
+                .attach_tty_container_raw("demo-container", &options, output_tx, input_rx)
+                .await
+                .expect("attach tty container")
+        });
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), output_rx.recv())
+            .await
+            .expect("initial prompt should arrive promptly")
+            .expect("initial prompt frame");
+        assert_eq!(frame.stream, ContainerLogStream::Console);
+        assert_eq!(frame.message, b"/ # ");
+
+        input_tx
+            .send(b"exit\n".to_vec())
+            .await
+            .expect("forward stdin to tty attach");
+        drop(input_tx);
+
+        attach.await.expect("attach task should finish");
+        server.await.expect("tcp attach server should finish");
+    }
+
+    #[tokio::test]
+    async fn tty_attach_real_docker_emits_prompt_before_input() {
+        let manager = Arc::new(DockerContainerManager::new().await.expect("connect docker"));
+        manager
+            .pull_image("busybox:1.36")
+            .await
+            .expect("pull busybox image");
+
+        let container_name = format!("mantissa-tty-attach-test-{}", Uuid::new_v4());
+        let container_id = manager
+            .create_container(ContainerCreateRequest {
+                name: container_name.clone(),
+                image: "busybox:1.36".to_string(),
+                command: Some(vec!["sh".to_string(), "-i".to_string()]),
+                tty: true,
+                open_stdin: true,
+                ..Default::default()
+            })
+            .await
+            .expect("create tty attach test container");
+        manager
+            .start_container(&container_id)
+            .await
+            .expect("start tty attach test container");
+
+        let (output_tx, mut output_rx) = mpsc::channel(8);
+        let (input_tx, input_rx) = mpsc::channel(8);
+        let attach_options = ContainerAttachOptions {
+            tty: true,
+            tty_width: Some(80),
+            tty_height: Some(24),
+            ..Default::default()
+        };
+
+        let attach_manager = Arc::clone(&manager);
+        let attach_container_id = container_id.clone();
+        let attach = tokio::spawn(async move {
+            attach_manager
+                .attach_tty_container_raw(
+                    &attach_container_id,
+                    &attach_options,
+                    output_tx,
+                    input_rx,
+                )
+                .await
+        });
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), output_rx.recv())
+            .await
+            .expect("tty prompt should arrive")
+            .expect("tty prompt frame");
+        let prompt = String::from_utf8_lossy(&frame.message);
+        assert!(
+            prompt.contains("#"),
+            "expected shell prompt before input, got {prompt:?}"
+        );
+
+        input_tx
+            .send(b"exit\r".to_vec())
+            .await
+            .expect("send shell exit");
+        drop(input_tx);
+
+        let attach_result = tokio::time::timeout(Duration::from_secs(5), attach)
+            .await
+            .expect("attach task should finish")
+            .expect("attach join result");
+        if let Err(err) = manager.remove_container(&container_id, true, true).await {
+            panic!("cleanup attach test container failed: {err}");
+        }
+        attach_result.expect("attach tty container");
+    }
+
+    #[tokio::test]
+    async fn tty_attach_real_docker_reattach_redraws_prompt_after_disconnect() {
+        let manager = Arc::new(DockerContainerManager::new().await.expect("connect docker"));
+        manager
+            .pull_image("busybox:1.36")
+            .await
+            .expect("pull busybox image");
+
+        let container_name = format!("mantissa-tty-reattach-test-{}", Uuid::new_v4());
+        let container_id = manager
+            .create_container(ContainerCreateRequest {
+                name: container_name.clone(),
+                image: "busybox:1.36".to_string(),
+                command: Some(vec!["sh".to_string(), "-i".to_string()]),
+                tty: true,
+                open_stdin: true,
+                ..Default::default()
+            })
+            .await
+            .expect("create tty reattach test container");
+        manager
+            .start_container(&container_id)
+            .await
+            .expect("start tty reattach test container");
+
+        let attach_options = ContainerAttachOptions {
+            tty: true,
+            tty_width: Some(80),
+            tty_height: Some(24),
+            ..Default::default()
+        };
+
+        let (first_output_tx, mut first_output_rx) = mpsc::channel(8);
+        let (_first_input_tx, first_input_rx) = mpsc::channel(8);
+        let first_manager = Arc::clone(&manager);
+        let first_container_id = container_id.clone();
+        let first_options = attach_options.clone();
+        let first_attach = tokio::spawn(async move {
+            first_manager
+                .attach_tty_container_raw(
+                    &first_container_id,
+                    &first_options,
+                    first_output_tx,
+                    first_input_rx,
+                )
+                .await
+        });
+
+        let first_frame = tokio::time::timeout(Duration::from_secs(2), first_output_rx.recv())
+            .await
+            .expect("first tty prompt should arrive")
+            .expect("first tty prompt frame");
+        assert!(
+            String::from_utf8_lossy(&first_frame.message).contains('#'),
+            "expected first prompt before detach, got {:?}",
+            String::from_utf8_lossy(&first_frame.message)
+        );
+        first_attach.abort();
+        let _ = first_attach.await;
+
+        let (second_output_tx, mut second_output_rx) = mpsc::channel(8);
+        let (second_input_tx, second_input_rx) = mpsc::channel(8);
+        let second_manager = Arc::clone(&manager);
+        let second_container_id = container_id.clone();
+        let second_options = attach_options.clone();
+        let second_attach = tokio::spawn(async move {
+            second_manager
+                .attach_tty_container_raw(
+                    &second_container_id,
+                    &second_options,
+                    second_output_tx,
+                    second_input_rx,
+                )
+                .await
+        });
+
+        let second_frame = tokio::time::timeout(Duration::from_secs(2), second_output_rx.recv())
+            .await
+            .expect("second tty prompt should arrive")
+            .expect("second tty prompt frame");
+        assert!(
+            String::from_utf8_lossy(&second_frame.message).contains('#'),
+            "expected prompt after reattach, got {:?}",
+            String::from_utf8_lossy(&second_frame.message)
+        );
+
+        second_input_tx
+            .send(b"exit\r".to_vec())
+            .await
+            .expect("send shell exit after reattach");
+        drop(second_input_tx);
+
+        let second_result = tokio::time::timeout(Duration::from_secs(5), second_attach)
+            .await
+            .expect("second attach task should finish")
+            .expect("second attach join result");
+        if let Err(err) = manager.remove_container(&container_id, true, true).await {
+            panic!("cleanup reattach test container failed: {err}");
+        }
+        second_result.expect("reattach tty container");
+    }
+
+    #[tokio::test]
+    async fn tty_attach_rejects_exited_container() {
+        let manager = DockerContainerManager::new().await.expect("connect docker");
+        manager
+            .pull_image("busybox:1.36")
+            .await
+            .expect("pull busybox image");
+
+        let container_name = format!("mantissa-tty-attach-stopped-{}", Uuid::new_v4());
+        let container_id = manager
+            .create_container(ContainerCreateRequest {
+                name: container_name,
+                image: "busybox:1.36".to_string(),
+                command: Some(vec!["/bin/true".to_string()]),
+                tty: true,
+                open_stdin: true,
+                ..Default::default()
+            })
+            .await
+            .expect("create stopped tty attach test container");
+        manager
+            .start_container(&container_id)
+            .await
+            .expect("start stopped tty attach test container");
+
+        let mut wait = manager.docker.wait_container(
+            &container_id,
+            Some(
+                WaitContainerOptionsBuilder::new()
+                    .condition("not-running")
+                    .build(),
+            ),
+        );
+        wait.next()
+            .await
+            .expect("wait item")
+            .expect("container should stop cleanly");
+
+        let (output_tx, _output_rx) = mpsc::channel(1);
+        let (_input_tx, input_rx) = mpsc::channel(1);
+        let result = manager
+            .attach_tty_container_raw(
+                &container_id,
+                &ContainerAttachOptions {
+                    tty: true,
+                    tty_width: Some(80),
+                    tty_height: Some(24),
+                    ..Default::default()
+                },
+                output_tx,
+                input_rx,
+            )
+            .await;
+
+        if let Err(err) = manager.remove_container(&container_id, true, true).await {
+            panic!("cleanup stopped attach test container failed: {err}");
+        }
+        let message = result.expect_err("attach should reject exited container");
+        assert!(
+            message.to_string().contains("not running"),
+            "unexpected attach error: {message}"
+        );
     }
 }

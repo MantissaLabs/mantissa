@@ -868,12 +868,78 @@ impl TaskManager {
                 .cloned()
                 .unwrap_or_else(|| format!("mantissa-{id}"))
         };
+        let mut runtime_options = options.clone();
+        let runtime_info = self
+            .runtime
+            .container_manager
+            .inspect_container(&container_identifier)
+            .await
+            .map_err(|err| anyhow!("task attach inspect failed for {id}: {err}"))?;
+        let runtime_tty = runtime_info
+            .config
+            .as_ref()
+            .and_then(|config| config.tty)
+            .unwrap_or(spec.tty);
+        if runtime_tty != spec.tty {
+            debug!(
+                task = %id,
+                spec_tty = spec.tty,
+                runtime_tty,
+                "task attach detected persisted tty mismatch, using runtime container setting"
+            );
+        }
+        runtime_options.tty = runtime_tty;
 
         self.runtime
             .container_manager
-            .attach_container(&container_identifier, options, output_tx, input_rx)
+            .attach_container(&container_identifier, &runtime_options, output_tx, input_rx)
             .await
             .map_err(|err| anyhow!("task attach failed for {id}: {err}"))
+    }
+
+    /// Verifies that a locally owned task still has a running runtime before attach is accepted.
+    ///
+    /// This lets the RPC path reject stale "running" task records when the container has already
+    /// exited, instead of returning an empty attach stream that looks like success to the CLI.
+    pub async fn ensure_local_task_attachable(&self, id: Uuid) -> Result<(), anyhow::Error> {
+        let spec = self.load_spec(id).await?;
+        if spec.node_id != self.local_node_id {
+            return Err(anyhow!(
+                "task {id} is owned by remote node {}",
+                spec.node_id
+            ));
+        }
+        if !matches!(spec.state, ContainerState::Running) {
+            return Err(anyhow!(
+                "task {id} is not running (state: {:?})",
+                spec.state
+            ));
+        }
+
+        let container_identifier = {
+            let guard = self.local_state.local_containers.lock().await;
+            guard
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("mantissa-{id}"))
+        };
+
+        let info = self
+            .runtime
+            .container_manager
+            .inspect_container(&container_identifier)
+            .await
+            .map_err(|err| anyhow!("task attach preflight failed for {id}: {err}"))?;
+        let running = info
+            .state
+            .as_ref()
+            .and_then(|state| state.running)
+            .unwrap_or(false);
+        if !running {
+            return Err(anyhow!("task {id} runtime is not running"));
+        }
+
+        Ok(())
     }
 
     /// Requests a task transition into `Stopping` and broadcasts the desired state.

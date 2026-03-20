@@ -3,15 +3,15 @@ use crate::connection;
 use crate::tasks::util::write_frame;
 use anyhow::{Result, anyhow};
 use capnp_rpc::new_client;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use protocol::task::{TaskLogStream, task_attach_session, task_log_sink};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncReadExt;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 const DEFAULT_DETACH_KEYS: &str = "ctrl-p,ctrl-q";
+const FALLBACK_DETACH_BYTE: u8 = 0x1d;
 
 /// Rendering and transport options for `mantissa tasks attach`.
 pub struct TaskAttachOptions<'a> {
@@ -159,6 +159,41 @@ impl DetachSequenceMatcher {
     }
 }
 
+/// Consume one stdin chunk against the configured detach sequence and one local fallback escape.
+///
+/// The fallback `Ctrl-]` escape exists because some terminal setups make the Docker default
+/// `Ctrl-P, Ctrl-Q` sequence difficult to use interactively even in raw mode.
+fn consume_detach_input(
+    matcher: Option<&mut DetachSequenceMatcher>,
+    bytes: &[u8],
+    allow_fallback_detach: bool,
+) -> (Vec<u8>, bool) {
+    let mut matcher = matcher;
+    let mut forwarded = Vec::with_capacity(bytes.len());
+
+    for &byte in bytes {
+        if allow_fallback_detach && byte == FALLBACK_DETACH_BYTE {
+            if let Some(matcher) = matcher.as_deref_mut() {
+                matcher.matched = 0;
+            }
+            return (forwarded, true);
+        }
+
+        match matcher.as_deref_mut() {
+            Some(matcher) => {
+                let (chunk, detached) = matcher.consume(&[byte]);
+                forwarded.extend_from_slice(&chunk);
+                if detached {
+                    return (forwarded, true);
+                }
+            }
+            None => forwarded.push(byte),
+        }
+    }
+
+    (forwarded, false)
+}
+
 /// RAII guard that restores canonical terminal mode after interactive attach input ends.
 struct RawModeGuard {
     enabled: bool,
@@ -185,22 +220,152 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Moves the local terminal to the next line after a detach so the host shell prompt does not
+/// reuse the attached task's prompt line.
+fn write_detach_newline() -> Result<()> {
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(b"\r\n")
+        .map_err(|err| anyhow!("failed to render detach newline: {err}"))?;
+    stdout
+        .flush()
+        .map_err(|err| anyhow!("failed to flush detach newline: {err}"))?;
+    Ok(())
+}
+
+/// Normalizes terminal dimensions for Docker-style attach, falling back when a PTY reports
+/// an unusable zero-sized window.
+fn attach_terminal_size(raw_terminal: bool) -> Option<(u16, u16)> {
+    if !raw_terminal {
+        return None;
+    }
+
+    Some(sanitize_terminal_size(terminal_size().ok()))
+}
+
+/// Converts the current terminal size probe into a concrete, non-zero attach resize.
+fn sanitize_terminal_size(size: Option<(u16, u16)>) -> (u16, u16) {
+    match size {
+        Some((width, height)) if width > 0 && height > 0 => (width, height),
+        _ => (80, 24),
+    }
+}
+
 #[derive(Default)]
 struct AttachOutputNormalizer {
     stdout_prev_was_cr: bool,
     stderr_prev_was_cr: bool,
+    initial_console_frame_seen: bool,
+    initial_console_prompt: Option<Vec<u8>>,
 }
 
 impl AttachOutputNormalizer {
+    /// Captures the first prompt bytes so an immediate redraw chunk can be suppressed.
+    fn capture_initial_prompt(bytes: &[u8]) -> Option<Vec<u8>> {
+        let trimmed = bytes.strip_prefix(b"\r").unwrap_or(bytes);
+        if trimmed.is_empty() || trimmed.len() > 128 {
+            return None;
+        }
+        if trimmed
+            .iter()
+            .any(|byte| *byte == b'\n' || *byte == 0x1b || byte.is_ascii_control())
+        {
+            return None;
+        }
+        Some(trimmed.to_vec())
+    }
+
+    /// Collapses the common prompt redraw sequence emitted after an immediate TTY resize.
+    fn collapse_initial_prompt_redraw(bytes: &[u8]) -> Option<Vec<u8>> {
+        const REDRAW_MARKER: &[u8] = b"\x1b[J\r\n";
+        let marker_index = bytes
+            .windows(REDRAW_MARKER.len())
+            .position(|window| window == REDRAW_MARKER)?;
+        let prompt = bytes[..marker_index]
+            .strip_prefix(b"\r")
+            .unwrap_or(&bytes[..marker_index]);
+        if prompt.is_empty() || prompt.len() > 128 {
+            return None;
+        }
+        if prompt
+            .iter()
+            .any(|byte| *byte == b'\n' || *byte == 0x1b || byte.is_ascii_control())
+        {
+            return None;
+        }
+
+        let mut remaining = &bytes[marker_index + REDRAW_MARKER.len()..];
+        if !remaining.starts_with(prompt) {
+            return None;
+        }
+        remaining = &remaining[prompt.len()..];
+
+        while !remaining.is_empty() {
+            remaining = remaining.strip_prefix(b"\r")?;
+            if !remaining.starts_with(prompt) {
+                return None;
+            }
+            remaining = &remaining[prompt.len()..];
+            remaining = remaining.strip_prefix(REDRAW_MARKER)?;
+            if !remaining.starts_with(prompt) {
+                return None;
+            }
+            remaining = &remaining[prompt.len()..];
+        }
+
+        let mut collapsed = Vec::with_capacity(prompt.len() + 1);
+        collapsed.push(b'\r');
+        collapsed.extend_from_slice(prompt);
+        Some(collapsed)
+    }
+
     /// Rewrites terminal line endings only while local raw mode is active so output stays readable.
     fn normalize(&mut self, stream: TaskLogStream, bytes: &[u8]) -> Vec<u8> {
+        let bytes = match stream {
+            TaskLogStream::Stdout | TaskLogStream::Console if !self.initial_console_frame_seen => {
+                if bytes.is_empty() {
+                    bytes.to_vec()
+                } else {
+                    self.initial_console_frame_seen = true;
+                    match Self::collapse_initial_prompt_redraw(bytes) {
+                        Some(collapsed) => {
+                            self.initial_console_prompt = None;
+                            collapsed
+                        }
+                        None => {
+                            self.initial_console_prompt = Self::capture_initial_prompt(bytes);
+                            bytes.to_vec()
+                        }
+                    }
+                }
+            }
+            TaskLogStream::Stdout | TaskLogStream::Console => {
+                let redraw_suffix = bytes
+                    .strip_prefix(b"\x1b[J\r\n")
+                    .or_else(|| bytes.strip_prefix(b"\x1b[J\n"));
+                let prompt = self.initial_console_prompt.clone();
+                if let (Some(prompt), Some(suffix)) = (prompt.as_ref(), redraw_suffix)
+                    && suffix == prompt.as_slice()
+                {
+                    self.initial_console_prompt = None;
+                    let mut collapsed = Vec::with_capacity(prompt.len() + 1);
+                    collapsed.push(b'\r');
+                    collapsed.extend_from_slice(prompt);
+                    collapsed
+                } else {
+                    self.initial_console_prompt = None;
+                    bytes.to_vec()
+                }
+            }
+            TaskLogStream::Stderr => bytes.to_vec(),
+        };
         let prev_was_cr = match stream {
             TaskLogStream::Stdout | TaskLogStream::Console => &mut self.stdout_prev_was_cr,
             TaskLogStream::Stderr => &mut self.stderr_prev_was_cr,
         };
 
         let mut normalized = Vec::with_capacity(bytes.len());
-        for &byte in bytes {
+        for &byte in &bytes {
             if byte == b'\n' && !*prev_was_cr {
                 normalized.push(b'\r');
             }
@@ -321,42 +486,87 @@ enum InputPumpOutcome {
     Detached,
 }
 
+/// Background event produced by the blocking stdin reader thread.
+enum StdinEvent {
+    Data(Vec<u8>),
+    Eof,
+    Error(String),
+}
+
+/// Spawns one blocking stdin reader thread so interactive attach input does not rely on
+/// `tokio::io::stdin()`, which is documented to be unsuitable for interactive cancellation.
+fn spawn_stdin_reader() -> Result<mpsc::UnboundedReceiver<StdinEvent>> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name("mantissa-attach-stdin".to_string())
+        .spawn(move || {
+            let stdin = io::stdin();
+            let mut stdin = stdin.lock();
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stdin.read(&mut buffer) {
+                    Ok(0) => {
+                        let _ = tx.send(StdinEvent::Eof);
+                        break;
+                    }
+                    Ok(bytes_read) => {
+                        if tx
+                            .send(StdinEvent::Data(buffer[..bytes_read].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        let _ = tx.send(StdinEvent::Error(err.to_string()));
+                        break;
+                    }
+                }
+            }
+        })
+        .map_err(|err| anyhow!("failed to spawn attach stdin reader thread: {err}"))?;
+    Ok(rx)
+}
+
 /// Reads local stdin and forwards bytes to the remote attach session.
 async fn pump_attach_input(
     session: task_attach_session::Client,
-    use_raw_mode: bool,
     detach_sequence: Option<DetachSequence>,
+    allow_fallback_detach: bool,
 ) -> Result<InputPumpOutcome> {
-    let _raw_mode = RawModeGuard::maybe_enable(use_raw_mode)?;
-    let mut stdin = tokio::io::stdin();
-    let mut buffer = vec![0u8; 4096];
+    let mut stdin = spawn_stdin_reader()?;
     let mut matcher = detach_sequence.map(DetachSequenceMatcher::new);
 
     loop {
-        let bytes_read = stdin
-            .read(&mut buffer)
+        let event = stdin
+            .recv()
             .await
-            .map_err(|err| anyhow!("failed to read stdin for task attach: {err}"))?;
-        if bytes_read == 0 {
-            if let Some(matcher) = matcher.as_mut() {
-                let pending = matcher.finish();
-                if !pending.is_empty() {
-                    let mut request = session.push_input_request();
-                    request.get().set_data(&pending);
-                    request
-                        .send()
-                        .await
-                        .map_err(|err| anyhow!("failed to forward task attach input: {err}"))?;
-                }
-            }
-            break;
-        }
+            .ok_or_else(|| anyhow!("stdin reader stopped unexpectedly during task attach"))?;
 
-        let chunk = &buffer[..bytes_read];
-        let (forwarded, detached) = match matcher.as_mut() {
-            Some(matcher) => matcher.consume(chunk),
-            None => (chunk.to_vec(), false),
+        let chunk = match event {
+            StdinEvent::Data(chunk) => chunk,
+            StdinEvent::Eof => {
+                if let Some(matcher) = matcher.as_mut() {
+                    let pending = matcher.finish();
+                    if !pending.is_empty() {
+                        let mut request = session.push_input_request();
+                        request.get().set_data(&pending);
+                        request
+                            .send()
+                            .await
+                            .map_err(|err| anyhow!("failed to forward task attach input: {err}"))?;
+                    }
+                }
+                break;
+            }
+            StdinEvent::Error(err) => {
+                return Err(anyhow!("failed to read stdin for task attach: {err}"));
+            }
         };
+
+        let (forwarded, detached) =
+            consume_detach_input(matcher.as_mut(), chunk.as_slice(), allow_fallback_detach);
         if !forwarded.is_empty() {
             let mut request = session.push_input_request();
             request.get().set_data(&forwarded);
@@ -400,6 +610,8 @@ pub async fn attach(cfg: &ClientConfig, id: &str, options: &TaskAttachOptions<'_
     let options = options.normalized()?;
     let client = connection::get_local_session(cfg).await?;
     let raw_terminal = options.stdin && std::io::stdin().is_terminal();
+    let _raw_mode = RawModeGuard::maybe_enable(raw_terminal)?;
+    let terminal_size = attach_terminal_size(raw_terminal);
     let normalize_stdout = raw_terminal && std::io::stdout().is_terminal();
     let normalize_stderr = raw_terminal && std::io::stderr().is_terminal();
     let detach_sequence = if raw_terminal {
@@ -413,6 +625,12 @@ pub async fn attach(cfg: &ClientConfig, id: &str, options: &TaskAttachOptions<'_
     } else {
         None
     };
+    let allow_fallback_detach = raw_terminal
+        && options
+            .detach_keys
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case(DEFAULT_DETACH_KEYS))
+            .unwrap_or(true);
 
     let request = client.get_task_request();
     let task = request.send().pipeline.get_task();
@@ -434,6 +652,10 @@ pub async fn attach(cfg: &ClientConfig, id: &str, options: &TaskAttachOptions<'_
         options_builder.set_stdout(options.stdout);
         options_builder.set_stderr(options.stderr);
         options_builder.set_detach_keys(options.detach_keys.as_deref().unwrap_or(""));
+        if let Some((width, height)) = terminal_size {
+            options_builder.set_tty_width(width);
+            options_builder.set_tty_height(height);
+        }
         builder.set_sink(sink);
     }
 
@@ -445,7 +667,7 @@ pub async fn attach(cfg: &ClientConfig, id: &str, options: &TaskAttachOptions<'_
         let session = session.clone();
         let detach_sequence = detach_sequence.clone();
         tokio::task::spawn_local(async move {
-            pump_attach_input(session, raw_terminal, detach_sequence).await
+            pump_attach_input(session, detach_sequence, allow_fallback_detach).await
         })
     });
 
@@ -466,6 +688,7 @@ pub async fn attach(cfg: &ClientConfig, id: &str, options: &TaskAttachOptions<'_
             };
             if !handle.is_finished() {
                 handle.abort();
+                let _ = handle.await;
             }
             result
         } else {
@@ -481,9 +704,13 @@ pub async fn attach(cfg: &ClientConfig, id: &str, options: &TaskAttachOptions<'_
 
     if let Some(handle) = input_task.take() {
         handle.abort();
+        let _ = handle.await;
     }
     if options.stdin && !detached {
         close_attach_input(&session).await;
+    }
+    if detached && raw_terminal {
+        write_detach_newline()?;
     }
 
     result
@@ -573,11 +800,75 @@ mod tests {
     }
 
     #[test]
+    fn detach_input_supports_fallback_ctrl_right_bracket() {
+        let mut matcher = DetachSequenceMatcher::new(DetachSequence {
+            bytes: vec![0x10, 0x11],
+        });
+
+        let (forwarded, detached) = consume_detach_input(Some(&mut matcher), b"echo hi\x1d", true);
+        assert_eq!(forwarded, b"echo hi");
+        assert!(detached);
+    }
+
+    #[test]
+    fn detach_input_forwards_ctrl_right_bracket_when_fallback_is_disabled() {
+        let mut matcher = DetachSequenceMatcher::new(DetachSequence {
+            bytes: vec![0x10, 0x11],
+        });
+
+        let (forwarded, detached) = consume_detach_input(Some(&mut matcher), &[0x1d], false);
+        assert_eq!(forwarded, vec![0x1d]);
+        assert!(!detached);
+    }
+
+    #[test]
     fn output_normalizer_rewrites_linefeeds_for_raw_terminal_output() {
         let mut normalizer = AttachOutputNormalizer::default();
         assert_eq!(
             normalizer.normalize(TaskLogStream::Stdout, b"line1\nline2\n"),
             b"line1\r\nline2\r\n"
         );
+    }
+
+    #[test]
+    fn output_normalizer_collapses_initial_prompt_redraw() {
+        let mut normalizer = AttachOutputNormalizer::default();
+        assert_eq!(
+            normalizer.normalize(TaskLogStream::Console, b"\r/ # \x1b[J\r\n/ # "),
+            b"\r/ # "
+        );
+    }
+
+    #[test]
+    fn output_normalizer_collapses_repeated_initial_prompt_redraws() {
+        let mut normalizer = AttachOutputNormalizer::default();
+        assert_eq!(
+            normalizer.normalize(
+                TaskLogStream::Console,
+                b"\r/ # \x1b[J\r\n/ # \r/ # \x1b[J\r\n/ # "
+            ),
+            b"\r/ # "
+        );
+    }
+
+    #[test]
+    fn output_normalizer_suppresses_split_initial_prompt_redraw() {
+        let mut normalizer = AttachOutputNormalizer::default();
+        assert_eq!(
+            normalizer.normalize(TaskLogStream::Console, b"\r/ # "),
+            b"\r/ # "
+        );
+        assert_eq!(
+            normalizer.normalize(TaskLogStream::Console, b"\x1b[J\r\n/ # "),
+            b"\r/ # "
+        );
+    }
+
+    #[test]
+    fn attach_terminal_size_falls_back_for_zero_sized_ptys() {
+        assert_eq!(sanitize_terminal_size(None), (80, 24));
+        assert_eq!(sanitize_terminal_size(Some((0, 24))), (80, 24));
+        assert_eq!(sanitize_terminal_size(Some((80, 0))), (80, 24));
+        assert_eq!(sanitize_terminal_size(Some((120, 40))), (120, 40));
     }
 }

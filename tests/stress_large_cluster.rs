@@ -133,6 +133,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
             networks: Vec::new(),
             readiness: None,
             liveness: None,
+            tty: false,
             public_port: None,
         }],
     }

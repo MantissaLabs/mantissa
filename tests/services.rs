@@ -187,6 +187,7 @@ local_test!(services_gossip_propagates_across_peers, {
                 networks: Vec::new(),
                 readiness: None,
                 liveness: None,
+                tty: false,
                 public_port: None,
                 public_protocol: None,
             }],
@@ -288,6 +289,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
         networks: Vec::new(),
         readiness: None,
         liveness: None,
+        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -379,6 +381,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                 networks: Vec::new(),
                 readiness: None,
                 liveness: None,
+                tty: false,
                 public_port: None,
                 public_protocol: None,
             }],
@@ -446,6 +449,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                 networks: Vec::new(),
                 readiness: None,
                 liveness: None,
+                tty: false,
                 public_port: None,
                 public_protocol: None,
             }],
@@ -515,6 +519,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
                 networks: Vec::new(),
                 readiness: None,
                 liveness: None,
+                tty: false,
                 public_port: None,
                 public_protocol: None,
             }],
@@ -3060,6 +3065,7 @@ local_test!(services_redeploy_scales_replicas, {
         networks: Vec::new(),
         readiness: None,
         liveness: None,
+        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -3188,6 +3194,7 @@ local_test!(services_redeploy_updates_resources, {
         networks: Vec::new(),
         readiness: None,
         liveness: None,
+        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -3325,6 +3332,7 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
         networks: Vec::new(),
         readiness: None,
         liveness: None,
+        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -3448,6 +3456,7 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
         networks: Vec::new(),
         readiness: None,
         liveness: None,
+        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -3545,6 +3554,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
         networks: Vec::new(),
         readiness: None,
         liveness: None,
+        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -3675,6 +3685,7 @@ local_test!(
             networks: Vec::new(),
             readiness: None,
             liveness: None,
+            tty: false,
             public_port: None,
             public_protocol: None,
         }];
@@ -3811,6 +3822,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
         networks: Vec::new(),
         readiness: None,
         liveness: None,
+        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -3920,6 +3932,7 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
         networks: Vec::new(),
         readiness: None,
         liveness: None,
+        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -4034,6 +4047,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
         networks: Vec::new(),
         readiness: None,
         liveness: None,
+        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -4153,6 +4167,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
         networks: Vec::new(),
         readiness: None,
         liveness: None,
+        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -4245,6 +4260,7 @@ fn demo_backend_task_template(name: &str, replicas: u16) -> ServiceTaskSpecValue
         networks: Vec::new(),
         readiness: None,
         liveness: None,
+        tty: false,
         public_port: None,
         public_protocol: None,
     }
@@ -5460,6 +5476,7 @@ fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
         created_at: spec.created_at.clone(),
         updated_at: spec.updated_at.clone(),
         command: spec.command.clone(),
+        tty: spec.tty,
         node_id: spec.node_id,
         node_name: spec.node_name.clone(),
         slot_ids: spec.slot_ids.clone(),
@@ -5816,6 +5833,7 @@ fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskS
                 networks,
                 readiness: None,
                 liveness: None,
+                tty: false,
                 public_port: None,
                 public_protocol: None,
             }

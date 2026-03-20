@@ -340,7 +340,13 @@ pub enum TasksCommand {
     /// Stream logs for a task
     Logs(TasksLogsArgs),
 
-    /// Attach to a task's live stdio stream
+    /// Attach to a task's live stdio stream.
+    ///
+    /// Use the detach sequence (`ctrl-p,ctrl-q` by default) to leave the task running.
+    /// `ctrl-]` also detaches locally as a fallback when the default sequence is swallowed by
+    /// the terminal.
+    /// If the task entrypoint is a shell, typing `exit` terminates that shell and the task,
+    /// matching Docker attach semantics.
     Attach(TasksAttachArgs),
 
     /// Start a container task
@@ -475,7 +481,9 @@ pub struct TasksAttachArgs {
     #[arg(long = "stderr", action = ArgAction::SetTrue)]
     pub stderr: bool,
 
-    /// Override Docker-style detach keys (default `ctrl-p,ctrl-q`)
+    /// Override Docker-style detach keys used to leave the task running (default `ctrl-p,ctrl-q`)
+    ///
+    /// The built-in local fallback `ctrl-]` is only active when using the default detach keys.
     #[arg(long = "detach-keys", value_name = "KEYS")]
     pub detach_keys: Option<String>,
 }

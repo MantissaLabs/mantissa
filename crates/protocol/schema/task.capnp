@@ -93,6 +93,12 @@ struct TaskAttachOptions {
 
   detachKeys @5 :Text;
   # Optional detach key override in Docker's attach format.
+
+  ttyWidth @6 :UInt16;
+  # Initial terminal width in columns for TTY attach sessions, 0 = unspecified.
+
+  ttyHeight @7 :UInt16;
+  # Initial terminal height in rows for TTY attach sessions, 0 = unspecified.
 }
 
 enum TaskLogStream {

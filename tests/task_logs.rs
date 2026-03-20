@@ -161,6 +161,7 @@ fn replicated_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str) -> Tas
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: vec!["/bin/demo".to_string()],
+        tty: false,
         node_id: owner_id,
         node_name: owner_name.to_string(),
         slot_ids: Vec::new(),

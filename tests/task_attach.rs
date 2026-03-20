@@ -79,7 +79,18 @@ impl ContainerManager for StaticAttachContainerManager {
         &self,
         container_id: &str,
     ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
-        Err(ContainerError::NotFound(container_id.to_string()))
+        let exists = self.frames.lock().await.contains_key(container_id);
+        if !exists {
+            return Err(ContainerError::NotFound(container_id.to_string()));
+        }
+
+        Ok(bollard::service::ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                running: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
     }
 
     async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
@@ -350,6 +361,9 @@ local_test!(task_attach_relay_over_tcp_sessions, {
                 stdout: true,
                 stderr: true,
                 detach_keys: Some("ctrl-p,ctrl-q".to_string()),
+                tty: false,
+                tty_width: None,
+                tty_height: None,
             }
         )]
     );
