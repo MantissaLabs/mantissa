@@ -349,6 +349,14 @@ pub enum TasksCommand {
     /// matching Docker attach semantics.
     Attach(TasksAttachArgs),
 
+    /// Execute one command inside a running task container.
+    ///
+    /// Use `--tty` for interactive shells. When stdin is attached to a TTY, the Docker default
+    /// detach sequence (`ctrl-p,ctrl-q`) leaves the exec process running and returns locally.
+    /// `ctrl-]` also detaches locally as a fallback when the default sequence is swallowed by
+    /// the terminal.
+    Exec(TasksExecArgs),
+
     /// Start a container task
     #[command(alias = "run")]
     Start(TasksStartArgs),
@@ -486,6 +494,44 @@ pub struct TasksAttachArgs {
     /// The built-in local fallback `ctrl-]` is only active when using the default detach keys.
     #[arg(long = "detach-keys", value_name = "KEYS")]
     pub detach_keys: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct TasksExecArgs {
+    /// Task ID or unique prefix to execute inside
+    #[arg(index = 1, value_name = "ID")]
+    pub id: String,
+
+    /// Disable stdin forwarding to the exec session
+    #[arg(long = "no-stdin", action = ArgAction::SetTrue)]
+    pub no_stdin: bool,
+
+    /// Allocate a pseudo-terminal for the exec session
+    #[arg(short = 't', long = "tty", action = ArgAction::SetTrue)]
+    pub tty: bool,
+
+    /// Include stdout frames
+    #[arg(long = "stdout", action = ArgAction::SetTrue)]
+    pub stdout: bool,
+
+    /// Include stderr frames
+    #[arg(long = "stderr", action = ArgAction::SetTrue)]
+    pub stderr: bool,
+
+    /// Override Docker-style detach keys used to leave the exec process running
+    #[arg(long = "detach-keys", value_name = "KEYS")]
+    pub detach_keys: Option<String>,
+
+    /// Command and arguments to execute inside the running task container
+    #[arg(
+        index = 2,
+        required = true,
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    pub command: Vec<String>,
 }
 
 #[derive(Args, Debug)]

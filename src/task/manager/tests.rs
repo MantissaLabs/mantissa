@@ -51,6 +51,7 @@ use tokio::sync::{Notify, RwLock, mpsc};
 
 type ExecCall = (String, Vec<String>, Option<std::time::Duration>);
 type AttachCall = (String, crate::task::docker::ContainerAttachOptions);
+type ExecStreamCall = (String, crate::task::docker::ContainerExecOptions);
 type LogCall = (String, crate::task::docker::ContainerLogsOptions);
 
 #[derive(Clone, Default)]
@@ -79,6 +80,17 @@ struct MockContainerManager {
     attach_frames: Arc<AsyncMutex<HashMap<String, Vec<crate::task::docker::ContainerLogFrame>>>>,
     attach_inputs: Arc<AsyncMutex<HashMap<String, Vec<Vec<u8>>>>>,
     attach_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
+    exec_stream_calls: Arc<AsyncMutex<Vec<ExecStreamCall>>>,
+    exec_stream_frames:
+        Arc<AsyncMutex<HashMap<String, Vec<crate::task::docker::ContainerLogFrame>>>>,
+    exec_stream_inputs: Arc<AsyncMutex<HashMap<String, Vec<Vec<u8>>>>>,
+    exec_stream_results: Arc<
+        AsyncMutex<
+            VecDeque<
+                crate::task::docker::ContainerResult<crate::task::docker::ContainerExecResult>,
+            >,
+        >,
+    >,
     log_calls: Arc<AsyncMutex<Vec<LogCall>>>,
     log_frames: Arc<AsyncMutex<HashMap<String, Vec<crate::task::docker::ContainerLogFrame>>>>,
     log_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
@@ -284,6 +296,47 @@ impl ContainerManager for MockContainerManager {
             .await
             .insert(container_id.to_string(), chunks);
         Ok(())
+    }
+
+    async fn exec_container_stream(
+        &self,
+        container_id: &str,
+        options: &crate::task::docker::ContainerExecOptions,
+        output_tx: tokio::sync::mpsc::Sender<crate::task::docker::ContainerLogFrame>,
+        mut input_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> crate::task::docker::ContainerResult<crate::task::docker::ContainerExecResult> {
+        self.exec_stream_calls
+            .lock()
+            .await
+            .push((container_id.to_string(), options.clone()));
+
+        let frames = self
+            .exec_stream_frames
+            .lock()
+            .await
+            .get(container_id)
+            .cloned()
+            .unwrap_or_default();
+        for frame in frames {
+            if output_tx.send(frame).await.is_err() {
+                return Ok(crate::task::docker::ContainerExecResult { exit_code: None });
+            }
+        }
+
+        let mut chunks = Vec::new();
+        while let Some(chunk) = input_rx.recv().await {
+            chunks.push(chunk);
+        }
+        self.exec_stream_inputs
+            .lock()
+            .await
+            .insert(container_id.to_string(), chunks);
+
+        if let Some(result) = self.exec_stream_results.lock().await.pop_front() {
+            return result;
+        }
+
+        Ok(crate::task::docker::ContainerExecResult { exit_code: Some(0) })
     }
 }
 
@@ -4035,6 +4088,122 @@ async fn attach_local_task_uses_runtime_tty_when_persisted_spec_is_stale() {
                 ..options
             }
         )]
+    );
+}
+
+#[tokio::test]
+async fn exec_local_task_forwards_input_output_and_options() {
+    let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let spec = TaskSpec {
+        id: task_id,
+        name: "execable".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: vec!["/bin/demo".to_string()],
+        tty: false,
+        node_id: manager.local_node_id,
+        node_name: manager.local_node_name.clone(),
+        slot_ids: Vec::new(),
+        slot_id: None,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 1,
+        last_terminal_observed_launch: None,
+    };
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    let container_name = format!("mantissa-{task_id}");
+    mock_cm.exec_stream_frames.lock().await.insert(
+        container_name.clone(),
+        vec![
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::Console,
+                message: b"/ # ".to_vec(),
+            },
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::StdOut,
+                message: b"done\n".to_vec(),
+            },
+        ],
+    );
+    mock_cm.exec_stream_results.lock().await.push_back(Ok(
+        crate::task::docker::ContainerExecResult { exit_code: Some(0) },
+    ));
+
+    let options = crate::task::docker::ContainerExecOptions {
+        command: vec!["sh".to_string(), "-c".to_string(), "echo done".to_string()],
+        stdin: true,
+        stdout: true,
+        stderr: true,
+        tty: true,
+        detach_keys: Some("ctrl-p,ctrl-q".to_string()),
+        tty_width: Some(80),
+        tty_height: Some(24),
+    };
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(8);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(8);
+    input_tx
+        .send(b"echo exec\n".to_vec())
+        .await
+        .expect("send exec input");
+    drop(input_tx);
+
+    let result = manager
+        .exec_local_task(task_id, &options, output_tx, input_rx)
+        .await
+        .expect("exec local task");
+
+    let mut frames = Vec::new();
+    while let Some(frame) = output_rx.recv().await {
+        frames.push(frame);
+    }
+
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(
+        mock_cm.exec_stream_calls.lock().await.clone(),
+        vec![(container_name.clone(), options.clone())]
+    );
+    assert_eq!(
+        mock_cm
+            .exec_stream_inputs
+            .lock()
+            .await
+            .get(&container_name)
+            .cloned()
+            .unwrap_or_default(),
+        vec![b"echo exec\n".to_vec()]
+    );
+    assert_eq!(
+        frames,
+        vec![
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::Console,
+                message: b"/ # ".to_vec(),
+            },
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::StdOut,
+                message: b"done\n".to_vec(),
+            },
+        ]
     );
 }
 

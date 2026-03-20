@@ -18,6 +18,9 @@ interface Task {
 
   attach @5 (request :TaskAttachRequest) -> (session :TaskAttachSession);
   # Attach to one task's live stdio stream and return a session for stdin forwarding.
+
+  exec @6 (request :TaskExecRequest) -> (session :TaskExecSession);
+  # Start one command inside a running task and return a session for stdin forwarding/results.
 }
 
 interface TaskLogSink {
@@ -99,6 +102,54 @@ struct TaskAttachOptions {
 
   ttyHeight @7 :UInt16;
   # Initial terminal height in rows for TTY attach sessions, 0 = unspecified.
+}
+
+interface TaskExecSession {
+  pushInput @0 (data :Data) -> stream;
+  # Push one stdin chunk into the exec session while preserving backpressure.
+
+  closeInput @1 ();
+  # Signals EOF on stdin for the exec session.
+
+  waitResult @2 () -> (hasExitCode :Bool, exitCode :Int32);
+  # Wait until the remote exec process finishes and return its exit status when available.
+}
+
+struct TaskExecRequest {
+  selector @0 :Text;
+  # Task UUID or unique prefix.
+
+  options @1 :TaskExecOptions;
+  # Stream options mirroring the interactive Docker exec API.
+
+  sink @2 :TaskLogSink;
+  # Sink receiving streamed stdout/stderr/console frames.
+}
+
+struct TaskExecOptions {
+  command @0 :List(Text);
+  # Command/argv to start inside the running task container.
+
+  stdin @1 :Bool;
+  # Attach the caller's stdin to the exec input stream.
+
+  stdout @2 :Bool;
+  # Include stdout frames in the stream.
+
+  stderr @3 :Bool;
+  # Include stderr frames in the stream.
+
+  tty @4 :Bool;
+  # Allocate a pseudo-terminal for the exec session.
+
+  detachKeys @5 :Text;
+  # Optional detach key override in Docker's exec format.
+
+  ttyWidth @6 :UInt16;
+  # Initial terminal width in columns for TTY exec sessions, 0 = unspecified.
+
+  ttyHeight @7 :UInt16;
+  # Initial terminal height in rows for TTY exec sessions, 0 = unspecified.
 }
 
 enum TaskLogStream {

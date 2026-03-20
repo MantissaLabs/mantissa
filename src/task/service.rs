@@ -5,7 +5,8 @@ use crate::task::capnp_codec::{
 };
 use crate::task::container::ContainerState;
 use crate::task::docker::{
-    ContainerAttachOptions, ContainerLogFrame, ContainerLogStream, ContainerLogsOptions,
+    ContainerAttachOptions, ContainerExecOptions, ContainerLogFrame, ContainerLogStream,
+    ContainerLogsOptions,
 };
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
@@ -17,11 +18,11 @@ use capnp::Error;
 use protocol::gossip::gossip_message;
 use protocol::task::{
     TaskLogStream as CapnpTaskLogStream, TaskStateFilter as CapnpTaskStateFilter, task,
-    task_attach_options, task_attach_session, task_event, task_list_request, task_log_sink,
-    task_logs_options, task_spec, task_status,
+    task_attach_options, task_attach_session, task_event, task_exec_options, task_exec_session,
+    task_list_request, task_log_sink, task_logs_options, task_spec, task_status,
 };
 use std::rc::Rc;
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -589,6 +590,42 @@ fn read_attach_options(
     })
 }
 
+/// Encodes task exec request options onto the wire.
+fn write_exec_options(mut builder: task_exec_options::Builder<'_>, options: &ContainerExecOptions) {
+    let mut command_builder = builder
+        .reborrow()
+        .init_command(options.command.len() as u32);
+    for (idx, arg) in options.command.iter().enumerate() {
+        command_builder.set(idx as u32, arg);
+    }
+    builder.set_stdin(options.stdin);
+    builder.set_stdout(options.stdout);
+    builder.set_stderr(options.stderr);
+    builder.set_tty(options.tty);
+    builder.set_detach_keys(options.detach_keys.as_deref().unwrap_or(""));
+    builder.set_tty_width(options.tty_width.unwrap_or(0));
+    builder.set_tty_height(options.tty_height.unwrap_or(0));
+}
+
+/// Decodes task exec request options from the wire format.
+fn read_exec_options(reader: task_exec_options::Reader<'_>) -> Result<ContainerExecOptions, Error> {
+    let mut command = Vec::new();
+    for arg in reader.get_command()?.iter() {
+        command.push(arg?.to_str()?.to_string());
+    }
+    let detach_keys = reader.get_detach_keys()?.to_str()?.trim().to_string();
+    Ok(ContainerExecOptions {
+        command,
+        stdin: reader.get_stdin(),
+        stdout: reader.get_stdout(),
+        stderr: reader.get_stderr(),
+        tty: reader.get_tty(),
+        detach_keys: (!detach_keys.is_empty()).then_some(detach_keys),
+        tty_width: (reader.get_tty_width() != 0).then(|| reader.get_tty_width()),
+        tty_height: (reader.get_tty_height() != 0).then(|| reader.get_tty_height()),
+    })
+}
+
 /// Pushes one runtime log frame into the caller-provided Cap'n Proto sink.
 async fn push_log_frame(
     sink: &task_log_sink::Client,
@@ -648,6 +685,103 @@ impl task_attach_session::Server for LocalTaskAttachSession {
     ) -> Result<(), Error> {
         self.input_tx.lock().await.take();
         Ok(())
+    }
+}
+
+/// Shared completion state for one running task exec session.
+struct LocalTaskExecCompletion {
+    result: AsyncMutex<Option<Result<crate::task::docker::ContainerExecResult, String>>>,
+    ready: Notify,
+}
+
+impl LocalTaskExecCompletion {
+    /// Builds one unresolved exec completion handle.
+    fn new() -> Self {
+        Self {
+            result: AsyncMutex::new(None),
+            ready: Notify::new(),
+        }
+    }
+
+    /// Stores the final exec outcome and wakes any waiter exactly once.
+    async fn finish(&self, result: Result<crate::task::docker::ContainerExecResult, String>) {
+        let mut guard = self.result.lock().await;
+        if guard.is_none() {
+            *guard = Some(result);
+            self.ready.notify_waiters();
+        }
+    }
+
+    /// Waits until the exec result has been published.
+    async fn wait(&self) -> Result<crate::task::docker::ContainerExecResult, String> {
+        loop {
+            if let Some(result) = self.result.lock().await.clone() {
+                return result;
+            }
+            self.ready.notified().await;
+        }
+    }
+}
+
+/// Session capability that forwards client stdin chunks into one running task exec bridge and
+/// exposes the final exit status when the exec process completes.
+struct LocalTaskExecSession {
+    input_tx: AsyncMutex<Option<mpsc::Sender<Vec<u8>>>>,
+    completion: Rc<LocalTaskExecCompletion>,
+}
+
+impl LocalTaskExecSession {
+    /// Builds one local exec session around the provided stdin channel and completion state.
+    fn new(
+        input_tx: Option<mpsc::Sender<Vec<u8>>>,
+        completion: Rc<LocalTaskExecCompletion>,
+    ) -> Self {
+        Self {
+            input_tx: AsyncMutex::new(input_tx),
+            completion,
+        }
+    }
+}
+
+impl task_exec_session::Server for LocalTaskExecSession {
+    async fn push_input(
+        self: Rc<Self>,
+        params: task_exec_session::PushInputParams,
+    ) -> Result<(), Error> {
+        let bytes = params.get()?.get_data()?.to_owned();
+        let sender = self.input_tx.lock().await.clone().ok_or_else(|| {
+            Error::failed("stdin is not attached for this exec session".to_string())
+        })?;
+        sender
+            .send(bytes.as_slice().to_vec())
+            .await
+            .map_err(|_| Error::failed("task exec session is closed".to_string()))?;
+        Ok(())
+    }
+
+    async fn close_input(
+        self: Rc<Self>,
+        _params: task_exec_session::CloseInputParams,
+        _results: task_exec_session::CloseInputResults,
+    ) -> Result<(), Error> {
+        self.input_tx.lock().await.take();
+        Ok(())
+    }
+
+    async fn wait_result(
+        self: Rc<Self>,
+        _params: task_exec_session::WaitResultParams,
+        mut results: task_exec_session::WaitResultResults,
+    ) -> Result<(), Error> {
+        match self.completion.wait().await {
+            Ok(result) => {
+                let mut out = results.get();
+                out.set_has_exit_code(result.exit_code.is_some());
+                out.set_exit_code(result.exit_code.unwrap_or_default() as i32);
+                Ok(())
+            }
+            Err(message) => Err(Error::failed(message)),
+        }
     }
 }
 
@@ -1082,6 +1216,106 @@ impl task::Server for TaskService {
 
             if let Err(err) = sink.end_request().send().promise.await {
                 warn!(target: "task", task = %id, "task attach sink close failed: {err}");
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn exec(
+        self: Rc<Self>,
+        params: task::ExecParams,
+        mut results: task::ExecResults,
+    ) -> Result<(), Error> {
+        let request = params.get()?.get_request()?;
+        let id = self
+            .manager
+            .resolve_task_id(request.get_selector()?.to_str()?)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+        let options = read_exec_options(request.get_options()?)?;
+        let sink = request.get_sink()?;
+        let spec = self
+            .manager
+            .inspect_task(id)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+
+        if spec.node_id != self.manager.local_node_id() {
+            let remote = self.remote_task_client(spec.node_id).await?;
+            let mut request = remote.exec_request();
+            {
+                let mut builder = request.get().init_request();
+                let id_selector = id.to_string();
+                builder.set_selector(&id_selector);
+                write_exec_options(builder.reborrow().init_options(), &options);
+                builder.set_sink(sink);
+            }
+            let response = request.send().promise.await?;
+            let session = response.get()?.get_session()?;
+            results.get().set_session(session);
+            return Ok(());
+        }
+
+        self.manager
+            .ensure_local_task_executable(id)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+
+        let (output_tx, mut output_rx) = mpsc::channel(1);
+        let input_tx = options.stdin.then(|| {
+            let (tx, rx) = mpsc::channel(1);
+            (tx, rx)
+        });
+        let (session_tx, input_rx) = match input_tx {
+            Some((tx, rx)) => (Some(tx), rx),
+            None => {
+                let (_tx, rx) = mpsc::channel(1);
+                (None, rx)
+            }
+        };
+        let completion = Rc::new(LocalTaskExecCompletion::new());
+        let session = capnp_rpc::new_client(LocalTaskExecSession::new(
+            session_tx.clone(),
+            Rc::clone(&completion),
+        ));
+        results.get().set_session(session);
+
+        let manager = self.manager.clone();
+        let options_for_task = options.clone();
+        tokio::task::spawn_local(async move {
+            tokio::task::yield_now().await;
+            let producer = tokio::task::spawn_local(async move {
+                manager
+                    .exec_local_task(id, &options_for_task, output_tx, input_rx)
+                    .await
+            });
+            while let Some(frame) = output_rx.recv().await {
+                if let Err(err) = push_log_frame(&sink, frame).await {
+                    producer.abort();
+                    completion
+                        .finish(Err(format!("task exec bridge failed: {err}")))
+                        .await;
+                    warn!(target: "task", task = %id, "task exec bridge failed: {err}");
+                    return;
+                }
+            }
+
+            let completion_result = match producer.await {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(err)) => {
+                    warn!(target: "task", task = %id, "task exec bridge failed: {err}");
+                    Err(err.to_string())
+                }
+                Err(err) => {
+                    warn!(target: "task", task = %id, "task exec worker failed: {err}");
+                    Err(format!("task exec worker failed: {err}"))
+                }
+            };
+            completion.finish(completion_result).await;
+
+            if let Err(err) = sink.end_request().send().promise.await {
+                warn!(target: "task", task = %id, "task exec sink close failed: {err}");
             }
         });
 

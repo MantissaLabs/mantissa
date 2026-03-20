@@ -10,8 +10,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
-const DEFAULT_DETACH_KEYS: &str = "ctrl-p,ctrl-q";
-const FALLBACK_DETACH_BYTE: u8 = 0x1d;
+pub(crate) const DEFAULT_DETACH_KEYS: &str = "ctrl-p,ctrl-q";
+pub(crate) const FALLBACK_DETACH_BYTE: u8 = 0x1d;
 
 /// Rendering and transport options for `mantissa tasks attach`.
 pub struct TaskAttachOptions<'a> {
@@ -62,13 +62,13 @@ impl TaskAttachOptions<'_> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DetachSequence {
+pub(crate) struct DetachSequence {
     bytes: Vec<u8>,
 }
 
 impl DetachSequence {
     /// Parses Docker-style detach key syntax into the raw byte sequence the local terminal emits.
-    fn parse(raw: &str) -> Result<Self> {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
         let mut bytes = Vec::new();
         for token in raw.split(',') {
             let token = token.trim().to_ascii_lowercase();
@@ -109,14 +109,14 @@ impl DetachSequence {
 }
 
 /// Stateful matcher that strips a detach sequence from stdin before it reaches the remote task.
-struct DetachSequenceMatcher {
+pub(crate) struct DetachSequenceMatcher {
     sequence: DetachSequence,
     matched: usize,
 }
 
 impl DetachSequenceMatcher {
     /// Creates one matcher around the configured detach sequence.
-    fn new(sequence: DetachSequence) -> Self {
+    pub(crate) fn new(sequence: DetachSequence) -> Self {
         Self {
             sequence,
             matched: 0,
@@ -152,7 +152,7 @@ impl DetachSequenceMatcher {
     }
 
     /// Flushes any partial detach prefix back into stdin when input ends without a full match.
-    fn finish(&mut self) -> Vec<u8> {
+    pub(crate) fn finish(&mut self) -> Vec<u8> {
         let pending = self.sequence.bytes[..self.matched].to_vec();
         self.matched = 0;
         pending
@@ -163,7 +163,7 @@ impl DetachSequenceMatcher {
 ///
 /// The fallback `Ctrl-]` escape exists because some terminal setups make the Docker default
 /// `Ctrl-P, Ctrl-Q` sequence difficult to use interactively even in raw mode.
-fn consume_detach_input(
+pub(crate) fn consume_detach_input(
     matcher: Option<&mut DetachSequenceMatcher>,
     bytes: &[u8],
     allow_fallback_detach: bool,
@@ -195,14 +195,14 @@ fn consume_detach_input(
 }
 
 /// RAII guard that restores canonical terminal mode after interactive attach input ends.
-struct RawModeGuard {
+pub(crate) struct RawModeGuard {
     enabled: bool,
 }
 
 impl RawModeGuard {
     /// Enables raw mode when stdin is attached to a terminal so interactive keystrokes stream
     /// immediately instead of waiting for a newline.
-    fn maybe_enable(enabled: bool) -> Result<Self> {
+    pub(crate) fn maybe_enable(enabled: bool) -> Result<Self> {
         if enabled {
             enable_raw_mode()
                 .map_err(|err| anyhow!("failed to enable raw terminal mode: {err}"))?;
@@ -222,7 +222,7 @@ impl Drop for RawModeGuard {
 
 /// Moves the local terminal to the next line after a detach so the host shell prompt does not
 /// reuse the attached task's prompt line.
-fn write_detach_newline() -> Result<()> {
+pub(crate) fn write_detach_newline() -> Result<()> {
     let mut stdout = io::stdout();
     stdout
         .write_all(b"\r\n")
@@ -244,7 +244,7 @@ fn attach_terminal_size(raw_terminal: bool) -> Option<(u16, u16)> {
 }
 
 /// Converts the current terminal size probe into a concrete, non-zero attach resize.
-fn sanitize_terminal_size(size: Option<(u16, u16)>) -> (u16, u16) {
+pub(crate) fn sanitize_terminal_size(size: Option<(u16, u16)>) -> (u16, u16) {
     match size {
         Some((width, height)) if width > 0 && height > 0 => (width, height),
         _ => (80, 24),
@@ -400,7 +400,7 @@ impl AttachCompletion {
 }
 
 /// Sink used by the CLI to render attached task output frames as they arrive.
-struct CliTaskAttachSink {
+pub(crate) struct CliTaskAttachSink {
     completion: Arc<AttachCompletion>,
     normalize_stdout: bool,
     normalize_stderr: bool,
@@ -408,6 +408,20 @@ struct CliTaskAttachSink {
 }
 
 impl CliTaskAttachSink {
+    /// Builds one CLI sink that renders task output and completes when the remote stream ends.
+    pub(crate) fn new(
+        done_tx: oneshot::Sender<Result<(), String>>,
+        normalize_stdout: bool,
+        normalize_stderr: bool,
+    ) -> Self {
+        Self {
+            completion: Arc::new(AttachCompletion::new(done_tx)),
+            normalize_stdout,
+            normalize_stderr,
+            normalizer: Mutex::new(AttachOutputNormalizer::default()),
+        }
+    }
+
     /// Writes one output frame to the correct local stream while fixing terminal newlines in raw mode.
     fn write_attach_frame(&self, stream: TaskLogStream, bytes: &[u8]) -> Result<(), capnp::Error> {
         let normalize = match stream {
@@ -481,13 +495,13 @@ async fn close_attach_input(session: &task_attach_session::Client) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InputPumpOutcome {
+pub(crate) enum InputPumpOutcome {
     Eof,
     Detached,
 }
 
 /// Background event produced by the blocking stdin reader thread.
-enum StdinEvent {
+pub(crate) enum StdinEvent {
     Data(Vec<u8>),
     Eof,
     Error(String),
@@ -495,7 +509,7 @@ enum StdinEvent {
 
 /// Spawns one blocking stdin reader thread so interactive attach input does not rely on
 /// `tokio::io::stdin()`, which is documented to be unsuitable for interactive cancellation.
-fn spawn_stdin_reader() -> Result<mpsc::UnboundedReceiver<StdinEvent>> {
+pub(crate) fn spawn_stdin_reader() -> Result<mpsc::UnboundedReceiver<StdinEvent>> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("mantissa-attach-stdin".to_string())
@@ -635,12 +649,11 @@ pub async fn attach(cfg: &ClientConfig, id: &str, options: &TaskAttachOptions<'_
     let request = client.get_task_request();
     let task = request.send().pipeline.get_task();
     let (done_tx, done_rx) = oneshot::channel();
-    let sink = new_client(CliTaskAttachSink {
-        completion: Arc::new(AttachCompletion::new(done_tx)),
+    let sink = new_client(CliTaskAttachSink::new(
+        done_tx,
         normalize_stdout,
         normalize_stderr,
-        normalizer: Mutex::new(AttachOutputNormalizer::default()),
-    });
+    ));
     let mut request = task.attach_request();
     {
         let mut builder = request.get().init_request();

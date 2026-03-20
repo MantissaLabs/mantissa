@@ -10,8 +10,8 @@ use crate::store::task_store::TaskStore;
 use crate::task::causality::{compare_task_causality, should_replace_task_event};
 use crate::task::container::ContainerState;
 use crate::task::docker::{
-    ContainerAttachOptions, ContainerError, ContainerLogFrame, ContainerLogsOptions,
-    ContainerManager,
+    ContainerAttachOptions, ContainerError, ContainerExecOptions, ContainerLogFrame,
+    ContainerLogsOptions, ContainerManager,
 };
 use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskLivenessProbe, TaskRestartPolicy, TaskSecretFile,
@@ -897,11 +897,57 @@ impl TaskManager {
             .map_err(|err| anyhow!("task attach failed for {id}: {err}"))
     }
 
-    /// Verifies that a locally owned task still has a running runtime before attach is accepted.
+    /// Starts one streamed exec session inside a locally owned task container.
+    ///
+    /// The RPC layer uses this to keep remote exec transport-agnostic while the runtime owns
+    /// command creation, tty allocation, and exit-code reporting.
+    pub async fn exec_local_task(
+        &self,
+        id: Uuid,
+        options: &ContainerExecOptions,
+        output_tx: MpscSender<ContainerLogFrame>,
+        input_rx: MpscReceiver<Vec<u8>>,
+    ) -> Result<crate::task::docker::ContainerExecResult, anyhow::Error> {
+        let spec = self.load_spec(id).await?;
+        if spec.node_id != self.local_node_id {
+            return Err(anyhow!(
+                "task {id} is owned by remote node {}",
+                spec.node_id
+            ));
+        }
+        if !matches!(spec.state, ContainerState::Running) {
+            return Err(anyhow!(
+                "task {id} is not running (state: {:?})",
+                spec.state
+            ));
+        }
+
+        let container_identifier = {
+            let guard = self.local_state.local_containers.lock().await;
+            guard
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("mantissa-{id}"))
+        };
+
+        self.runtime
+            .container_manager
+            .exec_container_stream(&container_identifier, options, output_tx, input_rx)
+            .await
+            .map_err(|err| anyhow!("task exec failed for {id}: {err}"))
+    }
+
+    /// Verifies that a locally owned task still has a running runtime before an interactive
+    /// attach or exec session is accepted.
     ///
     /// This lets the RPC path reject stale "running" task records when the container has already
-    /// exited, instead of returning an empty attach stream that looks like success to the CLI.
-    pub async fn ensure_local_task_attachable(&self, id: Uuid) -> Result<(), anyhow::Error> {
+    /// exited, instead of returning an empty attach/exec stream that looks like success to the
+    /// CLI.
+    async fn ensure_local_task_runtime_running(
+        &self,
+        id: Uuid,
+        action: &str,
+    ) -> Result<(), anyhow::Error> {
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
@@ -929,7 +975,7 @@ impl TaskManager {
             .container_manager
             .inspect_container(&container_identifier)
             .await
-            .map_err(|err| anyhow!("task attach preflight failed for {id}: {err}"))?;
+            .map_err(|err| anyhow!("task {action} preflight failed for {id}: {err}"))?;
         let running = info
             .state
             .as_ref()
@@ -940,6 +986,16 @@ impl TaskManager {
         }
 
         Ok(())
+    }
+
+    /// Verifies that a locally owned task still has a running runtime before attach is accepted.
+    pub async fn ensure_local_task_attachable(&self, id: Uuid) -> Result<(), anyhow::Error> {
+        self.ensure_local_task_runtime_running(id, "attach").await
+    }
+
+    /// Verifies that a locally owned task still has a running runtime before exec is accepted.
+    pub async fn ensure_local_task_executable(&self, id: Uuid) -> Result<(), anyhow::Error> {
+        self.ensure_local_task_runtime_running(id, "exec").await
     }
 
     /// Requests a task transition into `Stopping` and broadcasts the desired state.

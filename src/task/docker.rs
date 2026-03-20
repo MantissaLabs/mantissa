@@ -12,7 +12,7 @@ use std::time::Duration;
 use bollard::Docker;
 use bollard::container::{AttachContainerResults, LogOutput};
 use bollard::errors::Error as BollardError;
-use bollard::exec::{CreateExecOptions, StartExecResults};
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
 use bollard::models::{
     ContainerCreateBody, CreateImageInfo, DeviceRequest, EventMessageTypeEnum, HostConfig,
     RestartPolicy, RestartPolicyNameEnum,
@@ -159,6 +159,35 @@ impl Default for ContainerAttachOptions {
     }
 }
 
+/// Request options supported by task/container exec streaming.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerExecOptions {
+    pub command: Vec<String>,
+    pub stdin: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+    pub tty: bool,
+    pub detach_keys: Option<String>,
+    pub tty_width: Option<u16>,
+    pub tty_height: Option<u16>,
+}
+
+impl Default for ContainerExecOptions {
+    /// Builds Docker-compatible defaults for interactive task exec sessions.
+    fn default() -> Self {
+        Self {
+            command: Vec::new(),
+            stdin: true,
+            stdout: true,
+            stderr: true,
+            tty: false,
+            detach_keys: None,
+            tty_width: None,
+            tty_height: None,
+        }
+    }
+}
+
 /// Converts one Docker attach/log frame into the runtime-neutral task output stream.
 fn container_log_frame_from_output(output: LogOutput) -> ContainerLogFrame {
     match output {
@@ -229,6 +258,19 @@ pub trait ContainerManager {
     ) -> ContainerResult<ContainerExecResult> {
         Err(ContainerError::OperationFailed(
             "container exec is not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// Starts a streamed exec session inside one running container.
+    async fn exec_container_stream(
+        &self,
+        _container_id: &str,
+        _options: &ContainerExecOptions,
+        _output_tx: MpscSender<ContainerLogFrame>,
+        _input_rx: MpscReceiver<Vec<u8>>,
+    ) -> ContainerResult<ContainerExecResult> {
+        Err(ContainerError::OperationFailed(
+            "interactive container exec is not supported by this runtime".to_string(),
         ))
     }
 
@@ -593,8 +635,9 @@ impl DockerContainerManager {
         Ok(())
     }
 
-    /// Verifies that the target container is currently running before opening an attach session.
-    async fn ensure_container_running_for_attach(&self, container_id: &str) -> ContainerResult<()> {
+    /// Verifies that the target container is currently running before opening an interactive
+    /// attach or exec session against it.
+    async fn ensure_container_running_for_stream(&self, container_id: &str) -> ContainerResult<()> {
         let info = self
             .run_container_call(
                 container_id,
@@ -721,7 +764,7 @@ impl DockerContainerManager {
             builder = builder.detach_keys(detach_keys);
         }
 
-        self.ensure_container_running_for_attach(container_id)
+        self.ensure_container_running_for_stream(container_id)
             .await?;
         let AttachContainerResults {
             mut output,
@@ -739,6 +782,272 @@ impl DockerContainerManager {
             .await?;
         self.bridge_attached_io(
             container_id,
+            &mut output,
+            &mut input,
+            options,
+            AttachBridgeIo {
+                output_tx,
+                input_rx,
+                saw_output,
+            },
+        )
+        .await
+    }
+
+    /// Applies the caller's terminal dimensions to one exec session so interactive shells redraw
+    /// their prompt immediately after the command starts.
+    async fn resize_exec_tty(
+        &self,
+        exec_id: &str,
+        options: &ContainerExecOptions,
+    ) -> ContainerResult<()> {
+        let (Some(width), Some(height)) = (options.tty_width, options.tty_height) else {
+            return Ok(());
+        };
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        self.docker
+            .resize_exec(exec_id, ResizeExecOptions { width, height })
+            .await
+            .map_err(ContainerError::DockerAPI)?;
+        Ok(())
+    }
+
+    /// Forces one visible prompt refresh for attached TTY exec shells by delivering a resize
+    /// event even when the caller's terminal size already matches the exec session's current size.
+    async fn refresh_exec_tty_prompt(
+        &self,
+        exec_id: &str,
+        options: &ContainerExecOptions,
+    ) -> ContainerResult<()> {
+        let (Some(width), Some(height)) = (options.tty_width, options.tty_height) else {
+            return Ok(());
+        };
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        let mut jiggled = options.clone();
+        if width > 1 {
+            jiggled.tty_width = Some(width - 1);
+        } else if height > 1 {
+            jiggled.tty_height = Some(height - 1);
+        } else {
+            return self.resize_exec_tty(exec_id, options).await;
+        }
+
+        self.resize_exec_tty(exec_id, &jiggled).await?;
+        self.resize_exec_tty(exec_id, options).await
+    }
+
+    /// Waits briefly for natural TTY exec output before forcing a prompt refresh.
+    async fn flush_initial_exec_tty_output(
+        &self,
+        container_id: &str,
+        exec_id: &str,
+        output: &mut (impl futures::Stream<Item = Result<LogOutput, BollardError>> + Unpin),
+        output_tx: &MpscSender<ContainerLogFrame>,
+        options: &ContainerExecOptions,
+    ) -> ContainerResult<bool> {
+        match tokio::time::timeout(Duration::from_millis(100), output.next()).await {
+            Ok(Some(frame)) => {
+                let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
+                let frame = container_log_frame_from_output(frame);
+                if output_tx.send(frame).await.is_err() {
+                    return Ok(true);
+                }
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(_) => {
+                self.refresh_exec_tty_prompt(exec_id, options).await?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Polls Docker's exec metadata until the started command has terminated.
+    async fn wait_for_exec_completion(
+        &self,
+        exec_id: &str,
+    ) -> ContainerResult<bollard::models::ExecInspectResponse> {
+        loop {
+            let inspect = self
+                .docker
+                .inspect_exec(exec_id)
+                .await
+                .map_err(ContainerError::DockerAPI)?;
+            if inspect.running != Some(true) {
+                return Ok(inspect);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Bridges one Docker exec session across bounded output and stdin channels until the exec
+    /// process terminates, then returns its exit status.
+    async fn bridge_exec_io(
+        &self,
+        container_id: &str,
+        exec_id: &str,
+        output: &mut (impl futures::Stream<Item = Result<LogOutput, BollardError>> + Unpin),
+        input: &mut (impl tokio::io::AsyncWrite + Unpin),
+        options: &ContainerExecOptions,
+        io: AttachBridgeIo,
+    ) -> ContainerResult<ContainerExecResult> {
+        let AttachBridgeIo {
+            output_tx,
+            mut input_rx,
+            mut saw_output,
+        } = io;
+        let mut output_open = options.stdout || options.stderr;
+        let mut input_open = options.stdin;
+        let mut saw_input = false;
+        let wait = self.wait_for_exec_completion(exec_id);
+        tokio::pin!(wait);
+
+        loop {
+            tokio::select! {
+                maybe_frame = output.next(), if output_open => {
+                    let Some(frame) = maybe_frame else {
+                        output_open = false;
+                        continue;
+                    };
+                    let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
+                    saw_output = true;
+                    if output_tx.send(container_log_frame_from_output(frame)).await.is_err() {
+                        return Ok(ContainerExecResult { exit_code: None });
+                    }
+                }
+                maybe_chunk = input_rx.recv(), if input_open => {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            saw_input = true;
+                            input.write_all(&chunk).await.map_err(|err| {
+                                ContainerError::OperationFailed(format!(
+                                    "exec stdin write failed for {container_id}: {err}"
+                                ))
+                            })?;
+                            input.flush().await.map_err(|err| {
+                                ContainerError::OperationFailed(format!(
+                                    "exec stdin flush failed for {container_id}: {err}"
+                                ))
+                            })?;
+                        }
+                        None => {
+                            input.shutdown().await.map_err(|err| {
+                                ContainerError::OperationFailed(format!(
+                                    "exec stdin shutdown failed for {container_id}: {err}"
+                                ))
+                            })?;
+                            input_open = false;
+                        }
+                    }
+                }
+                inspect = &mut wait => {
+                    let inspect = inspect?;
+                    if input_open {
+                        input.shutdown().await.map_err(|err| {
+                            ContainerError::OperationFailed(format!(
+                                "exec stdin shutdown failed for {container_id}: {err}"
+                            ))
+                        })?;
+                    }
+
+                    if output_open {
+                        let _ = tokio::time::timeout(Duration::from_millis(100), async {
+                            while let Some(frame) = output.next().await {
+                                let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
+                                if output_tx.send(container_log_frame_from_output(frame)).await.is_err() {
+                                    return Ok::<(), ContainerError>(());
+                                }
+                            }
+                            Ok::<(), ContainerError>(())
+                        }).await;
+                    }
+
+                    if !saw_output && !saw_input && inspect.exit_code.is_none() {
+                        return Err(ContainerError::OperationFailed(format!(
+                            "exec stream closed before container {container_id} produced output, accepted input, or reported an exit code"
+                        )));
+                    }
+
+                    return Ok(ContainerExecResult {
+                        exit_code: inspect.exit_code,
+                    });
+                }
+                else => break,
+            }
+        }
+
+        Ok(ContainerExecResult { exit_code: None })
+    }
+
+    /// Starts one interactive exec session inside a running Docker container.
+    async fn exec_container_interactive(
+        &self,
+        container_id: &str,
+        options: &ContainerExecOptions,
+        output_tx: MpscSender<ContainerLogFrame>,
+        input_rx: MpscReceiver<Vec<u8>>,
+    ) -> ContainerResult<ContainerExecResult> {
+        if options.command.is_empty() {
+            return Err(ContainerError::OperationFailed(
+                "exec command must contain at least one argument".to_string(),
+            ));
+        }
+
+        self.ensure_container_running_for_stream(container_id)
+            .await?;
+        let exec_id = self
+            .run_container_call(
+                container_id,
+                self.docker.create_exec(
+                    container_id,
+                    CreateExecOptions::<String> {
+                        attach_stdin: Some(options.stdin),
+                        attach_stdout: Some(options.stdout),
+                        attach_stderr: Some(options.stderr),
+                        tty: Some(options.tty),
+                        detach_keys: options.detach_keys.clone(),
+                        cmd: Some(options.command.clone()),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await?
+            .id;
+
+        let StartExecResults::Attached {
+            mut output,
+            mut input,
+        } = self
+            .run_container_call(container_id, self.docker.start_exec(&exec_id, None))
+            .await?
+        else {
+            return Err(ContainerError::OperationFailed(format!(
+                "exec unexpectedly detached for container {container_id}"
+            )));
+        };
+
+        let saw_output = if options.tty {
+            self.flush_initial_exec_tty_output(
+                container_id,
+                &exec_id,
+                &mut output,
+                &output_tx,
+                options,
+            )
+            .await?
+        } else {
+            false
+        };
+
+        self.bridge_exec_io(
+            container_id,
+            &exec_id,
             &mut output,
             &mut input,
             options,
@@ -979,6 +1288,38 @@ impl ContainerManager for InMemoryContainerManager {
             )));
         }
 
+        Ok(ContainerExecResult { exit_code: Some(0) })
+    }
+
+    async fn exec_container_stream(
+        &self,
+        container_id: &str,
+        options: &ContainerExecOptions,
+        _output_tx: MpscSender<ContainerLogFrame>,
+        mut input_rx: MpscReceiver<Vec<u8>>,
+    ) -> ContainerResult<ContainerExecResult> {
+        if options.command.is_empty() {
+            return Err(ContainerError::OperationFailed(
+                "exec command must contain at least one argument".to_string(),
+            ));
+        }
+
+        let Some(id) = self.resolve_container_id(container_id).await else {
+            return Err(Self::not_found(container_id));
+        };
+
+        let containers = self.containers.lock().await;
+        let Some(container) = containers.get(&id) else {
+            return Err(Self::not_found(container_id));
+        };
+        if !container.running {
+            return Err(ContainerError::OperationFailed(format!(
+                "container {container_id} is not running"
+            )));
+        }
+        drop(containers);
+
+        while input_rx.recv().await.is_some() {}
         Ok(ContainerExecResult { exit_code: Some(0) })
     }
 
@@ -1272,6 +1613,17 @@ impl ContainerManager for DockerContainerManager {
         }
     }
 
+    async fn exec_container_stream(
+        &self,
+        container_id: &str,
+        options: &ContainerExecOptions,
+        output_tx: MpscSender<ContainerLogFrame>,
+        input_rx: MpscReceiver<Vec<u8>>,
+    ) -> ContainerResult<ContainerExecResult> {
+        self.exec_container_interactive(container_id, options, output_tx, input_rx)
+            .await
+    }
+
     async fn restart_container(
         &self,
         container_id: &str,
@@ -1492,7 +1844,7 @@ impl ContainerManager for DockerContainerManager {
             builder = builder.detach_keys(detach_keys);
         }
 
-        self.ensure_container_running_for_attach(container_id)
+        self.ensure_container_running_for_stream(container_id)
             .await?;
         let AttachContainerResults {
             mut output,
