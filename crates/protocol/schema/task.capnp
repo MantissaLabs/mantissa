@@ -15,6 +15,9 @@ interface Task {
 
   logs @4 (request :TaskLogsRequest);
   # Stream one task's container logs into the caller-provided sink.
+
+  attach @5 (request :TaskAttachRequest) -> (session :TaskAttachSession);
+  # Attach to one task's live stdio stream and return a session for stdin forwarding.
 }
 
 interface TaskLogSink {
@@ -51,6 +54,45 @@ struct TaskLogsOptions {
 
   tail @4 :Text;
   # Number of trailing lines to return, or "all".
+}
+
+interface TaskAttachSession {
+  pushInput @0 (data :Data) -> stream;
+  # Push one stdin chunk into the attached task while preserving backpressure.
+
+  closeInput @1 ();
+  # Signals EOF on stdin for the attached task.
+}
+
+struct TaskAttachRequest {
+  selector @0 :Text;
+  # Task UUID or unique prefix.
+
+  options @1 :TaskAttachOptions;
+  # Stream options mirroring the Docker attach API.
+
+  sink @2 :TaskLogSink;
+  # Sink receiving streamed stdout/stderr/console frames.
+}
+
+struct TaskAttachOptions {
+  logs @0 :Bool;
+  # Replay previous buffered output before streaming live frames.
+
+  stream @1 :Bool;
+  # Keep streaming future stdout/stderr/console output.
+
+  stdin @2 :Bool;
+  # Attach the caller's stdin to the container input stream.
+
+  stdout @3 :Bool;
+  # Include stdout frames in the stream.
+
+  stderr @4 :Bool;
+  # Include stderr frames in the stream.
+
+  detachKeys @5 :Text;
+  # Optional detach key override in Docker's attach format.
 }
 
 enum TaskLogStream {
@@ -198,6 +240,9 @@ struct TaskSpec {
 
   liveness @28 :LivenessProbe;
   # Optional local liveness probe executed by the hosting runtime.
+
+  tty @29 :Bool;
+  # Whether the task runtime was created with an allocated terminal.
 }
 
 struct TaskStatus {

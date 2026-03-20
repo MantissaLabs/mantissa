@@ -1,5 +1,7 @@
 use anyhow::Result;
 use capnp::Error as CapnpError;
+use protocol::task::TaskLogStream;
+use std::io::{self, Write};
 use uuid::Uuid;
 
 pub fn uuid_from_data(data: capnp::data::Reader) -> Result<Uuid, CapnpError> {
@@ -23,4 +25,30 @@ pub fn uuid_short(data: capnp::data::Reader) -> Result<String, CapnpError> {
         .next()
         .unwrap_or_default()
         .to_string())
+}
+
+/// Writes one streamed task output frame to stdout or stderr without reformatting the payload.
+pub(crate) fn write_frame(stream: TaskLogStream, bytes: &[u8]) -> Result<(), CapnpError> {
+    match stream {
+        TaskLogStream::Stdout | TaskLogStream::Console => {
+            let mut stdout = io::stdout();
+            stdout
+                .write_all(bytes)
+                .map_err(|err| CapnpError::failed(err.to_string()))?;
+            stdout
+                .flush()
+                .map_err(|err| CapnpError::failed(err.to_string()))?;
+        }
+        TaskLogStream::Stderr => {
+            let mut stderr = io::stderr();
+            stderr
+                .write_all(bytes)
+                .map_err(|err| CapnpError::failed(err.to_string()))?;
+            stderr
+                .flush()
+                .map_err(|err| CapnpError::failed(err.to_string()))?;
+        }
+    }
+
+    Ok(())
 }

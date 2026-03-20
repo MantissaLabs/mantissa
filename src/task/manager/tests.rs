@@ -50,6 +50,7 @@ use tempfile::tempdir;
 use tokio::sync::{Notify, RwLock, mpsc};
 
 type ExecCall = (String, Vec<String>, Option<std::time::Duration>);
+type AttachCall = (String, crate::task::docker::ContainerAttachOptions);
 type LogCall = (String, crate::task::docker::ContainerLogsOptions);
 
 #[derive(Clone, Default)]
@@ -68,11 +69,16 @@ struct MockContainerManager {
     stopped: Arc<AsyncMutex<Vec<String>>>,
     stop_timeouts: Arc<AsyncMutex<Vec<Option<std::time::Duration>>>>,
     stop_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
+    open_stdin: Arc<AsyncMutex<Vec<bool>>>,
     limits: Arc<AsyncMutex<Vec<crate::task::docker::ResourceLimits>>>,
     volume_mounts: Arc<AsyncMutex<Vec<Vec<String>>>>,
     inspect: Arc<AsyncMutex<HashMap<String, bollard::service::ContainerInspectResponse>>>,
     inspect_calls: Arc<AsyncMutex<Vec<String>>>,
     listed: Arc<AsyncMutex<Vec<crate::task::docker::ContainerInfo>>>,
+    attach_calls: Arc<AsyncMutex<Vec<AttachCall>>>,
+    attach_frames: Arc<AsyncMutex<HashMap<String, Vec<crate::task::docker::ContainerLogFrame>>>>,
+    attach_inputs: Arc<AsyncMutex<HashMap<String, Vec<Vec<u8>>>>>,
+    attach_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
     log_calls: Arc<AsyncMutex<Vec<LogCall>>>,
     log_frames: Arc<AsyncMutex<HashMap<String, Vec<crate::task::docker::ContainerLogFrame>>>>,
     log_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
@@ -94,6 +100,7 @@ impl ContainerManager for MockContainerManager {
 
         let resource_limits = request.resource_limits;
         let volumes = request.volumes.unwrap_or_default();
+        self.open_stdin.lock().await.push(request.open_stdin);
         let mut guard = self.created.lock().await;
         let id = format!("container-{}", guard.len());
         guard.push(id.clone());
@@ -237,6 +244,45 @@ impl ContainerManager for MockContainerManager {
             }
         }
 
+        Ok(())
+    }
+
+    async fn attach_container(
+        &self,
+        container_id: &str,
+        options: &crate::task::docker::ContainerAttachOptions,
+        output_tx: tokio::sync::mpsc::Sender<crate::task::docker::ContainerLogFrame>,
+        mut input_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> crate::task::docker::ContainerResult<()> {
+        self.attach_calls
+            .lock()
+            .await
+            .push((container_id.to_string(), options.clone()));
+        if let Some(err) = self.attach_errors.lock().await.pop_front() {
+            return Err(err);
+        }
+
+        let frames = self
+            .attach_frames
+            .lock()
+            .await
+            .get(container_id)
+            .cloned()
+            .unwrap_or_default();
+        for frame in frames {
+            if output_tx.send(frame).await.is_err() {
+                return Ok(());
+            }
+        }
+
+        let mut chunks = Vec::new();
+        while let Some(chunk) = input_rx.recv().await {
+            chunks.push(chunk);
+        }
+        self.attach_inputs
+            .lock()
+            .await
+            .insert(container_id.to_string(), chunks);
         Ok(())
     }
 }
@@ -767,6 +813,7 @@ fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> Tas
         name: "volume-task".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -825,6 +872,7 @@ async fn start_container_reserves_slot_and_records_resources() {
     assert_eq!(recorded.memory_bytes, Some((64 * 1_024 * 1_024) as i64));
     assert_eq!(recorded.nano_cpus, Some(200_000_000));
     assert_eq!(recorded.cpu_shares, Some(204));
+    assert_eq!(mock_cm.open_stdin.lock().await.as_slice(), &[true]);
 }
 
 #[tokio::test]
@@ -842,6 +890,7 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: vec!["/bin/demo".to_string()],
+        tty: false,
         node_id: manager.local_node_id,
         node_name: manager.local_node_name.clone(),
         slot_ids: Vec::new(),
@@ -907,6 +956,7 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: vec!["/bin/demo".to_string()],
+        tty: false,
         node_id: manager.local_node_id,
         node_name: manager.local_node_name.clone(),
         slot_ids: Vec::new(),
@@ -971,6 +1021,7 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: manager.local_node_id,
         node_name: "local-node".into(),
         slot_ids: vec![1],
@@ -1039,6 +1090,7 @@ async fn same_state_pulling_progress_stays_local_only() {
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: manager.local_node_id,
         node_name: "local-node".into(),
         slot_ids: vec![1],
@@ -1199,6 +1251,7 @@ async fn pull_image_for_task_skips_pull_when_image_exists_locally() {
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: manager.local_node_id,
         node_name: "local-node".into(),
         slot_ids: vec![1],
@@ -1263,6 +1316,7 @@ async fn reconcile_rejects_missing_slot_assignments() {
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: manager.local_node_id,
         node_name: "local-node".into(),
         slot_ids: Vec::new(),
@@ -1317,6 +1371,7 @@ async fn reconcile_pending_task_reserves_assigned_slots_before_launch() {
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: manager.local_node_id,
         node_name: "local-node".into(),
         slot_ids: vec![slot_spec.slot_id],
@@ -1383,6 +1438,7 @@ async fn reconcile_uses_latest_persisted_slot_assignment() {
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: manager.local_node_id,
         node_name: "local-node".into(),
         slot_ids: vec![slot_spec.slot_id],
@@ -1501,6 +1557,7 @@ async fn update_task_phase_ignores_stale_regression_from_creating_to_pulling() {
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: manager.local_node_id,
         node_name: "local-node".into(),
         slot_ids: vec![1],
@@ -1565,6 +1622,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         created_at: now.to_rfc3339(),
         updated_at: now.to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: node_a,
         node_name: "node-a".to_string(),
         slot_ids: vec![1],
@@ -1596,6 +1654,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         created_at: now.to_rfc3339(),
         updated_at: (now + chrono::Duration::seconds(30)).to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: node_b,
         node_name: "node-b".to_string(),
         slot_ids: vec![2],
@@ -1631,6 +1690,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         created_at: now.to_rfc3339(),
         updated_at: (now + chrono::Duration::seconds(30)).to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: node_b,
         node_name: "node-b".to_string(),
         slot_ids: vec![2],
@@ -1666,6 +1726,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         created_at: now.to_rfc3339(),
         updated_at: now.to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: node_b,
         node_name: "node-b".to_string(),
         slot_ids: vec![2],
@@ -1708,6 +1769,7 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         created_at: now.to_rfc3339(),
         updated_at: now.to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: node,
         node_name: "node".to_string(),
         slot_ids: vec![1],
@@ -1739,6 +1801,7 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         created_at: now.to_rfc3339(),
         updated_at: (now + chrono::Duration::seconds(45)).to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: node,
         node_name: "node".to_string(),
         slot_ids: vec![1],
@@ -1863,6 +1926,7 @@ async fn reconcile_local_tasks_does_not_duplicate_batch_launch_in_progress() {
         name: "launch-race".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -2787,6 +2851,7 @@ async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims
         created_at: now.clone(),
         updated_at: now,
         command: Vec::new(),
+        tty: false,
         node_id: manager.local_node_id,
         node_name: "node".to_string(),
         slot_ids: vec![contested_slot],
@@ -3491,6 +3556,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 name: "svc-a".into(),
                 image: "img".into(),
                 command: vec![],
+                tty: false,
                 cpu_millis: 200,
                 memory_bytes: 64 * 1_024 * 1_024,
                 gpu_count: 0,
@@ -3512,6 +3578,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 name: "svc-b".into(),
                 image: "img".into(),
                 command: vec![],
+                tty: false,
                 cpu_millis: 200,
                 memory_bytes: 64 * 1_024 * 1_024,
                 gpu_count: 0,
@@ -3568,6 +3635,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
             name: "svc-a".into(),
             image: "img".into(),
             command: vec![],
+            tty: false,
             cpu_millis: 200,
             memory_bytes: 64 * 1_024 * 1_024,
             gpu_count: 0,
@@ -3630,6 +3698,7 @@ async fn task_owned_locally_detects_remote_entries() {
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: vec![],
+        tty: false,
         node_id: Uuid::new_v4(),
         node_name: "remote-node".to_string(),
         slot_ids: vec![1],
@@ -3680,6 +3749,7 @@ async fn stream_local_task_logs_forwards_frames_and_options() {
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         command: vec!["/bin/demo".to_string()],
+        tty: false,
         node_id: manager.local_node_id,
         node_name: manager.local_node_name.clone(),
         slot_ids: Vec::new(),
@@ -3755,6 +3825,116 @@ async fn stream_local_task_logs_forwards_frames_and_options() {
 }
 
 #[tokio::test]
+async fn attach_local_task_forwards_input_output_and_options() {
+    let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let spec = TaskSpec {
+        id: task_id,
+        name: "attachable".to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: vec!["/bin/demo".to_string()],
+        tty: false,
+        node_id: manager.local_node_id,
+        node_name: manager.local_node_name.clone(),
+        slot_ids: Vec::new(),
+        slot_id: None,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 1,
+        last_terminal_observed_launch: None,
+    };
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    let container_name = format!("mantissa-{task_id}");
+    mock_cm.attach_frames.lock().await.insert(
+        container_name.clone(),
+        vec![
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::Console,
+                message: b"ready\n".to_vec(),
+            },
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::StdErr,
+                message: b"warn\n".to_vec(),
+            },
+        ],
+    );
+
+    let options = crate::task::docker::ContainerAttachOptions {
+        logs: true,
+        stream: true,
+        stdin: true,
+        stdout: true,
+        stderr: true,
+        detach_keys: Some("ctrl-p,ctrl-q".to_string()),
+    };
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(8);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(8);
+    input_tx
+        .send(b"echo attached\n".to_vec())
+        .await
+        .expect("send attach input");
+    drop(input_tx);
+
+    manager
+        .attach_local_task(task_id, &options, output_tx, input_rx)
+        .await
+        .expect("attach local task");
+
+    let mut frames = Vec::new();
+    while let Some(frame) = output_rx.recv().await {
+        frames.push(frame);
+    }
+
+    assert_eq!(
+        mock_cm.attach_calls.lock().await.clone(),
+        vec![(container_name.clone(), options.clone())]
+    );
+    assert_eq!(
+        mock_cm
+            .attach_inputs
+            .lock()
+            .await
+            .get(&container_name)
+            .cloned()
+            .unwrap_or_default(),
+        vec![b"echo attached\n".to_vec()]
+    );
+    assert_eq!(
+        frames,
+        vec![
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::Console,
+                message: b"ready\n".to_vec(),
+            },
+            crate::task::docker::ContainerLogFrame {
+                stream: crate::task::docker::ContainerLogStream::StdErr,
+                message: b"warn\n".to_vec(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn start_tasks_batch_is_atomic_on_capacity_failure() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
@@ -3779,6 +3959,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 name: "svc-c".into(),
                 image: "img".into(),
                 command: vec![],
+                tty: false,
                 cpu_millis: 200,
                 memory_bytes: 64 * 1_024 * 1_024,
                 gpu_count: 0,
@@ -3800,6 +3981,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 name: "svc-d".into(),
                 image: "img".into(),
                 command: vec![],
+                tty: false,
                 cpu_millis: 200,
                 memory_bytes: 64 * 1_024 * 1_024,
                 gpu_count: 0,
@@ -3881,6 +4063,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         name: "with-net".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -3979,6 +4162,7 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
         name: "service-backend".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -4039,6 +4223,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
         created_at: now.clone(),
         updated_at: now,
         command: Vec::new(),
+        tty: false,
         node_id: manager.local_node_id,
         node_name: "local-node".to_string(),
         slot_ids: vec![1],
@@ -4116,6 +4301,7 @@ async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachme
         created_at: now.clone(),
         updated_at: now.clone(),
         command: Vec::new(),
+        tty: false,
         node_id: manager.local_node_id,
         node_name: "local-node".to_string(),
         slot_ids: vec![1],
@@ -4228,6 +4414,7 @@ async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
         name: "standalone-net".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -4341,6 +4528,7 @@ async fn request_task_stop_cleans_up_after_teardown_failure() {
         name: "flaky-task".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -4706,6 +4894,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         created_at: original.created_at.clone(),
         updated_at: (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339(),
         command: original.command.clone(),
+        tty: false,
         node_id: remote_node,
         node_name: "remote-node".to_string(),
         slot_ids: vec![1],
@@ -4781,6 +4970,7 @@ fn build_remote_task_spec(
         created_at: updated_at.clone(),
         updated_at,
         command: Vec::new(),
+        tty: false,
         node_id,
         node_name: "remote-node".to_string(),
         slot_ids: vec![1],
@@ -5073,6 +5263,7 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         created_at: now.to_rfc3339(),
         updated_at: (now + chrono::Duration::seconds(120)).to_rfc3339(),
         command: Vec::new(),
+        tty: false,
         node_id: remote_node,
         node_name: "remote-node".to_string(),
         slot_ids: vec![1],
@@ -5209,6 +5400,7 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
         created_at: now.clone(),
         updated_at: now.clone(),
         command: vec![],
+        tty: false,
         node_id: remote_node,
         node_name: "remote-node".to_string(),
         slot_ids: vec![1],
@@ -5316,6 +5508,7 @@ async fn attachment_ready_triggers_forwarding_event() {
         name: "with-forwarding".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -5417,6 +5610,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         name: "two-nets".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -5515,6 +5709,7 @@ async fn runtime_attachments_retry_transient_provision_errors() {
         name: "retry-net-task".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -5617,6 +5812,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         name: "real-net-task".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -5676,6 +5872,7 @@ fn scheduling_retry_budget_stays_wide_for_untargeted_starts() {
         name: "untargeted".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 100,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -5704,6 +5901,7 @@ fn scheduling_retry_budget_is_shorter_for_targeted_starts() {
         name: "targeted".into(),
         image: "img".into(),
         command: Vec::new(),
+        tty: false,
         cpu_millis: 100,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
@@ -5908,6 +6106,7 @@ async fn multi_volume_bound_node_conflict_rejected() {
             name: "conflict".into(),
             image: "img".into(),
             command: Vec::new(),
+            tty: false,
             cpu_millis: 100,
             memory_bytes: 64 * 1_024 * 1_024,
             gpu_count: 0,

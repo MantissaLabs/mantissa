@@ -19,6 +19,8 @@ pub struct TaskSpec {
     #[serde(default)]
     pub updated_at: String,
     pub command: Vec<String>,
+    #[serde(default)]
+    pub tty: bool,
     pub node_id: Uuid,
     pub node_name: String,
     #[serde(default)]
@@ -218,6 +220,8 @@ pub struct TaskValue {
     #[serde(default)]
     pub updated_at: String,
     pub command: Vec<String>,
+    #[serde(default)]
+    pub tty: bool,
     pub node_id: Uuid,
     pub node_name: String,
     #[serde(default)]
@@ -271,6 +275,7 @@ pub struct TaskValueDraft {
     pub created_at: String,
     pub updated_at: String,
     pub command: Vec<String>,
+    pub tty: bool,
     pub node_id: Uuid,
     pub node_name: String,
     pub slot_ids: Vec<u64>,
@@ -305,6 +310,7 @@ impl TaskValue {
             created_at: draft.created_at,
             updated_at: draft.updated_at,
             command: draft.command,
+            tty: draft.tty,
             node_id: draft.node_id,
             node_name: draft.node_name,
             slot_ids: draft.slot_ids,

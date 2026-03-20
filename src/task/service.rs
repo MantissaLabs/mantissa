@@ -4,7 +4,9 @@ use crate::task::capnp_codec::{
     encode_secret_files, encode_volume_mounts,
 };
 use crate::task::container::ContainerState;
-use crate::task::docker::{ContainerLogFrame, ContainerLogStream, ContainerLogsOptions};
+use crate::task::docker::{
+    ContainerAttachOptions, ContainerLogFrame, ContainerLogStream, ContainerLogsOptions,
+};
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
     TaskEvent, TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicy, TaskRestartPolicyKind,
@@ -14,10 +16,13 @@ use crate::topology::Topology;
 use capnp::Error;
 use protocol::gossip::gossip_message;
 use protocol::task::{
-    TaskLogStream as CapnpTaskLogStream, TaskStateFilter as CapnpTaskStateFilter, task, task_event,
-    task_list_request, task_log_sink, task_logs_options, task_spec, task_status,
+    TaskLogStream as CapnpTaskLogStream, TaskStateFilter as CapnpTaskStateFilter, task,
+    task_attach_options, task_attach_session, task_event, task_list_request, task_log_sink,
+    task_logs_options, task_spec, task_status,
 };
 use std::rc::Rc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tracing::warn;
 use uuid::Uuid;
 
 fn state_to_str(state: &ContainerState) -> String {
@@ -285,6 +290,7 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     builder.set_updated_at(&spec.updated_at);
     builder.set_phase_reason(spec.phase_reason.as_deref().unwrap_or(""));
     builder.set_phase_progress(spec.phase_progress.as_deref().unwrap_or(""));
+    builder.set_tty(spec.tty);
     builder.set_task_epoch(spec.task_epoch);
     builder.set_phase_version(spec.phase_version);
     builder.set_launch_attempt(spec.launch_attempt);
@@ -473,6 +479,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         created_at,
         updated_at,
         command,
+        tty: reader.get_tty(),
         node_id,
         node_name,
         slot_ids,
@@ -549,6 +556,34 @@ fn read_logs_options(reader: task_logs_options::Reader<'_>) -> Result<ContainerL
     })
 }
 
+/// Encodes task attach request options into the wire format.
+fn write_attach_options(
+    mut builder: task_attach_options::Builder<'_>,
+    options: &ContainerAttachOptions,
+) {
+    builder.set_logs(options.logs);
+    builder.set_stream(options.stream);
+    builder.set_stdin(options.stdin);
+    builder.set_stdout(options.stdout);
+    builder.set_stderr(options.stderr);
+    builder.set_detach_keys(options.detach_keys.as_deref().unwrap_or(""));
+}
+
+/// Decodes task attach request options from the wire format.
+fn read_attach_options(
+    reader: task_attach_options::Reader<'_>,
+) -> Result<ContainerAttachOptions, Error> {
+    let detach_keys = reader.get_detach_keys()?.to_str()?.trim().to_string();
+    Ok(ContainerAttachOptions {
+        logs: reader.get_logs(),
+        stream: reader.get_stream(),
+        stdin: reader.get_stdin(),
+        stdout: reader.get_stdout(),
+        stderr: reader.get_stderr(),
+        detach_keys: (!detach_keys.is_empty()).then_some(detach_keys),
+    })
+}
+
 /// Pushes one runtime log frame into the caller-provided Cap'n Proto sink.
 async fn push_log_frame(
     sink: &task_log_sink::Client,
@@ -566,6 +601,49 @@ async fn push_log_frame(
     }
     request.send().await?;
     Ok(())
+}
+
+/// Session capability that forwards client stdin chunks into one running task attach bridge.
+struct LocalTaskAttachSession {
+    input_tx: AsyncMutex<Option<mpsc::Sender<Vec<u8>>>>,
+}
+
+impl LocalTaskAttachSession {
+    /// Builds one local attach session around the provided stdin channel.
+    fn new(input_tx: Option<mpsc::Sender<Vec<u8>>>) -> Self {
+        Self {
+            input_tx: AsyncMutex::new(input_tx),
+        }
+    }
+}
+
+impl task_attach_session::Server for LocalTaskAttachSession {
+    async fn push_input(
+        self: Rc<Self>,
+        params: task_attach_session::PushInputParams,
+    ) -> Result<(), Error> {
+        let bytes = params.get()?.get_data()?.to_owned();
+        let sender = self
+            .input_tx
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Error::failed("stdin is not attached for this task".to_string()))?;
+        sender
+            .send(bytes.as_slice().to_vec())
+            .await
+            .map_err(|_| Error::failed("task attach session is closed".to_string()))?;
+        Ok(())
+    }
+
+    async fn close_input(
+        self: Rc<Self>,
+        _params: task_attach_session::CloseInputParams,
+        _results: task_attach_session::CloseInputResults,
+    ) -> Result<(), Error> {
+        self.input_tx.lock().await.take();
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -669,6 +747,7 @@ impl task::Server for TaskService {
             name,
             image,
             command,
+            tty: false,
             cpu_millis,
             memory_bytes,
             gpu_count,
@@ -792,6 +871,7 @@ impl task::Server for TaskService {
                 name,
                 image,
                 command,
+                tty: false,
                 cpu_millis,
                 memory_bytes,
                 gpu_count,
@@ -908,6 +988,90 @@ impl task::Server for TaskService {
             .map_err(|err| Error::failed(err.to_string()))?;
 
         sink.end_request().send().promise.await?;
+        Ok(())
+    }
+
+    async fn attach(
+        self: Rc<Self>,
+        params: task::AttachParams,
+        mut results: task::AttachResults,
+    ) -> Result<(), Error> {
+        let request = params.get()?.get_request()?;
+        let id = self
+            .manager
+            .resolve_task_id(request.get_selector()?.to_str()?)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+        let options = read_attach_options(request.get_options()?)?;
+        let sink = request.get_sink()?;
+        let spec = self
+            .manager
+            .inspect_task(id)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+
+        if spec.node_id != self.manager.local_node_id() {
+            let remote = self.remote_task_client(spec.node_id).await?;
+            let mut request = remote.attach_request();
+            {
+                let mut builder = request.get().init_request();
+                let id_selector = id.to_string();
+                builder.set_selector(&id_selector);
+                write_attach_options(builder.reborrow().init_options(), &options);
+                builder.set_sink(sink);
+            }
+            let response = request.send().promise.await?;
+            let session = response.get()?.get_session()?;
+            results.get().set_session(session);
+            return Ok(());
+        }
+
+        let (output_tx, mut output_rx) = mpsc::channel(1);
+        let input_tx = options.stdin.then(|| {
+            let (tx, rx) = mpsc::channel(1);
+            (tx, rx)
+        });
+        let (session_tx, input_rx) = match input_tx {
+            Some((tx, rx)) => (Some(tx), rx),
+            None => {
+                let (_tx, rx) = mpsc::channel(1);
+                (None, rx)
+            }
+        };
+        let session = capnp_rpc::new_client(LocalTaskAttachSession::new(session_tx.clone()));
+        results.get().set_session(session);
+
+        let manager = self.manager.clone();
+        let options_for_task = options.clone();
+        tokio::task::spawn_local(async move {
+            let producer = tokio::task::spawn_local(async move {
+                manager
+                    .attach_local_task(id, &options_for_task, output_tx, input_rx)
+                    .await
+            });
+            while let Some(frame) = output_rx.recv().await {
+                if let Err(err) = push_log_frame(&sink, frame).await {
+                    producer.abort();
+                    warn!(target: "task", task = %id, "task attach bridge failed: {err}");
+                    return;
+                }
+            }
+
+            match producer.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    warn!(target: "task", task = %id, "task attach bridge failed: {err}");
+                }
+                Err(err) => {
+                    warn!(target: "task", task = %id, "task attach worker failed: {err}");
+                }
+            }
+
+            if let Err(err) = sink.end_request().send().promise.await {
+                warn!(target: "task", task = %id, "task attach sink close failed: {err}");
+            }
+        });
+
         Ok(())
     }
 

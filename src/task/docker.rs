@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::Docker;
-use bollard::container::LogOutput;
+use bollard::container::{AttachContainerResults, LogOutput};
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
@@ -18,9 +18,9 @@ use bollard::models::{
     RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
-    CreateContainerOptions, CreateImageOptions, EventsOptions, InspectContainerOptions,
-    ListContainersOptions, LogsOptionsBuilder, RemoveContainerOptions, RestartContainerOptions,
-    StartContainerOptions, StopContainerOptions,
+    AttachContainerOptionsBuilder, CreateContainerOptions, CreateImageOptions, EventsOptions,
+    InspectContainerOptions, ListContainersOptions, LogsOptionsBuilder, RemoveContainerOptions,
+    RestartContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::service::ContainerInspectResponse;
 
@@ -30,9 +30,10 @@ use futures::StreamExt;
 use log::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{
     Mutex as AsyncMutex,
-    mpsc::{Sender as MpscSender, UnboundedSender},
+    mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender},
 };
 
 /// Errors that can occur during container operations
@@ -119,6 +120,49 @@ impl ContainerLogsOptions {
     }
 }
 
+/// Request options supported by task/container attach streaming.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerAttachOptions {
+    pub logs: bool,
+    pub stream: bool,
+    pub stdin: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+    pub detach_keys: Option<String>,
+}
+
+impl Default for ContainerAttachOptions {
+    /// Builds Docker-compatible defaults for interactive task attach sessions.
+    fn default() -> Self {
+        Self {
+            logs: false,
+            stream: true,
+            stdin: true,
+            stdout: true,
+            stderr: true,
+            detach_keys: None,
+        }
+    }
+}
+
+/// Converts one Docker attach/log frame into the runtime-neutral task output stream.
+fn container_log_frame_from_output(output: LogOutput) -> ContainerLogFrame {
+    match output {
+        LogOutput::StdErr { message } => ContainerLogFrame {
+            stream: ContainerLogStream::StdErr,
+            message: message.to_vec(),
+        },
+        LogOutput::StdOut { message } => ContainerLogFrame {
+            stream: ContainerLogStream::StdOut,
+            message: message.to_vec(),
+        },
+        LogOutput::StdIn { message } | LogOutput::Console { message } => ContainerLogFrame {
+            stream: ContainerLogStream::Console,
+            message: message.to_vec(),
+        },
+    }
+}
+
 /// Normalizes low-level Docker API errors into stable container error variants.
 fn classify_container_error(container_id: &str, err: BollardError) -> ContainerError {
     match &err {
@@ -135,6 +179,8 @@ pub struct ContainerCreateRequest {
     pub name: String,
     pub image: String,
     pub command: Option<Vec<String>>,
+    pub tty: bool,
+    pub open_stdin: bool,
     pub env_vars: Option<Vec<String>>,
     pub ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
     pub volumes: Option<Vec<String>>,
@@ -181,6 +227,19 @@ pub trait ContainerManager {
     ) -> ContainerResult<()> {
         Err(ContainerError::OperationFailed(
             "container log streaming is not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// Attach to one container's stdio streams using bounded channels for output and stdin.
+    async fn attach_container(
+        &self,
+        _container_id: &str,
+        _options: &ContainerAttachOptions,
+        _output_tx: MpscSender<ContainerLogFrame>,
+        _input_rx: MpscReceiver<Vec<u8>>,
+    ) -> ContainerResult<()> {
+        Err(ContainerError::OperationFailed(
+            "container attach is not supported by this runtime".to_string(),
         ))
     }
 
@@ -750,6 +809,8 @@ impl ContainerManager for DockerContainerManager {
             name,
             image,
             command,
+            tty,
+            open_stdin,
             env_vars,
             ports,
             volumes,
@@ -824,6 +885,8 @@ impl ContainerManager for DockerContainerManager {
         // Create container config
         let config = ContainerCreateBody {
             image: Some(image.clone()),
+            tty: Some(tty),
+            open_stdin: Some(open_stdin),
             env: env_vars,
             cmd: command,
             exposed_ports: ports.map(|ports_map| ports_map.into_keys().collect()),
@@ -1106,20 +1169,88 @@ impl ContainerManager for DockerContainerManager {
 
         while let Some(next) = stream.next().await {
             let frame = next.map_err(|err| classify_container_error(container_id, err))?;
-            let (stream, message) = match frame {
-                LogOutput::StdOut { message } => (ContainerLogStream::StdOut, message.to_vec()),
-                LogOutput::StdErr { message } => (ContainerLogStream::StdErr, message.to_vec()),
-                LogOutput::StdIn { message } | LogOutput::Console { message } => {
-                    (ContainerLogStream::Console, message.to_vec())
-                }
-            };
-
             if logs_tx
-                .send(ContainerLogFrame { stream, message })
+                .send(container_log_frame_from_output(frame))
                 .await
                 .is_err()
             {
                 return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Attaches to one Docker container and bridges both stdout/stderr output and stdin input.
+    async fn attach_container(
+        &self,
+        container_id: &str,
+        options: &ContainerAttachOptions,
+        output_tx: MpscSender<ContainerLogFrame>,
+        mut input_rx: MpscReceiver<Vec<u8>>,
+    ) -> ContainerResult<()> {
+        let mut builder = AttachContainerOptionsBuilder::new()
+            .logs(options.logs)
+            .stream(options.stream)
+            .stdin(options.stdin)
+            .stdout(options.stdout)
+            .stderr(options.stderr);
+        if let Some(detach_keys) = options.detach_keys.as_deref() {
+            builder = builder.detach_keys(detach_keys);
+        }
+
+        let AttachContainerResults {
+            mut output,
+            mut input,
+        } = self
+            .run_container_call(
+                container_id,
+                self.docker
+                    .attach_container(container_id, Some(builder.build())),
+            )
+            .await?;
+
+        let output_open = options.stdout || options.stderr;
+        let mut input_open = options.stdin;
+
+        loop {
+            tokio::select! {
+                maybe_frame = output.next(), if output_open => {
+                    let Some(frame) = maybe_frame else {
+                        break;
+                    };
+                    let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
+                    if output_tx.send(container_log_frame_from_output(frame)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                maybe_chunk = input_rx.recv(), if input_open => {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            input.write_all(&chunk).await.map_err(|err| {
+                                ContainerError::OperationFailed(format!(
+                                    "attach stdin write failed for {container_id}: {err}"
+                                ))
+                            })?;
+                        }
+                        None => {
+                            input.shutdown().await.map_err(|err| {
+                                ContainerError::OperationFailed(format!(
+                                    "attach stdin shutdown failed for {container_id}: {err}"
+                                ))
+                            })?;
+                            input_open = false;
+                            if !output_open {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                else => break,
+            }
+
+            if !output_open && !input_open {
+                break;
             }
         }
 

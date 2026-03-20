@@ -125,6 +125,7 @@ mod tests {
             name: name.to_string(),
             image: "ghcr.io/demo/image:latest".to_string(),
             command: Vec::new(),
+            tty: false,
             depends_on: depends_on.iter().map(|entry| entry.to_string()).collect(),
             replicas: 1,
             cpu_millis: 0,

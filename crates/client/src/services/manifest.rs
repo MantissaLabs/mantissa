@@ -261,6 +261,8 @@ pub struct TaskSpec {
     pub liveness: Option<LivenessProbe>,
     #[serde(default)]
     pub public_port: Option<u16>,
+    #[serde(default)]
+    pub tty: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -1002,6 +1004,7 @@ mod tests {
                 readiness: None,
                 liveness: None,
                 public_port: None,
+                tty: false,
             }],
             update: ServiceUpdateStrategy::default(),
         };
@@ -1043,6 +1046,7 @@ mod tests {
                 }),
                 liveness: None,
                 public_port: None,
+                tty: false,
             }],
             update: ServiceUpdateStrategy::default(),
         };
@@ -1088,6 +1092,7 @@ mod tests {
                     start_period_ms: 30_000,
                 }),
                 public_port: None,
+                tty: false,
             }],
             update: ServiceUpdateStrategy::default(),
         };
@@ -1128,6 +1133,7 @@ mod tests {
                 readiness: None,
                 liveness: None,
                 public_port: None,
+                tty: false,
             }],
             update: ServiceUpdateStrategy::default(),
         };
@@ -1178,6 +1184,7 @@ mod tests {
                 readiness: None,
                 liveness: None,
                 public_port: None,
+                tty: false,
             }],
             update: ServiceUpdateStrategy::default(),
         };
@@ -1215,6 +1222,7 @@ mod tests {
                     readiness: None,
                     liveness: None,
                     public_port: None,
+                    tty: false,
                 },
                 TaskSpec {
                     name: "frontend".into(),
@@ -1233,6 +1241,7 @@ mod tests {
                     readiness: None,
                     liveness: None,
                     public_port: None,
+                    tty: false,
                 },
             ],
             update: ServiceUpdateStrategy::default(),

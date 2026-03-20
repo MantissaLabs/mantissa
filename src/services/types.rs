@@ -358,6 +358,8 @@ pub struct ServiceTaskSpecValue {
     pub public_port: Option<u16>,
     #[serde(default)]
     pub public_protocol: Option<ServicePortProtocol>,
+    #[serde(default)]
+    pub tty: bool,
 }
 
 /// Supported transport protocols for publicly exposed service ports.

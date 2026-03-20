@@ -493,6 +493,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         liveness,
         public_port,
         public_protocol,
+        tty: reader.get_tty(),
     })
 }
 
@@ -723,6 +724,7 @@ fn write_task_template(
         ServicePortProtocol::TcpUdp => protocol::services::PublicProtocol::TcpUdp,
     };
     builder.set_public_protocol(proto);
+    builder.set_tty(task.tty);
 
     Ok(())
 }

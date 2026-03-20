@@ -1,9 +1,9 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::tasks::util::write_frame;
 use anyhow::{Result, anyhow};
 use capnp_rpc::new_client;
-use protocol::task::{TaskLogStream, task_log_sink};
-use std::io::{self, Write};
+use protocol::task::task_log_sink;
 use std::rc::Rc;
 
 /// Rendering options for `mantissa tasks logs`.
@@ -52,32 +52,6 @@ impl TaskLogsOptions<'_> {
             timestamps: self.timestamps,
         })
     }
-}
-
-/// Writes one streamed task log frame to stdout or stderr without reformatting the payload.
-fn write_frame(stream: TaskLogStream, bytes: &[u8]) -> Result<(), capnp::Error> {
-    match stream {
-        TaskLogStream::Stdout | TaskLogStream::Console => {
-            let mut stdout = io::stdout();
-            stdout
-                .write_all(bytes)
-                .map_err(|err| capnp::Error::failed(err.to_string()))?;
-            stdout
-                .flush()
-                .map_err(|err| capnp::Error::failed(err.to_string()))?;
-        }
-        TaskLogStream::Stderr => {
-            let mut stderr = io::stderr();
-            stderr
-                .write_all(bytes)
-                .map_err(|err| capnp::Error::failed(err.to_string()))?;
-            stderr
-                .flush()
-                .map_err(|err| capnp::Error::failed(err.to_string()))?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Sink used by the CLI to render streamed task log frames as they arrive.

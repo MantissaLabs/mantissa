@@ -230,6 +230,7 @@ mod tests {
             created_at: now.clone(),
             updated_at: now.clone(),
             command: Vec::new(),
+            tty: false,
             node_id: Uuid::from_u128(1),
             node_name: "node-a".to_string(),
             slot_ids: vec![1],

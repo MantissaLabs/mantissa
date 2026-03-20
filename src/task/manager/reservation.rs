@@ -555,6 +555,7 @@ impl TaskManager {
                 created_at: Utc::now().to_rfc3339(),
                 updated_at: Utc::now().to_rfc3339(),
                 command: plan.command.clone(),
+                tty: plan.tty,
                 node_id: plan.peer_id,
                 node_name,
                 slot_ids: slot_ids.clone(),

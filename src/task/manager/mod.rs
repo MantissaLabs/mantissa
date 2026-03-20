@@ -10,7 +10,8 @@ use crate::store::task_store::TaskStore;
 use crate::task::causality::{compare_task_causality, should_replace_task_event};
 use crate::task::container::ContainerState;
 use crate::task::docker::{
-    ContainerError, ContainerLogFrame, ContainerLogsOptions, ContainerManager,
+    ContainerAttachOptions, ContainerError, ContainerLogFrame, ContainerLogsOptions,
+    ContainerManager,
 };
 use crate::task::types::{
     TaskEnvironmentVariable, TaskEvent, TaskLivenessProbe, TaskRestartPolicy, TaskSecretFile,
@@ -31,7 +32,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::{
     Mutex as AsyncMutex, Notify, RwLock, Semaphore,
-    mpsc::{Sender as MpscSender, UnboundedSender},
+    mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender},
 };
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, warn};
@@ -279,6 +280,7 @@ pub struct TaskStartRequest {
     pub name: String,
     pub image: String,
     pub command: Vec<String>,
+    pub tty: bool,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
     pub gpu_count: u32,
@@ -525,6 +527,7 @@ impl TaskManager {
             name: name.into(),
             image: image.into(),
             command,
+            tty: false,
             cpu_millis,
             memory_bytes,
             gpu_count: 0,
@@ -837,6 +840,40 @@ impl TaskManager {
             .stream_container_logs(&container_identifier, options, logs_tx)
             .await
             .map_err(|err| anyhow!("task log stream failed for {id}: {err}"))
+    }
+
+    /// Attaches to one locally owned task and bridges runtime stdio through bounded channels.
+    ///
+    /// The RPC layer uses this to keep the attach data path transport-agnostic while still
+    /// preserving backpressure for both output frames and stdin chunks.
+    pub async fn attach_local_task(
+        &self,
+        id: Uuid,
+        options: &ContainerAttachOptions,
+        output_tx: MpscSender<ContainerLogFrame>,
+        input_rx: MpscReceiver<Vec<u8>>,
+    ) -> Result<(), anyhow::Error> {
+        let spec = self.load_spec(id).await?;
+        if spec.node_id != self.local_node_id {
+            return Err(anyhow!(
+                "task {id} is owned by remote node {}",
+                spec.node_id
+            ));
+        }
+
+        let container_identifier = {
+            let guard = self.local_state.local_containers.lock().await;
+            guard
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("mantissa-{id}"))
+        };
+
+        self.runtime
+            .container_manager
+            .attach_container(&container_identifier, options, output_tx, input_rx)
+            .await
+            .map_err(|err| anyhow!("task attach failed for {id}: {err}"))
     }
 
     /// Requests a task transition into `Stopping` and broadcasts the desired state.
@@ -1454,6 +1491,7 @@ fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
         created_at: value.created_at,
         updated_at: value.updated_at,
         command: value.command,
+        tty: value.tty,
         node_id: value.node_id,
         node_name: value.node_name,
         slot_ids,
@@ -1518,6 +1556,7 @@ pub(crate) fn merge_status_into_value(
         created_at: status.created_at.clone(),
         updated_at: status.updated_at.clone(),
         command: Vec::new(),
+        tty: false,
         node_id: status.node_id,
         node_name: status.node_name.clone(),
         slot_ids: Vec::new(),
@@ -1569,6 +1608,7 @@ pub(crate) fn spec_to_value(spec: &TaskSpec) -> TaskValue {
         created_at: spec.created_at.clone(),
         updated_at: spec.updated_at.clone(),
         command: spec.command.clone(),
+        tty: spec.tty,
         node_id: spec.node_id,
         node_name: spec.node_name.clone(),
         slot_ids: spec.slot_ids.clone(),

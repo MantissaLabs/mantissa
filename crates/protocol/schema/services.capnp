@@ -74,6 +74,9 @@ struct TaskTemplate {
 
   volumes @17 :List(TaskSchema.VolumeMount);
   # Named volumes mounted into each replica of this template.
+
+  tty @19 :Bool;
+  # Allocate a terminal for the container entrypoint.
 }
 
 enum ReadinessProbeKind {

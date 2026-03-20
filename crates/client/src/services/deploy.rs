@@ -440,6 +440,7 @@ fn write_task(
     }
 
     builder.set_public_port(task.public_port.unwrap_or(0));
+    builder.set_tty(task.tty);
 
     let mut files_builder = builder
         .reborrow()

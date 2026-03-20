@@ -1799,6 +1799,7 @@ impl TaskManager {
                 container_name: &container_name,
                 image: &working.image,
                 command: &working.command,
+                tty: working.tty,
                 cpu_millis: working.cpu_millis,
                 memory_bytes: working.memory_bytes,
                 gpu_count: working.gpu_count,

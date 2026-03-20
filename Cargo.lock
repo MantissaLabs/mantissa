@@ -661,6 +661,7 @@ dependencies = [
  "capnp",
  "capnp-futures",
  "capnp-rpc",
+ "crossterm",
  "futures",
  "net",
  "protocol",

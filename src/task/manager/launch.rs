@@ -23,6 +23,7 @@ pub(super) struct ContainerLaunchRequest<'a> {
     pub container_name: &'a str,
     pub image: &'a str,
     pub command: &'a [String],
+    pub tty: bool,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
     pub gpu_count: u32,
@@ -124,6 +125,10 @@ impl TaskManager {
             } else {
                 Some(request.command.to_vec())
             },
+            tty: request.tty,
+            // Keep stdin open so later `tasks attach` sessions can forward input into shells and
+            // other interactive entrypoints after the container has already been started.
+            open_stdin: true,
             env_vars,
             ports: None,
             volumes,

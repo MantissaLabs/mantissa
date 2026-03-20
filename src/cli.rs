@@ -340,6 +340,9 @@ pub enum TasksCommand {
     /// Stream logs for a task
     Logs(TasksLogsArgs),
 
+    /// Attach to a task's live stdio stream
+    Attach(TasksAttachArgs),
+
     /// Start a container task
     #[command(alias = "run")]
     Start(TasksStartArgs),
@@ -444,6 +447,37 @@ pub struct TasksLogsArgs {
     /// Prefix each log line with its timestamp when supported by the runtime
     #[arg(long = "timestamps", action = ArgAction::SetTrue)]
     pub timestamps: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct TasksAttachArgs {
+    /// Task ID or unique prefix to attach to
+    #[arg(index = 1, value_name = "ID")]
+    pub id: String,
+
+    /// Replay buffered output before streaming live stdio
+    #[arg(long = "logs", action = ArgAction::SetTrue)]
+    pub logs: bool,
+
+    /// Disable stdin forwarding to the attached task
+    #[arg(long = "no-stdin", action = ArgAction::SetTrue)]
+    pub no_stdin: bool,
+
+    /// Disable live streaming after any buffered output has been replayed
+    #[arg(long = "no-stream", action = ArgAction::SetTrue)]
+    pub no_stream: bool,
+
+    /// Include stdout frames
+    #[arg(long = "stdout", action = ArgAction::SetTrue)]
+    pub stdout: bool,
+
+    /// Include stderr frames
+    #[arg(long = "stderr", action = ArgAction::SetTrue)]
+    pub stderr: bool,
+
+    /// Override Docker-style detach keys (default `ctrl-p,ctrl-q`)
+    #[arg(long = "detach-keys", value_name = "KEYS")]
+    pub detach_keys: Option<String>,
 }
 
 #[derive(Args, Debug)]
