@@ -1,14 +1,16 @@
 use crate::paths::{ensure_mantissa_group, ensure_state_dir, running_as_root};
 use async_trait::async_trait;
-use futures::lock::Mutex;
 use getrandom::getrandom;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use std::future::poll_fn;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::{fs, io};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -538,6 +540,9 @@ fn spawn_noise_io_bridge(
     let (mut noise_reader, mut noise_writer) = tokio::io::split(noise_end);
 
     // Share the Noise transport safely between the two tasks.
+    //
+    // The critical section never spans an `.await`, so a plain mutex avoids the
+    // scheduler overhead of an async mutex on the hottest crypto path.
     let transport = Arc::new(Mutex::new(transport));
     let transport_for_read = transport.clone(); // used by Task A (decrypt)
     let transport_for_write = transport.clone(); // used by Task B (encrypt)
@@ -575,22 +580,23 @@ fn spawn_noise_io_bridge(
             if plain_buf.len() < clen {
                 plain_buf.resize(clen, 0);
             }
-            let n_plain = {
-                let mut t = transport_for_read.lock().await;
-                match t.read_message(&cipher_buf[..clen], &mut plain_buf) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        warn!(
-                            target: "diag.transport",
-                            direction = "read",
-                            stage = "bridge.decrypt",
-                            frame_len = clen,
-                            error = %e,
-                            "noise decrypt failed"
-                        );
-                        let _ = noise_writer.shutdown().await;
-                        break;
-                    }
+            let n_plain = match decrypt_transport_frame(
+                &transport_for_read,
+                &cipher_buf[..clen],
+                &mut plain_buf,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(
+                        target: "diag.transport",
+                        direction = "read",
+                        stage = "bridge.decrypt",
+                        frame_len = clen,
+                        error = %e,
+                        "noise decrypt failed"
+                    );
+                    let _ = noise_writer.shutdown().await;
+                    break;
                 }
             };
 
@@ -608,12 +614,16 @@ fn spawn_noise_io_bridge(
     // Reads plaintext from `noise_reader` (what the application writes to `app_end`),
     // encrypts it with Noise, and writes length-prefixed ciphertext to the TCP socket.
     tokio::spawn(async move {
-        let mut plain_buf = vec![0u8; MAX_FRAME];
+        let mut plain_buf = vec![0u8; MAX_TRANSPORT_PLAINTEXT_FRAME];
         let mut cipher_buf = vec![0u8; MAX_FRAME + 16]; // AEAD overhead
 
         loop {
             // Read plaintext from the application side.
-            let n_plain = match noise_reader.read(&mut plain_buf).await {
+            //
+            // Cap'n Proto often emits several small writes back-to-back. Coalesce the
+            // bytes that are already ready in the in-process pipe so we produce fewer,
+            // larger Noise frames and pay the AEAD fixed cost less often.
+            let n_plain = match read_coalesced_plaintext(&mut noise_reader, &mut plain_buf).await {
                 Ok(0) => {
                     debug!(
                         target: "diag.transport",
@@ -632,72 +642,120 @@ fn spawn_noise_io_bridge(
                 Ok(n) => n,
             };
 
-            // One application read can exceed one Noise frame budget. Chunk it so each
-            // write_message call stays inside the transport frame limit.
-            let mut offset = 0usize;
-            while offset < n_plain {
-                let end = (offset + MAX_TRANSPORT_PLAINTEXT_FRAME).min(n_plain);
-                let plain = &plain_buf[offset..end];
-
-                // Encrypt with Noise.
-                if cipher_buf.len() < plain.len() + NOISE_TRANSPORT_OVERHEAD {
-                    cipher_buf.resize(plain.len() + NOISE_TRANSPORT_OVERHEAD, 0);
-                }
-                let clen = {
-                    let mut t = transport_for_write.lock().await;
-                    match t.write_message(plain, &mut cipher_buf) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            warn!(
-                                target: "diag.transport",
-                                direction = "write",
-                                stage = "bridge.encrypt",
-                                plain_len = plain.len(),
-                                error = %e,
-                                "noise encrypt failed"
-                            );
-                            let _ = tcp_writer.shutdown().await;
-                            return;
-                        }
-                    }
-                };
-
-                if clen > MAX_WIRE_FRAME {
+            // Encrypt with Noise.
+            if cipher_buf.len() < n_plain + NOISE_TRANSPORT_OVERHEAD {
+                cipher_buf.resize(n_plain + NOISE_TRANSPORT_OVERHEAD, 0);
+            }
+            let clen = match encrypt_transport_frame(
+                &transport_for_write,
+                &plain_buf[..n_plain],
+                &mut cipher_buf,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
                     warn!(
                         target: "diag.transport",
                         direction = "write",
-                        stage = "bridge.encrypt.frame_too_large",
-                        plain_len = plain.len(),
-                        cipher_len = clen,
-                        max_wire_frame = MAX_WIRE_FRAME,
-                        "noise ciphertext exceeds wire frame limit"
+                        stage = "bridge.encrypt",
+                        plain_len = n_plain,
+                        error = %e,
+                        "noise encrypt failed"
                     );
                     let _ = tcp_writer.shutdown().await;
                     return;
                 }
+            };
 
-                // Write length prefix + ciphertext to the wire.
-                let len_bytes = (clen as u16).to_be_bytes();
-                if let Err(e) = tcp_writer.write_all(&len_bytes).await {
-                    log_transport_io("bridge.write.len_prefix", "write", &e);
-                    return;
-                }
-                if let Err(e) = tcp_writer.write_all(&cipher_buf[..clen]).await {
-                    log_transport_io("bridge.write.frame", "write", &e);
-                    return;
-                }
-                if let Err(e) = tcp_writer.flush().await {
-                    log_transport_io("bridge.flush", "write", &e);
-                    return;
-                }
+            if clen > MAX_WIRE_FRAME {
+                warn!(
+                    target: "diag.transport",
+                    direction = "write",
+                    stage = "bridge.encrypt.frame_too_large",
+                    plain_len = n_plain,
+                    cipher_len = clen,
+                    max_wire_frame = MAX_WIRE_FRAME,
+                    "noise ciphertext exceeds wire frame limit"
+                );
+                let _ = tcp_writer.shutdown().await;
+                return;
+            }
 
-                offset = end;
+            // Write length prefix + ciphertext to the wire.
+            let len_bytes = (clen as u16).to_be_bytes();
+            if let Err(e) = tcp_writer.write_all(&len_bytes).await {
+                log_transport_io("bridge.write.len_prefix", "write", &e);
+                return;
+            }
+            if let Err(e) = tcp_writer.write_all(&cipher_buf[..clen]).await {
+                log_transport_io("bridge.write.frame", "write", &e);
+                return;
             }
         }
     });
 
     // The application uses this end (plaintext in both directions).
     app_end
+}
+
+/// Reads one plaintext burst from the application side and opportunistically drains any
+/// bytes that are already ready so the transport emits fewer AEAD frames.
+async fn read_coalesced_plaintext<R>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    let initial = reader.read(buf).await?;
+    if initial == 0 || initial == buf.len() {
+        return Ok(initial);
+    }
+
+    let mut total = initial;
+    let extra = poll_fn(|cx| {
+        loop {
+            if total == buf.len() {
+                return Poll::Ready(Ok(total - initial));
+            }
+
+            let mut read_buf = ReadBuf::new(&mut buf[total..]);
+            match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let read = read_buf.filled().len();
+                    if read == 0 {
+                        return Poll::Ready(Ok(total - initial));
+                    }
+                    total += read;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Ready(Ok(total - initial)),
+            }
+        }
+    })
+    .await?;
+
+    Ok(initial + extra)
+}
+
+/// Decrypts one wire frame while keeping the mutex guard scoped to the synchronous crypto call.
+fn decrypt_transport_frame(
+    transport: &Mutex<snow::TransportState>,
+    ciphertext: &[u8],
+    plaintext: &mut [u8],
+) -> Result<usize, snow::Error> {
+    let mut guard = transport
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.read_message(ciphertext, plaintext)
+}
+
+/// Encrypts one plaintext burst while keeping the mutex guard scoped to the synchronous crypto call.
+fn encrypt_transport_frame(
+    transport: &Mutex<snow::TransportState>,
+    plaintext: &[u8],
+    ciphertext: &mut [u8],
+) -> Result<usize, snow::Error> {
+    let mut guard = transport
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.write_message(plaintext, ciphertext)
 }
 
 /// # Description:
