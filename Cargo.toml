@@ -70,7 +70,7 @@ getrandom = "0.2"
 bollard = "0.20.2"
 
 # boringtun is used for inter-cluster communication via wireguard.
-snow = "0.9.6"
+snow = { version = "0.9.6", default-features = false, features = ["ring-accelerated"] }
 
 # used to fetch cpu system level information.
 raw-cpuid = "11.5.0"

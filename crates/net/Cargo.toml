@@ -17,7 +17,7 @@ thiserror = "1"
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 capnp-futures = { workspace = true }
-snow = "0.9.6"
+snow = { version = "0.9.6", default-features = false, features = ["ring-accelerated"] }
 hkdf = "0.12.4"
 sha2 = "0.10.9"
 async-trait = "0.1.88"

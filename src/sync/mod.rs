@@ -51,8 +51,10 @@ const ALL_DOMAINS: [Domain; 10] = [
 /// Number of replicated domains exposed through view-scoped sync RPCs.
 pub const VIEW_SCOPED_DOMAIN_COUNT: usize = ALL_DOMAINS.len();
 
-// Default chunk size used when streaming delta from server to client.
-pub const DEFAULT_DELTA_CHUNK_MAX: usize = 1024;
+/// Default max entries per streamed delta chunk.
+pub const DEFAULT_DELTA_CHUNK_MAX: usize = 2048;
+/// Default approximate payload target per streamed delta chunk.
+pub const DEFAULT_DELTA_CHUNK_TARGET_BYTES: usize = 128 * 1024;
 
 /// Reads the max register/tombstone entries per streamed delta chunk.
 ///
@@ -63,6 +65,18 @@ fn delta_chunk_max() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_DELTA_CHUNK_MAX)
+}
+
+/// Reads the approximate payload target per streamed delta chunk.
+///
+/// Chunk sizing stays approximate because the sender already has the encoded entries on hand
+/// and only needs a stable batching signal, not byte-perfect Cap'n Proto accounting.
+fn delta_chunk_target_bytes() -> usize {
+    std::env::var("MANTISSA_SYNC_DELTA_CHUNK_TARGET_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DELTA_CHUNK_TARGET_BYTES)
 }
 
 #[derive(Clone)]
@@ -475,10 +489,75 @@ fn encode_tombstones(tombs: Tombstones<UuidKey>) -> EncodedTombstones {
         .collect()
 }
 
+/// Returns the approximate payload bytes for one encoded register entry.
+///
+/// The estimate intentionally ignores Cap'n Proto framing overhead because chunk planning only
+/// needs a stable relative size signal to batch enough plaintext per request.
+fn encoded_register_payload_bytes((key, reg): &EncodedRegister) -> usize {
+    key.len().saturating_add(reg.len())
+}
+
+/// Returns the approximate payload bytes for one encoded tombstone entry.
+///
+/// The timestamp is fixed-width on the wire, so the estimate only needs the key length plus
+/// the replicated tombstone scalar payload.
+fn encoded_tombstone_payload_bytes((key, _ts): &EncodedTombstone) -> usize {
+    key.len().saturating_add(std::mem::size_of::<u64>())
+}
+
+/// Selects the next delta chunk prefix using both entry and approximate payload limits.
+///
+/// Registers stay ahead of tombstones to preserve the current stream ordering, while the byte
+/// target pushes each outbound RPC toward a fuller plaintext payload before encryption. The
+/// planner always admits at least one entry so a single large row cannot stall replication.
+fn take_delta_chunk_prefix(
+    regs: &[EncodedRegister],
+    tombs: &[EncodedTombstone],
+    max_entries: usize,
+    target_bytes: usize,
+) -> (usize, usize, usize) {
+    let mut regs_len = 0usize;
+    let mut tombs_len = 0usize;
+    let mut approx_payload_bytes = 0usize;
+
+    while regs_len + tombs_len < max_entries && regs_len < regs.len() {
+        let entry_bytes = encoded_register_payload_bytes(&regs[regs_len]);
+        if approx_payload_bytes > 0
+            && approx_payload_bytes.saturating_add(entry_bytes) > target_bytes
+        {
+            break;
+        }
+        approx_payload_bytes = approx_payload_bytes.saturating_add(entry_bytes);
+        regs_len += 1;
+    }
+
+    while regs_len + tombs_len < max_entries && tombs_len < tombs.len() {
+        let entry_bytes = encoded_tombstone_payload_bytes(&tombs[tombs_len]);
+        if approx_payload_bytes > 0
+            && approx_payload_bytes.saturating_add(entry_bytes) > target_bytes
+        {
+            break;
+        }
+        approx_payload_bytes = approx_payload_bytes.saturating_add(entry_bytes);
+        tombs_len += 1;
+    }
+
+    if regs_len == 0 && tombs_len == 0 {
+        if let Some(first_reg) = regs.first() {
+            return (1, 0, encoded_register_payload_bytes(first_reg));
+        }
+        if let Some(first_tomb) = tombs.first() {
+            return (0, 1, encoded_tombstone_payload_bytes(first_tomb));
+        }
+    }
+
+    (regs_len, tombs_len, approx_payload_bytes)
+}
+
 /// Streams one domain delta to the caller in bounded chunks.
 ///
-/// Chunking is entry-count based instead of byte-perfect sizing; that keeps the sender
-/// simple while still putting a hard cap on per-message work and memory.
+/// Chunking uses both entry and approximate payload limits so the sender can ship fewer,
+/// fatter requests without needing byte-perfect Cap'n Proto sizing.
 async fn send_chunks(
     domain: Domain,
     regs_wire: EncodedRegisters,
@@ -487,6 +566,7 @@ async fn send_chunks(
     sink: &delta_sink::Client,
 ) -> Result<bool, capnp::Error> {
     let chunk_max = delta_chunk_max();
+    let chunk_target_bytes = delta_chunk_target_bytes();
 
     if regs_wire.is_empty() && tombs_wire.is_empty() {
         return Ok(false);
@@ -496,34 +576,18 @@ async fn send_chunks(
     let mut tombs_slice = tombs_wire.as_slice();
 
     while !regs_slice.is_empty() || !tombs_slice.is_empty() {
-        let (regs_chunk, rest_regs) = if regs_slice.len() > chunk_max {
-            regs_slice.split_at(chunk_max)
-        } else {
-            (regs_slice, &[][..])
-        };
-
-        let remaining = chunk_max.saturating_sub(regs_chunk.len());
-        let (tombs_chunk, rest_tombs) = if tombs_slice.len() > remaining {
-            tombs_slice.split_at(remaining)
-        } else {
-            (tombs_slice, &[][..])
-        };
-
-        let regs_payload_bytes: usize = regs_chunk
-            .iter()
-            .map(|(key, reg)| key.len().saturating_add(reg.len()))
-            .sum();
-        let tombs_payload_bytes: usize = tombs_chunk
-            .iter()
-            .map(|(key, _)| key.len().saturating_add(std::mem::size_of::<u64>()))
-            .sum();
+        let (regs_len, tombs_len, approx_payload_bytes) =
+            take_delta_chunk_prefix(regs_slice, tombs_slice, chunk_max, chunk_target_bytes);
+        let (regs_chunk, rest_regs) = regs_slice.split_at(regs_len);
+        let (tombs_chunk, rest_tombs) = tombs_slice.split_at(tombs_len);
         debug!(
             target: "delta",
             ?domain,
             regs = regs_chunk.len(),
             tombs = tombs_chunk.len(),
             chunk_max,
-            approx_payload_bytes = regs_payload_bytes.saturating_add(tombs_payload_bytes),
+            chunk_target_bytes,
+            approx_payload_bytes,
             "sending delta chunk"
         );
 
@@ -556,4 +620,72 @@ async fn send_chunks(
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EncodedRegister, EncodedTombstone, take_delta_chunk_prefix};
+
+    /// Returns one synthetic encoded register entry for chunk-planning tests.
+    fn encoded_register(key_len: usize, reg_len: usize) -> EncodedRegister {
+        (vec![0u8; key_len], vec![0u8; reg_len])
+    }
+
+    /// Returns one synthetic encoded tombstone entry for chunk-planning tests.
+    fn encoded_tombstone(key_len: usize) -> EncodedTombstone {
+        (vec![0u8; key_len], 7)
+    }
+
+    /// The planner must still honor the entry cap when the payload target is generous.
+    #[test]
+    fn take_delta_chunk_prefix_respects_entry_limit() {
+        let regs = vec![
+            encoded_register(8, 16),
+            encoded_register(8, 16),
+            encoded_register(8, 16),
+        ];
+
+        let (regs_len, tombs_len, approx_payload_bytes) =
+            take_delta_chunk_prefix(&regs, &[], 2, 1024);
+        assert_eq!(regs_len, 2);
+        assert_eq!(tombs_len, 0);
+        assert_eq!(approx_payload_bytes, 48);
+    }
+
+    /// The planner should stop after the first entry once the approximate payload target is hit.
+    #[test]
+    fn take_delta_chunk_prefix_respects_payload_target() {
+        let regs = vec![encoded_register(8, 40), encoded_register(8, 40)];
+
+        let (regs_len, tombs_len, approx_payload_bytes) =
+            take_delta_chunk_prefix(&regs, &[], 8, 64);
+        assert_eq!(regs_len, 1);
+        assert_eq!(tombs_len, 0);
+        assert_eq!(approx_payload_bytes, 48);
+    }
+
+    /// The planner must always make progress even when one entry exceeds the target by itself.
+    #[test]
+    fn take_delta_chunk_prefix_always_keeps_one_large_entry() {
+        let regs = vec![encoded_register(8, 512)];
+
+        let (regs_len, tombs_len, approx_payload_bytes) =
+            take_delta_chunk_prefix(&regs, &[], 8, 64);
+        assert_eq!(regs_len, 1);
+        assert_eq!(tombs_len, 0);
+        assert_eq!(approx_payload_bytes, 520);
+    }
+
+    /// Tombstones should fill the remaining room after registers while preserving stream order.
+    #[test]
+    fn take_delta_chunk_prefix_adds_tombstones_after_registers() {
+        let regs = vec![encoded_register(8, 16)];
+        let tombs = vec![encoded_tombstone(8), encoded_tombstone(8)];
+
+        let (regs_len, tombs_len, approx_payload_bytes) =
+            take_delta_chunk_prefix(&regs, &tombs, 3, 1024);
+        assert_eq!(regs_len, 1);
+        assert_eq!(tombs_len, 2);
+        assert_eq!(approx_payload_bytes, 56);
+    }
 }

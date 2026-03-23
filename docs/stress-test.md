@@ -56,10 +56,14 @@ cargo test --test stress_large_cluster -- --ignored --nocapture
   - Override gossip dispatch tick interval (milliseconds).
 - `MANTISSA_GOSSIP_CHANNEL_CAPACITY`
   - Override internal gossip/task/service/network/secret queue capacity.
+- `MANTISSA_GOSSIP_DISPATCH_BATCH_MAX`
+  - Max messages processed in one outbound gossip dispatch slice per tick.
 - `MANTISSA_GOSSIP_RPC_BATCH_MAX`
   - Max messages per outbound gossip RPC batch.
 - `MANTISSA_SYNC_DELTA_CHUNK_MAX`
   - Max entries per sync delta chunk.
+- `MANTISSA_SYNC_DELTA_CHUNK_TARGET_BYTES`
+  - Approximate payload target per sync delta chunk.
 
 ## Defaults Set by the Test Itself
 

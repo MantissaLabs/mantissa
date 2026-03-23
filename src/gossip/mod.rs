@@ -172,10 +172,13 @@ fn should_relay_inbound_message(relay_inbound: bool, message: &Message) -> bool 
 }
 
 pub const DEFAULT_FANOUT: usize = 5;
-/// Max number of gossip messages sent in a single RPC request.
-const MAX_GOSSIP_BATCH_MESSAGES: usize = 32;
+/// Default max messages processed in one outbound dispatch slice per gossip tick.
+///
+/// This stays separate from the per-RPC cap so one tick can batch enough work to
+/// amortize transport encryption while still keeping memory and fanout loops bounded.
+const DEFAULT_GOSSIP_DISPATCH_BATCH_MAX: usize = 128;
 /// Default max message count per outbound gossip RPC call.
-const DEFAULT_GOSSIP_RPC_BATCH_MAX: usize = MAX_GOSSIP_BATCH_MESSAGES;
+const DEFAULT_GOSSIP_RPC_BATCH_MAX: usize = DEFAULT_GOSSIP_DISPATCH_BATCH_MAX;
 /// Default number of peer sends allowed concurrently within one outbound dispatch batch.
 const DEFAULT_GOSSIP_SEND_PARALLELISM: usize = 1;
 /// Maximum number of gossip identifiers retained for ingress deduplication.
@@ -240,6 +243,15 @@ fn should_replace_task_message(current: &Message, candidate: &Message) -> bool {
     };
 
     should_replace_task_event(current_event, candidate_event)
+}
+
+/// Reads the optional outbound gossip dispatch slice cap from the environment.
+fn gossip_dispatch_batch_max_from_env(default: usize) -> usize {
+    std::env::var("MANTISSA_GOSSIP_DISPATCH_BATCH_MAX")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 /// Reads the optional outbound gossip RPC batch cap from the environment.
@@ -593,6 +605,7 @@ pub(crate) async fn start<C>(
     use tokio::time::interval;
     let mut ticker = interval(tick);
     let mut buffer: Vec<Message> = Vec::new();
+    let dispatch_batch_max = gossip_dispatch_batch_max_from_env(DEFAULT_GOSSIP_DISPATCH_BATCH_MAX);
     let rpc_batch_max = gossip_rpc_batch_max_from_env(DEFAULT_GOSSIP_RPC_BATCH_MAX);
     let send_parallelism = gossip_send_parallelism_from_env(DEFAULT_GOSSIP_SEND_PARALLELISM);
     let send_timeout = gossip_send_timeout_from_env();
@@ -640,6 +653,7 @@ pub(crate) async fn start<C>(
                 let (view_scoped, global_metadata) = split_messages_by_plane(pending);
                 let options = DispatchOptions {
                     fanout,
+                    dispatch_batch_max,
                     rpc_batch_max,
                     send_parallelism,
                     send_timeout,
@@ -697,6 +711,7 @@ fn split_messages_by_plane(pending: Vec<Message>) -> (Vec<Message>, Vec<Message>
 #[derive(Clone, Copy)]
 struct DispatchOptions {
     fanout: Option<usize>,
+    dispatch_batch_max: usize,
     rpc_batch_max: usize,
     send_parallelism: usize,
     send_timeout: Option<Duration>,
@@ -750,8 +765,8 @@ async fn dispatch_gossip_plane<C>(
         "gossip tick dispatch"
     );
 
-    let total_batches = pending.len().div_ceil(MAX_GOSSIP_BATCH_MESSAGES);
-    for (batch_idx, batch) in pending.chunks(MAX_GOSSIP_BATCH_MESSAGES).enumerate() {
+    let total_batches = pending.len().div_ceil(options.dispatch_batch_max);
+    for (batch_idx, batch) in pending.chunks(options.dispatch_batch_max).enumerate() {
         debug!(
             target: "gossip",
             cluster_view = %cluster_view,
@@ -759,6 +774,8 @@ async fn dispatch_gossip_plane<C>(
             batch = batch_idx + 1,
             total_batches,
             message_count = batch.len(),
+            dispatch_batch_max = options.dispatch_batch_max,
+            rpc_batch_max = options.rpc_batch_max,
             "gossip chunk dispatch"
         );
 
