@@ -1,0 +1,428 @@
+use crate::gossip::Message;
+use crate::gpu::gpu_runtime_status;
+use crate::store::scheduler_digest_store::SchedulerDigestStore;
+use anyhow::{Result as AnyhowResult, anyhow};
+use async_channel::{Receiver, Sender};
+use capnp::Error;
+use protocol::scheduling::{scheduler_digest, scheduler_digest_event};
+use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::warn;
+use uuid::Uuid;
+
+use super::{GpuDeviceState, SchedulerSnapshot, SlotState};
+
+/// Compact per-node scheduler state replicated for shortlist selection.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct SchedulerDigestValue {
+    pub node_id: Uuid,
+    pub snapshot_version: u64,
+    pub updated_at_unix_ms: u64,
+    pub free_slot_count: u32,
+    pub free_cpu_millis: u64,
+    pub free_memory_bytes: u64,
+    pub largest_free_slot_cpu_millis: u64,
+    pub largest_free_slot_memory_bytes: u64,
+    pub free_gpu_count: u32,
+    pub gpu_runtime_ready: bool,
+}
+
+impl SchedulerDigestValue {
+    /// Builds one digest from the current scheduler snapshot for shortlist selection.
+    pub fn from_snapshot(node_id: Uuid, snapshot: &SchedulerSnapshot) -> Self {
+        let mut free_slot_count = 0u32;
+        let mut free_cpu_millis = 0u64;
+        let mut free_memory_bytes = 0u64;
+        let mut largest_free_slot_cpu_millis = 0u64;
+        let mut largest_free_slot_memory_bytes = 0u64;
+
+        for slot in &snapshot.slots {
+            if !matches!(slot.state, SlotState::Free) {
+                continue;
+            }
+
+            free_slot_count = free_slot_count.saturating_add(1);
+            free_cpu_millis = free_cpu_millis.saturating_add(slot.capacity.cpu_millis);
+            free_memory_bytes = free_memory_bytes.saturating_add(slot.capacity.memory_bytes);
+            largest_free_slot_cpu_millis =
+                largest_free_slot_cpu_millis.max(slot.capacity.cpu_millis);
+            largest_free_slot_memory_bytes =
+                largest_free_slot_memory_bytes.max(slot.capacity.memory_bytes);
+        }
+
+        let mut free_gpu_count = 0u32;
+        for device in &snapshot.gpu_devices {
+            if matches!(device.state, GpuDeviceState::Free) {
+                free_gpu_count = free_gpu_count.saturating_add(1);
+            }
+        }
+
+        Self {
+            node_id,
+            snapshot_version: snapshot.version,
+            updated_at_unix_ms: current_unix_ms(),
+            free_slot_count,
+            free_cpu_millis,
+            free_memory_bytes,
+            largest_free_slot_cpu_millis,
+            largest_free_slot_memory_bytes,
+            free_gpu_count,
+            gpu_runtime_ready: snapshot.gpu_devices.is_empty() || gpu_runtime_status().is_ready(),
+        }
+    }
+}
+
+/// Gossip event carrying one compact scheduler digest mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SchedulerDigestEvent {
+    Upsert(Box<SchedulerDigestValue>),
+    Remove(Uuid),
+}
+
+/// Storage-backed access layer for scheduler digest rows.
+#[derive(Clone)]
+pub struct SchedulerDigestRegistry {
+    store: SchedulerDigestStore,
+}
+
+impl SchedulerDigestRegistry {
+    /// Builds the registry from the underlying replicated digest store.
+    pub fn new(store: SchedulerDigestStore) -> Self {
+        Self { store }
+    }
+
+    /// Upserts one node-local scheduler digest into the replicated store.
+    pub async fn upsert(&self, value: SchedulerDigestValue) -> AnyhowResult<()> {
+        self.store
+            .upsert(&crdt_store::uuid_key::UuidKey::from(value.node_id), value)
+            .await
+            .map_err(|e| anyhow!("scheduler digest upsert failed: {e}"))
+    }
+
+    /// Removes one scheduler digest row from the replicated store.
+    pub async fn remove(&self, node_id: Uuid) -> AnyhowResult<()> {
+        self.store
+            .remove(&crdt_store::uuid_key::UuidKey::from(node_id))
+            .await
+            .map_err(|e| anyhow!("scheduler digest remove failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Reads the canonical digest for one node identifier.
+    pub fn get(&self, node_id: Uuid) -> AnyhowResult<Option<SchedulerDigestValue>> {
+        let key = crdt_store::uuid_key::UuidKey::from(node_id);
+        let snapshot = self
+            .store
+            .get_snapshot(&key)
+            .map_err(|e| anyhow!("scheduler digest lookup failed: {e}"))?;
+        Ok(snapshot.and_then(|values| select_best_scheduler_digest(values.as_slice())))
+    }
+
+    /// Lists every canonical scheduler digest currently known in the replicated store.
+    pub fn list(&self) -> AnyhowResult<Vec<SchedulerDigestValue>> {
+        let (entries, _) = self
+            .store
+            .load_all()
+            .map_err(|e| anyhow!("scheduler digest load_all failed: {e}"))?;
+
+        let mut values = Vec::with_capacity(entries.len());
+        for (_key, snapshot) in entries {
+            if let Some(value) = select_best_scheduler_digest(snapshot.as_slice()) {
+                values.push(value);
+            }
+        }
+
+        values.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        Ok(values)
+    }
+}
+
+/// Publishes the local node's digest into storage and onto gossip after scheduler mutations.
+#[derive(Clone)]
+pub struct SchedulerDigestPublisher {
+    registry: SchedulerDigestRegistry,
+    gossip_tx: Sender<Message>,
+    local_node_id: Uuid,
+}
+
+impl SchedulerDigestPublisher {
+    /// Creates one publisher bound to the local digest registry and gossip queue.
+    pub fn new(
+        registry: SchedulerDigestRegistry,
+        gossip_tx: Sender<Message>,
+        local_node_id: Uuid,
+    ) -> Self {
+        Self {
+            registry,
+            gossip_tx,
+            local_node_id,
+        }
+    }
+
+    /// Publishes a fresh digest derived from the provided scheduler snapshot.
+    pub async fn publish_from_snapshot(&self, snapshot: &SchedulerSnapshot) -> AnyhowResult<()> {
+        let digest = SchedulerDigestValue::from_snapshot(self.local_node_id, snapshot);
+        self.registry.upsert(digest.clone()).await?;
+
+        self.gossip_tx
+            .send(Message::SchedulerDigest {
+                id: Uuid::new_v4(),
+                event: SchedulerDigestEvent::Upsert(Box::new(digest)),
+            })
+            .await
+            .map_err(|e| anyhow!("failed to enqueue scheduler digest gossip: {e}"))
+    }
+}
+
+/// Applies inbound scheduler digest gossip to the local replicated digest store.
+#[derive(Clone)]
+pub struct SchedulerDigestReplicator {
+    registry: SchedulerDigestRegistry,
+    gossip_rx: Receiver<Message>,
+}
+
+impl SchedulerDigestReplicator {
+    /// Creates one inbound replicator bound to the provided registry and gossip channel.
+    pub fn new(registry: SchedulerDigestRegistry, gossip_rx: Receiver<Message>) -> Self {
+        Self {
+            registry,
+            gossip_rx,
+        }
+    }
+
+    /// Runs the inbound gossip loop and applies deduplicated scheduler digest events.
+    pub async fn run(&self) {
+        while let Ok(message) = self.gossip_rx.recv().await {
+            let Message::SchedulerDigest { event, .. } = message else {
+                continue;
+            };
+
+            if let Err(err) = self.apply_event(event).await {
+                warn!(
+                    target: "scheduler",
+                    "failed to apply scheduler digest gossip event: {err:#}"
+                );
+            }
+        }
+    }
+
+    /// Applies one decoded scheduler digest event to the local replicated store.
+    async fn apply_event(&self, event: SchedulerDigestEvent) -> AnyhowResult<()> {
+        match event {
+            SchedulerDigestEvent::Upsert(value) => self.registry.upsert(*value).await?,
+            SchedulerDigestEvent::Remove(node_id) => self.registry.remove(node_id).await?,
+        }
+        Ok(())
+    }
+}
+
+/// Returns the node identifier affected by one scheduler digest event.
+pub fn scheduler_digest_event_node_id(event: &SchedulerDigestEvent) -> Uuid {
+    match event {
+        SchedulerDigestEvent::Upsert(value) => value.node_id,
+        SchedulerDigestEvent::Remove(node_id) => *node_id,
+    }
+}
+
+/// Returns true when the candidate digest event should replace the retained event.
+pub fn should_replace_scheduler_digest_event(
+    current: &SchedulerDigestEvent,
+    candidate: &SchedulerDigestEvent,
+) -> bool {
+    match (current, candidate) {
+        (SchedulerDigestEvent::Remove(_), SchedulerDigestEvent::Upsert(_)) => false,
+        (SchedulerDigestEvent::Upsert(_), SchedulerDigestEvent::Remove(_))
+        | (SchedulerDigestEvent::Remove(_), SchedulerDigestEvent::Remove(_)) => true,
+        (SchedulerDigestEvent::Upsert(current), SchedulerDigestEvent::Upsert(candidate)) => {
+            compare_scheduler_digest_values(candidate, current).is_gt()
+        }
+    }
+}
+
+/// Serializes one scheduler digest value into the Cap'n Proto wire representation.
+pub(crate) fn write_scheduler_digest(
+    mut builder: scheduler_digest::Builder<'_>,
+    value: &SchedulerDigestValue,
+) {
+    builder.set_node_id(value.node_id.as_bytes());
+    builder.set_snapshot_version(value.snapshot_version);
+    builder.set_updated_at_unix_ms(value.updated_at_unix_ms);
+    builder.set_free_slot_count(value.free_slot_count);
+    builder.set_free_cpu_millis(value.free_cpu_millis);
+    builder.set_free_memory_bytes(value.free_memory_bytes);
+    builder.set_largest_free_slot_cpu_millis(value.largest_free_slot_cpu_millis);
+    builder.set_largest_free_slot_memory_bytes(value.largest_free_slot_memory_bytes);
+    builder.set_free_gpu_count(value.free_gpu_count);
+    builder.set_gpu_runtime_ready(value.gpu_runtime_ready);
+}
+
+/// Deserializes one scheduler digest value from the Cap'n Proto wire representation.
+pub(crate) fn read_scheduler_digest(
+    reader: scheduler_digest::Reader<'_>,
+) -> std::result::Result<SchedulerDigestValue, Error> {
+    Ok(SchedulerDigestValue {
+        node_id: read_uuid(reader.get_node_id()?)?,
+        snapshot_version: reader.get_snapshot_version(),
+        updated_at_unix_ms: reader.get_updated_at_unix_ms(),
+        free_slot_count: reader.get_free_slot_count(),
+        free_cpu_millis: reader.get_free_cpu_millis(),
+        free_memory_bytes: reader.get_free_memory_bytes(),
+        largest_free_slot_cpu_millis: reader.get_largest_free_slot_cpu_millis(),
+        largest_free_slot_memory_bytes: reader.get_largest_free_slot_memory_bytes(),
+        free_gpu_count: reader.get_free_gpu_count(),
+        gpu_runtime_ready: reader.get_gpu_runtime_ready(),
+    })
+}
+
+/// Serializes one scheduler digest gossip event into the Cap'n Proto envelope.
+pub(crate) fn write_scheduler_digest_event(
+    mut builder: scheduler_digest_event::Builder<'_>,
+    event: &SchedulerDigestEvent,
+) -> std::result::Result<(), Error> {
+    match event {
+        SchedulerDigestEvent::Upsert(value) => {
+            write_scheduler_digest(builder.reborrow().init_upsert(), value);
+        }
+        SchedulerDigestEvent::Remove(node_id) => {
+            builder.set_remove(node_id.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+/// Deserializes one scheduler digest gossip event from the Cap'n Proto envelope.
+pub(crate) fn read_scheduler_digest_event(
+    reader: scheduler_digest_event::Reader<'_>,
+) -> std::result::Result<SchedulerDigestEvent, Error> {
+    match reader.which()? {
+        scheduler_digest_event::Which::Upsert(Ok(value)) => Ok(SchedulerDigestEvent::Upsert(
+            Box::new(read_scheduler_digest(value)?),
+        )),
+        scheduler_digest_event::Which::Upsert(Err(err)) => Err(err),
+        scheduler_digest_event::Which::Remove(Ok(bytes)) => {
+            Ok(SchedulerDigestEvent::Remove(read_uuid(bytes)?))
+        }
+        scheduler_digest_event::Which::Remove(Err(err)) => Err(err),
+    }
+}
+
+/// Selects the canonical digest value from one MVReg snapshot.
+fn select_best_scheduler_digest(values: &[SchedulerDigestValue]) -> Option<SchedulerDigestValue> {
+    let mut best: Option<&SchedulerDigestValue> = None;
+    for value in values {
+        match best {
+            None => best = Some(value),
+            Some(current) => {
+                if compare_scheduler_digest_values(value, current).is_gt() {
+                    best = Some(value);
+                }
+            }
+        }
+    }
+    best.cloned()
+}
+
+/// Compares two digest rows to choose a deterministic canonical value.
+fn compare_scheduler_digest_values(
+    left: &SchedulerDigestValue,
+    right: &SchedulerDigestValue,
+) -> Ordering {
+    left.snapshot_version
+        .cmp(&right.snapshot_version)
+        .then(left.updated_at_unix_ms.cmp(&right.updated_at_unix_ms))
+        .then(left.free_slot_count.cmp(&right.free_slot_count))
+        .then(left.free_cpu_millis.cmp(&right.free_cpu_millis))
+        .then(left.free_memory_bytes.cmp(&right.free_memory_bytes))
+        .then(
+            left.largest_free_slot_cpu_millis
+                .cmp(&right.largest_free_slot_cpu_millis),
+        )
+        .then(
+            left.largest_free_slot_memory_bytes
+                .cmp(&right.largest_free_slot_memory_bytes),
+        )
+        .then(left.free_gpu_count.cmp(&right.free_gpu_count))
+        .then(left.gpu_runtime_ready.cmp(&right.gpu_runtime_ready))
+        .then(left.node_id.cmp(&right.node_id))
+}
+
+/// Decodes one required 16-byte UUID payload from the wire.
+fn read_uuid(bytes: capnp::data::Reader<'_>) -> std::result::Result<Uuid, Error> {
+    if bytes.len() != 16 {
+        return Err(Error::failed("uuid must be 16 bytes".into()));
+    }
+
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(bytes);
+    Ok(Uuid::from_bytes(arr))
+}
+
+/// Returns the current Unix timestamp in milliseconds for digest freshness ordering.
+fn current_unix_ms() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(u64::MAX as u128) as u64,
+        Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SchedulerDigestEvent, SchedulerDigestValue, should_replace_scheduler_digest_event,
+    };
+    use uuid::Uuid;
+
+    /// Newer snapshot versions should win when coalescing concurrent digest upserts.
+    #[test]
+    fn newer_snapshot_version_wins() {
+        let node_id = Uuid::new_v4();
+        let current = SchedulerDigestEvent::Upsert(Box::new(SchedulerDigestValue {
+            node_id,
+            snapshot_version: 4,
+            updated_at_unix_ms: 10,
+            free_slot_count: 2,
+            free_cpu_millis: 2_000,
+            free_memory_bytes: 4_096,
+            largest_free_slot_cpu_millis: 1_000,
+            largest_free_slot_memory_bytes: 2_048,
+            free_gpu_count: 0,
+            gpu_runtime_ready: false,
+        }));
+        let candidate = SchedulerDigestEvent::Upsert(Box::new(SchedulerDigestValue {
+            node_id,
+            snapshot_version: 5,
+            updated_at_unix_ms: 1,
+            free_slot_count: 1,
+            free_cpu_millis: 1_000,
+            free_memory_bytes: 2_048,
+            largest_free_slot_cpu_millis: 1_000,
+            largest_free_slot_memory_bytes: 2_048,
+            free_gpu_count: 0,
+            gpu_runtime_ready: false,
+        }));
+
+        assert!(should_replace_scheduler_digest_event(&current, &candidate));
+    }
+
+    /// Remove events should win over any queued digest upsert for the same node.
+    #[test]
+    fn remove_wins_over_upsert() {
+        let node_id = Uuid::new_v4();
+        let current = SchedulerDigestEvent::Upsert(Box::new(SchedulerDigestValue {
+            node_id,
+            snapshot_version: 4,
+            updated_at_unix_ms: 10,
+            free_slot_count: 2,
+            free_cpu_millis: 2_000,
+            free_memory_bytes: 4_096,
+            largest_free_slot_cpu_millis: 1_000,
+            largest_free_slot_memory_bytes: 2_048,
+            free_gpu_count: 0,
+            gpu_runtime_ready: false,
+        }));
+        let candidate = SchedulerDigestEvent::Remove(node_id);
+
+        assert!(should_replace_scheduler_digest_event(&current, &candidate));
+    }
+}

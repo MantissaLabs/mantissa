@@ -4,6 +4,7 @@ use arc_swap::ArcSwapOption;
 use crdt_store::uuid_key::UuidKey;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
@@ -12,8 +13,10 @@ use crate::gpu::{GpuDeviceOverrideAction, gpu_device_override_for, read_gpu_devi
 use crate::registry::Registry;
 use crate::store::scheduler_store::SchedulerStore;
 
+use self::digest::SchedulerDigestPublisher;
 use self::summary::SchedulerSummary;
 
+pub mod digest;
 pub mod service;
 pub mod summary;
 
@@ -273,6 +276,7 @@ pub struct Scheduler {
     store_key: UuidKey,
     state: Arc<ArcSwapOption<SchedulerState>>, // stores Option<Arc<SchedulerState>>
     registry: Registry,
+    digest_publisher: StdRwLock<Option<SchedulerDigestPublisher>>,
 }
 
 fn ptr_eq_option(a: &Option<Arc<SchedulerState>>, b: &Option<Arc<SchedulerState>>) -> bool {
@@ -303,7 +307,21 @@ impl Scheduler {
             store_key,
             state,
             registry,
+            digest_publisher: StdRwLock::new(None),
         })
+    }
+
+    /// Attaches the scheduler digest publisher used to replicate shortlist metadata.
+    pub fn set_digest_publisher(&self, publisher: SchedulerDigestPublisher) {
+        match self.digest_publisher.write() {
+            Ok(mut guard) => {
+                *guard = Some(publisher);
+            }
+            Err(err) => {
+                let mut guard = err.into_inner();
+                *guard = Some(publisher);
+            }
+        }
     }
 
     /// Initializes slot-only schedulers (legacy path) by delegating to `init_resources`.
@@ -371,6 +389,7 @@ impl Scheduler {
             return Err(SchedulerError::Store(e));
         }
 
+        self.publish_digest_from_snapshot(&snapshot).await;
         Ok(snapshot)
     }
 
@@ -402,6 +421,27 @@ impl Scheduler {
             .load_full()
             .as_ref()
             .map(|state| state.snapshot.clone())
+    }
+
+    /// Publishes one compact digest for the provided snapshot when the publisher is configured.
+    async fn publish_digest_from_snapshot(&self, snapshot: &SchedulerSnapshot) {
+        let publisher = match self.digest_publisher.read() {
+            Ok(guard) => guard.clone(),
+            Err(err) => err.into_inner().clone(),
+        };
+
+        let Some(publisher) = publisher else {
+            return;
+        };
+
+        if let Err(err) = publisher.publish_from_snapshot(snapshot).await {
+            warn!(
+                target: "scheduler",
+                node_id = %self.store_key.to_uuid(),
+                version = snapshot.version,
+                "failed to publish scheduler digest: {err:#}"
+            );
+        }
     }
 
     /// Derives the initial slot specifications from the node system information so that the scheduler
@@ -567,6 +607,7 @@ impl Scheduler {
                     return Ok(updated);
                 }
             }
+            self.publish_digest_from_snapshot(&snapshot).await;
             return Ok(snapshot);
         }
 
@@ -575,7 +616,10 @@ impl Scheduler {
             .await
         {
             Ok(snapshot) => Ok(snapshot),
-            Err(SchedulerError::AlreadyInitialized { snapshot }) => Ok(snapshot),
+            Err(SchedulerError::AlreadyInitialized { snapshot }) => {
+                self.publish_digest_from_snapshot(&snapshot).await;
+                Ok(snapshot)
+            }
             Err(err) => Err(err),
         }
     }
@@ -641,6 +685,7 @@ impl Scheduler {
                 return Err(SchedulerError::Store(e));
             }
 
+            self.publish_digest_from_snapshot(&new_snapshot).await;
             return Ok(new_snapshot);
         }
     }
@@ -840,6 +885,7 @@ impl Scheduler {
                 return Err(SchedulerError::Store(e));
             }
 
+            self.publish_digest_from_snapshot(&new_snapshot).await;
             return Ok(new_snapshot);
         }
     }
@@ -1072,6 +1118,7 @@ impl Scheduler {
                 return Err(SchedulerError::Store(e));
             }
 
+            self.publish_digest_from_snapshot(&new_snapshot).await;
             return Ok(new_snapshot);
         }
     }

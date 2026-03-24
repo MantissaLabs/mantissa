@@ -7,6 +7,9 @@ use crate::network::registry::NetworkRegistry;
 use crate::network::service::NetworksRpc;
 use crate::registry::Registry;
 use crate::scheduler::Scheduler;
+use crate::scheduler::digest::{
+    SchedulerDigestPublisher, SchedulerDigestRegistry, SchedulerDigestReplicator,
+};
 use crate::scheduler::service::SchedulerService;
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::gossip::SecretReplicator;
@@ -27,6 +30,7 @@ use crate::store::network_store::{
 };
 use crate::store::path::default_db_path;
 use crate::store::peer_store::{PeersStore, open_peers_store};
+use crate::store::scheduler_digest_store::{SchedulerDigestStore, open_scheduler_digest_store};
 use crate::store::scheduler_store::{SchedulerStore, open_scheduler_store};
 use crate::store::secret_store::{SecretStore, open_secret_store};
 use crate::store::service_store::{ServiceStore, open_service_store};
@@ -168,6 +172,7 @@ pub(crate) struct Stores {
     pub secret_master_store: SecretMasterStore,
     pub tasks: TaskStore,
     pub scheduler_store: SchedulerStore,
+    pub scheduler_digests: SchedulerDigestStore,
     pub services: ServiceStore,
     pub secrets: SecretStore,
     pub networks: NetworkSpecStore,
@@ -207,6 +212,7 @@ pub(crate) struct Components {
     pub network_gossiper: NetworkGossiper,
     pub secret_replicator: SecretReplicator,
     pub volume_replicator: VolumeReplicator,
+    pub scheduler_digest_replicator: SchedulerDigestReplicator,
 }
 
 impl Bootstrap {
@@ -305,6 +311,8 @@ impl Bootstrap {
 
         let scheduler_store = open_scheduler_store(ctx.db.clone(), ctx.self_id)?;
         scheduler_store.rebuild_mst_from_disk().await?;
+        let scheduler_digests = open_scheduler_digest_store(ctx.db.clone(), ctx.self_id)?;
+        scheduler_digests.rebuild_mst_from_disk().await?;
 
         let services = open_service_store(ctx.db.clone(), ctx.self_id)?;
         services.rebuild_mst_from_disk().await?;
@@ -336,6 +344,7 @@ impl Bootstrap {
             secret_master_store,
             tasks,
             scheduler_store,
+            scheduler_digests,
             services,
             secrets,
             networks,
@@ -372,6 +381,8 @@ impl Bootstrap {
             async_channel::bounded(channel_capacity);
         let (volume_tx, volume_rx): (Sender<Message>, Receiver<Message>) =
             async_channel::bounded(channel_capacity);
+        let (scheduler_digest_tx, scheduler_digest_rx): (Sender<Message>, Receiver<Message>) =
+            async_channel::bounded(channel_capacity);
         // Restore the last committed active view first; fallback to legacy view when absent.
         let persisted_active_view = stores
             .cluster_view
@@ -396,6 +407,7 @@ impl Bootstrap {
                 network_events: network_tx.clone(),
                 secret_events: secret_tx.clone(),
                 volume_events: volume_tx.clone(),
+                scheduler_digest_events: scheduler_digest_tx.clone(),
                 outbound_events: gossip_tx.clone(),
             },
             cluster_view.clone(),
@@ -424,6 +436,7 @@ impl Bootstrap {
             network_attachments: stores.network_attachments.clone(),
             volumes: stores.volumes.clone(),
             volume_nodes: stores.volume_nodes.clone(),
+            scheduler_digests: stores.scheduler_digests.clone(),
             secret_keyring: stores.secret_keyring.clone(),
         };
 
@@ -441,6 +454,16 @@ impl Bootstrap {
             health_monitor.clone(),
         );
 
+        let scheduler_digest_registry =
+            SchedulerDigestRegistry::new(stores.scheduler_digests.clone());
+        let scheduler_digest_publisher = SchedulerDigestPublisher::new(
+            scheduler_digest_registry.clone(),
+            gossip_tx.clone(),
+            ctx.self_id,
+        );
+        let scheduler_digest_replicator =
+            SchedulerDigestReplicator::new(scheduler_digest_registry, scheduler_digest_rx);
+
         let scheduler = Rc::new(
             Scheduler::new(
                 stores.scheduler_store.clone(),
@@ -449,6 +472,7 @@ impl Bootstrap {
             )
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?,
         );
+        scheduler.set_digest_publisher(scheduler_digest_publisher);
 
         // Initialize the scheduler with the node information to create the
         // slot allocation.
@@ -521,6 +545,7 @@ impl Bootstrap {
                 cluster_views: stores.cluster_view.cluster_view_domain_store(),
                 volumes: stores.volumes.clone(),
                 volume_nodes: stores.volume_nodes.clone(),
+                scheduler_digests: stores.scheduler_digests.clone(),
             },
         );
         let sync_client: protocol::sync::sync::Client = capnp_rpc::new_client(sync_service);
@@ -689,6 +714,7 @@ impl Bootstrap {
                 network_gossiper,
                 secret_replicator,
                 volume_replicator,
+                scheduler_digest_replicator,
             },
             gossip_rx,
             gossip_dedupe,
@@ -802,6 +828,11 @@ impl Bootstrap {
         let volume_replicator = comps.volume_replicator.clone();
         tokio::task::spawn_local(async move {
             volume_replicator.run().await;
+        });
+
+        let scheduler_digest_replicator = comps.scheduler_digest_replicator.clone();
+        tokio::task::spawn_local(async move {
+            scheduler_digest_replicator.run().await;
         });
 
         let volume_controller = comps.volume_controller.clone();

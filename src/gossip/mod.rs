@@ -9,6 +9,10 @@ use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::dedupe::BoundedSeenCache;
 use crate::network::service::{read_network_event, write_network_event};
 use crate::network::types::NetworkEvent;
+use crate::scheduler::digest::{
+    SchedulerDigestEvent, read_scheduler_digest_event, scheduler_digest_event_node_id,
+    should_replace_scheduler_digest_event, write_scheduler_digest_event,
+};
 use crate::secrets::service::{read_secret_event, write_secret_event};
 use crate::secrets::types::SecretEvent;
 use crate::services::service::{read_service_event, write_service_event};
@@ -88,14 +92,37 @@ pub trait GossipContext: PeerProvider {
 
 #[derive(Clone)]
 pub enum Message {
-    Void { id: Uuid },
-    Topology { id: Uuid, event: TopologyEvent },
-    Task { id: Uuid, event: TaskEvent },
-    Service { id: Uuid, event: ServiceEvent },
-    Network { id: Uuid, event: NetworkEvent },
-    Secret { id: Uuid, event: SecretEvent },
-    Volume { id: Uuid, event: VolumeEvent },
-    // Scheduling(SchedulingEvent),
+    Void {
+        id: Uuid,
+    },
+    Topology {
+        id: Uuid,
+        event: TopologyEvent,
+    },
+    Task {
+        id: Uuid,
+        event: TaskEvent,
+    },
+    Service {
+        id: Uuid,
+        event: ServiceEvent,
+    },
+    Network {
+        id: Uuid,
+        event: NetworkEvent,
+    },
+    Secret {
+        id: Uuid,
+        event: SecretEvent,
+    },
+    Volume {
+        id: Uuid,
+        event: VolumeEvent,
+    },
+    SchedulerDigest {
+        id: Uuid,
+        event: SchedulerDigestEvent,
+    },
 }
 
 impl Message {
@@ -107,7 +134,8 @@ impl Message {
             | Message::Service { id, .. }
             | Message::Network { id, .. }
             | Message::Secret { id, .. }
-            | Message::Volume { id, .. } => *id,
+            | Message::Volume { id, .. }
+            | Message::SchedulerDigest { id, .. } => *id,
         }
     }
 }
@@ -188,30 +216,46 @@ const GOSSIP_DEDUPE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Process-wide counter tracking how many outbound task gossip updates were coalesced.
 static GOSSIP_COALESCED_TASK_UPDATES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Coalesces one pending outbound gossip batch by task identifier.
+/// Coalesces one pending outbound gossip batch by task id and digest node id.
 ///
-/// This keeps at most one task lifecycle update per task id for each flush tick, selecting the
-/// causally newest state so we reduce launch-phase chatter and avoid propagating stale transitions.
+/// This keeps at most one task lifecycle update per task id and one scheduler digest event per
+/// node for each flush tick, selecting the causally newest state so we reduce burst chatter and
+/// avoid propagating stale shortlist metadata.
 fn coalesce_pending_messages(pending: Vec<Message>) -> (Vec<Message>, usize) {
     let mut coalesced = Vec::with_capacity(pending.len());
     let mut task_positions: HashMap<Uuid, usize> = HashMap::new();
+    let mut scheduler_digest_positions: HashMap<Uuid, usize> = HashMap::new();
     let mut dropped = 0usize;
 
     for message in pending {
-        let Some(task_id) = task_message_task_id(&message) else {
-            coalesced.push(message);
-            continue;
-        };
-
-        if let Some(position) = task_positions.get(&task_id).copied() {
-            if should_replace_task_message(&coalesced[position], &message) {
-                coalesced[position] = message;
+        if let Some(task_id) = task_message_task_id(&message) {
+            if let Some(position) = task_positions.get(&task_id).copied() {
+                if should_replace_task_message(&coalesced[position], &message) {
+                    coalesced[position] = message;
+                }
+                dropped = dropped.saturating_add(1);
+                continue;
             }
-            dropped = dropped.saturating_add(1);
+
+            task_positions.insert(task_id, coalesced.len());
+            coalesced.push(message);
             continue;
         }
 
-        task_positions.insert(task_id, coalesced.len());
+        if let Some(node_id) = scheduler_digest_message_node_id(&message) {
+            if let Some(position) = scheduler_digest_positions.get(&node_id).copied() {
+                if should_replace_scheduler_digest_message(&coalesced[position], &message) {
+                    coalesced[position] = message;
+                }
+                dropped = dropped.saturating_add(1);
+                continue;
+            }
+
+            scheduler_digest_positions.insert(node_id, coalesced.len());
+            coalesced.push(message);
+            continue;
+        }
+
         coalesced.push(message);
     }
 
@@ -222,6 +266,14 @@ fn coalesce_pending_messages(pending: Vec<Message>) -> (Vec<Message>, usize) {
 fn task_message_task_id(message: &Message) -> Option<Uuid> {
     match message {
         Message::Task { event, .. } => Some(task_event_id(event)),
+        _ => None,
+    }
+}
+
+/// Returns the logical node identifier for one scheduler digest gossip message.
+fn scheduler_digest_message_node_id(message: &Message) -> Option<Uuid> {
+    match message {
+        Message::SchedulerDigest { event, .. } => Some(scheduler_digest_event_node_id(event)),
         _ => None,
     }
 }
@@ -243,6 +295,25 @@ fn should_replace_task_message(current: &Message, candidate: &Message) -> bool {
     };
 
     should_replace_task_event(current_event, candidate_event)
+}
+
+/// Returns true when the candidate scheduler digest message should replace the retained one.
+fn should_replace_scheduler_digest_message(current: &Message, candidate: &Message) -> bool {
+    let (
+        Message::SchedulerDigest {
+            event: current_event,
+            ..
+        },
+        Message::SchedulerDigest {
+            event: candidate_event,
+            ..
+        },
+    ) = (current, candidate)
+    else {
+        return false;
+    };
+
+    should_replace_scheduler_digest_event(current_event, candidate_event)
 }
 
 /// Reads the optional outbound gossip dispatch slice cap from the environment.
@@ -359,9 +430,9 @@ pub struct Channels {
     pub network_events: Sender<Message>,
     pub secret_events: Sender<Message>,
     pub volume_events: Sender<Message>,
+    pub scheduler_digest_events: Sender<Message>,
     /// Shared outbound queue so newly received gossip can be forwarded to additional peers.
     pub outbound_events: Sender<Message>,
-    // scheduling_events: Sender<SchedulingEvent>,
 }
 
 impl Gossip {
@@ -393,6 +464,7 @@ impl gossip::Server for Gossip {
         let network_tx = self.chans.network_events.clone();
         let secret_tx = self.chans.secret_events.clone();
         let volume_tx = self.chans.volume_events.clone();
+        let scheduler_digest_tx = self.chans.scheduler_digest_events.clone();
         let outbound_tx = self.chans.outbound_events.clone();
         let relay_inbound = gossip_relay_inbound_from_env();
 
@@ -478,6 +550,7 @@ impl gossip::Server for Gossip {
                 Network(_) => "network",
                 Secret(_) => "secret",
                 Volume(_) => "volume",
+                SchedulerDigest(_) => "scheduler_digest",
             };
             debug!(
                 target: "gossip",
@@ -585,6 +658,23 @@ impl gossip::Server for Gossip {
                 },
                 Volume(Err(e)) => {
                     eprintln!("Error reading volume: {e}");
+                }
+                SchedulerDigest(Ok(reader)) => match read_scheduler_digest_event(reader) {
+                    Ok(event) => {
+                        let message = Message::SchedulerDigest { id, event };
+                        if should_relay_inbound_message(relay_inbound, &message) {
+                            forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
+                        }
+                        scheduler_digest_tx.send(message).await.map_err(|e| {
+                            capnp::Error::failed(format!(
+                                "Couldn't send event to scheduler digests: {e}"
+                            ))
+                        })?;
+                    }
+                    Err(e) => eprintln!("Failed to convert scheduler digest event: {e}"),
+                },
+                SchedulerDigest(Err(e)) => {
+                    eprintln!("Error reading scheduler digest: {e}");
                 }
             }
         }
@@ -1004,6 +1094,10 @@ where
                 let volume_builder = builder.init_volume();
                 write_volume_event(volume_builder, event)?;
             }
+            Message::SchedulerDigest { event, .. } => {
+                let digest_builder = builder.init_scheduler_digest();
+                write_scheduler_digest_event(digest_builder, event)?;
+            }
         }
     }
 
@@ -1058,6 +1152,7 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
         Message::Network { .. } => false,
         Message::Secret { .. } => false,
         Message::Volume { .. } => false,
+        Message::SchedulerDigest { event, .. } => scheduler_digest_event_node_id(event) == peer_id,
     }
 }
 

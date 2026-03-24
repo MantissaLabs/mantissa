@@ -13,6 +13,7 @@ use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::store::cluster_view_store::ClusterViewDomainStore;
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
+use crate::store::scheduler_digest_store::SchedulerDigestStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
@@ -35,7 +36,7 @@ type EncodedTombstones = Vec<EncodedTombstone>;
 /// Stable ordering of every replicated domain exposed through sync.
 ///
 /// Both client and server treat an empty domain list as "all domains in this order".
-const ALL_DOMAINS: [Domain; 10] = [
+const ALL_DOMAINS: [Domain; 11] = [
     Domain::Peers,
     Domain::Tasks,
     Domain::Services,
@@ -46,6 +47,7 @@ const ALL_DOMAINS: [Domain; 10] = [
     Domain::ClusterViews,
     Domain::Volumes,
     Domain::VolumeNodes,
+    Domain::SchedulerDigests,
 ];
 
 /// Number of replicated domains exposed through view-scoped sync RPCs.
@@ -93,6 +95,7 @@ pub struct SyncService {
     cluster_views: ClusterViewDomainStore,
     volumes: VolumeSpecStore,
     volume_nodes: VolumeNodeStore,
+    scheduler_digests: SchedulerDigestStore,
 }
 
 #[derive(Clone)]
@@ -111,6 +114,7 @@ pub struct SyncStores {
     pub cluster_views: ClusterViewDomainStore,
     pub volumes: VolumeSpecStore,
     pub volume_nodes: VolumeNodeStore,
+    pub scheduler_digests: SchedulerDigestStore,
 }
 
 impl SyncService {
@@ -127,6 +131,7 @@ impl SyncService {
             cluster_views,
             volumes,
             volume_nodes,
+            scheduler_digests,
         } = stores;
         Self {
             cluster_view,
@@ -140,6 +145,7 @@ impl SyncService {
             cluster_views,
             volumes,
             volume_nodes,
+            scheduler_digests,
         }
     }
 
@@ -169,6 +175,7 @@ impl SyncService {
             Domain::ClusterViews => DomainStoreRef::ClusterViews(&self.cluster_views),
             Domain::Volumes => DomainStoreRef::Volumes(&self.volumes),
             Domain::VolumeNodes => DomainStoreRef::VolumeNodes(&self.volume_nodes),
+            Domain::SchedulerDigests => DomainStoreRef::SchedulerDigests(&self.scheduler_digests),
         }
     }
 }
@@ -185,6 +192,7 @@ enum DomainStoreRef<'a> {
     ClusterViews(&'a ClusterViewDomainStore),
     Volumes(&'a VolumeSpecStore),
     VolumeNodes(&'a VolumeNodeStore),
+    SchedulerDigests(&'a SchedulerDigestStore),
 }
 
 /// Static diagnostic metadata associated with one replicated sync domain.
@@ -208,6 +216,7 @@ macro_rules! with_domain_store {
             DomainStoreRef::ClusterViews($store) => $body,
             DomainStoreRef::Volumes($store) => $body,
             DomainStoreRef::VolumeNodes($store) => $body,
+            DomainStoreRef::SchedulerDigests($store) => $body,
         }
     };
 }
@@ -265,6 +274,11 @@ impl DomainStoreRef<'_> {
                 domain: Domain::VolumeNodes,
                 log_label: "volume nodes",
                 dump_suffix: "volume_nodes",
+            },
+            Self::SchedulerDigests(_) => DomainDebugMeta {
+                domain: Domain::SchedulerDigests,
+                log_label: "scheduler digests",
+                dump_suffix: "scheduler_digests",
             },
         }
     }

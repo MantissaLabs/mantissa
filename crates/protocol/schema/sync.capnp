@@ -56,6 +56,9 @@ enum Domain {
 
   volumeNodes @9;
   # Volume node-state registry domain.
+
+  schedulerDigests @10;
+  # Compact per-node scheduler digest domain.
 }
 
 struct PageRange {

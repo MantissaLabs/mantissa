@@ -5,6 +5,7 @@ pub mod network_store;
 pub mod open;
 pub mod path;
 pub mod peer_store;
+pub mod scheduler_digest_store;
 pub mod scheduler_store;
 pub mod secret_store;
 pub mod service_store;

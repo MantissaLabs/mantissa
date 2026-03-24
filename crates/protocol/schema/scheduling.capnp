@@ -127,6 +127,48 @@ struct Summary {
   # Diagnostic message when GPU runtime readiness is false.
 }
 
+struct SchedulerDigest {
+  nodeId @0 :Data;
+  # 16-byte UUID of the node that produced the digest.
+
+  snapshotVersion @1 :UInt64;
+  # Monotonic scheduler snapshot version observed on the node.
+
+  updatedAtUnixMs @2 :UInt64;
+  # Wall-clock timestamp used to compare equally-versioned digest rows.
+
+  freeSlotCount @3 :UInt32;
+  # Number of free slots currently available on the node.
+
+  freeCpuMillis @4 :UInt64;
+  # Sum of free slot CPU capacity in milli-cores.
+
+  freeMemoryBytes @5 :UInt64;
+  # Sum of free slot memory capacity in bytes.
+
+  largestFreeSlotCpuMillis @6 :UInt64;
+  # Largest single-slot CPU capacity still available.
+
+  largestFreeSlotMemoryBytes @7 :UInt64;
+  # Largest single-slot memory capacity still available.
+
+  freeGpuCount @8 :UInt32;
+  # Number of GPU devices currently free on the node.
+
+  gpuRuntimeReady @9 :Bool;
+  # Whether the node's GPU runtime is prepared to accept GPU workloads.
+}
+
+struct SchedulerDigestEvent {
+  union {
+    upsert @0 :SchedulerDigest;
+    # Insert or replace one node's compact digest row.
+
+    remove @1 :Data;
+    # 16-byte UUID of the node whose digest should be removed.
+  }
+}
+
 struct SummaryRequest {
   peerId @0 :Data;
   # 16-byte UUID of the peer to query; empty means local node.

@@ -1129,6 +1129,7 @@ fn domain_label(domain: Domain) -> &'static str {
         Domain::ClusterViews => "cluster_views",
         Domain::Volumes => "volumes",
         Domain::VolumeNodes => "volume_nodes",
+        Domain::SchedulerDigests => "scheduler_digests",
     }
 }
 

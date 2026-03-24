@@ -6,11 +6,13 @@
 
 use crate::cluster::ClusterViewId;
 use crate::network::types::{NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue};
+use crate::scheduler::digest::SchedulerDigestValue;
 use crate::secrets::types::SecretValue;
 use crate::services::types::ServiceSpecValue;
 use crate::store::cluster_view_store::{ClusterNameRecord, ClusterViewDomainStore};
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
+use crate::store::scheduler_digest_store::SchedulerDigestStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
@@ -33,7 +35,7 @@ type RegisterDelta<V> = Vec<(UuidKey, MVReg<V, uuid::Uuid>)>;
 type TombstoneDelta = Vec<(UuidKey, u64)>;
 
 /// Same domain ordering as the server, used when a caller wants a full peer reconciliation.
-const ALL_SYNC_DOMAINS: [Domain; 10] = [
+const ALL_SYNC_DOMAINS: [Domain; 11] = [
     Domain::Peers,
     Domain::Tasks,
     Domain::Services,
@@ -44,6 +46,7 @@ const ALL_SYNC_DOMAINS: [Domain; 10] = [
     Domain::ClusterViews,
     Domain::Volumes,
     Domain::VolumeNodes,
+    Domain::SchedulerDigests,
 ];
 
 #[derive(Clone)]
@@ -59,6 +62,7 @@ pub struct SyncStores {
     pub cluster_views: ClusterViewDomainStore,
     pub volumes: VolumeSpecStore,
     pub volume_nodes: VolumeNodeStore,
+    pub scheduler_digests: SchedulerDigestStore,
 }
 
 /// Carries one peer-scoped context for anti-entropy diagnostics.
@@ -94,6 +98,7 @@ impl SyncStores {
             Domain::ClusterViews => self.cluster_views.root_hex().await,
             Domain::Volumes => self.volumes.root_hex().await,
             Domain::VolumeNodes => self.volume_nodes.root_hex().await,
+            Domain::SchedulerDigests => self.scheduler_digests.root_hex().await,
         }
     }
 
@@ -110,6 +115,7 @@ impl SyncStores {
             Domain::ClusterViews => self.cluster_views.page_range_summary().await,
             Domain::Volumes => self.volumes.page_range_summary().await,
             Domain::VolumeNodes => self.volume_nodes.page_range_summary().await,
+            Domain::SchedulerDigests => self.scheduler_digests.page_range_summary().await,
         }
     }
 }
@@ -236,6 +242,14 @@ impl delta_sink::Server for DeltaSinkImpl {
                     self.stores.volume_nodes.clone(),
                     &chunk,
                     decode_register::<VolumeNodeStateValue>,
+                )
+                .await?
+            }
+            Domain::SchedulerDigests => {
+                apply_chunk(
+                    self.stores.scheduler_digests.clone(),
+                    &chunk,
+                    decode_register::<SchedulerDigestValue>,
                 )
                 .await?
             }
@@ -412,6 +426,17 @@ impl DeltaStore<VolumeNodeStateValue> for VolumeNodeStore {
     async fn apply_delta(
         self,
         regs: Vec<(UuidKey, MVReg<VolumeNodeStateValue, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()> {
+        self.apply_delta_chunk_update_mst(regs, tombs).await
+    }
+}
+
+#[async_trait]
+impl DeltaStore<SchedulerDigestValue> for SchedulerDigestStore {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<SchedulerDigestValue, uuid::Uuid>)>,
         tombs: Vec<(UuidKey, u64)>,
     ) -> io::Result<()> {
         self.apply_delta_chunk_update_mst(regs, tombs).await

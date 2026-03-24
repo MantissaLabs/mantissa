@@ -6,6 +6,7 @@ using import "task.capnp".TaskEvent;
 using import "services.capnp".ServiceEvent;
 using import "network.capnp".NetworkEvent;
 using import "secrets.capnp".SecretEvent;
+using import "scheduling.capnp".SchedulerDigestEvent;
 using import "volumes.capnp".VolumeEvent;
 
 interface Gossip {
@@ -53,6 +54,9 @@ struct GossipMessage {
 
     volume @8 :VolumeEvent;
     # Volume upsert/remove event.
+
+    schedulerDigest @9 :SchedulerDigestEvent;
+    # Compact per-node scheduler digest event.
   }
 }
 

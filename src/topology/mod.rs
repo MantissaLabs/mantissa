@@ -13,6 +13,7 @@ use crate::store::cluster_view_store::{ClusterNameRecord, ClusterViewStore};
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, SecretMasterStore};
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
+use crate::store::scheduler_digest_store::SchedulerDigestStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::task_store::TaskStore;
@@ -155,6 +156,7 @@ pub struct TopologyStores {
     pub network_attachments: NetworkAttachmentStore,
     pub volumes: VolumeSpecStore,
     pub volume_nodes: VolumeNodeStore,
+    pub scheduler_digests: SchedulerDigestStore,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
@@ -362,6 +364,7 @@ pub struct Topology {
     network_attachments: NetworkAttachmentStore,
     volumes: VolumeSpecStore,
     volume_nodes: VolumeNodeStore,
+    scheduler_digests: SchedulerDigestStore,
 
     /// Cached Peers snapshot to avoid hitting storage on every tick.
     peer_snapshot_cache: Arc<AsyncMutex<PeerSnapshotCache>>,
@@ -469,6 +472,7 @@ impl Topology {
             network_attachments,
             volumes,
             volume_nodes,
+            scheduler_digests,
             secret_keyring,
         } = stores;
 
@@ -492,6 +496,7 @@ impl Topology {
             network_attachments,
             volumes,
             volume_nodes,
+            scheduler_digests,
             peer_snapshot_cache: Arc::new(AsyncMutex::new(PeerSnapshotCache::new())),
             gossip_warm_set: Arc::new(AsyncMutex::new(GossipWarmSetState::default())),
             excluded_peers: Arc::new(AsyncMutex::new(HashSet::new())),
@@ -958,6 +963,9 @@ impl Topology {
                 }
                 Ok(Message::Volume { .. }) => {
                     // Volume gossip is handled by the dedicated volume replicator.
+                }
+                Ok(Message::SchedulerDigest { .. }) => {
+                    // Scheduler digest gossip is handled by the dedicated digest replicator.
                 }
                 Ok(Message::Topology { id, event }) => {
                     match event {
@@ -1483,6 +1491,7 @@ impl Topology {
             cluster_views: self.cluster_view_store.cluster_view_domain_store(),
             volumes: self.volumes.clone(),
             volume_nodes: self.volume_nodes.clone(),
+            scheduler_digests: self.scheduler_digests.clone(),
         };
 
         let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic");
@@ -1521,6 +1530,7 @@ impl Topology {
             cluster_views: self.cluster_view_store.cluster_view_domain_store(),
             volumes: self.volumes.clone(),
             volume_nodes: self.volume_nodes.clone(),
+            scheduler_digests: self.scheduler_digests.clone(),
         };
 
         let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic-task-repair");
@@ -1569,6 +1579,7 @@ impl Topology {
             cluster_views: self.cluster_view_store.cluster_view_domain_store(),
             volumes: self.volumes.clone(),
             volume_nodes: self.volume_nodes.clone(),
+            scheduler_digests: self.scheduler_digests.clone(),
         };
 
         let trace =
