@@ -2,11 +2,11 @@ use crate::network::types::compute_network_id;
 use crate::services::manager::{ServiceController, ServiceDeploymentOutcome};
 use crate::services::types::{
     ServiceEvent, ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePortProtocol,
-    ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceRescheduleLock,
-    ServiceRescheduleReason, ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase,
-    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement,
-    ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
-    ServiceUpdateStrategy, ServiceUpdateStrategyMode,
+    ServicePreviousGeneration, ServiceReadinessProbe, ServiceReadinessProbeKind,
+    ServiceRescheduleLock, ServiceRescheduleReason, ServiceRollingUpdatePolicy,
+    ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
+    ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
+    ServiceTaskSpecValue, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
 };
 use crate::task::capnp_codec::{
     decode_env_vars, decode_secret_files, decode_volume_mounts, encode_env_vars,
@@ -165,6 +165,11 @@ pub(crate) fn write_service_spec(
         write_reschedule_lock(lock_builder, lock)?;
     }
 
+    if let Some(previous) = value.previous_generation.as_ref() {
+        let previous_builder = builder.reborrow().init_previous_generation();
+        write_previous_generation(previous_builder, previous)?;
+    }
+
     Ok(())
 }
 
@@ -243,6 +248,11 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
     } else {
         ServiceUpdateStrategy::default()
     };
+    value.previous_generation = if reader.has_previous_generation() {
+        Some(read_previous_generation(reader.get_previous_generation()?)?)
+    } else {
+        None
+    };
     value.reschedule_lock = if reader.has_reschedule_lock() {
         Some(read_reschedule_lock(reader.get_reschedule_lock()?)?)
     } else {
@@ -297,6 +307,68 @@ fn read_rollout_state(
         } else {
             Some(last_error)
         },
+    })
+}
+
+/// Encodes the prior generation snapshot so rollout adoption can reconstruct old service state.
+fn write_previous_generation(
+    mut builder: protocol::services::previous_generation::Builder<'_>,
+    previous: &ServicePreviousGeneration,
+) -> Result<(), Error> {
+    builder.set_manifest_id(previous.manifest_id.as_bytes());
+    builder.set_manifest_name(&previous.manifest_name);
+    builder.set_service_epoch(previous.service_epoch);
+    builder.set_status(service_status_to_proto(previous.status));
+    write_update_strategy(
+        builder.reborrow().init_update_strategy(),
+        &previous.update_strategy,
+    );
+
+    let mut tasks_builder = builder.reborrow().init_tasks(previous.tasks.len() as u32);
+    for (idx, task) in previous.tasks.iter().enumerate() {
+        write_task_template(tasks_builder.reborrow().get(idx as u32), task)?;
+    }
+
+    let mut task_ids_builder = builder
+        .reborrow()
+        .init_task_ids(previous.task_ids.len() as u32);
+    for (idx, task_id) in previous.task_ids.iter().enumerate() {
+        task_ids_builder.set(idx as u32, task_id.as_bytes());
+    }
+
+    Ok(())
+}
+
+/// Decodes the prior generation snapshot used by deterministic rollout owner adoption.
+fn read_previous_generation(
+    reader: protocol::services::previous_generation::Reader<'_>,
+) -> Result<ServicePreviousGeneration, Error> {
+    let manifest_id = read_uuid(reader.get_manifest_id()?)?;
+    let manifest_name = reader.get_manifest_name()?.to_str()?.to_string();
+    let mut tasks = Vec::new();
+    for tmpl in reader.get_tasks()?.iter() {
+        tasks.push(read_task_template(tmpl)?);
+    }
+
+    let mut task_ids = Vec::new();
+    for task_id in reader.get_task_ids()?.iter() {
+        task_ids.push(read_uuid(task_id?)?);
+    }
+
+    let update_strategy = if reader.has_update_strategy() {
+        read_update_strategy(reader.get_update_strategy()?)?
+    } else {
+        ServiceUpdateStrategy::default()
+    };
+
+    Ok(ServicePreviousGeneration {
+        manifest_id,
+        manifest_name,
+        tasks,
+        task_ids,
+        update_strategy,
+        service_epoch: reader.get_service_epoch(),
+        status: proto_to_service_status(reader.get_status()?),
     })
 }
 

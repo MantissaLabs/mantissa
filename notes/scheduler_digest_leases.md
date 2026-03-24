@@ -819,12 +819,18 @@ In complexity terms, the target shape is:
 
 ## Follow-up work that is intentionally separate
 
-Two useful follow-ups should remain separate from this RFC:
+One follow-up remains intentionally separate from this RFC:
 
-1. deterministic planner ownership per service generation,
-2. adaptive shortlist sizing and scoring based on observed prepare rejection
+1. adaptive shortlist sizing and scoring based on observed prepare rejection
    rates.
 
-Those are good next steps, but they should not block the lease-and-digest
-cutover because the largest current inefficiency is the remote detailed summary
-dependency, not the lack of a planner-owner election.
+Deterministic service-generation ownership is no longer pending. The service
+controller now persists the prior generation snapshot inside the `Deploying`
+service spec, selects one rollout owner with rendezvous hashing over the
+eligible node set, and adopts both deployment execution and readiness waiting
+from replicated service state rather than from the submitter's local memory.
+
+That ownership cutover complements the lease-and-digest path because it reduces
+competing planners without reintroducing a central coordinator, but it is still
+conceptually separate from the scheduler transport and allocation changes
+described above.

@@ -217,6 +217,26 @@ pub(super) fn select_task_owner(task_id: Uuid, candidates: &[Uuid]) -> Option<Uu
     best.map(|(node_id, _)| node_id)
 }
 
+/// Selects the deterministic owner for one service generation so only one node executes rollout.
+pub(super) fn select_generation_owner(
+    service_id: Uuid,
+    service_epoch: u64,
+    candidates: &[Uuid],
+) -> Option<Uuid> {
+    let mut best: Option<(Uuid, u128)> = None;
+    for node_id in candidates {
+        let score = generation_owner_score(service_id, service_epoch, *node_id);
+        match best {
+            None => best = Some((*node_id, score)),
+            Some((_, best_score)) if score > best_score => {
+                best = Some((*node_id, score));
+            }
+            _ => {}
+        }
+    }
+    best.map(|(node_id, _)| node_id)
+}
+
 /// Computes the rendezvous score for slot ownership selection.
 fn slot_owner_score(service_id: Uuid, template: &str, replica: u16, node_id: Uuid) -> u128 {
     let mut hasher = blake3::Hasher::new();
@@ -236,6 +256,19 @@ fn task_owner_score(task_id: Uuid, node_id: Uuid) -> u128 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"cleanup");
     hasher.update(task_id.as_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
+}
+
+/// Computes the rendezvous score used to choose one rollout owner for a service generation.
+fn generation_owner_score(service_id: Uuid, service_epoch: u64, node_id: Uuid) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"generation");
+    hasher.update(service_id.as_bytes());
+    hasher.update(&service_epoch.to_le_bytes());
     hasher.update(node_id.as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0u8; 16];

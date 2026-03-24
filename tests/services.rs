@@ -5879,6 +5879,7 @@ fn service_spec_matches_expected(actual: &ServiceSpecValue, expected: &ServiceSp
         && actual.rollout == expected.rollout
         && actual.status == expected.status
         && actual.status_detail == expected.status_detail
+        && actual.previous_generation == expected.previous_generation
         && actual.reschedule_lock == expected.reschedule_lock
 }
 

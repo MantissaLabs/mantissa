@@ -303,6 +303,29 @@ struct RescheduleLock {
   # Reason the lock was acquired.
 }
 
+struct PreviousGeneration {
+  manifestId @0 :Data;
+  # Manifest revision UUID (16 bytes) for the prior generation.
+
+  manifestName @1 :Text;
+  # Human-readable manifest name for the prior generation.
+
+  tasks @2 :List(TaskTemplate);
+  # Prior desired task templates used for rollback and redeploy planning.
+
+  taskIds @3 :List(Data);
+  # Prior task UUIDs (16 bytes each).
+
+  updateStrategy @4 :UpdateStrategy;
+  # Prior rollout strategy retained for rollback reconstruction.
+
+  serviceEpoch @5 :UInt64;
+  # Causal generation counter for the prior service generation.
+
+  status @6 :ServiceStatus;
+  # Prior lifecycle status restored after rollback when needed.
+}
+
 struct ServiceSpec {
   id @0 :Data;
   # Deterministic service UUID (16 bytes)
@@ -345,6 +368,9 @@ struct ServiceSpec {
 
   statusDetail @13 :Text;
   # Human-readable detail describing why the current lifecycle status is blocked or waiting.
+
+  previousGeneration @14 :PreviousGeneration;
+  # Prior generation snapshot retained while a new generation is still being executed.
 }
 
 struct ServiceEvent {

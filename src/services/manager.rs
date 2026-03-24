@@ -7,8 +7,8 @@ use crate::services::reconcile::{
 };
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServiceEvent, ServiceLivenessProbe, ServiceLivenessProbeKind, ServiceRolloutOrder,
-    ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
+    ServiceEvent, ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePreviousGeneration,
+    ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
     ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
     ServiceUpdateStrategy, compute_service_id,
 };
@@ -40,7 +40,7 @@ mod readiness;
 mod rollout;
 #[path = "slot_reconcile.rs"]
 mod slot_reconcile;
-use ownership::{SlotKey, compute_slot_targets};
+use ownership::{SlotKey, compute_slot_targets, select_generation_owner};
 #[cfg(test)]
 use ownership::{build_replica_slots, select_slot_owner, select_task_owner};
 use readiness::start_readiness_wait;
@@ -90,9 +90,29 @@ pub struct ServiceController {
     local_node_id: Uuid,
     health_monitor: Arc<HealthMonitor>,
     inflight_slots: Arc<AsyncMutex<HashSet<SlotKey>>>,
+    inflight_generations: Arc<AsyncMutex<HashSet<ServiceGenerationExecutionKey>>>,
     inflight_traffic_publish_waiters: Arc<AsyncMutex<HashSet<Uuid>>>,
     slot_missing_since: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
     slot_rebalance_after: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
+}
+
+/// Stable key for one in-flight service generation execution owned by this node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct ServiceGenerationExecutionKey {
+    service_id: Uuid,
+    manifest_id: Uuid,
+    service_epoch: u64,
+}
+
+impl ServiceGenerationExecutionKey {
+    /// Builds one in-flight generation key from the replicated service spec identity tuple.
+    fn from_spec(spec: &ServiceSpecValue) -> Self {
+        Self {
+            service_id: spec.id,
+            manifest_id: spec.manifest_id,
+            service_epoch: spec.service_epoch,
+        }
+    }
 }
 
 pub struct ServiceControllerConfig {
@@ -129,6 +149,7 @@ impl ServiceController {
             local_node_id,
             health_monitor,
             inflight_slots: Arc::new(AsyncMutex::new(HashSet::new())),
+            inflight_generations: Arc::new(AsyncMutex::new(HashSet::new())),
             inflight_traffic_publish_waiters: Arc::new(AsyncMutex::new(HashSet::new())),
             slot_missing_since: Arc::new(AsyncMutex::new(HashMap::new())),
             slot_rebalance_after: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -152,7 +173,7 @@ impl ServiceController {
                 message = self.gossip_rx.recv() => {
                     let Ok(message) = message else { break; };
                     if let Message::Service { event, .. } = message
-                        && let Err(err) = self.handle_event(event).await {
+                        && let Err(err) = self.handle_event(*event).await {
                             tracing::warn!(
                                 target: "services",
                                 "failed to apply service gossip event: {err}"
@@ -334,6 +355,7 @@ impl ServiceController {
                 pending_spec.start_new_generation();
                 pending_spec.task_ids.clear();
                 pending_spec.set_rollout(ServiceRolloutState::default());
+                pending_spec.previous_generation = None;
                 pending_spec.set_status(ServiceStatus::Deploying);
 
                 tracing::info!(
@@ -346,24 +368,8 @@ impl ServiceController {
 
                 self.apply_upsert(pending_spec.clone()).await?;
                 self.broadcast(ServiceEvent::Upsert(pending_spec)).await?;
-
-                let job = ServiceDeploymentJob {
-                    manifest_id,
-                    manifest_name,
-                    service_name,
-                    templates: tasks,
-                    update_strategy,
-                };
-
-                let controller = self.clone();
-                tokio::task::spawn_local(async move {
-                    if let Err(err) = controller.execute_deployment(job).await {
-                        tracing::warn!(
-                            target: "services",
-                            "service recovery deployment failed: {err}"
-                        );
-                    }
-                });
+                self.maybe_spawn_generation_execution_for_service(service_id)
+                    .await;
 
                 return Ok(ServiceDeploymentSubmission {
                     service_id,
@@ -381,6 +387,8 @@ impl ServiceController {
             // A new deployment generation must start from an empty assignment set so peers can
             // observe a clean Deploying bootstrap before task ids are repopulated.
             pending_spec.task_ids.clear();
+            pending_spec.previous_generation =
+                Some(ServicePreviousGeneration::from_service(&current_spec));
             pending_spec.set_status(ServiceStatus::Deploying);
 
             tracing::info!(
@@ -392,25 +400,8 @@ impl ServiceController {
 
             self.apply_upsert(pending_spec.clone()).await?;
             self.broadcast(ServiceEvent::Upsert(pending_spec)).await?;
-
-            let job = ServiceRedeploymentJob {
-                manifest_id,
-                manifest_name,
-                service_name,
-                templates: tasks,
-                current_spec,
-                update_strategy,
-            };
-
-            let controller = self.clone();
-            tokio::task::spawn_local(async move {
-                if let Err(err) = controller.execute_redeployment(job).await {
-                    tracing::warn!(
-                        target: "services",
-                        "service redeployment failed: {err}"
-                    );
-                }
-            });
+            self.maybe_spawn_generation_execution_for_service(service_id)
+                .await;
 
             return Ok(ServiceDeploymentSubmission {
                 service_id,
@@ -426,27 +417,12 @@ impl ServiceController {
             Vec::new(),
         );
         pending_spec.update_strategy = update_strategy.clone();
+        pending_spec.previous_generation = None;
         pending_spec.set_status(ServiceStatus::Deploying);
         self.apply_upsert(pending_spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(pending_spec)).await?;
-
-        let job = ServiceDeploymentJob {
-            manifest_id,
-            manifest_name,
-            service_name,
-            templates: tasks,
-            update_strategy,
-        };
-
-        let controller = self.clone();
-        tokio::task::spawn_local(async move {
-            if let Err(err) = controller.execute_deployment(job).await {
-                tracing::warn!(
-                    target: "services",
-                    "service deployment failed: {err}"
-                );
-            }
-        });
+        self.maybe_spawn_generation_execution_for_service(service_id)
+            .await;
 
         Ok(ServiceDeploymentSubmission {
             service_id,
@@ -457,7 +433,10 @@ impl ServiceController {
     async fn handle_event(&self, event: ServiceEvent) -> anyhow::Result<()> {
         match event {
             ServiceEvent::Upsert(spec) => {
+                let service_id = spec.id;
                 self.apply_upsert(spec).await?;
+                self.maybe_spawn_generation_execution_for_service(service_id)
+                    .await;
             }
             ServiceEvent::Remove(mut spec) => {
                 spec.set_status(ServiceStatus::Stopped);
@@ -470,7 +449,10 @@ impl ServiceController {
     async fn broadcast(&self, event: ServiceEvent) -> anyhow::Result<()> {
         let id = Uuid::new_v4();
         self.gossip_tx
-            .send(Message::Service { id, event })
+            .send(Message::Service {
+                id,
+                event: Box::new(event),
+            })
             .await
             .map_err(|e| anyhow::anyhow!("failed to enqueue service gossip: {e}"))
     }
@@ -488,6 +470,9 @@ impl ServiceController {
             Arc::new(self.collect_eligible_nodes_from_snapshot(health_snapshot.as_ref()));
 
         for spec in specs {
+            self.maybe_spawn_generation_execution(spec.clone(), eligible_nodes.as_ref())
+                .await;
+
             if should_reconcile_status(spec.status()) {
                 let controller = self.clone();
                 let inventory = inventory.clone();
@@ -578,6 +563,111 @@ impl ServiceController {
             .unwrap_or(false)
     }
 
+    /// Loads the current service spec and launches local generation execution when this node owns it.
+    async fn maybe_spawn_generation_execution_for_service(&self, service_id: Uuid) {
+        let spec = match self.registry.get(service_id) {
+            Ok(Some(spec)) => spec,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(
+                    target: "services",
+                    "failed to load service {service_id} while checking generation ownership: {err}"
+                );
+                return;
+            }
+        };
+        let eligible_nodes = self.collect_eligible_nodes();
+        self.maybe_spawn_generation_execution(spec, &eligible_nodes)
+            .await;
+    }
+
+    /// Starts the local adopter when replicated state says this node owns the deploying generation.
+    async fn maybe_spawn_generation_execution(
+        &self,
+        spec: ServiceSpecValue,
+        eligible_nodes: &[Uuid],
+    ) {
+        if spec.status() != ServiceStatus::Deploying || eligible_nodes.is_empty() {
+            return;
+        }
+
+        let Some(owner_id) = select_generation_owner(spec.id, spec.service_epoch, eligible_nodes)
+        else {
+            return;
+        };
+        if owner_id != self.local_node_id {
+            return;
+        }
+
+        let key = ServiceGenerationExecutionKey::from_spec(&spec);
+        let mut inflight = self.inflight_generations.lock().await;
+        if !inflight.insert(key) {
+            return;
+        }
+        drop(inflight);
+
+        let controller = self.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(err) = controller.adopt_deploying_generation(spec.clone()).await {
+                tracing::warn!(
+                    target: "services",
+                    service = %spec.service_name,
+                    manifest = %spec.manifest_id,
+                    epoch = spec.service_epoch,
+                    "service generation execution failed: {err:#}"
+                );
+            }
+            controller.finish_generation_execution(key).await;
+        });
+    }
+
+    /// Removes one completed generation execution from the local in-flight dedupe set.
+    async fn finish_generation_execution(&self, key: ServiceGenerationExecutionKey) {
+        let mut inflight = self.inflight_generations.lock().await;
+        inflight.remove(&key);
+    }
+
+    /// Adopts the current deploying service generation directly from replicated service state.
+    async fn adopt_deploying_generation(&self, spec: ServiceSpecValue) -> anyhow::Result<()> {
+        let current = match self.registry.get(spec.id)? {
+            Some(current)
+                if current.manifest_id == spec.manifest_id
+                    && current.service_epoch == spec.service_epoch
+                    && current.status() == ServiceStatus::Deploying =>
+            {
+                current
+            }
+            Some(_) | None => return Ok(()),
+        };
+
+        if let Some(previous) = current.previous_generation.as_ref() {
+            let job = ServiceRedeploymentJob {
+                manifest_id: current.manifest_id,
+                manifest_name: current.manifest_name.clone(),
+                service_name: current.service_name.clone(),
+                templates: current.tasks.clone(),
+                current_spec: previous.to_service_spec(current.id, current.service_name.clone()),
+                update_strategy: current.update_strategy.clone(),
+            };
+            return self.clone().execute_redeployment(job).await;
+        }
+
+        if deploying_assignment_incomplete(&current) {
+            let job = ServiceDeploymentJob {
+                manifest_id: current.manifest_id,
+                manifest_name: current.manifest_name.clone(),
+                service_name: current.service_name.clone(),
+                templates: current.tasks.clone(),
+                update_strategy: current.update_strategy.clone(),
+                assigned_task_ids: current.task_ids.clone(),
+            };
+            return self.clone().execute_deployment(job).await;
+        }
+
+        self.clone().await_service_readiness(current).await;
+        Ok(())
+    }
+
     /// Executes the deployment workflow in the background by starting tasks via the task manager
     /// and persisting the resulting service specification into the replicated registry.
     async fn execute_deployment(self, job: ServiceDeploymentJob) -> anyhow::Result<()> {
@@ -603,6 +693,7 @@ impl ServiceController {
             service_name,
             templates,
             update_strategy,
+            assigned_task_ids: _,
         } = job;
 
         let service_id = compute_service_id(&service_name);
@@ -773,6 +864,7 @@ impl ServiceController {
         spec.tasks = templates;
         spec.task_ids = task_ids;
         spec.update_strategy = update_strategy;
+        spec.previous_generation = None;
         spec.set_rollout(ServiceRolloutState::default());
         spec.set_status(ServiceStatus::Deploying);
         self.apply_upsert(spec.clone()).await?;
@@ -806,6 +898,7 @@ impl ServiceController {
             service_name,
             templates,
             update_strategy,
+            assigned_task_ids,
         } = job;
 
         let service_id = compute_service_id(&service_name);
@@ -833,8 +926,36 @@ impl ServiceController {
             .iter()
             .map(|template| (template.name.clone(), template.replicas))
             .collect();
-        let mut launched_task_ids: HashMap<String, Vec<Uuid>> = HashMap::new();
         let mut assignments: BTreeMap<(String, u16), Uuid> = BTreeMap::new();
+        for assignment in self
+            .collect_assignments(&service_name, &assigned_task_ids)
+            .await
+        {
+            assignments.insert(
+                (assignment.template.clone(), assignment.replica),
+                assignment.task_id,
+            );
+        }
+
+        let mut launched_task_ids: HashMap<String, Vec<Uuid>> = HashMap::new();
+        for template in &templates {
+            let mut template_task_ids = Vec::new();
+            for replica in 1..=template.replicas {
+                if let Some(task_id) = assignments.get(&(template.name.clone(), replica)) {
+                    template_task_ids.push(*task_id);
+                }
+            }
+            if !template_task_ids.is_empty() {
+                launched_task_ids.insert(template.name.clone(), template_task_ids);
+            }
+        }
+
+        let slot_targets = compute_effective_slot_targets(
+            service_id,
+            &templates,
+            &eligible_nodes,
+            &self.volume_registry,
+        )?;
 
         for template_index in ordered_indices {
             let template = templates[template_index].clone();
@@ -859,12 +980,12 @@ impl ServiceController {
                 return Ok(());
             }
 
-            let requests = build_start_requests(
+            let requests = build_missing_template_requests(
                 &service_name,
                 service_id,
-                std::slice::from_ref(&template),
-                &eligible_nodes,
-                &self.volume_registry,
+                &template,
+                &assignments,
+                &slot_targets,
             );
             if requests.is_empty() {
                 continue;
@@ -901,7 +1022,10 @@ impl ServiceController {
             };
 
             let stage_ids: Vec<Uuid> = task_specs.iter().map(|spec| spec.id).collect();
-            launched_task_ids.insert(template.name.clone(), stage_ids);
+            launched_task_ids
+                .entry(template.name.clone())
+                .or_default()
+                .extend(stage_ids);
             record_task_assignments(&service_name, &task_specs, &mut assignments);
 
             let ordered_task_ids = ordered_known_task_ids(&templates, &assignments);
@@ -1212,6 +1336,7 @@ impl ServiceController {
         spec.tasks = deployment.templates.to_vec();
         spec.task_ids = task_ids;
         spec.update_strategy = deployment.update_strategy.clone();
+        spec.previous_generation = None;
         spec.set_rollout(ServiceRolloutState::default());
         spec.set_status(ServiceStatus::Deploying);
         self.apply_upsert(spec.clone()).await?;
@@ -1237,6 +1362,7 @@ impl ServiceController {
         match self.registry.get(service_id) {
             Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(err) => {
                 persisted_spec.task_ids = desired_task_ids.to_vec();
+                persisted_spec.previous_generation = None;
                 persisted_spec.set_rollout(ServiceRolloutState::default());
                 persisted_spec.set_status(ServiceStatus::VolumeUnavailable);
                 if let Err(upsert_err) = self.apply_upsert(persisted_spec.clone()).await {
@@ -1270,6 +1396,7 @@ impl ServiceController {
                     desired_task_ids.to_vec(),
                 );
                 blocked_spec.update_strategy = deployment.update_strategy.clone();
+                blocked_spec.previous_generation = None;
                 blocked_spec.set_rollout(ServiceRolloutState::default());
                 blocked_spec.set_status(ServiceStatus::VolumeUnavailable);
                 if let Err(upsert_err) = self.apply_upsert(blocked_spec.clone()).await {
@@ -1302,6 +1429,7 @@ impl ServiceController {
                     Vec::new(),
                 );
                 failed_spec.update_strategy = deployment.update_strategy.clone();
+                failed_spec.previous_generation = None;
                 failed_spec.set_rollout(ServiceRolloutState::default());
                 failed_spec.set_status(ServiceStatus::Failed);
                 if let Err(upsert_err) = self.apply_upsert(failed_spec.clone()).await {
@@ -1353,6 +1481,7 @@ impl ServiceController {
         failed_spec.service_name = deployment.service_name.to_string();
         failed_spec.tasks = deployment.templates.to_vec();
         failed_spec.update_strategy = deployment.update_strategy.clone();
+        failed_spec.previous_generation = None;
         failed_spec.set_rollout(ServiceRolloutState {
             last_error: reason,
             ..ServiceRolloutState::default()
@@ -1872,6 +2001,13 @@ fn deploying_assignment_incomplete(spec: &ServiceSpecValue) -> bool {
     spec.status() == ServiceStatus::Deploying && spec.task_ids.len() < expected_task_id_count(spec)
 }
 
+#[cfg(test)]
+/// Returns true when the current `Deploying` spec still needs one owner to execute generation work.
+fn service_generation_requires_execution(spec: &ServiceSpecValue) -> bool {
+    spec.status() == ServiceStatus::Deploying
+        && (deploying_assignment_incomplete(spec) || spec.previous_generation.is_some())
+}
+
 /// Returns true when a submission matches the active running service spec exactly.
 ///
 /// This preserves idempotent `services run` behavior by rejecting unchanged
@@ -1896,6 +2032,7 @@ struct ServiceDeploymentJob {
     service_name: String,
     templates: Vec<ServiceTaskSpecValue>,
     update_strategy: ServiceUpdateStrategy,
+    assigned_task_ids: Vec<Uuid>,
 }
 
 /// Bundles immutable deployment manifest context shared across dependency-order helpers.
@@ -2000,6 +2137,34 @@ fn build_start_requests(
                 target_node,
             ));
         }
+    }
+    requests
+}
+
+/// Builds task start requests only for replicas that are still missing from the current manifest.
+fn build_missing_template_requests(
+    service_name: &str,
+    service_id: Uuid,
+    template: &ServiceTaskSpecValue,
+    assignments: &BTreeMap<(String, u16), Uuid>,
+    slot_targets: &HashMap<SlotKey, Uuid>,
+) -> Vec<TaskStartRequest> {
+    let mut requests = Vec::new();
+    for replica in 1..=template.replicas {
+        if assignments.contains_key(&(template.name.clone(), replica)) {
+            continue;
+        }
+
+        let desired_id = Uuid::new_v4();
+        let key = SlotKey::new(service_id, &template.name, replica);
+        let target_node = slot_targets.get(&key).copied();
+        requests.push(make_replica_request(
+            service_name,
+            template,
+            replica,
+            desired_id,
+            target_node,
+        ));
     }
     requests
 }
@@ -2574,6 +2739,22 @@ mod tests {
 
         let owner = select_task_owner(task_id, &candidates).expect("owner");
         let owner_reversed = select_task_owner(task_id, &reversed).expect("owner");
+        assert_eq!(owner, owner_reversed);
+    }
+
+    /// Ensures rollout ownership selection is deterministic across candidate orderings.
+    #[test]
+    fn generation_owner_is_deterministic() {
+        let service_id = Uuid::new_v4();
+        let node_a = Uuid::from_bytes([1u8; 16]);
+        let node_b = Uuid::from_bytes([2u8; 16]);
+        let node_c = Uuid::from_bytes([3u8; 16]);
+        let candidates = vec![node_a, node_b, node_c];
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+
+        let owner = select_generation_owner(service_id, 7, &candidates).expect("owner");
+        let owner_reversed = select_generation_owner(service_id, 7, &reversed).expect("owner");
         assert_eq!(owner, owner_reversed);
     }
 
@@ -3264,6 +3445,53 @@ mod tests {
         let mut running = complete.clone();
         running.set_status(ServiceStatus::Running);
         assert!(!deploying_assignment_incomplete(&running));
+    }
+
+    /// Deploying specs with persisted prior-generation state must keep generation execution active.
+    #[test]
+    fn deploying_generation_requires_execution_for_redeploy_context() {
+        let manifest_id = Uuid::new_v4();
+        let tasks = vec![ServiceTaskSpecValue {
+            name: "api".into(),
+            image: "ghcr.io/demo/api:latest".into(),
+            command: Vec::new(),
+            tty: false,
+            depends_on: Vec::new(),
+            replicas: 1,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            readiness: None,
+            liveness: None,
+            public_port: None,
+            public_protocol: None,
+        }];
+
+        let previous = ServiceSpecValue::new(
+            Uuid::new_v4(),
+            "manifest-v1",
+            "demo-service",
+            tasks.clone(),
+            vec![Uuid::new_v4()],
+        );
+        let mut deploying = ServiceSpecValue::new(
+            manifest_id,
+            "manifest-v2",
+            "demo-service",
+            tasks,
+            Vec::new(),
+        );
+        deploying.previous_generation = Some(ServicePreviousGeneration::from_service(&previous));
+        deploying.set_status(ServiceStatus::Deploying);
+
+        assert!(service_generation_requires_execution(&deploying));
     }
 
     /// Bound local volumes must keep their explicit placement target during fallback handling.

@@ -156,6 +156,7 @@ pub(super) async fn start_readiness_wait(
                 }
 
                 let mut running_spec = snapshot.clone();
+                running_spec.previous_generation = None;
                 running_spec.set_rollout(ServiceRolloutState::default());
                 running_spec.set_status(ServiceStatus::Running);
                 match controller.apply_upsert(running_spec.clone()).await {
@@ -542,6 +543,7 @@ async fn mark_service_failed(
             spec.clone()
         }
     };
+    failed_spec.previous_generation = None;
     failed_spec.set_rollout(ServiceRolloutState::default());
     failed_spec.task_ids.clear();
     failed_spec.set_status(ServiceStatus::Failed);

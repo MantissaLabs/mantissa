@@ -105,7 +105,7 @@ pub enum Message {
     },
     Service {
         id: Uuid,
-        event: ServiceEvent,
+        event: Box<ServiceEvent>,
     },
     Network {
         id: Uuid,
@@ -601,7 +601,10 @@ impl gossip::Server for Gossip {
                 }
                 Service(Ok(reader)) => match read_service_event(reader) {
                     Ok(event) => {
-                        let message = Message::Service { id, event };
+                        let message = Message::Service {
+                            id,
+                            event: Box::new(event),
+                        };
                         if should_relay_inbound_message(relay_inbound, &message) {
                             forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
                         }
@@ -1080,7 +1083,7 @@ where
             }
             Message::Service { event, .. } => {
                 let service_builder = builder.init_service();
-                write_service_event(service_builder, event)?;
+                write_service_event(service_builder, event.as_ref())?;
             }
             Message::Network { event, .. } => {
                 let network_builder = builder.init_network();

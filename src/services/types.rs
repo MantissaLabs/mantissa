@@ -28,6 +28,8 @@ pub struct ServiceSpecValue {
     #[serde(default)]
     pub status_detail: Option<String>,
     #[serde(default)]
+    pub previous_generation: Option<ServicePreviousGeneration>,
+    #[serde(default)]
     pub reschedule_lock: Option<ServiceRescheduleLock>,
 }
 
@@ -58,6 +60,7 @@ impl ServiceSpecValue {
             rollout: ServiceRolloutState::default(),
             status: ServiceStatus::Running,
             status_detail: None,
+            previous_generation: None,
             reschedule_lock: None,
         }
     }
@@ -109,6 +112,56 @@ impl ServiceSpecValue {
         }
         self.rollout = rollout;
         self.touch();
+    }
+}
+
+/// Snapshot of the prior service generation kept long enough for deterministic owner adoption.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServicePreviousGeneration {
+    pub manifest_id: Uuid,
+    pub manifest_name: String,
+    pub tasks: Vec<ServiceTaskSpecValue>,
+    pub task_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub update_strategy: ServiceUpdateStrategy,
+    #[serde(default)]
+    pub service_epoch: u64,
+    #[serde(default)]
+    pub status: ServiceStatus,
+}
+
+impl ServicePreviousGeneration {
+    /// Captures the previous service generation so another node can adopt the rollout later.
+    pub fn from_service(spec: &ServiceSpecValue) -> Self {
+        Self {
+            manifest_id: spec.manifest_id,
+            manifest_name: spec.manifest_name.clone(),
+            tasks: spec.tasks.clone(),
+            task_ids: spec.task_ids.clone(),
+            update_strategy: spec.update_strategy.clone(),
+            service_epoch: spec.service_epoch,
+            status: spec.status,
+        }
+    }
+
+    /// Rebuilds one in-memory service spec from the persisted prior-generation rollout context.
+    pub fn to_service_spec(
+        &self,
+        service_id: Uuid,
+        service_name: impl Into<String>,
+    ) -> ServiceSpecValue {
+        let mut spec = ServiceSpecValue::new(
+            self.manifest_id,
+            self.manifest_name.clone(),
+            service_name,
+            self.tasks.clone(),
+            self.task_ids.clone(),
+        );
+        spec.id = service_id;
+        spec.update_strategy = self.update_strategy.clone();
+        spec.service_epoch = self.service_epoch;
+        spec.status = self.status;
+        spec
     }
 }
 

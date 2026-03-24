@@ -432,6 +432,7 @@ impl ServiceController {
         updated.tasks = templates;
         updated.update_strategy = update_strategy;
         updated.start_new_generation();
+        updated.previous_generation = None;
         updated.set_status(previous_status);
         self.apply_upsert(updated.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(updated)).await?;
@@ -1064,6 +1065,7 @@ impl ServiceController {
         next_spec.task_ids = ordered_task_ids;
         next_spec.update_strategy = update_strategy;
         next_spec.service_epoch = current_spec.service_epoch.saturating_add(1);
+        next_spec.previous_generation = None;
         next_spec.set_rollout(ServiceRolloutState::default());
         next_spec.set_status(ServiceStatus::Deploying);
         self.apply_upsert(next_spec.clone()).await?;
@@ -1435,6 +1437,7 @@ impl ServiceController {
                         );
                     } else {
                         let mut rollback_spec = current_spec.clone();
+                        rollback_spec.previous_generation = None;
                         rollback_spec.set_rollout(ServiceRolloutState {
                             phase: ServiceRolloutPhase::Idle,
                             total_steps: settings.total_steps,
@@ -1482,6 +1485,7 @@ impl ServiceController {
 
         match self.registry.get(current_spec.id) {
             Ok(Some(mut failed_spec)) if failed_spec.manifest_id == manifest_id => {
+                failed_spec.previous_generation = None;
                 failed_spec.set_rollout(ServiceRolloutState {
                     phase: ServiceRolloutPhase::Failed,
                     total_steps: settings.total_steps,
