@@ -166,6 +166,30 @@ pub struct GpuReservationRequest {
     pub task_id: Option<Uuid>,
 }
 
+/// Resource-vector reservation intent used when the target node chooses exact bindings locally.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskResourceReservationIntent {
+    pub task_id: Uuid,
+    pub cpu_millis: u64,
+    pub memory_bytes: u64,
+    pub gpu_count: u32,
+}
+
+/// Exact bindings chosen locally for one task as part of a prepared reservation batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedTaskResources {
+    pub task_id: Uuid,
+    pub slot_ids: Vec<SlotId>,
+    pub gpu_device_ids: Vec<String>,
+}
+
+/// Successful prepared reservation response containing the committed scheduler version and bindings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedTaskReservationBatch {
+    pub new_version: u64,
+    pub bindings: Vec<PreparedTaskResources>,
+}
+
 #[derive(Debug, Error)]
 pub enum SchedulerError {
     #[error("scheduler store error: {0}")]
@@ -217,6 +241,12 @@ pub enum SchedulerError {
     #[error("gpu devices unavailable: {conflicts:?}")]
     GpuDevicesUnavailable {
         conflicts: Vec<String>,
+        snapshot: SchedulerSnapshot,
+    },
+
+    #[error("insufficient resources for tasks: {task_ids:?}")]
+    InsufficientResources {
+        task_ids: Vec<Uuid>,
         snapshot: SchedulerSnapshot,
     },
 
@@ -444,6 +474,71 @@ impl Scheduler {
                 state: GpuDeviceState::Free,
             })
             .collect()
+    }
+
+    /// Selects exact free slot indices that satisfy one resource-vector request.
+    fn select_slot_indices(
+        snapshot: &SchedulerSnapshot,
+        available_indices: &[usize],
+        cpu_millis: u64,
+        memory_bytes: u64,
+    ) -> Option<Vec<usize>> {
+        if available_indices.is_empty() {
+            return None;
+        }
+
+        if cpu_millis == 0 && memory_bytes == 0 {
+            return Some(vec![available_indices[0]]);
+        }
+
+        let mut remaining_cpu = cpu_millis;
+        let mut remaining_memory = memory_bytes;
+        let mut selected = Vec::new();
+        let mut candidates = available_indices.to_vec();
+
+        while remaining_cpu > 0 || remaining_memory > 0 {
+            let mut best_choice = None;
+            let mut best_score = 0u128;
+
+            for &idx in &candidates {
+                let slot = &snapshot.slots[idx];
+                let cpu_contrib = std::cmp::min(slot.capacity.cpu_millis, remaining_cpu);
+                let memory_contrib = std::cmp::min(slot.capacity.memory_bytes, remaining_memory);
+                let score = ((cpu_contrib as u128) << 64) | memory_contrib as u128;
+
+                if score > best_score {
+                    best_score = score;
+                    best_choice = Some(idx);
+                }
+            }
+
+            let best_idx = best_choice?;
+            if best_score == 0 {
+                return None;
+            }
+
+            let slot = &snapshot.slots[best_idx];
+            selected.push(best_idx);
+            remaining_cpu = remaining_cpu.saturating_sub(slot.capacity.cpu_millis);
+            remaining_memory = remaining_memory.saturating_sub(slot.capacity.memory_bytes);
+            candidates.retain(|idx| *idx != best_idx);
+        }
+
+        Some(selected)
+    }
+
+    /// Selects exact free GPU indices that satisfy one GPU count request.
+    fn select_gpu_indices(available_indices: &[usize], gpu_count: u32) -> Option<Vec<usize>> {
+        if gpu_count == 0 {
+            return Some(Vec::new());
+        }
+
+        let required = gpu_count as usize;
+        if available_indices.len() < required {
+            return None;
+        }
+
+        Some(available_indices.iter().copied().take(required).collect())
     }
 
     pub async fn snapshot(&self) -> Option<SchedulerSnapshot> {
@@ -917,6 +1012,150 @@ impl Scheduler {
 
             self.publish_digest_from_snapshot(&new_snapshot).await;
             return Ok(new_snapshot);
+        }
+    }
+
+    /// Reserves one batch of resource vectors by choosing exact local bindings atomically.
+    pub async fn reserve_task_resources(
+        &self,
+        expected_version: u64,
+        intents: Vec<TaskResourceReservationIntent>,
+    ) -> Result<PreparedTaskReservationBatch, SchedulerError> {
+        if intents.is_empty() {
+            return self
+                .state
+                .load_full()
+                .as_ref()
+                .ok_or(SchedulerError::Uninitialized)
+                .map(|state| PreparedTaskReservationBatch {
+                    new_version: state.snapshot.version,
+                    bindings: Vec::new(),
+                });
+        }
+
+        let owner = self.store_key.to_uuid();
+
+        loop {
+            let current_opt = self.state.load_full();
+            let current_arc = match current_opt.as_ref() {
+                Some(state) => state.clone(),
+                None => return Err(SchedulerError::Uninitialized),
+            };
+            let current = current_arc.as_ref();
+
+            if current.snapshot.version != expected_version {
+                return Err(SchedulerError::SnapshotMismatch {
+                    expected_version,
+                    current_version: current.snapshot.version,
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            let mut new_snapshot = current.snapshot.clone();
+            let mut free_slot_indices: Vec<usize> = new_snapshot
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, slot)| matches!(slot.state, SlotState::Free).then_some(idx))
+                .collect();
+            let mut free_gpu_indices: Vec<usize> = new_snapshot
+                .gpu_devices
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, device)| {
+                    matches!(device.state, GpuDeviceState::Free).then_some(idx)
+                })
+                .collect();
+            let mut bindings = Vec::with_capacity(intents.len());
+            let mut failed_tasks = Vec::new();
+
+            for intent in &intents {
+                let Some(slot_indices) = Self::select_slot_indices(
+                    &new_snapshot,
+                    &free_slot_indices,
+                    intent.cpu_millis,
+                    intent.memory_bytes,
+                ) else {
+                    failed_tasks.push(intent.task_id);
+                    return Err(SchedulerError::InsufficientResources {
+                        task_ids: failed_tasks,
+                        snapshot: current.snapshot.clone(),
+                    });
+                };
+
+                let Some(gpu_indices) =
+                    Self::select_gpu_indices(&free_gpu_indices, intent.gpu_count)
+                else {
+                    failed_tasks.push(intent.task_id);
+                    return Err(SchedulerError::InsufficientResources {
+                        task_ids: failed_tasks,
+                        snapshot: current.snapshot.clone(),
+                    });
+                };
+
+                let slot_index_set: HashSet<usize> = slot_indices.iter().copied().collect();
+                let gpu_index_set: HashSet<usize> = gpu_indices.iter().copied().collect();
+
+                let mut slot_ids = Vec::with_capacity(slot_indices.len());
+                for idx in &slot_indices {
+                    let slot = &mut new_snapshot.slots[*idx];
+                    slot.state = SlotState::Reserved(SlotReservation {
+                        owner,
+                        task_id: Some(intent.task_id),
+                    });
+                    slot_ids.push(slot.slot_id);
+                }
+                slot_ids.sort_unstable();
+
+                let mut gpu_device_ids = Vec::with_capacity(gpu_indices.len());
+                for idx in &gpu_indices {
+                    let device = &mut new_snapshot.gpu_devices[*idx];
+                    device.state = GpuDeviceState::Reserved(GpuDeviceReservation {
+                        owner,
+                        task_id: Some(intent.task_id),
+                    });
+                    gpu_device_ids.push(device.device_id.clone());
+                }
+
+                free_slot_indices.retain(|idx| !slot_index_set.contains(idx));
+                free_gpu_indices.retain(|idx| !gpu_index_set.contains(idx));
+                bindings.push(PreparedTaskResources {
+                    task_id: intent.task_id,
+                    slot_ids,
+                    gpu_device_ids,
+                });
+            }
+
+            new_snapshot.version = new_snapshot
+                .version
+                .checked_add(1)
+                .expect("scheduler snapshot version overflow");
+
+            let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
+            let prev = self
+                .state
+                .compare_and_swap(&current_opt, Some(new_state_arc.clone()));
+
+            if !ptr_eq_option(&prev, &current_opt) {
+                continue;
+            }
+
+            if let Err(e) = self
+                .store
+                .upsert(&self.store_key, new_snapshot.clone())
+                .await
+            {
+                let _ = self
+                    .state
+                    .compare_and_swap(&Some(new_state_arc.clone()), current_opt.clone());
+                return Err(SchedulerError::Store(e));
+            }
+
+            self.publish_digest_from_snapshot(&new_snapshot).await;
+            return Ok(PreparedTaskReservationBatch {
+                new_version: new_snapshot.version,
+                bindings,
+            });
         }
     }
 
@@ -1411,5 +1650,168 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn reserve_task_resources_prepares_exact_bindings() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_slots([
+                SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+                SlotSpec::new(2, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+                SlotSpec::new(3, SlotCapacity::new(1_000, 1024 * 1024 * 1024, 0)),
+            ])
+            .await
+            .unwrap();
+
+        let task_a = Uuid::new_v4();
+        let task_b = Uuid::new_v4();
+        let prepared = scheduler
+            .reserve_task_resources(
+                0,
+                vec![
+                    TaskResourceReservationIntent {
+                        task_id: task_a,
+                        cpu_millis: 1_500,
+                        memory_bytes: 1536 * 1024 * 1024,
+                        gpu_count: 0,
+                    },
+                    TaskResourceReservationIntent {
+                        task_id: task_b,
+                        cpu_millis: 500,
+                        memory_bytes: 512 * 1024 * 1024,
+                        gpu_count: 0,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.new_version, 1);
+        assert_eq!(prepared.bindings.len(), 2);
+        assert_eq!(prepared.bindings[0].task_id, task_a);
+        assert_eq!(prepared.bindings[0].slot_ids, vec![1, 3]);
+        assert_eq!(prepared.bindings[1].task_id, task_b);
+        assert_eq!(prepared.bindings[1].slot_ids, vec![2]);
+
+        let snapshot = scheduler.snapshot().await.unwrap();
+        assert_eq!(snapshot.version, 1);
+        assert!(
+            snapshot
+                .slots
+                .iter()
+                .all(|slot| matches!(slot.state, SlotState::Reserved(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_task_resources_is_atomic_on_failure() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_slots([
+                SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+                SlotSpec::new(2, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+            ])
+            .await
+            .unwrap();
+
+        let err = scheduler
+            .reserve_task_resources(
+                0,
+                vec![
+                    TaskResourceReservationIntent {
+                        task_id: Uuid::new_v4(),
+                        cpu_millis: 500,
+                        memory_bytes: 512 * 1024 * 1024,
+                        gpu_count: 0,
+                    },
+                    TaskResourceReservationIntent {
+                        task_id: Uuid::new_v4(),
+                        cpu_millis: 1_500,
+                        memory_bytes: 1536 * 1024 * 1024,
+                        gpu_count: 0,
+                    },
+                ],
+            )
+            .await
+            .expect_err("batch should fail atomically");
+
+        match err {
+            SchedulerError::InsufficientResources { snapshot, .. } => {
+                assert_eq!(snapshot.version, 0);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let snapshot = scheduler.snapshot().await.unwrap();
+        assert_eq!(snapshot.version, 0);
+        assert!(
+            snapshot
+                .slots
+                .iter()
+                .all(|slot| matches!(slot.state, SlotState::Free))
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_task_resources_returns_gpu_bindings() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_resources(
+                [SlotSpec::new(
+                    1,
+                    SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+                )],
+                [
+                    GpuDeviceSpec::new(
+                        "gpu-a",
+                        0,
+                        Some("gpu-a".to_string()),
+                        Some("0000:01:00.0".to_string()),
+                        "GPU A",
+                        16 * 1024 * 1024 * 1024,
+                    ),
+                    GpuDeviceSpec::new(
+                        "gpu-b",
+                        1,
+                        Some("gpu-b".to_string()),
+                        Some("0000:02:00.0".to_string()),
+                        "GPU B",
+                        16 * 1024 * 1024 * 1024,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let task_id = Uuid::new_v4();
+        let prepared = scheduler
+            .reserve_task_resources(
+                0,
+                vec![TaskResourceReservationIntent {
+                    task_id,
+                    cpu_millis: 0,
+                    memory_bytes: 0,
+                    gpu_count: 2,
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.bindings.len(), 1);
+        assert_eq!(prepared.bindings[0].task_id, task_id);
+        assert_eq!(prepared.bindings[0].slot_ids, vec![1]);
+        assert_eq!(
+            prepared.bindings[0].gpu_device_ids,
+            vec!["gpu-a".to_string(), "gpu-b".to_string()]
+        );
+
+        let snapshot = scheduler.snapshot().await.unwrap();
+        assert!(
+            snapshot
+                .gpu_devices
+                .iter()
+                .all(|device| matches!(device.state, GpuDeviceState::Reserved(_)))
+        );
     }
 }

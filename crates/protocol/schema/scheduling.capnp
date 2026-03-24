@@ -4,8 +4,8 @@ interface Scheduler {
   summary @0 (request :SummaryRequest) -> (summary :Summary);
   # Fetch a scheduling summary for a node, optionally with details.
 
-  reserveSlots @1 (request :ReserveSlotsRequest) -> (response :ReserveSlotsResponse);
-  # Reserve a set of slots using optimistic version checks.
+  reserveResources @1 (request :ReserveResourcesRequest) -> (response :ReserveResourcesResponse);
+  # Reserve resources by letting the target node choose exact slots and GPUs locally.
 
   releaseSlots @2 (request :ReleaseSlotsRequest) -> (response :ReleaseSlotsResponse);
   # Release reserved slots using optimistic version checks.
@@ -177,42 +177,45 @@ struct SummaryRequest {
   # True to include per-slot details in the summary.
 }
 
-struct SlotReservationIntent {
-  slotId @0 :UInt64;
-  # Slot identifier to reserve.
+struct ResourceReservationIntent {
+  taskId @0 :Data;
+  # 16-byte UUID of the task that will own the reservation.
 
-  owner @1 :Data;
-  # 16-byte UUID of the node requesting the reservation.
+  cpuMillis @1 :UInt64;
+  # Requested CPU reservation in milli-cores.
 
-  taskId @2 :Data;
-  # 16-byte UUID of the task to associate (empty if none).
+  memoryBytes @2 :UInt64;
+  # Requested memory reservation in bytes.
+
+  gpuCount @3 :UInt32;
+  # Requested number of GPU devices.
 }
 
-struct GpuReservationIntent {
-  deviceId @0 :Text;
-  # GPU device identifier to reserve.
+struct ReservedTaskResources {
+  taskId @0 :Data;
+  # 16-byte UUID of the task associated with this allocation.
 
-  owner @1 :Data;
-  # 16-byte UUID of the node requesting the reservation.
+  slotIds @1 :List(UInt64);
+  # Exact slot identifiers chosen by the target node.
 
-  taskId @2 :Data;
-  # 16-byte UUID of the task to associate (empty if none).
+  gpuDeviceIds @2 :List(Text);
+  # Exact GPU device identifiers chosen by the target node.
 }
 
-struct ReserveSlotsRequest {
+struct ReserveResourcesRequest {
   expectedVersion @0 :UInt64;
   # Expected scheduler version for optimistic locking.
 
-  intents @1 :List(SlotReservationIntent);
-  # Reservation intents to apply.
-
-  gpuIntents @2 :List(GpuReservationIntent);
-  # GPU reservation intents to apply.
+  intents @1 :List(ResourceReservationIntent);
+  # Resource requests to satisfy atomically on this target node.
 }
 
-struct ReserveSlotsResponse {
+struct ReserveResourcesResponse {
   newVersion @0 :UInt64;
   # Updated scheduler version after applying reservations.
+
+  bindings @1 :List(ReservedTaskResources);
+  # Exact task-to-slot/GPU bindings chosen locally by the target node.
 }
 
 struct ReleaseSlotsRequest {

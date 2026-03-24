@@ -13,7 +13,7 @@ use crate::task::service::read_spec;
 use crate::task::types::{TaskEvent, TaskSpec};
 
 use super::TaskManager;
-use super::planner::{BatchStartPlan, RemoteStartPlan};
+use super::planner::{BatchStartPlan, PreparedRemoteStartPlan, RemoteStartPlan};
 
 /// Error returned by slot reservation stages, signalling whether the caller should retry.
 pub(super) enum ExecutionError {
@@ -40,6 +40,17 @@ fn is_scheduler_retryable_message(message: &str) -> bool {
         || message.contains("unknown slots")
         || message.contains("gpu devices unavailable")
         || message.contains("unknown gpu devices")
+        || message.contains("insufficient resources")
+}
+
+fn parse_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, anyhow::Error> {
+    if bytes.len() != 16 {
+        return Err(anyhow::anyhow!("uuid fields must be 16 bytes"));
+    }
+
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(bytes);
+    Ok(Uuid::from_bytes(raw))
 }
 
 impl TaskManager {
@@ -208,10 +219,17 @@ impl TaskManager {
     pub(super) async fn reserve_remote_resources(
         &self,
         plans: &[RemoteStartPlan],
-    ) -> Result<HashMap<Uuid, RemoteReservation>, ExecutionError> {
+    ) -> Result<
+        (
+            HashMap<Uuid, RemoteReservation>,
+            Vec<PreparedRemoteStartPlan>,
+        ),
+        ExecutionError,
+    > {
         let mut reservations = HashMap::new();
+        let mut prepared_plans = Vec::new();
         if plans.is_empty() {
-            return Ok(reservations);
+            return Ok((reservations, prepared_plans));
         }
 
         let mut grouped: HashMap<Uuid, Vec<&RemoteStartPlan>> = HashMap::new();
@@ -251,7 +269,7 @@ impl TaskManager {
                     }
                 };
 
-            let mut reserve_req = scheduler_client.reserve_slots_request();
+            let mut reserve_req = scheduler_client.reserve_resources_request();
             {
                 let mut inner = reserve_req.get().init_request();
                 let expected_version = peer_plans
@@ -259,39 +277,13 @@ impl TaskManager {
                     .map(|plan| plan.scheduler_version)
                     .unwrap_or(0);
                 inner.set_expected_version(expected_version);
-                let total_slots: usize = peer_plans.iter().map(|plan| plan.slots.len()).sum();
-                let total_gpus: usize = peer_plans
-                    .iter()
-                    .map(|plan| plan.gpu_device_ids.len())
-                    .sum();
-                if total_slots == 0 {
-                    return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                        "remote plan missing slot assignments"
-                    )));
-                }
-
-                let mut intents_builder = inner.reborrow().init_intents(total_slots as u32);
-                let mut intent_idx = 0u32;
-                for plan in &peer_plans {
-                    for slot in &plan.slots {
-                        let mut entry = intents_builder.reborrow().get(intent_idx);
-                        entry.set_slot_id(slot.slot_id);
-                        entry.set_owner(plan.peer_id.as_bytes());
-                        entry.set_task_id(plan.id.as_bytes());
-                        intent_idx += 1;
-                    }
-                }
-
-                let mut gpu_builder = inner.reborrow().init_gpu_intents(total_gpus as u32);
-                let mut gpu_idx = 0u32;
-                for plan in &peer_plans {
-                    for device_id in &plan.gpu_device_ids {
-                        let mut entry = gpu_builder.reborrow().get(gpu_idx);
-                        entry.set_device_id(device_id);
-                        entry.set_owner(plan.peer_id.as_bytes());
-                        entry.set_task_id(plan.id.as_bytes());
-                        gpu_idx += 1;
-                    }
+                let mut intents_builder = inner.reborrow().init_intents(peer_plans.len() as u32);
+                for (idx, plan) in peer_plans.iter().enumerate() {
+                    let mut entry = intents_builder.reborrow().get(idx as u32);
+                    entry.set_task_id(plan.id.as_bytes());
+                    entry.set_cpu_millis(plan.cpu_millis);
+                    entry.set_memory_bytes(plan.memory_bytes);
+                    entry.set_gpu_count(plan.gpu_count);
                 }
             }
 
@@ -299,14 +291,153 @@ impl TaskManager {
                 Ok(resp) => match resp.get() {
                     Ok(result) => match result.get_response() {
                         Ok(response) => {
-                            let slots: Vec<SlotId> = peer_plans
-                                .iter()
-                                .flat_map(|plan| plan.slots.iter().map(|slot| slot.slot_id))
-                                .collect();
-                            let gpu_device_ids: Vec<String> = peer_plans
-                                .iter()
-                                .flat_map(|plan| plan.gpu_device_ids.iter().cloned())
-                                .collect();
+                            let mut bindings_by_task = HashMap::new();
+                            let bindings = match response.get_bindings() {
+                                Ok(bindings) => bindings,
+                                Err(err) => {
+                                    self.release_remote_resources(&reservations).await;
+                                    return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                        err.to_string()
+                                    )));
+                                }
+                            };
+                            for binding in bindings.iter() {
+                                let task_id = match binding.get_task_id() {
+                                    Ok(bytes) => match parse_uuid(bytes) {
+                                        Ok(task_id) => task_id,
+                                        Err(err) => {
+                                            self.release_remote_resources(&reservations).await;
+                                            return Err(ExecutionError::Fatal(err));
+                                        }
+                                    },
+                                    Err(err) => {
+                                        self.release_remote_resources(&reservations).await;
+                                        return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                            err.to_string()
+                                        )));
+                                    }
+                                };
+                                let slot_ids = match binding.get_slot_ids() {
+                                    Ok(ids) => ids.iter().collect::<Vec<_>>(),
+                                    Err(err) => {
+                                        self.release_remote_resources(&reservations).await;
+                                        return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                            err.to_string()
+                                        )));
+                                    }
+                                };
+                                let gpu_devices = match binding.get_gpu_device_ids() {
+                                    Ok(ids) => ids,
+                                    Err(err) => {
+                                        self.release_remote_resources(&reservations).await;
+                                        return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                            err.to_string()
+                                        )));
+                                    }
+                                };
+                                let mut gpu_device_ids =
+                                    Vec::with_capacity(gpu_devices.len() as usize);
+                                for device_id in gpu_devices.iter() {
+                                    let value = match device_id {
+                                        Ok(value) => value,
+                                        Err(err) => {
+                                            self.release_remote_resources(&reservations).await;
+                                            return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                                err.to_string()
+                                            )));
+                                        }
+                                    };
+                                    let value = match value.to_str() {
+                                        Ok(value) => value,
+                                        Err(err) => {
+                                            self.release_remote_resources(&reservations).await;
+                                            return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                                err.to_string()
+                                            )));
+                                        }
+                                    };
+                                    gpu_device_ids.push(value.to_string());
+                                }
+
+                                if bindings_by_task
+                                    .insert(task_id, (slot_ids, gpu_device_ids))
+                                    .is_some()
+                                {
+                                    self.release_remote_resources(&reservations).await;
+                                    return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                        "duplicate prepared binding returned for task {task_id}"
+                                    )));
+                                }
+                            }
+                            let mut slots = Vec::new();
+                            let mut gpu_device_ids = Vec::new();
+                            for plan in &peer_plans {
+                                let Some((prepared_slot_ids, prepared_gpu_ids)) =
+                                    bindings_by_task.remove(&plan.id)
+                                else {
+                                    self.release_remote_resources(&reservations).await;
+                                    return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                        "missing prepared binding for remote task {} on peer {}",
+                                        plan.id,
+                                        peer_id
+                                    )));
+                                };
+
+                                if prepared_slot_ids.is_empty() {
+                                    self.release_remote_resources(&reservations).await;
+                                    return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                        "prepared remote task {} on peer {} without slots",
+                                        plan.id,
+                                        peer_id
+                                    )));
+                                }
+
+                                if prepared_gpu_ids.len() < plan.gpu_count as usize {
+                                    self.release_remote_resources(&reservations).await;
+                                    return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                        "prepared remote task {} on peer {} returned only {} GPU(s) for request of {}",
+                                        plan.id,
+                                        peer_id,
+                                        prepared_gpu_ids.len(),
+                                        plan.gpu_count
+                                    )));
+                                }
+
+                                slots.extend(prepared_slot_ids.iter().copied());
+                                gpu_device_ids.extend(prepared_gpu_ids.iter().cloned());
+                                prepared_plans.push(PreparedRemoteStartPlan {
+                                    index: plan.index,
+                                    id: plan.id,
+                                    name: plan.name.clone(),
+                                    image: plan.image.clone(),
+                                    command: plan.command.clone(),
+                                    tty: plan.tty,
+                                    cpu_millis: plan.cpu_millis,
+                                    memory_bytes: plan.memory_bytes,
+                                    gpu_count: plan.gpu_count,
+                                    slot_ids: prepared_slot_ids,
+                                    gpu_device_ids: prepared_gpu_ids,
+                                    peer_id: plan.peer_id,
+                                    restart_policy: plan.restart_policy.clone(),
+                                    termination_grace_period_secs: plan
+                                        .termination_grace_period_secs,
+                                    pre_stop_command: plan.pre_stop_command.clone(),
+                                    liveness: plan.liveness.clone(),
+                                    env: plan.env.clone(),
+                                    secret_files: plan.secret_files.clone(),
+                                    volumes: plan.volumes.clone(),
+                                    networks: plan.networks.clone(),
+                                    service_metadata: plan.service_metadata.clone(),
+                                });
+                            }
+
+                            if !bindings_by_task.is_empty() {
+                                self.release_remote_resources(&reservations).await;
+                                return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                    "peer {peer_id} returned unexpected prepared bindings"
+                                )));
+                            }
+
                             let version = response.get_new_version();
                             reservations.insert(
                                 peer_id,
@@ -346,7 +477,7 @@ impl TaskManager {
             }
         }
 
-        Ok(reservations)
+        Ok((reservations, prepared_plans))
     }
 
     /// Releases remote reservations accumulated during previous stages.
@@ -519,7 +650,7 @@ impl TaskManager {
     /// Creates task specs for remote placements and persists them locally.
     pub(super) async fn materialize_remote_specs(
         &self,
-        plans: &[RemoteStartPlan],
+        plans: &[PreparedRemoteStartPlan],
     ) -> Result<Vec<(usize, TaskSpec)>, ExecutionError> {
         if plans.is_empty() {
             return Ok(Vec::new());
@@ -528,7 +659,7 @@ impl TaskManager {
         let mut results: Vec<(usize, TaskSpec)> = Vec::new();
 
         for plan in plans {
-            let slot_ids: Vec<SlotId> = plan.slots.iter().map(|slot| slot.slot_id).collect();
+            let slot_ids = plan.slot_ids.clone();
             if slot_ids.is_empty() {
                 return Err(ExecutionError::Fatal(anyhow::anyhow!(
                     "remote plan missing slot assignments"

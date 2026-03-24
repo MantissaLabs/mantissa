@@ -657,9 +657,10 @@ impl TaskManager {
                 Err(ExecutionError::Fatal(err)) => return Err(err),
             }
 
-            match self.reserve_remote_resources(&remote_plans).await {
-                Ok(map) => {
+            let prepared_remote_plans = match self.reserve_remote_resources(&remote_plans).await {
+                Ok((map, prepared)) => {
                     reserved_remote = map;
+                    prepared
                 }
                 Err(ExecutionError::Retry(err)) => {
                     debug!(
@@ -679,9 +680,9 @@ impl TaskManager {
                     reserved_remote.clear();
                     return Err(err);
                 }
-            }
+            };
 
-            let remote_specs = match self.materialize_remote_specs(&remote_plans).await {
+            let remote_specs = match self.materialize_remote_specs(&prepared_remote_plans).await {
                 Ok(specs) => specs,
                 Err(ExecutionError::Retry(err)) => {
                     debug!(

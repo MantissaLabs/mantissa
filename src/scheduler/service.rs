@@ -4,7 +4,7 @@ use protocol::scheduling::scheduler;
 use uuid::Uuid;
 
 use super::summary::SchedulerSummary;
-use super::{GpuReservationRequest, Scheduler, SlotReservationRequest};
+use super::{Scheduler, TaskResourceReservationIntent};
 
 pub struct SchedulerService {
     scheduler: Rc<Scheduler>,
@@ -73,72 +73,54 @@ impl scheduler::Server for SchedulerService {
         Ok(())
     }
 
-    async fn reserve_slots(
+    async fn reserve_resources(
         self: Rc<Self>,
-        params: scheduler::ReserveSlotsParams,
-        mut results: scheduler::ReserveSlotsResults,
+        params: scheduler::ReserveResourcesParams,
+        mut results: scheduler::ReserveResourcesResults,
     ) -> Result<(), capnp::Error> {
         let request = params.get()?.get_request()?;
         let expected_version = request.get_expected_version();
         let intents = request.get_intents()?;
-        let gpu_intents = request.get_gpu_intents()?;
 
         let mut reservations = Vec::with_capacity(intents.len() as usize);
         for intent in intents.iter() {
-            let slot_id = intent.get_slot_id();
-            let owner = Self::parse_uuid(intent.get_owner()?)?;
-
-            let task_id = {
-                let bytes = intent.get_task_id()?;
-                if bytes.len() == 16 {
-                    let mut arr = [0u8; 16];
-                    arr.copy_from_slice(bytes);
-                    Some(Uuid::from_bytes(arr))
-                } else {
-                    None
-                }
-            };
-
-            reservations.push(SlotReservationRequest {
-                slot_id,
-                owner,
+            let task_id = Self::parse_uuid(intent.get_task_id()?)?;
+            reservations.push(TaskResourceReservationIntent {
                 task_id,
+                cpu_millis: intent.get_cpu_millis(),
+                memory_bytes: intent.get_memory_bytes(),
+                gpu_count: intent.get_gpu_count(),
             });
         }
 
-        let mut gpu_reservations = Vec::with_capacity(gpu_intents.len() as usize);
-        for intent in gpu_intents.iter() {
-            let device_id = intent.get_device_id()?.to_str()?.to_string();
-            let owner = Self::parse_uuid(intent.get_owner()?)?;
-
-            let task_id = {
-                let bytes = intent.get_task_id()?;
-                if bytes.len() == 16 {
-                    let mut arr = [0u8; 16];
-                    arr.copy_from_slice(bytes);
-                    Some(Uuid::from_bytes(arr))
-                } else {
-                    None
-                }
-            };
-
-            gpu_reservations.push(GpuReservationRequest {
-                device_id,
-                owner,
-                task_id,
-            });
-        }
-
-        let snapshot = self
+        let prepared = self
             .scheduler
-            .reserve_resources(expected_version, reservations, gpu_reservations)
+            .reserve_task_resources(expected_version, reservations)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
 
-        results
-            .get()
-            .init_response()
-            .set_new_version(snapshot.version);
+        let mut response = results.get().init_response();
+        response.set_new_version(prepared.new_version);
+        let mut bindings = response
+            .reborrow()
+            .init_bindings(prepared.bindings.len() as u32);
+        for (idx, binding) in prepared.bindings.iter().enumerate() {
+            let mut entry = bindings.reborrow().get(idx as u32);
+            entry.set_task_id(binding.task_id.as_bytes());
+            let mut slot_ids = entry
+                .reborrow()
+                .init_slot_ids(binding.slot_ids.len() as u32);
+            for (slot_idx, slot_id) in binding.slot_ids.iter().enumerate() {
+                slot_ids.set(slot_idx as u32, *slot_id);
+            }
+
+            let mut gpu_ids = entry
+                .reborrow()
+                .init_gpu_device_ids(binding.gpu_device_ids.len() as u32);
+            for (gpu_idx, device_id) in binding.gpu_device_ids.iter().enumerate() {
+                gpu_ids.set(gpu_idx as u32, device_id);
+            }
+        }
 
         Ok(())
     }
