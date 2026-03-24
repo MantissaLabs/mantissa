@@ -1,10 +1,13 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use rand::rng;
 use rand::seq::SliceRandom;
 use thiserror::Error;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::gpu::gpu_runtime_status;
@@ -17,7 +20,10 @@ use crate::task::types::{
     TaskServiceMetadata, TaskVolumeMount,
 };
 
-use super::{TaskManager, TaskStartRequest};
+use super::{RemotePrepareFeedback, TaskManager, TaskStartRequest};
+
+/// Maximum digest age tolerated before a peer is treated as stale for shortlist ranking.
+const REMOTE_DIGEST_STALE_AFTER_MS: u64 = 15_000;
 
 /// Scheduling failures that indicate transient prerequisites are blocking placement decisions.
 #[derive(Error, Debug)]
@@ -407,6 +413,9 @@ struct RemoteCandidateHint {
     ready_networks: HashSet<Uuid>,
     hostable_intent_count: u32,
     targeted: bool,
+    digest_stale: bool,
+    prepare_backoff_active: bool,
+    prepare_failure_count: u32,
 }
 
 /// Aggregate lower-bound demand for the intents that still need placement.
@@ -481,6 +490,74 @@ fn digest_can_host_intent(
             .networks
             .iter()
             .all(|network_id| ready_networks.contains(network_id))
+}
+
+/// Returns the current Unix wall-clock in milliseconds for digest freshness checks.
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Returns true when a replicated scheduler digest is old enough to be deprioritized.
+fn digest_is_stale(updated_at_unix_ms: u64, now_unix_ms: u64) -> bool {
+    now_unix_ms.saturating_sub(updated_at_unix_ms) > REMOTE_DIGEST_STALE_AFTER_MS
+}
+
+/// Orders remote hints so the planner prefers healthy, fresh peers before stale or backed-off ones.
+fn compare_remote_candidate_hints(
+    left: &RemoteCandidateHint,
+    right: &RemoteCandidateHint,
+) -> Ordering {
+    right
+        .targeted
+        .cmp(&left.targeted)
+        .then(
+            left.prepare_backoff_active
+                .cmp(&right.prepare_backoff_active),
+        )
+        .then(left.digest_stale.cmp(&right.digest_stale))
+        .then(left.prepare_failure_count.cmp(&right.prepare_failure_count))
+        .then(right.hostable_intent_count.cmp(&left.hostable_intent_count))
+        .then(
+            right
+                .digest
+                .updated_at_unix_ms
+                .cmp(&left.digest.updated_at_unix_ms),
+        )
+        .then(
+            right
+                .digest
+                .free_slot_count
+                .cmp(&left.digest.free_slot_count),
+        )
+        .then(right.digest.free_gpu_count.cmp(&left.digest.free_gpu_count))
+        .then(
+            right
+                .digest
+                .free_cpu_millis
+                .cmp(&left.digest.free_cpu_millis),
+        )
+        .then(
+            right
+                .digest
+                .free_memory_bytes
+                .cmp(&left.digest.free_memory_bytes),
+        )
+        .then(
+            right
+                .digest
+                .largest_free_slot_cpu_millis
+                .cmp(&left.digest.largest_free_slot_cpu_millis),
+        )
+        .then(
+            right
+                .digest
+                .largest_free_slot_memory_bytes
+                .cmp(&left.digest.largest_free_slot_memory_bytes),
+        )
+        .then(left.peer_id.cmp(&right.peer_id))
 }
 
 #[derive(Clone)]
@@ -565,6 +642,17 @@ fn gpu_runtime_preflight(snapshot: &SchedulerSnapshot) -> (bool, Option<String>)
 }
 
 impl TaskManager {
+    /// Returns a pruned snapshot of recent remote prepare failures used for shortlist scoring.
+    pub(super) fn remote_prepare_feedback_snapshot(&self) -> HashMap<Uuid, RemotePrepareFeedback> {
+        let now = Instant::now();
+        let mut guard = match self.local_state.remote_prepare_feedback.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.retain(|_, feedback| feedback.reject_until > now);
+        guard.clone()
+    }
+
     /// Normalizes user requests into deterministic scheduling intents, applying IDs and defaults.
     pub(super) fn build_start_intents(
         requests: Vec<TaskStartRequest>,
@@ -917,6 +1005,8 @@ impl TaskManager {
         intents: &[&StartIntent],
         readiness: &HashMap<Uuid, HashSet<Uuid>>,
     ) -> Result<Vec<RemoteCandidateHint>, anyhow::Error> {
+        let now_unix_ms = current_unix_ms();
+        let prepare_feedback = self.remote_prepare_feedback_snapshot();
         let known_peers: HashSet<Uuid> = self.core.registry.known_peers()?.into_iter().collect();
         let targeted_nodes: HashSet<Uuid> = intents
             .iter()
@@ -946,6 +1036,7 @@ impl TaskManager {
                 .filter(|intent| digest_can_host_intent(&digest, &ready_networks, intent))
                 .count() as u32;
             let targeted = targeted_nodes.contains(&peer_id);
+            let feedback = prepare_feedback.get(&peer_id).copied();
 
             if !targeted && (digest.free_slot_count == 0 || hostable_intent_count == 0) {
                 continue;
@@ -953,59 +1044,21 @@ impl TaskManager {
 
             hints.push(RemoteCandidateHint {
                 peer_id,
+                digest_stale: digest_is_stale(digest.updated_at_unix_ms, now_unix_ms),
                 digest,
                 ready_networks,
                 hostable_intent_count,
                 targeted,
+                prepare_backoff_active: feedback.is_some(),
+                prepare_failure_count: feedback
+                    .map(|entry| entry.consecutive_failures)
+                    .unwrap_or(0),
             });
         }
 
         let mut rng = rng();
         hints.shuffle(&mut rng);
-        hints.sort_by(|left, right| {
-            right
-                .targeted
-                .cmp(&left.targeted)
-                .then(right.hostable_intent_count.cmp(&left.hostable_intent_count))
-                .then(
-                    right
-                        .digest
-                        .updated_at_unix_ms
-                        .cmp(&left.digest.updated_at_unix_ms),
-                )
-                .then(
-                    right
-                        .digest
-                        .free_slot_count
-                        .cmp(&left.digest.free_slot_count),
-                )
-                .then(right.digest.free_gpu_count.cmp(&left.digest.free_gpu_count))
-                .then(
-                    right
-                        .digest
-                        .free_cpu_millis
-                        .cmp(&left.digest.free_cpu_millis),
-                )
-                .then(
-                    right
-                        .digest
-                        .free_memory_bytes
-                        .cmp(&left.digest.free_memory_bytes),
-                )
-                .then(
-                    right
-                        .digest
-                        .largest_free_slot_cpu_millis
-                        .cmp(&left.digest.largest_free_slot_cpu_millis),
-                )
-                .then(
-                    right
-                        .digest
-                        .largest_free_slot_memory_bytes
-                        .cmp(&left.digest.largest_free_slot_memory_bytes),
-                )
-                .then(left.peer_id.cmp(&right.peer_id))
-        });
+        hints.sort_by(compare_remote_candidate_hints);
 
         Ok(hints)
     }
@@ -1306,12 +1359,42 @@ impl TaskManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        Candidate, CandidateCapacity, StartIntent, WorkloadDemand, capacity_covers_workload,
-        digest_can_host_intent,
+        Candidate, CandidateCapacity, RemoteCandidateHint, StartIntent, WorkloadDemand,
+        capacity_covers_workload, compare_remote_candidate_hints, digest_can_host_intent,
+        digest_is_stale,
     };
     use crate::scheduler::digest::SchedulerDigestValue;
     use std::collections::HashSet;
     use uuid::Uuid;
+
+    fn test_remote_hint(
+        peer_id: Uuid,
+        updated_at_unix_ms: u64,
+        digest_stale: bool,
+        prepare_backoff_active: bool,
+    ) -> RemoteCandidateHint {
+        RemoteCandidateHint {
+            peer_id,
+            digest: SchedulerDigestValue {
+                node_id: peer_id,
+                snapshot_version: 1,
+                updated_at_unix_ms,
+                free_slot_count: 2,
+                free_cpu_millis: 1_000,
+                free_memory_bytes: 1024 * 1_024 * 1_024,
+                largest_free_slot_cpu_millis: 500,
+                largest_free_slot_memory_bytes: 512 * 1_024 * 1_024,
+                free_gpu_count: 0,
+                gpu_runtime_ready: true,
+            },
+            ready_networks: HashSet::new(),
+            hostable_intent_count: 1,
+            targeted: false,
+            digest_stale,
+            prepare_backoff_active,
+            prepare_failure_count: u32::from(prepare_backoff_active),
+        }
+    }
 
     /// Digest hostability checks should enforce networks and GPU runtime readiness.
     #[test]
@@ -1455,5 +1538,31 @@ mod tests {
         .expect("remote candidate");
 
         assert!(candidate.allocate(900, 128 * 1_024 * 1_024, 0).is_none());
+    }
+
+    /// Remote shortlist ordering should prefer fresh peers before stale or recently rejected ones.
+    #[test]
+    fn remote_hint_priority_prefers_fresh_non_backed_off_peers() {
+        let fresh_peer = Uuid::new_v4();
+        let stale_peer = Uuid::new_v4();
+        let backed_off_peer = Uuid::new_v4();
+        let mut hints = [
+            test_remote_hint(backed_off_peer, 200, false, true),
+            test_remote_hint(stale_peer, 100, true, false),
+            test_remote_hint(fresh_peer, 300, false, false),
+        ];
+
+        hints.sort_by(compare_remote_candidate_hints);
+
+        assert_eq!(hints[0].peer_id, fresh_peer);
+        assert_eq!(hints[1].peer_id, stale_peer);
+        assert_eq!(hints[2].peer_id, backed_off_peer);
+    }
+
+    /// Digests should only be marked stale after the configured freshness window has elapsed.
+    #[test]
+    fn digest_staleness_uses_configured_freshness_window() {
+        assert!(!digest_is_stale(10_000, 24_999));
+        assert!(digest_is_stale(10_000, 25_001));
     }
 }

@@ -58,6 +58,37 @@ fn parse_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, anyhow::Error> {
 }
 
 impl TaskManager {
+    /// Clears any local prepare backoff for a peer after a successful remote lease prepare.
+    pub(super) fn clear_remote_prepare_feedback(&self, peer_id: Uuid) {
+        let mut guard = match self.local_state.remote_prepare_feedback.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.remove(&peer_id);
+    }
+
+    /// Records one retryable remote prepare failure so stale peers are deprioritized briefly.
+    pub(super) fn note_remote_prepare_failure(&self, peer_id: Uuid) {
+        let now = tokio::time::Instant::now();
+        let mut guard = match self.local_state.remote_prepare_feedback.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.retain(|_, feedback| feedback.reject_until > now);
+        let consecutive_failures = guard
+            .get(&peer_id)
+            .map(|feedback| feedback.consecutive_failures)
+            .unwrap_or(0)
+            .saturating_add(1);
+        guard.insert(
+            peer_id,
+            super::RemotePrepareFeedback {
+                consecutive_failures,
+                reject_until: now + super::remote_prepare_retry_backoff(consecutive_failures),
+            },
+        );
+    }
+
     /// Releases a single slot via the scheduler, retrying on snapshot mismatches.
     pub(super) async fn release_slot(&self, slot_id: SlotId) -> Result<(), anyhow::Error> {
         const MAX_ATTEMPTS: usize = 10;
@@ -245,6 +276,7 @@ impl TaskManager {
             let session = match self.remote_session(peer_id).await {
                 Ok(session) => session,
                 Err(err) => {
+                    self.note_remote_prepare_failure(peer_id);
                     self.release_remote_resources(&reservations).await;
                     return Err(ExecutionError::Retry(err));
                 }
@@ -256,6 +288,7 @@ impl TaskManager {
                         Ok(result) => match result.get_scheduler() {
                             Ok(client) => client,
                             Err(err) => {
+                                self.note_remote_prepare_failure(peer_id);
                                 self.release_remote_resources(&reservations).await;
                                 return Err(ExecutionError::Retry(anyhow::anyhow!(
                                     err.to_string()
@@ -263,11 +296,13 @@ impl TaskManager {
                             }
                         },
                         Err(err) => {
+                            self.note_remote_prepare_failure(peer_id);
                             self.release_remote_resources(&reservations).await;
                             return Err(ExecutionError::Retry(anyhow::anyhow!(err.to_string())));
                         }
                     },
                     Err(err) => {
+                        self.note_remote_prepare_failure(peer_id);
                         self.release_remote_resources(&reservations).await;
                         return Err(ExecutionError::Retry(anyhow::anyhow!(err.to_string())));
                     }
@@ -471,11 +506,13 @@ impl TaskManager {
                                     leases: lease_reservations,
                                 },
                             );
+                            self.clear_remote_prepare_feedback(peer_id);
                         }
                         Err(err) => {
                             let message = err.to_string();
                             self.release_remote_resources(&reservations).await;
                             if is_scheduler_retryable_message(&message) {
+                                self.note_remote_prepare_failure(peer_id);
                                 return Err(ExecutionError::Retry(anyhow::anyhow!(message)));
                             }
                             return Err(ExecutionError::Fatal(anyhow::anyhow!(message)));
@@ -485,6 +522,7 @@ impl TaskManager {
                         let message = err.to_string();
                         self.release_remote_resources(&reservations).await;
                         if is_scheduler_retryable_message(&message) {
+                            self.note_remote_prepare_failure(peer_id);
                             return Err(ExecutionError::Retry(anyhow::anyhow!(message)));
                         }
                         return Err(ExecutionError::Fatal(anyhow::anyhow!(message)));
@@ -494,6 +532,7 @@ impl TaskManager {
                     let message = err.to_string();
                     self.release_remote_resources(&reservations).await;
                     if is_scheduler_retryable_message(&message) {
+                        self.note_remote_prepare_failure(peer_id);
                         return Err(ExecutionError::Retry(anyhow::anyhow!(message)));
                     }
                     return Err(ExecutionError::Fatal(anyhow::anyhow!(message)));

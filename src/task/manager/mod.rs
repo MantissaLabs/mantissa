@@ -157,6 +157,14 @@ struct LivenessProbeEntry {
     consecutive_failures: u32,
 }
 
+#[derive(Clone, Copy)]
+struct RemotePrepareFeedback {
+    // Number of consecutive retryable prepare failures observed for this peer.
+    consecutive_failures: u32,
+    // Local wall-clock deadline until which this peer should be deprioritized.
+    reject_until: Instant,
+}
+
 #[derive(Clone)]
 struct CachedTaskSpecEntry {
     // Store change clock captured when this decoded spec was materialized.
@@ -232,6 +240,8 @@ struct TaskManagerLocalState {
     inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
     // Short-lived remove tombstones used to reject stale post-remove upserts.
     removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, RemoveTombstone>>>,
+    // Recent retryable remote prepare failures used to deprioritize stale peers locally.
+    remote_prepare_feedback: Arc<StdMutex<HashMap<Uuid, RemotePrepareFeedback>>>,
     // Per-task dirty gossip buffer collapsed before updates enter the shared gossip queue.
     dirty_gossip_tasks: Arc<AsyncMutex<HashMap<Uuid, DirtyTaskGossipRecord>>>,
     // Wake signal used by the runtime loop to flush dirty task gossip promptly.
@@ -401,6 +411,7 @@ impl TaskManager {
                 inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
                 inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
                 removed_task_watermarks: Arc::new(AsyncMutex::new(HashMap::new())),
+                remote_prepare_feedback: Arc::new(StdMutex::new(HashMap::new())),
                 dirty_gossip_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
                 dirty_gossip_notify: Arc::new(Notify::new()),
             },
@@ -1314,6 +1325,16 @@ fn scheduling_retry_backoff(attempt: usize) -> Duration {
     const MAX_MS: u64 = 2_000;
 
     let exp = attempt.min(5) as u32;
+    let backoff = BASE_MS.saturating_mul(1u64 << exp);
+    Duration::from_millis(backoff.min(MAX_MS))
+}
+
+/// Computes bounded backoff used to temporarily deprioritize peers after retryable prepare failures.
+fn remote_prepare_retry_backoff(consecutive_failures: u32) -> Duration {
+    const BASE_MS: u64 = 500;
+    const MAX_MS: u64 = 5_000;
+
+    let exp = consecutive_failures.saturating_sub(1).min(4);
     let backoff = BASE_MS.saturating_mul(1u64 << exp);
     Duration::from_millis(backoff.min(MAX_MS))
 }
