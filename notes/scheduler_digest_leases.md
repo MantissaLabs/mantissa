@@ -436,6 +436,8 @@ Hard cutover:
    - `LeaseIntent`
    - `PrepareLeasesRequest`
    - `PrepareLeasesResponse`
+   - `PrepareLeasesRejected`
+   - `PrepareLeasesRejectionReason`
    - `PreparedLease`
    - `AbortLeaseIntent`
    - `AbortLeasesRequest`
@@ -448,6 +450,11 @@ Hard cutover:
 The target node commits prepared leases locally when the replicated task spec
 is adopted by the runtime, so there is no separate remote `commitLeases` RPC
 in the implemented design.
+
+`prepareLeases` should return either prepared bindings or a structured
+rejection carrying the target node's current compact digest. That lets the
+coordinator refresh its local shortlist cache immediately after a failed
+prepare, instead of waiting for gossip or periodic sync to catch up.
 
 ## `crates/protocol/schema/gossip.capnp`
 
@@ -707,7 +714,9 @@ Exit criteria:
 
 1. no remote caller sends exact slot ids for placement,
 2. remote nodes allocate exact resources locally,
-3. rollback paths abort leases instead of releasing explicit slot ids.
+3. rollback paths abort leases instead of releasing explicit slot ids,
+4. prepare rejection returns current digest feedback without relying on string
+   parsing.
 
 ## Phase 4: rewrite planner hot path to use digests
 

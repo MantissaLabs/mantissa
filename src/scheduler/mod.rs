@@ -487,6 +487,20 @@ impl Scheduler {
         registry.list()
     }
 
+    /// Upserts one observed remote scheduler digest into the local replicated digest cache.
+    pub async fn observe_scheduler_digest(&self, digest: SchedulerDigestValue) -> AnyhowResult<()> {
+        let registry = match self.digest_registry.read() {
+            Ok(guard) => guard.clone(),
+            Err(err) => err.into_inner().clone(),
+        };
+
+        let Some(registry) = registry else {
+            return Ok(());
+        };
+
+        registry.upsert(digest).await
+    }
+
     /// Initializes slot-only schedulers (legacy path) by delegating to `init_resources`.
     #[allow(dead_code)]
     pub async fn init_slots<I>(&self, slots: I) -> Result<SchedulerSnapshot, SchedulerError>

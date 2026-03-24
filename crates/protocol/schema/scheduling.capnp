@@ -219,9 +219,30 @@ struct PrepareLeasesRequest {
   # Resource requests to satisfy atomically on this target node.
 }
 
+enum PrepareLeasesRejectionReason {
+  insufficientResources @0;
+  # The target node cannot currently satisfy the requested batch.
+
+  uninitialized @1;
+  # The target scheduler has not initialized its local resources yet.
+}
+
+struct PrepareLeasesRejected {
+  reason @0 :PrepareLeasesRejectionReason;
+  # Structured rejection reason used for retry and diagnostics.
+
+  currentDigest @1 :SchedulerDigest;
+  # Current target-node digest returned so callers can refresh local shortlist state immediately.
+}
+
 struct PrepareLeasesResponse {
-  leases @0 :List(PreparedLease);
-  # Prepared leases with exact bindings chosen locally by the target node.
+  union {
+    prepared @0 :List(PreparedLease);
+    # Prepared leases with exact bindings chosen locally by the target node.
+
+    rejected @1 :PrepareLeasesRejected;
+    # Structured prepare rejection with current target-node digest feedback.
+  }
 }
 
 struct AbortLeaseIntent {

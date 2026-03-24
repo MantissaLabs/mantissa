@@ -1,10 +1,14 @@
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use protocol::scheduling::scheduler;
+use protocol::scheduling::{self, scheduler};
 use uuid::Uuid;
 
+use super::digest::{SchedulerDigestValue, write_scheduler_digest};
 use super::summary::SchedulerSummary;
-use super::{AbortTaskLeaseIntent, Scheduler, TaskLeaseIntent};
+use super::{
+    AbortTaskLeaseIntent, PreparedTaskLeaseBatch, Scheduler, SchedulerError, TaskLeaseIntent,
+};
 
 pub struct SchedulerService {
     scheduler: Rc<Scheduler>,
@@ -29,6 +33,84 @@ impl SchedulerService {
         let mut arr = [0u8; 16];
         arr.copy_from_slice(bytes);
         Ok(Uuid::from_bytes(arr))
+    }
+
+    /// Builds one zero-capacity digest for rejections emitted before the scheduler is initialized.
+    fn empty_prepare_rejection_digest(&self) -> SchedulerDigestValue {
+        SchedulerDigestValue {
+            node_id: self.node_id,
+            snapshot_version: 0,
+            updated_at_unix_ms: current_unix_ms(),
+            free_slot_count: 0,
+            free_cpu_millis: 0,
+            free_memory_bytes: 0,
+            largest_free_slot_cpu_millis: 0,
+            largest_free_slot_memory_bytes: 0,
+            free_gpu_count: 0,
+            gpu_runtime_ready: false,
+        }
+    }
+
+    /// Maps one scheduler-side prepare failure into a structured wire rejection when possible.
+    fn prepare_rejection_from_error(
+        &self,
+        err: SchedulerError,
+    ) -> Result<
+        (
+            scheduling::PrepareLeasesRejectionReason,
+            SchedulerDigestValue,
+        ),
+        SchedulerError,
+    > {
+        match err {
+            SchedulerError::InsufficientResources { snapshot, .. } => Ok((
+                scheduling::PrepareLeasesRejectionReason::InsufficientResources,
+                SchedulerDigestValue::from_snapshot(self.node_id, &snapshot),
+            )),
+            SchedulerError::Uninitialized => Ok((
+                scheduling::PrepareLeasesRejectionReason::Uninitialized,
+                self.empty_prepare_rejection_digest(),
+            )),
+            other => Err(other),
+        }
+    }
+
+    /// Writes one successful prepared-lease batch into the wire response payload.
+    fn write_prepared_leases(
+        prepared: &PreparedTaskLeaseBatch,
+        mut response: scheduling::prepare_leases_response::Builder<'_>,
+    ) {
+        let mut leases = response
+            .reborrow()
+            .init_prepared(prepared.leases.len() as u32);
+        for (idx, lease) in prepared.leases.iter().enumerate() {
+            let mut entry = leases.reborrow().get(idx as u32);
+            entry.set_lease_id(lease.lease_id.as_bytes());
+            entry.set_task_id(lease.task_id.as_bytes());
+            entry.set_expires_at_unix_ms(lease.expires_at_unix_ms);
+            let mut slot_ids = entry.reborrow().init_slot_ids(lease.slot_ids.len() as u32);
+            for (slot_idx, slot_id) in lease.slot_ids.iter().enumerate() {
+                slot_ids.set(slot_idx as u32, *slot_id);
+            }
+
+            let mut gpu_ids = entry
+                .reborrow()
+                .init_gpu_device_ids(lease.gpu_device_ids.len() as u32);
+            for (gpu_idx, device_id) in lease.gpu_device_ids.iter().enumerate() {
+                gpu_ids.set(gpu_idx as u32, device_id);
+            }
+        }
+    }
+
+    /// Writes one structured prepare rejection so callers can refresh local digest state immediately.
+    fn write_prepare_rejection(
+        reason: scheduling::PrepareLeasesRejectionReason,
+        digest: &SchedulerDigestValue,
+        mut response: scheduling::prepare_leases_response::Builder<'_>,
+    ) {
+        let mut rejected = response.reborrow().init_rejected();
+        rejected.set_reason(reason);
+        write_scheduler_digest(rejected.reborrow().init_current_digest(), digest);
     }
 }
 
@@ -94,32 +176,19 @@ impl scheduler::Server for SchedulerService {
             });
         }
 
-        let prepared = self
+        let mut response = results.get().init_response();
+        match self
             .scheduler
             .prepare_task_leases(coordinator_node_id, ttl_ms, reservations)
             .await
-            .map_err(|err| capnp::Error::failed(err.to_string()))?;
-
-        let mut response = results.get().init_response();
-        let mut leases = response
-            .reborrow()
-            .init_leases(prepared.leases.len() as u32);
-        for (idx, lease) in prepared.leases.iter().enumerate() {
-            let mut entry = leases.reborrow().get(idx as u32);
-            entry.set_lease_id(lease.lease_id.as_bytes());
-            entry.set_task_id(lease.task_id.as_bytes());
-            entry.set_expires_at_unix_ms(lease.expires_at_unix_ms);
-            let mut slot_ids = entry.reborrow().init_slot_ids(lease.slot_ids.len() as u32);
-            for (slot_idx, slot_id) in lease.slot_ids.iter().enumerate() {
-                slot_ids.set(slot_idx as u32, *slot_id);
-            }
-
-            let mut gpu_ids = entry
-                .reborrow()
-                .init_gpu_device_ids(lease.gpu_device_ids.len() as u32);
-            for (gpu_idx, device_id) in lease.gpu_device_ids.iter().enumerate() {
-                gpu_ids.set(gpu_idx as u32, device_id);
-            }
+        {
+            Ok(prepared) => Self::write_prepared_leases(&prepared, response.reborrow()),
+            Err(err) => match self.prepare_rejection_from_error(err) {
+                Ok((reason, digest)) => {
+                    Self::write_prepare_rejection(reason, &digest, response.reborrow());
+                }
+                Err(err) => return Err(capnp::Error::failed(err.to_string())),
+            },
         }
 
         Ok(())
@@ -148,5 +217,169 @@ impl scheduler::Server for SchedulerService {
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
 
         Ok(())
+    }
+}
+
+/// Returns the current Unix timestamp in milliseconds for rejection digest timestamps.
+fn current_unix_ms() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(u64::MAX as u128) as u64,
+        Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SchedulerService;
+    use crate::registry::Registry;
+    use crate::scheduler::digest::read_scheduler_digest;
+    use crate::scheduler::{Scheduler, SlotCapacity, SlotSpec};
+    use crate::store::local::LocalSessionStore;
+    use crate::store::peer_store::open_peers_store;
+    use crate::store::scheduler_store::open_scheduler_store;
+    use ::health::HealthMonitor;
+    use capnp_rpc::new_client as capnp_new_client;
+    use ed25519_dalek::SigningKey;
+    use net::noise::NoiseKeys;
+    use protocol::scheduling::{self, scheduler};
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use tempfile::{TempDir, tempdir};
+    use uuid::Uuid;
+
+    /// Builds one isolated scheduler and local RPC client for scheduler service tests.
+    async fn make_scheduler_client() -> (scheduler::Client, Rc<Scheduler>, Uuid, TempDir) {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("scheduler-service-test-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+
+        let scheduler_store = open_scheduler_store(db.clone(), actor).expect("open store");
+        scheduler_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild scheduler store");
+
+        let peers_store = open_peers_store(db.clone(), actor).expect("open peers store");
+        peers_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild peers store");
+
+        let noise_keys = NoiseKeys::from_private_bytes([0x11; 32]);
+        let session_store =
+            LocalSessionStore::open(db.clone(), &noise_keys).expect("open local session store");
+        let registry = Registry::new(
+            peers_store,
+            session_store,
+            SigningKey::from_bytes(&[0xA5; 32]),
+            Arc::new(noise_keys),
+            actor,
+            HealthMonitor::new(actor),
+        );
+
+        let scheduler =
+            Rc::new(Scheduler::new(scheduler_store, registry, actor).expect("scheduler"));
+        let service = SchedulerService::new(scheduler.clone(), actor, "node-a".to_string());
+        let client: scheduler::Client = capnp_new_client(service);
+        (client, scheduler, actor, dir)
+    }
+
+    /// prepareLeases should reject uninitialized schedulers with a zero-capacity digest payload.
+    #[tokio::test]
+    async fn prepare_leases_returns_structured_uninitialized_rejection() {
+        let (client, _scheduler, node_id, _dir) = make_scheduler_client().await;
+        let mut request = client.prepare_leases_request();
+        {
+            let mut inner = request.get().init_request();
+            inner.set_coordinator_node_id(Uuid::new_v4().as_bytes());
+            inner.set_ttl_ms(30_000);
+            let mut intents = inner.reborrow().init_intents(1);
+            let mut intent = intents.reborrow().get(0);
+            intent.set_task_id(Uuid::new_v4().as_bytes());
+            intent.set_cpu_millis(500);
+            intent.set_memory_bytes(512 * 1024 * 1024);
+            intent.set_gpu_count(0);
+        }
+
+        let response = request.send().promise.await.expect("call prepareLeases");
+        let payload = response
+            .get()
+            .expect("prepareLeases response")
+            .get_response()
+            .expect("prepareLeases payload");
+
+        match payload.which().expect("prepareLeases variant") {
+            scheduling::prepare_leases_response::Rejected(Ok(rejected)) => {
+                assert_eq!(
+                    rejected.get_reason().expect("rejection reason"),
+                    scheduling::PrepareLeasesRejectionReason::Uninitialized
+                );
+                let digest =
+                    read_scheduler_digest(rejected.get_current_digest().expect("rejection digest"))
+                        .expect("decode rejection digest");
+                assert_eq!(digest.node_id, node_id);
+                assert_eq!(digest.snapshot_version, 0);
+                assert_eq!(digest.free_slot_count, 0);
+                assert_eq!(digest.free_cpu_millis, 0);
+                assert_eq!(digest.free_memory_bytes, 0);
+                assert_eq!(digest.free_gpu_count, 0);
+            }
+            _ => panic!("prepareLeases should reject uninitialized schedulers"),
+        }
+    }
+
+    /// prepareLeases should return the current digest when a batch is rejected for capacity.
+    #[tokio::test]
+    async fn prepare_leases_returns_structured_capacity_rejection_with_digest() {
+        let (client, scheduler, node_id, _dir) = make_scheduler_client().await;
+        scheduler
+            .init_slots([SlotSpec::new(
+                1,
+                SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+            )])
+            .await
+            .expect("init scheduler");
+
+        let mut request = client.prepare_leases_request();
+        {
+            let mut inner = request.get().init_request();
+            inner.set_coordinator_node_id(Uuid::new_v4().as_bytes());
+            inner.set_ttl_ms(30_000);
+            let mut intents = inner.reborrow().init_intents(1);
+            let mut intent = intents.reborrow().get(0);
+            intent.set_task_id(Uuid::new_v4().as_bytes());
+            intent.set_cpu_millis(1_500);
+            intent.set_memory_bytes(1536 * 1024 * 1024);
+            intent.set_gpu_count(0);
+        }
+
+        let response = request.send().promise.await.expect("call prepareLeases");
+        let payload = response
+            .get()
+            .expect("prepareLeases response")
+            .get_response()
+            .expect("prepareLeases payload");
+
+        match payload.which().expect("prepareLeases variant") {
+            scheduling::prepare_leases_response::Rejected(Ok(rejected)) => {
+                assert_eq!(
+                    rejected.get_reason().expect("rejection reason"),
+                    scheduling::PrepareLeasesRejectionReason::InsufficientResources
+                );
+                let digest =
+                    read_scheduler_digest(rejected.get_current_digest().expect("rejection digest"))
+                        .expect("decode rejection digest");
+                assert_eq!(digest.node_id, node_id);
+                assert_eq!(digest.snapshot_version, 0);
+                assert_eq!(digest.free_slot_count, 1);
+                assert_eq!(digest.free_cpu_millis, 500);
+                assert_eq!(digest.free_memory_bytes, 512 * 1024 * 1024);
+                assert_eq!(digest.free_gpu_count, 0);
+            }
+            _ => panic!("prepareLeases should reject oversized batches"),
+        }
     }
 }

@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::planner::StartIntent;
+use super::reservation::{RemotePrepareRejection, RemotePrepareRejectionReason};
 use super::*;
 
 use crate::network::attachment::{AttachmentProvisionerApi, AttachmentProvisioningRequest};
@@ -6447,6 +6448,48 @@ async fn remote_prepare_feedback_records_and_clears_retryable_peer_backoff() {
             .contains_key(&peer_id),
         "successful prepare should clear peer backoff immediately"
     );
+}
+
+#[tokio::test]
+async fn remote_prepare_rejection_updates_digest_cache_and_backoff() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let peer_id = Uuid::new_v4();
+    let rejection = RemotePrepareRejection {
+        reason: RemotePrepareRejectionReason::InsufficientResources,
+        digest: crate::scheduler::digest::SchedulerDigestValue {
+            node_id: peer_id,
+            snapshot_version: 7,
+            updated_at_unix_ms: 123_456,
+            free_slot_count: 1,
+            free_cpu_millis: 500,
+            free_memory_bytes: 512 * 1024 * 1024,
+            largest_free_slot_cpu_millis: 500,
+            largest_free_slot_memory_bytes: 512 * 1024 * 1024,
+            free_gpu_count: 0,
+            gpu_runtime_ready: true,
+        },
+    };
+
+    manager
+        .apply_remote_prepare_rejection(peer_id, rejection.clone())
+        .await
+        .expect("apply remote prepare rejection");
+
+    let feedback = manager.local_state.remote_prepare_feedback.snapshot();
+    let peer_feedback = feedback
+        .get(&peer_id)
+        .expect("peer feedback after rejection");
+    assert_eq!(peer_feedback.consecutive_failures, 1);
+
+    let digest = manager
+        .core
+        .scheduler
+        .scheduler_digests()
+        .expect("load scheduler digests")
+        .into_iter()
+        .find(|digest| digest.node_id == peer_id)
+        .expect("rejection digest cached locally");
+    assert_eq!(digest, rejection.digest);
 }
 
 #[tokio::test]
