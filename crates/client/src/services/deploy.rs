@@ -8,6 +8,7 @@ use crate::connection;
 use crate::networks;
 use crate::volumes;
 use anyhow::{Context, Result, anyhow};
+use blake3::Hasher;
 use capnp::{Error as CapnpError, struct_list};
 use protocol::services::task_template;
 use protocol::task::{environment_var, secret_file, secret_ref, volume_mount};
@@ -32,6 +33,16 @@ enum DeployOutcome {
 struct ResolvedManifestVolume {
     volume_id: Uuid,
     volume_name: String,
+}
+
+/// Derive the canonical network UUID from the manifest-facing network name.
+fn compute_network_id(name: &str) -> Uuid {
+    let mut hasher = Hasher::new();
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 /// Ensure every network referenced by the manifest exists so scheduling can attach tasks reliably.
@@ -427,7 +438,10 @@ fn write_task(
 
     let mut networks_builder = builder.reborrow().init_networks(task.networks.len() as u32);
     for (idx, network) in task.networks.iter().enumerate() {
-        networks_builder.set(idx as u32, network.trim());
+        let trimmed = network.trim();
+        let mut network_builder = networks_builder.reborrow().get(idx as u32);
+        network_builder.set_name(trimmed);
+        network_builder.set_network_id(compute_network_id(trimmed).as_bytes());
     }
 
     if let Some(readiness) = task.readiness.as_ref() {

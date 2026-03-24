@@ -1,4 +1,3 @@
-use crate::network::types::compute_network_id;
 use crate::services::manager::{ServiceController, ServiceDeploymentOutcome};
 use crate::services::types::{
     ServiceEvent, ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePortProtocol,
@@ -480,18 +479,18 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
     let mut networks = Vec::new();
     let mut seen_networks = HashSet::new();
     for entry in reader.get_networks()?.iter() {
-        let raw = entry?.to_str()?.trim().to_string();
+        let raw = entry.get_name()?.to_str()?.trim().to_string();
         if raw.is_empty() {
             return Err(Error::failed("network names must be non-empty".to_string()));
         }
 
-        if !seen_networks.insert(raw.clone()) {
+        let network_id = read_uuid(entry.get_network_id()?)?;
+        if !seen_networks.insert(network_id) {
             return Err(Error::failed(format!(
-                "duplicate network '{raw}' in task template"
+                "duplicate network '{raw}' ({network_id}) in task template"
             )));
         }
 
-        let network_id = compute_network_id(&raw);
         networks.push(ServiceTaskNetworkRequirement::new(raw, network_id));
     }
     networks.sort_by(|a, b| a.network_id.cmp(&b.network_id));
@@ -769,7 +768,9 @@ fn write_task_template(
 
     let mut networks_builder = builder.reborrow().init_networks(task.networks.len() as u32);
     for (idx, network) in task.networks.iter().enumerate() {
-        networks_builder.set(idx as u32, &network.name);
+        let mut network_builder = networks_builder.reborrow().get(idx as u32);
+        network_builder.set_name(&network.name);
+        network_builder.set_network_id(network.network_id.as_bytes());
     }
 
     let mut files_builder = builder
@@ -861,4 +862,57 @@ fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&owned);
     Ok(Uuid::from_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_task_template, write_task_template};
+    use crate::services::types::{ServiceTaskNetworkRequirement, ServiceTaskSpecValue};
+    use capnp::message::Builder;
+    use protocol::services::task_template;
+    use uuid::Uuid;
+
+    /// Service task template wire round-trips must preserve the declared network UUID exactly.
+    #[test]
+    fn task_template_round_trip_preserves_network_ids() {
+        let network_id = Uuid::new_v4();
+        let task = ServiceTaskSpecValue {
+            name: "backend".to_string(),
+            image: "ghcr.io/example/backend:latest".to_string(),
+            command: Vec::new(),
+            depends_on: Vec::new(),
+            replicas: 1,
+            cpu_millis: 250,
+            memory_bytes: 128 * 1024 * 1024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
+            readiness: None,
+            liveness: None,
+            public_port: None,
+            public_protocol: None,
+            tty: false,
+        };
+
+        let mut message = Builder::new_default();
+        {
+            let builder = message.init_root::<task_template::Builder<'_>>();
+            write_task_template(builder, &task).expect("encode task template");
+        }
+        let reader = message
+            .get_root::<task_template::Builder<'_>>()
+            .expect("read encoded task template builder")
+            .into_reader();
+        let decoded = read_task_template(reader).expect("decode task template");
+
+        assert_eq!(
+            decoded.networks, task.networks,
+            "service task network requirements should preserve their explicit network ids"
+        );
+    }
 }

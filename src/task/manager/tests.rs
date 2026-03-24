@@ -6398,6 +6398,43 @@ fn scheduling_retry_budget_is_shorter_for_targeted_starts() {
 }
 
 #[tokio::test]
+async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let request = TaskStartRequest {
+        name: "network-blocked".into(),
+        image: "img".into(),
+        command: Vec::new(),
+        tty: false,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        id: Some(Uuid::new_v4()),
+        slot_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: vec![Uuid::new_v4()],
+        service_metadata: Some(TaskServiceMetadata::new("demo-service", "api")),
+        target_node: None,
+    };
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        manager.start_tasks_batch_with_scheduling_retry_limit(vec![request], Some(1)),
+    )
+    .await
+    .expect("override should fail without waiting for the default retry window")
+    .expect_err("network-blocked start should fail");
+
+    assert!(task_start_error_is_retryable(&result));
+}
+
+#[tokio::test]
 async fn remote_prepare_feedback_records_and_clears_retryable_peer_backoff() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
     let peer_id = Uuid::new_v4();

@@ -13,7 +13,9 @@ use crate::services::types::{
     ServiceUpdateStrategy, compute_service_id,
 };
 use crate::task::container::ContainerState;
-use crate::task::manager::{TaskManager, TaskStartRequest, TaskTrafficPublicationUpdate};
+use crate::task::manager::{
+    TaskManager, TaskStartRequest, TaskTrafficPublicationUpdate, task_start_error_is_retryable,
+};
 use crate::task::types::{
     TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicy, TaskRestartPolicyKind,
     TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskVolumeMount,
@@ -59,6 +61,8 @@ const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
 const SERVICE_ROLLOUT_STOP_TIMEOUT_SECS: u64 = 120;
 /// Poll interval while waiting on rollout task readiness transitions.
 const SERVICE_ROLLOUT_POLL_INTERVAL_MS: u64 = 200;
+/// Fast-fail retry budget for untargeted fallback scheduling inside one rollout attempt.
+const SERVICE_FALLBACK_SCHEDULING_RETRY_MAX_ATTEMPTS: usize = 1;
 /// Proactive slot rebalance keeps long-lived running services aligned with deterministic ownership.
 ///
 /// This is required for split/merge convergence so replicas migrate off overloaded partitions once
@@ -667,7 +671,6 @@ impl ServiceController {
         self.clone().await_service_readiness(current).await;
         Ok(())
     }
-
     /// Executes the deployment workflow in the background by starting tasks via the task manager
     /// and persisting the resulting service specification into the replicated registry.
     async fn execute_deployment(self, job: ServiceDeploymentJob) -> anyhow::Result<()> {
@@ -746,6 +749,15 @@ impl ServiceController {
                     "initial task launch for service '{}' failed: {err:#}",
                     service_name
                 );
+
+                if task_start_error_is_retryable(&err) {
+                    tracing::info!(
+                        target: "services",
+                        "deferring deployment retry for '{}' until scheduling prerequisites converge",
+                        service_name
+                    );
+                    return Ok(());
+                }
 
                 let service_id = compute_service_id(&service_name);
                 match self.registry.get(service_id) {
@@ -1358,6 +1370,15 @@ impl ServiceController {
             deployment.service_name
         );
 
+        if task_start_error_is_retryable(err) {
+            tracing::info!(
+                target: "services",
+                "deferring deployment retry for '{}' until scheduling prerequisites converge",
+                deployment.service_name
+            );
+            return;
+        }
+
         let service_id = compute_service_id(deployment.service_name);
         match self.registry.get(service_id) {
             Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(err) => {
@@ -1668,9 +1689,12 @@ impl ServiceController {
                     request.target_node = None;
                 }
                 self.task_manager
-                    .start_tasks_batch(requests)
+                    .start_tasks_batch_with_scheduling_retry_limit(
+                        requests,
+                        Some(SERVICE_FALLBACK_SCHEDULING_RETRY_MAX_ATTEMPTS),
+                    )
                     .await
-                    .map_err(|err| anyhow::anyhow!("fallback placement failed: {err}"))
+                    .map_err(|err| err.context("fallback placement failed"))
             }
             Err(err) => Err(err),
         }

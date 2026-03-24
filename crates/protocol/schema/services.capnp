@@ -48,8 +48,8 @@ struct TaskTemplate {
   secretFiles @8 :List(TaskSchema.SecretFile);
   # Secret-backed file projections
 
-  networks @9 :List(Text);
-  # Required overlay network names
+  networks @9 :List(TaskNetwork);
+  # Required overlay networks with user-facing alias and canonical UUID
 
   readiness @10 :ReadinessProbe;
   # Optional distributed readiness probe used to admit service backends.
@@ -77,6 +77,14 @@ struct TaskTemplate {
 
   tty @19 :Bool;
   # Allocate a terminal for the container entrypoint.
+}
+
+struct TaskNetwork {
+  name @0 :Text;
+  # User-facing network alias declared in the service manifest.
+
+  networkId @1 :Data;
+  # Required overlay network UUID as a 16-byte binary identifier.
 }
 
 enum ReadinessProbeKind {

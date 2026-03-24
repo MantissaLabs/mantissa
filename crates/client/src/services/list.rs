@@ -187,7 +187,7 @@ impl ServiceTaskRow {
 
         let mut networks = Vec::new();
         for entry in reader.get_networks()?.iter() {
-            networks.push(entry?.to_str()?.to_string());
+            networks.push(entry.get_name()?.to_str()?.to_string());
         }
 
         let raw_public = reader.get_public_port();

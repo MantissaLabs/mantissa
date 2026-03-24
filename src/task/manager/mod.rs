@@ -579,9 +579,24 @@ impl TaskManager {
             .expect("batch start with single request should yield one spec"))
     }
 
+    /// Starts one task batch using the default transient scheduling retry policy for the caller.
     pub async fn start_tasks_batch(
         &self,
         requests: Vec<TaskStartRequest>,
+    ) -> Result<Vec<TaskSpec>, anyhow::Error> {
+        self.start_tasks_batch_with_scheduling_retry_limit(requests, None)
+            .await
+    }
+
+    /// Starts one task batch while allowing higher layers to clamp scheduling retries.
+    ///
+    /// Service rollout ownership already retries failed generations at the controller layer. Those
+    /// callers can pass a small override so one stale scheduling view does not monopolize the
+    /// in-flight generation slot for nearly a minute before reconciliation gets another attempt.
+    pub(crate) async fn start_tasks_batch_with_scheduling_retry_limit(
+        &self,
+        requests: Vec<TaskStartRequest>,
+        scheduling_retry_max_attempts_override: Option<usize>,
     ) -> Result<Vec<TaskSpec>, anyhow::Error> {
         if requests.is_empty() {
             return Ok(Vec::new());
@@ -595,7 +610,8 @@ impl TaskManager {
         const MAX_ATTEMPTS: usize = 5;
         let mut attempt = 0usize;
         let mut scheduling_retry_attempts = 0usize;
-        let scheduling_retry_max_attempts = scheduling_retry_max_attempts_for_intents(&intents);
+        let scheduling_retry_max_attempts = scheduling_retry_max_attempts_override
+            .unwrap_or_else(|| scheduling_retry_max_attempts_for_intents(&intents));
 
         while attempt < MAX_ATTEMPTS {
             let assignment = match self.compute_assignment(&intents).await {
@@ -1299,6 +1315,11 @@ impl Drop for TaskManager {
 /// Identify scheduling errors that should be retried because prerequisites are still converging.
 fn is_retryable_scheduling_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| cause.is::<SchedulingError>())
+}
+
+/// Returns true when one task-start failure should be retried by a higher-level controller.
+pub(crate) fn task_start_error_is_retryable(err: &anyhow::Error) -> bool {
+    is_retryable_scheduling_error(err)
 }
 
 /// Pick a smaller scheduling retry budget for targeted starts so callers can fall back quickly.
