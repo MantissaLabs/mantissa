@@ -195,7 +195,6 @@ local_test!(node_leave_tcp, {
 // Leave → Rejoin → Leave-again flow on TCP transport.
 // Ensures that a node can leave, rejoin (clearing any tombstone),
 // and leave again without causing persistent divergence between peers.
-/*
 local_test!(node_leave_rejoin_tcp, {
     // Bring up a 3-node cluster with a fast sync tick (100ms)
     let cluster = match TestNode::new_cluster_tcp_with_tick(3, 100).await {
@@ -212,60 +211,94 @@ local_test!(node_leave_rejoin_tcp, {
     let anchor = &cluster[0];
     let joiner1 = &cluster[1];
     let rejoiner = &cluster[2];
+    let remaining = &cluster[..2];
+
+    let mut expected_all = vec![anchor.id(), joiner1.id(), rejoiner.id()];
+    expected_all.sort();
+    let mut expected_remaining = vec![anchor.id(), joiner1.id()];
+    expected_remaining.sort();
 
     TestNode::assert_cluster_size_all(&cluster, 3, "initial cluster size 3").await;
     TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(5))
         .await
         .expect("all roots equal initially");
 
+    let anchor_ids = anchor.list_ids().await;
+    let joiner1_ids = joiner1.list_ids().await;
+    let rejoiner_ids = rejoiner.list_ids().await;
+    assert_eq!(
+        anchor_ids, expected_all,
+        "anchor membership should include all three nodes initially"
+    );
+    assert_eq!(
+        joiner1_ids, expected_all,
+        "joiner1 membership should include all three nodes initially"
+    );
+    assert_eq!(
+        rejoiner_ids, expected_all,
+        "rejoiner membership should include all three nodes initially"
+    );
+
     // Step 1: rejoiner leaves → remaining two converge to size 2
     rejoiner.leave().await.expect("leave ok");
 
-    // Wait two ticks.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    anchor
-        .assert_cluster_size(2, "anchor sees 2 after leave")
-        .await;
-    joiner1
-        .assert_cluster_size(2, "joiner1 sees 2 after leave")
-        .await;
-    TestNode::wait_roots_equal(anchor, joiner1, Duration::from_secs(5))
+    TestNode::assert_cluster_size_all(remaining, 2, "remaining nodes see 2 after leave").await;
+    TestNode::wait_roots_equal_all(remaining, Duration::from_secs(5))
         .await
-        .expect("roots equal after leave");
+        .expect("remaining roots equal after leave");
+
+    let anchor_ids = anchor.list_ids().await;
+    let joiner1_ids = joiner1.list_ids().await;
+    assert_eq!(
+        anchor_ids, expected_remaining,
+        "anchor membership should exclude rejoiner after leave"
+    );
+    assert_eq!(
+        joiner1_ids, expected_remaining,
+        "joiner1 membership should exclude rejoiner after leave"
+    );
 
     // Step 2: rejoiner rejoins via anchor → all converge to 3
     rejoiner.join(anchor).await.expect("rejoin ok");
 
-    // Wait two ticks.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    TestNode::assert_cluster_size_all(&cluster, 3, "all see 3 after rejoin").await;
+    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(5))
+        .await
+        .expect("all roots equal after rejoin");
 
-    for n in [&anchor, &joiner1, &rejoiner] {
-        n.assert_cluster_size(3, "all see 3 after rejoin").await;
-    }
+    let anchor_ids = anchor.list_ids().await;
+    let joiner1_ids = joiner1.list_ids().await;
+    let rejoiner_ids = rejoiner.list_ids().await;
+    assert_eq!(
+        anchor_ids, expected_all,
+        "anchor membership should include rejoiner after rejoin"
+    );
+    assert_eq!(
+        joiner1_ids, expected_all,
+        "joiner1 membership should include rejoiner after rejoin"
+    );
+    assert_eq!(
+        rejoiner_ids, expected_all,
+        "rejoiner membership should include all three nodes after rejoin"
+    );
 
     // Step 3: rejoiner leaves again → remaining two stabilize at 2 and stay consistent
     rejoiner.leave().await.expect("second leave ok");
-    anchor
-        .assert_cluster_size(2, "anchor sees 2 after second leave")
-        .await;
-    joiner1
-        .assert_cluster_size(2, "joiner1 sees 2 after second leave")
-        .await;
-    TestNode::wait_roots_equal(anchor, joiner1, Duration::from_secs(10))
-        .await
-        .expect("roots equal after second leave");
 
-    // Sanity check: after a short wait (two ticks), they still agree and size is 2.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    anchor
-        .assert_cluster_size(2, "anchor still sees 2 after delay")
+    TestNode::assert_cluster_size_all(remaining, 2, "remaining nodes see 2 after second leave")
         .await;
-    joiner1
-        .assert_cluster_size(2, "joiner1 still sees 2 after delay")
-        .await;
-    TestNode::wait_roots_equal(anchor, joiner1, Duration::from_secs(5))
+    TestNode::wait_roots_equal_all(remaining, Duration::from_secs(10))
         .await
-        .expect("roots remain equal after delay");
+        .expect("remaining roots equal after second leave");
+
+    let anchor_ids = anchor.list_ids().await;
+    let joiner1_ids = joiner1.list_ids().await;
+    assert_eq!(
+        anchor_ids, expected_remaining,
+        "anchor membership should exclude rejoiner after second leave"
+    );
+    assert_eq!(
+        joiner1_ids, expected_remaining,
+        "joiner1 membership should exclude rejoiner after second leave"
+    );
 });
-*/
