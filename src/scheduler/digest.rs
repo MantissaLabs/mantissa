@@ -7,6 +7,8 @@ use capnp::Error;
 use protocol::scheduling::{scheduler_digest, scheduler_digest_event};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use uuid::Uuid;
@@ -80,24 +82,38 @@ pub enum SchedulerDigestEvent {
     Remove(Uuid),
 }
 
+/// Local cache view of one replicated scheduler digest together with its ingest time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedSchedulerDigest {
+    pub digest: SchedulerDigestValue,
+    pub observed_at_unix_ms: u64,
+}
+
 /// Storage-backed access layer for scheduler digest rows.
 #[derive(Clone)]
 pub struct SchedulerDigestRegistry {
     store: SchedulerDigestStore,
+    observed_at_unix_ms: Arc<StdMutex<HashMap<Uuid, u64>>>,
 }
 
 impl SchedulerDigestRegistry {
     /// Builds the registry from the underlying replicated digest store.
     pub fn new(store: SchedulerDigestStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            observed_at_unix_ms: Arc::new(StdMutex::new(HashMap::new())),
+        }
     }
 
     /// Upserts one node-local scheduler digest into the replicated store.
     pub async fn upsert(&self, value: SchedulerDigestValue) -> AnyhowResult<()> {
+        let node_id = value.node_id;
         self.store
-            .upsert(&crdt_store::uuid_key::UuidKey::from(value.node_id), value)
+            .upsert(&crdt_store::uuid_key::UuidKey::from(node_id), value)
             .await
-            .map_err(|e| anyhow!("scheduler digest upsert failed: {e}"))
+            .map_err(|e| anyhow!("scheduler digest upsert failed: {e}"))?;
+        self.record_observed_now(node_id);
+        Ok(())
     }
 
     /// Removes one scheduler digest row from the replicated store.
@@ -106,6 +122,7 @@ impl SchedulerDigestRegistry {
             .remove(&crdt_store::uuid_key::UuidKey::from(node_id))
             .await
             .map_err(|e| anyhow!("scheduler digest remove failed: {e}"))?;
+        self.clear_observed(node_id);
         Ok(())
     }
 
@@ -117,6 +134,17 @@ impl SchedulerDigestRegistry {
             .get_snapshot(&key)
             .map_err(|e| anyhow!("scheduler digest lookup failed: {e}"))?;
         Ok(snapshot.and_then(|values| select_best_scheduler_digest(values.as_slice())))
+    }
+
+    /// Reads the canonical digest for one node together with the local ingest timestamp.
+    pub fn get_observed(&self, node_id: Uuid) -> AnyhowResult<Option<ObservedSchedulerDigest>> {
+        let Some(digest) = self.get(node_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(ObservedSchedulerDigest {
+            observed_at_unix_ms: self.observed_at(node_id),
+            digest,
+        }))
     }
 
     /// Lists every canonical scheduler digest currently known in the replicated store.
@@ -135,6 +163,48 @@ impl SchedulerDigestRegistry {
 
         values.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         Ok(values)
+    }
+
+    /// Lists every canonical scheduler digest currently known together with local ingest times.
+    pub fn list_observed(&self) -> AnyhowResult<Vec<ObservedSchedulerDigest>> {
+        let mut values = Vec::new();
+        for digest in self.list()? {
+            let node_id = digest.node_id;
+            values.push(ObservedSchedulerDigest {
+                observed_at_unix_ms: self.observed_at(node_id),
+                digest,
+            });
+        }
+        Ok(values)
+    }
+
+    /// Records one local observation timestamp for a digest row.
+    fn record_observed_now(&self, node_id: Uuid) {
+        let now_unix_ms = current_unix_ms();
+        let mut guard = match self.observed_at_unix_ms.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.insert(node_id, now_unix_ms);
+    }
+
+    /// Returns the local ingest timestamp for one digest row, seeding it lazily if absent.
+    fn observed_at(&self, node_id: Uuid) -> u64 {
+        let now_unix_ms = current_unix_ms();
+        let mut guard = match self.observed_at_unix_ms.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard.entry(node_id).or_insert(now_unix_ms)
+    }
+
+    /// Clears the local ingest timestamp when the digest row disappears.
+    fn clear_observed(&self, node_id: Uuid) {
+        let mut guard = match self.observed_at_unix_ms.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.remove(&node_id);
     }
 }
 
@@ -369,8 +439,12 @@ fn current_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        SchedulerDigestEvent, SchedulerDigestValue, should_replace_scheduler_digest_event,
+        SchedulerDigestEvent, SchedulerDigestRegistry, SchedulerDigestValue,
+        should_replace_scheduler_digest_event,
     };
+    use crate::store::scheduler_digest_store::open_scheduler_digest_store;
+    use std::sync::Arc;
+    use tempfile::tempdir;
     use uuid::Uuid;
 
     /// Newer snapshot versions should win when coalescing concurrent digest upserts.
@@ -424,5 +498,49 @@ mod tests {
         let candidate = SchedulerDigestEvent::Remove(node_id);
 
         assert!(should_replace_scheduler_digest_event(&current, &candidate));
+    }
+
+    /// Local digest freshness should track when this node ingested the row, not the peer timestamp.
+    #[tokio::test]
+    async fn observed_digest_tracks_local_ingest_time() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("scheduler-digest-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let store = open_scheduler_digest_store(db, actor).expect("open digest store");
+        store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild digest store");
+        let registry = SchedulerDigestRegistry::new(store);
+        let node_id = Uuid::new_v4();
+
+        registry
+            .upsert(SchedulerDigestValue {
+                node_id,
+                snapshot_version: 9,
+                updated_at_unix_ms: 1,
+                free_slot_count: 2,
+                free_cpu_millis: 1_000,
+                free_memory_bytes: 2_048,
+                largest_free_slot_cpu_millis: 500,
+                largest_free_slot_memory_bytes: 1_024,
+                free_gpu_count: 0,
+                gpu_runtime_ready: true,
+            })
+            .await
+            .expect("upsert digest");
+
+        let observed = registry
+            .get_observed(node_id)
+            .expect("lookup observed digest")
+            .expect("observed digest");
+        assert_eq!(observed.digest.node_id, node_id);
+        assert!(
+            observed.observed_at_unix_ms > observed.digest.updated_at_unix_ms,
+            "local ingest time should not reuse the peer-provided digest timestamp"
+        );
     }
 }

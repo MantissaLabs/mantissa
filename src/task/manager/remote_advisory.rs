@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::scheduler::digest::SchedulerDigestValue;
+use crate::scheduler::digest::{ObservedSchedulerDigest, SchedulerDigestValue};
 
 /// Maximum digest age tolerated before a peer is treated as stale for shortlist ranking.
 const REMOTE_DIGEST_STALE_AFTER_MS: u64 = 15_000;
@@ -120,8 +120,7 @@ pub(super) struct RemoteCandidateHint {
 impl RemoteCandidateHint {
     /// Builds one ranked remote candidate hint from digest state plus local prepare feedback.
     pub(super) fn new(
-        peer_id: Uuid,
-        digest: SchedulerDigestValue,
+        observed: ObservedSchedulerDigest,
         ready_networks: HashSet<Uuid>,
         hostable_intent_count: u32,
         targeted: bool,
@@ -129,9 +128,9 @@ impl RemoteCandidateHint {
         now_unix_ms: u64,
     ) -> Self {
         Self {
-            peer_id,
-            digest_stale: digest_is_stale(digest.updated_at_unix_ms, now_unix_ms),
-            digest,
+            peer_id: observed.digest.node_id,
+            digest_stale: digest_is_stale(observed.observed_at_unix_ms, now_unix_ms),
+            digest: observed.digest,
             ready_networks,
             hostable_intent_count,
             targeted,
@@ -151,9 +150,9 @@ pub(super) fn current_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Returns true when a replicated scheduler digest is old enough to be deprioritized.
-pub(super) fn digest_is_stale(updated_at_unix_ms: u64, now_unix_ms: u64) -> bool {
-    now_unix_ms.saturating_sub(updated_at_unix_ms) > REMOTE_DIGEST_STALE_AFTER_MS
+/// Returns true when the locally observed digest row is old enough to be deprioritized.
+pub(super) fn digest_is_stale(observed_at_unix_ms: u64, now_unix_ms: u64) -> bool {
+    now_unix_ms.saturating_sub(observed_at_unix_ms) > REMOTE_DIGEST_STALE_AFTER_MS
 }
 
 /// Orders remote hints so the planner prefers healthy, fresh peers before stale or backed-off ones.

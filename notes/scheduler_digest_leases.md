@@ -412,7 +412,9 @@ expired or committed after restart.
 
 A stale digest may cause a prepare request to fail, but the failure is local to
 that candidate. It does not create conflicting reservations because exact
-allocation is still local to the target node.
+allocation is still local to the target node. Freshness should be judged from
+the local node's digest-ingest time, not just the remote digest timestamp, so
+clock skew or delayed replication does not make an old row look fresh.
 
 ## Contract changes
 

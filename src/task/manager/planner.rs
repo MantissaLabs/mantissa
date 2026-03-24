@@ -920,8 +920,8 @@ impl TaskManager {
             .collect();
         let mut hints = Vec::new();
 
-        for digest in self.core.scheduler.scheduler_digests()? {
-            let peer_id = digest.node_id;
+        for observed in self.core.scheduler.observed_scheduler_digests()? {
+            let peer_id = observed.digest.node_id;
             if peer_id == self.local_node_id {
                 continue;
             }
@@ -931,6 +931,8 @@ impl TaskManager {
             if !self.core.registry.peer_schedulable(peer_id) {
                 continue;
             }
+
+            let digest = observed.digest.clone();
 
             let ready_networks = readiness
                 .get(&peer_id)
@@ -948,8 +950,7 @@ impl TaskManager {
             }
 
             hints.push(RemoteCandidateHint::new(
-                peer_id,
-                digest,
+                observed,
                 ready_networks,
                 hostable_intent_count,
                 targeted,
