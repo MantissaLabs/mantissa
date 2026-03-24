@@ -5,13 +5,10 @@ use chrono::{DateTime, Utc};
 use rand::rng;
 use rand::seq::SliceRandom;
 use thiserror::Error;
-use tracing::debug;
 use uuid::Uuid;
 
 use crate::gpu::gpu_runtime_status;
 use crate::scheduler::digest::SchedulerDigestValue;
-use crate::scheduler::summary::SchedulerSummary;
-use crate::scheduler::summary::{SchedulerGpuState, SchedulerSlotState};
 use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
 };
@@ -124,7 +121,7 @@ pub(super) struct ResourceAllocation {
 #[derive(Clone)]
 enum CandidateLocation {
     Local,
-    Remote { peer_id: Uuid, version: u64 },
+    Remote { peer_id: Uuid },
 }
 
 /// Wrapper for a node's free slots together with the metadata needed to build
@@ -134,13 +131,17 @@ struct Candidate {
     slots: Vec<SlotChoice>,
     gpu_devices: Vec<GpuChoice>,
     ready_networks: HashSet<Uuid>,
+    free_slot_count: u32,
+    free_cpu_millis: u64,
+    free_memory_bytes: u64,
+    free_gpu_count: u32,
+    largest_free_slot_cpu_millis: u64,
+    largest_free_slot_memory_bytes: u64,
 }
 
 impl Candidate {
-    /// Returns `Some` when the node has at least one usable slot; otherwise we
-    /// drop the candidate early so later stages don't need to handle empties.
-    fn new(
-        location: CandidateLocation,
+    /// Builds one local candidate from the exact free slots and GPU devices currently available.
+    fn new_local(
         slots: Vec<SlotChoice>,
         gpu_devices: Vec<GpuChoice>,
         ready_networks: HashSet<Uuid>,
@@ -148,17 +149,128 @@ impl Candidate {
         if slots.is_empty() {
             None
         } else {
-            Some(Self {
-                location,
+            let mut candidate = Self {
+                location: CandidateLocation::Local,
                 slots,
                 gpu_devices,
                 ready_networks,
+                free_slot_count: 0,
+                free_cpu_millis: 0,
+                free_memory_bytes: 0,
+                free_gpu_count: 0,
+                largest_free_slot_cpu_millis: 0,
+                largest_free_slot_memory_bytes: 0,
+            };
+            candidate.refresh_local_capacity();
+            Some(candidate)
+        }
+    }
+
+    /// Builds one remote candidate from a replicated scheduler digest.
+    fn new_remote(
+        peer_id: Uuid,
+        digest: SchedulerDigestValue,
+        ready_networks: HashSet<Uuid>,
+    ) -> Option<Self> {
+        if digest.free_slot_count == 0 {
+            None
+        } else {
+            Some(Self {
+                location: CandidateLocation::Remote { peer_id },
+                slots: Vec::new(),
+                gpu_devices: Vec::new(),
+                ready_networks,
+                free_slot_count: digest.free_slot_count,
+                free_cpu_millis: digest.free_cpu_millis,
+                free_memory_bytes: digest.free_memory_bytes,
+                free_gpu_count: digest.free_gpu_count,
+                largest_free_slot_cpu_millis: digest.largest_free_slot_cpu_millis,
+                largest_free_slot_memory_bytes: digest.largest_free_slot_memory_bytes,
             })
         }
     }
 
+    /// Refreshes the aggregate capacity counters after local exact-slot allocation mutates the vectors.
+    fn refresh_local_capacity(&mut self) {
+        self.free_slot_count = self.slots.len() as u32;
+        self.free_cpu_millis = self.slots.iter().fold(0u64, |total, slot| {
+            total.saturating_add(slot.capacity.cpu_millis)
+        });
+        self.free_memory_bytes = self.slots.iter().fold(0u64, |total, slot| {
+            total.saturating_add(slot.capacity.memory_bytes)
+        });
+        self.free_gpu_count = self.gpu_devices.len() as u32;
+        self.largest_free_slot_cpu_millis = self
+            .slots
+            .iter()
+            .map(|slot| slot.capacity.cpu_millis)
+            .max()
+            .unwrap_or(0);
+        self.largest_free_slot_memory_bytes = self
+            .slots
+            .iter()
+            .map(|slot| slot.capacity.memory_bytes)
+            .max()
+            .unwrap_or(0);
+    }
+
     fn can_host(&self, networks: &[Uuid]) -> bool {
         networks.iter().all(|net| self.ready_networks.contains(net))
+    }
+
+    /// Returns the minimum remote slot count implied by aggregate digest bounds for this request.
+    fn required_remote_slot_count(&self, cpu_millis: u64, memory_bytes: u64) -> Option<u32> {
+        let mut required_slots = 1u64;
+
+        if cpu_millis > 0 {
+            if self.largest_free_slot_cpu_millis == 0 {
+                return None;
+            }
+            required_slots =
+                required_slots.max(cpu_millis.div_ceil(self.largest_free_slot_cpu_millis));
+        }
+
+        if memory_bytes > 0 {
+            if self.largest_free_slot_memory_bytes == 0 {
+                return None;
+            }
+            required_slots =
+                required_slots.max(memory_bytes.div_ceil(self.largest_free_slot_memory_bytes));
+        }
+
+        u32::try_from(required_slots).ok()
+    }
+
+    /// Consumes aggregate remote digest capacity for one placement without relying on slot details.
+    fn allocate_remote(
+        &mut self,
+        cpu_millis: u64,
+        memory_bytes: u64,
+        gpu_count: u32,
+    ) -> Option<ResourceAllocation> {
+        let required_slots = self.required_remote_slot_count(cpu_millis, memory_bytes)?;
+        if self.free_slot_count < required_slots
+            || self.free_cpu_millis < cpu_millis
+            || self.free_memory_bytes < memory_bytes
+            || self.free_gpu_count < gpu_count
+        {
+            return None;
+        }
+
+        self.free_slot_count -= required_slots;
+        self.free_cpu_millis -= cpu_millis;
+        self.free_memory_bytes -= memory_bytes;
+        self.free_gpu_count -= gpu_count;
+        self.largest_free_slot_cpu_millis =
+            self.largest_free_slot_cpu_millis.min(self.free_cpu_millis);
+        self.largest_free_slot_memory_bytes = self
+            .largest_free_slot_memory_bytes
+            .min(self.free_memory_bytes);
+
+        Some(ResourceAllocation {
+            slots: Vec::new(),
+            gpu_device_ids: Vec::new(),
+        })
     }
 
     /// Attempts to reserve enough slots to satisfy the requested CPU, memory, and GPU counts.
@@ -172,6 +284,9 @@ impl Candidate {
         memory_bytes: u64,
         gpu_count: u32,
     ) -> Option<ResourceAllocation> {
+        if matches!(self.location, CandidateLocation::Remote { .. }) {
+            return self.allocate_remote(cpu_millis, memory_bytes, gpu_count);
+        }
         if self.slots.is_empty() {
             return None;
         }
@@ -208,6 +323,7 @@ impl Candidate {
                 self.gpu_devices
                     .retain(|device| !selected.contains(&device.device_id));
             }
+            self.refresh_local_capacity();
             return Some(ResourceAllocation {
                 slots: vec![slot],
                 gpu_device_ids: selected_gpu_ids,
@@ -260,6 +376,7 @@ impl Candidate {
             self.gpu_devices
                 .retain(|device| !selected.contains(&device.device_id));
         }
+        self.refresh_local_capacity();
 
         Some(ResourceAllocation {
             slots: allocated,
@@ -268,25 +385,17 @@ impl Candidate {
     }
 
     fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.free_slot_count == 0
     }
 
     /// Summarizes the remaining free capacity carried by this candidate.
     fn capacity(&self) -> CandidateCapacity {
-        let mut capacity = CandidateCapacity {
-            free_slot_count: self.slots.len() as u32,
-            free_gpu_count: self.gpu_devices.len() as u32,
-            ..CandidateCapacity::default()
-        };
-        for slot in &self.slots {
-            capacity.free_cpu_millis = capacity
-                .free_cpu_millis
-                .saturating_add(slot.capacity.cpu_millis);
-            capacity.free_memory_bytes = capacity
-                .free_memory_bytes
-                .saturating_add(slot.capacity.memory_bytes);
+        CandidateCapacity {
+            free_slot_count: self.free_slot_count,
+            free_cpu_millis: self.free_cpu_millis,
+            free_memory_bytes: self.free_memory_bytes,
+            free_gpu_count: self.free_gpu_count,
         }
-        capacity
     }
 }
 
@@ -386,7 +495,6 @@ pub(super) struct RemoteStartPlan {
     pub(super) memory_bytes: u64,
     pub(super) gpu_count: u32,
     pub(super) peer_id: Uuid,
-    pub(super) scheduler_version: u64,
     pub(super) restart_policy: Option<TaskRestartPolicy>,
     pub(super) termination_grace_period_secs: Option<u32>,
     pub(super) pre_stop_command: Option<Vec<String>>,
@@ -568,15 +676,13 @@ impl TaskManager {
             return Ok(assignment);
         }
 
-        let mut candidates = self
-            .build_candidate_queue(
-                available_slots,
-                available_gpus,
-                &readiness_map,
-                &local_ready,
-                &remaining_intents,
-            )
-            .await?;
+        let mut candidates = self.build_candidate_queue(
+            available_slots,
+            available_gpus,
+            &readiness_map,
+            &local_ready,
+            &remaining_intents,
+        )?;
         if candidates.is_empty() {
             return Err(anyhow::anyhow!(
                 "scheduler reservation failed: no available capacity across cluster"
@@ -864,6 +970,12 @@ impl TaskManager {
                 .then(
                     right
                         .digest
+                        .updated_at_unix_ms
+                        .cmp(&left.digest.updated_at_unix_ms),
+                )
+                .then(
+                    right
+                        .digest
                         .free_slot_count
                         .cmp(&left.digest.free_slot_count),
                 )
@@ -898,50 +1010,8 @@ impl TaskManager {
         Ok(hints)
     }
 
-    /// Converts one detailed scheduler summary into a concrete candidate.
-    fn candidate_from_remote_summary(
-        &self,
-        peer_id: Uuid,
-        summary: SchedulerSummary,
-        ready_networks: HashSet<Uuid>,
-    ) -> Option<Candidate> {
-        let slots: Vec<SlotChoice> = summary
-            .details
-            .iter()
-            .filter(|detail| matches!(detail.state, SchedulerSlotState::Free))
-            .map(|detail| SlotChoice {
-                slot_id: detail.slot_id,
-                capacity: SlotCapacity::new(detail.cpu_millis, detail.memory_bytes, 0),
-            })
-            .collect();
-
-        let mut gpu_devices: Vec<GpuChoice> = summary
-            .gpu_devices
-            .iter()
-            .filter(|device| matches!(device.state, SchedulerGpuState::Free))
-            .map(|device| GpuChoice {
-                device_id: device.device_id.clone(),
-            })
-            .collect();
-        gpu_devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-        if !summary.gpu_runtime_ready {
-            gpu_devices.clear();
-        }
-
-        Candidate::new(
-            CandidateLocation::Remote {
-                peer_id,
-                version: summary.version,
-            },
-            slots,
-            gpu_devices,
-            ready_networks,
-        )
-    }
-
-    /// Build the round-robin candidate queue starting with the local node and then
-    /// hydrating only the digest-ranked remote peers needed for this workload.
-    async fn build_candidate_queue(
+    /// Builds the round-robin candidate queue from local exact capacity plus digest-backed remotes.
+    fn build_candidate_queue(
         &self,
         local_slots: Vec<SlotChoice>,
         local_gpus: Vec<GpuChoice>,
@@ -952,12 +1022,8 @@ impl TaskManager {
         let mut queue = VecDeque::new();
         let mut provided_capacity = CandidateCapacity::default();
         if self.core.registry.peer_schedulable(self.local_node_id)
-            && let Some(local_candidate) = Candidate::new(
-                CandidateLocation::Local,
-                local_slots,
-                local_gpus,
-                local_ready.clone(),
-            )
+            && let Some(local_candidate) =
+                Candidate::new_local(local_slots, local_gpus, local_ready.clone())
         {
             provided_capacity.add_candidate(&local_candidate);
             queue.push_back(local_candidate);
@@ -965,49 +1031,33 @@ impl TaskManager {
 
         let demand = WorkloadDemand::from_intents(intents);
         let hints = self.build_remote_candidate_hints(intents, readiness)?;
+        let minimum_candidate_nodes = usize::min(demand.task_count as usize, hints.len() + 1);
         let required_target_nodes: HashSet<Uuid> = hints
             .iter()
             .filter(|hint| hint.targeted)
             .map(|hint| hint.peer_id)
             .collect();
-        let mut hydrated_target_nodes = HashSet::new();
+        let mut included_target_nodes = HashSet::new();
 
         for hint in hints {
             if capacity_covers_workload(provided_capacity, demand)
-                && hydrated_target_nodes.len() == required_target_nodes.len()
+                && queue.len() >= minimum_candidate_nodes
+                && included_target_nodes.len() == required_target_nodes.len()
             {
                 break;
             }
 
-            let summary = match self
-                .core
-                .scheduler
-                .fetch_remote_summary(hint.peer_id, true)
-                .await
-            {
-                Ok(summary) => summary,
-                Err(err) => {
-                    debug!(
-                        target: "task",
-                        "scheduler summary fetch failed for shortlisted peer {}: {err}",
-                        hint.peer_id
-                    );
-                    if hint.targeted {
-                        hydrated_target_nodes.insert(hint.peer_id);
-                    }
-                    continue;
-                }
-            };
-
-            if let Some(candidate) =
-                self.candidate_from_remote_summary(hint.peer_id, summary, hint.ready_networks)
-            {
+            if let Some(candidate) = Candidate::new_remote(
+                hint.peer_id,
+                hint.digest.clone(),
+                hint.ready_networks.clone(),
+            ) {
                 provided_capacity.add_candidate(&candidate);
                 queue.push_back(candidate);
             }
 
             if hint.targeted {
-                hydrated_target_nodes.insert(hint.peer_id);
+                included_target_nodes.insert(hint.peer_id);
             }
         }
 
@@ -1036,7 +1086,7 @@ impl TaskManager {
                 .expect("candidate deque should not be empty");
             let candidate_node = match candidate.location {
                 CandidateLocation::Local => self.local_node_id,
-                CandidateLocation::Remote { peer_id, .. } => peer_id,
+                CandidateLocation::Remote { peer_id } => peer_id,
             };
 
             if candidate_node == target_node {
@@ -1120,7 +1170,7 @@ impl TaskManager {
                             service_metadata: intent.service_metadata.clone(),
                         });
                     }
-                    CandidateLocation::Remote { peer_id, version } => {
+                    CandidateLocation::Remote { peer_id } => {
                         assignment.remote.push(RemoteStartPlan {
                             index: intent.index,
                             id: intent.id,
@@ -1132,7 +1182,6 @@ impl TaskManager {
                             memory_bytes: intent.memory_bytes,
                             gpu_count: intent.gpu_count,
                             peer_id,
-                            scheduler_version: version,
                             restart_policy: intent.restart_policy.clone(),
                             termination_grace_period_secs: intent.termination_grace_period_secs,
                             pre_stop_command: intent.pre_stop_command.clone(),
@@ -1224,7 +1273,7 @@ impl TaskManager {
                         service_metadata: intent.service_metadata.clone(),
                     });
                 }
-                CandidateLocation::Remote { peer_id, version } => {
+                CandidateLocation::Remote { peer_id } => {
                     assignment.remote.push(RemoteStartPlan {
                         index: intent.index,
                         id: intent.id,
@@ -1236,7 +1285,6 @@ impl TaskManager {
                         memory_bytes: intent.memory_bytes,
                         gpu_count: intent.gpu_count,
                         peer_id,
-                        scheduler_version: version,
                         restart_policy: intent.restart_policy.clone(),
                         termination_grace_period_secs: intent.termination_grace_period_secs,
                         pre_stop_command: intent.pre_stop_command.clone(),
@@ -1258,10 +1306,11 @@ impl TaskManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateCapacity, StartIntent, WorkloadDemand, capacity_covers_workload,
+        Candidate, CandidateCapacity, StartIntent, WorkloadDemand, capacity_covers_workload,
         digest_can_host_intent,
     };
     use crate::scheduler::digest::SchedulerDigestValue;
+    use std::collections::HashSet;
     use uuid::Uuid;
 
     /// Digest hostability checks should enforce networks and GPU runtime readiness.
@@ -1346,5 +1395,65 @@ mod tests {
 
         assert!(!capacity_covers_workload(incomplete, demand));
         assert!(capacity_covers_workload(complete, demand));
+    }
+
+    /// Remote digest candidates should consume aggregate advisory capacity as placements are assigned.
+    #[test]
+    fn remote_digest_candidate_tracks_aggregate_capacity() {
+        let peer_id = Uuid::new_v4();
+        let mut candidate = Candidate::new_remote(
+            peer_id,
+            SchedulerDigestValue {
+                node_id: peer_id,
+                snapshot_version: 4,
+                updated_at_unix_ms: 11,
+                free_slot_count: 3,
+                free_cpu_millis: 1_500,
+                free_memory_bytes: 1536 * 1_024 * 1_024,
+                largest_free_slot_cpu_millis: 750,
+                largest_free_slot_memory_bytes: 768 * 1_024 * 1_024,
+                free_gpu_count: 1,
+                gpu_runtime_ready: true,
+            },
+            HashSet::new(),
+        )
+        .expect("remote candidate");
+
+        let allocation = candidate
+            .allocate(500, 512 * 1_024 * 1_024, 1)
+            .expect("first remote placement should fit");
+        assert!(allocation.slots.is_empty());
+        assert!(allocation.gpu_device_ids.is_empty());
+
+        let remaining = candidate.capacity();
+        assert_eq!(remaining.free_slot_count, 2);
+        assert_eq!(remaining.free_cpu_millis, 1_000);
+        assert_eq!(remaining.free_memory_bytes, 1024 * 1_024 * 1_024);
+        assert_eq!(remaining.free_gpu_count, 0);
+    }
+
+    /// Remote digest candidates should reject requests whose minimum slot count already exceeds the digest.
+    #[test]
+    fn remote_digest_candidate_rejects_impossible_slot_lower_bound() {
+        let peer_id = Uuid::new_v4();
+        let mut candidate = Candidate::new_remote(
+            peer_id,
+            SchedulerDigestValue {
+                node_id: peer_id,
+                snapshot_version: 2,
+                updated_at_unix_ms: 9,
+                free_slot_count: 1,
+                free_cpu_millis: 1_000,
+                free_memory_bytes: 1024 * 1_024 * 1_024,
+                largest_free_slot_cpu_millis: 500,
+                largest_free_slot_memory_bytes: 1024 * 1_024 * 1_024,
+                free_gpu_count: 0,
+                gpu_runtime_ready: true,
+            },
+            HashSet::new(),
+        )
+        .expect("remote candidate");
+
+        assert!(candidate.allocate(900, 128 * 1_024 * 1_024, 0).is_none());
     }
 }

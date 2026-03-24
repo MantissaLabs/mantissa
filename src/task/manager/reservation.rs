@@ -27,7 +27,7 @@ pub(super) struct ReservedResources {
     pub(super) gpu_device_ids: Vec<String>,
 }
 
-/// Tracks slot reservations that happened on a peer so they can be released on rollback.
+/// Tracks prepared remote leases so they can be aborted on rollback.
 pub(super) struct RemoteReservation {
     pub(super) leases: Vec<RemoteLeaseReservation>,
 }
@@ -219,7 +219,7 @@ impl TaskManager {
         );
     }
 
-    /// Reserves slots and GPUs on remote peers grouped per node, returning the reservations map.
+    /// Prepares remote leases grouped per target node and returns the rollback map.
     pub(super) async fn reserve_remote_resources(
         &self,
         plans: &[RemoteStartPlan],
@@ -273,15 +273,10 @@ impl TaskManager {
                     }
                 };
 
-            let mut reserve_req = scheduler_client.prepare_leases_request();
+            let mut prepare_req = scheduler_client.prepare_leases_request();
             {
-                let mut inner = reserve_req.get().init_request();
+                let mut inner = prepare_req.get().init_request();
                 inner.set_coordinator_node_id(self.local_node_id.as_bytes());
-                let expected_version = peer_plans
-                    .first()
-                    .map(|plan| plan.scheduler_version)
-                    .unwrap_or(0);
-                inner.set_expected_version(expected_version);
                 inner.set_ttl_ms(30_000);
                 let mut intents_builder = inner.reborrow().init_intents(peer_plans.len() as u32);
                 for (idx, plan) in peer_plans.iter().enumerate() {
@@ -293,7 +288,7 @@ impl TaskManager {
                 }
             }
 
-            match reserve_req.send().promise.await {
+            match prepare_req.send().promise.await {
                 Ok(resp) => match resp.get() {
                     Ok(result) => match result.get_response() {
                         Ok(response) => {

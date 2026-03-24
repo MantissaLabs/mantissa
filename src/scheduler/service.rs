@@ -80,7 +80,6 @@ impl scheduler::Server for SchedulerService {
     ) -> Result<(), capnp::Error> {
         let request = params.get()?.get_request()?;
         let coordinator_node_id = Self::parse_uuid(request.get_coordinator_node_id()?)?;
-        let expected_version = request.get_expected_version();
         let ttl_ms = request.get_ttl_ms();
         let intents = request.get_intents()?;
 
@@ -97,12 +96,11 @@ impl scheduler::Server for SchedulerService {
 
         let prepared = self
             .scheduler
-            .prepare_task_leases(coordinator_node_id, expected_version, ttl_ms, reservations)
+            .prepare_task_leases(coordinator_node_id, ttl_ms, reservations)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
 
         let mut response = results.get().init_response();
-        response.set_new_version(prepared.new_version);
         let mut leases = response
             .reborrow()
             .init_leases(prepared.leases.len() as u32);

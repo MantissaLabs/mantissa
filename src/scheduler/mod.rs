@@ -197,10 +197,9 @@ pub struct PreparedTaskLease {
     pub gpu_device_ids: Vec<String>,
 }
 
-/// Successful prepared lease response containing the current scheduler version and lease bindings.
+/// Successful prepared lease response containing exact bindings chosen locally for one batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedTaskLeaseBatch {
-    pub new_version: u64,
     pub leases: Vec<PreparedTaskLease>,
 }
 
@@ -1165,20 +1164,11 @@ impl Scheduler {
     pub async fn prepare_task_leases(
         &self,
         coordinator_node_id: Uuid,
-        expected_version: u64,
         ttl_ms: u64,
         intents: Vec<TaskLeaseIntent>,
     ) -> Result<PreparedTaskLeaseBatch, SchedulerError> {
         if intents.is_empty() {
-            return self
-                .state
-                .load_full()
-                .as_ref()
-                .ok_or(SchedulerError::Uninitialized)
-                .map(|state| PreparedTaskLeaseBatch {
-                    new_version: state.snapshot.version,
-                    leases: Vec::new(),
-                });
+            return Ok(PreparedTaskLeaseBatch { leases: Vec::new() });
         }
 
         loop {
@@ -1188,14 +1178,6 @@ impl Scheduler {
                 None => return Err(SchedulerError::Uninitialized),
             };
             let current = current_arc.as_ref();
-
-            if current.snapshot.version != expected_version {
-                return Err(SchedulerError::SnapshotMismatch {
-                    expected_version,
-                    current_version: current.snapshot.version,
-                    snapshot: current.snapshot.clone(),
-                });
-            }
 
             let mut new_snapshot = current.snapshot.clone();
             let now_unix_ms = current_unix_ms();
@@ -1293,10 +1275,7 @@ impl Scheduler {
             }
 
             self.publish_digest_from_snapshot(&new_snapshot).await;
-            return Ok(PreparedTaskLeaseBatch {
-                new_version: new_snapshot.version,
-                leases,
-            });
+            return Ok(PreparedTaskLeaseBatch { leases });
         }
     }
 
@@ -2039,7 +2018,6 @@ mod tests {
         let prepared = scheduler
             .prepare_task_leases(
                 Uuid::new_v4(),
-                0,
                 30_000,
                 vec![
                     TaskLeaseIntent {
@@ -2059,7 +2037,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(prepared.new_version, 1);
         assert_eq!(prepared.leases.len(), 2);
         assert_eq!(prepared.leases[0].task_id, task_a);
         assert_eq!(prepared.leases[0].slot_ids, vec![1, 3]);
@@ -2090,7 +2067,6 @@ mod tests {
         let err = scheduler
             .prepare_task_leases(
                 Uuid::new_v4(),
-                0,
                 30_000,
                 vec![
                     TaskLeaseIntent {
@@ -2162,7 +2138,6 @@ mod tests {
         let prepared = scheduler
             .prepare_task_leases(
                 Uuid::new_v4(),
-                0,
                 30_000,
                 vec![TaskLeaseIntent {
                     task_id,
@@ -2217,7 +2192,6 @@ mod tests {
         let prepared = scheduler
             .prepare_task_leases(
                 coordinator,
-                0,
                 30_000,
                 vec![TaskLeaseIntent {
                     task_id,
@@ -2284,7 +2258,6 @@ mod tests {
         let prepared = scheduler
             .prepare_task_leases(
                 coordinator,
-                0,
                 30_000,
                 vec![TaskLeaseIntent {
                     task_id,
@@ -2337,7 +2310,6 @@ mod tests {
         let prepared = scheduler
             .prepare_task_leases(
                 Uuid::new_v4(),
-                0,
                 1,
                 vec![TaskLeaseIntent {
                     task_id: Uuid::new_v4(),

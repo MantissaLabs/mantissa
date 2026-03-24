@@ -212,21 +212,15 @@ struct PrepareLeasesRequest {
   coordinatorNodeId @0 :Data;
   # 16-byte UUID of the node coordinating this placement batch.
 
-  expectedVersion @1 :UInt64;
-  # Expected scheduler version for optimistic shortlisting retries.
-
-  ttlMs @2 :UInt64;
+  ttlMs @1 :UInt64;
   # Lease lifetime in milliseconds from prepare time.
 
-  intents @3 :List(LeaseIntent);
+  intents @2 :List(LeaseIntent);
   # Resource requests to satisfy atomically on this target node.
 }
 
 struct PrepareLeasesResponse {
-  newVersion @0 :UInt64;
-  # Updated scheduler version after preparing the leases.
-
-  leases @1 :List(PreparedLease);
+  leases @0 :List(PreparedLease);
   # Prepared leases with exact bindings chosen locally by the target node.
 }
 
