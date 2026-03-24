@@ -4,11 +4,11 @@ interface Scheduler {
   summary @0 (request :SummaryRequest) -> (summary :Summary);
   # Fetch a scheduling summary for a node, optionally with details.
 
-  reserveResources @1 (request :ReserveResourcesRequest) -> (response :ReserveResourcesResponse);
-  # Reserve resources by letting the target node choose exact slots and GPUs locally.
+  prepareLeases @1 (request :PrepareLeasesRequest) -> (response :PrepareLeasesResponse);
+  # Prepare short-lived resource leases by letting the target node choose exact bindings locally.
 
-  releaseSlots @2 (request :ReleaseSlotsRequest) -> (response :ReleaseSlotsResponse);
-  # Release reserved slots using optimistic version checks.
+  abortLeases @2 (request :AbortLeasesRequest) -> ();
+  # Abort prepared leases that are no longer needed.
 }
 
 enum SlotState {
@@ -177,9 +177,9 @@ struct SummaryRequest {
   # True to include per-slot details in the summary.
 }
 
-struct ResourceReservationIntent {
+struct LeaseIntent {
   taskId @0 :Data;
-  # 16-byte UUID of the task that will own the reservation.
+  # 16-byte UUID of the task that will own the prepared lease.
 
   cpuMillis @1 :UInt64;
   # Requested CPU reservation in milli-cores.
@@ -191,45 +191,57 @@ struct ResourceReservationIntent {
   # Requested number of GPU devices.
 }
 
-struct ReservedTaskResources {
-  taskId @0 :Data;
-  # 16-byte UUID of the task associated with this allocation.
+struct PreparedLease {
+  leaseId @0 :Data;
+  # 16-byte UUID identifying the prepared lease.
 
-  slotIds @1 :List(UInt64);
+  taskId @1 :Data;
+  # 16-byte UUID of the task associated with this lease.
+
+  expiresAtUnixMs @2 :UInt64;
+  # Absolute wall-clock expiry used to reclaim leaked prepared leases.
+
+  slotIds @3 :List(UInt64);
   # Exact slot identifiers chosen by the target node.
 
-  gpuDeviceIds @2 :List(Text);
+  gpuDeviceIds @4 :List(Text);
   # Exact GPU device identifiers chosen by the target node.
 }
 
-struct ReserveResourcesRequest {
-  expectedVersion @0 :UInt64;
-  # Expected scheduler version for optimistic locking.
+struct PrepareLeasesRequest {
+  coordinatorNodeId @0 :Data;
+  # 16-byte UUID of the node coordinating this placement batch.
 
-  intents @1 :List(ResourceReservationIntent);
+  expectedVersion @1 :UInt64;
+  # Expected scheduler version for optimistic shortlisting retries.
+
+  ttlMs @2 :UInt64;
+  # Lease lifetime in milliseconds from prepare time.
+
+  intents @3 :List(LeaseIntent);
   # Resource requests to satisfy atomically on this target node.
 }
 
-struct ReserveResourcesResponse {
+struct PrepareLeasesResponse {
   newVersion @0 :UInt64;
-  # Updated scheduler version after applying reservations.
+  # Updated scheduler version after preparing the leases.
 
-  bindings @1 :List(ReservedTaskResources);
-  # Exact task-to-slot/GPU bindings chosen locally by the target node.
+  leases @1 :List(PreparedLease);
+  # Prepared leases with exact bindings chosen locally by the target node.
 }
 
-struct ReleaseSlotsRequest {
-  expectedVersion @0 :UInt64;
-  # Expected scheduler version for optimistic locking.
+struct AbortLeaseIntent {
+  leaseId @0 :Data;
+  # 16-byte UUID of the prepared lease to release.
 
-  slotIds @1 :List(UInt64);
-  # Slot identifiers to release.
-
-  gpuDeviceIds @2 :List(Text);
-  # GPU device identifiers to release.
+  taskId @1 :Data;
+  # 16-byte UUID of the task that originally owned the lease.
 }
 
-struct ReleaseSlotsResponse {
-  newVersion @0 :UInt64;
-  # Updated scheduler version after releasing reservations.
+struct AbortLeasesRequest {
+  coordinatorNodeId @0 :Data;
+  # 16-byte UUID of the node coordinating this placement batch.
+
+  intents @1 :List(AbortLeaseIntent);
+  # Prepared leases to abort. Missing or expired leases are treated as already released.
 }

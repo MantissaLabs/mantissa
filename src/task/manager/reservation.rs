@@ -29,9 +29,12 @@ pub(super) struct ReservedResources {
 
 /// Tracks slot reservations that happened on a peer so they can be released on rollback.
 pub(super) struct RemoteReservation {
-    pub(super) slots: Vec<SlotId>,
-    pub(super) gpu_device_ids: Vec<String>,
-    pub(super) version: u64,
+    pub(super) leases: Vec<RemoteLeaseReservation>,
+}
+
+pub(super) struct RemoteLeaseReservation {
+    pub(super) lease_id: Uuid,
+    pub(super) task_id: Uuid,
 }
 
 fn is_scheduler_retryable_message(message: &str) -> bool {
@@ -41,6 +44,7 @@ fn is_scheduler_retryable_message(message: &str) -> bool {
         || message.contains("gpu devices unavailable")
         || message.contains("unknown gpu devices")
         || message.contains("insufficient resources")
+        || message.contains("expired leases")
 }
 
 fn parse_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, anyhow::Error> {
@@ -269,14 +273,16 @@ impl TaskManager {
                     }
                 };
 
-            let mut reserve_req = scheduler_client.reserve_resources_request();
+            let mut reserve_req = scheduler_client.prepare_leases_request();
             {
                 let mut inner = reserve_req.get().init_request();
+                inner.set_coordinator_node_id(self.local_node_id.as_bytes());
                 let expected_version = peer_plans
                     .first()
                     .map(|plan| plan.scheduler_version)
                     .unwrap_or(0);
                 inner.set_expected_version(expected_version);
+                inner.set_ttl_ms(30_000);
                 let mut intents_builder = inner.reborrow().init_intents(peer_plans.len() as u32);
                 for (idx, plan) in peer_plans.iter().enumerate() {
                     let mut entry = intents_builder.reborrow().get(idx as u32);
@@ -292,7 +298,7 @@ impl TaskManager {
                     Ok(result) => match result.get_response() {
                         Ok(response) => {
                             let mut bindings_by_task = HashMap::new();
-                            let bindings = match response.get_bindings() {
+                            let leases = match response.get_leases() {
                                 Ok(bindings) => bindings,
                                 Err(err) => {
                                     self.release_remote_resources(&reservations).await;
@@ -301,8 +307,23 @@ impl TaskManager {
                                     )));
                                 }
                             };
-                            for binding in bindings.iter() {
-                                let task_id = match binding.get_task_id() {
+                            for lease in leases.iter() {
+                                let lease_id = match lease.get_lease_id() {
+                                    Ok(bytes) => match parse_uuid(bytes) {
+                                        Ok(lease_id) => lease_id,
+                                        Err(err) => {
+                                            self.release_remote_resources(&reservations).await;
+                                            return Err(ExecutionError::Fatal(err));
+                                        }
+                                    },
+                                    Err(err) => {
+                                        self.release_remote_resources(&reservations).await;
+                                        return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                                            err.to_string()
+                                        )));
+                                    }
+                                };
+                                let task_id = match lease.get_task_id() {
                                     Ok(bytes) => match parse_uuid(bytes) {
                                         Ok(task_id) => task_id,
                                         Err(err) => {
@@ -317,7 +338,8 @@ impl TaskManager {
                                         )));
                                     }
                                 };
-                                let slot_ids = match binding.get_slot_ids() {
+                                let expires_at_unix_ms = lease.get_expires_at_unix_ms();
+                                let slot_ids = match lease.get_slot_ids() {
                                     Ok(ids) => ids.iter().collect::<Vec<_>>(),
                                     Err(err) => {
                                         self.release_remote_resources(&reservations).await;
@@ -326,7 +348,7 @@ impl TaskManager {
                                         )));
                                     }
                                 };
-                                let gpu_devices = match binding.get_gpu_device_ids() {
+                                let gpu_devices = match lease.get_gpu_device_ids() {
                                     Ok(ids) => ids,
                                     Err(err) => {
                                         self.release_remote_resources(&reservations).await;
@@ -360,7 +382,10 @@ impl TaskManager {
                                 }
 
                                 if bindings_by_task
-                                    .insert(task_id, (slot_ids, gpu_device_ids))
+                                    .insert(
+                                        task_id,
+                                        (lease_id, expires_at_unix_ms, slot_ids, gpu_device_ids),
+                                    )
                                     .is_some()
                                 {
                                     self.release_remote_resources(&reservations).await;
@@ -369,11 +394,14 @@ impl TaskManager {
                                     )));
                                 }
                             }
-                            let mut slots = Vec::new();
-                            let mut gpu_device_ids = Vec::new();
+                            let mut lease_reservations = Vec::new();
                             for plan in &peer_plans {
-                                let Some((prepared_slot_ids, prepared_gpu_ids)) =
-                                    bindings_by_task.remove(&plan.id)
+                                let Some((
+                                    lease_id,
+                                    _expires_at_unix_ms,
+                                    prepared_slot_ids,
+                                    prepared_gpu_ids,
+                                )) = bindings_by_task.remove(&plan.id)
                                 else {
                                     self.release_remote_resources(&reservations).await;
                                     return Err(ExecutionError::Fatal(anyhow::anyhow!(
@@ -403,11 +431,15 @@ impl TaskManager {
                                     )));
                                 }
 
-                                slots.extend(prepared_slot_ids.iter().copied());
-                                gpu_device_ids.extend(prepared_gpu_ids.iter().cloned());
+                                lease_reservations.push(RemoteLeaseReservation {
+                                    lease_id,
+                                    task_id: plan.id,
+                                });
                                 prepared_plans.push(PreparedRemoteStartPlan {
                                     index: plan.index,
                                     id: plan.id,
+                                    lease_id,
+                                    lease_coordinator_node_id: self.local_node_id,
                                     name: plan.name.clone(),
                                     image: plan.image.clone(),
                                     command: plan.command.clone(),
@@ -438,13 +470,10 @@ impl TaskManager {
                                 )));
                             }
 
-                            let version = response.get_new_version();
                             reservations.insert(
                                 peer_id,
                                 RemoteReservation {
-                                    slots,
-                                    gpu_device_ids,
-                                    version,
+                                    leases: lease_reservations,
                                 },
                             );
                         }
@@ -480,7 +509,7 @@ impl TaskManager {
         Ok((reservations, prepared_plans))
     }
 
-    /// Releases remote reservations accumulated during previous stages.
+    /// Aborts prepared remote leases accumulated during previous stages.
     pub(super) async fn release_remote_resources(
         &self,
         reservations: &HashMap<Uuid, RemoteReservation>,
@@ -491,7 +520,7 @@ impl TaskManager {
                 Err(err) => {
                     warn!(
                         target: "task",
-                        "failed to reopen session with peer {peer_id} while releasing slots: {err}"
+                        "failed to reopen session with peer {peer_id} while aborting leases: {err}"
                     );
                     continue;
                 }
@@ -510,7 +539,7 @@ impl TaskManager {
                         Err(err) => {
                             warn!(
                                 target: "task",
-                                "failed to access scheduler for peer {peer_id} while releasing slots: {err}"
+                                "failed to access scheduler for peer {peer_id} while aborting leases: {err}"
                             );
                             continue;
                         }
@@ -532,29 +561,24 @@ impl TaskManager {
                 }
             };
 
-            let mut release_req = scheduler_client.release_slots_request();
+            let mut release_req = scheduler_client.abort_leases_request();
             {
                 let mut inner = release_req.get().init_request();
-                inner.set_expected_version(reservation.version);
-                let mut ids_builder = inner
+                inner.set_coordinator_node_id(self.local_node_id.as_bytes());
+                let mut intents = inner
                     .reborrow()
-                    .init_slot_ids(reservation.slots.len() as u32);
-                for (idx, slot_id) in reservation.slots.iter().enumerate() {
-                    ids_builder.set(idx as u32, *slot_id);
-                }
-
-                let mut gpu_builder = inner
-                    .reborrow()
-                    .init_gpu_device_ids(reservation.gpu_device_ids.len() as u32);
-                for (idx, device_id) in reservation.gpu_device_ids.iter().enumerate() {
-                    gpu_builder.set(idx as u32, device_id);
+                    .init_intents(reservation.leases.len() as u32);
+                for (idx, lease) in reservation.leases.iter().enumerate() {
+                    let mut entry = intents.reborrow().get(idx as u32);
+                    entry.set_lease_id(lease.lease_id.as_bytes());
+                    entry.set_task_id(lease.task_id.as_bytes());
                 }
             }
 
             if let Err(err) = release_req.send().promise.await {
                 warn!(
                     target: "task",
-                    "failed to release slots on peer {peer_id}: {err}"
+                    "failed to abort leases on peer {peer_id}: {err}"
                 );
             }
         }
@@ -704,6 +728,8 @@ impl TaskManager {
                 volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),
                 service_metadata: plan.service_metadata.clone(),
+                lease_id: Some(plan.lease_id),
+                lease_coordinator_node_id: Some(plan.lease_coordinator_node_id),
                 task_epoch,
                 phase_version: 0,
                 launch_attempt: 0,

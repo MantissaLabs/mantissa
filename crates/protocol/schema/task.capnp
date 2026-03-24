@@ -300,6 +300,12 @@ struct TaskSpec {
 
   tty @29 :Bool;
   # Whether the task runtime was created with an allocated terminal.
+
+  leaseId @30 :Data;
+  # 16-byte UUID of the prepared scheduler lease, empty when the task is already committed.
+
+  leaseCoordinatorNodeId @31 :Data;
+  # 16-byte UUID of the node that coordinated the prepared lease, empty when unset.
 }
 
 struct TaskStatus {

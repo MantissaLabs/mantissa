@@ -16,7 +16,8 @@ use uuid::Uuid;
 use crate::gossip::Message;
 use crate::network::types::{NetworkAttachmentState, NetworkAttachmentValue};
 use crate::scheduler::{
-    GpuReservationRequest, SchedulerError, SlotId, SlotReservationRequest, SlotState,
+    GpuReservationRequest, LeaseReservation, SchedulerError, SlotId, SlotReservationRequest,
+    SlotState,
 };
 use crate::task::causality::{parse_task_timestamp, task_event_id};
 use crate::task::container::ContainerState;
@@ -485,6 +486,177 @@ impl TaskManager {
     ///
     /// This closes races where reconciliation starts from a slot-assigned snapshot but later
     /// reads a newer CRDT value with missing or mismatched scheduler ownership.
+    async fn clear_task_lease_metadata(&self, spec: &TaskSpec) -> Result<TaskSpec, anyhow::Error> {
+        if spec.lease_id.is_none() && spec.lease_coordinator_node_id.is_none() {
+            return Ok(spec.clone());
+        }
+
+        let mut cleared = spec.clone();
+        cleared.lease_id = None;
+        cleared.lease_coordinator_node_id = None;
+        cleared.updated_at = Utc::now().to_rfc3339();
+
+        if let Err(err) = self.persist_spec(&cleared).await {
+            warn!(
+                target: "task",
+                task = %cleared.id,
+                "failed to persist cleared task lease metadata: {err}"
+            );
+        } else if let Err(err) = self
+            .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(cleared.clone())))
+            .await
+        {
+            warn!(
+                target: "task",
+                task = %cleared.id,
+                "failed to gossip cleared task lease metadata: {err}"
+            );
+        }
+
+        Ok(cleared)
+    }
+
+    /// Commits a prepared scheduler lease for one pending local task before launch work begins.
+    async fn ensure_task_lease_commit(&self, spec: &TaskSpec) -> Result<TaskSpec, anyhow::Error> {
+        let Some(lease_id) = spec.lease_id else {
+            return Ok(spec.clone());
+        };
+        let coordinator_node_id = spec.lease_coordinator_node_id.ok_or_else(|| {
+            anyhow!(
+                "task {} ({}) carries lease {} without coordinator metadata",
+                spec.name,
+                spec.id,
+                lease_id
+            )
+        })?;
+
+        let snapshot = self
+            .core
+            .scheduler
+            .snapshot()
+            .await
+            .ok_or_else(|| anyhow!("scheduler snapshot unavailable"))?;
+
+        let mut fully_committed = true;
+        for slot_id in &spec.slot_ids {
+            let slot = snapshot
+                .slots
+                .iter()
+                .find(|slot| slot.slot_id == *slot_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "task {} ({}) references unknown scheduler slot {}",
+                        spec.name,
+                        spec.id,
+                        slot_id
+                    )
+                })?;
+
+            match &slot.state {
+                SlotState::Reserved(reservation)
+                    if reservation.owner == self.local_node_id
+                        && reservation.task_id == Some(spec.id) => {}
+                SlotState::Leased(lease)
+                    if lease.lease_id == lease_id
+                        && lease.coordinator_node_id == coordinator_node_id
+                        && lease.task_id == spec.id =>
+                {
+                    fully_committed = false;
+                }
+                SlotState::Reserved(reservation) => {
+                    return Err(anyhow!(
+                        "task {} ({}) requires slot {} but it is reserved by {} ({:?})",
+                        spec.name,
+                        spec.id,
+                        slot_id,
+                        reservation.owner,
+                        reservation.task_id
+                    ));
+                }
+                SlotState::Leased(lease) => {
+                    return Err(anyhow!(
+                        "task {} ({}) lease {} does not match slot {} lease {}",
+                        spec.name,
+                        spec.id,
+                        lease_id,
+                        slot_id,
+                        lease.lease_id
+                    ));
+                }
+                SlotState::Free => {
+                    fully_committed = false;
+                }
+            }
+        }
+
+        for device_id in &spec.gpu_device_ids {
+            let device = snapshot
+                .gpu_devices
+                .iter()
+                .find(|device| device.device_id == *device_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "task {} ({}) references unknown gpu device {}",
+                        spec.name,
+                        spec.id,
+                        device_id
+                    )
+                })?;
+
+            match &device.state {
+                crate::scheduler::GpuDeviceState::Reserved(reservation)
+                    if reservation.owner == self.local_node_id
+                        && reservation.task_id == Some(spec.id) => {}
+                crate::scheduler::GpuDeviceState::Leased(lease)
+                    if lease.lease_id == lease_id
+                        && lease.coordinator_node_id == coordinator_node_id
+                        && lease.task_id == spec.id =>
+                {
+                    fully_committed = false;
+                }
+                crate::scheduler::GpuDeviceState::Reserved(reservation) => {
+                    return Err(anyhow!(
+                        "task {} ({}) requires gpu device {} but it is reserved by {} ({:?})",
+                        spec.name,
+                        spec.id,
+                        device_id,
+                        reservation.owner,
+                        reservation.task_id
+                    ));
+                }
+                crate::scheduler::GpuDeviceState::Leased(lease) => {
+                    return Err(anyhow!(
+                        "task {} ({}) lease {} does not match gpu device {} lease {}",
+                        spec.name,
+                        spec.id,
+                        lease_id,
+                        device_id,
+                        lease.lease_id
+                    ));
+                }
+                crate::scheduler::GpuDeviceState::Free => {
+                    fully_committed = false;
+                }
+            }
+        }
+
+        if !fully_committed {
+            self.core
+                .scheduler
+                .commit_task_lease(
+                    lease_id,
+                    coordinator_node_id,
+                    spec.id,
+                    &spec.slot_ids,
+                    &spec.gpu_device_ids,
+                )
+                .await
+                .map_err(anyhow::Error::from)?;
+        }
+
+        self.clear_task_lease_metadata(spec).await
+    }
+
     async fn ensure_task_slot_reservations(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
         if spec.slot_ids.is_empty() {
             return Err(anyhow!(
@@ -534,11 +706,29 @@ impl TaskManager {
                     SlotState::Reserved(reservation)
                         if reservation.owner == self.local_node_id
                             && reservation.task_id == Some(spec.id) => {}
+                    SlotState::Leased(LeaseReservation {
+                        lease_id,
+                        coordinator_node_id,
+                        task_id,
+                        ..
+                    }) if spec.lease_id == Some(*lease_id)
+                        && spec.lease_coordinator_node_id == Some(*coordinator_node_id)
+                        && *task_id == spec.id => {}
                     SlotState::Free => requests.push(SlotReservationRequest {
                         slot_id: *slot_id,
                         owner: self.local_node_id,
                         task_id: Some(spec.id),
                     }),
+                    SlotState::Leased(lease) => {
+                        return Err(anyhow!(
+                            "task {} ({}) requires slot {} but it is leased by coordinator {} for task {}",
+                            spec.name,
+                            spec.id,
+                            slot_id,
+                            lease.coordinator_node_id,
+                            lease.task_id
+                        ));
+                    }
                     SlotState::Reserved(reservation) => {
                         return Err(anyhow!(
                             "task {} ({}) requires slot {} but it is reserved by {} ({:?})",
@@ -1711,6 +1901,7 @@ impl TaskManager {
 
         // Guard launch with scheduler ownership so local start never proceeds without concrete
         // reservations for this task.
+        working = self.ensure_task_lease_commit(&working).await?;
         self.ensure_task_slot_reservations(&working).await?;
 
         if let Err(err) = self.pull_image_for_task(working.id, &working.image).await {
@@ -1750,6 +1941,7 @@ impl TaskManager {
         }
         // Re-check after pull because phase updates and concurrent CRDT writes may have changed
         // the persisted assignment while the image was downloading.
+        working = self.ensure_task_lease_commit(&working).await?;
         self.ensure_task_slot_reservations(&working).await?;
         if !matches!(working.state, ContainerState::Creating)
             || working.phase_reason.is_some()
@@ -2539,6 +2731,13 @@ impl TaskManager {
 
     /// Periodically reconciles all locally owned tasks so missed gossip updates still apply.
     pub(super) async fn reconcile_local_tasks(&self) -> Result<(), anyhow::Error> {
+        if let Err(err) = self.core.scheduler.reap_expired_leases().await {
+            warn!(
+                target: "task",
+                "failed to reap expired scheduler leases during reconcile: {err}"
+            );
+        }
+
         let runtime_inventory = match self.list_runtime_inventory().await {
             Ok(inventory) => Some(inventory),
             Err(err) => {
@@ -2942,6 +3141,18 @@ impl TaskManager {
                             task_id: Some(task_id),
                         });
                     }
+                    SlotState::Leased(lease) => {
+                        if lease.task_id != task_id {
+                            warn!(
+                                target: "task",
+                                slot_id = slot.slot_id,
+                                coordinator = %lease.coordinator_node_id,
+                                lease_task = %lease.task_id,
+                                expected_task = %task_id,
+                                "slot needed by local task is leased for another pending task"
+                            );
+                        }
+                    }
                     SlotState::Reserved(reservation) => {
                         if reservation.owner != self.local_node_id {
                             warn!(
@@ -2967,6 +3178,18 @@ impl TaskManager {
                             owner: self.local_node_id,
                             task_id: Some(task_id),
                         });
+                    }
+                    crate::scheduler::GpuDeviceState::Leased(lease) => {
+                        if lease.task_id != task_id {
+                            warn!(
+                                target: "task",
+                                device_id = device.device_id.as_str(),
+                                coordinator = %lease.coordinator_node_id,
+                                lease_task = %lease.task_id,
+                                expected_task = %task_id,
+                                "gpu device needed by local task is leased for another pending task"
+                            );
+                        }
                     }
                     crate::scheduler::GpuDeviceState::Reserved(reservation) => {
                         if reservation.owner != self.local_node_id {

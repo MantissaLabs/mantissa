@@ -2145,6 +2145,8 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             service_metadata: Some(TaskServiceMetadata::new(service_name, "backend")),
+            lease_id: None,
+            lease_coordinator_node_id: None,
             task_epoch: 0,
             phase_version: 0,
             launch_attempt: 0,

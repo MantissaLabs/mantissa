@@ -248,6 +248,8 @@ mod tests {
             volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: None,
+            lease_id: None,
+            lease_coordinator_node_id: None,
             task_epoch: 3,
             phase_version: 9,
             launch_attempt: 0,

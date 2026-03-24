@@ -52,6 +52,10 @@ pub struct TaskSpec {
     #[serde(default)]
     pub service_metadata: Option<TaskServiceMetadata>,
     #[serde(default)]
+    pub lease_id: Option<Uuid>,
+    #[serde(default)]
+    pub lease_coordinator_node_id: Option<Uuid>,
+    #[serde(default)]
     pub task_epoch: u64,
     #[serde(default)]
     pub phase_version: u64,
@@ -253,6 +257,10 @@ pub struct TaskValue {
     #[serde(default)]
     pub service_metadata: Option<TaskServiceMetadata>,
     #[serde(default)]
+    pub lease_id: Option<Uuid>,
+    #[serde(default)]
+    pub lease_coordinator_node_id: Option<Uuid>,
+    #[serde(default)]
     pub task_epoch: u64,
     #[serde(default)]
     pub phase_version: u64,
@@ -291,6 +299,8 @@ pub struct TaskValueDraft {
     pub secret_files: Vec<TaskSecretFile>,
     pub volumes: Vec<TaskVolumeMount>,
     pub service_metadata: Option<TaskServiceMetadata>,
+    pub lease_id: Option<Uuid>,
+    pub lease_coordinator_node_id: Option<Uuid>,
     pub task_epoch: u64,
     pub phase_version: u64,
     pub launch_attempt: u64,
@@ -328,6 +338,8 @@ impl TaskValue {
             secret_files: draft.secret_files,
             volumes: draft.volumes,
             service_metadata: draft.service_metadata,
+            lease_id: draft.lease_id,
+            lease_coordinator_node_id: draft.lease_coordinator_node_id,
             task_epoch: draft.task_epoch,
             phase_version: draft.phase_version,
             launch_attempt: draft.launch_attempt,

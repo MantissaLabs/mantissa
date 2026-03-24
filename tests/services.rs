@@ -5500,6 +5500,8 @@ fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
                 service_name: meta.service_name.clone(),
                 template: meta.template.clone(),
             }),
+        lease_id: spec.lease_id,
+        lease_coordinator_node_id: spec.lease_coordinator_node_id,
         task_epoch: spec.task_epoch,
         phase_version: spec.phase_version,
         launch_attempt: spec.launch_attempt,

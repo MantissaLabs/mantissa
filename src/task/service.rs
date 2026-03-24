@@ -296,6 +296,20 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     builder.set_phase_version(spec.phase_version);
     builder.set_launch_attempt(spec.launch_attempt);
     builder.set_last_terminal_observed_launch(spec.last_terminal_observed_launch.unwrap_or(0));
+    builder.set_lease_id(
+        spec.lease_id
+            .as_ref()
+            .map(Uuid::as_bytes)
+            .map(|bytes| bytes.as_slice())
+            .unwrap_or(&[]),
+    );
+    builder.set_lease_coordinator_node_id(
+        spec.lease_coordinator_node_id
+            .as_ref()
+            .map(Uuid::as_bytes)
+            .map(|bytes| bytes.as_slice())
+            .unwrap_or(&[]),
+    );
     builder.set_node_id(spec.node_id.as_bytes());
     builder.set_node_name(&spec.node_name);
 
@@ -372,6 +386,22 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     let last_terminal_observed_launch = match reader.get_last_terminal_observed_launch() {
         0 => None,
         value => Some(value),
+    };
+    let lease_id = match reader.get_lease_id() {
+        Ok(bytes) if bytes.len() == 16 => {
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(bytes);
+            Some(Uuid::from_bytes(arr))
+        }
+        _ => None,
+    };
+    let lease_coordinator_node_id = match reader.get_lease_coordinator_node_id() {
+        Ok(bytes) if bytes.len() == 16 => {
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(bytes);
+            Some(Uuid::from_bytes(arr))
+        }
+        _ => None,
     };
     let node_bytes = reader.get_node_id()?.to_owned();
     let node_slice: [u8; 16] = node_bytes
@@ -498,6 +528,8 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         volumes,
         networks,
         service_metadata,
+        lease_id,
+        lease_coordinator_node_id,
         task_epoch,
         phase_version,
         launch_attempt,

@@ -154,6 +154,8 @@ fn running_task(task_id: Uuid, node_id: Uuid, service_name: &str, network_id: Uu
         secret_files: Vec::new(),
         volumes: Vec::new(),
         service_metadata: Some(TaskServiceMetadata::new(service_name, "backend")),
+        lease_id: None,
+        lease_coordinator_node_id: None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 0,

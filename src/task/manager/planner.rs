@@ -402,6 +402,8 @@ pub(super) struct RemoteStartPlan {
 pub(super) struct PreparedRemoteStartPlan {
     pub(super) index: usize,
     pub(super) id: Uuid,
+    pub(super) lease_id: Uuid,
+    pub(super) lease_coordinator_node_id: Uuid,
     pub(super) name: String,
     pub(super) image: String,
     pub(super) command: Vec<String>,

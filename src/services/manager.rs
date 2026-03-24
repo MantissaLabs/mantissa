@@ -2434,6 +2434,8 @@ mod tests {
             volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: Some(TaskServiceMetadata::new(service_name, template)),
+            lease_id: None,
+            lease_coordinator_node_id: None,
             task_epoch: 0,
             phase_version: 0,
             launch_attempt: 0,

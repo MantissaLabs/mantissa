@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::gpu::gpu_runtime_status;
 
-use super::{SlotId, SlotReservation, SlotState};
+use super::{LeaseReservation, SlotId, SlotReservation, SlotState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerSlotState {
@@ -90,7 +90,7 @@ impl SchedulerSummary {
         for slot in &snapshot.slots {
             match &slot.state {
                 SlotState::Free => summary.free_slots += 1,
-                SlotState::Reserved(_) => summary.reserved_slots += 1,
+                SlotState::Leased(_) | SlotState::Reserved(_) => summary.reserved_slots += 1,
             }
 
             if include_details {
@@ -101,13 +101,20 @@ impl SchedulerSummary {
                     gpu_count: 0,
                     state: match &slot.state {
                         SlotState::Free => SchedulerSlotState::Free,
-                        SlotState::Reserved(_) => SchedulerSlotState::Reserved,
+                        SlotState::Leased(_) | SlotState::Reserved(_) => {
+                            SchedulerSlotState::Reserved
+                        }
                     },
                     owner: match &slot.state {
+                        SlotState::Leased(LeaseReservation {
+                            coordinator_node_id,
+                            ..
+                        }) => Some(*coordinator_node_id),
                         SlotState::Reserved(SlotReservation { owner, .. }) => Some(*owner),
                         _ => None,
                     },
                     task_id: match &slot.state {
+                        SlotState::Leased(LeaseReservation { task_id, .. }) => Some(*task_id),
                         SlotState::Reserved(SlotReservation { task_id, .. }) => *task_id,
                         _ => None,
                     },
@@ -128,7 +135,9 @@ impl SchedulerSummary {
         for device in &snapshot.gpu_devices {
             match &device.state {
                 super::GpuDeviceState::Free => summary.gpu_free += 1,
-                super::GpuDeviceState::Reserved(_) => summary.gpu_reserved += 1,
+                super::GpuDeviceState::Leased(_) | super::GpuDeviceState::Reserved(_) => {
+                    summary.gpu_reserved += 1
+                }
             }
 
             if include_details {
@@ -140,9 +149,15 @@ impl SchedulerSummary {
                     memory_total_bytes: device.memory_total_bytes,
                     state: match &device.state {
                         super::GpuDeviceState::Free => SchedulerGpuState::Free,
-                        super::GpuDeviceState::Reserved(_) => SchedulerGpuState::Reserved,
+                        super::GpuDeviceState::Leased(_) | super::GpuDeviceState::Reserved(_) => {
+                            SchedulerGpuState::Reserved
+                        }
                     },
                     owner: match &device.state {
+                        super::GpuDeviceState::Leased(LeaseReservation {
+                            coordinator_node_id,
+                            ..
+                        }) => Some(*coordinator_node_id),
                         super::GpuDeviceState::Reserved(super::GpuDeviceReservation {
                             owner,
                             ..
@@ -150,6 +165,9 @@ impl SchedulerSummary {
                         _ => None,
                     },
                     task_id: match &device.state {
+                        super::GpuDeviceState::Leased(LeaseReservation { task_id, .. }) => {
+                            Some(*task_id)
+                        }
                         super::GpuDeviceState::Reserved(super::GpuDeviceReservation {
                             task_id,
                             ..

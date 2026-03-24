@@ -4,7 +4,7 @@ use protocol::scheduling::scheduler;
 use uuid::Uuid;
 
 use super::summary::SchedulerSummary;
-use super::{Scheduler, TaskResourceReservationIntent};
+use super::{AbortTaskLeaseIntent, Scheduler, TaskLeaseIntent};
 
 pub struct SchedulerService {
     scheduler: Rc<Scheduler>,
@@ -73,19 +73,21 @@ impl scheduler::Server for SchedulerService {
         Ok(())
     }
 
-    async fn reserve_resources(
+    async fn prepare_leases(
         self: Rc<Self>,
-        params: scheduler::ReserveResourcesParams,
-        mut results: scheduler::ReserveResourcesResults,
+        params: scheduler::PrepareLeasesParams,
+        mut results: scheduler::PrepareLeasesResults,
     ) -> Result<(), capnp::Error> {
         let request = params.get()?.get_request()?;
+        let coordinator_node_id = Self::parse_uuid(request.get_coordinator_node_id()?)?;
         let expected_version = request.get_expected_version();
+        let ttl_ms = request.get_ttl_ms();
         let intents = request.get_intents()?;
 
         let mut reservations = Vec::with_capacity(intents.len() as usize);
         for intent in intents.iter() {
             let task_id = Self::parse_uuid(intent.get_task_id()?)?;
-            reservations.push(TaskResourceReservationIntent {
+            reservations.push(TaskLeaseIntent {
                 task_id,
                 cpu_millis: intent.get_cpu_millis(),
                 memory_bytes: intent.get_memory_bytes(),
@@ -95,29 +97,29 @@ impl scheduler::Server for SchedulerService {
 
         let prepared = self
             .scheduler
-            .reserve_task_resources(expected_version, reservations)
+            .prepare_task_leases(coordinator_node_id, expected_version, ttl_ms, reservations)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
 
         let mut response = results.get().init_response();
         response.set_new_version(prepared.new_version);
-        let mut bindings = response
+        let mut leases = response
             .reborrow()
-            .init_bindings(prepared.bindings.len() as u32);
-        for (idx, binding) in prepared.bindings.iter().enumerate() {
-            let mut entry = bindings.reborrow().get(idx as u32);
-            entry.set_task_id(binding.task_id.as_bytes());
-            let mut slot_ids = entry
-                .reborrow()
-                .init_slot_ids(binding.slot_ids.len() as u32);
-            for (slot_idx, slot_id) in binding.slot_ids.iter().enumerate() {
+            .init_leases(prepared.leases.len() as u32);
+        for (idx, lease) in prepared.leases.iter().enumerate() {
+            let mut entry = leases.reborrow().get(idx as u32);
+            entry.set_lease_id(lease.lease_id.as_bytes());
+            entry.set_task_id(lease.task_id.as_bytes());
+            entry.set_expires_at_unix_ms(lease.expires_at_unix_ms);
+            let mut slot_ids = entry.reborrow().init_slot_ids(lease.slot_ids.len() as u32);
+            for (slot_idx, slot_id) in lease.slot_ids.iter().enumerate() {
                 slot_ids.set(slot_idx as u32, *slot_id);
             }
 
             let mut gpu_ids = entry
                 .reborrow()
-                .init_gpu_device_ids(binding.gpu_device_ids.len() as u32);
-            for (gpu_idx, device_id) in binding.gpu_device_ids.iter().enumerate() {
+                .init_gpu_device_ids(lease.gpu_device_ids.len() as u32);
+            for (gpu_idx, device_id) in lease.gpu_device_ids.iter().enumerate() {
                 gpu_ids.set(gpu_idx as u32, device_id);
             }
         }
@@ -125,36 +127,27 @@ impl scheduler::Server for SchedulerService {
         Ok(())
     }
 
-    async fn release_slots(
+    async fn abort_leases(
         self: Rc<Self>,
-        params: scheduler::ReleaseSlotsParams,
-        mut results: scheduler::ReleaseSlotsResults,
+        params: scheduler::AbortLeasesParams,
+        _results: scheduler::AbortLeasesResults,
     ) -> Result<(), capnp::Error> {
         let request = params.get()?.get_request()?;
-        let expected_version = request.get_expected_version();
+        let coordinator_node_id = Self::parse_uuid(request.get_coordinator_node_id()?)?;
+        let intents = request.get_intents()?;
 
-        let ids_reader = request.get_slot_ids()?;
-        let mut slot_ids = Vec::with_capacity(ids_reader.len() as usize);
-        for slot_id in ids_reader.iter() {
-            slot_ids.push(slot_id);
+        let mut aborts = Vec::with_capacity(intents.len() as usize);
+        for intent in intents.iter() {
+            aborts.push(AbortTaskLeaseIntent {
+                lease_id: Self::parse_uuid(intent.get_lease_id()?)?,
+                task_id: Self::parse_uuid(intent.get_task_id()?)?,
+            });
         }
 
-        let gpu_reader = request.get_gpu_device_ids()?;
-        let mut gpu_device_ids = Vec::with_capacity(gpu_reader.len() as usize);
-        for device_id in gpu_reader.iter() {
-            gpu_device_ids.push(device_id?.to_str()?.to_string());
-        }
-
-        let snapshot = self
-            .scheduler
-            .free_resources(expected_version, slot_ids, gpu_device_ids)
+        self.scheduler
+            .abort_task_leases(coordinator_node_id, aborts)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
-
-        results
-            .get()
-            .init_response()
-            .set_new_version(snapshot.version);
 
         Ok(())
     }

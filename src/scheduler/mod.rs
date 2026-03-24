@@ -6,6 +6,7 @@ use crdt_store::uuid_key::UuidKey;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
@@ -38,10 +39,20 @@ pub struct GpuDeviceReservation {
     pub task_id: Option<Uuid>,
 }
 
+/// Prepared lease details attached to resources before runtime commit.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct LeaseReservation {
+    pub lease_id: Uuid,
+    pub coordinator_node_id: Uuid,
+    pub task_id: Uuid,
+    pub expires_at_unix_ms: u64,
+}
+
 /// Current state of a slot inside the scheduler snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum SlotState {
     Free,
+    Leased(LeaseReservation),
     Reserved(SlotReservation),
 }
 
@@ -49,6 +60,7 @@ pub enum SlotState {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum GpuDeviceState {
     Free,
+    Leased(LeaseReservation),
     Reserved(GpuDeviceReservation),
 }
 
@@ -166,28 +178,46 @@ pub struct GpuReservationRequest {
     pub task_id: Option<Uuid>,
 }
 
-/// Resource-vector reservation intent used when the target node chooses exact bindings locally.
+/// Resource-vector lease intent used when the target node chooses exact bindings locally.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskResourceReservationIntent {
+pub struct TaskLeaseIntent {
     pub task_id: Uuid,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
     pub gpu_count: u32,
 }
 
-/// Exact bindings chosen locally for one task as part of a prepared reservation batch.
+/// Exact bindings chosen locally for one task as part of a prepared lease batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreparedTaskResources {
+pub struct PreparedTaskLease {
+    pub lease_id: Uuid,
     pub task_id: Uuid,
+    pub expires_at_unix_ms: u64,
     pub slot_ids: Vec<SlotId>,
     pub gpu_device_ids: Vec<String>,
 }
 
-/// Successful prepared reservation response containing the committed scheduler version and bindings.
+/// Successful prepared lease response containing the current scheduler version and lease bindings.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreparedTaskReservationBatch {
+pub struct PreparedTaskLeaseBatch {
     pub new_version: u64,
-    pub bindings: Vec<PreparedTaskResources>,
+    pub leases: Vec<PreparedTaskLease>,
+}
+
+/// Lease identity used to abort prepared capacity from another node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AbortTaskLeaseIntent {
+    pub lease_id: Uuid,
+    pub task_id: Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LeaseAllocation {
+    coordinator_node_id: Uuid,
+    task_id: Uuid,
+    expires_at_unix_ms: u64,
+    slot_ids: Vec<SlotId>,
+    gpu_device_ids: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -250,6 +280,24 @@ pub enum SchedulerError {
         snapshot: SchedulerSnapshot,
     },
 
+    #[error("unknown leases in request: {lease_ids:?}")]
+    UnknownLeases {
+        lease_ids: Vec<Uuid>,
+        snapshot: SchedulerSnapshot,
+    },
+
+    #[error("expired leases in request: {lease_ids:?}")]
+    ExpiredLeases {
+        lease_ids: Vec<Uuid>,
+        snapshot: SchedulerSnapshot,
+    },
+
+    #[error("lease mismatch for lease {lease_id}")]
+    LeaseMismatch {
+        lease_id: Uuid,
+        snapshot: SchedulerSnapshot,
+    },
+
     #[error("slots not reserved: {slots:?}")]
     SlotsNotReserved {
         slots: Vec<SlotId>,
@@ -268,16 +316,19 @@ struct SchedulerState {
     snapshot: SchedulerSnapshot,
     slot_index: HashMap<SlotId, usize>,
     gpu_index: HashMap<GpuDeviceId, usize>,
+    lease_index: HashMap<Uuid, LeaseAllocation>,
 }
 
 impl SchedulerState {
     fn new(snapshot: SchedulerSnapshot) -> Self {
         let slot_index = Self::build_slot_index(&snapshot.slots);
         let gpu_index = Self::build_gpu_index(&snapshot.gpu_devices);
+        let lease_index = Self::build_lease_index(&snapshot);
         Self {
             snapshot,
             slot_index,
             gpu_index,
+            lease_index,
         }
     }
 
@@ -298,6 +349,59 @@ impl SchedulerState {
         }
         index
     }
+
+    /// Build the prepared lease index used for local commit, abort, and expiry.
+    fn build_lease_index(snapshot: &SchedulerSnapshot) -> HashMap<Uuid, LeaseAllocation> {
+        let mut index = HashMap::new();
+
+        for slot in &snapshot.slots {
+            let SlotState::Leased(lease) = &slot.state else {
+                continue;
+            };
+
+            let entry = index
+                .entry(lease.lease_id)
+                .or_insert_with(|| LeaseAllocation {
+                    coordinator_node_id: lease.coordinator_node_id,
+                    task_id: lease.task_id,
+                    expires_at_unix_ms: lease.expires_at_unix_ms,
+                    slot_ids: Vec::new(),
+                    gpu_device_ids: Vec::new(),
+                });
+            entry.slot_ids.push(slot.slot_id);
+        }
+
+        for device in &snapshot.gpu_devices {
+            let GpuDeviceState::Leased(lease) = &device.state else {
+                continue;
+            };
+
+            let entry = index
+                .entry(lease.lease_id)
+                .or_insert_with(|| LeaseAllocation {
+                    coordinator_node_id: lease.coordinator_node_id,
+                    task_id: lease.task_id,
+                    expires_at_unix_ms: lease.expires_at_unix_ms,
+                    slot_ids: Vec::new(),
+                    gpu_device_ids: Vec::new(),
+                });
+            entry.gpu_device_ids.push(device.device_id.clone());
+        }
+
+        for allocation in index.values_mut() {
+            allocation.slot_ids.sort_unstable();
+            allocation.gpu_device_ids.sort();
+        }
+
+        index
+    }
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Scheduler maintains a local in-memory view of slots together with a CRDT-backed snapshot
@@ -473,6 +577,51 @@ impl Scheduler {
                 memory_total_bytes: spec.memory_total_bytes,
                 state: GpuDeviceState::Free,
             })
+            .collect()
+    }
+
+    /// Releases every prepared lease whose expiry is at or before `now_unix_ms`.
+    fn clear_expired_leases(snapshot: &mut SchedulerSnapshot, now_unix_ms: u64) -> Vec<Uuid> {
+        let mut expired = BTreeSet::new();
+
+        for slot in &mut snapshot.slots {
+            if let SlotState::Leased(lease) = &slot.state
+                && lease.expires_at_unix_ms <= now_unix_ms
+            {
+                expired.insert(lease.lease_id);
+                slot.state = SlotState::Free;
+            }
+        }
+
+        for device in &mut snapshot.gpu_devices {
+            if let GpuDeviceState::Leased(lease) = &device.state
+                && lease.expires_at_unix_ms <= now_unix_ms
+            {
+                expired.insert(lease.lease_id);
+                device.state = GpuDeviceState::Free;
+            }
+        }
+
+        expired.into_iter().collect()
+    }
+
+    /// Selects the free slot indices visible after expired prepared leases have been reclaimed.
+    fn free_slot_indices(snapshot: &SchedulerSnapshot) -> Vec<usize> {
+        snapshot
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| matches!(slot.state, SlotState::Free).then_some(idx))
+            .collect()
+    }
+
+    /// Selects the free GPU indices visible after expired prepared leases have been reclaimed.
+    fn free_gpu_indices(snapshot: &SchedulerSnapshot) -> Vec<usize> {
+        snapshot
+            .gpu_devices
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, device)| matches!(device.state, GpuDeviceState::Free).then_some(idx))
             .collect()
     }
 
@@ -865,6 +1014,9 @@ impl Scheduler {
                 });
             }
 
+            let mut new_snapshot = current.snapshot.clone();
+            Self::clear_expired_leases(&mut new_snapshot, current_unix_ms());
+
             // Track the validation outcome using deterministic sets so callers receive stable
             // ordering without the extra sort/dedup passes we previously needed.
             let mut slot_seen = HashSet::with_capacity(slot_requests.len());
@@ -881,7 +1033,7 @@ impl Scheduler {
 
                 match current.slot_index.get(&req.slot_id) {
                     Some(&idx) => {
-                        if !matches!(current.snapshot.slots[idx].state, SlotState::Free) {
+                        if !matches!(new_snapshot.slots[idx].state, SlotState::Free) {
                             slot_conflicts.insert(req.slot_id);
                         }
                     }
@@ -925,10 +1077,7 @@ impl Scheduler {
 
                 match current.gpu_index.get(&req.device_id) {
                     Some(&idx) => {
-                        if !matches!(
-                            current.snapshot.gpu_devices[idx].state,
-                            GpuDeviceState::Free
-                        ) {
+                        if !matches!(new_snapshot.gpu_devices[idx].state, GpuDeviceState::Free) {
                             gpu_conflicts.insert(req.device_id.clone());
                         }
                     }
@@ -959,9 +1108,6 @@ impl Scheduler {
                 });
             }
 
-            // Clone the snapshot so we can safely mutate a private copy while readers continue to
-            // observe the old data. We only publish the new snapshot once every validation passes.
-            let mut new_snapshot = current.snapshot.clone();
             for req in &slot_requests {
                 let idx = current.slot_index[&req.slot_id];
                 new_snapshot.slots[idx].state = SlotState::Reserved(SlotReservation {
@@ -1015,25 +1161,25 @@ impl Scheduler {
         }
     }
 
-    /// Reserves one batch of resource vectors by choosing exact local bindings atomically.
-    pub async fn reserve_task_resources(
+    /// Prepares one batch of short-lived resource leases by choosing exact local bindings atomically.
+    pub async fn prepare_task_leases(
         &self,
+        coordinator_node_id: Uuid,
         expected_version: u64,
-        intents: Vec<TaskResourceReservationIntent>,
-    ) -> Result<PreparedTaskReservationBatch, SchedulerError> {
+        ttl_ms: u64,
+        intents: Vec<TaskLeaseIntent>,
+    ) -> Result<PreparedTaskLeaseBatch, SchedulerError> {
         if intents.is_empty() {
             return self
                 .state
                 .load_full()
                 .as_ref()
                 .ok_or(SchedulerError::Uninitialized)
-                .map(|state| PreparedTaskReservationBatch {
+                .map(|state| PreparedTaskLeaseBatch {
                     new_version: state.snapshot.version,
-                    bindings: Vec::new(),
+                    leases: Vec::new(),
                 });
         }
-
-        let owner = self.store_key.to_uuid();
 
         loop {
             let current_opt = self.state.load_full();
@@ -1052,21 +1198,12 @@ impl Scheduler {
             }
 
             let mut new_snapshot = current.snapshot.clone();
-            let mut free_slot_indices: Vec<usize> = new_snapshot
-                .slots
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, slot)| matches!(slot.state, SlotState::Free).then_some(idx))
-                .collect();
-            let mut free_gpu_indices: Vec<usize> = new_snapshot
-                .gpu_devices
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, device)| {
-                    matches!(device.state, GpuDeviceState::Free).then_some(idx)
-                })
-                .collect();
-            let mut bindings = Vec::with_capacity(intents.len());
+            let now_unix_ms = current_unix_ms();
+            Self::clear_expired_leases(&mut new_snapshot, now_unix_ms);
+            let expires_at_unix_ms = now_unix_ms.saturating_add(ttl_ms);
+            let mut free_slot_indices = Self::free_slot_indices(&new_snapshot);
+            let mut free_gpu_indices = Self::free_gpu_indices(&new_snapshot);
+            let mut leases = Vec::with_capacity(intents.len());
             let mut failed_tasks = Vec::new();
 
             for intent in &intents {
@@ -1095,14 +1232,18 @@ impl Scheduler {
 
                 let slot_index_set: HashSet<usize> = slot_indices.iter().copied().collect();
                 let gpu_index_set: HashSet<usize> = gpu_indices.iter().copied().collect();
+                let lease_id = Uuid::new_v4();
+                let reservation = LeaseReservation {
+                    lease_id,
+                    coordinator_node_id,
+                    task_id: intent.task_id,
+                    expires_at_unix_ms,
+                };
 
                 let mut slot_ids = Vec::with_capacity(slot_indices.len());
                 for idx in &slot_indices {
                     let slot = &mut new_snapshot.slots[*idx];
-                    slot.state = SlotState::Reserved(SlotReservation {
-                        owner,
-                        task_id: Some(intent.task_id),
-                    });
+                    slot.state = SlotState::Leased(reservation.clone());
                     slot_ids.push(slot.slot_id);
                 }
                 slot_ids.sort_unstable();
@@ -1110,17 +1251,17 @@ impl Scheduler {
                 let mut gpu_device_ids = Vec::with_capacity(gpu_indices.len());
                 for idx in &gpu_indices {
                     let device = &mut new_snapshot.gpu_devices[*idx];
-                    device.state = GpuDeviceState::Reserved(GpuDeviceReservation {
-                        owner,
-                        task_id: Some(intent.task_id),
-                    });
+                    device.state = GpuDeviceState::Leased(reservation.clone());
                     gpu_device_ids.push(device.device_id.clone());
                 }
+                gpu_device_ids.sort();
 
                 free_slot_indices.retain(|idx| !slot_index_set.contains(idx));
                 free_gpu_indices.retain(|idx| !gpu_index_set.contains(idx));
-                bindings.push(PreparedTaskResources {
+                leases.push(PreparedTaskLease {
+                    lease_id,
                     task_id: intent.task_id,
+                    expires_at_unix_ms,
                     slot_ids,
                     gpu_device_ids,
                 });
@@ -1152,10 +1293,239 @@ impl Scheduler {
             }
 
             self.publish_digest_from_snapshot(&new_snapshot).await;
-            return Ok(PreparedTaskReservationBatch {
+            return Ok(PreparedTaskLeaseBatch {
                 new_version: new_snapshot.version,
-                bindings,
+                leases,
             });
+        }
+    }
+
+    /// Commits one prepared lease into a durable task reservation on the local node.
+    pub async fn commit_task_lease(
+        &self,
+        lease_id: Uuid,
+        coordinator_node_id: Uuid,
+        task_id: Uuid,
+        expected_slot_ids: &[SlotId],
+        expected_gpu_device_ids: &[String],
+    ) -> Result<SchedulerSnapshot, SchedulerError> {
+        loop {
+            let current_opt = self.state.load_full();
+            let current_arc = match current_opt.as_ref() {
+                Some(state) => state.clone(),
+                None => return Err(SchedulerError::Uninitialized),
+            };
+            let current = current_arc.as_ref();
+            let now_unix_ms = current_unix_ms();
+
+            let Some(allocation) = current.lease_index.get(&lease_id).cloned() else {
+                return Err(SchedulerError::UnknownLeases {
+                    lease_ids: vec![lease_id],
+                    snapshot: current.snapshot.clone(),
+                });
+            };
+
+            if allocation.expires_at_unix_ms <= now_unix_ms {
+                return Err(SchedulerError::ExpiredLeases {
+                    lease_ids: vec![lease_id],
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            let mut expected_slots = expected_slot_ids.to_vec();
+            expected_slots.sort_unstable();
+            let mut expected_gpus = expected_gpu_device_ids.to_vec();
+            expected_gpus.sort();
+
+            if allocation.coordinator_node_id != coordinator_node_id
+                || allocation.task_id != task_id
+                || allocation.slot_ids != expected_slots
+                || allocation.gpu_device_ids != expected_gpus
+            {
+                return Err(SchedulerError::LeaseMismatch {
+                    lease_id,
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            let mut new_snapshot = current.snapshot.clone();
+            for slot_id in &allocation.slot_ids {
+                let idx = current.slot_index[slot_id];
+                new_snapshot.slots[idx].state = SlotState::Reserved(SlotReservation {
+                    owner: self.store_key.to_uuid(),
+                    task_id: Some(task_id),
+                });
+            }
+            for device_id in &allocation.gpu_device_ids {
+                let idx = current.gpu_index[device_id];
+                new_snapshot.gpu_devices[idx].state =
+                    GpuDeviceState::Reserved(GpuDeviceReservation {
+                        owner: self.store_key.to_uuid(),
+                        task_id: Some(task_id),
+                    });
+            }
+
+            new_snapshot.version = new_snapshot
+                .version
+                .checked_add(1)
+                .expect("scheduler snapshot version overflow");
+
+            let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
+            let prev = self
+                .state
+                .compare_and_swap(&current_opt, Some(new_state_arc.clone()));
+            if !ptr_eq_option(&prev, &current_opt) {
+                continue;
+            }
+
+            if let Err(e) = self
+                .store
+                .upsert(&self.store_key, new_snapshot.clone())
+                .await
+            {
+                let _ = self
+                    .state
+                    .compare_and_swap(&Some(new_state_arc.clone()), current_opt.clone());
+                return Err(SchedulerError::Store(e));
+            }
+
+            self.publish_digest_from_snapshot(&new_snapshot).await;
+            return Ok(new_snapshot);
+        }
+    }
+
+    /// Aborts prepared leases, releasing any still-leased capacity for the provided coordinator.
+    pub async fn abort_task_leases(
+        &self,
+        coordinator_node_id: Uuid,
+        intents: Vec<AbortTaskLeaseIntent>,
+    ) -> Result<SchedulerSnapshot, SchedulerError> {
+        if intents.is_empty() {
+            return self
+                .state
+                .load_full()
+                .as_ref()
+                .ok_or(SchedulerError::Uninitialized)
+                .map(|state| state.snapshot.clone());
+        }
+
+        loop {
+            let current_opt = self.state.load_full();
+            let current_arc = match current_opt.as_ref() {
+                Some(state) => state.clone(),
+                None => return Err(SchedulerError::Uninitialized),
+            };
+            let current = current_arc.as_ref();
+            let mut new_snapshot = current.snapshot.clone();
+            let mut changed = false;
+
+            for intent in &intents {
+                let Some(allocation) = current.lease_index.get(&intent.lease_id) else {
+                    continue;
+                };
+                if allocation.coordinator_node_id != coordinator_node_id
+                    || allocation.task_id != intent.task_id
+                {
+                    continue;
+                }
+
+                for slot_id in &allocation.slot_ids {
+                    let idx = current.slot_index[slot_id];
+                    if matches!(
+                        new_snapshot.slots[idx].state,
+                        SlotState::Leased(LeaseReservation { lease_id, .. }) if lease_id == intent.lease_id
+                    ) {
+                        new_snapshot.slots[idx].state = SlotState::Free;
+                        changed = true;
+                    }
+                }
+                for device_id in &allocation.gpu_device_ids {
+                    let idx = current.gpu_index[device_id];
+                    if matches!(
+                        new_snapshot.gpu_devices[idx].state,
+                        GpuDeviceState::Leased(LeaseReservation { lease_id, .. }) if lease_id == intent.lease_id
+                    ) {
+                        new_snapshot.gpu_devices[idx].state = GpuDeviceState::Free;
+                        changed = true;
+                    }
+                }
+            }
+
+            if !changed {
+                return Ok(current.snapshot.clone());
+            }
+
+            new_snapshot.version = new_snapshot
+                .version
+                .checked_add(1)
+                .expect("scheduler snapshot version overflow");
+
+            let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
+            let prev = self
+                .state
+                .compare_and_swap(&current_opt, Some(new_state_arc.clone()));
+            if !ptr_eq_option(&prev, &current_opt) {
+                continue;
+            }
+
+            if let Err(e) = self
+                .store
+                .upsert(&self.store_key, new_snapshot.clone())
+                .await
+            {
+                let _ = self
+                    .state
+                    .compare_and_swap(&Some(new_state_arc.clone()), current_opt.clone());
+                return Err(SchedulerError::Store(e));
+            }
+
+            self.publish_digest_from_snapshot(&new_snapshot).await;
+            return Ok(new_snapshot);
+        }
+    }
+
+    /// Reclaims expired prepared leases so leaked scheduler capacity becomes visible again.
+    pub async fn reap_expired_leases(&self) -> Result<Vec<Uuid>, SchedulerError> {
+        loop {
+            let current_opt = self.state.load_full();
+            let current_arc = match current_opt.as_ref() {
+                Some(state) => state.clone(),
+                None => return Err(SchedulerError::Uninitialized),
+            };
+            let current = current_arc.as_ref();
+            let mut new_snapshot = current.snapshot.clone();
+            let expired = Self::clear_expired_leases(&mut new_snapshot, current_unix_ms());
+
+            if expired.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            new_snapshot.version = new_snapshot
+                .version
+                .checked_add(1)
+                .expect("scheduler snapshot version overflow");
+
+            let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
+            let prev = self
+                .state
+                .compare_and_swap(&current_opt, Some(new_state_arc.clone()));
+            if !ptr_eq_option(&prev, &current_opt) {
+                continue;
+            }
+
+            if let Err(e) = self
+                .store
+                .upsert(&self.store_key, new_snapshot.clone())
+                .await
+            {
+                let _ = self
+                    .state
+                    .compare_and_swap(&Some(new_state_arc.clone()), current_opt.clone());
+                return Err(SchedulerError::Store(e));
+            }
+
+            self.publish_digest_from_snapshot(&new_snapshot).await;
+            return Ok(expired);
         }
     }
 
@@ -1294,6 +1664,9 @@ impl Scheduler {
                 });
             }
 
+            let mut new_snapshot = current.snapshot.clone();
+            Self::clear_expired_leases(&mut new_snapshot, current_unix_ms());
+
             let mut unknown_slots = Vec::new();
             let mut not_reserved_slots = Vec::new();
             for slot_id in &slot_ids {
@@ -1302,7 +1675,7 @@ impl Scheduler {
                     continue;
                 };
 
-                if matches!(current.snapshot.slots[idx].state, SlotState::Free) {
+                if matches!(new_snapshot.slots[idx].state, SlotState::Free) {
                     not_reserved_slots.push(*slot_id);
                 }
             }
@@ -1329,10 +1702,7 @@ impl Scheduler {
                     continue;
                 };
 
-                if matches!(
-                    current.snapshot.gpu_devices[idx].state,
-                    GpuDeviceState::Free
-                ) {
+                if matches!(new_snapshot.gpu_devices[idx].state, GpuDeviceState::Free) {
                     not_reserved_gpus.push(device_id.clone());
                 }
             }
@@ -1351,7 +1721,6 @@ impl Scheduler {
                 });
             }
 
-            let mut new_snapshot = current.snapshot.clone();
             for slot_id in &slot_ids {
                 let idx = current.slot_index[slot_id];
                 new_snapshot.slots[idx].state = SlotState::Free;
@@ -1398,6 +1767,7 @@ mod tests {
     use super::*;
 
     use std::sync::Arc;
+    use std::time::Duration;
 
     use crate::store::local::LocalSessionStore;
     use crate::store::peer_store::open_peers_store;
@@ -1653,7 +2023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserve_task_resources_prepares_exact_bindings() {
+    async fn prepare_task_leases_prepares_exact_bindings() {
         let (scheduler, _dir) = make_scheduler().await;
         scheduler
             .init_slots([
@@ -1667,16 +2037,18 @@ mod tests {
         let task_a = Uuid::new_v4();
         let task_b = Uuid::new_v4();
         let prepared = scheduler
-            .reserve_task_resources(
+            .prepare_task_leases(
+                Uuid::new_v4(),
                 0,
+                30_000,
                 vec![
-                    TaskResourceReservationIntent {
+                    TaskLeaseIntent {
                         task_id: task_a,
                         cpu_millis: 1_500,
                         memory_bytes: 1536 * 1024 * 1024,
                         gpu_count: 0,
                     },
-                    TaskResourceReservationIntent {
+                    TaskLeaseIntent {
                         task_id: task_b,
                         cpu_millis: 500,
                         memory_bytes: 512 * 1024 * 1024,
@@ -1688,11 +2060,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(prepared.new_version, 1);
-        assert_eq!(prepared.bindings.len(), 2);
-        assert_eq!(prepared.bindings[0].task_id, task_a);
-        assert_eq!(prepared.bindings[0].slot_ids, vec![1, 3]);
-        assert_eq!(prepared.bindings[1].task_id, task_b);
-        assert_eq!(prepared.bindings[1].slot_ids, vec![2]);
+        assert_eq!(prepared.leases.len(), 2);
+        assert_eq!(prepared.leases[0].task_id, task_a);
+        assert_eq!(prepared.leases[0].slot_ids, vec![1, 3]);
+        assert_eq!(prepared.leases[1].task_id, task_b);
+        assert_eq!(prepared.leases[1].slot_ids, vec![2]);
 
         let snapshot = scheduler.snapshot().await.unwrap();
         assert_eq!(snapshot.version, 1);
@@ -1700,12 +2072,12 @@ mod tests {
             snapshot
                 .slots
                 .iter()
-                .all(|slot| matches!(slot.state, SlotState::Reserved(_)))
+                .all(|slot| matches!(slot.state, SlotState::Leased(_)))
         );
     }
 
     #[tokio::test]
-    async fn reserve_task_resources_is_atomic_on_failure() {
+    async fn prepare_task_leases_is_atomic_on_failure() {
         let (scheduler, _dir) = make_scheduler().await;
         scheduler
             .init_slots([
@@ -1716,16 +2088,18 @@ mod tests {
             .unwrap();
 
         let err = scheduler
-            .reserve_task_resources(
+            .prepare_task_leases(
+                Uuid::new_v4(),
                 0,
+                30_000,
                 vec![
-                    TaskResourceReservationIntent {
+                    TaskLeaseIntent {
                         task_id: Uuid::new_v4(),
                         cpu_millis: 500,
                         memory_bytes: 512 * 1024 * 1024,
                         gpu_count: 0,
                     },
-                    TaskResourceReservationIntent {
+                    TaskLeaseIntent {
                         task_id: Uuid::new_v4(),
                         cpu_millis: 1_500,
                         memory_bytes: 1536 * 1024 * 1024,
@@ -1754,7 +2128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserve_task_resources_returns_gpu_bindings() {
+    async fn prepare_task_leases_returns_gpu_bindings() {
         let (scheduler, _dir) = make_scheduler().await;
         scheduler
             .init_resources(
@@ -1786,9 +2160,11 @@ mod tests {
 
         let task_id = Uuid::new_v4();
         let prepared = scheduler
-            .reserve_task_resources(
+            .prepare_task_leases(
+                Uuid::new_v4(),
                 0,
-                vec![TaskResourceReservationIntent {
+                30_000,
+                vec![TaskLeaseIntent {
                     task_id,
                     cpu_millis: 0,
                     memory_bytes: 0,
@@ -1798,11 +2174,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(prepared.bindings.len(), 1);
-        assert_eq!(prepared.bindings[0].task_id, task_id);
-        assert_eq!(prepared.bindings[0].slot_ids, vec![1]);
+        assert_eq!(prepared.leases.len(), 1);
+        assert_eq!(prepared.leases[0].task_id, task_id);
+        assert_eq!(prepared.leases[0].slot_ids, vec![1]);
         assert_eq!(
-            prepared.bindings[0].gpu_device_ids,
+            prepared.leases[0].gpu_device_ids,
             vec!["gpu-a".to_string(), "gpu-b".to_string()]
         );
 
@@ -1811,7 +2187,181 @@ mod tests {
             snapshot
                 .gpu_devices
                 .iter()
-                .all(|device| matches!(device.state, GpuDeviceState::Reserved(_)))
+                .all(|device| matches!(device.state, GpuDeviceState::Leased(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_task_lease_promotes_resources_to_reserved() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_resources(
+                [SlotSpec::new(
+                    1,
+                    SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+                )],
+                [GpuDeviceSpec::new(
+                    "gpu-a",
+                    0,
+                    Some("gpu-a".to_string()),
+                    Some("0000:01:00.0".to_string()),
+                    "GPU A",
+                    16 * 1024 * 1024 * 1024,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let coordinator = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let prepared = scheduler
+            .prepare_task_leases(
+                coordinator,
+                0,
+                30_000,
+                vec![TaskLeaseIntent {
+                    task_id,
+                    cpu_millis: 500,
+                    memory_bytes: 512 * 1024 * 1024,
+                    gpu_count: 1,
+                }],
+            )
+            .await
+            .unwrap();
+        let lease = &prepared.leases[0];
+
+        let snapshot = scheduler
+            .commit_task_lease(
+                lease.lease_id,
+                coordinator,
+                task_id,
+                &lease.slot_ids,
+                &lease.gpu_device_ids,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.version, 2);
+        assert!(snapshot.slots.iter().all(|slot| matches!(
+            &slot.state,
+            SlotState::Reserved(SlotReservation {
+                owner,
+                task_id: Some(owner_task_id),
+            }) if *owner == scheduler.store_key.to_uuid() && *owner_task_id == task_id
+        )));
+        assert!(snapshot.gpu_devices.iter().all(|device| matches!(
+            &device.state,
+            GpuDeviceState::Reserved(GpuDeviceReservation {
+                owner,
+                task_id: Some(owner_task_id),
+            }) if *owner == scheduler.store_key.to_uuid() && *owner_task_id == task_id
+        )));
+    }
+
+    #[tokio::test]
+    async fn abort_task_leases_releases_prepared_resources() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_resources(
+                [SlotSpec::new(
+                    1,
+                    SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+                )],
+                [GpuDeviceSpec::new(
+                    "gpu-a",
+                    0,
+                    Some("gpu-a".to_string()),
+                    Some("0000:01:00.0".to_string()),
+                    "GPU A",
+                    16 * 1024 * 1024 * 1024,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let coordinator = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let prepared = scheduler
+            .prepare_task_leases(
+                coordinator,
+                0,
+                30_000,
+                vec![TaskLeaseIntent {
+                    task_id,
+                    cpu_millis: 500,
+                    memory_bytes: 512 * 1024 * 1024,
+                    gpu_count: 1,
+                }],
+            )
+            .await
+            .unwrap();
+        let lease = &prepared.leases[0];
+
+        let snapshot = scheduler
+            .abort_task_leases(
+                coordinator,
+                vec![AbortTaskLeaseIntent {
+                    lease_id: lease.lease_id,
+                    task_id,
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.version, 2);
+        assert!(
+            snapshot
+                .slots
+                .iter()
+                .all(|slot| matches!(slot.state, SlotState::Free))
+        );
+        assert!(
+            snapshot
+                .gpu_devices
+                .iter()
+                .all(|device| matches!(device.state, GpuDeviceState::Free))
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_expired_leases_releases_stale_capacity() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_slots([SlotSpec::new(
+                1,
+                SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+            )])
+            .await
+            .unwrap();
+
+        let prepared = scheduler
+            .prepare_task_leases(
+                Uuid::new_v4(),
+                0,
+                1,
+                vec![TaskLeaseIntent {
+                    task_id: Uuid::new_v4(),
+                    cpu_millis: 500,
+                    memory_bytes: 512 * 1024 * 1024,
+                    gpu_count: 0,
+                }],
+            )
+            .await
+            .unwrap();
+        let lease = &prepared.leases[0];
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let expired = scheduler.reap_expired_leases().await.unwrap();
+        assert_eq!(expired, vec![lease.lease_id]);
+
+        let snapshot = scheduler.snapshot().await.unwrap();
+        assert_eq!(snapshot.version, 2);
+        assert!(
+            snapshot
+                .slots
+                .iter()
+                .all(|slot| matches!(slot.state, SlotState::Free))
         );
     }
 }
