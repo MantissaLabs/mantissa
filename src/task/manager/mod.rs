@@ -29,7 +29,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{
     Mutex as AsyncMutex, Notify, RwLock, Semaphore,
     mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender},
@@ -157,6 +157,22 @@ struct LivenessProbeEntry {
     consecutive_failures: u32,
 }
 
+#[derive(Clone)]
+struct CachedTaskSpecEntry {
+    // Store change clock captured when this decoded spec was materialized.
+    change_clock: u64,
+    // Fully decoded task snapshot reused until the backing store changes.
+    spec: TaskSpec,
+}
+
+#[derive(Clone)]
+struct CachedTaskValueIndex {
+    // Store change clock captured when this decoded index was materialized.
+    change_clock: u64,
+    // Latest decoded task values keyed by task identifier.
+    task_values: Arc<HashMap<Uuid, TaskValue>>,
+}
+
 /// Runtime loop cadence configuration for the task manager reconciliation workers.
 #[derive(Clone, Copy, Debug)]
 pub struct TaskRuntimeConfig {
@@ -204,6 +220,10 @@ struct TaskManagerRuntime {
 struct TaskManagerLocalState {
     // Best-effort mapping from task id to current container identifier.
     local_containers: Arc<AsyncMutex<HashMap<Uuid, String>>>,
+    // Per-task decoded spec cache reused while the backing store stays unchanged.
+    task_spec_cache: Arc<StdMutex<HashMap<Uuid, CachedTaskSpecEntry>>>,
+    // Full task-store snapshot reused across periodic scans until the store changes.
+    task_value_index: Arc<StdMutex<Option<CachedTaskValueIndex>>>,
     // Per-task liveness probe bookkeeping used by reconciliation.
     liveness_probes: Arc<AsyncMutex<HashMap<Uuid, LivenessProbeEntry>>>,
     // Stop deduplication guard so only one stop workflow runs per task.
@@ -375,6 +395,8 @@ impl TaskManager {
             },
             local_state: TaskManagerLocalState {
                 local_containers: Arc::new(AsyncMutex::new(HashMap::new())),
+                task_spec_cache: Arc::new(StdMutex::new(HashMap::new())),
+                task_value_index: Arc::new(StdMutex::new(None)),
                 liveness_probes: Arc::new(AsyncMutex::new(HashMap::new())),
                 inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
                 inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),

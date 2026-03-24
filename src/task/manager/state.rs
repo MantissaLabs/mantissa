@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -654,7 +655,9 @@ impl TaskManager {
             .store
             .upsert_many(entries)
             .await
-            .map_err(|e| anyhow::anyhow!("task batch upsert failed: {e}"))
+            .map_err(|e| anyhow::anyhow!("task batch upsert failed: {e}"))?;
+
+        Ok(())
     }
 
     /// Removes a task snapshot from the store.
@@ -687,6 +690,7 @@ impl TaskManager {
             .await
             .map_err(|e| anyhow::anyhow!("task remove failed: {e}"))?;
         self.record_remove_watermark(id, watermark, max_epoch).await;
+        self.evict_cached_spec(id);
         Ok(())
     }
 
@@ -1030,29 +1034,19 @@ impl TaskManager {
 
     /// Collects the set of slot IDs that belong to tasks owned by this node.
     pub(super) async fn collect_local_slot_ids(&self) -> Result<HashSet<SlotId>, anyhow::Error> {
-        let (actives, _) = self
-            .core
-            .store
-            .load_all()
-            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
-
+        let task_index = self.load_task_value_index().await?;
         let mut slots = HashSet::new();
-        for (key, snapshot) in actives {
-            let id = key.to_uuid();
-            if let Some(value) = select_best_task_value(snapshot.as_slice()) {
-                if value.node_id == self.local_node_id {
-                    if value.slot_ids.is_empty() {
-                        if let Some(slot_id) = value.slot_id {
-                            slots.insert(slot_id);
-                        }
-                    } else {
-                        for slot_id in &value.slot_ids {
-                            slots.insert(*slot_id);
-                        }
+        for value in task_index.values() {
+            if value.node_id == self.local_node_id {
+                if value.slot_ids.is_empty() {
+                    if let Some(slot_id) = value.slot_id {
+                        slots.insert(slot_id);
+                    }
+                } else {
+                    for slot_id in &value.slot_ids {
+                        slots.insert(*slot_id);
                     }
                 }
-            } else {
-                let _ = self.remove_spec(id).await;
             }
         }
 
@@ -1063,23 +1057,13 @@ impl TaskManager {
     pub(super) async fn collect_local_gpu_device_ids(
         &self,
     ) -> Result<HashSet<String>, anyhow::Error> {
-        let (actives, _) = self
-            .core
-            .store
-            .load_all()
-            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
-
+        let task_index = self.load_task_value_index().await?;
         let mut device_ids = HashSet::new();
-        for (key, snapshot) in actives {
-            let id = key.to_uuid();
-            if let Some(value) = select_best_task_value(snapshot.as_slice()) {
-                if value.node_id == self.local_node_id {
-                    for device_id in &value.gpu_device_ids {
-                        device_ids.insert(device_id.clone());
-                    }
+        for value in task_index.values() {
+            if value.node_id == self.local_node_id {
+                for device_id in &value.gpu_device_ids {
+                    device_ids.insert(device_id.clone());
                 }
-            } else {
-                let _ = self.remove_spec(id).await;
             }
         }
 
@@ -2193,8 +2177,122 @@ impl TaskManager {
         }
     }
 
+    /// Returns one decoded task spec from the local cache when it still matches the store clock.
+    fn cached_spec(&self, id: Uuid, change_clock: u64) -> Option<TaskSpec> {
+        let guard = self
+            .local_state
+            .task_spec_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .get(&id)
+            .filter(|entry| entry.change_clock == change_clock)
+            .map(|entry| entry.spec.clone())
+    }
+
+    /// Records one decoded task spec so repeated lookups can reuse it until the store changes.
+    fn cache_spec(&self, change_clock: u64, spec: TaskSpec) {
+        let mut guard = self
+            .local_state
+            .task_spec_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.insert(spec.id, super::CachedTaskSpecEntry { change_clock, spec });
+    }
+
+    /// Removes one task from the decoded spec cache after delete paths.
+    fn evict_cached_spec(&self, id: Uuid) {
+        let mut guard = self
+            .local_state
+            .task_spec_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.remove(&id);
+    }
+
+    /// Returns one decoded full-store index when it still matches the current store clock.
+    fn cached_task_value_index(&self, change_clock: u64) -> Option<Arc<HashMap<Uuid, TaskValue>>> {
+        let guard = self
+            .local_state
+            .task_value_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .as_ref()
+            .filter(|entry| entry.change_clock == change_clock)
+            .map(|entry| entry.task_values.clone())
+    }
+
+    /// Records one decoded full-store index for repeated periodic scans under the same store clock.
+    fn cache_task_value_index(
+        &self,
+        change_clock: u64,
+        task_values: Arc<HashMap<Uuid, TaskValue>>,
+    ) {
+        let mut guard = self
+            .local_state
+            .task_value_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(super::CachedTaskValueIndex {
+            change_clock,
+            task_values,
+        });
+    }
+
+    /// Loads and decodes the full task store once, then reuses it until the store changes.
+    pub(super) async fn load_task_value_index(
+        &self,
+    ) -> Result<Arc<HashMap<Uuid, TaskValue>>, anyhow::Error> {
+        let change_clock = self.core.store.change_clock();
+        if let Some(task_values) = self.cached_task_value_index(change_clock) {
+            return Ok(task_values);
+        }
+
+        let (entries, _) = self
+            .core
+            .store
+            .load_all()
+            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
+
+        let mut task_values = HashMap::with_capacity(entries.len());
+        let mut invalid_ids = Vec::new();
+        for (key, snapshot) in entries {
+            let id = key.to_uuid();
+            if let Some(value) = select_best_task_value(snapshot.as_slice()) {
+                task_values.insert(id, value);
+            } else {
+                invalid_ids.push(id);
+            }
+        }
+
+        let task_values = Arc::new(task_values);
+        if invalid_ids.is_empty() {
+            self.cache_task_value_index(change_clock, task_values.clone());
+        } else {
+            for id in invalid_ids {
+                let _ = self.remove_spec(id).await;
+            }
+        }
+
+        Ok(task_values)
+    }
+
     /// Loads the current persisted spec for a task by identifier.
     pub(super) async fn load_spec(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
+        let change_clock = self.core.store.change_clock();
+        if let Some(spec) = self.cached_spec(id, change_clock) {
+            return Ok(spec);
+        }
+
+        if let Some(task_values) = self.cached_task_value_index(change_clock)
+            && let Some(value) = task_values.get(&id)
+        {
+            let spec = value_to_spec(id, value.clone());
+            self.cache_spec(change_clock, spec.clone());
+            return Ok(spec);
+        }
+
         let key = UuidKey::from(id);
         let snapshot = self
             .core
@@ -2205,8 +2303,9 @@ impl TaskManager {
 
         let value = select_best_task_value(snapshot.as_slice())
             .ok_or_else(|| anyhow::anyhow!("task {id} has no value"))?;
-
-        Ok(value_to_spec(id, value))
+        let spec = value_to_spec(id, value);
+        self.cache_spec(change_clock, spec.clone());
+        Ok(spec)
     }
 
     /// Reconciles the Docker inventory with the task store so stale containers are adopted or removed.
@@ -2218,18 +2317,7 @@ impl TaskManager {
         const UNOWNED_TASK_GRACE_SECS: i64 = 5;
 
         let containers = self.runtime.container_manager.list_containers(None).await?;
-        let (entries, _) = self
-            .core
-            .store
-            .load_all()
-            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
-
-        let mut task_index: HashMap<Uuid, TaskValue> = HashMap::new();
-        for (key, snapshot) in entries {
-            if let Some(value) = select_best_task_value(snapshot.as_slice()) {
-                task_index.insert(key.to_uuid(), value);
-            }
-        }
+        let task_index = self.load_task_value_index().await?;
 
         for container in containers {
             let Some(task_id) = container
@@ -2240,17 +2328,17 @@ impl TaskManager {
                 continue;
             };
 
-            let Some(value) = task_index.get(&task_id) else {
+            let Some(value) = task_index.get(&task_id).cloned() else {
                 self.stop_unowned_container(task_id, &container.name, true, None)
                     .await;
                 continue;
             };
 
             if value.node_id != self.local_node_id {
-                if task_value_recent(value, UNOWNED_TASK_GRACE_SECS) {
+                if task_value_recent(&value, UNOWNED_TASK_GRACE_SECS) {
                     continue;
                 }
-                self.stop_unowned_container(task_id, &container.name, false, Some(value))
+                self.stop_unowned_container(task_id, &container.name, false, Some(&value))
                     .await;
                 continue;
             }
@@ -2281,7 +2369,7 @@ impl TaskManager {
             if matches!(value.state, ContainerState::Running)
                 && !value.networks.is_empty()
                 && self
-                    .attachments_need_refresh(task_id, &value.networks, task_revision(value))
+                    .attachments_need_refresh(task_id, &value.networks, task_revision(&value))
                     .await?
                 && let Err(err) = self
                     .ensure_runtime_attachments(
@@ -2462,21 +2550,14 @@ impl TaskManager {
             }
         };
 
-        let (actives, _) = self
-            .core
-            .store
-            .load_all()
-            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
+        let task_index = self.load_task_value_index().await?;
+        let local_specs: Vec<TaskSpec> = task_index
+            .iter()
+            .filter(|(_, value)| value.node_id == self.local_node_id)
+            .map(|(id, value)| value_to_spec(*id, value.clone()))
+            .collect();
 
-        for (key, snapshot) in actives {
-            let Some(value) = select_best_task_value(snapshot.as_slice()) else {
-                continue;
-            };
-            if value.node_id != self.local_node_id {
-                continue;
-            }
-
-            let spec = value_to_spec(key.to_uuid(), value);
+        for spec in local_specs {
             if matches!(spec.state, ContainerState::Running)
                 && self
                     .refresh_running_task_from_runtime_inventory(&spec, runtime_inventory.as_ref())
@@ -2645,12 +2726,7 @@ impl TaskManager {
                 Some(snapshot) => snapshot,
                 None => return Ok(()),
             };
-
-            let (actives, _) = self
-                .core
-                .store
-                .load_all()
-                .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
+            let task_index = self.load_task_value_index().await?;
 
             let mut desired: HashMap<SlotId, Uuid> = HashMap::new();
             let mut desired_gpus: HashMap<String, Uuid> = HashMap::new();
@@ -2688,10 +2764,7 @@ impl TaskManager {
 
             let mut local_tasks: HashMap<Uuid, TaskValue> = HashMap::new();
 
-            for (key, values) in actives {
-                let Some(value) = select_best_task_value(values.as_slice()) else {
-                    continue;
-                };
+            for (task_id, value) in task_index.iter() {
                 if value.node_id != self.local_node_id {
                     continue;
                 }
@@ -2702,8 +2775,7 @@ impl TaskManager {
                     continue;
                 }
 
-                let task_id = key.to_uuid();
-                local_tasks.insert(task_id, value);
+                local_tasks.insert(*task_id, value.clone());
             }
 
             let mut task_ids: Vec<Uuid> = local_tasks.keys().copied().collect();

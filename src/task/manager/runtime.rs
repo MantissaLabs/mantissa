@@ -190,26 +190,18 @@ impl TaskManager {
             }
         }
 
-        let (entries, _) = self
-            .core
-            .store
-            .load_all()
-            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
+        let task_values = self.load_task_value_index().await?;
+        let running_network_tasks: Vec<_> = task_values
+            .values()
+            .filter(|value| {
+                value.node_id == self.local_node_id
+                    && !value.networks.is_empty()
+                    && matches!(value.state, ContainerState::Running)
+            })
+            .cloned()
+            .collect();
 
-        for (_key, snapshot) in entries {
-            let Some(value) = select_best_task_value(snapshot.as_slice()) else {
-                continue;
-            };
-            if value.node_id != self.local_node_id {
-                continue;
-            }
-            if value.networks.is_empty() {
-                continue;
-            }
-            if !matches!(value.state, ContainerState::Running) {
-                continue;
-            }
-
+        for value in running_network_tasks {
             let known = attachment_index.get(&value.id);
             let missing = value.networks.iter().any(|network_id| {
                 let state = known

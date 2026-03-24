@@ -802,6 +802,101 @@ async fn task_manager_drop_cleans_secret_runtime_root() {
     );
 }
 
+#[tokio::test]
+async fn load_spec_cache_refreshes_after_store_change() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let mut spec = test_task_spec(&manager, "cache-refresh");
+
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist initial spec");
+
+    let loaded = manager.load_spec(spec.id).await.expect("load initial spec");
+    assert!(
+        matches!(loaded.state, ContainerState::Pending),
+        "initial cached load should reflect the pending state"
+    );
+
+    let cached_clock = manager
+        .local_state
+        .task_spec_cache
+        .lock()
+        .unwrap()
+        .get(&spec.id)
+        .map(|entry| entry.change_clock)
+        .expect("cache entry after first load");
+    assert_eq!(
+        cached_clock,
+        manager.core.store.change_clock(),
+        "cache entry should be keyed to the current store clock"
+    );
+
+    spec.state = ContainerState::Running;
+    spec.phase_version = 1;
+    spec.updated_at = Utc::now().to_rfc3339();
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist updated spec");
+
+    let refreshed = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load refreshed spec");
+    assert!(
+        matches!(refreshed.state, ContainerState::Running),
+        "load_spec must not return a stale cached state after a write"
+    );
+    assert_eq!(
+        refreshed.phase_version, 1,
+        "load_spec should return the latest persisted phase version"
+    );
+}
+
+#[tokio::test]
+async fn task_value_index_cache_reuses_snapshot_until_store_changes() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let first_spec = test_task_spec(&manager, "cache-index-a");
+    manager
+        .persist_spec(&first_spec)
+        .await
+        .expect("persist first task");
+
+    let first = manager
+        .load_task_value_index()
+        .await
+        .expect("load first cached index");
+    let second = manager
+        .load_task_value_index()
+        .await
+        .expect("load second cached index");
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "unchanged task stores should reuse the same decoded snapshot"
+    );
+
+    let second_spec = test_task_spec(&manager, "cache-index-b");
+    manager
+        .persist_spec(&second_spec)
+        .await
+        .expect("persist second task");
+
+    let refreshed = manager
+        .load_task_value_index()
+        .await
+        .expect("load refreshed cached index");
+    assert!(
+        !Arc::ptr_eq(&first, &refreshed),
+        "a store write should invalidate the cached decoded snapshot"
+    );
+    assert_eq!(
+        refreshed.len(),
+        2,
+        "refreshed decoded snapshot should include the new task"
+    );
+}
+
 /// Writes the local peer scheduling row used by task-manager drain-aware reconciliation tests.
 async fn set_local_drain_requested(
     manager: &TaskManager,
@@ -858,6 +953,43 @@ async fn create_managed_local_volume(
         .await
         .expect("upsert managed local volume");
     spec
+}
+
+/// Builds one minimal task spec used by cache and store-view tests.
+fn test_task_spec(manager: &TaskManager, name: &str) -> TaskSpec {
+    TaskSpec {
+        id: Uuid::new_v4(),
+        name: name.to_string(),
+        image: "img".to_string(),
+        state: ContainerState::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: Utc::now().to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        command: Vec::new(),
+        tty: false,
+        node_id: manager.local_node_id,
+        node_name: manager.local_node_name.clone(),
+        slot_ids: Vec::new(),
+        slot_id: None,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: Vec::new(),
+        service_metadata: None,
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
+    }
 }
 
 /// Builds one standalone task request that mounts a single resolved volume reference.
