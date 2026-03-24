@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use anyhow::Result as AnyhowResult;
 use arc_swap::ArcSwapOption;
 use crdt_store::uuid_key::UuidKey;
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,7 @@ use crate::gpu::{GpuDeviceOverrideAction, gpu_device_override_for, read_gpu_devi
 use crate::registry::Registry;
 use crate::store::scheduler_store::SchedulerStore;
 
-use self::digest::SchedulerDigestPublisher;
+use self::digest::{SchedulerDigestPublisher, SchedulerDigestRegistry, SchedulerDigestValue};
 use self::summary::SchedulerSummary;
 
 pub mod digest;
@@ -277,6 +278,7 @@ pub struct Scheduler {
     state: Arc<ArcSwapOption<SchedulerState>>, // stores Option<Arc<SchedulerState>>
     registry: Registry,
     digest_publisher: StdRwLock<Option<SchedulerDigestPublisher>>,
+    digest_registry: StdRwLock<Option<SchedulerDigestRegistry>>,
 }
 
 fn ptr_eq_option(a: &Option<Arc<SchedulerState>>, b: &Option<Arc<SchedulerState>>) -> bool {
@@ -308,6 +310,7 @@ impl Scheduler {
             state,
             registry,
             digest_publisher: StdRwLock::new(None),
+            digest_registry: StdRwLock::new(None),
         })
     }
 
@@ -322,6 +325,33 @@ impl Scheduler {
                 *guard = Some(publisher);
             }
         }
+    }
+
+    /// Attaches the scheduler digest registry used by the planner for shortlist reads.
+    pub fn set_digest_registry(&self, registry: SchedulerDigestRegistry) {
+        match self.digest_registry.write() {
+            Ok(mut guard) => {
+                *guard = Some(registry);
+            }
+            Err(err) => {
+                let mut guard = err.into_inner();
+                *guard = Some(registry);
+            }
+        }
+    }
+
+    /// Returns the latest canonical scheduler digest rows replicated for shortlist selection.
+    pub fn scheduler_digests(&self) -> AnyhowResult<Vec<SchedulerDigestValue>> {
+        let registry = match self.digest_registry.read() {
+            Ok(guard) => guard.clone(),
+            Err(err) => err.into_inner().clone(),
+        };
+
+        let Some(registry) = registry else {
+            return Ok(Vec::new());
+        };
+
+        registry.list()
     }
 
     /// Initializes slot-only schedulers (legacy path) by delegating to `init_resources`.

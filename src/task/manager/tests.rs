@@ -11,6 +11,7 @@ use crate::network::types::{
     NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
 };
 use crate::registry::Registry;
+use crate::scheduler::digest::SchedulerDigestRegistry;
 use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
@@ -19,6 +20,7 @@ use crate::store::network_store::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
 use crate::store::peer_store::open_peers_store;
+use crate::store::scheduler_digest_store::open_scheduler_digest_store;
 use crate::store::scheduler_store::open_scheduler_store;
 use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
@@ -658,6 +660,12 @@ async fn setup_manager_with_forwarding(
         .rebuild_mst_from_disk()
         .await
         .expect("rebuild scheduler store");
+    let scheduler_digest_store =
+        open_scheduler_digest_store(scheduler_db.clone(), actor).expect("open scheduler digests");
+    scheduler_digest_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild scheduler digest store");
 
     let (registry_db, _reg_dir) = temp_db("registry");
     let peers_store = open_peers_store(registry_db.clone(), actor).expect("open peers store");
@@ -745,6 +753,7 @@ async fn setup_manager_with_forwarding(
     let scheduler = Rc::new(
         Scheduler::new(scheduler_store.clone(), registry.clone(), actor).expect("create scheduler"),
     );
+    scheduler.set_digest_registry(SchedulerDigestRegistry::new(scheduler_digest_store));
 
     let network_registry = NetworkRegistry::new(
         network_spec_store,

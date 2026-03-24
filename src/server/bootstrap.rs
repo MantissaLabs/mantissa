@@ -462,7 +462,7 @@ impl Bootstrap {
             ctx.self_id,
         );
         let scheduler_digest_replicator =
-            SchedulerDigestReplicator::new(scheduler_digest_registry, scheduler_digest_rx);
+            SchedulerDigestReplicator::new(scheduler_digest_registry.clone(), scheduler_digest_rx);
 
         let scheduler = Rc::new(
             Scheduler::new(
@@ -473,6 +473,7 @@ impl Bootstrap {
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?,
         );
         scheduler.set_digest_publisher(scheduler_digest_publisher);
+        scheduler.set_digest_registry(scheduler_digest_registry);
 
         // Initialize the scheduler with the node information to create the
         // slot allocation.

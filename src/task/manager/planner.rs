@@ -9,6 +9,8 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::gpu::gpu_runtime_status;
+use crate::scheduler::digest::SchedulerDigestValue;
+use crate::scheduler::summary::SchedulerSummary;
 use crate::scheduler::summary::{SchedulerGpuState, SchedulerSlotState};
 use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
@@ -268,6 +270,108 @@ impl Candidate {
     fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
+
+    /// Summarizes the remaining free capacity carried by this candidate.
+    fn capacity(&self) -> CandidateCapacity {
+        let mut capacity = CandidateCapacity {
+            free_slot_count: self.slots.len() as u32,
+            free_gpu_count: self.gpu_devices.len() as u32,
+            ..CandidateCapacity::default()
+        };
+        for slot in &self.slots {
+            capacity.free_cpu_millis = capacity
+                .free_cpu_millis
+                .saturating_add(slot.capacity.cpu_millis);
+            capacity.free_memory_bytes = capacity
+                .free_memory_bytes
+                .saturating_add(slot.capacity.memory_bytes);
+        }
+        capacity
+    }
+}
+
+/// Digest-backed remote candidate metadata used to rank peers before fetching slot details.
+#[derive(Clone)]
+struct RemoteCandidateHint {
+    peer_id: Uuid,
+    digest: SchedulerDigestValue,
+    ready_networks: HashSet<Uuid>,
+    hostable_intent_count: u32,
+    targeted: bool,
+}
+
+/// Aggregate lower-bound demand for the intents that still need placement.
+#[derive(Clone, Copy, Debug, Default)]
+struct WorkloadDemand {
+    task_count: u32,
+    cpu_millis: u64,
+    memory_bytes: u64,
+    gpu_count: u32,
+}
+
+impl WorkloadDemand {
+    /// Aggregates one lower-bound resource demand across the intents that still need placement.
+    fn from_intents(intents: &[&StartIntent]) -> Self {
+        let mut demand = Self::default();
+        for intent in intents {
+            demand.task_count = demand.task_count.saturating_add(1);
+            demand.cpu_millis = demand.cpu_millis.saturating_add(intent.cpu_millis);
+            demand.memory_bytes = demand.memory_bytes.saturating_add(intent.memory_bytes);
+            demand.gpu_count = demand.gpu_count.saturating_add(intent.gpu_count);
+        }
+        demand
+    }
+}
+
+/// Aggregate free capacity already hydrated into concrete scheduling candidates.
+#[derive(Clone, Copy, Debug, Default)]
+struct CandidateCapacity {
+    free_slot_count: u32,
+    free_cpu_millis: u64,
+    free_memory_bytes: u64,
+    free_gpu_count: u32,
+}
+
+impl CandidateCapacity {
+    /// Adds one hydrated candidate's free capacity into the running aggregate.
+    fn add_candidate(&mut self, candidate: &Candidate) {
+        let capacity = candidate.capacity();
+        self.free_slot_count = self
+            .free_slot_count
+            .saturating_add(capacity.free_slot_count);
+        self.free_cpu_millis = self
+            .free_cpu_millis
+            .saturating_add(capacity.free_cpu_millis);
+        self.free_memory_bytes = self
+            .free_memory_bytes
+            .saturating_add(capacity.free_memory_bytes);
+        self.free_gpu_count = self.free_gpu_count.saturating_add(capacity.free_gpu_count);
+    }
+}
+
+/// Returns true when the hydrated candidate pool already covers the aggregate workload lower bound.
+fn capacity_covers_workload(available: CandidateCapacity, demand: WorkloadDemand) -> bool {
+    available.free_slot_count >= demand.task_count
+        && available.free_cpu_millis >= demand.cpu_millis
+        && available.free_memory_bytes >= demand.memory_bytes
+        && available.free_gpu_count >= demand.gpu_count
+}
+
+/// Returns true when the digest can plausibly host the intent without fetching slot details.
+fn digest_can_host_intent(
+    digest: &SchedulerDigestValue,
+    ready_networks: &HashSet<Uuid>,
+    intent: &StartIntent,
+) -> bool {
+    digest.free_slot_count > 0
+        && digest.free_cpu_millis >= intent.cpu_millis
+        && digest.free_memory_bytes >= intent.memory_bytes
+        && (intent.gpu_count == 0
+            || (digest.gpu_runtime_ready && digest.free_gpu_count >= intent.gpu_count))
+        && intent
+            .networks
+            .iter()
+            .all(|network_id| ready_networks.contains(network_id))
 }
 
 #[derive(Clone)]
@@ -445,6 +549,7 @@ impl TaskManager {
                 available_gpus,
                 &readiness_map,
                 &local_ready,
+                &remaining_intents,
             )
             .await?;
         if candidates.is_empty() {
@@ -675,17 +780,152 @@ impl TaskManager {
         ))
     }
 
-    /// Build the round-robin candidate queue starting with the local node followed
-    /// by a shuffled list of peers. Each candidate wraps the slots currently
-    /// reported as free by the relevant scheduler snapshot.
+    /// Builds remote digest hints ranked by shortlist utility for the current workload.
+    fn build_remote_candidate_hints(
+        &self,
+        intents: &[&StartIntent],
+        readiness: &HashMap<Uuid, HashSet<Uuid>>,
+    ) -> Result<Vec<RemoteCandidateHint>, anyhow::Error> {
+        let known_peers: HashSet<Uuid> = self.core.registry.known_peers()?.into_iter().collect();
+        let targeted_nodes: HashSet<Uuid> = intents
+            .iter()
+            .filter_map(|intent| intent.target_node)
+            .filter(|node_id| *node_id != self.local_node_id)
+            .collect();
+        let mut hints = Vec::new();
+
+        for digest in self.core.scheduler.scheduler_digests()? {
+            let peer_id = digest.node_id;
+            if peer_id == self.local_node_id {
+                continue;
+            }
+            if !known_peers.contains(&peer_id) {
+                continue;
+            }
+            if !self.core.registry.peer_schedulable(peer_id) {
+                continue;
+            }
+
+            let ready_networks = readiness
+                .get(&peer_id)
+                .cloned()
+                .unwrap_or_else(HashSet::new);
+            let hostable_intent_count = intents
+                .iter()
+                .filter(|intent| digest_can_host_intent(&digest, &ready_networks, intent))
+                .count() as u32;
+            let targeted = targeted_nodes.contains(&peer_id);
+
+            if !targeted && (digest.free_slot_count == 0 || hostable_intent_count == 0) {
+                continue;
+            }
+
+            hints.push(RemoteCandidateHint {
+                peer_id,
+                digest,
+                ready_networks,
+                hostable_intent_count,
+                targeted,
+            });
+        }
+
+        let mut rng = rng();
+        hints.shuffle(&mut rng);
+        hints.sort_by(|left, right| {
+            right
+                .targeted
+                .cmp(&left.targeted)
+                .then(right.hostable_intent_count.cmp(&left.hostable_intent_count))
+                .then(
+                    right
+                        .digest
+                        .free_slot_count
+                        .cmp(&left.digest.free_slot_count),
+                )
+                .then(right.digest.free_gpu_count.cmp(&left.digest.free_gpu_count))
+                .then(
+                    right
+                        .digest
+                        .free_cpu_millis
+                        .cmp(&left.digest.free_cpu_millis),
+                )
+                .then(
+                    right
+                        .digest
+                        .free_memory_bytes
+                        .cmp(&left.digest.free_memory_bytes),
+                )
+                .then(
+                    right
+                        .digest
+                        .largest_free_slot_cpu_millis
+                        .cmp(&left.digest.largest_free_slot_cpu_millis),
+                )
+                .then(
+                    right
+                        .digest
+                        .largest_free_slot_memory_bytes
+                        .cmp(&left.digest.largest_free_slot_memory_bytes),
+                )
+                .then(left.peer_id.cmp(&right.peer_id))
+        });
+
+        Ok(hints)
+    }
+
+    /// Converts one detailed scheduler summary into a concrete candidate.
+    fn candidate_from_remote_summary(
+        &self,
+        peer_id: Uuid,
+        summary: SchedulerSummary,
+        ready_networks: HashSet<Uuid>,
+    ) -> Option<Candidate> {
+        let slots: Vec<SlotChoice> = summary
+            .details
+            .iter()
+            .filter(|detail| matches!(detail.state, SchedulerSlotState::Free))
+            .map(|detail| SlotChoice {
+                slot_id: detail.slot_id,
+                capacity: SlotCapacity::new(detail.cpu_millis, detail.memory_bytes, 0),
+            })
+            .collect();
+
+        let mut gpu_devices: Vec<GpuChoice> = summary
+            .gpu_devices
+            .iter()
+            .filter(|device| matches!(device.state, SchedulerGpuState::Free))
+            .map(|device| GpuChoice {
+                device_id: device.device_id.clone(),
+            })
+            .collect();
+        gpu_devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        if !summary.gpu_runtime_ready {
+            gpu_devices.clear();
+        }
+
+        Candidate::new(
+            CandidateLocation::Remote {
+                peer_id,
+                version: summary.version,
+            },
+            slots,
+            gpu_devices,
+            ready_networks,
+        )
+    }
+
+    /// Build the round-robin candidate queue starting with the local node and then
+    /// hydrating only the digest-ranked remote peers needed for this workload.
     async fn build_candidate_queue(
         &self,
         local_slots: Vec<SlotChoice>,
         local_gpus: Vec<GpuChoice>,
         readiness: &HashMap<Uuid, HashSet<Uuid>>,
         local_ready: &HashSet<Uuid>,
+        intents: &[&StartIntent],
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
+        let mut provided_capacity = CandidateCapacity::default();
         if self.core.registry.peer_schedulable(self.local_node_id)
             && let Some(local_candidate) = Candidate::new(
                 CandidateLocation::Local,
@@ -694,80 +934,56 @@ impl TaskManager {
                 local_ready.clone(),
             )
         {
+            provided_capacity.add_candidate(&local_candidate);
             queue.push_back(local_candidate);
         }
 
-        let peers = self.core.registry.known_peers()?;
-        let mut remote_candidates = Vec::new();
-        for peer_id in peers {
-            if peer_id == self.local_node_id {
-                continue;
-            }
-            if !self.core.registry.peer_schedulable(peer_id) {
-                continue;
+        let demand = WorkloadDemand::from_intents(intents);
+        let hints = self.build_remote_candidate_hints(intents, readiness)?;
+        let required_target_nodes: HashSet<Uuid> = hints
+            .iter()
+            .filter(|hint| hint.targeted)
+            .map(|hint| hint.peer_id)
+            .collect();
+        let mut hydrated_target_nodes = HashSet::new();
+
+        for hint in hints {
+            if capacity_covers_workload(provided_capacity, demand)
+                && hydrated_target_nodes.len() == required_target_nodes.len()
+            {
+                break;
             }
 
             let summary = match self
                 .core
                 .scheduler
-                .fetch_remote_summary(peer_id, true)
+                .fetch_remote_summary(hint.peer_id, true)
                 .await
             {
                 Ok(summary) => summary,
                 Err(err) => {
                     debug!(
                         target: "task",
-                        "scheduler summary fetch failed for peer {peer_id}: {err}"
+                        "scheduler summary fetch failed for shortlisted peer {}: {err}",
+                        hint.peer_id
                     );
+                    if hint.targeted {
+                        hydrated_target_nodes.insert(hint.peer_id);
+                    }
                     continue;
                 }
             };
 
-            let slots: Vec<SlotChoice> = summary
-                .details
-                .iter()
-                .filter(|detail| matches!(detail.state, SchedulerSlotState::Free))
-                .map(|detail| SlotChoice {
-                    slot_id: detail.slot_id,
-                    capacity: SlotCapacity::new(detail.cpu_millis, detail.memory_bytes, 0),
-                })
-                .collect();
-
-            let mut gpu_devices: Vec<GpuChoice> = summary
-                .gpu_devices
-                .iter()
-                .filter(|device| matches!(device.state, SchedulerGpuState::Free))
-                .map(|device| GpuChoice {
-                    device_id: device.device_id.clone(),
-                })
-                .collect();
-            gpu_devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-            if !summary.gpu_runtime_ready {
-                gpu_devices.clear();
+            if let Some(candidate) =
+                self.candidate_from_remote_summary(hint.peer_id, summary, hint.ready_networks)
+            {
+                provided_capacity.add_candidate(&candidate);
+                queue.push_back(candidate);
             }
 
-            let ready_networks = readiness
-                .get(&peer_id)
-                .cloned()
-                .unwrap_or_else(HashSet::new);
-
-            if let Some(candidate) = Candidate::new(
-                CandidateLocation::Remote {
-                    peer_id,
-                    version: summary.version,
-                },
-                slots,
-                gpu_devices,
-                ready_networks,
-            ) {
-                remote_candidates.push(candidate);
+            if hint.targeted {
+                hydrated_target_nodes.insert(hint.peer_id);
             }
-        }
-
-        let mut rng = rng();
-        remote_candidates.shuffle(&mut rng);
-        for candidate in remote_candidates {
-            queue.push_back(candidate);
         }
 
         Ok(queue)
@@ -1015,5 +1231,99 @@ impl TaskManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CandidateCapacity, StartIntent, WorkloadDemand, capacity_covers_workload,
+        digest_can_host_intent,
+    };
+    use crate::scheduler::digest::SchedulerDigestValue;
+    use uuid::Uuid;
+
+    /// Digest hostability checks should enforce networks and GPU runtime readiness.
+    #[test]
+    fn digest_hostability_honors_networks_and_gpu_runtime() {
+        let required_network = Uuid::new_v4();
+        let intent = StartIntent {
+            index: 0,
+            id: Uuid::new_v4(),
+            name: "gpu-task".into(),
+            image: "img".into(),
+            command: Vec::new(),
+            tty: false,
+            cpu_millis: 500,
+            memory_bytes: 256 * 1_024 * 1_024,
+            gpu_count: 1,
+            gpu_device_ids: Vec::new(),
+            preassigned_slots: Vec::new(),
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: vec![required_network],
+            service_metadata: None,
+            target_node: None,
+        };
+        let digest = SchedulerDigestValue {
+            node_id: Uuid::new_v4(),
+            snapshot_version: 3,
+            updated_at_unix_ms: 10,
+            free_slot_count: 2,
+            free_cpu_millis: 1_000,
+            free_memory_bytes: 512 * 1_024 * 1_024,
+            largest_free_slot_cpu_millis: 500,
+            largest_free_slot_memory_bytes: 256 * 1_024 * 1_024,
+            free_gpu_count: 1,
+            gpu_runtime_ready: false,
+        };
+
+        assert!(!digest_can_host_intent(
+            &digest,
+            &Default::default(),
+            &intent
+        ));
+
+        let mut ready_networks = std::collections::HashSet::new();
+        ready_networks.insert(required_network);
+
+        assert!(!digest_can_host_intent(&digest, &ready_networks, &intent));
+
+        let mut gpu_ready_digest = digest.clone();
+        gpu_ready_digest.gpu_runtime_ready = true;
+        assert!(digest_can_host_intent(
+            &gpu_ready_digest,
+            &ready_networks,
+            &intent
+        ));
+    }
+
+    /// Aggregate stop conditions should require slots, CPU, memory, and GPUs to be covered.
+    #[test]
+    fn capacity_covers_workload_requires_all_resource_dimensions() {
+        let demand = WorkloadDemand {
+            task_count: 2,
+            cpu_millis: 1_000,
+            memory_bytes: 512 * 1_024 * 1_024,
+            gpu_count: 1,
+        };
+        let incomplete = CandidateCapacity {
+            free_slot_count: 2,
+            free_cpu_millis: 1_000,
+            free_memory_bytes: 512 * 1_024 * 1_024,
+            free_gpu_count: 0,
+        };
+        let complete = CandidateCapacity {
+            free_gpu_count: 1,
+            ..incomplete
+        };
+
+        assert!(!capacity_covers_workload(incomplete, demand));
+        assert!(capacity_covers_workload(complete, demand));
     }
 }
