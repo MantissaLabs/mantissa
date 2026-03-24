@@ -41,6 +41,7 @@ use uuid::Uuid;
 mod launch;
 mod local;
 mod planner;
+mod remote_advisory;
 mod reservation;
 mod runtime;
 mod secrets;
@@ -51,6 +52,7 @@ mod volumes;
 mod tests;
 
 use self::planner::{RemoteStartPlan, SchedulingError};
+use self::remote_advisory::RemotePrepareFeedbackRegistry;
 use self::reservation::{ExecutionError, RemoteReservation, ReservedResources};
 /// Maximum number of concurrent image pulls executed per node.
 const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
@@ -157,14 +159,6 @@ struct LivenessProbeEntry {
     consecutive_failures: u32,
 }
 
-#[derive(Clone, Copy)]
-struct RemotePrepareFeedback {
-    // Number of consecutive retryable prepare failures observed for this peer.
-    consecutive_failures: u32,
-    // Local wall-clock deadline until which this peer should be deprioritized.
-    reject_until: Instant,
-}
-
 #[derive(Clone)]
 struct CachedTaskSpecEntry {
     // Store change clock captured when this decoded spec was materialized.
@@ -241,7 +235,7 @@ struct TaskManagerLocalState {
     // Short-lived remove tombstones used to reject stale post-remove upserts.
     removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, RemoveTombstone>>>,
     // Recent retryable remote prepare failures used to deprioritize stale peers locally.
-    remote_prepare_feedback: Arc<StdMutex<HashMap<Uuid, RemotePrepareFeedback>>>,
+    remote_prepare_feedback: RemotePrepareFeedbackRegistry,
     // Per-task dirty gossip buffer collapsed before updates enter the shared gossip queue.
     dirty_gossip_tasks: Arc<AsyncMutex<HashMap<Uuid, DirtyTaskGossipRecord>>>,
     // Wake signal used by the runtime loop to flush dirty task gossip promptly.
@@ -411,7 +405,7 @@ impl TaskManager {
                 inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
                 inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
                 removed_task_watermarks: Arc::new(AsyncMutex::new(HashMap::new())),
-                remote_prepare_feedback: Arc::new(StdMutex::new(HashMap::new())),
+                remote_prepare_feedback: RemotePrepareFeedbackRegistry::new(),
                 dirty_gossip_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
                 dirty_gossip_notify: Arc::new(Notify::new()),
             },
@@ -668,7 +662,7 @@ impl TaskManager {
                 Err(ExecutionError::Fatal(err)) => return Err(err),
             }
 
-            let prepared_remote_plans = match self.reserve_remote_resources(&remote_plans).await {
+            let prepared_remote_plans = match self.prepare_remote_leases(&remote_plans).await {
                 Ok((map, prepared)) => {
                     reserved_remote = map;
                     prepared
@@ -676,7 +670,7 @@ impl TaskManager {
                 Err(ExecutionError::Retry(err)) => {
                     debug!(
                         target: "task",
-                        "remote reservation conflicted on attempt {attempt}: {err}"
+                        "remote lease prepare conflicted on attempt {attempt}: {err}"
                     );
                     if let Some(resources) = reserved_local_resources.take() {
                         self.release_local_resources(&resources).await;
@@ -700,7 +694,7 @@ impl TaskManager {
                         target: "task",
                         "remote materialization conflicted on attempt {attempt}: {err}"
                     );
-                    self.release_remote_resources(&reserved_remote).await;
+                    self.abort_remote_leases(&reserved_remote).await;
                     reserved_remote.clear();
                     if let Some(resources) = reserved_local_resources.take() {
                         self.release_local_resources(&resources).await;
@@ -708,7 +702,7 @@ impl TaskManager {
                     continue;
                 }
                 Err(ExecutionError::Fatal(err)) => {
-                    self.release_remote_resources(&reserved_remote).await;
+                    self.abort_remote_leases(&reserved_remote).await;
                     reserved_remote.clear();
                     if let Some(resources) = reserved_local_resources.take() {
                         self.release_local_resources(&resources).await;
@@ -739,7 +733,7 @@ impl TaskManager {
                         "local execution failed; rolling back remote tasks: {err}"
                     );
                     self.signal_remote_stop(&remote_specs).await;
-                    self.release_remote_resources(&reserved_remote).await;
+                    self.abort_remote_leases(&reserved_remote).await;
                     reserved_remote.clear();
                     // start_local_containers already runs cleanup_batch on failure, which releases
                     // any local slot/GPU reservations touched by this attempt.
@@ -1325,16 +1319,6 @@ fn scheduling_retry_backoff(attempt: usize) -> Duration {
     const MAX_MS: u64 = 2_000;
 
     let exp = attempt.min(5) as u32;
-    let backoff = BASE_MS.saturating_mul(1u64 << exp);
-    Duration::from_millis(backoff.min(MAX_MS))
-}
-
-/// Computes bounded backoff used to temporarily deprioritize peers after retryable prepare failures.
-fn remote_prepare_retry_backoff(consecutive_failures: u32) -> Duration {
-    const BASE_MS: u64 = 500;
-    const MAX_MS: u64 = 5_000;
-
-    let exp = consecutive_failures.saturating_sub(1).min(4);
     let backoff = BASE_MS.saturating_mul(1u64 << exp);
     Duration::from_millis(backoff.min(MAX_MS))
 }

@@ -38,8 +38,7 @@ pub(super) struct RemoteLeaseReservation {
 }
 
 fn is_scheduler_retryable_message(message: &str) -> bool {
-    message.contains("snapshot mismatch")
-        || message.contains("slots unavailable")
+    message.contains("slots unavailable")
         || message.contains("unknown slots")
         || message.contains("gpu devices unavailable")
         || message.contains("unknown gpu devices")
@@ -58,37 +57,6 @@ fn parse_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, anyhow::Error> {
 }
 
 impl TaskManager {
-    /// Clears any local prepare backoff for a peer after a successful remote lease prepare.
-    pub(super) fn clear_remote_prepare_feedback(&self, peer_id: Uuid) {
-        let mut guard = match self.local_state.remote_prepare_feedback.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.remove(&peer_id);
-    }
-
-    /// Records one retryable remote prepare failure so stale peers are deprioritized briefly.
-    pub(super) fn note_remote_prepare_failure(&self, peer_id: Uuid) {
-        let now = tokio::time::Instant::now();
-        let mut guard = match self.local_state.remote_prepare_feedback.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.retain(|_, feedback| feedback.reject_until > now);
-        let consecutive_failures = guard
-            .get(&peer_id)
-            .map(|feedback| feedback.consecutive_failures)
-            .unwrap_or(0)
-            .saturating_add(1);
-        guard.insert(
-            peer_id,
-            super::RemotePrepareFeedback {
-                consecutive_failures,
-                reject_until: now + super::remote_prepare_retry_backoff(consecutive_failures),
-            },
-        );
-    }
-
     /// Releases a single slot via the scheduler, retrying on snapshot mismatches.
     pub(super) async fn release_slot(&self, slot_id: SlotId) -> Result<(), anyhow::Error> {
         const MAX_ATTEMPTS: usize = 10;
@@ -251,7 +219,7 @@ impl TaskManager {
     }
 
     /// Prepares remote leases grouped per target node and returns the rollback map.
-    pub(super) async fn reserve_remote_resources(
+    pub(super) async fn prepare_remote_leases(
         &self,
         plans: &[RemoteStartPlan],
     ) -> Result<
@@ -276,8 +244,10 @@ impl TaskManager {
             let session = match self.remote_session(peer_id).await {
                 Ok(session) => session,
                 Err(err) => {
-                    self.note_remote_prepare_failure(peer_id);
-                    self.release_remote_resources(&reservations).await;
+                    self.local_state
+                        .remote_prepare_feedback
+                        .record_retryable_failure(peer_id);
+                    self.abort_remote_leases(&reservations).await;
                     return Err(ExecutionError::Retry(err));
                 }
             };
@@ -288,22 +258,28 @@ impl TaskManager {
                         Ok(result) => match result.get_scheduler() {
                             Ok(client) => client,
                             Err(err) => {
-                                self.note_remote_prepare_failure(peer_id);
-                                self.release_remote_resources(&reservations).await;
+                                self.local_state
+                                    .remote_prepare_feedback
+                                    .record_retryable_failure(peer_id);
+                                self.abort_remote_leases(&reservations).await;
                                 return Err(ExecutionError::Retry(anyhow::anyhow!(
                                     err.to_string()
                                 )));
                             }
                         },
                         Err(err) => {
-                            self.note_remote_prepare_failure(peer_id);
-                            self.release_remote_resources(&reservations).await;
+                            self.local_state
+                                .remote_prepare_feedback
+                                .record_retryable_failure(peer_id);
+                            self.abort_remote_leases(&reservations).await;
                             return Err(ExecutionError::Retry(anyhow::anyhow!(err.to_string())));
                         }
                     },
                     Err(err) => {
-                        self.note_remote_prepare_failure(peer_id);
-                        self.release_remote_resources(&reservations).await;
+                        self.local_state
+                            .remote_prepare_feedback
+                            .record_retryable_failure(peer_id);
+                        self.abort_remote_leases(&reservations).await;
                         return Err(ExecutionError::Retry(anyhow::anyhow!(err.to_string())));
                     }
                 };
@@ -331,7 +307,7 @@ impl TaskManager {
                             let leases = match response.get_leases() {
                                 Ok(bindings) => bindings,
                                 Err(err) => {
-                                    self.release_remote_resources(&reservations).await;
+                                    self.abort_remote_leases(&reservations).await;
                                     return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                         err.to_string()
                                     )));
@@ -342,12 +318,12 @@ impl TaskManager {
                                     Ok(bytes) => match parse_uuid(bytes) {
                                         Ok(lease_id) => lease_id,
                                         Err(err) => {
-                                            self.release_remote_resources(&reservations).await;
+                                            self.abort_remote_leases(&reservations).await;
                                             return Err(ExecutionError::Fatal(err));
                                         }
                                     },
                                     Err(err) => {
-                                        self.release_remote_resources(&reservations).await;
+                                        self.abort_remote_leases(&reservations).await;
                                         return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                             err.to_string()
                                         )));
@@ -357,12 +333,12 @@ impl TaskManager {
                                     Ok(bytes) => match parse_uuid(bytes) {
                                         Ok(task_id) => task_id,
                                         Err(err) => {
-                                            self.release_remote_resources(&reservations).await;
+                                            self.abort_remote_leases(&reservations).await;
                                             return Err(ExecutionError::Fatal(err));
                                         }
                                     },
                                     Err(err) => {
-                                        self.release_remote_resources(&reservations).await;
+                                        self.abort_remote_leases(&reservations).await;
                                         return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                             err.to_string()
                                         )));
@@ -372,7 +348,7 @@ impl TaskManager {
                                 let slot_ids = match lease.get_slot_ids() {
                                     Ok(ids) => ids.iter().collect::<Vec<_>>(),
                                     Err(err) => {
-                                        self.release_remote_resources(&reservations).await;
+                                        self.abort_remote_leases(&reservations).await;
                                         return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                             err.to_string()
                                         )));
@@ -381,7 +357,7 @@ impl TaskManager {
                                 let gpu_devices = match lease.get_gpu_device_ids() {
                                     Ok(ids) => ids,
                                     Err(err) => {
-                                        self.release_remote_resources(&reservations).await;
+                                        self.abort_remote_leases(&reservations).await;
                                         return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                             err.to_string()
                                         )));
@@ -393,7 +369,7 @@ impl TaskManager {
                                     let value = match device_id {
                                         Ok(value) => value,
                                         Err(err) => {
-                                            self.release_remote_resources(&reservations).await;
+                                            self.abort_remote_leases(&reservations).await;
                                             return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                                 err.to_string()
                                             )));
@@ -402,7 +378,7 @@ impl TaskManager {
                                     let value = match value.to_str() {
                                         Ok(value) => value,
                                         Err(err) => {
-                                            self.release_remote_resources(&reservations).await;
+                                            self.abort_remote_leases(&reservations).await;
                                             return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                                 err.to_string()
                                             )));
@@ -418,7 +394,7 @@ impl TaskManager {
                                     )
                                     .is_some()
                                 {
-                                    self.release_remote_resources(&reservations).await;
+                                    self.abort_remote_leases(&reservations).await;
                                     return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                         "duplicate prepared binding returned for task {task_id}"
                                     )));
@@ -433,7 +409,7 @@ impl TaskManager {
                                     prepared_gpu_ids,
                                 )) = bindings_by_task.remove(&plan.id)
                                 else {
-                                    self.release_remote_resources(&reservations).await;
+                                    self.abort_remote_leases(&reservations).await;
                                     return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                         "missing prepared binding for remote task {} on peer {}",
                                         plan.id,
@@ -442,7 +418,7 @@ impl TaskManager {
                                 };
 
                                 if prepared_slot_ids.is_empty() {
-                                    self.release_remote_resources(&reservations).await;
+                                    self.abort_remote_leases(&reservations).await;
                                     return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                         "prepared remote task {} on peer {} without slots",
                                         plan.id,
@@ -451,7 +427,7 @@ impl TaskManager {
                                 }
 
                                 if prepared_gpu_ids.len() < plan.gpu_count as usize {
-                                    self.release_remote_resources(&reservations).await;
+                                    self.abort_remote_leases(&reservations).await;
                                     return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                         "prepared remote task {} on peer {} returned only {} GPU(s) for request of {}",
                                         plan.id,
@@ -494,7 +470,7 @@ impl TaskManager {
                             }
 
                             if !bindings_by_task.is_empty() {
-                                self.release_remote_resources(&reservations).await;
+                                self.abort_remote_leases(&reservations).await;
                                 return Err(ExecutionError::Fatal(anyhow::anyhow!(
                                     "peer {peer_id} returned unexpected prepared bindings"
                                 )));
@@ -506,13 +482,17 @@ impl TaskManager {
                                     leases: lease_reservations,
                                 },
                             );
-                            self.clear_remote_prepare_feedback(peer_id);
+                            self.local_state
+                                .remote_prepare_feedback
+                                .clear_success(peer_id);
                         }
                         Err(err) => {
                             let message = err.to_string();
-                            self.release_remote_resources(&reservations).await;
+                            self.abort_remote_leases(&reservations).await;
                             if is_scheduler_retryable_message(&message) {
-                                self.note_remote_prepare_failure(peer_id);
+                                self.local_state
+                                    .remote_prepare_feedback
+                                    .record_retryable_failure(peer_id);
                                 return Err(ExecutionError::Retry(anyhow::anyhow!(message)));
                             }
                             return Err(ExecutionError::Fatal(anyhow::anyhow!(message)));
@@ -520,9 +500,11 @@ impl TaskManager {
                     },
                     Err(err) => {
                         let message = err.to_string();
-                        self.release_remote_resources(&reservations).await;
+                        self.abort_remote_leases(&reservations).await;
                         if is_scheduler_retryable_message(&message) {
-                            self.note_remote_prepare_failure(peer_id);
+                            self.local_state
+                                .remote_prepare_feedback
+                                .record_retryable_failure(peer_id);
                             return Err(ExecutionError::Retry(anyhow::anyhow!(message)));
                         }
                         return Err(ExecutionError::Fatal(anyhow::anyhow!(message)));
@@ -530,9 +512,11 @@ impl TaskManager {
                 },
                 Err(err) => {
                     let message = err.to_string();
-                    self.release_remote_resources(&reservations).await;
+                    self.abort_remote_leases(&reservations).await;
                     if is_scheduler_retryable_message(&message) {
-                        self.note_remote_prepare_failure(peer_id);
+                        self.local_state
+                            .remote_prepare_feedback
+                            .record_retryable_failure(peer_id);
                         return Err(ExecutionError::Retry(anyhow::anyhow!(message)));
                     }
                     return Err(ExecutionError::Fatal(anyhow::anyhow!(message)));
@@ -544,7 +528,7 @@ impl TaskManager {
     }
 
     /// Aborts prepared remote leases accumulated during previous stages.
-    pub(super) async fn release_remote_resources(
+    pub(super) async fn abort_remote_leases(
         &self,
         reservations: &HashMap<Uuid, RemoteReservation>,
     ) {

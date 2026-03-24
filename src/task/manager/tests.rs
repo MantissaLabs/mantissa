@@ -6401,28 +6401,49 @@ async fn remote_prepare_feedback_records_and_clears_retryable_peer_backoff() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
     let peer_id = Uuid::new_v4();
 
-    manager.note_remote_prepare_failure(peer_id);
-    let first = manager.remote_prepare_feedback_snapshot();
+    manager
+        .local_state
+        .remote_prepare_feedback
+        .record_retryable_failure(peer_id);
+    let first = manager.local_state.remote_prepare_feedback.snapshot();
     let first_feedback = first
         .get(&peer_id)
         .expect("peer feedback after first failure");
+    let first_reject_until = manager
+        .local_state
+        .remote_prepare_feedback
+        .reject_until(peer_id)
+        .expect("peer backoff deadline after first failure");
     assert_eq!(first_feedback.consecutive_failures, 1);
 
-    manager.note_remote_prepare_failure(peer_id);
-    let second = manager.remote_prepare_feedback_snapshot();
+    manager
+        .local_state
+        .remote_prepare_feedback
+        .record_retryable_failure(peer_id);
+    let second = manager.local_state.remote_prepare_feedback.snapshot();
     let second_feedback = second
         .get(&peer_id)
         .expect("peer feedback after second failure");
+    let second_reject_until = manager
+        .local_state
+        .remote_prepare_feedback
+        .reject_until(peer_id)
+        .expect("peer backoff deadline after second failure");
     assert_eq!(second_feedback.consecutive_failures, 2);
     assert!(
-        second_feedback.reject_until > first_feedback.reject_until,
+        second_reject_until > first_reject_until,
         "later retryable failures should extend peer backoff"
     );
 
-    manager.clear_remote_prepare_feedback(peer_id);
+    manager
+        .local_state
+        .remote_prepare_feedback
+        .clear_success(peer_id);
     assert!(
         !manager
-            .remote_prepare_feedback_snapshot()
+            .local_state
+            .remote_prepare_feedback
+            .snapshot()
             .contains_key(&peer_id),
         "successful prepare should clear peer backoff immediately"
     );

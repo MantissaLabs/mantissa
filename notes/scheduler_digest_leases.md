@@ -432,14 +432,11 @@ Hard cutover:
 
 2. Add:
    - `prepareLeases`
-   - `commitLeases`
    - `abortLeases`
    - `LeaseIntent`
    - `PrepareLeasesRequest`
    - `PrepareLeasesResponse`
    - `PreparedLease`
-   - `CommitLeaseIntent`
-   - `CommitLeasesRequest`
    - `AbortLeaseIntent`
    - `AbortLeasesRequest`
    - `SchedulingDigest`
@@ -448,6 +445,9 @@ Hard cutover:
 3. Keep `summary` as a diagnostic surface only.
 
 `summary` should no longer be used by the scheduling hot path.
+The target node commits prepared leases locally when the replicated task spec
+is adopted by the runtime, so there is no separate remote `commitLeases` RPC
+in the implemented design.
 
 ## `crates/protocol/schema/gossip.capnp`
 
@@ -572,21 +572,22 @@ Required work:
 1. extend snapshot state to represent prepared leases,
 2. add lease index bookkeeping,
 3. add `prepare_leases`,
-4. add `commit_leases`,
+4. add local lease commit handling,
 5. add `abort_leases`,
 6. add expiry sweep logic,
 7. publish digest updates after every effective local scheduler mutation.
 
-The existing `reserve_resources` and `free_resources` paths should be removed
-and replaced by lease-aware flows.
+The existing remote reservation paths should be removed and replaced by
+lease-aware flows. Local task ownership still uses explicit
+`reserve_resources`/`free_resources` promotion after a prepared lease is
+committed.
 
 ### `src/scheduler/service.rs`
 
 Replace the old slot reservation handlers with:
 
 1. `prepare_leases`
-2. `commit_leases`
-3. `abort_leases`
+2. `abort_leases`
 
 Keep `summary` for operator diagnostics.
 
@@ -632,11 +633,10 @@ Replace:
 with:
 
 1. `prepare_remote_leases`
-2. `commit_remote_leases`
-3. `abort_remote_leases`
+2. `abort_remote_leases`
 
-Local scheduling should also use the same lease model so the code path is not
-split between "local reserve by snapshot" and "remote reserve by RPC".
+Local scheduling continues to reserve the already selected local resources by
+snapshot version. Only remote coordination moves onto lease prepare/abort.
 
 ### `src/task/manager/state.rs`
 
@@ -687,7 +687,7 @@ Exit criteria:
 ## Phase 2: add lease-aware local scheduler state
 
 1. Extend `SchedulerSnapshot` and `SchedulerState` with lease records.
-2. Implement local `prepare_leases`, `commit_leases`, `abort_leases`, and
+2. Implement local `prepare_leases`, local lease commit, `abort_leases`, and
    expiry sweep.
 3. Update summary rendering to expose lease-held resources.
 
