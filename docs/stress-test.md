@@ -21,6 +21,22 @@ MANTISSA_RUN_STRESS=1 \
 cargo test --test stress_large_cluster -- --ignored --nocapture
 ```
 
+One practical local profile that keeps the subprocess cluster busy without
+oversubscribing the machine is:
+
+```bash
+MANTISSA_RUN_STRESS=1 \
+TOKIO_WORKER_THREADS=1 \
+MANTISSA_STRESS_WORKERS=2 \
+MANTISSA_STRESS_MAX_BLOCKING=16 \
+MANTISSA_STRESS_NODE_COUNT=30 \
+MANTISSA_STRESS_TARGET_TASKS=500 \
+MANTISSA_GOSSIP_FANOUT=5 \
+MANTISSA_GOSSIP_TICK_MS=1000 \
+MANTISSA_GOSSIP_CHANNEL_CAPACITY=512 \
+cargo test --test stress_large_cluster -- --ignored --nocapture
+```
+
 ## Key Environment Variables
 
 ### Stress harness variables
@@ -128,3 +144,34 @@ increase gradually.
 
 - Inter-node traffic in this stress test is over TCP (`127.0.0.1:<port>`).
 - The harness control path to each daemon uses its local Unix socket.
+
+## Convergence Metrics Printed by the Test
+
+The stress test logs a few high-signal checkpoints during deployment and stop:
+
+- `active task target reached`
+  - The anchor sees the expected number of active tasks.
+- `task-root distribution after active convergence`
+  - How many distinct task-domain MST roots exist right after the active-task
+    target is reached.
+- `task-root settle after active convergence`
+  - A task-row churn proxy. This reports:
+  - `elapsed`
+    - Time from the initial post-deployment task-root snapshot to one fully
+      converged task root across all nodes.
+  - `initial_unique_roots`
+    - Distinct non-empty task roots present at the first post-deployment
+      snapshot.
+  - `max_unique_roots`
+    - Highest distinct-root count observed before settle.
+  - `node_root_changes`
+    - Total number of node-local task-root changes observed while waiting for
+      convergence.
+  - `snapshot_rounds`
+    - Number of root snapshots sampled before convergence.
+- `reservations drained to zero on all nodes`
+  - Confirms scheduler reservations were fully released after stop.
+
+The task-root settle line is useful when evaluating scheduler changes that aim
+to reduce post-deployment task-row churn rather than only improving final
+eventual convergence.

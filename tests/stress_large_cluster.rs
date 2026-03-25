@@ -205,6 +205,15 @@ struct SchedulerSummarySnapshot {
     reserved_slots: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct DomainRootConvergenceMetrics {
+    elapsed: Duration,
+    initial_unique_roots: usize,
+    max_unique_roots: usize,
+    snapshot_rounds: u32,
+    node_root_changes: usize,
+}
+
 /// Waits for one local Unix socket session to become reachable on a spawned daemon.
 async fn wait_for_session_ready(
     child: &mut Child,
@@ -1133,6 +1142,150 @@ fn domain_label(domain: Domain) -> &'static str {
     }
 }
 
+/// Collects one per-node root snapshot for the provided sync domain.
+async fn collect_domain_roots(
+    nodes: &[ProcessNode],
+    domain: Domain,
+) -> Vec<(String, Option<String>)> {
+    let mut roots = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        roots.push((
+            node.node_name.clone(),
+            node.local_root_hex_for_domain(domain).await.ok(),
+        ));
+    }
+    roots
+}
+
+/// Returns true when every collected root is non-empty and identical.
+fn roots_all_equal_non_empty(roots: &[(String, Option<String>)]) -> bool {
+    let all_non_empty = roots
+        .iter()
+        .all(|(_, root)| root.as_ref().is_some_and(|value| !value.is_empty()));
+    if !all_non_empty {
+        return false;
+    }
+
+    roots
+        .first()
+        .and_then(|(_, first)| first.as_ref())
+        .map(|first| {
+            roots
+                .iter()
+                .all(|(_, root)| root.as_ref().is_some_and(|value| value == first))
+        })
+        .unwrap_or(false)
+}
+
+/// Builds one compact root distribution summary for log output.
+fn root_distribution(roots: &[(String, Option<String>)]) -> BTreeMap<String, usize> {
+    let mut distribution = BTreeMap::new();
+    for (_, root) in roots {
+        let label = match root {
+            Some(value) if !value.is_empty() => value.clone(),
+            Some(_) => "<empty>".to_string(),
+            None => "<error>".to_string(),
+        };
+        *distribution.entry(label).or_insert(0) += 1;
+    }
+    distribution
+}
+
+/// Counts how many distinct non-empty roots are present in one snapshot.
+fn unique_non_empty_root_count(roots: &[(String, Option<String>)]) -> usize {
+    root_distribution(roots)
+        .into_keys()
+        .filter(|label| label != "<empty>" && label != "<error>")
+        .count()
+}
+
+/// Counts the number of node-local root values that changed between two snapshots.
+fn count_root_changes(
+    previous: &[(String, Option<String>)],
+    current: &[(String, Option<String>)],
+) -> usize {
+    previous
+        .iter()
+        .zip(current.iter())
+        .filter(
+            |((previous_name, previous_root), (current_name, current_root))| {
+                debug_assert_eq!(previous_name, current_name);
+                previous_root != current_root
+            },
+        )
+        .count()
+}
+
+/// Renders one divergent root snapshot for timeout diagnostics.
+fn render_root_snapshot(roots: &[(String, Option<String>)]) -> String {
+    roots
+        .iter()
+        .map(|(name, root)| match root {
+            Some(value) if !value.is_empty() => format!("{name}={value}"),
+            Some(_) => format!("{name}=<empty>"),
+            None => format!("{name}=<error>"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Waits for one domain to converge and returns root-stability metrics collected along the way.
+async fn wait_roots_equal_all_for_domain_with_metrics(
+    nodes: &[ProcessNode],
+    domain: Domain,
+    timeout: Duration,
+    initial_roots: Vec<(String, Option<String>)>,
+) -> Result<DomainRootConvergenceMetrics> {
+    if nodes.is_empty() {
+        return Ok(DomainRootConvergenceMetrics::default());
+    }
+
+    let domain_name = domain_label(domain);
+    let started_at = Instant::now();
+    let deadline = started_at + timeout;
+    let mut previous = initial_roots;
+    let mut metrics = DomainRootConvergenceMetrics {
+        initial_unique_roots: unique_non_empty_root_count(&previous),
+        max_unique_roots: unique_non_empty_root_count(&previous),
+        snapshot_rounds: 1,
+        ..DomainRootConvergenceMetrics::default()
+    };
+
+    if roots_all_equal_non_empty(&previous) {
+        metrics.elapsed = started_at.elapsed();
+        return Ok(metrics);
+    }
+
+    loop {
+        if Instant::now() >= deadline {
+            bail!(
+                "{domain_name} roots did not settle after {:?}: initial_unique_roots={} max_unique_roots={} node_root_changes={} snapshot_rounds={} [{}]",
+                timeout,
+                metrics.initial_unique_roots,
+                metrics.max_unique_roots,
+                metrics.node_root_changes,
+                metrics.snapshot_rounds,
+                render_root_snapshot(&previous),
+            );
+        }
+
+        sleep(Duration::from_millis(200)).await;
+        let current = collect_domain_roots(nodes, domain).await;
+        metrics.snapshot_rounds = metrics.snapshot_rounds.saturating_add(1);
+        metrics.node_root_changes += count_root_changes(&previous, &current);
+        metrics.max_unique_roots = metrics
+            .max_unique_roots
+            .max(unique_non_empty_root_count(&current));
+
+        if roots_all_equal_non_empty(&current) {
+            metrics.elapsed = started_at.elapsed();
+            return Ok(metrics);
+        }
+
+        previous = current;
+    }
+}
+
 /// Waits until all nodes report the same non-empty root hash for one sync domain.
 async fn wait_roots_equal_all_for_domain(
     nodes: &[ProcessNode],
@@ -1143,50 +1296,9 @@ async fn wait_roots_equal_all_for_domain(
         return Ok(());
     }
 
-    let domain_name = domain_label(domain);
-    let deadline = Instant::now() + timeout;
-    loop {
-        let mut roots: Vec<(String, Option<String>)> = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            let root = node.local_root_hex_for_domain(domain).await.ok();
-            roots.push((node.node_name.clone(), root));
-        }
-
-        let all_non_empty = roots
-            .iter()
-            .all(|(_, root)| root.as_ref().is_some_and(|value| !value.is_empty()));
-        let all_equal = roots
-            .first()
-            .and_then(|(_, first)| first.as_ref())
-            .map(|first| {
-                roots
-                    .iter()
-                    .all(|(_, root)| root.as_ref().is_some_and(|value| value == first))
-            })
-            .unwrap_or(false);
-
-        if all_non_empty && all_equal {
-            return Ok(());
-        }
-
-        if Instant::now() >= deadline {
-            let snapshot = roots
-                .into_iter()
-                .map(|(name, root)| match root {
-                    Some(value) if !value.is_empty() => format!("{name}={value}"),
-                    Some(_) => format!("{name}=<empty>"),
-                    None => format!("{name}=<error>"),
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "{domain_name} roots diverged or empty after {:?}: {snapshot}",
-                timeout
-            );
-        }
-
-        sleep(Duration::from_millis(200)).await;
-    }
+    let initial_roots = collect_domain_roots(nodes, domain).await;
+    wait_roots_equal_all_for_domain_with_metrics(nodes, domain, timeout, initial_roots).await?;
+    Ok(())
 }
 
 /// Waits until all nodes report the same non-empty peers root hash.
@@ -1328,22 +1440,30 @@ fn stress_converges_large_service() {
             visibility.join(", ")
         );
 
-        let mut task_roots: BTreeMap<String, usize> = BTreeMap::new();
-        for node in &cluster.nodes {
-            let root = node
-                .local_root_hex_for_domain(Domain::Tasks)
-                .await
-                .unwrap_or_else(|_| "<error>".to_string());
-            *task_roots.entry(root).or_insert(0) += 1;
-        }
+        let task_root_snapshot = collect_domain_roots(&cluster.nodes, Domain::Tasks).await;
+        let task_roots = root_distribution(&task_root_snapshot);
         eprintln!("stress: task-root distribution after active convergence {task_roots:?}");
+
+        let task_root_metrics = wait_roots_equal_all_for_domain_with_metrics(
+            &cluster.nodes,
+            Domain::Tasks,
+            Duration::from_secs(600),
+            task_root_snapshot,
+        )
+        .await
+        .expect("all nodes should converge on equal task roots after deployment");
+        eprintln!(
+            "stress: task-root settle after active convergence elapsed={:?} initial_unique_roots={} max_unique_roots={} node_root_changes={} snapshot_rounds={}",
+            task_root_metrics.elapsed,
+            task_root_metrics.initial_unique_roots,
+            task_root_metrics.max_unique_roots,
+            task_root_metrics.node_root_changes,
+            task_root_metrics.snapshot_rounds,
+        );
 
         wait_roots_equal_all_for_domain(&cluster.nodes, Domain::Services, Duration::from_secs(300))
             .await
             .expect("all nodes should converge on equal services roots after deployment");
-        wait_roots_equal_all_for_domain(&cluster.nodes, Domain::Tasks, Duration::from_secs(600))
-            .await
-            .expect("all nodes should converge on equal task roots after deployment");
         eprintln!("stress: service/task roots converged after deployment");
 
         let running_target_reached = wait_for_service_task_count(
