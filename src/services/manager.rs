@@ -1691,6 +1691,7 @@ impl ServiceController {
         }
 
         let has_targets = requests.iter().any(|request| request.target_node.is_some());
+        let allow_untargeted_fallback = allow_untargeted_fallback(&requests);
         let requires_pinned_targets = if has_targets {
             requests_require_pinned_targets(&self.volume_registry, &requests)?
         } else {
@@ -1702,6 +1703,13 @@ impl ServiceController {
                 tracing::warn!(
                     target: "services",
                     "pinned placement failed for {context}; bound local volumes disable fallback retries: {err:#}"
+                );
+                Err(err)
+            }
+            Err(err) if has_targets && !allow_untargeted_fallback => {
+                tracing::warn!(
+                    target: "services",
+                    "pinned placement failed for {context}; preserving multi-node targets for retry: {err:#}"
                 );
                 Err(err)
             }
@@ -2495,6 +2503,21 @@ fn should_accept_update(current: Option<&ServiceSpecValue>, incoming: &ServiceSp
     should_accept_service_update(current, incoming)
 }
 
+/// Returns whether a targeted rollout batch may safely drop its node targets on fallback.
+///
+/// Multi-node targeted batches encode deterministic spread decisions. Dropping every target after
+/// one transient scheduling miss can collapse a balanced scale-out onto fewer nodes and leave the
+/// repair work to a later rebalance loop. Only batches that point at zero or one distinct target
+/// should use the untargeted fallback path.
+fn allow_untargeted_fallback(requests: &[TaskStartRequest]) -> bool {
+    requests
+        .iter()
+        .filter_map(|request| request.target_node)
+        .collect::<HashSet<_>>()
+        .len()
+        <= 1
+}
+
 fn should_stop_tasks(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecValue) -> bool {
     use ServiceStatus::{Deploying, Running, Stopped, Stopping};
 
@@ -2615,6 +2638,32 @@ mod tests {
                 target: "/var/lib/app".to_string(),
                 read_only: false,
             }],
+            networks: Vec::new(),
+            service_metadata: None,
+            target_node,
+        }
+    }
+
+    /// Builds one minimal task start request for fallback-policy tests.
+    fn make_request(target_node: Option<Uuid>) -> TaskStartRequest {
+        TaskStartRequest {
+            name: "demo-task".to_string(),
+            image: "ghcr.io/demo/app:latest".to_string(),
+            command: Vec::new(),
+            tty: false,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            gpu_device_ids: Vec::new(),
+            id: Some(Uuid::new_v4()),
+            slot_ids: Vec::new(),
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: None,
             target_node,
@@ -3599,5 +3648,28 @@ mod tests {
             .expect("evaluate fallback policy");
 
         assert!(!requires_pinned);
+    }
+
+    /// Multi-target rollout batches should keep deterministic spread instead of dropping targets.
+    #[test]
+    fn multi_target_batches_disable_untargeted_fallback() {
+        let node_a = Uuid::from_bytes([1u8; 16]);
+        let node_b = Uuid::from_bytes([2u8; 16]);
+
+        assert!(!allow_untargeted_fallback(&[
+            make_request(Some(node_a)),
+            make_request(Some(node_b)),
+        ]));
+    }
+
+    /// Single-target batches can still fall back to generic placement when needed.
+    #[test]
+    fn single_target_batches_allow_untargeted_fallback() {
+        let node_a = Uuid::from_bytes([1u8; 16]);
+
+        assert!(allow_untargeted_fallback(&[
+            make_request(Some(node_a)),
+            make_request(Some(node_a)),
+        ]));
     }
 }
