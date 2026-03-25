@@ -440,10 +440,6 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
         },
 
-        Command::Submit(_s) => {
-            // e.g., task::task::submit(&s.input).await?;
-        }
-
         Command::Link(link_args) => {
             cfg.join_token = link_args.join_token.clone();
             cfg.anchor = Some(link_args.anchor.clone());

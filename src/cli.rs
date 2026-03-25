@@ -192,9 +192,6 @@ pub enum Command {
         #[command(subcommand)]
         cmd: VolumesCommand,
     },
-
-    /// Submit a job to the cluster
-    Submit(SubmitArgs),
 }
 
 #[derive(Args, Debug)]
