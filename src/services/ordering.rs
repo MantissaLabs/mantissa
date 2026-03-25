@@ -5,6 +5,9 @@ use std::cmp::Ordering;
 /// Compares two service specs and returns which one should win CRDT selection.
 pub(crate) fn compare_service_specs(left: &ServiceSpecValue, right: &ServiceSpecValue) -> Ordering {
     if left.manifest_id == right.manifest_id {
+        if let Some(ordering) = compare_same_generation_terminal_preference(left, right) {
+            return ordering;
+        }
         return compare_causal_tuple(left, right).then_with(|| left.cmp(right));
     }
 
@@ -50,6 +53,29 @@ fn compare_manifest_mismatch(left: &ServiceSpecValue, right: &ServiceSpecValue) 
         .then_with(|| left.cmp(right))
 }
 
+/// Keeps same-generation terminal intent dominant over stale non-terminal updates.
+///
+/// Readiness, rollout, or status-detail tasks can still be in flight when a user stops a
+/// service. Those stale workers must not be able to resurrect the same generation back into a
+/// non-terminal state just because they observed a later timestamp or incremented phase version.
+fn compare_same_generation_terminal_preference(
+    left: &ServiceSpecValue,
+    right: &ServiceSpecValue,
+) -> Option<Ordering> {
+    if left.service_epoch != right.service_epoch {
+        return None;
+    }
+
+    match (
+        status_is_same_generation_terminal(left.status),
+        status_is_same_generation_terminal(right.status),
+    ) {
+        (true, false) => Some(Ordering::Greater),
+        (false, true) => Some(Ordering::Less),
+        _ => None,
+    }
+}
+
 /// Gives stop propagation priority so new manifests cannot resurrect a stopping service.
 fn compare_stopping_preference(
     left: &ServiceSpecValue,
@@ -61,6 +87,14 @@ fn compare_stopping_preference(
         (_, ServiceStatus::Stopping) => Some(Ordering::Less),
         _ => None,
     }
+}
+
+/// Returns true when the status represents same-generation terminal intent.
+fn status_is_same_generation_terminal(status: ServiceStatus) -> bool {
+    matches!(
+        status,
+        ServiceStatus::Stopping | ServiceStatus::Stopped | ServiceStatus::Failed
+    )
 }
 
 /// Detects an explicit rollback result that should beat the immediately newer deploying epoch.
@@ -135,5 +169,82 @@ fn status_rank(status: ServiceStatus) -> u8 {
         ServiceStatus::Running => 1,
         ServiceStatus::Stopping => 2,
         ServiceStatus::Stopped => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::types::ServiceTaskSpecValue;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use uuid::Uuid;
+
+    /// Builds one service spec value with explicit lifecycle ordering metadata for comparisons.
+    fn build_service_spec(
+        manifest_id: Uuid,
+        service_epoch: u64,
+        phase_version: u64,
+        status: ServiceStatus,
+    ) -> ServiceSpecValue {
+        let tasks = vec![ServiceTaskSpecValue {
+            name: "api".into(),
+            image: "ghcr.io/demo/api:latest".into(),
+            command: Vec::new(),
+            tty: false,
+            depends_on: Vec::new(),
+            replicas: 1,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            readiness: None,
+            liveness: None,
+            public_port: None,
+            public_protocol: None,
+        }];
+
+        let mut spec =
+            ServiceSpecValue::new(manifest_id, "manifest", "demo-service", tasks, vec![]);
+        spec.service_epoch = service_epoch;
+        spec.phase_version = phase_version;
+        spec.status = status;
+        spec.updated_at = (Utc::now() + ChronoDuration::seconds(phase_version as i64)).to_rfc3339();
+        spec
+    }
+
+    /// Ensures stop intent wins over later same-generation running updates from stale workers.
+    #[test]
+    fn same_generation_stopped_beats_later_running_update() {
+        let manifest_id = Uuid::new_v4();
+        let current = build_service_spec(manifest_id, 7, 4, ServiceStatus::Stopped);
+        let incoming = build_service_spec(manifest_id, 7, 9, ServiceStatus::Running);
+
+        assert!(compare_service_specs(&current, &incoming).is_gt());
+    }
+
+    /// Ensures a same-generation failure cannot be overwritten by a stale running heartbeat.
+    #[test]
+    fn same_generation_failed_beats_later_running_update() {
+        let manifest_id = Uuid::new_v4();
+        let current = build_service_spec(manifest_id, 8, 3, ServiceStatus::Failed);
+        let incoming = build_service_spec(manifest_id, 8, 10, ServiceStatus::Running);
+
+        assert!(compare_service_specs(&current, &incoming).is_gt());
+    }
+
+    /// Ensures a newer deployment generation can still reactivate the same manifest after stop.
+    #[test]
+    fn newer_generation_can_reactivate_same_manifest_after_stop() {
+        let manifest_id = Uuid::new_v4();
+        let current = build_service_spec(manifest_id, 2, 5, ServiceStatus::Stopped);
+        let incoming = build_service_spec(manifest_id, 3, 0, ServiceStatus::Deploying);
+
+        assert!(compare_service_specs(&incoming, &current).is_gt());
     }
 }

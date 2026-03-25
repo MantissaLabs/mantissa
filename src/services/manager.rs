@@ -501,10 +501,7 @@ impl ServiceController {
                 continue;
             }
 
-            if matches!(
-                spec.status(),
-                ServiceStatus::Stopped | ServiceStatus::Failed
-            ) {
+            if should_drain_local_tasks(spec.status()) {
                 self.reconcile_inactive_service(spec, inventory.as_ref())
                     .await;
             }
@@ -1617,8 +1614,11 @@ impl ServiceController {
         self.stop_local_service_tasks(spec, &inventory).await;
     }
 
-    /// Continuously drains local tasks for inactive services so stale task gossip cannot
-    /// resurrect placement after a stop has been propagated.
+    /// Continuously drains local tasks for services that are stopping or already inactive.
+    ///
+    /// Nodes can briefly lag the final `Stopped` propagation and remain on `Stopping`, but they
+    /// must still keep draining local tasks during that window so stop progress does not depend on
+    /// one more gossip/sync round.
     async fn reconcile_inactive_service(&self, spec: ServiceSpecValue, inventory: &TaskInventory) {
         self.stop_local_service_tasks(&spec, inventory).await;
     }
@@ -1626,6 +1626,18 @@ impl ServiceController {
     /// Stops every locally owned task associated with the service, including stale rows that are
     /// no longer referenced by the current service spec task id list.
     async fn stop_local_service_tasks(&self, spec: &ServiceSpecValue, inventory: &TaskInventory) {
+        let spawn_stop_reconcile = |task_manager: crate::task::manager::TaskManager,
+                                    service_name: String,
+                                    task_id: Uuid| {
+            tokio::task::spawn_local(async move {
+                if let Err(err) = task_manager.reconcile_requested_stop(task_id).await {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to finish stop cleanup for task {task_id} in service {service_name}: {err}",
+                    );
+                }
+            });
+        };
         let desired_ids: HashSet<Uuid> = spec.task_ids.iter().copied().collect();
         let service_tasks = inventory.service_task_snapshot(&spec.service_name, desired_ids);
         for task_id in service_tasks.all_known_task_ids() {
@@ -1639,10 +1651,23 @@ impl ServiceController {
                 task.state,
                 ContainerState::Stopping | ContainerState::Stopped
             ) {
+                spawn_stop_reconcile(
+                    self.task_manager.clone(),
+                    spec.service_name.clone(),
+                    task_id,
+                );
                 continue;
             }
             match self.task_manager.request_task_stop(task_id).await {
-                Ok(_) => {}
+                Ok(updated) => {
+                    if updated.node_id == self.local_node_id {
+                        spawn_stop_reconcile(
+                            self.task_manager.clone(),
+                            spec.service_name.clone(),
+                            task_id,
+                        );
+                    }
+                }
                 Err(err) => {
                     let message = err.to_string();
                     tracing::warn!(
@@ -1988,6 +2013,14 @@ fn should_reconcile_status(status: ServiceStatus) -> bool {
     matches!(
         status,
         ServiceStatus::Running | ServiceStatus::Deploying | ServiceStatus::VolumeUnavailable
+    )
+}
+
+/// Returns true when local task drain should continue for the service status.
+fn should_drain_local_tasks(status: ServiceStatus) -> bool {
+    matches!(
+        status,
+        ServiceStatus::Stopping | ServiceStatus::Stopped | ServiceStatus::Failed
     )
 }
 
@@ -2476,12 +2509,14 @@ fn should_stop_tasks(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecV
         return false;
     }
 
-    // Trigger a single drain wave at stop/failure start; re-triggering on
-    // `Stopping -> Stopped` causes duplicate stop attempts and gossip fanout.
+    // Trigger drain when terminal stop intent first appears and once more when the final
+    // `Stopped` state lands. The second edge is intentional: some nodes can observe
+    // `Stopping` before a complete task inventory snapshot or can lag that first drain wave.
     matches!(
         (current_spec.status(), incoming.status()),
         (Running, Stopping)
             | (Deploying, Stopping)
+            | (Stopping, Stopped)
             | (Running, Stopped)
             | (Deploying, Stopped)
             | (Running, ServiceStatus::Failed)
@@ -2959,9 +2994,9 @@ mod tests {
         assert_eq!(eligible, vec![local, healthy_peer]);
     }
 
-    /// Ensure service stop progression does not launch duplicate local stop waves.
+    /// Ensures the final `Stopped` edge re-drives local task drain after `Stopping`.
     #[test]
-    fn should_not_stop_again_when_progressing_stopping_to_stopped() {
+    fn should_stop_again_when_progressing_stopping_to_stopped() {
         let manifest_id = Uuid::new_v4();
         let tasks = vec![ServiceTaskSpecValue {
             name: "api".into(),
@@ -3004,7 +3039,7 @@ mod tests {
         );
         incoming.set_status(ServiceStatus::Stopped);
 
-        assert!(!should_stop_tasks(Some(&current), &incoming));
+        assert!(should_stop_tasks(Some(&current), &incoming));
     }
 
     /// Builds a service spec with explicit status/timestamp for update-order tests.
@@ -3300,6 +3335,16 @@ mod tests {
         assert!(!should_reconcile_status(ServiceStatus::Stopping));
         assert!(!should_reconcile_status(ServiceStatus::Stopped));
         assert!(!should_reconcile_status(ServiceStatus::Failed));
+    }
+
+    /// Ensures stop drain keeps running while a node still sees the intermediate `Stopping` state.
+    #[test]
+    fn drain_status_includes_stopping_and_terminal_states() {
+        assert!(should_drain_local_tasks(ServiceStatus::Stopping));
+        assert!(should_drain_local_tasks(ServiceStatus::Stopped));
+        assert!(should_drain_local_tasks(ServiceStatus::Failed));
+        assert!(!should_drain_local_tasks(ServiceStatus::Deploying));
+        assert!(!should_drain_local_tasks(ServiceStatus::Running));
     }
 
     /// Ensures deployment fast-tracks restarts for terminal task states.

@@ -1416,6 +1416,34 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
         wait_for_reserved_slots(&node, 0, Duration::from_secs(12)).await,
         "inactive service reconciliation should release stale slot reservations"
     );
+
+    let mut stale_stopping = original_task.clone();
+    stale_stopping.state = ContainerState::Stopping;
+    stale_stopping.slot_ids.clear();
+    stale_stopping.slot_id = None;
+    stale_stopping.cpu_millis = 0;
+    stale_stopping.memory_bytes = 0;
+    stale_stopping.updated_at = Utc::now().to_rfc3339();
+
+    node.node
+        .tasks
+        .upsert(
+            &UuidKey::from(stale_stopping.id),
+            task_spec_to_value(&stale_stopping),
+        )
+        .await
+        .expect("inject stale stopping task value");
+
+    assert!(
+        wait_for_service_task_count_all(
+            std::slice::from_ref(&node),
+            service_name,
+            0,
+            Duration::from_secs(12)
+        )
+        .await,
+        "inactive service reconciliation should remove stale stopping task rows"
+    );
 });
 
 local_test!(

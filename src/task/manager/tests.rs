@@ -73,6 +73,8 @@ struct MockContainerManager {
     stopped: Arc<AsyncMutex<Vec<String>>>,
     stop_timeouts: Arc<AsyncMutex<Vec<Option<std::time::Duration>>>>,
     stop_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
+    removed: Arc<AsyncMutex<Vec<String>>>,
+    remove_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
     open_stdin: Arc<AsyncMutex<Vec<bool>>>,
     limits: Arc<AsyncMutex<Vec<crate::task::docker::ResourceLimits>>>,
     volume_mounts: Arc<AsyncMutex<Vec<Vec<String>>>>,
@@ -132,7 +134,8 @@ impl ContainerManager for MockContainerManager {
             state: Some(state),
             ..Default::default()
         };
-        inspect.insert(id.clone(), response);
+        inspect.insert(id.clone(), response.clone());
+        inspect.insert(request.name, response);
         Ok(id)
     }
 
@@ -187,10 +190,19 @@ impl ContainerManager for MockContainerManager {
 
     async fn remove_container(
         &self,
-        _container_id: &str,
+        container_id: &str,
         _force: bool,
         _remove_volumes: bool,
     ) -> crate::task::docker::ContainerResult<()> {
+        let delay = *self.remove_delay.lock().await;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.removed.lock().await.push(container_id.to_string());
+        let mut inspect = self.inspect.lock().await;
+        inspect.retain(|key, response| {
+            key != container_id && response.id.as_deref() != Some(container_id)
+        });
         Ok(())
     }
 
@@ -1040,8 +1052,9 @@ async fn start_container_reserves_slot_and_records_resources() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    let slot_id = slot_spec.slot_id;
     scheduler
-        .init_slots(vec![slot_spec.clone()])
+        .init_slots(vec![slot_spec])
         .await
         .expect("init slots");
 
@@ -1059,7 +1072,7 @@ async fn start_container_reserves_slot_and_records_resources() {
 
     assert_eq!(spec.cpu_millis, 200);
     assert_eq!(spec.memory_bytes, 64 * 1_024 * 1_024);
-    assert_eq!(spec.slot_ids, vec![slot_spec.slot_id]);
+    assert_eq!(spec.slot_ids, vec![slot_id]);
 
     let created = mock_cm.created.lock().await.clone();
     assert_eq!(created.len(), 1);
@@ -3474,6 +3487,7 @@ async fn request_task_stop_is_idempotent_while_stopping() {
         .expect("start container");
 
     spec.state = ContainerState::Stopping;
+    spec.phase_version = spec.phase_version.saturating_add(1);
     spec.updated_at = Utc::now().to_rfc3339();
     manager
         .persist_spec(&spec)
@@ -3490,6 +3504,121 @@ async fn request_task_stop_is_idempotent_while_stopping() {
     assert!(
         mock_cm.stopped.lock().await.is_empty(),
         "stop should not invoke runtime stop again when task is already stopping"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_requested_stop_removes_containerless_stopping_task() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    let slot_id = slot_spec.slot_id;
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    spec.state = ContainerState::Stopping;
+    spec.updated_at = Utc::now().to_rfc3339();
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist stopping state");
+    let persisted = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load persisted stopping task");
+    assert!(
+        matches!(persisted.state, ContainerState::Stopping),
+        "manual test setup should persist a stopping task before explicit cleanup"
+    );
+
+    manager
+        .local_state
+        .local_containers
+        .lock()
+        .await
+        .remove(&spec.id);
+    {
+        let mut inspect = mock_cm.inspect.lock().await;
+        inspect.clear();
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    manager
+        .reconcile_requested_stop(spec.id)
+        .await
+        .expect("finish stop cleanup");
+
+    assert!(
+        manager
+            .core
+            .store
+            .get_snapshot(&UuidKey::from(spec.id))
+            .expect("raw task snapshot after explicit stop cleanup")
+            .is_none(),
+        "containerless stopping task should be removed from the task store by explicit stop cleanup"
+    );
+    assert!(
+        manager.load_spec(spec.id).await.is_err(),
+        "containerless stopping task should be removed by explicit stop cleanup"
+    );
+    let snapshot = scheduler.snapshot().await.expect("scheduler snapshot");
+    let slot = snapshot
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == slot_id)
+        .expect("slot present after cleanup");
+    assert!(
+        matches!(slot.state, SlotState::Free),
+        "containerless stopping cleanup should also release the reserved slot"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_requested_stop_treats_non_running_container_as_containerless() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    spec.state = ContainerState::Stopping;
+    spec.phase_version = spec.phase_version.saturating_add(1);
+    spec.updated_at = Utc::now().to_rfc3339();
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist stopping state");
+
+    manager
+        .local_state
+        .local_containers
+        .lock()
+        .await
+        .remove(&spec.id);
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    manager
+        .reconcile_requested_stop(spec.id)
+        .await
+        .expect("finish stop cleanup");
+
+    assert!(
+        manager.load_spec(spec.id).await.is_err(),
+        "non-running inspected containers should not block task-row removal"
     );
 }
 
@@ -3634,6 +3763,116 @@ async fn reconcile_stopping_task_serializes_duplicate_stop_attempts() {
         1,
         "duplicate stop attempts should collapse into a single runtime stop call"
     );
+}
+
+#[tokio::test]
+async fn reconcile_stopping_task_retries_after_stop_timeout() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    spec.state = ContainerState::Stopping;
+    spec.termination_grace_period_secs = Some(1);
+    spec.updated_at = Utc::now().to_rfc3339();
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist stopping state");
+
+    *mock_cm.stop_delay.lock().await = Some(std::time::Duration::from_secs(2));
+
+    let err = manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect_err("slow runtime stop should time out");
+    assert!(
+        err.to_string().contains("docker stop timed out"),
+        "expected bounded stop timeout, got: {err:#}"
+    );
+
+    let persisted = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load stopping task");
+    assert!(matches!(persisted.state, ContainerState::Stopping));
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    *mock_cm.stop_delay.lock().await = None;
+    manager
+        .reconcile_local_task(persisted)
+        .await
+        .expect("retry stop after timeout");
+
+    if let Ok(remaining) = manager.load_spec(spec.id).await {
+        panic!(
+            "task should be removed after stop retry succeeds, but remained in state {:?}",
+            remaining.state
+        );
+    }
+}
+
+#[tokio::test]
+async fn reconcile_stopping_task_retries_after_remove_timeout() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut spec = manager
+        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    spec.state = ContainerState::Stopping;
+    spec.termination_grace_period_secs = Some(1);
+    spec.updated_at = Utc::now().to_rfc3339();
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist stopping state");
+
+    *mock_cm.remove_delay.lock().await = Some(std::time::Duration::from_secs(2));
+
+    let err = manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect_err("slow runtime remove should time out");
+    assert!(
+        err.to_string().contains("docker remove timed out"),
+        "expected bounded remove timeout, got: {err:#}"
+    );
+
+    let persisted = manager
+        .load_spec(spec.id)
+        .await
+        .expect("load stopping task");
+    assert!(matches!(persisted.state, ContainerState::Stopping));
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    *mock_cm.remove_delay.lock().await = None;
+    manager
+        .reconcile_local_task(persisted)
+        .await
+        .expect("retry remove after timeout");
+
+    if let Ok(remaining) = manager.load_spec(spec.id).await {
+        panic!(
+            "task should be removed after remove retry succeeds, but remained in state {:?}",
+            remaining.state
+        );
+    }
 }
 
 #[tokio::test]

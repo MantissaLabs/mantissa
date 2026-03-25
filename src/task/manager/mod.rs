@@ -1078,6 +1078,31 @@ impl TaskManager {
         Ok(updated)
     }
 
+    /// Re-drives final local stop cleanup for one task that is already in a terminal stop state.
+    ///
+    /// Inactive-service reconciliation uses this to keep draining lingering local `Stopping`
+    /// rows after the service registry entry has already transitioned into teardown. Callers that
+    /// need this to be non-blocking should spawn it; the helper itself stays synchronous so tests
+    /// and narrow callers can drive the cleanup directly.
+    pub(crate) async fn reconcile_requested_stop(&self, id: Uuid) -> Result<(), anyhow::Error> {
+        let spec = self.load_spec(id).await?;
+        if spec.node_id != self.local_node_id {
+            return Ok(());
+        }
+        if !matches!(
+            spec.state,
+            ContainerState::Stopping | ContainerState::Stopped
+        ) {
+            return Ok(());
+        }
+
+        let Some(reconcile_guard) = self.try_begin_reconcile(id).await else {
+            return Ok(());
+        };
+        let _reconcile_guard = reconcile_guard;
+        self.ensure_task_stopped(spec).await
+    }
+
     /// Updates whether a task's network attachments may receive service traffic.
     ///
     /// Attachment publication is separate from attachment readiness so controllers can stage

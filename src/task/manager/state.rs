@@ -1275,6 +1275,59 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Stops one runtime container with a bounded wall-clock timeout so retries are possible.
+    async fn stop_container_bounded(
+        &self,
+        container_identifier: &str,
+        timeout_budget: Duration,
+    ) -> Result<(), anyhow::Error> {
+        let timeout_budget = timeout_budget.max(Duration::from_millis(1));
+        match timeout(
+            timeout_budget,
+            self.runtime
+                .container_manager
+                .stop_container(container_identifier, Some(timeout_budget)),
+        )
+        .await
+        {
+            Ok(Ok(())) | Ok(Err(ContainerError::NotFound(_))) => Ok(()),
+            Ok(Err(err)) => Err(anyhow::anyhow!("docker stop failed: {err}")),
+            Err(_) => Err(anyhow::anyhow!(
+                "docker stop timed out after {:?}",
+                timeout_budget
+            )),
+        }
+    }
+
+    /// Removes one runtime container with a bounded wall-clock timeout so stale stops can retry.
+    async fn remove_container_bounded(
+        &self,
+        container_identifier: &str,
+        force: bool,
+        remove_volumes: bool,
+        timeout_budget: Duration,
+    ) -> Result<(), anyhow::Error> {
+        let timeout_budget = timeout_budget.max(Duration::from_millis(1));
+        match timeout(
+            timeout_budget,
+            self.runtime.container_manager.remove_container(
+                container_identifier,
+                force,
+                remove_volumes,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) | Ok(Err(ContainerError::NotFound(_))) => Ok(()),
+            Ok(Err(err)) if container_remove_in_progress(&err) => Ok(()),
+            Ok(Err(err)) => Err(anyhow::anyhow!("docker remove failed: {err}")),
+            Err(_) => Err(anyhow::anyhow!(
+                "docker remove timed out after {:?}",
+                timeout_budget
+            )),
+        }
+    }
+
     /// Performs a graceful stop of a locally owned task and tears down its container.
     pub(super) async fn perform_local_stop(
         &self,
@@ -1299,10 +1352,7 @@ impl TaskManager {
         };
         self.local_state.liveness_probes.lock().await.remove(&id);
 
-        let (container_identifier, from_cache) = match identifier_entry {
-            Some(value) => (value, true),
-            None => (format!("mantissa-{id}"), false),
-        };
+        let container_identifier = identifier_entry.unwrap_or_else(|| format!("mantissa-{id}"));
 
         let mut updated = spec.clone();
         if !matches!(spec.state, ContainerState::Stopping) {
@@ -1332,54 +1382,29 @@ impl TaskManager {
             .await;
 
         match self
-            .runtime
-            .container_manager
-            .stop_container(
-                &container_identifier,
-                Some(remaining_stop_timeout(stop_deadline)),
-            )
+            .stop_container_bounded(&container_identifier, remaining_stop_timeout(stop_deadline))
             .await
         {
-            Ok(_) => {}
-            Err(ContainerError::NotFound(_)) => {
-                debug!(
-                    target: "task",
-                    "container {container_identifier} not found while stopping task {id}; cache_hit={from_cache}"
-                );
-            }
-            Err(e) => {
-                updated.state = spec.state;
-                if updated.state != ContainerState::Stopping {
-                    updated.updated_at = Utc::now().to_rfc3339();
-                    self.persist_spec(&updated).await?;
-                    self.enqueue_gossip(TaskEvent::UpsertSpec(Box::new(updated.clone())))
-                        .await?;
-                }
-                return Err(anyhow::anyhow!("docker stop failed: {e}"));
+            Ok(()) => {}
+            Err(err) => {
+                // Keep the task in `Stopping` so the periodic reconcile loop can retry after one
+                // bounded runtime timeout instead of pinning the stop guard forever.
+                return Err(err);
             }
         }
 
-        if let Err(e) = self
-            .runtime
-            .container_manager
-            .remove_container(&container_identifier, false, true)
-            .await
-        {
-            match e {
-                ContainerError::NotFound(_) => debug!(
-                    target: "task",
-                    "container {container_identifier} already absent while removing task {id}"
-                ),
-                other if container_remove_in_progress(&other) => debug!(
-                    target: "task",
-                    "container {container_identifier} removal already in progress while stopping task {id}"
-                ),
-                other => warn!(
-                    target: "task",
-                    "failed to remove container {container_identifier}: {other}"
-                ),
-            }
-        }
+        self.remove_container_bounded(
+            &container_identifier,
+            false,
+            true,
+            remaining_stop_timeout(stop_deadline),
+        )
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "failed to remove container {container_identifier} while stopping task {id}: {err}"
+            )
+        })?;
 
         self.cleanup_secret_artifacts(id).await;
         if let Err(err) = self.unpublish_task_volume_mounts(&spec).await {
@@ -2172,9 +2197,7 @@ impl TaskManager {
     /// Stops and removes a launched container best-effort when one launch stage must roll back.
     pub(super) async fn rollback_container_launch(&self, container_id: &str, reason: &str) {
         if let Err(stop_err) = self
-            .runtime
-            .container_manager
-            .stop_container(container_id, Some(Duration::from_secs(10)))
+            .stop_container_bounded(container_id, Duration::from_secs(10))
             .await
         {
             warn!(
@@ -2185,9 +2208,7 @@ impl TaskManager {
             );
         }
         if let Err(remove_err) = self
-            .runtime
-            .container_manager
-            .remove_container(container_id, true, true)
+            .remove_container_bounded(container_id, true, true, Duration::from_secs(10))
             .await
         {
             warn!(
@@ -2280,10 +2301,17 @@ impl TaskManager {
                 .await
             {
                 Ok(info) => {
-                    let resolved = info.id.unwrap_or(container_name);
-                    let mut guard = self.local_state.local_containers.lock().await;
-                    guard.insert(spec.id, resolved);
-                    has_container = true;
+                    let running = info
+                        .state
+                        .as_ref()
+                        .and_then(|state| state.running)
+                        .unwrap_or(false);
+                    if running {
+                        let resolved = info.id.unwrap_or(container_name);
+                        let mut guard = self.local_state.local_containers.lock().await;
+                        guard.insert(spec.id, resolved);
+                        has_container = true;
+                    }
                 }
                 Err(ContainerError::NotFound(_)) => {}
                 Err(err) => {
@@ -2297,6 +2325,22 @@ impl TaskManager {
         }
 
         if !has_container {
+            let mut slot_ids = spec.slot_ids.clone();
+            if slot_ids.is_empty()
+                && let Some(slot_id) = spec.slot_id
+            {
+                slot_ids.push(slot_id);
+            }
+            for slot_id in slot_ids {
+                if let Err(err) = self.release_slot(slot_id).await {
+                    warn!(
+                        target: "task",
+                        task = %spec.id,
+                        slot_id,
+                        "failed to release slot while removing containerless task: {err}"
+                    );
+                }
+            }
             self.cleanup_secret_artifacts(spec.id).await;
             if let Err(err) = self.unpublish_task_volume_mounts(&spec).await {
                 warn!(
@@ -2318,6 +2362,7 @@ impl TaskManager {
             self.remove_spec(spec.id).await?;
             self.enqueue_gossip(TaskEvent::Remove { id: spec.id })
                 .await?;
+            self.cleanup_orphaned_slots().await;
             if let Err(err) = self.cleanup_orphaned_local_attachments().await {
                 warn!(
                     target: "task",
@@ -2653,18 +2698,15 @@ impl TaskManager {
         }
 
         match self
-            .runtime
-            .container_manager
-            .stop_container(
+            .stop_container_bounded(
                 &identifier,
-                Some(self.effective_task_stop_timeout(
+                self.effective_task_stop_timeout(
                     task_value.and_then(|value| value.termination_grace_period_secs),
-                )),
+                ),
             )
             .await
         {
             Ok(_) => {}
-            Err(ContainerError::NotFound(_)) => {}
             Err(err) => {
                 warn!(
                     target: "task",
@@ -2674,19 +2716,13 @@ impl TaskManager {
         }
 
         if let Err(err) = self
-            .runtime
-            .container_manager
-            .remove_container(&identifier, false, true)
+            .remove_container_bounded(&identifier, false, true, Duration::from_secs(10))
             .await
         {
-            match err {
-                ContainerError::NotFound(_) => {}
-                other if container_remove_in_progress(&other) => {}
-                other => warn!(
-                    target: "task",
-                    "failed to remove unowned container {identifier} for task {task_id}: {other}"
-                ),
-            }
+            warn!(
+                target: "task",
+                "failed to remove unowned container {identifier} for task {task_id}: {err}"
+            );
         }
 
         self.cleanup_secret_artifacts(task_id).await;
