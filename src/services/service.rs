@@ -866,10 +866,21 @@ fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_task_template, write_task_template};
-    use crate::services::types::{ServiceTaskNetworkRequirement, ServiceTaskSpecValue};
+    use super::{read_service_spec, read_task_template, write_service_spec, write_task_template};
+    use crate::services::types::{
+        ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePortProtocol,
+        ServicePreviousGeneration, ServiceReadinessProbe, ServiceReadinessProbeKind,
+        ServiceRescheduleLock, ServiceRescheduleReason, ServiceRollingUpdatePolicy,
+        ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue,
+        ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
+        ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy,
+        ServiceUpdateStrategyMode,
+    };
+    use crate::task::types::{
+        TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskVolumeMount,
+    };
     use capnp::message::Builder;
-    use protocol::services::task_template;
+    use protocol::services::{service_spec, task_template};
     use uuid::Uuid;
 
     /// Service task template wire round-trips must preserve the declared network UUID exactly.
@@ -913,6 +924,196 @@ mod tests {
         assert_eq!(
             decoded.networks, task.networks,
             "service task network requirements should preserve their explicit network ids"
+        );
+    }
+
+    /// Full service spec wire round-trips must preserve rollout metadata and canonical ids.
+    #[test]
+    fn service_spec_round_trip_preserves_replicated_state() {
+        let manifest_id = Uuid::new_v4();
+        let service_id = Uuid::new_v4();
+        let task_network_id = Uuid::new_v4();
+        let previous_network_id = Uuid::new_v4();
+        let volume_id = Uuid::new_v4();
+        let secret_version = Uuid::new_v4();
+        let holder_id = Uuid::new_v4();
+        let lock_token = Uuid::new_v4();
+
+        let task = ServiceTaskSpecValue {
+            name: "frontend".to_string(),
+            image: "ghcr.io/example/frontend:v2".to_string(),
+            command: vec![
+                "serve".to_string(),
+                "--port".to_string(),
+                "8080".to_string(),
+            ],
+            depends_on: vec!["backend".to_string()],
+            replicas: 2,
+            cpu_millis: 500,
+            memory_bytes: 256 * 1024 * 1024,
+            gpu_count: 1,
+            restart_policy: Some(ServiceTaskRestartPolicy {
+                name: ServiceTaskRestartPolicyKind::OnFailure,
+                max_retry_count: Some(5),
+            }),
+            termination_grace_period_secs: Some(30),
+            pre_stop_command: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 1".to_string(),
+            ]),
+            env: vec![TaskEnvironmentVariable {
+                name: "API_TOKEN".to_string(),
+                value: None,
+                secret: Some(TaskSecretReference {
+                    name: "api-token".to_string(),
+                    version_id: Some(secret_version),
+                }),
+            }],
+            secret_files: vec![TaskSecretFile {
+                path: "/run/secrets/api-token".to_string(),
+                secret: TaskSecretReference {
+                    name: "api-token".to_string(),
+                    version_id: Some(secret_version),
+                },
+                mode: Some(0o440),
+            }],
+            volumes: vec![TaskVolumeMount {
+                volume_id,
+                volume_name: "frontend-cache".to_string(),
+                target: "/var/cache/frontend".to_string(),
+                read_only: false,
+            }],
+            networks: vec![ServiceTaskNetworkRequirement::new(
+                "public",
+                task_network_id,
+            )],
+            readiness: Some(ServiceReadinessProbe {
+                kind: ServiceReadinessProbeKind::Http,
+                port: 8080,
+                path: Some("/ready".to_string()),
+                interval_ms: 1_500,
+                timeout_ms: 250,
+                failure_threshold: 2,
+            }),
+            liveness: Some(ServiceLivenessProbe {
+                kind: ServiceLivenessProbeKind::Exec,
+                command: vec!["/usr/bin/check".to_string()],
+                port: 0,
+                path: None,
+                interval_ms: 7_000,
+                timeout_ms: 2_000,
+                failure_threshold: 4,
+                start_period_ms: 12_000,
+            }),
+            public_port: Some(443),
+            public_protocol: Some(ServicePortProtocol::TcpUdp),
+            tty: true,
+        };
+
+        let mut previous = ServiceSpecValue::new(
+            Uuid::new_v4(),
+            "demo-manifest-v1",
+            "demo-service",
+            vec![ServiceTaskSpecValue {
+                name: "backend".to_string(),
+                image: "ghcr.io/example/backend:v1".to_string(),
+                command: vec!["serve".to_string()],
+                depends_on: Vec::new(),
+                replicas: 1,
+                cpu_millis: 250,
+                memory_bytes: 128 * 1024 * 1024,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: vec![ServiceTaskNetworkRequirement::new(
+                    "backend",
+                    previous_network_id,
+                )],
+                readiness: None,
+                liveness: None,
+                public_port: None,
+                public_protocol: None,
+                tty: false,
+            }],
+            vec![Uuid::new_v4()],
+        );
+        previous.update_strategy = ServiceUpdateStrategy {
+            mode: ServiceUpdateStrategyMode::Rolling,
+            rolling: ServiceRollingUpdatePolicy {
+                parallelism: 2,
+                order: ServiceRolloutOrder::StopFirst,
+                startup_timeout_secs: 120,
+                monitor_secs: 5,
+                max_failures: 2,
+                auto_rollback: false,
+            },
+        };
+        previous.service_epoch = 3;
+        previous.phase_version = 8;
+        previous.updated_at = "2026-03-23T10:00:00Z".to_string();
+        previous.status = ServiceStatus::Running;
+
+        let mut spec = ServiceSpecValue::new(
+            manifest_id,
+            "demo-manifest-v2",
+            "demo-service",
+            vec![task],
+            vec![Uuid::new_v4(), Uuid::new_v4()],
+        );
+        spec.id = service_id;
+        spec.updated_at = "2026-03-24T15:16:17Z".to_string();
+        spec.update_strategy = ServiceUpdateStrategy {
+            mode: ServiceUpdateStrategyMode::Rolling,
+            rolling: ServiceRollingUpdatePolicy {
+                parallelism: 3,
+                order: ServiceRolloutOrder::StartFirst,
+                startup_timeout_secs: 180,
+                monitor_secs: 8,
+                max_failures: 1,
+                auto_rollback: true,
+            },
+        };
+        spec.service_epoch = 4;
+        spec.phase_version = 11;
+        spec.rollout = ServiceRolloutState {
+            phase: ServiceRolloutPhase::RollingForward,
+            total_steps: 6,
+            completed_steps: 2,
+            failed_steps: 1,
+            max_failures: 1,
+            last_error: Some("frontend replacement timed out".to_string()),
+        };
+        spec.status = ServiceStatus::Deploying;
+        spec.status_detail = Some("waiting for backend publication".to_string());
+        spec.previous_generation = Some(ServicePreviousGeneration::from_service(&previous));
+        spec.reschedule_lock = Some(ServiceRescheduleLock::new(
+            holder_id,
+            "node-a",
+            lock_token,
+            "2026-03-24T15:10:00Z".to_string(),
+            "2026-03-24T15:20:00Z".to_string(),
+            ServiceRescheduleReason::MissingReplicas,
+        ));
+
+        let mut message = Builder::new_default();
+        {
+            let mut builder = message.init_root::<service_spec::Builder<'_>>();
+            write_service_spec(&mut builder, &spec).expect("encode service spec");
+        }
+        let reader = message
+            .get_root::<service_spec::Builder<'_>>()
+            .expect("read encoded service spec builder")
+            .into_reader();
+        let decoded = read_service_spec(reader).expect("decode service spec");
+
+        assert_eq!(
+            decoded, spec,
+            "service spec wire round-trip should preserve rollout state and explicit ids"
         );
     }
 }

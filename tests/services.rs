@@ -27,6 +27,7 @@ use mantissa::network::types::{
 use mantissa::node::id::set_node_id;
 use mantissa::scheduler::SlotReservationRequest;
 use mantissa::scheduler::SlotState;
+use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport};
 use mantissa::services::ServiceController;
 use mantissa::services::manager::ServiceDeploymentOutcome;
 use mantissa::services::types::{
@@ -37,6 +38,7 @@ use mantissa::services::types::{
 use mantissa::task::container::ContainerState;
 use mantissa::task::docker::{
     ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager, ContainerRuntimeEvent,
+    new_in_memory_container_manager,
 };
 use mantissa::task::manager::TaskManager;
 use mantissa::task::types::{
@@ -52,7 +54,7 @@ use protocol::volumes::volumes;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -63,6 +65,8 @@ use tempfile::tempdir;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 use uuid::Uuid;
+
+use net::noise::NoiseKeys;
 
 /// Restores the global Mantissa config after a test-scoped override.
 struct ConfigOverrideGuard {
@@ -482,6 +486,156 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
         recovered.task_ids.len(),
         1,
         "recovery deployment should repopulate task ids"
+    );
+});
+
+local_test!(services_deploying_generation_resumes_after_restart, {
+    let state_dir = tempdir().expect("state dir");
+    let db_path = state_dir.path().join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+    let self_id = Uuid::new_v4();
+    let noise_keys = Arc::new(NoiseKeys::from_private_bytes([0x63; 32]));
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]);
+    let local_volume_root = state_dir.path().join("volumes");
+
+    let mut node = create_restartable_service_node(
+        db.clone(),
+        self_id,
+        HeadlessKeys::new(noise_keys.clone(), signing.clone()),
+        Arc::new(SlowCreateContainerManager::default()),
+        local_volume_root.clone(),
+    )
+    .await;
+
+    let service_id = node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            "restartable-deploy",
+            "restartable-deploy",
+            vec![
+                ServiceTaskSpecValue {
+                    name: "backend".into(),
+                    image: "ghcr.io/example/backend:latest".into(),
+                    command: vec!["serve".into()],
+                    depends_on: Vec::new(),
+                    replicas: 1,
+                    cpu_millis: 100,
+                    memory_bytes: 64 * 1024 * 1024,
+                    gpu_count: 0,
+                    restart_policy: None,
+                    termination_grace_period_secs: None,
+                    pre_stop_command: None,
+                    env: Vec::new(),
+                    secret_files: Vec::new(),
+                    volumes: Vec::new(),
+                    networks: Vec::new(),
+                    readiness: None,
+                    liveness: None,
+                    tty: false,
+                    public_port: None,
+                    public_protocol: None,
+                },
+                ServiceTaskSpecValue {
+                    name: "frontend".into(),
+                    image: "ghcr.io/example/frontend:latest".into(),
+                    command: vec!["serve".into()],
+                    depends_on: vec!["backend".into()],
+                    replicas: 1,
+                    cpu_millis: 100,
+                    memory_bytes: 64 * 1024 * 1024,
+                    gpu_count: 0,
+                    restart_policy: None,
+                    termination_grace_period_secs: None,
+                    pre_stop_command: None,
+                    env: Vec::new(),
+                    secret_files: Vec::new(),
+                    volumes: Vec::new(),
+                    networks: Vec::new(),
+                    readiness: None,
+                    liveness: None,
+                    tty: false,
+                    public_port: None,
+                    public_protocol: None,
+                },
+            ],
+        )
+        .await
+        .expect("submit restartable deployment");
+
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            || async {
+                let Some(spec) = node
+                    .service_controller
+                    .registry()
+                    .get(service_id)
+                    .expect("load deploying spec")
+                else {
+                    return false;
+                };
+
+                spec.status() == ServiceStatus::Deploying && spec.task_ids.len() == 1
+            }
+        )
+        .await,
+        "deployment should persist the first dependency stage before restart"
+    );
+    let persisted_backend_task_id = node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("reload persisted deploying spec")
+        .and_then(|spec| spec.task_ids.first().copied())
+        .expect("backend task id should be persisted before restart");
+
+    node.stop().await.expect("stop first node");
+    drop(node);
+
+    let restarted = create_restartable_service_node(
+        db,
+        self_id,
+        HeadlessKeys::new(noise_keys, signing),
+        new_in_memory_container_manager(),
+        local_volume_root,
+    )
+    .await;
+
+    assert!(
+        wait_until(
+            Duration::from_secs(20),
+            Duration::from_millis(100),
+            || async {
+                let Some(spec) = restarted
+                    .service_controller
+                    .registry()
+                    .get(service_id)
+                    .expect("load restarted service spec")
+                else {
+                    return false;
+                };
+
+                spec.status() == ServiceStatus::Running
+                    && spec.task_ids.len() == 2
+                    && spec.task_ids.contains(&persisted_backend_task_id)
+            }
+        )
+        .await,
+        "restart should resume the deploying generation from persisted task ids"
+    );
+
+    let restarted = TestNode { node: restarted };
+    assert!(
+        wait_for_service_task_count_all(
+            std::slice::from_ref(&restarted),
+            "restartable-deploy",
+            2,
+            Duration::from_secs(5),
+        )
+        .await,
+        "restarted node should restore both service tasks after adoption"
     );
 });
 
@@ -5124,6 +5278,37 @@ async fn wait_for_min_local_service_task_count_refs(
         true
     })
     .await
+}
+
+/// Creates one restartable headless node backed by the provided durable state and runtime.
+async fn create_restartable_service_node(
+    db: Arc<redb::Database>,
+    self_id: Uuid,
+    keys: HeadlessKeys,
+    container_manager: Arc<dyn ContainerManager + Send + Sync>,
+    local_volume_root: PathBuf,
+) -> HeadlessNode {
+    HeadlessNode::new_with(
+        db,
+        self_id,
+        keys,
+        HeadlessConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            transport: HeadlessTransport::Inproc,
+            sync_tick: Some(Duration::from_millis(100)),
+            sync_fanout: None,
+            global_metadata_sync_tick: Some(Duration::from_millis(100)),
+            global_metadata_sync_fanout: None,
+            gossip_tick: Some(Duration::from_millis(100)),
+            gossip_fanout: None,
+            gossip_channel_capacity: None,
+            task_runtime: None,
+            container_manager: Some(container_manager),
+            local_volume_root: Some(local_volume_root),
+        },
+    )
+    .await
+    .expect("start restartable service node")
 }
 
 /// Builds a rollout strategy used by redeploy integration tests.
