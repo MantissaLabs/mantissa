@@ -20,7 +20,7 @@ struct JoinRequest {
     joiner_id: uuid::Uuid,
     active_view: ClusterViewId,
     root_hash: String,
-    handle: protocol::server::server::Client,
+    server_handle: protocol::server::server::Client,
     peer: PeerValue,
     noise_static_pub: PublicKey,
     signing_vk: ed25519_dalek::VerifyingKey,
@@ -32,13 +32,13 @@ impl JoinRequest {
     /// Parses and validates the static fields of a join request.
     ///
     /// This converts the wire format into strongly typed Rust values before the
-    /// server mutates topology state or issues any session material.
+    /// server mutates topology state or issues any server session handle.
     fn from_params(params: protocol::server::RegisterNodeParams) -> Result<Self, capnp::Error> {
         let params = params.get()?;
         let info = params.get_info()?;
         let joiner_id = id::read_node_id(info.get_id()?)?;
         let join_token = params.get_token()?.to_string()?;
-        let handle = info.get_handle()?;
+        let server_handle = info.get_handle()?;
         let active_view = ClusterViewId::from_capnp(info.get_active_cluster_view()?)
             .map_err(capnp::Error::failed)?;
 
@@ -93,7 +93,7 @@ impl JoinRequest {
             joiner_id,
             active_view,
             root_hash,
-            handle,
+            server_handle,
             peer,
             noise_static_pub,
             signing_vk,
@@ -186,7 +186,7 @@ impl JoinRequest {
             address: self.peer.address.clone(),
             root_hash: self.root_hash.clone(),
             incarnation: self.incarnation,
-            client: Some(self.handle.clone()),
+            client: Some(self.server_handle.clone()),
             noise_static_pub: self.noise_static_pub,
             signing_pub: Box::new(self.signing_vk),
             identity_sig: self.identity_sig.clone(),
@@ -196,11 +196,11 @@ impl JoinRequest {
     }
 }
 
-/// Session material returned to a newly joined node.
+/// Cluster session handle returned to a newly joined node.
 ///
 /// Grouping the issued ticket, credential, and session capability together
 /// keeps response population separate from issuance logic.
-struct JoinSessionMaterial {
+struct ClusterSession {
     ticket: Vec<u8>,
     credential: Vec<u8>,
     session: protocol::server::cluster_session::Client,
@@ -250,7 +250,7 @@ impl Server {
             .register_peer(
                 request.joiner_id,
                 &request.peer,
-                Some(request.handle.clone()),
+                Some(request.server_handle.clone()),
             )
             .await
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
@@ -259,14 +259,11 @@ impl Server {
         Ok(())
     }
 
-    /// Issues the ticket, credential, and session capability for a joiner.
+    /// Issues the ticket, credential, and cluster session capability for a joiner.
     ///
     /// Keeping this logic together makes the register flow read as "validate,
     /// persist, issue, respond, gossip" instead of one interleaved procedure.
-    fn issue_join_session(
-        &self,
-        joiner_id: uuid::Uuid,
-    ) -> Result<JoinSessionMaterial, capnp::Error> {
+    fn issue_join_session(&self, joiner_id: uuid::Uuid) -> Result<ClusterSession, capnp::Error> {
         let ticket = self
             .auth
             .sessions
@@ -280,29 +277,30 @@ impl Server {
                 .to_bytes()
                 .map_err(capnp::Error::failed)?;
 
-        Ok(JoinSessionMaterial {
+        Ok(ClusterSession {
             ticket,
             credential,
             session: self.sessions.new_client(),
         })
     }
 
-    /// Populates the join response with session material and local node info.
+    /// Populates the join response with a cluster session handle and local node
+    /// info.
     ///
     /// This keeps the Cap'n Proto writer manipulation out of the main control
     /// flow and ensures all successful joins return the same response shape.
     fn write_join_response(
         &self,
         results: &mut protocol::server::RegisterNodeResults,
-        material: &JoinSessionMaterial,
+        cluster_session: &ClusterSession,
     ) -> Result<(), capnp::Error> {
         let mut out = results.get();
-        out.set_session(material.session.clone());
-        out.set_ticket(&material.ticket);
+        out.set_session(cluster_session.session.clone());
+        out.set_ticket(&cluster_session.ticket);
 
         let node_info = out.reborrow().init_node_info();
         self.topology.populate_self_node_info(node_info);
-        out.set_credential(&material.credential);
+        out.set_credential(&cluster_session.credential);
         Ok(())
     }
 
@@ -330,9 +328,9 @@ impl protocol::server::Server for Server {
         self.validate_join_request(&join_request).await?;
         self.register_join_request(&join_request).await?;
 
-        let session_material = self.issue_join_session(join_request.joiner_id)?;
+        let cluster_session = self.issue_join_session(join_request.joiner_id)?;
         self.ensure_periodic_sync_after_join();
-        self.write_join_response(&mut results, &session_material)?;
+        self.write_join_response(&mut results, &cluster_session)?;
 
         self.topology
             .gossip_topology_event(join_request.to_topology_event())
