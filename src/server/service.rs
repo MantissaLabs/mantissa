@@ -188,7 +188,7 @@ impl JoinRequest {
             incarnation: self.incarnation,
             client: Some(self.handle.clone()),
             noise_static_pub: self.noise_static_pub,
-            signing_pub: Box::new(self.signing_vk.clone()),
+            signing_pub: Box::new(self.signing_vk),
             identity_sig: self.identity_sig.clone(),
             wireguard: self.peer.wireguard.clone(),
             scheduling: self.peer.scheduling.clone(),

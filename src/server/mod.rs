@@ -171,6 +171,18 @@ struct ServerTransport {
     noise_keys: Arc<NoiseKeys>,
 }
 
+/// Runtime dependencies used to construct the exported server capability.
+///
+/// Bootstrap assembles these first, then hands them to `Server::new()` as one
+/// input so the constructor does not balloon as more server concerns appear.
+pub(crate) struct ServerDependencies {
+    pub topology: Topology,
+    pub session_services: ClusterSessionServices,
+    pub token_store: TokenStore,
+    pub session_store: AuthStore,
+    pub noise_keys: Arc<NoiseKeys>,
+}
+
 /// Fully wired server implementation exported over Cap'n Proto.
 ///
 /// The server now owns smaller dependency bundles for identity, transport,
@@ -190,27 +202,30 @@ impl Server {
     ///
     /// Bootstrap calls this once all runtime capabilities are assembled and the
     /// session factory can be derived from the exported service handles.
-    pub fn new(
+    pub(crate) fn new(
         id: Uuid,
-        config: Config,
-        topology: Topology,
-        session_services: ClusterSessionServices,
-        token_store: TokenStore,
-        session_store: AuthStore,
-        noise_keys: Arc<NoiseKeys>,
         signing_key: SigningKey,
+        config: Config,
+        deps: ServerDependencies,
     ) -> Self {
         let liveness = Liveness::new();
-        let sessions = SessionFactory::new(session_services, topology.clone(), liveness.clone());
+        let sessions = SessionFactory::new(
+            deps.session_services,
+            deps.topology.clone(),
+            liveness.clone(),
+        );
 
         Self {
             identity: ServerIdentity { id, signing_key },
-            topology,
+            topology: deps.topology,
             auth: ServerAuth {
-                join_tokens: token_store,
-                sessions: session_store,
+                join_tokens: deps.token_store,
+                sessions: deps.session_store,
             },
-            transport: ServerTransport { config, noise_keys },
+            transport: ServerTransport {
+                config,
+                noise_keys: deps.noise_keys,
+            },
             sessions,
             liveness,
         }

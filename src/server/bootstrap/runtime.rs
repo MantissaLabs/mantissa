@@ -12,7 +12,7 @@ use crate::scheduler::digest::{
 };
 use crate::scheduler::service::SchedulerService;
 use crate::server::config::Config;
-use crate::server::{Server, ServerClients};
+use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
 use crate::sync::{SyncService, SyncStores};
 use crate::task::docker::{self, ContainerManager, DockerContainerManager};
@@ -144,6 +144,21 @@ struct RuntimeChannels {
     scheduler_digest_rx: Receiver<Message>,
 }
 
+/// Cloned gossip routes fed into the gossip service.
+///
+/// This groups the sender side of the runtime channels so helper functions can
+/// depend on one argument instead of a long list of near-identical senders.
+struct GossipRoutes {
+    topology: Sender<Message>,
+    task: Sender<Message>,
+    service: Sender<Message>,
+    network: Sender<Message>,
+    secret: Sender<Message>,
+    volume: Sender<Message>,
+    scheduler_digest: Sender<Message>,
+    outbound: Sender<Message>,
+}
+
 impl RuntimeChannels {
     /// Allocates the gossip channels shared by startup actors.
     ///
@@ -179,6 +194,39 @@ impl RuntimeChannels {
             scheduler_digest_rx,
         }
     }
+
+    /// Clones the sender routes consumed by the gossip service.
+    ///
+    /// Runtime assembly keeps ownership of the original channels while helpers
+    /// receive a smaller grouped view of the routes they need.
+    fn routes(&self) -> GossipRoutes {
+        GossipRoutes {
+            topology: self.topology_tx.clone(),
+            task: self.task_tx.clone(),
+            service: self.service_tx.clone(),
+            network: self.network_tx.clone(),
+            secret: self.secret_tx.clone(),
+            volume: self.volume_tx.clone(),
+            scheduler_digest: self.scheduler_digest_tx.clone(),
+            outbound: self.gossip_tx.clone(),
+        }
+    }
+}
+
+/// Inputs required to construct the topology actor.
+///
+/// Grouping these runtime dependencies keeps the topology factory readable and
+/// avoids an ever-growing positional argument list.
+struct TopologyBuildInputs<'a> {
+    ctx: &'a BootstrapContext,
+    cluster_view: ClusterViewState,
+    topology_rx: Receiver<Message>,
+    gossip_tx: Sender<Message>,
+    topology_stores: TopologyStores,
+    registry: Registry,
+    scheduler: Rc<Scheduler>,
+    health_monitor: Arc<health::HealthMonitor>,
+    runtime_health: config::RuntimeHealthConfig,
 }
 
 /// Boots the full server runtime from an initialized bootstrap context.
@@ -259,54 +307,40 @@ async fn build_runtime_components(
     Receiver<Message>,
     DedupeStateHandle,
 )> {
+    let channels = RuntimeChannels::new(options.gossip_channel_capacity);
+    let gossip_routes = channels.routes();
     let RuntimeChannels {
         gossip_tx,
         gossip_rx,
-        topology_tx,
         topology_rx,
-        task_tx,
         task_rx,
-        service_tx,
         service_rx,
-        network_tx,
         network_rx,
-        secret_tx,
         secret_rx,
-        volume_tx,
         volume_rx,
-        scheduler_digest_tx,
         scheduler_digest_rx,
-    } = RuntimeChannels::new(options.gossip_channel_capacity);
+        ..
+    } = channels;
 
     let cluster_view = stores.restore_active_view()?;
-    let (gossip_client, gossip_dedupe) = build_gossip_client(
-        &cluster_view,
-        &gossip_tx,
-        &topology_tx,
-        &task_tx,
-        &service_tx,
-        &network_tx,
-        &secret_tx,
-        &volume_tx,
-        &scheduler_digest_tx,
-    );
+    let (gossip_client, gossip_dedupe) = build_gossip_client(&cluster_view, &gossip_routes);
 
     let runtime_health = config::health_runtime_config();
     let health_monitor = health::HealthMonitor::new(ctx.self_id);
     let topology_stores = build_topology_stores(stores);
     let registry = build_registry(ctx, stores, health_monitor.clone());
     let scheduler = build_scheduler(ctx, stores, registry.clone()).await?;
-    let topology = build_topology(
+    let topology = build_topology(TopologyBuildInputs {
         ctx,
-        cluster_view.clone(),
+        cluster_view: cluster_view.clone(),
         topology_rx,
-        gossip_tx.clone(),
-        topology_stores.clone(),
-        registry.clone(),
-        scheduler.clone(),
-        health_monitor.clone(),
+        gossip_tx: gossip_tx.clone(),
+        topology_stores: topology_stores.clone(),
+        registry: registry.clone(),
+        scheduler: scheduler.clone(),
+        health_monitor: health_monitor.clone(),
         runtime_health,
-    )?;
+    })?;
     hydrate_topology(&topology).await?;
     let topology_client = capnp_rpc::new_client(topology.clone());
     let sync_client = build_sync_client(cluster_view, stores, &topology_stores);
@@ -371,6 +405,7 @@ async fn build_runtime_components(
         SchedulerDigestReplicator::new(scheduler_digest_registry.clone(), scheduler_digest_rx);
     scheduler.set_digest_publisher(scheduler_digest_publisher);
     scheduler.set_digest_registry(scheduler_digest_registry);
+    scheduler.publish_current_digest().await;
 
     let task_manager = TaskManager::new(TaskManagerConfig {
         store: stores.tasks.clone(),
@@ -387,7 +422,7 @@ async fn build_runtime_components(
         secret_keyring: stores.secret_keyring.clone(),
         forwarding_events: Some(forwarding_tx),
         attachment_override: None,
-        runtime_config: options.task_runtime.clone(),
+        runtime_config: options.task_runtime,
         local_volume_root,
         enforce_local_volume_capacity: config::local_volume_enforce_capacity(),
     });
@@ -501,25 +536,18 @@ fn build_topology_stores(stores: &BootstrapStores) -> TopologyStores {
 /// bootstrap wires it first and hands its channels to the rest of the stack.
 fn build_gossip_client(
     cluster_view: &ClusterViewState,
-    gossip_tx: &Sender<Message>,
-    topology_tx: &Sender<Message>,
-    task_tx: &Sender<Message>,
-    service_tx: &Sender<Message>,
-    network_tx: &Sender<Message>,
-    secret_tx: &Sender<Message>,
-    volume_tx: &Sender<Message>,
-    scheduler_digest_tx: &Sender<Message>,
+    routes: &GossipRoutes,
 ) -> (GossipClient, DedupeStateHandle) {
     let gossip = gossip::Gossip::new(
         gossip::Channels {
-            topology_events: topology_tx.clone(),
-            task_events: task_tx.clone(),
-            service_events: service_tx.clone(),
-            network_events: network_tx.clone(),
-            secret_events: secret_tx.clone(),
-            volume_events: volume_tx.clone(),
-            scheduler_digest_events: scheduler_digest_tx.clone(),
-            outbound_events: gossip_tx.clone(),
+            topology_events: routes.topology.clone(),
+            task_events: routes.task.clone(),
+            service_events: routes.service.clone(),
+            network_events: routes.network.clone(),
+            secret_events: routes.secret.clone(),
+            volume_events: routes.volume.clone(),
+            scheduler_digest_events: routes.scheduler_digest.clone(),
+            outbound_events: routes.outbound.clone(),
         },
         cluster_view.clone(),
     );
@@ -570,33 +598,23 @@ async fn build_scheduler(
 ///
 /// Topology is the central coordination component, so the rest of the runtime
 /// hangs off the stores, registry, and scheduler wired here.
-fn build_topology(
-    ctx: &BootstrapContext,
-    cluster_view: ClusterViewState,
-    topology_rx: Receiver<Message>,
-    gossip_tx: Sender<Message>,
-    topology_stores: TopologyStores,
-    registry: Registry,
-    scheduler: Rc<Scheduler>,
-    health_monitor: Arc<health::HealthMonitor>,
-    runtime_health: config::RuntimeHealthConfig,
-) -> BootstrapResult<Topology> {
+fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> {
     let keys = Keys {
-        noise_public_key: ctx.noise_keys.public,
-        signing_key: ctx.signing_key.clone(),
+        noise_public_key: inputs.ctx.noise_keys.public,
+        signing_key: inputs.ctx.signing_key.clone(),
     };
     Topology::new(TopologyConfig {
-        addr: ctx.listen_addr.clone(),
-        gossip_receiver: topology_rx,
-        gossip_sender: gossip_tx,
-        node: ctx.node.clone(),
-        cluster_view,
-        stores: topology_stores,
+        addr: inputs.ctx.listen_addr.clone(),
+        gossip_receiver: inputs.topology_rx,
+        gossip_sender: inputs.gossip_tx,
+        node: inputs.ctx.node.clone(),
+        cluster_view: inputs.cluster_view,
+        stores: inputs.topology_stores,
         crypto: keys,
-        registry,
-        scheduler,
-        health_monitor,
-        runtime_health,
+        registry: inputs.registry,
+        scheduler: inputs.scheduler,
+        health_monitor: inputs.health_monitor,
+        runtime_health: inputs.runtime_health,
     })
     .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
 }
@@ -731,8 +749,7 @@ fn build_server(
     stores: &BootstrapStores,
     components: &RuntimeComponents,
 ) -> Server {
-    let mut config = Config::new();
-    let config = config.with_listen_addr(ctx.listen_addr.clone()).build();
+    let config = Config::new(ctx.listen_addr.clone());
 
     let clients = ServerClients {
         topology_client: components.topology_client.clone(),
@@ -749,13 +766,15 @@ fn build_server(
 
     Server::new(
         ctx.self_id,
-        config,
-        components.topology.clone(),
-        clients.into(),
-        stores.token_store.clone(),
-        stores.session_auth.clone(),
-        ctx.noise_keys.clone(),
         ctx.signing_key.clone(),
+        config,
+        ServerDependencies {
+            topology: components.topology.clone(),
+            session_services: clients.into(),
+            token_store: stores.token_store.clone(),
+            session_store: stores.session_auth.clone(),
+            noise_keys: ctx.noise_keys.clone(),
+        },
     )
 }
 

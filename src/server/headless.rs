@@ -171,24 +171,22 @@ impl HeadlessNode {
             node_obj,
             node_client,
         );
-        let mut options = BootstrapOptions::default();
-        options.task_runtime = task_runtime;
-        options.container_manager = container_manager;
-        options.local_volume_root = local_volume_root;
-        options.sync_tick = sync_tick;
-        options.sync_fanout = sync_fanout;
-        options.global_metadata_sync_tick = global_metadata_sync_tick;
-        options.global_metadata_sync_fanout = global_metadata_sync_fanout;
-        options.gossip_tick = gossip_tick;
-        if let Some(capacity) = gossip_channel_capacity {
-            options.gossip_channel_capacity = capacity;
-        }
-        if let Some(fanout) = gossip_fanout {
-            options.gossip_fanout = fanout;
-        }
-        if matches!(&transport, HeadlessTransport::Inproc) {
-            options.advertise_override = Some(format!("inproc://{self_id}"));
-        }
+        let defaults = BootstrapOptions::default();
+        let options = BootstrapOptions {
+            task_runtime,
+            container_manager,
+            local_volume_root,
+            gossip_channel_capacity: gossip_channel_capacity
+                .unwrap_or(defaults.gossip_channel_capacity),
+            gossip_fanout: gossip_fanout.unwrap_or(defaults.gossip_fanout),
+            sync_tick,
+            sync_fanout,
+            global_metadata_sync_tick,
+            global_metadata_sync_fanout,
+            gossip_tick,
+            advertise_override: matches!(&transport, HeadlessTransport::Inproc)
+                .then(|| format!("inproc://{self_id}")),
+        };
 
         let BootedRuntime {
             stores,

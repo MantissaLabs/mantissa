@@ -748,6 +748,17 @@ impl Scheduler {
         }
     }
 
+    /// Republishes the current scheduler snapshot through the attached digest publisher.
+    ///
+    /// Bootstrap uses this after wiring the digest publisher and registry onto an
+    /// already-initialized scheduler so the initial capacity digest is visible to
+    /// the local planner and to remote peers before any placements are attempted.
+    pub async fn publish_current_digest(&self) {
+        if let Some(snapshot) = self.snapshot().await {
+            self.publish_digest_from_snapshot(&snapshot).await;
+        }
+    }
+
     /// Derives the initial slot specifications from the node system information so that the scheduler
     /// can initialise its slot table with reasonable CPU and memory allocations.
     pub fn derive_slot_specs(node: &crate::node::Node) -> Vec<SlotSpec> {

@@ -23,6 +23,14 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
+/// Wraps one bootstrap store error with a short startup-specific context.
+///
+/// This keeps storage open failures readable without introducing a custom error
+/// enum for each individual store creation step.
+fn store_error(context: &str, error: impl std::fmt::Display) -> Box<dyn std::error::Error> {
+    Box::new(std::io::Error::other(format!("{context}: {error}")))
+}
+
 /// Durable stores opened during bootstrap.
 ///
 /// This groups the persistent state needed by topology, scheduling, secrets,
@@ -66,13 +74,14 @@ impl BootstrapStores {
         let local_sessions = LocalSessionStore::open(ctx.db.clone(), &ctx.noise_keys)?;
         let local_creds = LocalCredentialStore::new(ctx.db.clone())?;
 
-        let token_store = TokenStore::load(ctx.db.clone()).expect("load persistent join token");
+        let token_store = TokenStore::load(ctx.db.clone())
+            .map_err(|error| store_error("load persistent join token", error))?;
 
-        let secret_master_store =
-            SecretMasterStore::new(ctx.db.clone()).expect("open secret master key store");
+        let secret_master_store = SecretMasterStore::new(ctx.db.clone())
+            .map_err(|error| store_error("open secret master key store", error))?;
         let master_record = secret_master_store
             .ensure_current()
-            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+            .map_err(|error| store_error("ensure current secret master record", error))?;
         let secret_keyring = Arc::new(RwLock::new(SecretKeyring::new(
             secret_master_store.clone(),
             master_record,
@@ -141,7 +150,7 @@ impl BootstrapStores {
         let persisted_active_view = self
             .cluster_view
             .read_active_view()
-            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+            .map_err(|error| store_error("read persisted active cluster view", error))?;
         let active_view = persisted_active_view.unwrap_or_else(ClusterViewId::legacy_default);
         if persisted_active_view.is_some() {
             info!(
