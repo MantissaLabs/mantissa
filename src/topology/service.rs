@@ -91,6 +91,22 @@ impl JoinInputs {
     }
 }
 
+/// Builds the durable peer-store row that represents one local join payload.
+///
+/// This keeps the join path consistent across the local self-row restore and the
+/// anchor-side registration flow.
+fn peer_value_from_join_payload(payload: &JoinPayload) -> PeerValue {
+    PeerValue {
+        address: payload.advertise_addr.clone(),
+        hostname: payload.hostname.clone(),
+        noise_static_pub: payload.public_key,
+        signing_pub: payload.signing_key,
+        identity_sig: payload.identity_sig.to_vec(),
+        wireguard: payload.wireguard.clone(),
+        scheduling: payload.scheduling.clone(),
+    }
+}
+
 struct JoinResponse {
     peer_id: Uuid,
     peer_value: PeerValue,
@@ -583,6 +599,18 @@ impl Topology {
             .put(peer_id, credential)
             .map_err(|e| Error::failed(format!("credential persist failed: {e}")))?;
 
+        Ok(())
+    }
+
+    /// Restores this node's own peer row after a successful join so rejoin does not depend on
+    /// remote gossip to clear the self tombstone created by `leave()`.
+    async fn persist_local_join_payload(&self, payload: &JoinPayload) -> Result<(), Error> {
+        let local_peer_value = peer_value_from_join_payload(payload);
+        self.peers
+            .upsert(&UuidKey::from(payload.id), local_peer_value)
+            .await
+            .map_err(|err| Error::failed(format!("local join upsert failed: {err}")))?;
+        self.swim_record_join(payload.id, payload.incarnation);
         Ok(())
     }
 
@@ -1500,6 +1528,8 @@ impl topology::Server for Topology {
             session,
         } = response;
 
+        self.persist_local_join_payload(&payload).await?;
+
         Topology::persist_join_state(
             &self.peers,
             &self.local_sessions,
@@ -1541,13 +1571,21 @@ impl topology::Server for Topology {
 
         let sync_trace = SyncTraceContext::peer(peer_id, peer_value.address.clone(), "join");
         tokio::task::spawn_local({
+            let topology = self.clone();
             let stores = sync_stores;
             let cluster_view = self.active_cluster_view();
             let trace = sync_trace;
+            let payload = payload.clone();
             async move {
                 // Bootstrap immediately from the anchor session so the join path does not wait
                 // for the next periodic tick before the new node has a converged view.
                 sync_all_domains(stores, sync_cap, cluster_view, Some(trace)).await;
+
+                // A successful rejoin must end with the local node's own peer row restored even
+                // if the bootstrap sync observed a stale leave tombstone from another peer.
+                if let Err(err) = topology.persist_local_join_payload(&payload).await {
+                    warn!(target: "topology", "join: failed to restore local peer row after bootstrap sync: {err}");
+                }
             }
         });
 
