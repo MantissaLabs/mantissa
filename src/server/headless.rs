@@ -5,7 +5,6 @@ use uuid::Uuid;
 
 use crate::{
     cluster::ClusterViewId,
-    gossip::DEFAULT_FANOUT,
     network::controller::NetworkController,
     network::registry::NetworkRegistry,
     node,
@@ -13,7 +12,7 @@ use crate::{
     scheduler::Scheduler,
     server::{
         RunHandles, RunMode, Server,
-        bootstrap::{Bootstrap, Stores},
+        bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, boot},
     },
     services::ServiceController,
     task::docker::ContainerManager,
@@ -163,7 +162,7 @@ impl HeadlessNode {
         let node_client = capnp_rpc::new_client(node_obj.clone());
 
         // Build runtime exactly like production
-        let ctx = Bootstrap::from_parts(
+        let ctx = BootstrapContext::from_parts(
             listen_addr,
             self_id,
             noise.clone(),
@@ -172,44 +171,30 @@ impl HeadlessNode {
             node_obj,
             node_client,
         );
-        let stores: Stores = Bootstrap::open_stores(&ctx).await?;
-        let gossip_channel_capacity = gossip_channel_capacity.unwrap_or(128);
-        let (comps, gossip_rx, gossip_dedupe) = Bootstrap::build_components(
-            &ctx,
-            &stores,
-            task_runtime,
-            gossip_channel_capacity,
-            container_manager,
-            local_volume_root,
-        )
-        .await?;
-        if let Some(d) = sync_tick {
-            comps.topology.set_sync_interval(d);
+        let mut options = BootstrapOptions::default();
+        options.task_runtime = task_runtime;
+        options.container_manager = container_manager;
+        options.local_volume_root = local_volume_root;
+        options.sync_tick = sync_tick;
+        options.sync_fanout = sync_fanout;
+        options.global_metadata_sync_tick = global_metadata_sync_tick;
+        options.global_metadata_sync_fanout = global_metadata_sync_fanout;
+        options.gossip_tick = gossip_tick;
+        if let Some(capacity) = gossip_channel_capacity {
+            options.gossip_channel_capacity = capacity;
         }
-        if let Some(fanout) = sync_fanout {
-            comps.topology.set_sync_fanout(fanout);
+        if let Some(fanout) = gossip_fanout {
+            options.gossip_fanout = fanout;
         }
-        if let Some(d) = global_metadata_sync_tick.or(sync_tick) {
-            comps.topology.set_global_metadata_sync_interval(d);
+        if matches!(&transport, HeadlessTransport::Inproc) {
+            options.advertise_override = Some(format!("inproc://{self_id}"));
         }
-        if let Some(fanout) = global_metadata_sync_fanout.or(sync_fanout) {
-            comps.topology.set_global_metadata_sync_fanout(fanout);
-        }
-        if let Some(d) = gossip_tick {
-            comps.topology.set_gossip_interval(d);
-        }
-        if matches!(transport, HeadlessTransport::Inproc) {
-            comps
-                .topology
-                .set_advertise_override(Some(format!("inproc://{}", ctx.self_id)));
-        }
-        let server: Server = Bootstrap::build_server(&ctx, &stores, &comps);
 
-        // Finish wiring and spawn background tasks (gossip loop, topology loop, etc.)
-        Bootstrap::after_boot(&server, &ctx, &stores, &comps).await?;
-        let fanout = gossip_fanout.unwrap_or(DEFAULT_FANOUT);
-        Bootstrap::spawn_runtime_tasks(&ctx, &stores, &comps, gossip_rx, gossip_dedupe, fanout)
-            .await;
+        let BootedRuntime {
+            stores,
+            components: comps,
+            server,
+        } = boot(ctx, options).await?;
 
         // Cap’n Proto Server capability
         let server_client: protocol::server::server::Client = capnp_rpc::new_client(server.clone());
@@ -221,12 +206,7 @@ impl HeadlessNode {
         let (handles, effective_transport) = match transport {
             HeadlessTransport::Inproc => {
                 // Register in-process so get_client_secure_join/get_client_secure_peer resolves here
-                net::inproc::register(ctx.self_id.to_string(), server_client.clone());
-
-                // Ensure peers advertise the inproc URI in tests
-                comps
-                    .topology
-                    .set_advertise_override(Some(format!("inproc://{}", ctx.self_id)));
+                net::inproc::register(self_id.to_string(), server_client.clone());
 
                 (None, HeadlessTransport::Inproc)
             }
@@ -254,7 +234,7 @@ impl HeadlessNode {
         };
 
         Ok(Self {
-            id: ctx.self_id,
+            id: self_id,
             topology_client: comps.topology_client.clone(),
             server_client,
             sync_client: comps.sync_client.clone(),
