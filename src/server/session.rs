@@ -1,20 +1,22 @@
-use crate::cluster::ClusterViewId;
+use super::Liveness;
+use crate::{cluster::ClusterViewId, topology::Topology};
 use protocol::{
     gossip::gossip, health::health, network::networks, node::node, scheduling::scheduler,
     secrets::secrets, server::cluster_session, services::services, sync::sync, task::task,
     topology::topology, volumes::volumes,
 };
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Capabilities exported through a cluster session.
+///
+/// The server and session layers share this bundle so bootstrap only assembles
+/// the capability graph once.
 #[derive(Clone)]
-pub struct ClusterSessionClients {
+pub struct ClusterSessionServices {
     pub topology: topology::Client,
     pub sync: sync::Client,
     pub gossip: gossip::Client,
     pub node: node::Client,
-    pub health: health::Client,
     pub task: task::Client,
     pub scheduler: scheduler::Client,
     pub services: services::Client,
@@ -23,32 +25,96 @@ pub struct ClusterSessionClients {
     pub volumes: volumes::Client,
 }
 
+/// Factory for cluster session capabilities served to peers and local clients.
+///
+/// This keeps session assembly out of `Server` so the server struct only stores
+/// a focused dependency bundle rather than rebuilding session state inline.
+#[derive(Clone)]
+pub(crate) struct SessionFactory {
+    services: ClusterSessionServices,
+    topology: Topology,
+    liveness: Liveness,
+}
+
+impl SessionFactory {
+    /// Constructs a reusable session factory from the exported capabilities.
+    ///
+    /// The server owns one of these and asks it for fresh cluster sessions when
+    /// peers authenticate or when the local Unix socket needs a session handle.
+    pub(crate) fn new(
+        services: ClusterSessionServices,
+        topology: Topology,
+        liveness: Liveness,
+    ) -> Self {
+        Self {
+            services,
+            topology,
+            liveness,
+        }
+    }
+
+    /// Builds a fresh health capability backed by the current liveness state.
+    ///
+    /// Health must observe server stop/start transitions, so it is minted on
+    /// demand instead of being stored as a static capability.
+    fn health_client(&self) -> health::Client {
+        let health =
+            crate::topology::health::Health::new(self.topology.clone(), self.liveness.online());
+        capnp_rpc::new_client(health)
+    }
+
+    /// Creates a new cluster session capability for a connected peer or client.
+    ///
+    /// Each session snapshots the active cluster view while sharing the common
+    /// exported service capabilities and liveness state.
+    pub(crate) fn new_client(&self) -> cluster_session::Client {
+        let session = ClusterSessionImpl::new(
+            self.services.clone(),
+            self.health_client(),
+            self.liveness.clone(),
+            self.topology.active_cluster_view(),
+        );
+        capnp_rpc::new_client(session)
+    }
+}
+
+/// Cap'n Proto implementation serving the per-connection cluster session.
+///
+/// A session is a thin, liveness-aware wrapper around the capability bundle the
+/// server has already assembled during bootstrap.
 #[derive(Clone)]
 pub struct ClusterSessionImpl {
-    clients: ClusterSessionClients,
-    online: Arc<AtomicBool>,
+    services: ClusterSessionServices,
+    health: health::Client,
+    liveness: Liveness,
     cluster_view: ClusterViewId,
 }
 
 impl ClusterSessionImpl {
-    pub fn new(
-        clients: ClusterSessionClients,
-        online: Arc<AtomicBool>,
+    /// Constructs one session implementation from the shared capability bundle.
+    ///
+    /// The server uses this for both authenticated peer sessions and the local
+    /// Unix socket session served to the CLI.
+    pub(crate) fn new(
+        services: ClusterSessionServices,
+        health: health::Client,
+        liveness: Liveness,
         cluster_view: ClusterViewId,
     ) -> Self {
         Self {
-            clients,
-            online,
+            services,
+            health,
+            liveness,
             cluster_view,
         }
     }
 
+    /// Rejects requests once the backing server has been stopped.
+    ///
+    /// Cluster sessions should fail closed when the daemon is offline so peers
+    /// do not continue to interact with stale local state.
     fn ensure_online(&self) -> Result<(), capnp::Error> {
-        if self.online.load(Ordering::SeqCst) {
-            Ok(())
-        } else {
-            Err(capnp::Error::failed("server offline".into()))
-        }
+        self.liveness.ensure_online()
     }
 }
 
@@ -63,16 +129,16 @@ impl cluster_session::Server for ClusterSessionImpl {
 
         let mut caps = results.get().init_caps();
 
-        caps.set_gossip(self.clients.gossip.clone());
-        caps.set_topology(self.clients.topology.clone());
-        caps.set_sync(self.clients.sync.clone());
-        caps.set_health(self.clients.health.clone());
-        caps.set_task(self.clients.task.clone());
-        caps.set_scheduler(self.clients.scheduler.clone());
-        caps.set_services(self.clients.services.clone());
-        caps.set_secrets(self.clients.secrets.clone());
-        caps.set_networks(self.clients.networks.clone());
-        caps.set_volumes(self.clients.volumes.clone());
+        caps.set_gossip(self.services.gossip.clone());
+        caps.set_topology(self.services.topology.clone());
+        caps.set_sync(self.services.sync.clone());
+        caps.set_health(self.health.clone());
+        caps.set_task(self.services.task.clone());
+        caps.set_scheduler(self.services.scheduler.clone());
+        caps.set_services(self.services.services.clone());
+        caps.set_secrets(self.services.secrets.clone());
+        caps.set_networks(self.services.networks.clone());
+        caps.set_volumes(self.services.volumes.clone());
         self.cluster_view
             .write_capnp(caps.reborrow().init_active_view());
 
@@ -86,7 +152,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_topology(self.clients.topology.clone());
+        results.get().set_topology(self.services.topology.clone());
         Ok(())
     }
 
@@ -97,7 +163,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_sync(self.clients.sync.clone());
+        results.get().set_sync(self.services.sync.clone());
         Ok(())
     }
 
@@ -108,7 +174,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_gossip(self.clients.gossip.clone());
+        results.get().set_gossip(self.services.gossip.clone());
         Ok(())
     }
 
@@ -119,7 +185,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_node(self.clients.node.clone());
+        results.get().set_node(self.services.node.clone());
         Ok(())
     }
 
@@ -130,7 +196,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_task(self.clients.task.clone());
+        results.get().set_task(self.services.task.clone());
         Ok(())
     }
 
@@ -141,7 +207,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_scheduler(self.clients.scheduler.clone());
+        results.get().set_scheduler(self.services.scheduler.clone());
         Ok(())
     }
 
@@ -152,7 +218,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_services(self.clients.services.clone());
+        results.get().set_services(self.services.services.clone());
         Ok(())
     }
 
@@ -163,7 +229,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_secrets(self.clients.secrets.clone());
+        results.get().set_secrets(self.services.secrets.clone());
         Ok(())
     }
 
@@ -174,7 +240,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_networks(self.clients.networks.clone());
+        results.get().set_networks(self.services.networks.clone());
         Ok(())
     }
 
@@ -186,7 +252,7 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
 
-        results.get().set_volumes(self.clients.volumes.clone());
+        results.get().set_volumes(self.services.volumes.clone());
         Ok(())
     }
 

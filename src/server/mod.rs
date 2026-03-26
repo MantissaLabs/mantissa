@@ -1,21 +1,18 @@
-use crate::secrets::crypto::SecretKeyring;
 use crate::server::auth::AuthStore;
 use crate::server::config::Config;
-use crate::server::session::{ClusterSessionClients, ClusterSessionImpl};
+use crate::server::session::{ClusterSessionServices, SessionFactory};
 use crate::token::TokenStore;
 use crate::topology::Topology;
 use ed25519_dalek::SigningKey;
 use net::noise::NoiseKeys;
-use protocol::server::cluster_session;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::RwLock;
 use tracing::error;
 use uuid::Uuid;
 
 use protocol::{
-    gossip::GossipClient, health::HealthClient, network::NetworksClient, node::NodeClient,
+    gossip::GossipClient, network::NetworksClient, node::NodeClient,
     scheduling::scheduler::Client as SchedulerClient, secrets::secrets::Client as SecretsClient,
     services::ServicesClient, sync::SyncClient, task::TaskClient, topology::TopologyClient,
     volumes::VolumesClient,
@@ -29,28 +26,14 @@ pub mod headless;
 mod service;
 pub mod session;
 
-#[derive(Clone)]
-pub struct Server {
-    // UUID of the node.
-    pub id: Uuid,
-
-    topology: Topology,
-    clients: ServerClients,
-    stores: ServerStores,
-    config: Config,
-    noise_keys: Arc<NoiseKeys>,
-    signing_key: SigningKey,
-    online: Arc<AtomicBool>,
-}
-
-// How to run the listeners
+/// How to run the exported transports.
 #[derive(Clone, Copy, Debug)]
 pub enum RunMode {
     Blocking,
     NonBlocking,
 }
 
-// Join handles when running in NonBlocking mode (tests usually keep these)
+/// Join handles for the server transports started in non-blocking mode.
 #[derive(Debug)]
 pub struct RunHandles {
     pub tcp_task: tokio::task::JoinHandle<()>,
@@ -60,149 +43,230 @@ pub struct RunHandles {
 }
 
 impl RunHandles {
-    /// Await the readiness signal once (no-op if already awaited).
+    /// Awaits the TCP listener readiness signal once.
+    ///
+    /// Headless tests use this when they need to know the secure transport is
+    /// bound before attempting a join or peer session.
     pub async fn wait_ready(&mut self) {
         if let Some(rx) = self.tcp_ready.take() {
             let _ = rx.await;
         }
     }
 
+    /// Returns the bound TCP address for the secure listener.
+    ///
+    /// This is mainly used by headless tests so they can discover ephemeral
+    /// ports chosen during startup.
     pub fn addr(&self) -> std::net::SocketAddr {
         self.tcp_addr
     }
 
-    /// Abort listener tasks (used in tests for fast shutdown).
+    /// Awaits the transport tasks in blocking daemon mode.
+    ///
+    /// This centralizes the listener join behavior so blocking startup does not
+    /// have to duplicate the same await logic as the non-blocking path.
+    pub async fn join(self) {
+        if let Some(unix) = self.unix_task {
+            let _ = tokio::join!(self.tcp_task, unix);
+        } else {
+            let _ = self.tcp_task.await;
+        }
+    }
+
+    /// Aborts the transport tasks for fast shutdown in tests.
+    ///
+    /// Headless nodes use this instead of graceful transport shutdown to keep
+    /// the integration tests deterministic and quick.
     pub fn abort(self) {
-        if let Some(u) = self.unix_task {
-            u.abort();
+        if let Some(unix) = self.unix_task {
+            unix.abort();
         }
         self.tcp_task.abort();
     }
 }
 
+/// Shared server liveness state.
+///
+/// Server-facing RPC implementations and cluster sessions all consult the same
+/// flag so stop/start transitions are enforced consistently.
 #[derive(Clone)]
-pub struct ServerClients {
-    pub topology_client: TopologyClient,
-    pub gossip_client: GossipClient,
-    pub sync_client: SyncClient,
-    pub node_client: NodeClient,
-    pub task_client: TaskClient,
-    pub scheduler_client: SchedulerClient,
-    pub services_client: ServicesClient,
-    pub secrets_client: SecretsClient,
-    pub networks_client: NetworksClient,
-    pub volumes_client: VolumesClient,
+pub(crate) struct Liveness {
+    online: Arc<AtomicBool>,
 }
 
-#[derive(Clone)]
-pub struct ServerStores {
-    pub token_store: TokenStore,
-    pub session_store: AuthStore,
-    #[allow(dead_code)]
-    pub secret_keyring: Arc<RwLock<SecretKeyring>>,
-}
-
-impl Server {
-    /// Construct a fully wired server implementation.
-    pub fn new(
-        id: Uuid,
-        config: Config,
-        topology: Topology,
-        clients: ServerClients,
-        stores: ServerStores,
-        noise_keys: Arc<NoiseKeys>,
-        signing_key: SigningKey,
-    ) -> Self {
+impl Liveness {
+    /// Creates a liveness flag in the online state.
+    ///
+    /// A freshly booted server starts online and can later be toggled by
+    /// headless tests that simulate node failures.
+    fn new() -> Self {
         Self {
-            id,
-            topology,
-            clients,
-            stores,
-            config,
-            noise_keys,
-            signing_key,
             online: Arc::new(AtomicBool::new(true)),
         }
     }
 
-    fn new_session_client(&self) -> cluster_session::Client {
-        let health_srv =
-            crate::topology::health::Health::new(self.topology.clone(), self.online.clone());
-        let health_client: HealthClient = capnp_rpc::new_client(health_srv);
-
-        let session_clients = ClusterSessionClients {
-            topology: self.clients.topology_client.clone(),
-            sync: self.clients.sync_client.clone(),
-            gossip: self.clients.gossip_client.clone(),
-            node: self.clients.node_client.clone(),
-            health: health_client,
-            task: self.clients.task_client.clone(),
-            scheduler: self.clients.scheduler_client.clone(),
-            services: self.clients.services_client.clone(),
-            secrets: self.clients.secrets_client.clone(),
-            networks: self.clients.networks_client.clone(),
-            volumes: self.clients.volumes_client.clone(),
-        };
-        let session = ClusterSessionImpl::new(
-            session_clients,
-            self.online.clone(),
-            self.topology.active_cluster_view(),
-        );
-
-        capnp_rpc::new_client(session)
+    /// Returns the shared atomic flag used by health and session services.
+    ///
+    /// The returned handle is cloned so dependent services can observe online
+    /// transitions without mutating the server directly.
+    pub(crate) fn online(&self) -> Arc<AtomicBool> {
+        self.online.clone()
     }
 
-    pub fn set_online(&self, online: bool) {
+    /// Sets the online state exposed by server-backed capabilities.
+    ///
+    /// Headless tests call this when they stop or restart the node without
+    /// tearing down all in-memory runtime state.
+    pub(crate) fn set_online(&self, online: bool) {
         self.online.store(online, Ordering::SeqCst);
     }
 
-    pub fn is_online(&self) -> bool {
+    /// Returns whether the server should currently accept requests.
+    ///
+    /// This is shared by RPC entrypoints and the health/session services.
+    pub(crate) fn is_online(&self) -> bool {
         self.online.load(Ordering::SeqCst)
     }
 
-    fn ensure_online(&self) -> Result<(), capnp::Error> {
+    /// Rejects a request when the server is offline.
+    ///
+    /// Server RPC methods call this at the edge so offline behavior stays
+    /// consistent across all exported capabilities.
+    pub(crate) fn ensure_online(&self) -> Result<(), capnp::Error> {
         if self.is_online() {
             Ok(())
         } else {
             Err(capnp::Error::failed("server offline".into()))
         }
     }
+}
 
-    /// Internal helper: spawn TCP secure listener (and optionally Unix socket) without blocking.
-    async fn spawn_listeners_nonblocking(
-        &self,
-        enable_unix_socket: bool,
-    ) -> std::io::Result<RunHandles> {
-        let listen_addr = self.config.listen_addr.clone();
+/// Immutable server identity and signing material.
+///
+/// Keeping these together separates request identity concerns from transport,
+/// session, and authentication wiring.
+#[derive(Clone)]
+struct ServerIdentity {
+    id: Uuid,
+    signing_key: SigningKey,
+}
 
-        // identical to start_daemon’s server handle
+/// Stores used to authenticate joins and issue server-side sessions.
+///
+/// This is a smaller, focused bundle around the two pieces of persistent
+/// authentication state the server actually uses at runtime.
+#[derive(Clone)]
+struct ServerAuth {
+    join_tokens: TokenStore,
+    sessions: AuthStore,
+}
+
+/// Transport configuration and keys used to expose the server.
+///
+/// Keeping transport-specific state together makes the listener startup code
+/// easier to scan and keeps it separate from request handling concerns.
+#[derive(Clone)]
+struct ServerTransport {
+    config: Config,
+    noise_keys: Arc<NoiseKeys>,
+}
+
+/// Fully wired server implementation exported over Cap'n Proto.
+///
+/// The server now owns smaller dependency bundles for identity, transport,
+/// authentication, sessions, and liveness instead of one large flat struct.
+#[derive(Clone)]
+pub struct Server {
+    identity: ServerIdentity,
+    topology: Topology,
+    auth: ServerAuth,
+    transport: ServerTransport,
+    sessions: SessionFactory,
+    liveness: Liveness,
+}
+
+impl Server {
+    /// Constructs the server from its focused dependency bundles.
+    ///
+    /// Bootstrap calls this once all runtime capabilities are assembled and the
+    /// session factory can be derived from the exported service handles.
+    pub fn new(
+        id: Uuid,
+        config: Config,
+        topology: Topology,
+        session_services: ClusterSessionServices,
+        token_store: TokenStore,
+        session_store: AuthStore,
+        noise_keys: Arc<NoiseKeys>,
+        signing_key: SigningKey,
+    ) -> Self {
+        let liveness = Liveness::new();
+        let sessions = SessionFactory::new(session_services, topology.clone(), liveness.clone());
+
+        Self {
+            identity: ServerIdentity { id, signing_key },
+            topology,
+            auth: ServerAuth {
+                join_tokens: token_store,
+                sessions: session_store,
+            },
+            transport: ServerTransport { config, noise_keys },
+            sessions,
+            liveness,
+        }
+    }
+
+    /// Sets whether the server should currently accept requests.
+    ///
+    /// Headless tests use this to simulate node failures while keeping the rest
+    /// of the runtime alive.
+    pub fn set_online(&self, online: bool) {
+        self.liveness.set_online(online);
+    }
+
+    /// Returns whether the server is currently accepting requests.
+    ///
+    /// This is mainly used by tests and shared health handling.
+    pub fn is_online(&self) -> bool {
+        self.liveness.is_online()
+    }
+
+    /// Rejects a request when the server is offline.
+    ///
+    /// All server RPC methods use the same liveness check to keep failure
+    /// behavior consistent across transports.
+    fn ensure_online(&self) -> Result<(), capnp::Error> {
+        self.liveness.ensure_online()
+    }
+
+    /// Starts the secure TCP listener and optional Unix socket without blocking.
+    ///
+    /// The daemon and headless paths both use this as the single transport
+    /// startup primitive, then choose whether to await the handles or not.
+    pub async fn start_nonblocking(&self, enable_unix_socket: bool) -> std::io::Result<RunHandles> {
         let server_handle: protocol::server::server::Client = capnp_rpc::new_client(self.clone());
-        let noise_keys = self.noise_keys.clone();
-
         let psk_provider: Arc<dyn net::noise::NoisePskProvider> =
-            Arc::new(self.stores.token_store.clone());
+            Arc::new(self.auth.join_tokens.clone());
         let peer_verifier: Rc<dyn net::noise::NoisePeerVerifier> = Rc::new(self.topology.clone());
 
-        // Non-blocking TCP listener with readiness + bound addr.
         let (tcp_task, tcp_ready, bound) =
             net::tcp_secure::start_tcp_secure_listener_nonblocking_with_ready(
-                listen_addr,
-                server_handle.clone(),
-                noise_keys,
+                self.transport.config.listen_addr.clone(),
+                server_handle,
+                self.transport.noise_keys.clone(),
                 psk_provider,
                 peer_verifier,
             )
             .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
 
-        // Optional Unix socket (same behavior as start_daemon)
         let unix_task = if enable_unix_socket {
-            let local_session = self.new_session_client();
-
+            let local_session = self.sessions.new_client();
             Some(tokio::task::spawn_local(async move {
-                if let Err(e) = net::unix_socket::start_unix_socket_server_auto(local_session).await
+                if let Err(error) =
+                    net::unix_socket::start_unix_socket_server_auto(local_session).await
                 {
-                    error!(target: "server", "UnixSocket listener error: {e}");
+                    error!(target: "server", "UnixSocket listener error: {error}");
                 }
             }))
         } else {
@@ -217,44 +281,53 @@ impl Server {
         })
     }
 
-    /// New unified entry point: choose Blocking vs NonBlocking.
-    /// - `Blocking` = identical behavior to previous `start_daemon(true/false)`.
-    /// - `NonBlocking` = returns join handles so tests can proceed.
-    pub async fn start_with_mode(
-        self,
-        mode: RunMode,
-        enable_unix_socket: bool,
-    ) -> Result<Option<RunHandles>, Box<dyn std::error::Error>> {
-        let mut handles = self.spawn_listeners_nonblocking(enable_unix_socket).await?;
-
-        match mode {
-            RunMode::Blocking => {
-                // be “up” before awaiting tasks
-                handles.wait_ready().await;
-
-                if let Some(unix) = handles.unix_task {
-                    let _ = tokio::join!(handles.tcp_task, unix);
-                } else {
-                    let _ = handles.tcp_task.await;
-                }
-                Ok(None)
-            }
-            RunMode::NonBlocking => {
-                // caller (Headless/Test) can await readiness or not
-                Ok(Some(handles))
-            }
-        }
-    }
-
-    /// Backward-compatible wrapper (kept for the daemon path).
-    #[allow(dead_code)]
-    pub async fn start_daemon(
-        self,
-        enable_unix_socket: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = self
-            .start_with_mode(RunMode::Blocking, enable_unix_socket)
-            .await?;
+    /// Starts the exported transports and then waits for them to exit.
+    ///
+    /// The daemon path uses this for blocking startup while headless tests use
+    /// `start_nonblocking()` directly and keep the returned handles.
+    pub async fn run_blocking(&self, enable_unix_socket: bool) -> std::io::Result<()> {
+        let mut handles = self.start_nonblocking(enable_unix_socket).await?;
+        handles.wait_ready().await;
+        handles.join().await;
         Ok(())
+    }
+}
+
+/// Builds the cluster session capability bundle from bootstrap outputs.
+///
+/// Bootstrap keeps using this type name so the server constructor is explicit
+/// about the capabilities that will later be served through cluster sessions.
+#[derive(Clone)]
+pub struct ServerClients {
+    pub topology_client: TopologyClient,
+    pub gossip_client: GossipClient,
+    pub sync_client: SyncClient,
+    pub node_client: NodeClient,
+    pub task_client: TaskClient,
+    pub scheduler_client: SchedulerClient,
+    pub services_client: ServicesClient,
+    pub secrets_client: SecretsClient,
+    pub networks_client: NetworksClient,
+    pub volumes_client: VolumesClient,
+}
+
+impl From<ServerClients> for ClusterSessionServices {
+    /// Converts the bootstrap capability bundle into the shared session bundle.
+    ///
+    /// This keeps bootstrap wiring explicit while letting the server/session
+    /// layer work with one shared capability type internally.
+    fn from(clients: ServerClients) -> Self {
+        Self {
+            topology: clients.topology_client,
+            sync: clients.sync_client,
+            gossip: clients.gossip_client,
+            node: clients.node_client,
+            task: clients.task_client,
+            scheduler: clients.scheduler_client,
+            services: clients.services_client,
+            secrets: clients.secrets_client,
+            networks: clients.networks_client,
+            volumes: clients.volumes_client,
+        }
     }
 }

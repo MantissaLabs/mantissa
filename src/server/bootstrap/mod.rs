@@ -22,8 +22,16 @@ pub async fn start(
 ) -> BootstrapResult<Option<server::RunHandles>> {
     let ctx = BootstrapContext::init_base(listen_addr).await?;
     let runtime = boot(ctx, transport::daemon_bootstrap_options()).await?;
-    runtime
-        .server
-        .start_with_mode(mode, enable_unix_socket)
-        .await
+    match mode {
+        server::RunMode::Blocking => {
+            runtime.server.run_blocking(enable_unix_socket).await?;
+            Ok(None)
+        }
+        server::RunMode::NonBlocking => runtime
+            .server
+            .start_nonblocking(enable_unix_socket)
+            .await
+            .map(Some)
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) }),
+    }
 }

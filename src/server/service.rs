@@ -23,14 +23,14 @@ impl protocol::server::Server for Server {
         let handle = info.get_handle()?;
 
         // Join token check.
-        if !self.stores.token_store.matches(&token).await {
+        if !self.auth.join_tokens.matches(&token).await {
             return Err(capnp::Error::failed("invalid join token".to_string()));
         }
 
         self.topology.ensure_join_allowed()?;
 
         let joiner_id = id::read_node_id(info.get_id()?)?;
-        if joiner_id == self.id {
+        if joiner_id == self.identity.id {
             return Err(capnp::Error::failed("cannot join self".to_string()));
         }
 
@@ -151,17 +151,17 @@ impl protocol::server::Server for Server {
 
         // Issue session ticket.
         let ticket = self
-            .stores
-            .session_store
+            .auth
+            .sessions
             .issue_ticket(joiner_id)
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         let nonce = rand::try_nonce16().map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         const TTL_SECS: u64 = 3600; // 1 hour (tune it)
-        let cred = ClusterCredential::sign(&self.signing_key, joiner_id, TTL_SECS, nonce);
+        let cred = ClusterCredential::sign(&self.identity.signing_key, joiner_id, TTL_SECS, nonce);
         let cred_bytes = cred.to_bytes().map_err(capnp::Error::failed)?;
-        let session_client = self.new_session_client();
+        let session_client = self.sessions.new_client();
 
         // Ensure the periodic sync loop is running on this node as soon as we have a cluster
         // at least two nodes.
@@ -211,8 +211,8 @@ impl protocol::server::Server for Server {
 
         let ticket = params.get()?.get_ticket()?;
         let Some(peer_id) = self
-            .stores
-            .session_store
+            .auth
+            .sessions
             .lookup(ticket)
             .map_err(|e| capnp::Error::failed(e.to_string()))?
         else {
@@ -227,7 +227,7 @@ impl protocol::server::Server for Server {
             return Err(capnp::Error::failed("peer not registered".to_string()));
         }
 
-        let session_client = self.new_session_client();
+        let session_client = self.sessions.new_client();
         results.get().set_session(session_client);
         Ok(())
     }
@@ -274,13 +274,13 @@ impl protocol::server::Server for Server {
 
         // Mint a fresh ticket for the subject
         let ticket = self
-            .stores
-            .session_store
+            .auth
+            .sessions
             .issue_ticket(cred.subject)
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         // Return session + ticket + our peer id (so caller can persist)
-        let session_client = self.new_session_client();
+        let session_client = self.sessions.new_client();
 
         let mut out = results.get();
         out.set_session(session_client);

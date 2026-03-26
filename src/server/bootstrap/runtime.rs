@@ -12,7 +12,7 @@ use crate::scheduler::digest::{
 };
 use crate::scheduler::service::SchedulerService;
 use crate::server::config::Config;
-use crate::server::{Server, ServerClients, ServerStores};
+use crate::server::{Server, ServerClients};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
 use crate::sync::{SyncService, SyncStores};
 use crate::task::docker::{self, ContainerManager, DockerContainerManager};
@@ -747,18 +747,13 @@ fn build_server(
         volumes_client: components.volumes_client.clone(),
     };
 
-    let stores = ServerStores {
-        token_store: stores.token_store.clone(),
-        session_store: stores.session_auth.clone(),
-        secret_keyring: stores.secret_keyring.clone(),
-    };
-
     Server::new(
         ctx.self_id,
         config,
         components.topology.clone(),
-        clients,
-        stores,
+        clients.into(),
+        stores.token_store.clone(),
+        stores.session_auth.clone(),
         ctx.noise_keys.clone(),
         ctx.signing_key.clone(),
     )

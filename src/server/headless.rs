@@ -11,7 +11,7 @@ use crate::{
     registry::Registry,
     scheduler::Scheduler,
     server::{
-        RunHandles, RunMode, Server,
+        RunHandles, Server,
         bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, boot},
     },
     services::ServiceController,
@@ -212,10 +212,7 @@ impl HeadlessNode {
             }
             HeadlessTransport::Tcp { .. } => {
                 // Start TCP listener non-blocking (Noise + Cap’n Proto)
-                let mut h = server
-                    .start_with_mode(RunMode::NonBlocking, false)
-                    .await?
-                    .expect("NonBlocking must return handles");
+                let mut h = server.start_nonblocking(false).await?;
 
                 // Wait until the listener is actually bound and ready.
                 h.wait_ready().await;
@@ -617,11 +614,7 @@ impl HeadlessNode {
             }
             HeadlessTransport::Tcp { addr } => {
                 let server = self.server.clone();
-                let mut h = server
-                    .start_with_mode(RunMode::NonBlocking, false)
-                    .await
-                    .map_err(to_io)?
-                    .expect("handles");
+                let mut h = server.start_nonblocking(false).await.map_err(to_io)?;
                 h.wait_ready().await;
                 *addr = h.addr().to_string();
                 self.handles = Some(h);
