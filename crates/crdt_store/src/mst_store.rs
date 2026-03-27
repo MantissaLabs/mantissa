@@ -509,6 +509,16 @@ where
 
     /// Apply an inbound tombstone (idempotent, monotonic).
     pub async fn apply_tombstone(&self, k: &C::Key, ts: u64) -> io::Result<()> {
+        let next_ts = {
+            let r = self.db.begin_read().map_err(into_err)?;
+            let tombs = r.open_table(T::tombs()).map_err(into_err)?;
+            let kb = Self::encode_key(k);
+            match tombs.get(kb.as_slice()).map_err(into_err)? {
+                Some(g) => g.value().max(ts),
+                None => ts,
+            }
+        };
+
         let w = self.db.begin_write().map_err(into_err)?;
         {
             let mut values = w.open_table(T::values()).map_err(into_err)?;
@@ -519,16 +529,12 @@ where
         {
             let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
             let kb = Self::encode_key(k);
-            let next_ts = match tombs.get(kb.as_slice()).map_err(into_err)? {
-                Some(g) => g.value().max(ts),
-                None => ts,
-            };
             tombs.insert(kb.as_slice(), &next_ts).map_err(into_err)?;
         }
         w.commit().map_err(into_err)?;
 
         let mut t = self.mst.write().await;
-        t.upsert(k.clone(), &Entry::Deleted { ts });
+        t.upsert(k.clone(), &Entry::Deleted { ts: next_ts });
         self.bump_change_clock();
         Ok(())
     }
@@ -541,9 +547,10 @@ where
     ) -> io::Result<()> {
         // Prepare merged registers by reading current values once.
         let merged_regs = self.prepare_merged_registers(regs, &tombs)?;
+        let merged_tombs = self.prepare_merged_tombstones(tombs, false)?;
 
         // Track whether anything was written so we only advance the change clock when needed.
-        let had_changes = !merged_regs.is_empty() || !tombs.is_empty();
+        let had_changes = !merged_regs.is_empty() || !merged_tombs.is_empty();
 
         // Single write transaction for everything:
         let w = self.db.begin_write().map_err(into_err)?;
@@ -564,7 +571,7 @@ where
             }
 
             // Apply tombstones (and remove register rows)
-            for (k, ts) in &tombs {
+            for (k, ts) in &merged_tombs {
                 tt.insert(Self::encode_key(k).as_slice(), ts)
                     .map_err(into_err)?;
                 let _ = tv
@@ -590,8 +597,9 @@ where
     ) -> io::Result<()> {
         // Prepare merged registers by reading current values once.
         let merged_regs = self.prepare_merged_registers(regs, &tombs)?;
+        let merged_tombs = self.prepare_merged_tombstones(tombs, true)?;
 
-        let had_changes = !merged_regs.is_empty() || !tombs.is_empty();
+        let had_changes = !merged_regs.is_empty() || !merged_tombs.is_empty();
 
         // Single write transaction for everything:
         let w = self.db.begin_write().map_err(into_err)?;
@@ -610,7 +618,7 @@ where
                     .map_err(into_err)?;
             }
 
-            for (k, ts) in &tombs {
+            for (k, ts) in &merged_tombs {
                 tt.insert(Self::encode_key(k).as_slice(), ts)
                     .map_err(into_err)?;
                 let _ = tv
@@ -627,7 +635,7 @@ where
                 let snap = C::snapshot_reg(reg);
                 t.upsert(k.clone(), &Entry::Active(snap));
             }
-            for (k, ts) in tombs {
+            for (k, ts) in merged_tombs {
                 t.upsert(k.clone(), &Entry::Deleted { ts });
             }
         }
@@ -637,6 +645,40 @@ where
         }
 
         Ok(())
+    }
+
+    /// Normalize inbound tombstones so stale remote deletes cannot downgrade newer local state.
+    fn prepare_merged_tombstones(
+        &self,
+        tombs: Tombstones<C::Key>,
+        refresh_existing_for_mst: bool,
+    ) -> io::Result<Tombstones<C::Key>> {
+        if tombs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let r = self.db.begin_read().map_err(into_err)?;
+        let values = r.open_table(T::values()).map_err(into_err)?;
+        let tomb_table = r.open_table(T::tombs()).map_err(into_err)?;
+
+        let mut out = Vec::with_capacity(tombs.len());
+        for (k, incoming_ts) in tombs {
+            let kb = Self::encode_key(&k);
+            let current_tomb = tomb_table
+                .get(kb.as_slice())
+                .map_err(into_err)?
+                .map(|g| g.value());
+            let value_exists = values.get(kb.as_slice()).map_err(into_err)?.is_some();
+            let next_ts = current_tomb.unwrap_or(0).max(incoming_ts);
+
+            if current_tomb == Some(next_ts) && !value_exists && !refresh_existing_for_mst {
+                continue;
+            }
+
+            out.push((k, next_ts));
+        }
+
+        Ok(out)
     }
 
     /// Prepare merged registers honoring the configured tombstone strategy.
@@ -1296,15 +1338,53 @@ mod tests {
 
         // First a higher remote ts arrives
         store.apply_tombstone(&k, 100).await.unwrap();
+        let root_after_high = store.root_hex().await;
         // Then a stale lower ts arrives
         store.apply_tombstone(&k, 10).await.unwrap();
+        let root_after_lower = store.root_hex().await;
 
         // Disk must hold 100, and MST leaf must also be 100 (not 10)
         let (_, tombs) = store.load_all().unwrap();
         assert_eq!(tombs[0].1, 100);
-        let root_before = store.root_hex().await;
+        assert_eq!(root_after_high, root_after_lower);
         store.apply_tombstone(&k, 10).await.unwrap();
         let root_after = store.root_hex().await;
+        assert_eq!(root_after_lower, root_after);
+    }
+
+    #[tokio::test]
+    async fn apply_delta_chunk_update_mst_keeps_newer_local_tombstone() {
+        let (_local_dir, local_db) = temp_db();
+        let (_remote_dir, remote_db) = temp_db();
+        let local: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(local_db, 1u8).unwrap();
+        let remote: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(remote_db, 2u8).unwrap();
+        let tomb_key = key(1);
+
+        // Give the local store a newer tombstone sequence than the remote store.
+        local.remove(&key(9)).await.unwrap();
+        local.remove(&tomb_key).await.unwrap();
+        remote.remove(&tomb_key).await.unwrap();
+
+        let root_before = local.root_hex().await;
+        let remote_ranges = remote.page_range_summary().await.unwrap();
+        let (regs, tombs) = remote.export_page_ranges_delta(&remote_ranges).unwrap();
+
+        local
+            .apply_delta_chunk_update_mst(regs, tombs)
+            .await
+            .unwrap();
+
+        let (_, local_tombs) = local.load_all().unwrap();
+        let local_ts = local_tombs
+            .into_iter()
+            .find(|(key, _)| *key == tomb_key)
+            .map(|(_, ts)| ts)
+            .expect("local tombstone present");
+        let root_after = local.root_hex().await;
+
+        assert_eq!(local_ts, 2);
         assert_eq!(root_before, root_after);
     }
 
