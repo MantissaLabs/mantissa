@@ -3,8 +3,8 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use net::{
     noise::{
-        NoiseKeys, client_handshake_join_with_probe, client_handshake_peer, join_probe_client,
-        load_or_generate_noise_keys,
+        NoiseKeys, NoiseStream, client_handshake_join_with_probe, client_handshake_peer,
+        join_probe_client, load_or_generate_noise_keys,
     },
     unix_socket::candidate_unix_socket_paths,
 };
@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tokio::net::UnixStream;
-use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// Resolve an in-process client handle when using the inproc transport.
 fn inproc_client(addr: &str) -> Result<Option<server::Client>, capnp::Error> {
@@ -38,14 +38,12 @@ fn to_socket_addr(addr: &str) -> Result<std::net::SocketAddr, capnp::Error> {
         .ok_or_else(|| capnp::Error::failed("no addr".into()))
 }
 
-async fn rpc_client_from_stream(
-    noise_stream: tokio::io::DuplexStream,
-) -> Result<server::Client, capnp::Error> {
-    let (r, w) = tokio_util::compat::TokioAsyncReadCompatExt::compat(noise_stream).split();
+async fn rpc_client_from_stream(noise_stream: NoiseStream) -> Result<server::Client, capnp::Error> {
+    let (reader, writer) = noise_stream.into_split();
 
     let network = Box::new(twoparty::VatNetwork::new(
-        futures::io::BufReader::new(r),
-        futures::io::BufWriter::new(w),
+        reader.compat(),
+        writer.compat_write(),
         rpc_twoparty_capnp::Side::Client,
         Default::default(),
     ));

@@ -1,6 +1,5 @@
 use crate::noise::{HandshakeKind, NoisePeerVerifier, NoisePskProvider};
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
-use futures::AsyncReadExt;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::rc::Rc;
@@ -8,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::{error, info, warn};
 
 // Global default cap on concurrent handshakes to keep CPU usage predictable.
@@ -263,12 +263,11 @@ async fn accept_loop(
                 return;
             }
 
-            let (reader, writer) =
-                tokio_util::compat::TokioAsyncReadCompatExt::compat(handshake.stream).split();
+            let (reader, writer) = handshake.stream.into_split();
 
             let network = twoparty::VatNetwork::new(
-                futures::io::BufReader::new(reader),
-                futures::io::BufWriter::new(writer),
+                reader.compat(),
+                writer.compat_write(),
                 rpc_twoparty_capnp::Side::Server,
                 Default::default(),
             );

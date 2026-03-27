@@ -3,14 +3,15 @@ use async_trait::async_trait;
 use getrandom::getrandom;
 use hkdf::Hkdf;
 use sha2::Sha256;
-use std::future::poll_fn;
+use std::cmp::min;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use std::task::Poll;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::{fs, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -67,20 +68,534 @@ pub enum HandshakeKind {
 
 /// Result of a server-side Noise handshake, including the authenticated kind.
 pub struct ServerHandshake {
-    pub stream: tokio::io::DuplexStream,
+    pub stream: NoiseStream,
     pub kind: HandshakeKind,
     pub join_probe: bool,
 }
 
 /// Client-side join handshake result, including whether the server supports probes.
 pub struct ClientJoinHandshake {
-    pub stream: tokio::io::DuplexStream,
+    pub stream: NoiseStream,
     pub probe_enabled: bool,
 }
 
 struct ServerJoinHandshake {
-    stream: tokio::io::DuplexStream,
+    stream: NoiseStream,
     probe_required: bool,
+}
+
+/// Direct Noise transport stream backed by the TCP socket halves.
+///
+/// This keeps application bytes on the caller's I/O path instead of bouncing
+/// them through an in-process duplex bridge and background tasks.
+pub struct NoiseStream {
+    reader: NoiseReadHalf,
+    writer: NoiseWriteHalf,
+}
+
+/// Read half of one Noise transport session.
+///
+/// It owns the TCP read half, frame parsing state, and the inbound nonce.
+pub struct NoiseReadHalf {
+    tcp_reader: OwnedReadHalf,
+    transport: Arc<snow::StatelessTransportState>,
+    next_nonce: u64,
+    len_prefix: [u8; 2],
+    len_prefix_filled: usize,
+    cipher_buf: Vec<u8>,
+    cipher_len: usize,
+    cipher_read: usize,
+    plain_buf: Vec<u8>,
+    plain_len: usize,
+    plain_offset: usize,
+}
+
+/// Write half of one Noise transport session.
+///
+/// It owns the TCP write half, the outbound nonce, one staged plaintext frame,
+/// and one encrypted frame waiting to hit the socket.
+pub struct NoiseWriteHalf {
+    tcp_writer: OwnedWriteHalf,
+    transport: Arc<snow::StatelessTransportState>,
+    next_nonce: u64,
+    staged_plain: Vec<u8>,
+    staged_plain_len: usize,
+    wire_buf: Vec<u8>,
+    wire_len: usize,
+    wire_written: usize,
+}
+
+impl NoiseStream {
+    /// Build one direct Noise stream from the TCP halves and the finished
+    /// stateless transport state derived from the handshake.
+    fn new(
+        tcp_reader: OwnedReadHalf,
+        tcp_writer: OwnedWriteHalf,
+        transport: snow::StatelessTransportState,
+    ) -> Self {
+        let transport = Arc::new(transport);
+        Self {
+            reader: NoiseReadHalf {
+                tcp_reader,
+                transport: transport.clone(),
+                next_nonce: 0,
+                len_prefix: [0u8; 2],
+                len_prefix_filled: 0,
+                cipher_buf: vec![0u8; MAX_WIRE_FRAME],
+                cipher_len: 0,
+                cipher_read: 0,
+                plain_buf: vec![0u8; MAX_TRANSPORT_PLAINTEXT_FRAME],
+                plain_len: 0,
+                plain_offset: 0,
+            },
+            writer: NoiseWriteHalf {
+                tcp_writer,
+                transport,
+                next_nonce: 0,
+                staged_plain: vec![0u8; MAX_TRANSPORT_PLAINTEXT_FRAME],
+                staged_plain_len: 0,
+                wire_buf: vec![0u8; MAX_WIRE_FRAME + 2],
+                wire_len: 0,
+                wire_written: 0,
+            },
+        }
+    }
+
+    /// Split the direct Noise stream into independent read and write halves.
+    ///
+    /// The RPC layer uses this so Cap'n Proto can drive both directions without
+    /// an extra Tokio `split()` lock around the whole transport.
+    pub fn into_split(self) -> (NoiseReadHalf, NoiseWriteHalf) {
+        (self.reader, self.writer)
+    }
+}
+
+impl AsyncRead for NoiseStream {
+    /// Read decrypted plaintext directly from the underlying TCP socket.
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.reader).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for NoiseStream {
+    /// Stage plaintext for encryption and flush encrypted frames directly to
+    /// the underlying TCP socket as capacity requires.
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.writer).poll_write(cx, buf)
+    }
+
+    /// Flush any staged plaintext and encrypted bytes to the TCP socket.
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.writer).poll_flush(cx)
+    }
+
+    /// Flush pending bytes and shut down the TCP write half.
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
+
+impl AsyncRead for NoiseReadHalf {
+    /// Read decrypted bytes into the caller-provided buffer.
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            if this.plain_offset < this.plain_len {
+                let available = this.plain_len - this.plain_offset;
+                let to_copy = min(available, buf.remaining());
+                buf.put_slice(&this.plain_buf[this.plain_offset..this.plain_offset + to_copy]);
+                this.plain_offset += to_copy;
+                if this.plain_offset == this.plain_len {
+                    this.plain_offset = 0;
+                    this.plain_len = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            match poll_fill_reader(
+                Pin::new(&mut this.tcp_reader),
+                cx,
+                &mut this.len_prefix,
+                &mut this.len_prefix_filled,
+                "stream.read.len_prefix",
+                true,
+            ) {
+                Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(true)) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+
+            this.cipher_len = u16::from_be_bytes(this.len_prefix) as usize;
+            if this.cipher_len > MAX_WIRE_FRAME {
+                warn!(
+                    target: "diag.transport",
+                    direction = "read",
+                    stage = "stream.read.frame_too_large",
+                    frame_len = this.cipher_len,
+                    max_wire_frame = MAX_WIRE_FRAME,
+                    "noise ciphertext exceeds wire frame limit"
+                );
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "noise frame too large",
+                )));
+            }
+
+            match poll_fill_reader(
+                Pin::new(&mut this.tcp_reader),
+                cx,
+                &mut this.cipher_buf[..this.cipher_len],
+                &mut this.cipher_read,
+                "stream.read.frame",
+                false,
+            ) {
+                Poll::Ready(Ok(true)) => {}
+                Poll::Ready(Ok(false)) => unreachable!("frame reads do not allow clean EOF"),
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+
+            let nonce = next_nonce(&mut this.next_nonce)?;
+            let n_plain = match this.transport.read_message(
+                nonce,
+                &this.cipher_buf[..this.cipher_len],
+                &mut this.plain_buf,
+            ) {
+                Ok(n) => n,
+                Err(err) => {
+                    warn!(
+                        target: "diag.transport",
+                        direction = "read",
+                        stage = "stream.decrypt",
+                        frame_len = this.cipher_len,
+                        error = %err,
+                        "noise decrypt failed"
+                    );
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("noise decrypt failed: {err}"),
+                    )));
+                }
+            };
+
+            this.len_prefix_filled = 0;
+            this.cipher_len = 0;
+            this.cipher_read = 0;
+            this.plain_len = n_plain;
+            this.plain_offset = 0;
+
+            if this.plain_len == 0 {
+                continue;
+            }
+        }
+    }
+}
+
+impl NoiseWriteHalf {
+    /// Returns true when one encrypted frame is still being written to the TCP
+    /// socket.
+    fn has_pending_wire(&self) -> bool {
+        self.wire_written < self.wire_len
+    }
+
+    /// Encrypt one caller-provided plaintext slice into the pending wire
+    /// buffer.
+    fn prepare_pending_frame_from_slice(&mut self, plaintext: &[u8]) -> io::Result<()> {
+        debug_assert!(!self.has_pending_wire());
+
+        let nonce = next_nonce(&mut self.next_nonce)?;
+        let cipher_len =
+            match self
+                .transport
+                .write_message(nonce, plaintext, &mut self.wire_buf[2..])
+            {
+                Ok(n) => n,
+                Err(err) => {
+                    warn!(
+                        target: "diag.transport",
+                        direction = "write",
+                        stage = "stream.encrypt",
+                        plain_len = plaintext.len(),
+                        error = %err,
+                        "noise encrypt failed"
+                    );
+                    return Err(io::Error::other(format!("noise encrypt failed: {err}")));
+                }
+            };
+
+        if cipher_len > MAX_WIRE_FRAME {
+            warn!(
+                target: "diag.transport",
+                direction = "write",
+                stage = "stream.encrypt.frame_too_large",
+                plain_len = plaintext.len(),
+                cipher_len,
+                max_wire_frame = MAX_WIRE_FRAME,
+                "noise ciphertext exceeds wire frame limit"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "noise ciphertext exceeds wire frame limit",
+            ));
+        }
+
+        self.wire_buf[..2].copy_from_slice(&(cipher_len as u16).to_be_bytes());
+        self.wire_len = cipher_len + 2;
+        self.wire_written = 0;
+        Ok(())
+    }
+
+    /// Encrypt the staged plaintext buffer into the pending wire buffer.
+    fn prepare_pending_frame_from_staged(&mut self) -> io::Result<()> {
+        if self.staged_plain_len == 0 {
+            return Ok(());
+        }
+
+        let plain_len = self.staged_plain_len;
+        let nonce = next_nonce(&mut self.next_nonce)?;
+        let cipher_len = match self.transport.write_message(
+            nonce,
+            &self.staged_plain[..plain_len],
+            &mut self.wire_buf[2..],
+        ) {
+            Ok(n) => n,
+            Err(err) => {
+                warn!(
+                    target: "diag.transport",
+                    direction = "write",
+                    stage = "stream.encrypt",
+                    plain_len,
+                    error = %err,
+                    "noise encrypt failed"
+                );
+                return Err(io::Error::other(format!("noise encrypt failed: {err}")));
+            }
+        };
+
+        if cipher_len > MAX_WIRE_FRAME {
+            warn!(
+                target: "diag.transport",
+                direction = "write",
+                stage = "stream.encrypt.frame_too_large",
+                plain_len,
+                cipher_len,
+                max_wire_frame = MAX_WIRE_FRAME,
+                "noise ciphertext exceeds wire frame limit"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "noise ciphertext exceeds wire frame limit",
+            ));
+        }
+
+        self.wire_buf[..2].copy_from_slice(&(cipher_len as u16).to_be_bytes());
+        self.wire_len = cipher_len + 2;
+        self.wire_written = 0;
+        self.staged_plain_len = 0;
+        Ok(())
+    }
+
+    /// Push the pending encrypted frame to the TCP socket.
+    fn poll_drain_pending_wire(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.has_pending_wire() {
+            match Pin::new(&mut self.tcp_writer)
+                .poll_write(cx, &self.wire_buf[self.wire_written..self.wire_len])
+            {
+                Poll::Ready(Ok(0)) => {
+                    let err = io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "noise transport write returned 0",
+                    );
+                    log_transport_io("stream.write.frame", "write", &err);
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Ready(Ok(written)) => {
+                    self.wire_written += written;
+                }
+                Poll::Ready(Err(err)) => {
+                    log_transport_io("stream.write.frame", "write", &err);
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        self.wire_len = 0;
+        self.wire_written = 0;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for NoiseWriteHalf {
+    /// Stage plaintext and only encrypt immediately when a full frame is ready
+    /// or the caller provided a full frame directly.
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.as_mut().get_mut();
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // Bound the buffered state to one encrypted frame plus one staged
+        // plaintext frame. If both are full we must make forward progress on
+        // the socket before accepting more bytes.
+        if this.staged_plain_len == this.staged_plain.len() {
+            if this.has_pending_wire() {
+                match this.poll_drain_pending_wire(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            this.prepare_pending_frame_from_staged()?;
+        }
+
+        // Large writes can skip the staging buffer entirely once the current
+        // pending frame has drained.
+        if this.staged_plain_len == 0
+            && !this.has_pending_wire()
+            && buf.len() >= MAX_TRANSPORT_PLAINTEXT_FRAME
+        {
+            this.prepare_pending_frame_from_slice(&buf[..MAX_TRANSPORT_PLAINTEXT_FRAME])?;
+            let _ = this.poll_drain_pending_wire(cx);
+            return Poll::Ready(Ok(MAX_TRANSPORT_PLAINTEXT_FRAME));
+        }
+
+        let capacity = this.staged_plain.len() - this.staged_plain_len;
+        if capacity == 0 {
+            return Poll::Pending;
+        }
+
+        let to_copy = min(capacity, buf.len());
+        this.staged_plain[this.staged_plain_len..this.staged_plain_len + to_copy]
+            .copy_from_slice(&buf[..to_copy]);
+        this.staged_plain_len += to_copy;
+
+        if this.staged_plain_len == this.staged_plain.len() && !this.has_pending_wire() {
+            this.prepare_pending_frame_from_staged()?;
+            let _ = this.poll_drain_pending_wire(cx);
+        }
+
+        Poll::Ready(Ok(to_copy))
+    }
+
+    /// Encrypt any staged plaintext and flush all bytes to the socket.
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        loop {
+            if this.has_pending_wire() {
+                match this.poll_drain_pending_wire(cx) {
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            if this.staged_plain_len > 0 {
+                this.prepare_pending_frame_from_staged()?;
+                continue;
+            }
+
+            match Pin::new(&mut this.tcp_writer).poll_flush(cx) {
+                Poll::Ready(Ok(())) => return Poll::Ready(Ok(())),
+                Poll::Ready(Err(err)) => {
+                    log_transport_io("stream.flush", "write", &err);
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    /// Flush pending bytes before shutting down the TCP write half.
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut this.tcp_writer).poll_shutdown(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(err)) => {
+                log_transport_io("stream.shutdown", "write", &err);
+                Poll::Ready(Err(err))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Advance one monotonically increasing Noise nonce and fail once the session
+/// exhausts the transport counter space.
+fn next_nonce(next: &mut u64) -> io::Result<u64> {
+    let nonce = *next;
+    *next = next
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("noise nonce exhausted"))?;
+    Ok(nonce)
+}
+
+/// Fill the caller-provided slice directly from the TCP reader.
+///
+/// When `allow_clean_eof` is true, reaching EOF before any bytes of the next
+/// frame have arrived cleanly ends the stream instead of surfacing an error.
+fn poll_fill_reader<R>(
+    mut reader: Pin<&mut R>,
+    cx: &mut Context<'_>,
+    buf: &mut [u8],
+    filled: &mut usize,
+    stage: &'static str,
+    allow_clean_eof: bool,
+) -> Poll<io::Result<bool>>
+where
+    R: AsyncRead,
+{
+    while *filled < buf.len() {
+        let mut read_buf = ReadBuf::new(&mut buf[*filled..]);
+        match reader.as_mut().poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => {
+                let read = read_buf.filled().len();
+                if read == 0 {
+                    if *filled == 0 && allow_clean_eof {
+                        return Poll::Ready(Ok(false));
+                    }
+                    let err = io::Error::new(io::ErrorKind::UnexpectedEof, "noise frame truncated");
+                    log_transport_io(stage, "read", &err);
+                    return Poll::Ready(Err(err));
+                }
+                *filled += read;
+            }
+            Poll::Ready(Err(err)) => {
+                log_transport_io(stage, "read", &err);
+                return Poll::Ready(Err(err));
+            }
+            Poll::Pending => return Poll::Pending,
+        }
+    }
+
+    Poll::Ready(Ok(true))
 }
 
 /// Parse and validate the configured Noise parameters.
@@ -190,13 +705,13 @@ pub async fn client_handshake_join_with_probe(
         .map_err(|e| io::Error::other(e.to_string()))?;
     write_framed(&mut wr, &out[..n]).await?;
 
-    // Done: switch to transport and spawn the IO bridge
+    // Done: switch to transport and return a direct encrypted stream.
     let transport = hs
-        .into_transport_mode()
+        .into_stateless_transport_mode()
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     Ok(ClientJoinHandshake {
-        stream: crate::noise::spawn_noise_io_bridge(rd, wr, transport),
+        stream: NoiseStream::new(rd, wr, transport),
         probe_enabled,
     })
 }
@@ -208,7 +723,7 @@ pub async fn client_handshake_join(
     tcp: tokio::net::TcpStream,
     keys: &crate::noise::NoiseKeys,
     psk: &[u8; 32],
-) -> io::Result<tokio::io::DuplexStream> {
+) -> io::Result<NoiseStream> {
     Ok(client_handshake_join_with_probe(tcp, keys, psk)
         .await?
         .stream)
@@ -216,7 +731,10 @@ pub async fn client_handshake_join(
 
 /// Confirm the join PSK on the client side by round-tripping a short probe.
 /// This ensures an invalid join token fails before Cap'n Proto setup.
-pub async fn join_probe_client(stream: &mut tokio::io::DuplexStream) -> io::Result<()> {
+pub async fn join_probe_client<S>(stream: &mut S) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let fut = async {
         stream.write_all(JOIN_PROBE_REQ).await?;
         stream.flush().await?;
@@ -238,7 +756,10 @@ pub async fn join_probe_client(stream: &mut tokio::io::DuplexStream) -> io::Resu
 
 /// Confirm the join PSK on the server side by validating a short probe and responding.
 /// This rejects invalid tokens before Cap'n Proto setup.
-pub async fn join_probe_server(stream: &mut tokio::io::DuplexStream) -> io::Result<()> {
+pub async fn join_probe_server<S>(stream: &mut S) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let fut = async {
         let mut buf = [0u8; JOIN_PROBE_REQ.len()];
         stream.read_exact(&mut buf).await?;
@@ -264,7 +785,7 @@ pub async fn client_handshake_peer(
     tcp: tokio::net::TcpStream,
     keys: &crate::noise::NoiseKeys,
     responder_static: &[u8; 32],
-) -> io::Result<tokio::io::DuplexStream> {
+) -> io::Result<NoiseStream> {
     let pk_bytes = keys.private.to_bytes();
 
     let builder = snow::Builder::new(parsed_noise_params(NOISE_PARAMS_PEER)?)
@@ -296,10 +817,10 @@ pub async fn client_handshake_peer(
     })?;
 
     let transport = hs
-        .into_transport_mode()
+        .into_stateless_transport_mode()
         .map_err(|e| io::Error::other(e.to_string()))?;
 
-    Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
+    Ok(NoiseStream::new(rd, wr, transport))
 }
 
 /// Server side handshake.
@@ -309,7 +830,7 @@ pub async fn server_handshake_join(
     tcp: tokio::net::TcpStream,
     keys: &crate::noise::NoiseKeys,
     psk: &[u8; 32],
-) -> io::Result<tokio::io::DuplexStream> {
+) -> io::Result<NoiseStream> {
     let (mut rd, wr) = tcp.into_split();
     let mut first = vec![0u8; 65535];
     let nread = read_framed_len(&mut rd, &mut first).await?;
@@ -318,12 +839,12 @@ pub async fn server_handshake_join(
 
 /// Server side join handshake (Noise_XXpsk3) using a pre-read first frame.
 pub async fn server_handshake_join_with_first_frame(
-    rd: tokio::net::tcp::OwnedReadHalf,
-    wr: tokio::net::tcp::OwnedWriteHalf,
+    rd: OwnedReadHalf,
+    wr: OwnedWriteHalf,
     keys: &crate::noise::NoiseKeys,
     psk: &[u8; 32],
     first_frame: &[u8],
-) -> io::Result<tokio::io::DuplexStream> {
+) -> io::Result<NoiseStream> {
     Ok(
         server_handshake_join_with_first_frame_probe(rd, wr, keys, psk, first_frame)
             .await?
@@ -334,8 +855,8 @@ pub async fn server_handshake_join_with_first_frame(
 /// Server side join handshake (Noise_XXpsk3) using a pre-read first frame.
 /// Returns the Noise stream plus whether the client requested the join probe.
 async fn server_handshake_join_with_first_frame_probe(
-    mut rd: tokio::net::tcp::OwnedReadHalf,
-    mut wr: tokio::net::tcp::OwnedWriteHalf,
+    mut rd: OwnedReadHalf,
+    mut wr: OwnedWriteHalf,
     keys: &crate::noise::NoiseKeys,
     psk: &[u8; 32],
     first_frame: &[u8],
@@ -387,23 +908,23 @@ async fn server_handshake_join_with_first_frame_probe(
         .map_err(map_join_error)?;
 
     let transport = hs
-        .into_transport_mode()
+        .into_stateless_transport_mode()
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     Ok(ServerJoinHandshake {
-        stream: crate::noise::spawn_noise_io_bridge(rd, wr, transport),
+        stream: NoiseStream::new(rd, wr, transport),
         probe_required,
     })
 }
 
 /// Server side peer handshake (Noise IK) using a pre-read first frame.
 pub async fn server_handshake_peer_with_first_frame(
-    rd: tokio::net::tcp::OwnedReadHalf,
-    mut wr: tokio::net::tcp::OwnedWriteHalf,
+    rd: OwnedReadHalf,
+    mut wr: OwnedWriteHalf,
     keys: &crate::noise::NoiseKeys,
     first_frame: &[u8],
     verifier: Rc<dyn NoisePeerVerifier>,
-) -> Result<tokio::io::DuplexStream, PeerHandshakeError> {
+) -> Result<NoiseStream, PeerHandshakeError> {
     let pk_bytes = keys.private.to_bytes();
 
     let builder = snow::Builder::new(parsed_noise_params(NOISE_PARAMS_PEER)?)
@@ -432,10 +953,10 @@ pub async fn server_handshake_peer_with_first_frame(
     write_framed(&mut wr, &out[..n]).await?;
 
     let transport = hs
-        .into_transport_mode()
+        .into_stateless_transport_mode()
         .map_err(|e| io::Error::other(e.to_string()))?;
 
-    Ok(crate::noise::spawn_noise_io_bridge(rd, wr, transport))
+    Ok(NoiseStream::new(rd, wr, transport))
 }
 
 #[derive(Debug)]
@@ -454,8 +975,8 @@ impl From<io::Error> for ServerHandshakeError {
 /// - Try peer IK first (requires authorized static key).
 /// - Fallback to join XXpsk3 when the peer pattern doesn't match.
 pub async fn server_handshake_select(
-    rd: tokio::net::tcp::OwnedReadHalf,
-    wr: tokio::net::tcp::OwnedWriteHalf,
+    rd: OwnedReadHalf,
+    wr: OwnedWriteHalf,
     keys: &crate::noise::NoiseKeys,
     psk: &[u8; 32],
     first_frame: &[u8],
@@ -489,11 +1010,11 @@ pub async fn server_handshake_select(
             write_framed(&mut wr, &out[..n]).await?;
 
             let transport = hs
-                .into_transport_mode()
+                .into_stateless_transport_mode()
                 .map_err(|e| io::Error::other(e.to_string()))?;
 
             Ok(ServerHandshake {
-                stream: crate::noise::spawn_noise_io_bridge(rd, wr, transport),
+                stream: NoiseStream::new(rd, wr, transport),
                 kind: HandshakeKind::Peer,
                 join_probe: false,
             })
@@ -508,254 +1029,6 @@ pub async fn server_handshake_select(
             })
         }
     }
-}
-/// Spawn a Noise-protected I/O bridge between the TCP socket and an in-process
-/// duplex stream returned to the caller (the "application end").
-///
-/// Layout:
-///   - app_end  (returned)  <==== plaintext ====>  noise_end (internal)
-///   - Task A: TCP -> [len|ciphertext] -> decrypt -> write plaintext to app_end
-///   - Task B: read plaintext from app_end -> encrypt -> TCP [len|ciphertext]
-///
-/// Framing:
-///   Each encrypted frame on the wire is sent as:
-///     [u16 big-endian length][ciphertext bytes...]
-///
-/// Concurrency:
-///   `snow::TransportState` is not `Sync`, and its read/write operations mutate
-///   internal counters/nonces. We wrap it in `Arc<Mutex<_>>` and *share the same
-///   transport* across both directions to keep the Noise state coherent.
-fn spawn_noise_io_bridge(
-    mut tcp_reader: tokio::net::tcp::OwnedReadHalf,
-    mut tcp_writer: tokio::net::tcp::OwnedWriteHalf,
-    transport: snow::TransportState,
-) -> tokio::io::DuplexStream {
-    // A bidirectional in-process pipe: one end for the application (`app_end`),
-    // the other end (`noise_end`) is used internally by the bridge tasks.
-    let (app_end, noise_end) = tokio::io::duplex(MAX_FRAME * 2);
-
-    // Split the internal end so each task owns exactly one half.
-    // - `noise_writer`: Task A writes plaintext to the app (app will read it from `app_end`)
-    // - `noise_reader`: Task B reads plaintext from the app (app writes to `app_end`)
-    let (mut noise_reader, mut noise_writer) = tokio::io::split(noise_end);
-
-    // Share the Noise transport safely between the two tasks.
-    //
-    // The critical section never spans an `.await`, so a plain mutex avoids the
-    // scheduler overhead of an async mutex on the hottest crypto path.
-    let transport = Arc::new(Mutex::new(transport));
-    let transport_for_read = transport.clone(); // used by Task A (decrypt)
-    let transport_for_write = transport.clone(); // used by Task B (encrypt)
-
-    // Task A: TCP -> decrypt -> app
-    //
-    // Reads length-prefixed ciphertext from the TCP socket, decrypts it with
-    // Noise, and forwards the resulting plaintext into `noise_writer` so the
-    // application can read it from `app_end`.
-    tokio::spawn(async move {
-        let mut len_prefix = [0u8; 2];
-        let mut cipher_buf = vec![0u8; MAX_FRAME + 1024]; // headroom
-        let mut plain_buf = vec![0u8; MAX_FRAME + 1024];
-
-        loop {
-            // Read the 2-byte length prefix.
-            if let Err(e) = tcp_reader.read_exact(&mut len_prefix).await {
-                log_transport_io("bridge.read.len_prefix", "read", &e);
-                let _ = noise_writer.shutdown().await;
-                break;
-            }
-            let clen = u16::from_be_bytes(len_prefix) as usize;
-
-            // Read encrypted payload.
-            if cipher_buf.len() < clen {
-                cipher_buf.resize(clen, 0);
-            }
-            if let Err(e) = tcp_reader.read_exact(&mut cipher_buf[..clen]).await {
-                log_transport_io("bridge.read.frame", "read", &e);
-                let _ = noise_writer.shutdown().await;
-                break;
-            }
-
-            // Decrypt into plaintext.
-            if plain_buf.len() < clen {
-                plain_buf.resize(clen, 0);
-            }
-            let n_plain = match decrypt_transport_frame(
-                &transport_for_read,
-                &cipher_buf[..clen],
-                &mut plain_buf,
-            ) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(
-                        target: "diag.transport",
-                        direction = "read",
-                        stage = "bridge.decrypt",
-                        frame_len = clen,
-                        error = %e,
-                        "noise decrypt failed"
-                    );
-                    let _ = noise_writer.shutdown().await;
-                    break;
-                }
-            };
-
-            // Forward plaintext to the application side.
-            if let Err(e) = noise_writer.write_all(&plain_buf[..n_plain]).await {
-                log_transport_io("bridge.write.app_plaintext", "write", &e);
-                let _ = noise_writer.shutdown().await;
-                break;
-            }
-        }
-    });
-
-    // Task B: app -> encrypt -> TCP
-    //
-    // Reads plaintext from `noise_reader` (what the application writes to `app_end`),
-    // encrypts it with Noise, and writes length-prefixed ciphertext to the TCP socket.
-    tokio::spawn(async move {
-        let mut plain_buf = vec![0u8; MAX_TRANSPORT_PLAINTEXT_FRAME];
-        let mut cipher_buf = vec![0u8; MAX_FRAME + 16]; // AEAD overhead
-
-        loop {
-            // Read plaintext from the application side.
-            //
-            // Cap'n Proto often emits several small writes back-to-back. Coalesce the
-            // bytes that are already ready in the in-process pipe so we produce fewer,
-            // larger Noise frames and pay the AEAD fixed cost less often.
-            let n_plain = match read_coalesced_plaintext(&mut noise_reader, &mut plain_buf).await {
-                Ok(0) => {
-                    debug!(
-                        target: "diag.transport",
-                        direction = "read",
-                        stage = "bridge.read.app_plaintext",
-                        "noise app side closed"
-                    );
-                    let _ = tcp_writer.shutdown().await;
-                    break;
-                }
-                Err(e) => {
-                    log_transport_io("bridge.read.app_plaintext", "read", &e);
-                    let _ = tcp_writer.shutdown().await;
-                    break;
-                }
-                Ok(n) => n,
-            };
-
-            // Encrypt with Noise.
-            if cipher_buf.len() < n_plain + NOISE_TRANSPORT_OVERHEAD {
-                cipher_buf.resize(n_plain + NOISE_TRANSPORT_OVERHEAD, 0);
-            }
-            let clen = match encrypt_transport_frame(
-                &transport_for_write,
-                &plain_buf[..n_plain],
-                &mut cipher_buf,
-            ) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(
-                        target: "diag.transport",
-                        direction = "write",
-                        stage = "bridge.encrypt",
-                        plain_len = n_plain,
-                        error = %e,
-                        "noise encrypt failed"
-                    );
-                    let _ = tcp_writer.shutdown().await;
-                    return;
-                }
-            };
-
-            if clen > MAX_WIRE_FRAME {
-                warn!(
-                    target: "diag.transport",
-                    direction = "write",
-                    stage = "bridge.encrypt.frame_too_large",
-                    plain_len = n_plain,
-                    cipher_len = clen,
-                    max_wire_frame = MAX_WIRE_FRAME,
-                    "noise ciphertext exceeds wire frame limit"
-                );
-                let _ = tcp_writer.shutdown().await;
-                return;
-            }
-
-            // Write length prefix + ciphertext to the wire.
-            let len_bytes = (clen as u16).to_be_bytes();
-            if let Err(e) = tcp_writer.write_all(&len_bytes).await {
-                log_transport_io("bridge.write.len_prefix", "write", &e);
-                return;
-            }
-            if let Err(e) = tcp_writer.write_all(&cipher_buf[..clen]).await {
-                log_transport_io("bridge.write.frame", "write", &e);
-                return;
-            }
-        }
-    });
-
-    // The application uses this end (plaintext in both directions).
-    app_end
-}
-
-/// Reads one plaintext burst from the application side and opportunistically drains any
-/// bytes that are already ready so the transport emits fewer AEAD frames.
-async fn read_coalesced_plaintext<R>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize>
-where
-    R: AsyncRead + Unpin,
-{
-    let initial = reader.read(buf).await?;
-    if initial == 0 || initial == buf.len() {
-        return Ok(initial);
-    }
-
-    let mut total = initial;
-    let extra = poll_fn(|cx| {
-        loop {
-            if total == buf.len() {
-                return Poll::Ready(Ok(total - initial));
-            }
-
-            let mut read_buf = ReadBuf::new(&mut buf[total..]);
-            match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => {
-                    let read = read_buf.filled().len();
-                    if read == 0 {
-                        return Poll::Ready(Ok(total - initial));
-                    }
-                    total += read;
-                }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Pending => return Poll::Ready(Ok(total - initial)),
-            }
-        }
-    })
-    .await?;
-
-    Ok(initial + extra)
-}
-
-/// Decrypts one wire frame while keeping the mutex guard scoped to the synchronous crypto call.
-fn decrypt_transport_frame(
-    transport: &Mutex<snow::TransportState>,
-    ciphertext: &[u8],
-    plaintext: &mut [u8],
-) -> Result<usize, snow::Error> {
-    let mut guard = transport
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.read_message(ciphertext, plaintext)
-}
-
-/// Encrypts one plaintext burst while keeping the mutex guard scoped to the synchronous crypto call.
-fn encrypt_transport_frame(
-    transport: &Mutex<snow::TransportState>,
-    plaintext: &[u8],
-    ciphertext: &mut [u8],
-) -> Result<usize, snow::Error> {
-    let mut guard = transport
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.write_message(plaintext, ciphertext)
 }
 
 /// # Description:
