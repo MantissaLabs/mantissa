@@ -107,6 +107,21 @@ fn peer_value_from_join_payload(payload: &JoinPayload) -> PeerValue {
     }
 }
 
+/// Builds the local peer row to restore after join without clobbering newer runtime metadata.
+///
+/// The join path intentionally starts from a conservative self-row snapshot captured before the
+/// node has necessarily finished publishing dynamic local state like WireGuard readiness. When
+/// reasserting the self row after bootstrap sync, preserve any better local runtime metadata that
+/// already won the local MVReg register.
+fn restored_local_peer_value(current: Option<&PeerValue>, mut restored: PeerValue) -> PeerValue {
+    if let Some(current) = current {
+        restored.wireguard =
+            WireGuardPeerValue::preferred(current.wireguard.as_ref(), restored.wireguard.as_ref());
+        restored.scheduling = PeerSchedulingState::merge(&restored.scheduling, &current.scheduling);
+    }
+    restored
+}
+
 struct JoinResponse {
     peer_id: Uuid,
     peer_value: PeerValue,
@@ -605,7 +620,9 @@ impl Topology {
     /// Restores this node's own peer row after a successful join so rejoin does not depend on
     /// remote gossip to clear the self tombstone created by `leave()`.
     async fn persist_local_join_payload(&self, payload: &JoinPayload) -> Result<(), Error> {
-        let local_peer_value = peer_value_from_join_payload(payload);
+        let current = self.registry.peer_value_unscoped(payload.id);
+        let local_peer_value =
+            restored_local_peer_value(current.as_ref(), peer_value_from_join_payload(payload));
         self.peers
             .upsert(&UuidKey::from(payload.id), local_peer_value)
             .await
@@ -2554,5 +2571,86 @@ pub fn add_event(
                 node.set_scheduling_reason(reason);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restored_local_peer_value;
+    use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
+    use uuid::Uuid;
+
+    /// Build one synthetic self row matching the conservative join-time snapshot.
+    fn test_join_peer_value() -> PeerValue {
+        let node_id = Uuid::from_bytes([9u8; 16]);
+        PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: Some(WireGuardPeerValue {
+                public_key: [4u8; 32],
+                port: 7777,
+                enabled: false,
+            }),
+            scheduling: PeerSchedulingState {
+                schedulable: true,
+                drain_requested: false,
+                updated_at_unix_ms: 10,
+                actor_node_id: node_id,
+                reason: None,
+                drain_task_stop_timeout_secs: None,
+            },
+        }
+    }
+
+    /// Restoring the self row should preserve a newer locally published WireGuard advertisement.
+    #[test]
+    fn restored_local_peer_value_keeps_newer_wireguard_state() {
+        let payload = test_join_peer_value();
+        let mut current = payload.clone();
+        current.wireguard = Some(WireGuardPeerValue {
+            public_key: [4u8; 32],
+            port: 7777,
+            enabled: true,
+        });
+
+        let restored = restored_local_peer_value(Some(&current), payload.clone());
+
+        assert_eq!(restored.address, payload.address);
+        assert!(restored.wireguard.expect("wireguard state").enabled);
+    }
+
+    /// Restoring the self row should preserve later local scheduling updates over stale join data.
+    #[test]
+    fn restored_local_peer_value_keeps_newer_scheduling_state() {
+        let node_id = Uuid::from_bytes([9u8; 16]);
+        let payload = test_join_peer_value();
+        let current = PeerValue {
+            address: "127.0.0.1:7999".to_string(),
+            hostname: "node-newer".to_string(),
+            noise_static_pub: [8u8; 32],
+            signing_pub: [7u8; 32],
+            identity_sig: vec![6u8; 64],
+            wireguard: None,
+            scheduling: PeerSchedulingState {
+                schedulable: false,
+                drain_requested: true,
+                updated_at_unix_ms: 20,
+                actor_node_id: node_id,
+                reason: Some("maintenance".to_string()),
+                drain_task_stop_timeout_secs: Some(30),
+            },
+        };
+
+        let restored = restored_local_peer_value(Some(&current), payload.clone());
+
+        assert_eq!(restored.address, payload.address);
+        assert_eq!(restored.hostname, payload.hostname);
+        assert!(!restored.scheduling.schedulable);
+        assert!(restored.scheduling.drain_requested);
+        assert_eq!(restored.scheduling.reason.as_deref(), Some("maintenance"));
+        assert_eq!(restored.scheduling.drain_task_stop_timeout_secs, Some(30));
     }
 }

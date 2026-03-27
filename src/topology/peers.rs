@@ -143,6 +143,38 @@ pub struct WireGuardPeerValue {
     pub enabled: bool,
 }
 
+impl WireGuardPeerValue {
+    /// Returns whichever WireGuard advertisement is more complete and more ready for use.
+    pub(crate) fn preferred(left: Option<&Self>, right: Option<&Self>) -> Option<Self> {
+        fn is_nonzero_key(key: &[u8; 32]) -> bool {
+            key.iter().any(|b| *b != 0)
+        }
+
+        fn precedence_key(wg: &WireGuardPeerValue) -> (bool, bool, bool, u16, [u8; 32]) {
+            (
+                wg.enabled,
+                is_nonzero_key(&wg.public_key),
+                wg.port != 0,
+                wg.port,
+                wg.public_key,
+            )
+        }
+
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                if precedence_key(left) >= precedence_key(right) {
+                    Some(left.clone())
+                } else {
+                    Some(right.clone())
+                }
+            }
+            (Some(left), None) => Some(left.clone()),
+            (None, Some(right)) => Some(right.clone()),
+            (None, None) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct PeerValue {
     pub address: String,
@@ -200,20 +232,6 @@ impl PeerProvider for Topology {
 impl PeerValue {
     /// Selects one deterministic winner from the concurrent values stored for one peer row.
     pub fn select(values: &[PeerValue]) -> Option<PeerValue> {
-        fn is_nonzero_key(key: &[u8; 32]) -> bool {
-            key.iter().any(|b| *b != 0)
-        }
-
-        fn rank_wireguard(wg: &WireGuardPeerValue) -> (bool, bool, bool, u16, [u8; 32]) {
-            (
-                wg.enabled,
-                is_nonzero_key(&wg.public_key),
-                wg.port != 0,
-                wg.port,
-                wg.public_key,
-            )
-        }
-
         if values.is_empty() {
             return None;
         }
@@ -258,18 +276,7 @@ impl PeerValue {
                 };
             }
 
-            if let Some(candidate) = value.wireguard.as_ref() {
-                wireguard = match wireguard.as_ref() {
-                    None => Some(candidate.clone()),
-                    Some(current) => {
-                        if rank_wireguard(candidate) > rank_wireguard(current) {
-                            Some(candidate.clone())
-                        } else {
-                            Some(current.clone())
-                        }
-                    }
-                };
-            }
+            wireguard = WireGuardPeerValue::preferred(wireguard.as_ref(), value.wireguard.as_ref());
 
             scheduling = Some(match scheduling.as_ref() {
                 None => value.scheduling.clone(),
@@ -396,7 +403,7 @@ fn read_optional_node_id_capnp(
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerSchedulingState, PeerValue};
+    use super::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
     use uuid::Uuid;
 
     /// Legacy nodes without scheduling metadata should default to schedulable.
@@ -450,5 +457,27 @@ mod tests {
         assert_eq!(selected.scheduling.reason.as_deref(), Some("maintenance"));
         assert_eq!(selected.scheduling.drain_task_stop_timeout_secs, Some(15));
         assert_eq!(selected.address, "127.0.0.1:7000");
+    }
+
+    /// Enabled WireGuard advertisements should win over stale disabled placeholders.
+    #[test]
+    fn wireguard_preferred_keeps_enabled_state() {
+        let disabled = WireGuardPeerValue {
+            public_key: [1u8; 32],
+            port: 7777,
+            enabled: false,
+        };
+        let enabled = WireGuardPeerValue {
+            public_key: [1u8; 32],
+            port: 7777,
+            enabled: true,
+        };
+
+        let selected = WireGuardPeerValue::preferred(Some(&disabled), Some(&enabled))
+            .expect("preferred WireGuard value");
+
+        assert!(selected.enabled);
+        assert_eq!(selected.port, 7777);
+        assert_eq!(selected.public_key, [1u8; 32]);
     }
 }
