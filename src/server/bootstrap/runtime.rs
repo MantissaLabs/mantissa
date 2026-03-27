@@ -244,7 +244,6 @@ pub(crate) async fn boot(
     apply_runtime_overrides(&components, &options);
 
     let server = build_server(&ctx, &stores, &components);
-    finish_boot(&server, &components).await?;
     spawn_runtime_tasks(
         &components,
         actors,
@@ -254,6 +253,7 @@ pub(crate) async fn boot(
         options.gossip_fanout,
     )
     .await;
+    finish_boot(&server, &components).await?;
 
     Ok(BootedRuntime {
         stores,
