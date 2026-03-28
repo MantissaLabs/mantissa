@@ -5,6 +5,7 @@ use crate::token::TokenStore;
 use crate::topology::Topology;
 use ed25519_dalek::SigningKey;
 use net::noise::NoiseKeys;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -254,11 +255,38 @@ impl Server {
         self.liveness.ensure_online()
     }
 
+    /// Updates topology state after the TCP listener binds or rebinds.
+    ///
+    /// Headless TCP tests call this after startup and restart so the local peer
+    /// row keeps advertising the actual bound address instead of the original
+    /// placeholder configuration.
+    pub async fn refresh_bound_addr(&self, bound: SocketAddr) -> std::io::Result<()> {
+        self.topology.set_bound_addr(bound);
+        self.topology.refresh_local_peer_row().await
+    }
+
     /// Starts the secure TCP listener and optional Unix socket without blocking.
     ///
     /// The daemon and headless paths both use this as the single transport
     /// startup primitive, then choose whether to await the handles or not.
     pub async fn start_nonblocking(&self, enable_unix_socket: bool) -> std::io::Result<RunHandles> {
+        self.start_nonblocking_with_addr(
+            self.transport.config.listen_addr.clone(),
+            enable_unix_socket,
+        )
+        .await
+    }
+
+    /// Starts the secure TCP listener with an explicit listen address.
+    ///
+    /// Headless TCP tests use this on restart so they keep listening on the
+    /// already learned bound port instead of rebinding to a fresh `:0`
+    /// address and invalidating previously advertised peer addresses.
+    pub async fn start_nonblocking_with_addr(
+        &self,
+        listen_addr: String,
+        enable_unix_socket: bool,
+    ) -> std::io::Result<RunHandles> {
         let server_handle: protocol::server::server::Client = capnp_rpc::new_client(self.clone());
         let psk_provider: Arc<dyn net::noise::NoisePskProvider> =
             Arc::new(self.auth.join_tokens.clone());
@@ -266,7 +294,7 @@ impl Server {
 
         let (tcp_task, tcp_ready, bound) =
             net::tcp_secure::start_tcp_secure_listener_nonblocking_with_ready(
-                self.transport.config.listen_addr.clone(),
+                listen_addr,
                 server_handle,
                 self.transport.noise_keys.clone(),
                 psk_provider,

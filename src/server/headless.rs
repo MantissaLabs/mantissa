@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{io, net::TcpListener, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
+use std::{io, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
@@ -217,7 +217,7 @@ impl HeadlessNode {
 
                 // Use the actual bound socket addr in our transport (handles ephemeral ports)
                 let bound = h.addr();
-                comps.topology.set_bound_addr(bound);
+                server.refresh_bound_addr(bound).await?;
 
                 (
                     Some(h),
@@ -311,7 +311,7 @@ impl HeadlessNode {
         signing_key: ed25519_dalek::SigningKey,
         self_id: Uuid,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let addr = pick_loopback_ephemeral()?;
+        let addr = "127.0.0.1:0".to_string();
         Self::new_with(
             db,
             self_id,
@@ -352,7 +352,7 @@ impl HeadlessNode {
         self_id: Uuid,
         tick: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let addr = pick_loopback_ephemeral()?;
+        let addr = "127.0.0.1:0".to_string();
         Self::new_with(
             db,
             self_id,
@@ -599,7 +599,7 @@ impl HeadlessNode {
 
     /// Start (or restart) the listener.
     /// - Inproc: re-register in registry.
-    /// - TCP: start listener again; update bound addr (ephemeral port).
+    /// - TCP: start listener again on the previously learned bound address.
     pub async fn start(&mut self) -> io::Result<()> {
         match &mut self.transport {
             HeadlessTransport::Inproc => {
@@ -612,9 +612,14 @@ impl HeadlessNode {
             }
             HeadlessTransport::Tcp { addr } => {
                 let server = self.server.clone();
-                let mut h = server.start_nonblocking(false).await.map_err(to_io)?;
+                let mut h = server
+                    .start_nonblocking_with_addr(addr.clone(), false)
+                    .await
+                    .map_err(to_io)?;
                 h.wait_ready().await;
-                *addr = h.addr().to_string();
+                let bound = h.addr();
+                *addr = bound.to_string();
+                server.refresh_bound_addr(bound).await?;
                 self.handles = Some(h);
                 self.server.set_online(true);
                 Ok(())
@@ -648,13 +653,6 @@ impl Drop for HeadlessNode {
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
-}
-
-fn pick_loopback_ephemeral() -> io::Result<String> {
-    let l = TcpListener::bind(("127.0.0.1", 0))?;
-    let addr = l.local_addr()?;
-    drop(l);
-    Ok(addr.to_string())
 }
 
 /// Create an isolated temp dir with a redb DB and deterministic test keys.

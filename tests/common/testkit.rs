@@ -16,7 +16,6 @@ use protocol::health::NodeStatus;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -271,11 +270,6 @@ fn container_manager_for_next_node() -> Arc<dyn ContainerManager + Send + Sync> 
     }
 }
 
-fn pick_loopback_ephemeral_addr() -> std::io::Result<String> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.to_string())
-}
-
 pub struct ContainerManagerOverrideGuard;
 
 impl ContainerManagerOverrideGuard {
@@ -386,7 +380,7 @@ impl TestNode {
     }
 
     pub async fn try_new_tcp() -> Result<Self, Box<dyn std::error::Error>> {
-        let addr = pick_loopback_ephemeral_addr()?;
+        let addr = "127.0.0.1:0".to_string();
         let node =
             HeadlessNode::new_with_config(Self::apply_test_container_manager(HeadlessConfig {
                 listen_addr: addr.clone(),
@@ -415,7 +409,7 @@ impl TestNode {
     }
 
     pub async fn try_new_tcp_with_tick_ms(ms: u64) -> Result<Self, Box<dyn std::error::Error>> {
-        let addr = pick_loopback_ephemeral_addr()?;
+        let addr = "127.0.0.1:0".to_string();
         let node =
             HeadlessNode::new_with_config(Self::apply_test_container_manager(HeadlessConfig {
                 listen_addr: addr.clone(),

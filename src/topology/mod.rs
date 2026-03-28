@@ -610,6 +610,21 @@ impl Topology {
         self.networking.set_bound(sa);
     }
 
+    /// Rebuild and persist the local peer row after the runtime learns a more
+    /// accurate advertise address.
+    ///
+    /// Headless TCP tests bind on `127.0.0.1:0`, so the real port is unknown
+    /// until the listener comes up. Refreshing the self row here updates the
+    /// advertised address and any WireGuard port derived from it without
+    /// waiting for unrelated local state changes.
+    pub async fn refresh_local_peer_row(&self) -> io::Result<()> {
+        let value = self.build_local_peer_value()?;
+        self.peers
+            .upsert(&UuidKey::from(self.node.id), value)
+            .await
+            .map_err(|err| io::Error::other(format!("failed to refresh local peer row: {err}")))
+    }
+
     pub fn self_id(&self) -> Uuid {
         self.node.id
     }
@@ -623,39 +638,19 @@ impl Topology {
     pub async fn set_server_handle(&self, handle: server::Client) -> Result<(), server::Client> {
         let registry = self.registry.clone();
         let local_id = self.node.id;
-        let public_key = self.public_key;
-        let verifying_key = self.signing_key.verifying_key();
         let local_incarnation = self.swim_local_incarnation();
-        // Precompute the identity signature so the async task doesn't capture `self`.
-        let identity_sig = crate::node::identity::sign_peer_identity(
-            &self.signing_key,
-            &local_id,
-            &public_key.to_bytes(),
-            &verifying_key.to_bytes(),
-        );
 
         // Compute advertise address before registering. If this fails we abort so the node
         // does not appear joined without a reachable address.
-        let advertise = match self.compute_advertise_addr() {
-            Ok(addr) => addr,
+        let value = match self.build_local_peer_value() {
+            Ok(value) => value,
             Err(e) => {
                 log::error!(
-                    "topology: failed to compute advertise address during server handle setup: {e}"
+                    "topology: failed to build local peer row during server handle setup: {e}"
                 );
                 return Err(handle);
             }
         };
-        let preferred_wireguard_port = extract_port(&advertise).ok();
-
-        // Also ensure our own peer-entry exists in the store
-        let peers = self.peers.clone();
-        let host = self
-            .node
-            .system_info
-            .info
-            .hostname
-            .clone()
-            .unwrap_or_default();
 
         let first_set = self.server_handle.set(handle.clone()).is_ok();
         if !first_set {
@@ -664,7 +659,39 @@ impl Topology {
 
         registry.register_peer_handle(local_id, handle).await;
 
-        let key = UuidKey::from(local_id);
+        if let Err(e) = self.peers.upsert(&UuidKey::from(local_id), value).await {
+            log::warn!("failed to upsert self peer: {e}");
+        }
+
+        self.health_monitor.record_join(local_id, local_incarnation);
+
+        Ok(())
+    }
+
+    /// Build the local peer-store row from the node's current runtime state.
+    ///
+    /// This is used both during initial server-handle publication and later
+    /// when the listener learns its actual bound address.
+    fn build_local_peer_value(&self) -> io::Result<PeerValue> {
+        let advertise = self.compute_advertise_addr()?;
+        let preferred_wireguard_port = extract_port(&advertise).ok();
+        let host = self
+            .node
+            .system_info
+            .info
+            .hostname
+            .clone()
+            .unwrap_or_default();
+        let public_key = self.public_key.to_bytes();
+        let verifying_key = self.signing_key.verifying_key();
+        let signing_pub = verifying_key.to_bytes();
+        let identity_sig = crate::node::identity::sign_peer_identity(
+            &self.signing_key,
+            &self.node.id,
+            &public_key,
+            &signing_pub,
+        );
+
         let wireguard = if !config::wireguard_enabled() || !net::paths::running_as_root() {
             None
         } else {
@@ -679,7 +706,11 @@ impl Topology {
                         Ok(port) => Some(crate::topology::peers::WireGuardPeerValue {
                             public_key: keys.public_bytes(),
                             port,
-                            enabled: false,
+                            enabled: self
+                                .registry
+                                .peer_wireguard(self.node.id)
+                                .map(|wg| wg.enabled)
+                                .unwrap_or(false),
                         }),
                         Err(err) => {
                             log::warn!(
@@ -698,27 +729,15 @@ impl Topology {
             }
         };
 
-        let scheduling = registry
-            .peer_scheduling(local_id)
-            .unwrap_or_else(|| PeerSchedulingState::schedulable_default(local_id));
-
-        let v = PeerValue {
+        Ok(PeerValue {
             address: advertise,
             hostname: host,
-            noise_static_pub: public_key.to_bytes(),
-            signing_pub: verifying_key.to_bytes(),
+            noise_static_pub: public_key,
+            signing_pub,
             identity_sig: identity_sig.to_vec(),
             wireguard,
-            scheduling,
-        };
-
-        if let Err(e) = peers.upsert(&key, v).await {
-            log::warn!("failed to upsert self peer: {e}");
-        }
-
-        self.health_monitor.record_join(local_id, local_incarnation);
-
-        Ok(())
+            scheduling: self.current_scheduling_state(),
+        })
     }
 
     /// Computes what we publish in NodeInfo.addr / PeerValue.address.
