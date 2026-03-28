@@ -145,9 +145,9 @@ Filter the report for transport and Cap'n Proto symbols:
 
 ```bash
 perf report --stdio --sort symbol -i perf.data | \
-  grep -e 'net::noise::NoiseWriteHalf::poll_drain_pending_wire' \
-       -e 'net::noise::NoiseWriteHalf::prepare_pending_frame_from_staged' \
-       -e 'net::noise::poll_fill_reader' \
+  grep -e 'net::noise::transport::NoiseWriteHalf::poll_drain_pending_wire' \
+       -e 'net::noise::transport::NoiseWriteHalf::prepare_pending_frame_from_staged' \
+       -e 'net::noise::transport::poll_fill_reader' \
        -e 'capnp_futures::write_queue::write_queue::{{closure}}' \
        -e 'capnp_futures::serialize::read_segment_table::{{closure}}' \
        -e 'capnp_futures::serialize::try_read_message::{{closure}}' \
