@@ -67,7 +67,7 @@ fn parse_log_tail(raw: &str) -> Result<String, String> {
     name = "mantissa",
     version = "0.0.1",
     author = "Mantissa Labs",
-    about = "Decentralized job orchestration and cluster management",
+    about = "Distributed job orchestration and cluster management",
     subcommand_required = true,
     arg_required_else_help = true
 )]
@@ -108,7 +108,7 @@ pub enum Command {
     /// Link a node to an existing cluster
     Link(LinkArgs),
 
-    /// Leave a node to an existing cluster
+    /// Leave an existing cluster
     Leave(LeaveArgs),
 
     /// Nodes subcommands

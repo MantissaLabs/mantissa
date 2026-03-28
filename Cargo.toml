@@ -3,7 +3,7 @@ name = "mantissa"
 version = "0.1.0"
 authors = ["Alexandre Beslic"]
 license = "Apache-2.0"
-description = "Decentralized cluster management"
+description = "Distributed scheduler and cluster management"
 homepage = "https://mantissa.io"
 repository = "https://github.com/abronan/mantissa"
 readme = "README.md"
@@ -60,6 +60,8 @@ uuid = { version = "1", features = ["v4", "v7", "fast-rng", "serde"] }
 futures = "0.3.31"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+snow = { version = "0.9.6", default-features = false, features = ["ring-accelerated"] }
+chacha20poly1305 = "0.10.1"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 ed25519-dalek = { version = "2", default-features = false, features = [
     "alloc",
@@ -69,9 +71,6 @@ getrandom = "0.2"
 # Container / MicroVMs / Task management
 bollard = "0.20.2"
 
-# boringtun is used for inter-cluster communication via wireguard.
-snow = { version = "0.9.6", default-features = false, features = ["ring-accelerated"] }
-
 # used to fetch cpu system level information.
 raw-cpuid = "11.5.0"
 
@@ -80,8 +79,10 @@ redb = "3.1.1"
 
 # crdt based structures useful for state replication and conflict resolution.
 merkle-search-tree = "0.8.0"
-# melda = "0.2.3"
 crdts = "7.3.2"
+
+# used for fully deterministic hashing across platforms and compiler versions (XXHash).
+twox-hash = "2.1.1"
 
 # Serialization / Parsing / Configuration
 ron = "0.10.1"
@@ -113,11 +114,8 @@ tracing-subscriber = { version = "0.3.18", features = [
 time = { version = "0.3", features = ["local-offset", "macros"] }
 log = "0.4"
 
-# used for fully deterministic hashing across platforms and compiler versions (XXHash).
-twox-hash = "2.1.1"
 once_cell = "1.21.3"
 base64 = "0.22.1"
-chacha20poly1305 = "0.10.1"
 hkdf = "0.12.4"
 sha2 = "0.10.9"
 tempfile = "3"
@@ -129,7 +127,7 @@ tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
 tempfile = "3"
 anyhow = "1"
 
-# eBPF / Networking
+# eBPF / Networking / Linux only dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = "0.13.1"
 rtnetlink = { version = "0.18.1", default-features = false, features = ["tokio_socket"] }
