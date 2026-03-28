@@ -1,12 +1,13 @@
 use net::noise::{NoiseKeys, client_handshake_join, derive_psk_from_token, server_handshake_join};
 use std::cmp::min;
+use std::env;
 use std::io;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-const WARMUP_RUNS: usize = 1;
-const MEASURE_RUNS: usize = 5;
+const DEFAULT_WARMUP_RUNS: usize = 1;
+const DEFAULT_MEASURE_RUNS: usize = 5;
 
 /// One benchmark scenario for the Noise transport hot path.
 struct Scenario {
@@ -52,6 +53,17 @@ fn main() -> io::Result<()> {
 
 /// Run every benchmark scenario and print compact per-scenario summaries.
 async fn run() -> io::Result<()> {
+    let warmup_runs = env_usize("NOISE_BENCH_WARMUP_RUNS", DEFAULT_WARMUP_RUNS)?;
+    let measure_runs = env_usize("NOISE_BENCH_MEASURE_RUNS", DEFAULT_MEASURE_RUNS)?;
+    if measure_runs == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NOISE_BENCH_MEASURE_RUNS must be at least 1",
+        ));
+    }
+    let scenario_filter = env::var("NOISE_BENCH_SCENARIO")
+        .ok()
+        .filter(|value| !value.is_empty());
     let scenarios = [
         Scenario {
             name: "bulk_64m_16k_chunks",
@@ -78,24 +90,54 @@ async fn run() -> io::Result<()> {
     ];
 
     println!("noise transport benchmark");
-    println!("warmup_runs={} measure_runs={}", WARMUP_RUNS, MEASURE_RUNS);
+    println!("warmup_runs={} measure_runs={}", warmup_runs, measure_runs);
+    if let Some(filter) = scenario_filter.as_deref() {
+        println!("scenario_filter={filter}");
+    }
 
     for scenario in scenarios {
-        let result = benchmark_scenario(&scenario).await?;
+        if scenario_filter
+            .as_deref()
+            .is_some_and(|filter| scenario.name != filter)
+        {
+            continue;
+        }
+        let result = benchmark_scenario(&scenario, warmup_runs, measure_runs).await?;
         print_result(&result);
     }
 
     Ok(())
 }
 
+/// Parse one optional numeric environment variable with a fallback default.
+fn env_usize(var: &str, default: usize) -> io::Result<usize> {
+    match env::var(var) {
+        Ok(value) => value.parse::<usize>().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid {var} value {value:?}: {err}"),
+            )
+        }),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(err) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("failed to read {var}: {err}"),
+        )),
+    }
+}
+
 /// Benchmark one scenario repeatedly and retain only the measured runs.
-async fn benchmark_scenario(scenario: &Scenario) -> io::Result<ScenarioResult> {
-    let total_runs = WARMUP_RUNS + MEASURE_RUNS;
-    let mut durations = Vec::with_capacity(MEASURE_RUNS);
+async fn benchmark_scenario(
+    scenario: &Scenario,
+    warmup_runs: usize,
+    measure_runs: usize,
+) -> io::Result<ScenarioResult> {
+    let total_runs = warmup_runs + measure_runs;
+    let mut durations = Vec::with_capacity(measure_runs);
 
     for run_idx in 0..total_runs {
         let duration = run_scenario(&scenario.kind).await?;
-        if run_idx >= WARMUP_RUNS {
+        if run_idx >= warmup_runs {
             durations.push(duration);
         }
     }
