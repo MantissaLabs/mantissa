@@ -30,6 +30,7 @@ use mantissa::task::docker::{
 use mantissa::task::manager::{TaskManager, TaskManagerConfig, TaskStartRequest};
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use mantissa::volumes::VolumeRegistry;
+use mantissa::workload::types::TaskExecutionSpec;
 use net::noise::NoiseKeys;
 use protocol::secrets::secrets;
 use std::collections::HashMap;
@@ -405,37 +406,39 @@ local_test!(task_manager_stages_secret_env_and_files, {
 
     let request = TaskStartRequest {
         name: "with-secrets".into(),
-        image: "busybox:latest".into(),
-        command: vec!["/bin/true".into()],
-        tty: false,
-        cpu_millis: 200,
-        memory_bytes: 64 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            image: "busybox:latest".into(),
+            command: vec!["/bin/true".into()],
+            tty: false,
+            cpu_millis: 200,
+            memory_bytes: 64 * 1_024 * 1_024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: vec![TaskEnvironmentVariable {
+                name: "DB_PASSWORD".into(),
+                value: None,
+                secret: Some(TaskSecretReference {
+                    name: secret_name.to_string(),
+                    version_id: None,
+                }),
+            }],
+            secret_files: vec![TaskSecretFile {
+                path: "/run/secrets/db-password".into(),
+                secret: TaskSecretReference {
+                    name: secret_name.to_string(),
+                    version_id: None,
+                },
+                mode: Some(0o440),
+            }],
+            volumes: Vec::new(),
+            networks: Vec::new(),
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: vec![TaskEnvironmentVariable {
-            name: "DB_PASSWORD".into(),
-            value: None,
-            secret: Some(TaskSecretReference {
-                name: secret_name.to_string(),
-                version_id: None,
-            }),
-        }],
-        secret_files: vec![TaskSecretFile {
-            path: "/run/secrets/db-password".into(),
-            secret: TaskSecretReference {
-                name: secret_name.to_string(),
-                version_id: None,
-            },
-            mode: Some(0o440),
-        }],
-        volumes: Vec::new(),
-        networks: Vec::new(),
         service_metadata: None,
         target_node: None,
     };
@@ -548,30 +551,32 @@ local_test!(task_manager_rejects_missing_secret_reference, {
 
     let request = TaskStartRequest {
         name: "missing-secret".into(),
-        image: "busybox:latest".into(),
-        command: vec!["/bin/false".into()],
-        tty: false,
-        cpu_millis: 100,
-        memory_bytes: 32 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            image: "busybox:latest".into(),
+            command: vec!["/bin/false".into()],
+            tty: false,
+            cpu_millis: 100,
+            memory_bytes: 32 * 1_024 * 1_024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: vec![TaskEnvironmentVariable {
+                name: "API_KEY".into(),
+                value: None,
+                secret: Some(TaskSecretReference {
+                    name: "api-key".into(),
+                    version_id: None,
+                }),
+            }],
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: vec![TaskEnvironmentVariable {
-            name: "API_KEY".into(),
-            value: None,
-            secret: Some(TaskSecretReference {
-                name: "api-key".into(),
-                version_id: None,
-            }),
-        }],
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: Vec::new(),
         service_metadata: None,
         target_node: None,
     };

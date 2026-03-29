@@ -176,6 +176,7 @@ fn status_rank(status: ServiceStatus) -> u8 {
 mod tests {
     use super::*;
     use crate::services::types::ServiceTaskSpecValue;
+    use crate::workload::types::WorkloadExecutionSpec;
     use chrono::{Duration as ChronoDuration, Utc};
     use uuid::Uuid;
 
@@ -188,23 +189,25 @@ mod tests {
     ) -> ServiceSpecValue {
         let tasks = vec![ServiceTaskSpecValue {
             name: "api".into(),
-            image: "ghcr.io/demo/api:latest".into(),
-            command: Vec::new(),
-            tty: false,
+            execution: WorkloadExecutionSpec {
+                image: "ghcr.io/demo/api:latest".into(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 0,
+                memory_bytes: 0,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+            },
             depends_on: Vec::new(),
             replicas: 1,
-            cpu_millis: 0,
-            memory_bytes: 0,
-            gpu_count: 0,
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: Vec::new(),
             readiness: None,
-            liveness: None,
             public_port: None,
             public_protocol: None,
         }];

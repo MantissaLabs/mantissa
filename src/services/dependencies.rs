@@ -118,28 +118,31 @@ pub(super) fn build_template_dependency_stages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workload::types::WorkloadExecutionSpec;
 
     /// Builds a minimal service template value for dependency graph tests.
     fn template(name: &str, depends_on: &[&str]) -> ServiceTaskSpecValue {
         ServiceTaskSpecValue {
             name: name.to_string(),
-            image: "ghcr.io/demo/image:latest".to_string(),
-            command: Vec::new(),
-            tty: false,
+            execution: WorkloadExecutionSpec {
+                image: "ghcr.io/demo/image:latest".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 0,
+                memory_bytes: 0,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+            },
             depends_on: depends_on.iter().map(|entry| entry.to_string()).collect(),
             replicas: 1,
-            cpu_millis: 0,
-            memory_bytes: 0,
-            gpu_count: 0,
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: Vec::new(),
             readiness: None,
-            liveness: None,
             public_port: None,
             public_protocol: None,
         }

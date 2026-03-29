@@ -7,19 +7,15 @@ use crate::services::reconcile::{
 };
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServiceEvent, ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePreviousGeneration,
-    ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
-    ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind, ServiceTaskSpecValue,
+    ServiceEvent, ServicePreviousGeneration, ServiceRolloutOrder, ServiceRolloutPhase,
+    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceTaskSpecValue,
     ServiceUpdateStrategy, compute_service_id,
 };
 use crate::task::container::ContainerState;
 use crate::task::manager::{
     TaskManager, TaskStartRequest, TaskTrafficPublicationUpdate, task_start_error_is_retryable,
 };
-use crate::task::types::{
-    TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicy, TaskRestartPolicyKind,
-    TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskVolumeMount,
-};
+use crate::task::types::{TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskVolumeMount};
 use crate::volumes::types::VolumeDriver;
 use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
 use anyhow::anyhow;
@@ -2402,23 +2398,12 @@ fn make_replica_request(
     let name = format_replica_name(service_name, &template.name, replica, desired_id);
     TaskStartRequest {
         name,
-        image: template.image.clone(),
-        command: template.command.clone(),
-        tty: template.tty,
-        cpu_millis: template.cpu_millis,
-        memory_bytes: template.memory_bytes,
-        gpu_count: template.gpu_count,
+        execution: template
+            .execution
+            .map_networks(|network| network.network_id),
         gpu_device_ids: Vec::new(),
         id: Some(desired_id),
         slot_ids: Vec::new(),
-        restart_policy: template.restart_policy.as_ref().map(map_restart_policy),
-        termination_grace_period_secs: template.termination_grace_period_secs,
-        pre_stop_command: template.pre_stop_command.clone(),
-        liveness: template.liveness.as_ref().map(map_liveness_probe),
-        env: template.env.clone(),
-        secret_files: template.secret_files.clone(),
-        volumes: template.volumes.clone(),
-        networks: template.required_network_ids(),
         service_metadata: Some(TaskServiceMetadata::new(service_name, &template.name)),
         target_node,
     }
@@ -2458,39 +2443,6 @@ where
     }
 
     nodes.into_iter().collect()
-}
-
-/// Converts the service restart policy representation into a task manager policy structure.
-fn map_restart_policy(policy: &ServiceTaskRestartPolicy) -> TaskRestartPolicy {
-    let name = match policy.name {
-        ServiceTaskRestartPolicyKind::No => TaskRestartPolicyKind::No,
-        ServiceTaskRestartPolicyKind::Always => TaskRestartPolicyKind::Always,
-        ServiceTaskRestartPolicyKind::OnFailure => TaskRestartPolicyKind::OnFailure,
-        ServiceTaskRestartPolicyKind::UnlessStopped => TaskRestartPolicyKind::UnlessStopped,
-    };
-
-    TaskRestartPolicy {
-        name,
-        max_retry_count: policy.max_retry_count,
-    }
-}
-
-/// Converts the service liveness probe into the runtime-owned task liveness shape.
-fn map_liveness_probe(probe: &ServiceLivenessProbe) -> TaskLivenessProbe {
-    TaskLivenessProbe {
-        kind: match probe.kind {
-            ServiceLivenessProbeKind::Exec => TaskLivenessProbeKind::Exec,
-            ServiceLivenessProbeKind::Http => TaskLivenessProbeKind::Http,
-            ServiceLivenessProbeKind::Tcp => TaskLivenessProbeKind::Tcp,
-        },
-        command: probe.command.clone(),
-        port: probe.port,
-        path: probe.path.clone(),
-        interval_ms: probe.interval_ms,
-        timeout_ms: probe.timeout_ms,
-        failure_threshold: probe.failure_threshold,
-        start_period_ms: probe.start_period_ms,
-    }
 }
 
 fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
@@ -2551,12 +2503,14 @@ fn should_stop_tasks(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecV
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::types::ServiceTaskNetworkRequirement;
     use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
     use crate::task::types::TaskServiceMetadata;
     use crate::volumes::types::{
         LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
         VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
     };
+    use crate::workload::types::{TaskExecutionSpec, WorkloadExecutionSpec};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2609,6 +2563,48 @@ mod tests {
         })
     }
 
+    /// Builds one default direct-task execution spec for test request setup.
+    fn empty_task_execution(image: &str) -> TaskExecutionSpec {
+        TaskExecutionSpec {
+            image: image.to_string(),
+            command: Vec::new(),
+            tty: false,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+        }
+    }
+
+    /// Builds one default service execution spec so test templates only override meaningful fields.
+    fn empty_service_execution(
+        image: &str,
+    ) -> WorkloadExecutionSpec<ServiceTaskNetworkRequirement> {
+        WorkloadExecutionSpec {
+            image: image.to_string(),
+            command: Vec::new(),
+            tty: false,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+        }
+    }
+
     /// Builds one minimal task start request that mounts exactly one volume.
     fn make_volume_request(
         volume_id: Uuid,
@@ -2617,28 +2613,18 @@ mod tests {
     ) -> TaskStartRequest {
         TaskStartRequest {
             name: "demo-task".to_string(),
-            image: "ghcr.io/demo/app:latest".to_string(),
-            command: Vec::new(),
-            tty: false,
-            cpu_millis: 0,
-            memory_bytes: 0,
-            gpu_count: 0,
+            execution: TaskExecutionSpec {
+                volumes: vec![TaskVolumeMount {
+                    volume_id,
+                    volume_name: volume_name.to_string(),
+                    target: "/var/lib/app".to_string(),
+                    read_only: false,
+                }],
+                ..empty_task_execution("ghcr.io/demo/app:latest")
+            },
             gpu_device_ids: Vec::new(),
             id: Some(Uuid::new_v4()),
             slot_ids: Vec::new(),
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            liveness: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: vec![TaskVolumeMount {
-                volume_id,
-                volume_name: volume_name.to_string(),
-                target: "/var/lib/app".to_string(),
-                read_only: false,
-            }],
-            networks: Vec::new(),
             service_metadata: None,
             target_node,
         }
@@ -2648,23 +2634,10 @@ mod tests {
     fn make_request(target_node: Option<Uuid>) -> TaskStartRequest {
         TaskStartRequest {
             name: "demo-task".to_string(),
-            image: "ghcr.io/demo/app:latest".to_string(),
-            command: Vec::new(),
-            tty: false,
-            cpu_millis: 0,
-            memory_bytes: 0,
-            gpu_count: 0,
+            execution: empty_task_execution("ghcr.io/demo/app:latest"),
             gpu_device_ids: Vec::new(),
             id: Some(Uuid::new_v4()),
             slot_ids: Vec::new(),
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            liveness: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: Vec::new(),
             service_metadata: None,
             target_node,
         }
@@ -2722,23 +2695,14 @@ mod tests {
         let desired_id = Uuid::new_v4();
         let template = ServiceTaskSpecValue {
             name: "api".into(),
-            image: "ghcr.io/demo/api:latest".into(),
-            command: Vec::new(),
-            tty: false,
+            execution: WorkloadExecutionSpec {
+                termination_grace_period_secs: Some(42),
+                pre_stop_command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()]),
+                ..empty_service_execution("ghcr.io/demo/api:latest")
+            },
             depends_on: Vec::new(),
             replicas: 1,
-            cpu_millis: 0,
-            memory_bytes: 0,
-            gpu_count: 0,
-            restart_policy: None,
-            termination_grace_period_secs: Some(42),
-            pre_stop_command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()]),
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: Vec::new(),
             readiness: None,
-            liveness: None,
             public_port: None,
             public_protocol: None,
         };
@@ -2763,45 +2727,19 @@ mod tests {
             vec![
                 ServiceTaskSpecValue {
                     name: "api".into(),
-                    image: "ghcr.io/demo/api:latest".into(),
-                    command: Vec::new(),
-                    tty: false,
+                    execution: empty_service_execution("ghcr.io/demo/api:latest"),
                     depends_on: Vec::new(),
                     replicas: 2,
-                    cpu_millis: 0,
-                    memory_bytes: 0,
-                    gpu_count: 0,
-                    restart_policy: None,
-                    termination_grace_period_secs: None,
-                    pre_stop_command: None,
-                    env: Vec::new(),
-                    secret_files: Vec::new(),
-                    volumes: Vec::new(),
-                    networks: Vec::new(),
                     readiness: None,
-                    liveness: None,
                     public_port: None,
                     public_protocol: None,
                 },
                 ServiceTaskSpecValue {
                     name: "web".into(),
-                    image: "ghcr.io/demo/web:latest".into(),
-                    command: Vec::new(),
-                    tty: false,
+                    execution: empty_service_execution("ghcr.io/demo/web:latest"),
                     depends_on: Vec::new(),
                     replicas: 1,
-                    cpu_millis: 0,
-                    memory_bytes: 0,
-                    gpu_count: 0,
-                    restart_policy: None,
-                    termination_grace_period_secs: None,
-                    pre_stop_command: None,
-                    env: Vec::new(),
-                    secret_files: Vec::new(),
-                    volumes: Vec::new(),
-                    networks: Vec::new(),
                     readiness: None,
-                    liveness: None,
                     public_port: None,
                     public_protocol: None,
                 },
@@ -2880,45 +2818,19 @@ mod tests {
         let templates = vec![
             ServiceTaskSpecValue {
                 name: "backend".into(),
-                image: "ghcr.io/demo/backend:latest".into(),
-                command: Vec::new(),
-                tty: false,
+                execution: empty_service_execution("ghcr.io/demo/backend:latest"),
                 depends_on: Vec::new(),
                 replicas: 2,
-                cpu_millis: 0,
-                memory_bytes: 0,
-                gpu_count: 0,
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 readiness: None,
-                liveness: None,
                 public_port: None,
                 public_protocol: None,
             },
             ServiceTaskSpecValue {
                 name: "curl".into(),
-                image: "curlimages/curl:latest".into(),
-                command: Vec::new(),
-                tty: false,
+                execution: empty_service_execution("curlimages/curl:latest"),
                 depends_on: Vec::new(),
                 replicas: 1,
-                cpu_millis: 0,
-                memory_bytes: 0,
-                gpu_count: 0,
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 readiness: None,
-                liveness: None,
                 public_port: None,
                 public_protocol: None,
             },
@@ -2942,45 +2854,19 @@ mod tests {
         let templates = vec![
             ServiceTaskSpecValue {
                 name: "backend".into(),
-                image: "ghcr.io/demo/backend:latest".into(),
-                command: Vec::new(),
-                tty: false,
+                execution: empty_service_execution("ghcr.io/demo/backend:latest"),
                 depends_on: Vec::new(),
                 replicas: 2,
-                cpu_millis: 0,
-                memory_bytes: 0,
-                gpu_count: 0,
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 readiness: None,
-                liveness: None,
                 public_port: None,
                 public_protocol: None,
             },
             ServiceTaskSpecValue {
                 name: "curl".into(),
-                image: "curlimages/curl:latest".into(),
-                command: Vec::new(),
-                tty: false,
+                execution: empty_service_execution("curlimages/curl:latest"),
                 depends_on: Vec::new(),
                 replicas: 1,
-                cpu_millis: 0,
-                memory_bytes: 0,
-                gpu_count: 0,
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 readiness: None,
-                liveness: None,
                 public_port: None,
                 public_protocol: None,
             },
@@ -3049,23 +2935,10 @@ mod tests {
         let manifest_id = Uuid::new_v4();
         let tasks = vec![ServiceTaskSpecValue {
             name: "api".into(),
-            image: "ghcr.io/demo/api:latest".into(),
-            command: Vec::new(),
-            tty: false,
+            execution: empty_service_execution("ghcr.io/demo/api:latest"),
             depends_on: Vec::new(),
             replicas: 1,
-            cpu_millis: 0,
-            memory_bytes: 0,
-            gpu_count: 0,
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: Vec::new(),
             readiness: None,
-            liveness: None,
             public_port: None,
             public_protocol: None,
         }];
@@ -3100,23 +2973,10 @@ mod tests {
     ) -> ServiceSpecValue {
         let tasks = vec![ServiceTaskSpecValue {
             name: "api".into(),
-            image: "ghcr.io/demo/api:latest".into(),
-            command: Vec::new(),
-            tty: false,
+            execution: empty_service_execution("ghcr.io/demo/api:latest"),
             depends_on: Vec::new(),
             replicas: 1,
-            cpu_millis: 0,
-            memory_bytes: 0,
-            gpu_count: 0,
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: Vec::new(),
             readiness: None,
-            liveness: None,
             public_port: None,
             public_protocol: None,
         }];
@@ -3518,23 +3378,10 @@ mod tests {
         let manifest_id = Uuid::new_v4();
         let tasks = vec![ServiceTaskSpecValue {
             name: "api".into(),
-            image: "ghcr.io/demo/api:latest".into(),
-            command: Vec::new(),
-            tty: false,
+            execution: empty_service_execution("ghcr.io/demo/api:latest"),
             depends_on: Vec::new(),
             replicas: 3,
-            cpu_millis: 0,
-            memory_bytes: 0,
-            gpu_count: 0,
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: Vec::new(),
             readiness: None,
-            liveness: None,
             public_port: None,
             public_protocol: None,
         }];
@@ -3571,23 +3418,10 @@ mod tests {
         let manifest_id = Uuid::new_v4();
         let tasks = vec![ServiceTaskSpecValue {
             name: "api".into(),
-            image: "ghcr.io/demo/api:latest".into(),
-            command: Vec::new(),
-            tty: false,
+            execution: empty_service_execution("ghcr.io/demo/api:latest"),
             depends_on: Vec::new(),
             replicas: 1,
-            cpu_millis: 0,
-            memory_bytes: 0,
-            gpu_count: 0,
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: Vec::new(),
             readiness: None,
-            liveness: None,
             public_port: None,
             public_protocol: None,
         }];

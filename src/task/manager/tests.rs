@@ -37,6 +37,7 @@ use crate::volumes::types::{
     LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
     VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
 };
+use crate::workload::types::TaskExecutionSpec;
 use ::health::HealthMonitor;
 use anyhow::{Result, anyhow};
 use async_channel::bounded;
@@ -1016,32 +1017,42 @@ fn test_task_spec(manager: &TaskManager, name: &str) -> TaskSpec {
     }
 }
 
-/// Builds one standalone task request that mounts a single resolved volume reference.
-fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> TaskStartRequest {
-    TaskStartRequest {
-        name: "volume-task".into(),
-        image: "img".into(),
+/// Builds one default execution spec so task-request tests only override relevant fields.
+fn empty_task_execution(image: &str) -> TaskExecutionSpec {
+    TaskExecutionSpec {
+        image: image.to_string(),
         command: Vec::new(),
         tty: false,
         cpu_millis: 200,
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
-        gpu_device_ids: Vec::new(),
-        id: None,
-        slot_ids: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
         liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
-        volumes: vec![crate::task::types::TaskVolumeMount {
-            volume_id: volume.id,
-            volume_name: volume.name.clone(),
-            target: target.to_string(),
-            read_only: false,
-        }],
+        volumes: Vec::new(),
         networks: Vec::new(),
+    }
+}
+
+/// Builds one standalone task request that mounts a single resolved volume reference.
+fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> TaskStartRequest {
+    TaskStartRequest {
+        name: "volume-task".into(),
+        execution: TaskExecutionSpec {
+            volumes: vec![crate::task::types::TaskVolumeMount {
+                volume_id: volume.id,
+                volume_name: volume.name.clone(),
+                target: target.to_string(),
+                read_only: false,
+            }],
+            ..empty_task_execution("img")
+        },
+        gpu_device_ids: Vec::new(),
+        id: None,
+        slot_ids: Vec::new(),
         service_metadata: None,
         target_node: None,
     }
@@ -2165,23 +2176,13 @@ async fn reconcile_local_tasks_does_not_duplicate_batch_launch_in_progress() {
 
     let request = TaskStartRequest {
         name: "launch-race".into(),
-        image: "img".into(),
-        command: Vec::new(),
-        tty: false,
-        cpu_millis: 200,
-        memory_bytes: 64 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            networks: vec![spec.id],
+            ..empty_task_execution("img")
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
     };
@@ -4026,45 +4027,19 @@ async fn start_tasks_batch_reserves_every_slot() {
         .start_tasks_batch(vec![
             TaskStartRequest {
                 name: "svc-a".into(),
-                image: "img".into(),
-                command: vec![],
-                tty: false,
-                cpu_millis: 200,
-                memory_bytes: 64 * 1_024 * 1_024,
-                gpu_count: 0,
+                execution: empty_task_execution("img"),
                 gpu_device_ids: Vec::new(),
                 id: None,
                 slot_ids: Vec::new(),
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                liveness: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 service_metadata: None,
                 target_node: None,
             },
             TaskStartRequest {
                 name: "svc-b".into(),
-                image: "img".into(),
-                command: vec![],
-                tty: false,
-                cpu_millis: 200,
-                memory_bytes: 64 * 1_024 * 1_024,
-                gpu_count: 0,
+                execution: empty_task_execution("img"),
                 gpu_device_ids: Vec::new(),
                 id: None,
                 slot_ids: Vec::new(),
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                liveness: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 service_metadata: None,
                 target_node: None,
             },
@@ -4105,23 +4080,10 @@ async fn start_tasks_batch_respects_existing_reservations() {
     let specs = manager
         .start_tasks_batch(vec![TaskStartRequest {
             name: "svc-a".into(),
-            image: "img".into(),
-            command: vec![],
-            tty: false,
-            cpu_millis: 200,
-            memory_bytes: 64 * 1_024 * 1_024,
-            gpu_count: 0,
+            execution: empty_task_execution("img"),
             gpu_device_ids: Vec::new(),
             id: Some(task_id),
             slot_ids: vec![slot_spec.slot_id],
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            liveness: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: Vec::new(),
             service_metadata: None,
             target_node: None,
         }])
@@ -4659,45 +4621,19 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
         .start_tasks_batch(vec![
             TaskStartRequest {
                 name: "svc-c".into(),
-                image: "img".into(),
-                command: vec![],
-                tty: false,
-                cpu_millis: 200,
-                memory_bytes: 64 * 1_024 * 1_024,
-                gpu_count: 0,
+                execution: empty_task_execution("img"),
                 gpu_device_ids: Vec::new(),
                 id: None,
                 slot_ids: Vec::new(),
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                liveness: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 service_metadata: None,
                 target_node: None,
             },
             TaskStartRequest {
                 name: "svc-d".into(),
-                image: "img".into(),
-                command: vec![],
-                tty: false,
-                cpu_millis: 200,
-                memory_bytes: 64 * 1_024 * 1_024,
-                gpu_count: 0,
+                execution: empty_task_execution("img"),
                 gpu_device_ids: Vec::new(),
                 id: None,
                 slot_ids: Vec::new(),
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                liveness: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 service_metadata: None,
                 target_node: None,
             },
@@ -4763,23 +4699,13 @@ async fn runtime_attachments_created_and_removed_on_stop() {
 
     let request = TaskStartRequest {
         name: "with-net".into(),
-        image: "img".into(),
-        command: Vec::new(),
-        tty: false,
-        cpu_millis: 200,
-        memory_bytes: 64 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            networks: vec![spec.id],
+            ..empty_task_execution("img")
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
     };
@@ -4862,23 +4788,13 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
 
     let request = TaskStartRequest {
         name: "service-backend".into(),
-        image: "img".into(),
-        command: Vec::new(),
-        tty: false,
-        cpu_millis: 200,
-        memory_bytes: 64 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            networks: vec![spec.id],
+            ..empty_task_execution("img")
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: vec![spec.id],
         service_metadata: Some(TaskServiceMetadata::new("svc", "backend")),
         target_node: None,
     };
@@ -5118,23 +5034,13 @@ async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
 
     let request = TaskStartRequest {
         name: "standalone-net".into(),
-        image: "img".into(),
-        command: Vec::new(),
-        tty: false,
-        cpu_millis: 200,
-        memory_bytes: 64 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            networks: vec![spec.id],
+            ..empty_task_execution("img")
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
     };
@@ -5232,23 +5138,13 @@ async fn request_task_stop_cleans_up_after_teardown_failure() {
 
     let request = TaskStartRequest {
         name: "flaky-task".into(),
-        image: "img".into(),
-        command: Vec::new(),
-        tty: false,
-        cpu_millis: 200,
-        memory_bytes: 64 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            networks: vec![spec.id],
+            ..empty_task_execution("img")
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
     };
@@ -6220,23 +6116,13 @@ async fn attachment_ready_triggers_forwarding_event() {
 
     let request = TaskStartRequest {
         name: "with-forwarding".into(),
-        image: "img".into(),
-        command: Vec::new(),
-        tty: false,
-        cpu_millis: 200,
-        memory_bytes: 64 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            networks: vec![spec.id],
+            ..empty_task_execution("img")
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
     };
@@ -6322,23 +6208,13 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
 
     let request = TaskStartRequest {
         name: "two-nets".into(),
-        image: "img".into(),
-        command: Vec::new(),
-        tty: false,
-        cpu_millis: 200,
-        memory_bytes: 64 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            networks: vec![spec_a.id, spec_b.id],
+            ..empty_task_execution("img")
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: vec![spec_a.id, spec_b.id],
         service_metadata: None,
         target_node: None,
     };
@@ -6421,23 +6297,13 @@ async fn runtime_attachments_retry_transient_provision_errors() {
 
     let request = TaskStartRequest {
         name: "retry-net-task".into(),
-        image: "img".into(),
-        command: Vec::new(),
-        tty: false,
-        cpu_millis: 200,
-        memory_bytes: 64 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            networks: vec![spec.id],
+            ..empty_task_execution("img")
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
     };
@@ -6524,23 +6390,13 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
 
     let request = TaskStartRequest {
         name: "real-net-task".into(),
-        image: "img".into(),
-        command: Vec::new(),
-        tty: false,
-        cpu_millis: 200,
-        memory_bytes: 64 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            networks: vec![spec.id],
+            ..empty_task_execution("img")
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: vec![spec.id],
         service_metadata: None,
         target_node: None,
     };
@@ -6641,23 +6497,14 @@ async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
     let request = TaskStartRequest {
         name: "network-blocked".into(),
-        image: "img".into(),
-        command: Vec::new(),
-        tty: false,
-        cpu_millis: 100,
-        memory_bytes: 64 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            cpu_millis: 100,
+            networks: vec![Uuid::new_v4()],
+            ..empty_task_execution("img")
+        },
         gpu_device_ids: Vec::new(),
         id: Some(Uuid::new_v4()),
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: vec![Uuid::new_v4()],
         service_metadata: Some(TaskServiceMetadata::new("demo-service", "api")),
         target_node: None,
     };
@@ -6950,36 +6797,27 @@ async fn multi_volume_bound_node_conflict_rejected() {
     let err = manager
         .start_tasks_batch(vec![TaskStartRequest {
             name: "conflict".into(),
-            image: "img".into(),
-            command: Vec::new(),
-            tty: false,
-            cpu_millis: 100,
-            memory_bytes: 64 * 1_024 * 1_024,
-            gpu_count: 0,
+            execution: TaskExecutionSpec {
+                cpu_millis: 100,
+                volumes: vec![
+                    crate::task::types::TaskVolumeMount {
+                        volume_id: left.id,
+                        volume_name: left.name.clone(),
+                        target: "/left".into(),
+                        read_only: false,
+                    },
+                    crate::task::types::TaskVolumeMount {
+                        volume_id: right.id,
+                        volume_name: right.name.clone(),
+                        target: "/right".into(),
+                        read_only: false,
+                    },
+                ],
+                ..empty_task_execution("img")
+            },
             gpu_device_ids: Vec::new(),
             id: None,
             slot_ids: Vec::new(),
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            liveness: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: vec![
-                crate::task::types::TaskVolumeMount {
-                    volume_id: left.id,
-                    volume_name: left.name.clone(),
-                    target: "/left".into(),
-                    read_only: false,
-                },
-                crate::task::types::TaskVolumeMount {
-                    volume_id: right.id,
-                    volume_name: right.name.clone(),
-                    target: "/right".into(),
-                    read_only: false,
-                },
-            ],
-            networks: Vec::new(),
             service_metadata: None,
             target_node: None,
         }])

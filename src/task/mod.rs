@@ -1,4 +1,3 @@
-pub mod capnp_codec;
 pub mod causality;
 pub mod container;
 pub mod docker;

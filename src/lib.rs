@@ -28,3 +28,4 @@ pub mod task;
 pub mod token;
 pub mod topology;
 pub mod volumes;
+pub mod workload;

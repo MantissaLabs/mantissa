@@ -1,8 +1,4 @@
 use crate::registry::Registry;
-use crate::task::capnp_codec::{
-    decode_env_vars, decode_secret_files, decode_volume_mounts, encode_env_vars,
-    encode_secret_files, encode_volume_mounts,
-};
 use crate::task::container::ContainerState;
 use crate::task::docker::{
     ContainerAttachOptions, ContainerExecOptions, ContainerLogFrame, ContainerLogStream,
@@ -10,10 +6,15 @@ use crate::task::docker::{
 };
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
-    TaskEvent, TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicy, TaskRestartPolicyKind,
-    TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStateKind, TaskStatus,
+    TaskEvent, TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStateKind, TaskStatus,
 };
 use crate::topology::Topology;
+use crate::workload::capnp_codec::{
+    decode_env_vars, decode_secret_files, decode_task_liveness_probe, decode_task_restart_policy,
+    decode_volume_mounts, encode_env_vars, encode_secret_files, encode_task_liveness_probe,
+    encode_task_restart_policy, encode_volume_mounts,
+};
+use crate::workload::types::TaskExecutionSpec;
 use capnp::Error;
 use protocol::gossip::gossip_message;
 use protocol::task::{
@@ -63,94 +64,6 @@ fn state_from_str(input: &str) -> ContainerState {
             ContainerState::Unknown
         }
     }
-}
-
-/// Encodes one local liveness probe into the task wire payload.
-fn write_liveness_probe(
-    mut builder: protocol::task::liveness_probe::Builder<'_>,
-    probe: &TaskLivenessProbe,
-) {
-    let kind = match probe.kind {
-        TaskLivenessProbeKind::Exec => protocol::task::LivenessProbeKind::Exec,
-        TaskLivenessProbeKind::Http => protocol::task::LivenessProbeKind::Http,
-        TaskLivenessProbeKind::Tcp => protocol::task::LivenessProbeKind::Tcp,
-    };
-    builder.set_kind(kind);
-    let mut command_builder = builder.reborrow().init_command(probe.command.len() as u32);
-    for (idx, arg) in probe.command.iter().enumerate() {
-        command_builder.set(idx as u32, arg);
-    }
-    builder.set_port(probe.port);
-    builder.set_path(probe.path.as_deref().unwrap_or(""));
-    builder.set_interval_ms(probe.interval_ms);
-    builder.set_timeout_ms(probe.timeout_ms);
-    builder.set_failure_threshold(probe.failure_threshold);
-    builder.set_start_period_ms(probe.start_period_ms);
-}
-
-/// Decodes one local liveness probe from the task wire payload.
-fn read_liveness_probe(
-    reader: protocol::task::liveness_probe::Reader<'_>,
-) -> Result<TaskLivenessProbe, Error> {
-    let kind = match reader.get_kind()? {
-        protocol::task::LivenessProbeKind::Exec => TaskLivenessProbeKind::Exec,
-        protocol::task::LivenessProbeKind::Http => TaskLivenessProbeKind::Http,
-        protocol::task::LivenessProbeKind::Tcp => TaskLivenessProbeKind::Tcp,
-    };
-    let mut command = Vec::new();
-    for arg in reader.get_command()?.iter() {
-        let text = arg?.to_str()?.to_string();
-        if !text.is_empty() {
-            command.push(text);
-        }
-    }
-    let path = reader.get_path()?.to_str()?.trim().to_string();
-
-    Ok(TaskLivenessProbe {
-        kind,
-        command,
-        port: reader.get_port(),
-        path: (!path.is_empty()).then_some(path),
-        interval_ms: reader.get_interval_ms(),
-        timeout_ms: reader.get_timeout_ms(),
-        failure_threshold: reader.get_failure_threshold(),
-        start_period_ms: reader.get_start_period_ms(),
-    })
-}
-
-fn encode_restart_policy(
-    mut builder: protocol::task::restart_policy::Builder<'_>,
-    policy: &TaskRestartPolicy,
-) {
-    let name = match policy.name {
-        TaskRestartPolicyKind::No => protocol::task::RestartPolicyName::No,
-        TaskRestartPolicyKind::Always => protocol::task::RestartPolicyName::Always,
-        TaskRestartPolicyKind::OnFailure => protocol::task::RestartPolicyName::OnFailure,
-        TaskRestartPolicyKind::UnlessStopped => protocol::task::RestartPolicyName::UnlessStopped,
-    };
-    builder.set_name(name);
-    builder.set_max_retry_count(policy.max_retry_count.unwrap_or(-1));
-}
-
-fn decode_restart_policy(
-    reader: protocol::task::restart_policy::Reader<'_>,
-) -> Result<TaskRestartPolicy, Error> {
-    let name = match reader.get_name()? {
-        protocol::task::RestartPolicyName::No => TaskRestartPolicyKind::No,
-        protocol::task::RestartPolicyName::Always => TaskRestartPolicyKind::Always,
-        protocol::task::RestartPolicyName::OnFailure => TaskRestartPolicyKind::OnFailure,
-        protocol::task::RestartPolicyName::UnlessStopped => TaskRestartPolicyKind::UnlessStopped,
-    };
-
-    let max_retry_count = match reader.get_max_retry_count() {
-        value if value < 0 => None,
-        value => Some(value),
-    };
-
-    Ok(TaskRestartPolicy {
-        name,
-        max_retry_count,
-    })
 }
 
 /// Encodes optional service ownership metadata into a task wire payload.
@@ -335,7 +248,7 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     }
     if let Some(liveness) = spec.liveness.as_ref() {
         let builder = builder.reborrow().init_liveness();
-        write_liveness_probe(builder, liveness);
+        encode_task_liveness_probe(builder, liveness);
     }
     let mut gpu_builder = builder
         .reborrow()
@@ -346,7 +259,7 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
 
     if let Some(policy) = &spec.restart_policy {
         let restart_builder = builder.reborrow().init_restart_policy();
-        encode_restart_policy(restart_builder, policy);
+        encode_task_restart_policy(restart_builder, policy);
     }
 
     let mut env_builder = builder.reborrow().init_env(spec.env.len() as u32);
@@ -441,7 +354,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         Some(pre_stop_cmds)
     };
     let liveness = if reader.has_liveness() {
-        Some(read_liveness_probe(reader.get_liveness()?)?)
+        Some(decode_task_liveness_probe(reader.get_liveness()?)?)
     } else {
         None
     };
@@ -453,7 +366,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     let slot_id = slot_ids.first().copied();
 
     let restart_policy = if reader.has_restart_policy() {
-        Some(decode_restart_policy(reader.get_restart_policy()?)?)
+        Some(decode_task_restart_policy(reader.get_restart_policy()?)?)
     } else {
         None
     };
@@ -874,7 +787,7 @@ impl task::Server for TaskService {
             slot_ids.push(slot_id);
         }
         let restart_policy = if req.has_restart_policy() {
-            Some(decode_restart_policy(req.get_restart_policy()?)?)
+            Some(decode_task_restart_policy(req.get_restart_policy()?)?)
         } else {
             None
         };
@@ -895,7 +808,7 @@ impl task::Server for TaskService {
             Some(pre_stop_command)
         };
         let liveness = if req.has_liveness() {
-            Some(read_liveness_probe(req.get_liveness()?)?)
+            Some(decode_task_liveness_probe(req.get_liveness()?)?)
         } else {
             None
         };
@@ -916,23 +829,25 @@ impl task::Server for TaskService {
 
         let request = TaskStartRequest {
             name,
-            image,
-            command,
-            tty: false,
-            cpu_millis,
-            memory_bytes,
-            gpu_count,
+            execution: TaskExecutionSpec {
+                image,
+                command,
+                tty: false,
+                cpu_millis,
+                memory_bytes,
+                gpu_count,
+                restart_policy,
+                termination_grace_period_secs,
+                pre_stop_command,
+                liveness,
+                env,
+                secret_files,
+                volumes,
+                networks,
+            },
             gpu_device_ids,
             id: None,
             slot_ids,
-            restart_policy,
-            termination_grace_period_secs,
-            pre_stop_command,
-            liveness,
-            env,
-            secret_files,
-            volumes,
-            networks,
             service_metadata: None,
             target_node: None,
         };
@@ -1012,7 +927,7 @@ impl task::Server for TaskService {
             }
 
             let restart_policy = if entry.has_restart_policy() {
-                Some(decode_restart_policy(entry.get_restart_policy()?)?)
+                Some(decode_task_restart_policy(entry.get_restart_policy()?)?)
             } else {
                 None
             };
@@ -1033,30 +948,32 @@ impl task::Server for TaskService {
                 Some(pre_stop_command)
             };
             let liveness = if entry.has_liveness() {
-                Some(read_liveness_probe(entry.get_liveness()?)?)
+                Some(decode_task_liveness_probe(entry.get_liveness()?)?)
             } else {
                 None
             };
 
             requests.push(TaskStartRequest {
                 name,
-                image,
-                command,
-                tty: false,
-                cpu_millis,
-                memory_bytes,
-                gpu_count,
+                execution: TaskExecutionSpec {
+                    image,
+                    command,
+                    tty: false,
+                    cpu_millis,
+                    memory_bytes,
+                    gpu_count,
+                    restart_policy,
+                    termination_grace_period_secs,
+                    pre_stop_command,
+                    liveness,
+                    env,
+                    secret_files,
+                    volumes,
+                    networks,
+                },
                 gpu_device_ids,
                 id: task_id,
                 slot_ids,
-                restart_policy,
-                termination_grace_period_secs,
-                pre_stop_command,
-                liveness,
-                env,
-                secret_files,
-                volumes,
-                networks,
                 service_metadata: None,
                 target_node: None,
             });

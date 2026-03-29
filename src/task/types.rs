@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::time::Duration;
 use uuid::Uuid;
 
 use crate::task::container::ContainerState;
+pub use crate::workload::types::{
+    WorkloadLivenessProbe as TaskLivenessProbe, WorkloadLivenessProbeKind as TaskLivenessProbeKind,
+    WorkloadRestartPolicy as TaskRestartPolicy, WorkloadRestartPolicyKind as TaskRestartPolicyKind,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskSpec {
@@ -354,89 +357,6 @@ fn default_task_value_definition_complete() -> bool {
     true
 }
 
-/// Default liveness probe interval in milliseconds.
-fn default_liveness_interval_ms() -> u64 {
-    10_000
-}
-
-/// Default liveness probe timeout in milliseconds.
-fn default_liveness_timeout_ms() -> u64 {
-    3_000
-}
-
-/// Default liveness probe failure threshold before the runtime restarts a task.
-fn default_liveness_failure_threshold() -> u32 {
-    3
-}
-
-/// Default warm-up delay before liveness failures are enforced.
-fn default_liveness_start_period_ms() -> u64 {
-    30_000
-}
-
-/// Transport style used by local liveness probing.
-#[derive(
-    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskLivenessProbeKind {
-    #[default]
-    Exec,
-    Http,
-    Tcp,
-}
-
-/// Liveness probe evaluated by the local runtime for one running task.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TaskLivenessProbe {
-    #[serde(default)]
-    pub kind: TaskLivenessProbeKind,
-    #[serde(default)]
-    pub command: Vec<String>,
-    #[serde(default)]
-    pub port: u16,
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default = "default_liveness_interval_ms")]
-    pub interval_ms: u64,
-    #[serde(default = "default_liveness_timeout_ms")]
-    pub timeout_ms: u64,
-    #[serde(default = "default_liveness_failure_threshold")]
-    pub failure_threshold: u32,
-    #[serde(default = "default_liveness_start_period_ms")]
-    pub start_period_ms: u64,
-}
-
-impl TaskLivenessProbe {
-    /// Returns the effective local liveness probe period.
-    pub fn interval(&self) -> Duration {
-        Duration::from_millis(self.interval_ms)
-    }
-
-    /// Returns the maximum execution time allowed for one liveness probe.
-    pub fn timeout(&self) -> Duration {
-        Duration::from_millis(self.timeout_ms)
-    }
-
-    /// Returns the normalized consecutive failure threshold.
-    pub fn failure_threshold(&self) -> u32 {
-        self.failure_threshold.max(1)
-    }
-
-    /// Returns the delay before liveness failures start counting after a task reaches running.
-    pub fn start_period(&self) -> Duration {
-        Duration::from_millis(self.start_period_ms)
-    }
-
-    /// Returns the HTTP path to probe when HTTP liveness is selected.
-    pub fn http_path(&self) -> Option<&str> {
-        match self.kind {
-            TaskLivenessProbeKind::Http => Some(self.path.as_deref().unwrap_or("/")),
-            TaskLivenessProbeKind::Exec | TaskLivenessProbeKind::Tcp => None,
-        }
-    }
-}
-
 /// One resolved volume mount attached to a task after manifest and CLI inputs are validated.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskVolumeMount {
@@ -459,21 +379,6 @@ impl TaskServiceMetadata {
             template: template.into(),
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TaskRestartPolicy {
-    pub name: TaskRestartPolicyKind,
-    #[serde(default)]
-    pub max_retry_count: Option<i32>,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum TaskRestartPolicyKind {
-    No,
-    Always,
-    OnFailure,
-    UnlessStopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]

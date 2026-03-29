@@ -1958,6 +1958,7 @@ mod tests {
     use crate::store::task_store::{TaskStore, open_task_store};
     use crate::task::container::ContainerState;
     use crate::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
+    use crate::workload::types::WorkloadExecutionSpec;
     use crdt_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -2205,23 +2206,25 @@ mod tests {
             service_name,
             vec![ServiceTaskSpecValue {
                 name: "backend".to_string(),
-                image: "hashicorp/http-echo:1.0.0".to_string(),
-                command: Vec::new(),
-                tty: false,
+                execution: WorkloadExecutionSpec {
+                    image: "hashicorp/http-echo:1.0.0".to_string(),
+                    command: Vec::new(),
+                    tty: false,
+                    cpu_millis: 100,
+                    memory_bytes: 64 * 1024 * 1024,
+                    gpu_count: 0,
+                    restart_policy: None,
+                    termination_grace_period_secs: None,
+                    pre_stop_command: None,
+                    liveness: None,
+                    env: Vec::new(),
+                    secret_files: Vec::new(),
+                    volumes: Vec::new(),
+                    networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
+                },
                 depends_on: Vec::new(),
                 replicas: task_ids.len() as u16,
-                cpu_millis: 100,
-                memory_bytes: 64 * 1024 * 1024,
-                gpu_count: 0,
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
                 readiness,
-                liveness: None,
                 public_port: None,
                 public_protocol: None,
             }],

@@ -1,9 +1,16 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskVolumeMount};
+use crate::workload::types::WorkloadExecutionSpec;
+pub use crate::workload::types::{
+    WorkloadLivenessProbe as ServiceLivenessProbe,
+    WorkloadLivenessProbeKind as ServiceLivenessProbeKind,
+    WorkloadRestartPolicy as ServiceTaskRestartPolicy,
+    WorkloadRestartPolicyKind as ServiceTaskRestartPolicyKind,
+};
 
 /// Value stored in the replicated service store describing desired service state.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -271,26 +278,6 @@ fn default_readiness_failure_threshold() -> u32 {
     1
 }
 
-/// Default liveness probe interval in milliseconds.
-fn default_liveness_interval_ms() -> u64 {
-    10_000
-}
-
-/// Default liveness probe timeout in milliseconds.
-fn default_liveness_timeout_ms() -> u64 {
-    3_000
-}
-
-/// Default liveness failure threshold before the local runtime restarts a task.
-fn default_liveness_failure_threshold() -> u32 {
-    3
-}
-
-/// Default warm-up delay before liveness failures are enforced.
-fn default_liveness_start_period_ms() -> u64 {
-    30_000
-}
-
 /// Transport style used by distributed readiness probing.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
@@ -343,76 +330,20 @@ impl ServiceReadinessProbe {
     }
 }
 
-/// Transport style used by local liveness probing.
-#[derive(
-    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceLivenessProbeKind {
-    #[default]
-    Exec,
-    Http,
-    Tcp,
-}
-
-/// Declarative liveness probe consumed by the local runtime to restart unhealthy containers.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ServiceLivenessProbe {
-    #[serde(default)]
-    pub kind: ServiceLivenessProbeKind,
-    #[serde(default)]
-    pub command: Vec<String>,
-    #[serde(default)]
-    pub port: u16,
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default = "default_liveness_interval_ms")]
-    pub interval_ms: u64,
-    #[serde(default = "default_liveness_timeout_ms")]
-    pub timeout_ms: u64,
-    #[serde(default = "default_liveness_failure_threshold")]
-    pub failure_threshold: u32,
-    #[serde(default = "default_liveness_start_period_ms")]
-    pub start_period_ms: u64,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServiceTaskSpecValue {
     pub name: String,
-    pub image: String,
-    pub command: Vec<String>,
+    pub execution: WorkloadExecutionSpec<ServiceTaskNetworkRequirement>,
     /// Template names within the same service that must be ready before this template starts.
     #[serde(default)]
     pub depends_on: Vec<String>,
     pub replicas: u16,
-    pub cpu_millis: u64,
-    pub memory_bytes: u64,
-    #[serde(default)]
-    pub gpu_count: u32,
-    #[serde(default)]
-    pub restart_policy: Option<ServiceTaskRestartPolicy>,
-    #[serde(default)]
-    pub termination_grace_period_secs: Option<u32>,
-    #[serde(default)]
-    pub pre_stop_command: Option<Vec<String>>,
-    #[serde(default)]
-    pub env: Vec<TaskEnvironmentVariable>,
-    #[serde(default)]
-    pub secret_files: Vec<TaskSecretFile>,
-    #[serde(default)]
-    pub volumes: Vec<TaskVolumeMount>,
-    #[serde(default)]
-    pub networks: Vec<ServiceTaskNetworkRequirement>,
     #[serde(default)]
     pub readiness: Option<ServiceReadinessProbe>,
-    #[serde(default)]
-    pub liveness: Option<ServiceLivenessProbe>,
     #[serde(default)]
     pub public_port: Option<u16>,
     #[serde(default)]
     pub public_protocol: Option<ServicePortProtocol>,
-    #[serde(default)]
-    pub tty: bool,
 }
 
 /// Supported transport protocols for publicly exposed service ports.
@@ -449,11 +380,12 @@ impl ServiceTaskSpecValue {
 
     /// Returns the local liveness probe, if the template declares one.
     pub fn liveness(&self) -> Option<&ServiceLivenessProbe> {
-        self.liveness.as_ref()
+        self.execution.liveness.as_ref()
     }
 
     pub fn required_network_ids(&self) -> Vec<Uuid> {
-        self.networks
+        self.execution
+            .networks
             .iter()
             .map(|network| network.network_id)
             .collect()
@@ -478,20 +410,13 @@ impl ServiceTaskSpecValue {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ServiceTaskRestartPolicy {
-    pub name: ServiceTaskRestartPolicyKind,
-    #[serde(default)]
-    pub max_retry_count: Option<i32>,
-}
+impl Deref for ServiceTaskSpecValue {
+    type Target = WorkloadExecutionSpec<ServiceTaskNetworkRequirement>;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceTaskRestartPolicyKind {
-    No,
-    Always,
-    OnFailure,
-    UnlessStopped,
+    /// Exposes the shared execution fields so service callers can keep using task-like accessors.
+    fn deref(&self) -> &Self::Target {
+        &self.execution
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

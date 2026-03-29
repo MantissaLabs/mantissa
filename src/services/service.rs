@@ -1,17 +1,18 @@
 use crate::services::manager::{ServiceController, ServiceDeploymentOutcome};
 use crate::services::types::{
-    ServiceEvent, ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePortProtocol,
-    ServicePreviousGeneration, ServiceReadinessProbe, ServiceReadinessProbeKind,
-    ServiceRescheduleLock, ServiceRescheduleReason, ServiceRollingUpdatePolicy,
-    ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
-    ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy, ServiceTaskRestartPolicyKind,
-    ServiceTaskSpecValue, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
-};
-use crate::task::capnp_codec::{
-    decode_env_vars, decode_secret_files, decode_volume_mounts, encode_env_vars,
-    encode_secret_files, encode_volume_mounts,
+    ServiceEvent, ServicePortProtocol, ServicePreviousGeneration, ServiceReadinessProbe,
+    ServiceReadinessProbeKind, ServiceRescheduleLock, ServiceRescheduleReason,
+    ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
+    ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskSpecValue,
+    ServiceUpdateStrategy, ServiceUpdateStrategyMode,
 };
 use crate::topology::Topology;
+use crate::workload::capnp_codec::{
+    decode_env_vars, decode_secret_files, decode_service_liveness_probe,
+    decode_service_restart_policy, decode_volume_mounts, encode_env_vars, encode_secret_files,
+    encode_service_liveness_probe, encode_service_restart_policy, encode_volume_mounts,
+};
+use crate::workload::types::WorkloadExecutionSpec;
 use capnp::Error;
 use protocol::services::{service_event, service_spec, services, task_template};
 use std::collections::HashSet;
@@ -391,36 +392,6 @@ fn read_readiness_probe(
     })
 }
 
-/// Decodes one local liveness probe definition from the service wire payload.
-fn read_liveness_probe(
-    reader: protocol::services::liveness_probe::Reader<'_>,
-) -> Result<ServiceLivenessProbe, Error> {
-    let kind = match reader.get_kind()? {
-        protocol::services::LivenessProbeKind::Exec => ServiceLivenessProbeKind::Exec,
-        protocol::services::LivenessProbeKind::Http => ServiceLivenessProbeKind::Http,
-        protocol::services::LivenessProbeKind::Tcp => ServiceLivenessProbeKind::Tcp,
-    };
-    let mut command = Vec::new();
-    for arg in reader.get_command()?.iter() {
-        let text = arg?.to_str()?.to_string();
-        if !text.is_empty() {
-            command.push(text);
-        }
-    }
-    let path = reader.get_path()?.to_str()?.trim().to_string();
-
-    Ok(ServiceLivenessProbe {
-        kind,
-        command,
-        port: reader.get_port(),
-        path: (!path.is_empty()).then_some(path),
-        interval_ms: reader.get_interval_ms(),
-        timeout_ms: reader.get_timeout_ms(),
-        failure_threshold: reader.get_failure_threshold(),
-        start_period_ms: reader.get_start_period_ms(),
-    })
-}
-
 fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSpecValue, Error> {
     let mut command = Vec::new();
     for arg in reader.get_command()?.iter() {
@@ -447,27 +418,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
     }
 
     let restart_policy = if reader.has_restart_policy() {
-        let policy = reader.get_restart_policy()?;
-        let kind = match policy.get_name()? {
-            protocol::services::RestartPolicyName::No => ServiceTaskRestartPolicyKind::No,
-            protocol::services::RestartPolicyName::Always => ServiceTaskRestartPolicyKind::Always,
-            protocol::services::RestartPolicyName::OnFailure => {
-                ServiceTaskRestartPolicyKind::OnFailure
-            }
-            protocol::services::RestartPolicyName::UnlessStopped => {
-                ServiceTaskRestartPolicyKind::UnlessStopped
-            }
-        };
-
-        let max_retry_count = match policy.get_max_retry_count() {
-            value if value < 0 => None,
-            value => Some(value),
-        };
-
-        Some(ServiceTaskRestartPolicy {
-            name: kind,
-            max_retry_count,
-        })
+        Some(decode_service_restart_policy(reader.get_restart_policy()?)?)
     } else {
         None
     };
@@ -500,7 +451,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         None
     };
     let liveness = if reader.has_liveness() {
-        Some(read_liveness_probe(reader.get_liveness()?)?)
+        Some(decode_service_liveness_probe(reader.get_liveness()?)?)
     } else {
         None
     };
@@ -543,28 +494,30 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
 
     Ok(ServiceTaskSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
-        image: reader.get_image()?.to_str()?.to_string(),
-        command,
+        execution: WorkloadExecutionSpec {
+            image: reader.get_image()?.to_str()?.to_string(),
+            command,
+            tty: reader.get_tty(),
+            cpu_millis: reader.get_cpu_millis(),
+            memory_bytes: reader.get_memory_bytes(),
+            gpu_count: reader.get_gpu_count(),
+            restart_policy,
+            termination_grace_period_secs: match reader.get_termination_grace_period_secs() {
+                0 => None,
+                value => Some(value),
+            },
+            pre_stop_command,
+            liveness,
+            env,
+            secret_files,
+            volumes,
+            networks,
+        },
         depends_on,
         replicas: reader.get_replicas(),
-        cpu_millis: reader.get_cpu_millis(),
-        memory_bytes: reader.get_memory_bytes(),
-        gpu_count: reader.get_gpu_count(),
-        restart_policy,
-        termination_grace_period_secs: match reader.get_termination_grace_period_secs() {
-            0 => None,
-            value => Some(value),
-        },
-        pre_stop_command,
-        env,
-        secret_files,
-        volumes,
-        networks,
         readiness,
-        liveness,
         public_port,
         public_protocol,
-        tty: reader.get_tty(),
     })
 }
 
@@ -748,19 +701,8 @@ fn write_task_template(
     }
 
     if let Some(policy) = &task.restart_policy {
-        let mut policy_builder = builder.reborrow().init_restart_policy();
-        let name = match policy.name {
-            ServiceTaskRestartPolicyKind::No => protocol::services::RestartPolicyName::No,
-            ServiceTaskRestartPolicyKind::Always => protocol::services::RestartPolicyName::Always,
-            ServiceTaskRestartPolicyKind::OnFailure => {
-                protocol::services::RestartPolicyName::OnFailure
-            }
-            ServiceTaskRestartPolicyKind::UnlessStopped => {
-                protocol::services::RestartPolicyName::UnlessStopped
-            }
-        };
-        policy_builder.set_name(name);
-        policy_builder.set_max_retry_count(policy.max_retry_count.unwrap_or(-1));
+        let policy_builder = builder.reborrow().init_restart_policy();
+        encode_service_restart_policy(policy_builder, policy);
     }
 
     let mut env_builder = builder.reborrow().init_env(task.env.len() as u32);
@@ -786,7 +728,7 @@ fn write_task_template(
     }
     if let Some(liveness) = task.liveness() {
         let builder = builder.reborrow().init_liveness();
-        write_liveness_probe(builder, liveness);
+        encode_service_liveness_probe(builder, liveness);
     }
 
     builder.set_public_port(task.public_port().unwrap_or(0));
@@ -817,29 +759,6 @@ fn write_readiness_probe(
     builder.set_interval_ms(probe.interval_ms);
     builder.set_timeout_ms(probe.timeout_ms);
     builder.set_failure_threshold(probe.failure_threshold);
-}
-
-/// Encodes one local liveness probe into the service wire payload.
-fn write_liveness_probe(
-    mut builder: protocol::services::liveness_probe::Builder<'_>,
-    probe: &ServiceLivenessProbe,
-) {
-    let kind = match probe.kind {
-        ServiceLivenessProbeKind::Exec => protocol::services::LivenessProbeKind::Exec,
-        ServiceLivenessProbeKind::Http => protocol::services::LivenessProbeKind::Http,
-        ServiceLivenessProbeKind::Tcp => protocol::services::LivenessProbeKind::Tcp,
-    };
-    builder.set_kind(kind);
-    let mut command_builder = builder.reborrow().init_command(probe.command.len() as u32);
-    for (idx, arg) in probe.command.iter().enumerate() {
-        command_builder.set(idx as u32, arg);
-    }
-    builder.set_port(probe.port);
-    builder.set_path(probe.path.as_deref().unwrap_or(""));
-    builder.set_interval_ms(probe.interval_ms);
-    builder.set_timeout_ms(probe.timeout_ms);
-    builder.set_failure_threshold(probe.failure_threshold);
-    builder.set_start_period_ms(probe.start_period_ms);
 }
 
 fn read_optional_uuid(data: capnp::data::Reader<'_>) -> Option<Uuid> {
@@ -879,6 +798,7 @@ mod tests {
     use crate::task::types::{
         TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskVolumeMount,
     };
+    use crate::workload::types::WorkloadExecutionSpec;
     use capnp::message::Builder;
     use protocol::services::{service_spec, task_template};
     use uuid::Uuid;
@@ -889,25 +809,27 @@ mod tests {
         let network_id = Uuid::new_v4();
         let task = ServiceTaskSpecValue {
             name: "backend".to_string(),
-            image: "ghcr.io/example/backend:latest".to_string(),
-            command: Vec::new(),
+            execution: WorkloadExecutionSpec {
+                image: "ghcr.io/example/backend:latest".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 250,
+                memory_bytes: 128 * 1024 * 1024,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
+            },
             depends_on: Vec::new(),
             replicas: 1,
-            cpu_millis: 250,
-            memory_bytes: 128 * 1024 * 1024,
-            gpu_count: 0,
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
             readiness: None,
-            liveness: None,
             public_port: None,
             public_protocol: None,
-            tty: false,
         };
 
         let mut message = Builder::new_default();
@@ -941,53 +863,66 @@ mod tests {
 
         let task = ServiceTaskSpecValue {
             name: "frontend".to_string(),
-            image: "ghcr.io/example/frontend:v2".to_string(),
-            command: vec![
-                "serve".to_string(),
-                "--port".to_string(),
-                "8080".to_string(),
-            ],
+            execution: WorkloadExecutionSpec {
+                image: "ghcr.io/example/frontend:v2".to_string(),
+                command: vec![
+                    "serve".to_string(),
+                    "--port".to_string(),
+                    "8080".to_string(),
+                ],
+                tty: true,
+                cpu_millis: 500,
+                memory_bytes: 256 * 1024 * 1024,
+                gpu_count: 1,
+                restart_policy: Some(ServiceTaskRestartPolicy {
+                    name: ServiceTaskRestartPolicyKind::OnFailure,
+                    max_retry_count: Some(5),
+                }),
+                termination_grace_period_secs: Some(30),
+                pre_stop_command: Some(vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 1".to_string(),
+                ]),
+                env: vec![TaskEnvironmentVariable {
+                    name: "API_TOKEN".to_string(),
+                    value: None,
+                    secret: Some(TaskSecretReference {
+                        name: "api-token".to_string(),
+                        version_id: Some(secret_version),
+                    }),
+                }],
+                secret_files: vec![TaskSecretFile {
+                    path: "/run/secrets/api-token".to_string(),
+                    secret: TaskSecretReference {
+                        name: "api-token".to_string(),
+                        version_id: Some(secret_version),
+                    },
+                    mode: Some(0o440),
+                }],
+                volumes: vec![TaskVolumeMount {
+                    volume_id,
+                    volume_name: "frontend-cache".to_string(),
+                    target: "/var/cache/frontend".to_string(),
+                    read_only: false,
+                }],
+                networks: vec![ServiceTaskNetworkRequirement::new(
+                    "public",
+                    task_network_id,
+                )],
+                liveness: Some(ServiceLivenessProbe {
+                    kind: ServiceLivenessProbeKind::Exec,
+                    command: vec!["/usr/bin/check".to_string()],
+                    port: 0,
+                    path: None,
+                    interval_ms: 7_000,
+                    timeout_ms: 2_000,
+                    failure_threshold: 4,
+                    start_period_ms: 12_000,
+                }),
+            },
             depends_on: vec!["backend".to_string()],
             replicas: 2,
-            cpu_millis: 500,
-            memory_bytes: 256 * 1024 * 1024,
-            gpu_count: 1,
-            restart_policy: Some(ServiceTaskRestartPolicy {
-                name: ServiceTaskRestartPolicyKind::OnFailure,
-                max_retry_count: Some(5),
-            }),
-            termination_grace_period_secs: Some(30),
-            pre_stop_command: Some(vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                "sleep 1".to_string(),
-            ]),
-            env: vec![TaskEnvironmentVariable {
-                name: "API_TOKEN".to_string(),
-                value: None,
-                secret: Some(TaskSecretReference {
-                    name: "api-token".to_string(),
-                    version_id: Some(secret_version),
-                }),
-            }],
-            secret_files: vec![TaskSecretFile {
-                path: "/run/secrets/api-token".to_string(),
-                secret: TaskSecretReference {
-                    name: "api-token".to_string(),
-                    version_id: Some(secret_version),
-                },
-                mode: Some(0o440),
-            }],
-            volumes: vec![TaskVolumeMount {
-                volume_id,
-                volume_name: "frontend-cache".to_string(),
-                target: "/var/cache/frontend".to_string(),
-                read_only: false,
-            }],
-            networks: vec![ServiceTaskNetworkRequirement::new(
-                "public",
-                task_network_id,
-            )],
             readiness: Some(ServiceReadinessProbe {
                 kind: ServiceReadinessProbeKind::Http,
                 port: 8080,
@@ -996,19 +931,8 @@ mod tests {
                 timeout_ms: 250,
                 failure_threshold: 2,
             }),
-            liveness: Some(ServiceLivenessProbe {
-                kind: ServiceLivenessProbeKind::Exec,
-                command: vec!["/usr/bin/check".to_string()],
-                port: 0,
-                path: None,
-                interval_ms: 7_000,
-                timeout_ms: 2_000,
-                failure_threshold: 4,
-                start_period_ms: 12_000,
-            }),
             public_port: Some(443),
             public_protocol: Some(ServicePortProtocol::TcpUdp),
-            tty: true,
         };
 
         let mut previous = ServiceSpecValue::new(
@@ -1017,28 +941,30 @@ mod tests {
             "demo-service",
             vec![ServiceTaskSpecValue {
                 name: "backend".to_string(),
-                image: "ghcr.io/example/backend:v1".to_string(),
-                command: vec!["serve".to_string()],
+                execution: WorkloadExecutionSpec {
+                    image: "ghcr.io/example/backend:v1".to_string(),
+                    command: vec!["serve".to_string()],
+                    tty: false,
+                    cpu_millis: 250,
+                    memory_bytes: 128 * 1024 * 1024,
+                    gpu_count: 0,
+                    restart_policy: None,
+                    termination_grace_period_secs: None,
+                    pre_stop_command: None,
+                    liveness: None,
+                    env: Vec::new(),
+                    secret_files: Vec::new(),
+                    volumes: Vec::new(),
+                    networks: vec![ServiceTaskNetworkRequirement::new(
+                        "backend",
+                        previous_network_id,
+                    )],
+                },
                 depends_on: Vec::new(),
                 replicas: 1,
-                cpu_millis: 250,
-                memory_bytes: 128 * 1024 * 1024,
-                gpu_count: 0,
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: vec![ServiceTaskNetworkRequirement::new(
-                    "backend",
-                    previous_network_id,
-                )],
                 readiness: None,
-                liveness: None,
                 public_port: None,
                 public_protocol: None,
-                tty: false,
             }],
             vec![Uuid::new_v4()],
         );

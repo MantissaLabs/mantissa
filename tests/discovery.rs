@@ -22,6 +22,7 @@ use mantissa::store::service_store::open_service_store;
 use mantissa::store::task_store::open_task_store;
 use mantissa::task::container::ContainerState;
 use mantissa::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
+use mantissa::workload::types::WorkloadExecutionSpec;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -214,23 +215,25 @@ async fn upsert_service(
         service_name,
         vec![ServiceTaskSpecValue {
             name: "backend".to_string(),
-            image: "hashicorp/http-echo:1.0.0".to_string(),
-            command: Vec::new(),
+            execution: WorkloadExecutionSpec {
+                image: "hashicorp/http-echo:1.0.0".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1024 * 1024,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
+            },
             depends_on: Vec::new(),
             replicas: task_ids.len() as u16,
-            cpu_millis: 100,
-            memory_bytes: 64 * 1024 * 1024,
-            gpu_count: 0,
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
             readiness: None,
-            liveness: None,
-            tty: false,
             public_port: None,
             public_protocol: None,
         }],

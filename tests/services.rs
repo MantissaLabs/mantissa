@@ -46,6 +46,7 @@ use mantissa::task::types::{
     TaskStateFilter, TaskValue, TaskVolumeMount,
 };
 use mantissa::topology_capnp::topology;
+use mantissa::workload::types::WorkloadExecutionSpec;
 use protocol::health::NodeStatus;
 use protocol::secrets::secrets;
 use protocol::services::services;
@@ -167,31 +168,23 @@ local_test!(services_gossip_propagates_across_peers, {
             SERVICE_NAME,
             vec![ServiceTaskSpecValue {
                 name: "web".into(),
-                image: "ghcr.io/mantissa/demo:web".into(),
-                command: vec!["--serve".into()],
+                execution: WorkloadExecutionSpec {
+                    command: vec!["--serve".into()],
+                    env: vec![TaskEnvironmentVariable {
+                        name: "DEMO_SECRET".into(),
+                        value: None,
+                        secret: Some(secret_ref.clone()),
+                    }],
+                    secret_files: vec![TaskSecretFile {
+                        path: "/run/secrets/demo-service-secret".into(),
+                        secret: secret_ref.clone(),
+                        mode: Some(0o440),
+                    }],
+                    ..empty_service_execution("ghcr.io/mantissa/demo:web")
+                },
                 depends_on: Vec::new(),
                 replicas: 1,
-                cpu_millis: 0,
-                memory_bytes: 0,
-                gpu_count: 0,
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                env: vec![TaskEnvironmentVariable {
-                    name: "DEMO_SECRET".into(),
-                    value: None,
-                    secret: Some(secret_ref.clone()),
-                }],
-                secret_files: vec![TaskSecretFile {
-                    path: "/run/secrets/demo-service-secret".into(),
-                    secret: secret_ref.clone(),
-                    mode: Some(0o440),
-                }],
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 readiness: None,
-                liveness: None,
-                tty: false,
                 public_port: None,
                 public_protocol: None,
             }],
@@ -269,31 +262,23 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
 
     let tasks = vec![ServiceTaskSpecValue {
         name: "web".into(),
-        image: "ghcr.io/mantissa/demo:web".into(),
-        command: vec!["--serve".into()],
+        execution: WorkloadExecutionSpec {
+            command: vec!["--serve".into()],
+            env: vec![TaskEnvironmentVariable {
+                name: "ACK_SECRET".into(),
+                value: None,
+                secret: Some(secret_ref.clone()),
+            }],
+            secret_files: vec![TaskSecretFile {
+                path: "/run/secrets/ack-demo-secret".into(),
+                secret: secret_ref,
+                mode: Some(0o440),
+            }],
+            ..empty_service_execution("ghcr.io/mantissa/demo:web")
+        },
         depends_on: Vec::new(),
         replicas: 1,
-        cpu_millis: 0,
-        memory_bytes: 0,
-        gpu_count: 0,
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        env: vec![TaskEnvironmentVariable {
-            name: "ACK_SECRET".into(),
-            value: None,
-            secret: Some(secret_ref.clone()),
-        }],
-        secret_files: vec![TaskSecretFile {
-            path: "/run/secrets/ack-demo-secret".into(),
-            secret: secret_ref,
-            mode: Some(0o440),
-        }],
-        volumes: Vec::new(),
-        networks: Vec::new(),
         readiness: None,
-        liveness: None,
-        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -361,31 +346,25 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
             "capacity-starved",
             vec![ServiceTaskSpecValue {
                 name: "heavy".into(),
-                image: "ghcr.io/mantissa/demo:web".into(),
-                command: vec!["--serve".into()],
+                execution: WorkloadExecutionSpec {
+                    command: vec!["--serve".into()],
+                    cpu_millis: 500_000,
+                    memory_bytes: 8 * 1024 * 1024 * 1024,
+                    env: vec![TaskEnvironmentVariable {
+                        name: "CAPACITY_SECRET".into(),
+                        value: None,
+                        secret: Some(secret_ref.clone()),
+                    }],
+                    secret_files: vec![TaskSecretFile {
+                        path: "/run/secrets/capacity-secret".into(),
+                        secret: secret_ref,
+                        mode: Some(0o440),
+                    }],
+                    ..empty_service_execution("ghcr.io/mantissa/demo:web")
+                },
                 depends_on: Vec::new(),
                 replicas: 1,
-                cpu_millis: 500_000, // intentionally exceeds any single-node capacity
-                memory_bytes: 8 * 1024 * 1024 * 1024, // 8 GiB to force allocation failure
-                gpu_count: 0,
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                env: vec![TaskEnvironmentVariable {
-                    name: "CAPACITY_SECRET".into(),
-                    value: None,
-                    secret: Some(secret_ref.clone()),
-                }],
-                secret_files: vec![TaskSecretFile {
-                    path: "/run/secrets/capacity-secret".into(),
-                    secret: secret_ref,
-                    mode: Some(0o440),
-                }],
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 readiness: None,
-                liveness: None,
-                tty: false,
                 public_port: None,
                 public_protocol: None,
             }],
@@ -437,23 +416,15 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
             "capacity-starved",
             vec![ServiceTaskSpecValue {
                 name: "heavy".into(),
-                image: "ghcr.io/mantissa/demo:web".into(),
-                command: vec!["--serve".into()],
+                execution: WorkloadExecutionSpec {
+                    command: vec!["--serve".into()],
+                    cpu_millis: 200,
+                    memory_bytes: 128 * 1024 * 1024,
+                    ..empty_service_execution("ghcr.io/mantissa/demo:web")
+                },
                 depends_on: Vec::new(),
                 replicas: 1,
-                cpu_millis: 200,
-                memory_bytes: 128 * 1024 * 1024,
-                gpu_count: 0,
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 readiness: None,
-                liveness: None,
-                tty: false,
                 public_port: None,
                 public_protocol: None,
             }],
@@ -516,45 +487,29 @@ local_test!(services_deploying_generation_resumes_after_restart, {
             vec![
                 ServiceTaskSpecValue {
                     name: "backend".into(),
-                    image: "ghcr.io/example/backend:latest".into(),
-                    command: vec!["serve".into()],
+                    execution: WorkloadExecutionSpec {
+                        command: vec!["serve".into()],
+                        cpu_millis: 100,
+                        memory_bytes: 64 * 1024 * 1024,
+                        ..empty_service_execution("ghcr.io/example/backend:latest")
+                    },
                     depends_on: Vec::new(),
                     replicas: 1,
-                    cpu_millis: 100,
-                    memory_bytes: 64 * 1024 * 1024,
-                    gpu_count: 0,
-                    restart_policy: None,
-                    termination_grace_period_secs: None,
-                    pre_stop_command: None,
-                    env: Vec::new(),
-                    secret_files: Vec::new(),
-                    volumes: Vec::new(),
-                    networks: Vec::new(),
                     readiness: None,
-                    liveness: None,
-                    tty: false,
                     public_port: None,
                     public_protocol: None,
                 },
                 ServiceTaskSpecValue {
                     name: "frontend".into(),
-                    image: "ghcr.io/example/frontend:latest".into(),
-                    command: vec!["serve".into()],
+                    execution: WorkloadExecutionSpec {
+                        command: vec!["serve".into()],
+                        cpu_millis: 100,
+                        memory_bytes: 64 * 1024 * 1024,
+                        ..empty_service_execution("ghcr.io/example/frontend:latest")
+                    },
                     depends_on: vec!["backend".into()],
                     replicas: 1,
-                    cpu_millis: 100,
-                    memory_bytes: 64 * 1024 * 1024,
-                    gpu_count: 0,
-                    restart_policy: None,
-                    termination_grace_period_secs: None,
-                    pre_stop_command: None,
-                    env: Vec::new(),
-                    secret_files: Vec::new(),
-                    volumes: Vec::new(),
-                    networks: Vec::new(),
                     readiness: None,
-                    liveness: None,
-                    tty: false,
                     public_port: None,
                     public_protocol: None,
                 },
@@ -653,27 +608,19 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
             "missing-runtime",
             vec![ServiceTaskSpecValue {
                 name: "api".into(),
-                image: "alpine:3.20".into(),
-                command: vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "while true; do sleep 1; done".into(),
-                ],
+                execution: WorkloadExecutionSpec {
+                    command: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "while true; do sleep 1; done".into(),
+                    ],
+                    cpu_millis: 100,
+                    memory_bytes: 64 * 1024 * 1024,
+                    ..empty_service_execution("alpine:3.20")
+                },
                 depends_on: Vec::new(),
                 replicas: 1,
-                cpu_millis: 100,
-                memory_bytes: 64 * 1024 * 1024,
-                gpu_count: 0,
-                restart_policy: None,
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                env: Vec::new(),
-                secret_files: Vec::new(),
-                volumes: Vec::new(),
-                networks: Vec::new(),
                 readiness: None,
-                liveness: None,
-                tty: false,
                 public_port: None,
                 public_protocol: None,
             }],
@@ -1508,7 +1455,7 @@ local_test!(
 
         let redeploy_manifest_id = Uuid::new_v4();
         let mut redeploy_templates = templates;
-        redeploy_templates[0].image = "hashicorp/http-echo:0.2.3".to_string();
+        redeploy_templates[0].execution.image = "hashicorp/http-echo:0.2.3".to_string();
         node.node
             .service_controller
             .submit_deployment(
@@ -3227,27 +3174,19 @@ local_test!(services_redeploy_scales_replicas, {
 
     let mut tasks = vec![ServiceTaskSpecValue {
         name: "echo".into(),
-        image: "alpine:3.20".into(),
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            "while true; do sleep 1; done".into(),
-        ],
+        execution: WorkloadExecutionSpec {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while true; do sleep 1; done".into(),
+            ],
+            cpu_millis: 100,
+            memory_bytes: 32 * 1024 * 1024,
+            ..empty_service_execution("alpine:3.20")
+        },
         depends_on: Vec::new(),
         replicas: 1,
-        cpu_millis: 100,
-        memory_bytes: 32 * 1024 * 1024,
-        gpu_count: 0,
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: Vec::new(),
         readiness: None,
-        liveness: None,
-        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -3356,27 +3295,19 @@ local_test!(services_redeploy_updates_resources, {
 
     let mut tasks = vec![ServiceTaskSpecValue {
         name: "echo".into(),
-        image: "alpine:3.20".into(),
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            "while true; do sleep 1; done".into(),
-        ],
+        execution: WorkloadExecutionSpec {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while true; do sleep 1; done".into(),
+            ],
+            cpu_millis: 100,
+            memory_bytes: 64 * 1024 * 1024,
+            ..empty_service_execution("alpine:3.20")
+        },
         depends_on: Vec::new(),
         replicas: 1,
-        cpu_millis: 100,
-        memory_bytes: 64 * 1024 * 1024,
-        gpu_count: 0,
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: Vec::new(),
         readiness: None,
-        liveness: None,
-        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -3414,8 +3345,8 @@ local_test!(services_redeploy_updates_resources, {
         .first()
         .expect("baseline spec should include one task id");
 
-    tasks[0].cpu_millis = 750;
-    tasks[0].memory_bytes = 256 * 1024 * 1024;
+    tasks[0].execution.cpu_millis = 750;
+    tasks[0].execution.memory_bytes = 256 * 1024 * 1024;
 
     let redeploy_id = node
         .node
@@ -3494,27 +3425,19 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
 
     let tasks = vec![ServiceTaskSpecValue {
         name: "echo".into(),
-        image: "alpine:3.20".into(),
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            "while true; do sleep 1; done".into(),
-        ],
+        execution: WorkloadExecutionSpec {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while true; do sleep 1; done".into(),
+            ],
+            cpu_millis: 100,
+            memory_bytes: 32 * 1024 * 1024,
+            ..empty_service_execution("alpine:3.20")
+        },
         depends_on: Vec::new(),
         replicas: 1,
-        cpu_millis: 100,
-        memory_bytes: 32 * 1024 * 1024,
-        gpu_count: 0,
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: Vec::new(),
         readiness: None,
-        liveness: None,
-        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -3618,27 +3541,19 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
 
     let tasks = vec![ServiceTaskSpecValue {
         name: "echo".into(),
-        image: "alpine:3.20".into(),
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            "while true; do sleep 1; done".into(),
-        ],
+        execution: WorkloadExecutionSpec {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while true; do sleep 1; done".into(),
+            ],
+            cpu_millis: 100,
+            memory_bytes: 64 * 1024 * 1024,
+            ..empty_service_execution("alpine:3.20")
+        },
         depends_on: Vec::new(),
         replicas: 1,
-        cpu_millis: 100,
-        memory_bytes: 64 * 1024 * 1024,
-        gpu_count: 0,
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: Vec::new(),
         readiness: None,
-        liveness: None,
-        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -3671,8 +3586,8 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
     let baseline_task_ids = baseline_spec.task_ids.clone();
 
     let mut failing_tasks = tasks;
-    failing_tasks[0].cpu_millis = 500_000;
-    failing_tasks[0].memory_bytes = 8 * 1024 * 1024 * 1024;
+    failing_tasks[0].execution.cpu_millis = 500_000;
+    failing_tasks[0].execution.memory_bytes = 8 * 1024 * 1024 * 1024;
 
     node.node
         .service_controller
@@ -3716,27 +3631,19 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
 
     let tasks = vec![ServiceTaskSpecValue {
         name: "echo".into(),
-        image: "alpine:3.20".into(),
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            "while true; do sleep 1; done".into(),
-        ],
+        execution: WorkloadExecutionSpec {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while true; do sleep 1; done".into(),
+            ],
+            cpu_millis: 100,
+            memory_bytes: 64 * 1024 * 1024,
+            ..empty_service_execution("alpine:3.20")
+        },
         depends_on: Vec::new(),
         replicas: 1,
-        cpu_millis: 100,
-        memory_bytes: 64 * 1024 * 1024,
-        gpu_count: 0,
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: Vec::new(),
         readiness: None,
-        liveness: None,
-        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -3769,8 +3676,8 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
     let baseline_task_ids = baseline_spec.task_ids.clone();
 
     let mut failing_tasks = tasks;
-    failing_tasks[0].cpu_millis = 500_000;
-    failing_tasks[0].memory_bytes = 8 * 1024 * 1024 * 1024;
+    failing_tasks[0].execution.cpu_millis = 500_000;
+    failing_tasks[0].execution.memory_bytes = 8 * 1024 * 1024 * 1024;
 
     let strategy = ServiceUpdateStrategy {
         rolling: ServiceRollingUpdatePolicy {
@@ -3847,27 +3754,19 @@ local_test!(
 
         let mut tasks = vec![ServiceTaskSpecValue {
             name: "echo".into(),
-            image: "alpine:3.20".into(),
-            command: vec![
-                "sh".into(),
-                "-c".into(),
-                "while true; do sleep 1; done".into(),
-            ],
+            execution: WorkloadExecutionSpec {
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "while true; do sleep 1; done".into(),
+                ],
+                cpu_millis: 100,
+                memory_bytes: 64 * 1024 * 1024,
+                ..empty_service_execution("alpine:3.20")
+            },
             depends_on: Vec::new(),
             replicas: 1,
-            cpu_millis: 100,
-            memory_bytes: 64 * 1024 * 1024,
-            gpu_count: 0,
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: Vec::new(),
             readiness: None,
-            liveness: None,
-            tty: false,
             public_port: None,
             public_protocol: None,
         }];
@@ -3898,7 +3797,7 @@ local_test!(
             .expect("baseline spec present");
         let old_task_id = baseline_spec.task_ids[0];
 
-        tasks[0].image = "alpine:3.19".into();
+        tasks[0].execution.image = "alpine:3.19".into();
         let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, 1, true);
 
         node.node
@@ -3984,27 +3883,17 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
 
     let mut tasks = vec![ServiceTaskSpecValue {
         name: "echo".into(),
-        image: "alpine:3.20".into(),
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            "while true; do sleep 1; done".into(),
-        ],
+        execution: WorkloadExecutionSpec {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while true; do sleep 1; done".into(),
+            ],
+            ..empty_service_execution("alpine:3.20")
+        },
         depends_on: Vec::new(),
         replicas: 4,
-        cpu_millis: 0,
-        memory_bytes: 0,
-        gpu_count: 0,
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: Vec::new(),
         readiness: None,
-        liveness: None,
-        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -4026,7 +3915,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
         "baseline deployment should reach running"
     );
 
-    tasks[0].image = "alpine:3.19".into();
+    tasks[0].execution.image = "alpine:3.19".into();
     let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, 1, true);
     node.node
         .service_controller
@@ -4094,27 +3983,19 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
 
     let tasks = vec![ServiceTaskSpecValue {
         name: "echo".into(),
-        image: "alpine:3.20".into(),
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            "while true; do sleep 1; done".into(),
-        ],
+        execution: WorkloadExecutionSpec {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while true; do sleep 1; done".into(),
+            ],
+            cpu_millis: 100,
+            memory_bytes: 64 * 1024 * 1024,
+            ..empty_service_execution("alpine:3.20")
+        },
         depends_on: Vec::new(),
         replicas: 1,
-        cpu_millis: 100,
-        memory_bytes: 64 * 1024 * 1024,
-        gpu_count: 0,
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: Vec::new(),
         readiness: None,
-        liveness: None,
-        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -4138,8 +4019,8 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
 
     let failing_manifest_id = Uuid::new_v4();
     let mut failing_tasks = tasks;
-    failing_tasks[0].cpu_millis = 500_000;
-    failing_tasks[0].memory_bytes = 8 * 1024 * 1024 * 1024;
+    failing_tasks[0].execution.cpu_millis = 500_000;
+    failing_tasks[0].execution.memory_bytes = 8 * 1024 * 1024 * 1024;
     let strategy = rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, 1, false);
 
     node.node
@@ -4204,32 +4085,25 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
     let manifest_name = "volume-unavailable-service";
     let tasks = vec![ServiceTaskSpecValue {
         name: "db".into(),
-        image: "postgres:16".into(),
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            "while true; do sleep 1; done".into(),
-        ],
+        execution: WorkloadExecutionSpec {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while true; do sleep 1; done".into(),
+            ],
+            cpu_millis: 100,
+            memory_bytes: 64 * 1024 * 1024,
+            volumes: vec![TaskVolumeMount {
+                volume_id,
+                volume_name: volume_name.to_string(),
+                target: "/var/lib/postgresql/data".to_string(),
+                read_only: false,
+            }],
+            ..empty_service_execution("postgres:16")
+        },
         depends_on: Vec::new(),
         replicas: 1,
-        cpu_millis: 100,
-        memory_bytes: 64 * 1024 * 1024,
-        gpu_count: 0,
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: vec![TaskVolumeMount {
-            volume_id,
-            volume_name: volume_name.to_string(),
-            target: "/var/lib/postgresql/data".to_string(),
-            read_only: false,
-        }],
-        networks: Vec::new(),
         readiness: None,
-        liveness: None,
-        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -4329,27 +4203,19 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
 
     let tasks = vec![ServiceTaskSpecValue {
         name: "echo".into(),
-        image: "alpine:3.20".into(),
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            "while true; do sleep 1; done".into(),
-        ],
+        execution: WorkloadExecutionSpec {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while true; do sleep 1; done".into(),
+            ],
+            cpu_millis: 100,
+            memory_bytes: 64 * 1024 * 1024,
+            ..empty_service_execution("alpine:3.20")
+        },
         depends_on: Vec::new(),
         replicas: 1,
-        cpu_millis: 100,
-        memory_bytes: 64 * 1024 * 1024,
-        gpu_count: 0,
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        networks: Vec::new(),
         readiness: None,
-        liveness: None,
-        tty: false,
         public_port: None,
         public_protocol: None,
     }];
@@ -4373,7 +4239,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
 
     let failing_manifest_id = Uuid::new_v4();
     let mut failing_tasks = tasks;
-    failing_tasks[0].image = "alpine:3.19".into();
+    failing_tasks[0].execution.image = "alpine:3.19".into();
     let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, 1, true);
     manager.enable_create_failures();
 
@@ -4418,31 +4284,43 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
 });
 
 /// Builds a lightweight backend template used by placement-focused integration tests.
-fn demo_backend_task_template(name: &str, replicas: u16) -> ServiceTaskSpecValue {
-    ServiceTaskSpecValue {
-        name: name.to_string(),
-        image: "hashicorp/http-echo:1.0.0".to_string(),
-        command: vec![
-            "-listen".to_string(),
-            ":8000".to_string(),
-            "-text".to_string(),
-            "hello from backend replica".to_string(),
-        ],
-        depends_on: Vec::new(),
-        replicas,
-        cpu_millis: 200,
-        memory_bytes: 64 * 1024 * 1024,
+fn empty_service_execution(image: &str) -> WorkloadExecutionSpec<ServiceTaskNetworkRequirement> {
+    WorkloadExecutionSpec {
+        image: image.to_string(),
+        command: Vec::new(),
+        tty: false,
+        cpu_millis: 0,
+        memory_bytes: 0,
         gpu_count: 0,
         restart_policy: None,
         termination_grace_period_secs: None,
         pre_stop_command: None,
+        liveness: None,
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
+    }
+}
+
+/// Builds a lightweight backend template used by placement-focused integration tests.
+fn demo_backend_task_template(name: &str, replicas: u16) -> ServiceTaskSpecValue {
+    ServiceTaskSpecValue {
+        name: name.to_string(),
+        execution: WorkloadExecutionSpec {
+            command: vec![
+                "-listen".to_string(),
+                ":8000".to_string(),
+                "-text".to_string(),
+                "hello from backend replica".to_string(),
+            ],
+            cpu_millis: 200,
+            memory_bytes: 64 * 1024 * 1024,
+            ..empty_service_execution("hashicorp/http-echo:1.0.0")
+        },
+        depends_on: Vec::new(),
+        replicas,
         readiness: None,
-        liveness: None,
-        tty: false,
         public_port: None,
         public_protocol: None,
     }
@@ -4455,7 +4333,7 @@ fn demo_networked_backend_task_template(
     network_id: Uuid,
 ) -> ServiceTaskSpecValue {
     let mut template = demo_backend_task_template(name, replicas);
-    template.networks = vec![ServiceTaskNetworkRequirement::new("default", network_id)];
+    template.execution.networks = vec![ServiceTaskNetworkRequirement::new("default", network_id)];
     template
 }
 
@@ -4623,14 +4501,14 @@ local_test!(
                 .collect();
 
         let mut redeploy_backend = backend;
-        redeploy_backend.command = vec![
+        redeploy_backend.execution.command = vec![
             "-listen".to_string(),
             ":8000".to_string(),
             "-text".to_string(),
             "hello from redeployed backend replica".to_string(),
         ];
         let mut redeploy_frontend = frontend;
-        redeploy_frontend.command = vec![
+        redeploy_frontend.execution.command = vec![
             "-listen".to_string(),
             ":8000".to_string(),
             "-text".to_string(),
@@ -5992,63 +5870,65 @@ fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskS
 
             ServiceTaskSpecValue {
                 name: task.name.clone(),
-                image: task.image.clone(),
-                command: task.command.clone(),
+                execution: WorkloadExecutionSpec {
+                    image: task.image.clone(),
+                    command: task.command.clone(),
+                    tty: false,
+                    cpu_millis: task.resources.cpu_millis,
+                    memory_bytes: task.resources.memory_bytes(),
+                    gpu_count: 0,
+                    restart_policy: task.restart_policy.as_ref().map(|policy| {
+                        ServiceTaskRestartPolicy {
+                            name: match policy.name {
+                                ManifestRestartPolicyName::No => ServiceTaskRestartPolicyKind::No,
+                                ManifestRestartPolicyName::Always => {
+                                    ServiceTaskRestartPolicyKind::Always
+                                }
+                                ManifestRestartPolicyName::OnFailure => {
+                                    ServiceTaskRestartPolicyKind::OnFailure
+                                }
+                                ManifestRestartPolicyName::UnlessStopped => {
+                                    ServiceTaskRestartPolicyKind::UnlessStopped
+                                }
+                            },
+                            max_retry_count: policy.max_retry_count.map(|value| {
+                                i32::try_from(value).expect("validated manifest bound")
+                            }),
+                        }
+                    }),
+                    termination_grace_period_secs: None,
+                    pre_stop_command: None,
+                    liveness: None,
+                    env: task
+                        .env
+                        .iter()
+                        .map(|var| TaskEnvironmentVariable {
+                            name: var.name.clone(),
+                            value: var.value.clone(),
+                            secret: var.secret.as_ref().map(|secret| TaskSecretReference {
+                                name: secret.name.clone(),
+                                version_id: parse_secret_version(secret),
+                            }),
+                        })
+                        .collect(),
+                    secret_files: task
+                        .secret_files
+                        .iter()
+                        .map(|file| TaskSecretFile {
+                            path: file.path.clone(),
+                            secret: TaskSecretReference {
+                                name: file.secret.name.clone(),
+                                version_id: parse_secret_version(&file.secret),
+                            },
+                            mode: file.mode,
+                        })
+                        .collect(),
+                    volumes: Vec::new(),
+                    networks,
+                },
                 depends_on: task.depends_on.clone(),
                 replicas: task.replicas,
-                cpu_millis: task.resources.cpu_millis,
-                memory_bytes: task.resources.memory_bytes(),
-                gpu_count: 0,
-                restart_policy: task.restart_policy.as_ref().map(|policy| {
-                    ServiceTaskRestartPolicy {
-                        name: match policy.name {
-                            ManifestRestartPolicyName::No => ServiceTaskRestartPolicyKind::No,
-                            ManifestRestartPolicyName::Always => {
-                                ServiceTaskRestartPolicyKind::Always
-                            }
-                            ManifestRestartPolicyName::OnFailure => {
-                                ServiceTaskRestartPolicyKind::OnFailure
-                            }
-                            ManifestRestartPolicyName::UnlessStopped => {
-                                ServiceTaskRestartPolicyKind::UnlessStopped
-                            }
-                        },
-                        max_retry_count: policy
-                            .max_retry_count
-                            .map(|value| i32::try_from(value).expect("validated manifest bound")),
-                    }
-                }),
-                termination_grace_period_secs: None,
-                pre_stop_command: None,
-                env: task
-                    .env
-                    .iter()
-                    .map(|var| TaskEnvironmentVariable {
-                        name: var.name.clone(),
-                        value: var.value.clone(),
-                        secret: var.secret.as_ref().map(|secret| TaskSecretReference {
-                            name: secret.name.clone(),
-                            version_id: parse_secret_version(secret),
-                        }),
-                    })
-                    .collect(),
-                secret_files: task
-                    .secret_files
-                    .iter()
-                    .map(|file| TaskSecretFile {
-                        path: file.path.clone(),
-                        secret: TaskSecretReference {
-                            name: file.secret.name.clone(),
-                            version_id: parse_secret_version(&file.secret),
-                        },
-                        mode: file.mode,
-                    })
-                    .collect(),
-                volumes: Vec::new(),
-                networks,
                 readiness: None,
-                liveness: None,
-                tty: false,
                 public_port: None,
                 public_protocol: None,
             }

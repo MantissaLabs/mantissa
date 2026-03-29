@@ -18,6 +18,7 @@ use mantissa::volumes::types::{
     LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
     VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
 };
+use mantissa::workload::types::TaskExecutionSpec;
 use protocol::topology::topology;
 use protocol::volumes::{LocalVolumeSourceKind, volumes};
 use std::collections::HashMap;
@@ -379,28 +380,30 @@ fn standalone_volume_task_request(
 ) -> TaskStartRequest {
     TaskStartRequest {
         name: "standalone-volume-task".into(),
-        image: "busybox:latest".into(),
-        command: vec!["/bin/true".into()],
-        tty: false,
-        cpu_millis: 100,
-        memory_bytes: 32 * 1_024 * 1_024,
-        gpu_count: 0,
+        execution: TaskExecutionSpec {
+            image: "busybox:latest".into(),
+            command: vec!["/bin/true".into()],
+            tty: false,
+            cpu_millis: 100,
+            memory_bytes: 32 * 1_024 * 1_024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: vec![TaskVolumeMount {
+                volume_id,
+                volume_name: volume_name.to_string(),
+                target: target.to_string(),
+                read_only: false,
+            }],
+            networks: Vec::new(),
+        },
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: vec![TaskVolumeMount {
-            volume_id,
-            volume_name: volume_name.to_string(),
-            target: target.to_string(),
-            read_only: false,
-        }],
-        networks: Vec::new(),
         service_metadata: None,
         target_node: None,
     }
@@ -850,36 +853,38 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
         .task_manager
         .start_tasks_batch(vec![TaskStartRequest {
             name: "conflict".into(),
-            image: "busybox:latest".into(),
-            command: vec!["/bin/true".into()],
-            tty: false,
-            cpu_millis: 100,
-            memory_bytes: 32 * 1_024 * 1_024,
-            gpu_count: 0,
+            execution: TaskExecutionSpec {
+                image: "busybox:latest".into(),
+                command: vec!["/bin/true".into()],
+                tty: false,
+                cpu_millis: 100,
+                memory_bytes: 32 * 1_024 * 1_024,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: vec![
+                    TaskVolumeMount {
+                        volume_id: left.id,
+                        volume_name: left.name.clone(),
+                        target: "/left".into(),
+                        read_only: false,
+                    },
+                    TaskVolumeMount {
+                        volume_id: right.id,
+                        volume_name: right.name.clone(),
+                        target: "/right".into(),
+                        read_only: false,
+                    },
+                ],
+                networks: Vec::new(),
+            },
             gpu_device_ids: Vec::new(),
             id: None,
             slot_ids: Vec::new(),
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            liveness: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: vec![
-                TaskVolumeMount {
-                    volume_id: left.id,
-                    volume_name: left.name.clone(),
-                    target: "/left".into(),
-                    read_only: false,
-                },
-                TaskVolumeMount {
-                    volume_id: right.id,
-                    volume_name: right.name.clone(),
-                    target: "/right".into(),
-                    read_only: false,
-                },
-            ],
-            networks: Vec::new(),
             service_metadata: None,
             target_node: None,
         }])

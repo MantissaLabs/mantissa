@@ -565,29 +565,37 @@ impl TaskManager {
         let mut intents = Vec::with_capacity(requests.len());
 
         for (index, request) in requests.into_iter().enumerate() {
-            let gpu_device_ids = request.gpu_device_ids;
+            let TaskStartRequest {
+                name,
+                execution,
+                gpu_device_ids,
+                id,
+                slot_ids,
+                service_metadata,
+                target_node,
+            } = request;
             if !gpu_device_ids.is_empty() {
                 let mut seen = HashSet::with_capacity(gpu_device_ids.len());
                 for id in &gpu_device_ids {
                     if !seen.insert(id) {
                         return Err(anyhow!(
                             "duplicate gpu device id '{id}' supplied for task {}",
-                            request.name
+                            name
                         ));
                     }
                 }
-                if request.slot_ids.is_empty() {
+                if slot_ids.is_empty() {
                     return Err(anyhow!(
                         "gpu_device_ids require preassigned slots for task {}",
-                        request.name
+                        name
                     ));
                 }
             }
 
-            let resolved_gpu_count = if request.gpu_count == 0 {
+            let resolved_gpu_count = if execution.gpu_count == 0 {
                 gpu_device_ids.len() as u32
             } else {
-                request.gpu_count
+                execution.gpu_count
             };
 
             if !gpu_device_ids.is_empty() && resolved_gpu_count != gpu_device_ids.len() as u32 {
@@ -595,32 +603,32 @@ impl TaskManager {
                     "gpu_count {} does not match {} gpu device ids for task {}",
                     resolved_gpu_count,
                     gpu_device_ids.len(),
-                    request.name
+                    name
                 ));
             }
 
             intents.push(StartIntent {
                 index,
-                id: request.id.unwrap_or_else(Uuid::new_v4),
-                name: request.name,
-                image: request.image,
-                command: request.command,
-                tty: request.tty,
-                cpu_millis: request.cpu_millis,
-                memory_bytes: request.memory_bytes,
+                id: id.unwrap_or_else(Uuid::new_v4),
+                name,
+                image: execution.image,
+                command: execution.command,
+                tty: execution.tty,
+                cpu_millis: execution.cpu_millis,
+                memory_bytes: execution.memory_bytes,
                 gpu_count: resolved_gpu_count,
                 gpu_device_ids,
-                preassigned_slots: request.slot_ids,
-                restart_policy: request.restart_policy,
-                termination_grace_period_secs: request.termination_grace_period_secs,
-                pre_stop_command: request.pre_stop_command,
-                liveness: request.liveness,
-                env: request.env,
-                secret_files: request.secret_files,
-                volumes: request.volumes,
-                networks: request.networks,
-                service_metadata: request.service_metadata,
-                target_node: request.target_node,
+                preassigned_slots: slot_ids,
+                restart_policy: execution.restart_policy,
+                termination_grace_period_secs: execution.termination_grace_period_secs,
+                pre_stop_command: execution.pre_stop_command,
+                liveness: execution.liveness,
+                env: execution.env,
+                secret_files: execution.secret_files,
+                volumes: execution.volumes,
+                networks: execution.networks,
+                service_metadata,
+                target_node,
             });
         }
 

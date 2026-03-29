@@ -14,11 +14,11 @@ use crate::task::docker::{
     ContainerLogsOptions, ContainerManager,
 };
 use crate::task::types::{
-    TaskEnvironmentVariable, TaskEvent, TaskLivenessProbe, TaskRestartPolicy, TaskSecretFile,
-    TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStatus, TaskValue, TaskValueDraft,
-    TaskVolumeMount,
+    TaskEvent, TaskRestartPolicy, TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStatus,
+    TaskValue, TaskValueDraft,
 };
 use crate::volumes::VolumeRegistry;
+use crate::workload::types::TaskExecutionSpec;
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use bollard::errors::Error as BollardError;
@@ -27,6 +27,7 @@ use crdt_store::uuid_key::UuidKey;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -302,26 +303,22 @@ pub enum TaskTrafficPublicationUpdate {
 #[derive(Clone)]
 pub struct TaskStartRequest {
     pub name: String,
-    pub image: String,
-    pub command: Vec<String>,
-    pub tty: bool,
-    pub cpu_millis: u64,
-    pub memory_bytes: u64,
-    pub gpu_count: u32,
+    pub execution: TaskExecutionSpec,
     pub gpu_device_ids: Vec<String>,
     pub id: Option<Uuid>,
     pub slot_ids: Vec<SlotId>,
-    pub restart_policy: Option<TaskRestartPolicy>,
-    pub termination_grace_period_secs: Option<u32>,
-    pub pre_stop_command: Option<Vec<String>>,
-    pub liveness: Option<TaskLivenessProbe>,
-    pub env: Vec<TaskEnvironmentVariable>,
-    pub secret_files: Vec<TaskSecretFile>,
-    pub volumes: Vec<TaskVolumeMount>,
-    pub networks: Vec<Uuid>,
     pub service_metadata: Option<TaskServiceMetadata>,
     /// Placement hint used by the scheduler when a task must land on a specific node.
     pub target_node: Option<Uuid>,
+}
+
+impl Deref for TaskStartRequest {
+    type Target = TaskExecutionSpec;
+
+    /// Exposes shared execution fields to existing task scheduling code during the cutover.
+    fn deref(&self) -> &Self::Target {
+        &self.execution
+    }
 }
 
 #[derive(Clone)]
@@ -552,23 +549,25 @@ impl TaskManager {
     ) -> Result<TaskSpec, anyhow::Error> {
         let request = TaskStartRequest {
             name: name.into(),
-            image: image.into(),
-            command,
-            tty: false,
-            cpu_millis,
-            memory_bytes,
-            gpu_count: 0,
+            execution: TaskExecutionSpec {
+                image: image.into(),
+                command,
+                tty: false,
+                cpu_millis,
+                memory_bytes,
+                gpu_count: 0,
+                restart_policy,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+            },
             gpu_device_ids: Vec::new(),
             id: None,
             slot_ids: Vec::new(),
-            restart_policy,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            liveness: None,
-            env: Vec::new(),
-            secret_files: Vec::new(),
-            volumes: Vec::new(),
-            networks: Vec::new(),
             service_metadata: None,
             target_node: None,
         };
