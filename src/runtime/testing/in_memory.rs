@@ -7,9 +7,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 
 use crate::runtime::types::{
-    RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeExecOptions,
-    RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogsOptions, RuntimeResult,
-    RuntimeStateInfo,
+    RuntimeAttachmentTarget, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest,
+    RuntimeError, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeLogFrame,
+    RuntimeLogsOptions, RuntimeResult, RuntimeStateInfo,
 };
 
 /// Returns whether tests requested the shared in-memory runtime backend through one env override.
@@ -238,6 +238,9 @@ impl RuntimeBackend for InMemoryRuntimeBackend {
                     ..Default::default()
                 },
                 created: 0,
+                attachment_target: entry
+                    .running
+                    .then_some(RuntimeAttachmentTarget::NetworkNamespacePid(1000)),
                 ..Default::default()
             });
         }
@@ -275,6 +278,9 @@ impl RuntimeBackend for InMemoryRuntimeBackend {
                 ..Default::default()
             },
             created: 0,
+            attachment_target: entry
+                .running
+                .then_some(RuntimeAttachmentTarget::NetworkNamespacePid(1000)),
             ..Default::default()
         })
     }

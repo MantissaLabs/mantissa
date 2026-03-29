@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use std::net::IpAddr;
 use uuid::Uuid;
 
+use crate::runtime::types::RuntimeAttachmentTarget;
+
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -15,13 +17,13 @@ pub use linux::AttachmentProvisioner as PlatformAttachmentProvisioner;
 #[cfg(not(target_os = "linux"))]
 pub type PlatformAttachmentProvisioner = AttachmentProvisioner;
 
-/// Parameters required to provision an attachment for a container network namespace.
+/// Parameters required to provision an attachment for one runtime-defined network target.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct AttachmentProvisioningRequest<'a> {
     pub bridge_name: &'a str,
     pub mtu: u32,
     pub attachment_id: Uuid,
-    pub container_pid: i32,
+    pub attachment_target: &'a RuntimeAttachmentTarget,
     pub assigned_ip: &'a str,
     pub prefix: u8,
     pub mac: &'a str,
@@ -161,7 +163,7 @@ pub(crate) fn host_iface_name(attachment_id: Uuid) -> String {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn container_iface_name(attachment_id: Uuid) -> String {
+pub(crate) fn instance_iface_name(attachment_id: Uuid) -> String {
     format!("mntc-{}", short_id(attachment_id))
 }
 

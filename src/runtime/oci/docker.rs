@@ -26,10 +26,10 @@ use bollard::service::ContainerInspectResponse;
 
 use crate::config;
 use crate::runtime::types::{
-    RestartPolicyType, RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities,
-    RuntimeConfigInfo, RuntimeCreateRequest, RuntimeError, RuntimeEvent, RuntimeExecOptions,
-    RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogStream, RuntimeLogsOptions,
-    RuntimeNetworkEndpoint, RuntimeResult, RuntimeStateInfo,
+    RestartPolicyType, RuntimeAttachOptions, RuntimeAttachmentTarget, RuntimeBackend,
+    RuntimeCapabilities, RuntimeConfigInfo, RuntimeCreateRequest, RuntimeError, RuntimeEvent,
+    RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogStream,
+    RuntimeLogsOptions, RuntimeNetworkEndpoint, RuntimeResult, RuntimeStateInfo,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -97,6 +97,16 @@ fn runtime_info_from_inspect(inspect: ContainerInspectResponse) -> RuntimeInfo {
         .and_then(|state| state.exit_code)
         .and_then(|value| i32::try_from(value).ok());
     let error = inspect.state.as_ref().and_then(|state| state.error.clone());
+    let attachment_target = inspect.state.as_ref().and_then(|state| {
+        if !state.running.unwrap_or(false) {
+            return None;
+        }
+        state
+            .pid
+            .filter(|pid| *pid > 0)
+            .and_then(|pid| i32::try_from(pid).ok())
+            .map(RuntimeAttachmentTarget::NetworkNamespacePid)
+    });
     let network_endpoints = inspect
         .network_settings
         .as_ref()
@@ -132,6 +142,7 @@ fn runtime_info_from_inspect(inspect: ContainerInspectResponse) -> RuntimeInfo {
         // metadata keeps the sortable creation field in the list/inventory path only.
         created: 0,
         config: RuntimeConfigInfo { tty },
+        attachment_target,
         network_endpoints,
     }
 }

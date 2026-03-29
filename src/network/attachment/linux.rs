@@ -17,8 +17,10 @@ use tokio::task::spawn_blocking;
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::runtime::types::RuntimeAttachmentTarget;
+
 use super::{
-    AttachmentProvisionerApi, AttachmentProvisioningRequest, container_iface_name, host_iface_name,
+    AttachmentProvisionerApi, AttachmentProvisioningRequest, host_iface_name, instance_iface_name,
 };
 use async_trait::async_trait;
 use nix::sched::{CloneFlags, setns};
@@ -82,14 +84,14 @@ impl AttachmentProvisioner {
         };
 
         let host_if = host_iface_name(request.attachment_id);
-        let container_if = container_iface_name(request.attachment_id);
+        let instance_if = instance_iface_name(request.attachment_id);
 
         let bridge_name = request.bridge_name;
 
         let host_index = match self.link_index(handle, &host_if).await? {
             Some(index) => index,
             None => {
-                self.create_veth(handle, &host_if, &container_if).await?;
+                self.create_veth(handle, &host_if, &instance_if).await?;
                 self.link_index(handle, &host_if)
                     .await?
                     .context("veth host interface missing after creation")?
@@ -97,7 +99,7 @@ impl AttachmentProvisioner {
         };
 
         let container_index = self
-            .link_index(handle, &container_if)
+            .link_index(handle, &instance_if)
             .await?
             .context("veth peer interface missing after creation")?;
 
@@ -137,49 +139,46 @@ impl AttachmentProvisioner {
             .await
             .with_context(|| format!("failed to bring {host_if} up"))?;
 
-        let netns_pid: u32 = request
-            .container_pid
+        let netns_pid = namespace_pid_for_attachment_target(request.attachment_target)?;
+        let netns_pid_u32: u32 = netns_pid
             .try_into()
-            .context("container pid is negative")?;
+            .context("runtime network namespace pid is negative")?;
 
         handle
             .link()
             .set(
                 LinkUnspec::new_with_index(container_index)
-                    .setns_by_pid(netns_pid)
+                    .setns_by_pid(netns_pid_u32)
                     .build(),
             )
             .execute()
             .await
             .with_context(|| {
-                format!(
-                    "failed to move {container_if} to pid {}",
-                    request.container_pid
-                )
+                format!("failed to move {instance_if} to runtime network namespace pid {netns_pid}")
             })?;
 
-        self.configure_container_interface(
-            container_if.clone(),
+        self.configure_instance_interface(
+            instance_if.clone(),
             request.mtu,
             request.assigned_ip.to_string(),
             request.prefix,
             request.mac.to_string(),
-            request.container_pid,
+            netns_pid,
         )
         .await
-        .with_context(|| format!("configure container interface {container_if}"))?;
+        .with_context(|| format!("configure runtime interface {instance_if}"))?;
 
         Ok(())
     }
 
-    async fn configure_container_interface(
+    async fn configure_instance_interface(
         &self,
         iface: String,
         mtu: u32,
         assigned_ip: String,
         prefix: u8,
         mac: String,
-        container_pid: i32,
+        network_namespace_pid: i32,
     ) -> Result<()> {
         let assigned_addr = assigned_ip
             .parse::<Ipv4Addr>()
@@ -187,17 +186,17 @@ impl AttachmentProvisioner {
         let mac_bytes = parse_mac(&mac)?;
 
         spawn_blocking(move || {
-            configure_container_interface_blocking(
+            configure_instance_interface_blocking(
                 iface,
                 mtu,
                 assigned_addr,
                 prefix,
                 mac_bytes,
-                container_pid,
+                network_namespace_pid,
             )
         })
         .await
-        .context("configure container interface task failed")??;
+        .context("configure runtime interface task failed")??;
 
         Ok(())
     }
@@ -584,19 +583,19 @@ fn warn_unless_not_found(err: rtnetlink::Error, context: impl FnOnce() -> String
     warn!(target: "network", "{}: {err}", context());
 }
 
-fn configure_container_interface_blocking(
+fn configure_instance_interface_blocking(
     iface: String,
     mtu: u32,
     assigned_ip: Ipv4Addr,
     prefix: u8,
     mac_bytes: Vec<u8>,
-    container_pid: i32,
+    network_namespace_pid: i32,
 ) -> Result<()> {
     let host_ns = File::open("/proc/self/ns/net").context("open host network namespace")?;
-    let target_ns = File::open(format!("/proc/{container_pid}/ns/net"))
-        .context("open container network namespace")?;
+    let target_ns = File::open(format!("/proc/{network_namespace_pid}/ns/net"))
+        .context("open runtime network namespace")?;
 
-    setns(&target_ns, CloneFlags::empty()).context("enter container network namespace")?;
+    setns(&target_ns, CloneFlags::empty()).context("enter runtime network namespace")?;
 
     let configure_result =
         configure_interface_in_current_ns(&iface, mtu, assigned_ip, prefix, mac_bytes);
@@ -623,11 +622,11 @@ fn configure_interface_in_current_ns(
     let rt = RuntimeBuilder::new_current_thread()
         .enable_all()
         .build()
-        .context("create runtime for container network namespace operations")?;
+        .context("create runtime for network namespace operations")?;
 
     rt.block_on(async move {
         let (connection, handle, _) = rtnetlink::new_connection()
-            .context("open rtnetlink connection in container namespace")?;
+            .context("open rtnetlink connection in runtime namespace")?;
         tokio::spawn(connection);
 
         let mut links = handle.link().get().match_name(iface.to_string()).execute();
@@ -635,8 +634,8 @@ fn configure_interface_in_current_ns(
         let link = links
             .try_next()
             .await
-            .context("query container interface state")?
-            .context("container interface missing after namespace move")?;
+            .context("query runtime interface state")?
+            .context("runtime interface missing after namespace move")?;
         let index = link.header.index;
 
         if mtu > 0 {
@@ -645,7 +644,7 @@ fn configure_interface_in_current_ns(
                 .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
                 .execute()
                 .await
-                .context("set container interface mtu")?;
+                .context("set runtime interface mtu")?;
         }
 
         handle
@@ -657,7 +656,7 @@ fn configure_interface_in_current_ns(
             )
             .execute()
             .await
-            .context("assign container interface mac")?;
+            .context("assign runtime interface mac")?;
 
         handle
             .address()
@@ -665,15 +664,27 @@ fn configure_interface_in_current_ns(
             .replace()
             .execute()
             .await
-            .context("assign overlay ip to container interface")?;
+            .context("assign overlay ip to runtime interface")?;
 
         handle
             .link()
             .set(LinkUnspec::new_with_index(index).up().build())
             .execute()
             .await
-            .context("bring container overlay interface up")?;
+            .context("bring runtime overlay interface up")?;
 
         Ok(())
     })
+}
+
+fn namespace_pid_for_attachment_target(target: &RuntimeAttachmentTarget) -> Result<i32> {
+    match target {
+        RuntimeAttachmentTarget::NetworkNamespacePid(pid) => Ok(*pid),
+        RuntimeAttachmentTarget::NetworkNamespacePath(path) => Err(anyhow!(
+            "network-namespace path attachment targets are not supported by the linux provisioner yet: {path}"
+        )),
+        RuntimeAttachmentTarget::TapDevice(name) => Err(anyhow!(
+            "tap-device attachment targets are not supported by the linux provisioner: {name}"
+        )),
+    }
 }

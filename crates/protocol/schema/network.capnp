@@ -213,8 +213,8 @@ struct NetworkAttachmentSpec {
   nodeId @11 :Data;
   # 16-byte UUID of the node hosting the attachment.
 
-  containerId @2 :Text;
-  # Container/runtime identifier on the node.
+  instanceId @2 :Text;
+  # Runtime instance identifier on the node.
 
   networkId @3 :Data;
   # 16-byte UUID of the network.

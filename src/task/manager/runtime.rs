@@ -19,7 +19,7 @@ use crate::network::types::{
     compute_network_attachment_id,
 };
 use crate::network::wireguard;
-use crate::runtime::types::RuntimeEvent;
+use crate::runtime::types::{RuntimeAttachmentTarget, RuntimeEvent};
 use crate::task::causality::{compare_task_causality, compare_task_status_causality};
 use crate::task::container::ContainerState;
 use crate::task::types::{
@@ -40,8 +40,8 @@ const ATTACHMENT_PROVISION_RETRY_BASE_MS: u64 = 50;
 const ATTACHMENT_PROVISION_RETRY_MAX_MS: u64 = 800;
 
 impl TaskManager {
-    /// Periodically re-attach networks to running containers whose attachment interfaces vanished
-    /// (for example after a container restart) so backends rejoin service discovery and load
+    /// Periodically re-attach networks to running instances whose attachment interfaces vanished
+    /// (for example after a runtime restart) so backends rejoin service discovery and load
     /// balancing without manual intervention.
     pub(super) async fn repair_runtime_attachments(&self) -> Result<()> {
         self.cleanup_orphaned_local_attachments()
@@ -109,27 +109,27 @@ impl TaskManager {
             }
 
             let desired_name = format!("mantissa-{}", spec.id);
-            let mut container_id = {
+            let mut instance_id = {
                 let guard = self.local_state.local_containers.lock().await;
                 guard
                     .get(&spec.id)
                     .cloned()
                     .filter(|id| !id.is_empty())
-                    .unwrap_or_else(|| attachment.container_id.clone())
+                    .unwrap_or_else(|| attachment.instance_id.clone())
             };
-            if container_id.is_empty() {
-                container_id = desired_name.clone();
+            if instance_id.is_empty() {
+                instance_id = desired_name.clone();
             }
 
             let inspect = match self
                 .runtime
                 .runtime_backend
-                .inspect_instance(&container_id)
+                .inspect_instance(&instance_id)
                 .await
             {
                 Ok(info) => info,
                 Err(first_err) => {
-                    if container_id != desired_name {
+                    if instance_id != desired_name {
                         match self
                             .runtime
                             .runtime_backend
@@ -142,7 +142,7 @@ impl TaskManager {
                                     target: "task",
                                     task = %attachment.task_id,
                                     attachment = %attachment.id,
-                                    container = %container_id,
+                                    instance = %instance_id,
                                     name = %desired_name,
                                     "skipping repair; inspect failed (by id and name): {first_err:#}; {err:#}"
                                 );
@@ -154,7 +154,7 @@ impl TaskManager {
                             target: "task",
                             task = %attachment.task_id,
                             attachment = %attachment.id,
-                            container = %container_id,
+                            instance = %instance_id,
                             "skipping repair; inspect failed: {first_err:#}"
                         );
                         continue;
@@ -163,18 +163,18 @@ impl TaskManager {
             };
 
             if !inspect.id.is_empty() {
-                container_id = inspect.id.clone();
+                instance_id = inspect.id.clone();
             }
 
             {
                 let mut guard = self.local_state.local_containers.lock().await;
-                guard.insert(spec.id, container_id.clone());
+                guard.insert(spec.id, instance_id.clone());
             }
 
             if let Err(err) = self
                 .ensure_runtime_attachments(
                     spec.id,
-                    &container_id,
+                    &instance_id,
                     &spec.networks,
                     spec.service_metadata.as_ref(),
                 )
@@ -184,7 +184,7 @@ impl TaskManager {
                     target: "task",
                     task = %attachment.task_id,
                     attachment = %attachment.id,
-                    container = %container_id,
+                    instance = %instance_id,
                     "failed to repair runtime attachment: {err:#}"
                 );
             }
@@ -230,7 +230,7 @@ impl TaskManager {
                 continue;
             }
 
-            let container_id = {
+            let instance_id = {
                 let guard = self.local_state.local_containers.lock().await;
                 guard
                     .get(&value.id)
@@ -242,7 +242,7 @@ impl TaskManager {
             if let Err(err) = self
                 .ensure_runtime_attachments(
                     value.id,
-                    &container_id,
+                    &instance_id,
                     &value.networks,
                     value.service_metadata.as_ref(),
                 )
@@ -251,7 +251,7 @@ impl TaskManager {
                 warn!(
                     target: "task",
                     task = %value.id,
-                    container = %container_id,
+                    instance = %instance_id,
                     "failed to restore missing attachments for running task: {err:#}"
                 );
             }
@@ -690,7 +690,7 @@ impl TaskManager {
     pub(super) async fn ensure_runtime_attachments(
         &self,
         task_id: Uuid,
-        container_id: &str,
+        instance_id: &str,
         network_ids: &[Uuid],
         service_meta: Option<&TaskServiceMetadata>,
     ) -> Result<()> {
@@ -721,14 +721,14 @@ impl TaskManager {
             warn!(
                 target: "task",
                 task = %task_id,
-                container = %container_id,
+                instance = %instance_id,
                 "skipping network attachment because no networks were provided"
             );
             return Ok(());
         }
 
-        let Some(mut container_pid) = self
-            .attachment_container_pid_for_runtime(task_id, container_id)
+        let Some(mut attachment_target) = self
+            .runtime_attachment_target_for_instance(task_id, instance_id)
             .await?
         else {
             return Ok(());
@@ -772,8 +772,8 @@ impl TaskManager {
                         location_changed = true;
                     }
 
-                    if value.container_id != container_id {
-                        value.container_id = container_id.to_string();
+                    if value.instance_id != instance_id {
+                        value.instance_id = instance_id.to_string();
                         location_changed = true;
                     }
 
@@ -810,7 +810,7 @@ impl TaskManager {
                         id: compute_network_attachment_id(task_id, *network_id),
                         task_id,
                         node_id: self.local_node_id,
-                        container_id: container_id.to_string(),
+                        instance_id: instance_id.to_string(),
                         network_id: *network_id,
                         task_updated_at: task_revision.clone(),
                         requested_ip: None,
@@ -874,7 +874,7 @@ impl TaskManager {
                     attachment = %attachment.id,
                     bridge = %bridge,
                     mtu,
-                    pid = container_pid,
+                    attachment_target = ?attachment_target,
                     assigned_ip = %allocation.assigned_ip,
                     mac = %allocation.mac_address,
                     "provisioning new runtime attachment"
@@ -890,7 +890,7 @@ impl TaskManager {
                 if let Err(err) = self
                     .ensure_runtime_attachment_with_retry(
                         task_id,
-                        container_id,
+                        instance_id,
                         &spec.id,
                         &attachment.id,
                         &bridge,
@@ -898,7 +898,7 @@ impl TaskManager {
                         &allocation.assigned_ip,
                         prefix,
                         &allocation.mac_address,
-                        &mut container_pid,
+                        &mut attachment_target,
                     )
                     .await
                 {
@@ -965,52 +965,60 @@ impl TaskManager {
 
     /// # Description:
     ///
-    /// Resolves the live container PID used by network attachment provisioning and returns
-    /// `None` when the container is not running yet.
-    async fn attachment_container_pid_for_runtime(
+    /// Resolves the runtime-defined attachment target used by network attachment provisioning and
+    /// returns `None` when the instance is not ready for network wiring yet.
+    async fn runtime_attachment_target_for_instance(
         &self,
         task_id: Uuid,
-        container_id: &str,
-    ) -> Result<Option<i32>> {
+        instance_id: &str,
+    ) -> Result<Option<RuntimeAttachmentTarget>> {
         let inspect = self
             .runtime
             .runtime_backend
-            .inspect_instance(container_id)
+            .inspect_instance(instance_id)
             .await
             .with_context(|| {
-                format!("inspect container {container_id} for network attachment provisioning")
+                format!(
+                    "inspect runtime instance {instance_id} for network attachment provisioning"
+                )
             })?;
-        let pid = inspect.state.pid.unwrap_or(0);
 
-        // Treat unknown running state as true for compatibility with older Docker/mocks, but
-        // require a non-zero PID.
+        // Treat unknown running state as true for compatibility with older runtime mocks, but
+        // require the backend to publish a concrete attachment target before provisioning.
         let running = inspect.state.running.unwrap_or(true);
-        if pid == 0 || !running {
+        if !running {
             tracing::trace!(
                 target: "task",
                 task = %task_id,
-                container = %container_id,
-                pid,
+                instance = %instance_id,
                 running,
-                "skipping attachment provisioning; container not running yet"
+                "skipping attachment provisioning; runtime instance not running yet"
             );
             return Ok(None);
         }
 
-        let container_pid = i32::try_from(pid)
-            .context("container pid exceeds 32-bit range for attachment provisioning")?;
-        Ok(Some(container_pid))
+        let Some(attachment_target) = inspect.attachment_target.clone() else {
+            tracing::trace!(
+                target: "task",
+                task = %task_id,
+                instance = %instance_id,
+                "skipping attachment provisioning; runtime attachment target unavailable"
+            );
+            return Ok(None);
+        };
+
+        Ok(Some(attachment_target))
     }
 
     /// # Description:
     ///
-    /// Provisions one runtime attachment and retries transient container lifecycle races by
-    /// refreshing the target PID before each retry.
+    /// Provisions one runtime attachment and retries transient runtime lifecycle races by
+    /// refreshing the attachment target before each retry.
     #[allow(clippy::too_many_arguments)]
     async fn ensure_runtime_attachment_with_retry(
         &self,
         task_id: Uuid,
-        container_id: &str,
+        instance_id: &str,
         network_id: &Uuid,
         attachment_id: &Uuid,
         bridge: &str,
@@ -1018,14 +1026,14 @@ impl TaskManager {
         assigned_ip: &str,
         prefix: u8,
         mac: &str,
-        container_pid: &mut i32,
+        attachment_target: &mut RuntimeAttachmentTarget,
     ) -> Result<()> {
         for attempt in 1..=ATTACHMENT_PROVISION_MAX_ATTEMPTS {
             let provisioning = AttachmentProvisioningRequest {
                 bridge_name: bridge,
                 mtu,
                 attachment_id: *attachment_id,
-                container_pid: *container_pid,
+                attachment_target,
                 assigned_ip,
                 prefix,
                 mac,
@@ -1051,31 +1059,31 @@ impl TaskManager {
                         network_id = %network_id,
                         attachment = %attachment_id,
                         bridge = %bridge,
-                        container = %container_id,
-                        pid = *container_pid,
+                        instance = %instance_id,
+                        attachment_target = ?attachment_target,
                         attempt,
                         max_attempts = ATTACHMENT_PROVISION_MAX_ATTEMPTS,
                         backoff_ms = backoff.as_millis() as u64,
                         error = ?err,
-                        "runtime attachment provisioning hit transient container race; retrying"
+                        "runtime attachment provisioning hit transient runtime race; retrying"
                     );
                     sleep(backoff).await;
 
                     match self
-                        .attachment_container_pid_for_runtime(task_id, container_id)
+                        .runtime_attachment_target_for_instance(task_id, instance_id)
                         .await
                     {
-                        Ok(Some(refreshed_pid)) => {
-                            *container_pid = refreshed_pid;
+                        Ok(Some(refreshed_target)) => {
+                            *attachment_target = refreshed_target;
                         }
                         Ok(None) => {
                             return Err(err.context(
-                                "container stopped before runtime attachment retry could continue",
+                                "runtime attachment target disappeared before retry could continue",
                             ));
                         }
                         Err(refresh_err) => {
                             return Err(err.context(format!(
-                                "failed to refresh container pid for attachment retry: {refresh_err:#}"
+                                "failed to refresh runtime attachment target for retry: {refresh_err:#}"
                             )));
                         }
                     }
@@ -1270,16 +1278,21 @@ impl TaskManager {
 /// # Description:
 ///
 /// Classifies runtime attachment provisioning errors that are typically caused by transient
-/// container lifecycle races (namespace/pid changes during setup) and are safe to retry.
+/// instance lifecycle races (namespace or attachment-target changes during setup) and are safe
+/// to retry.
 fn is_retryable_attachment_provision_error(err: &anyhow::Error) -> bool {
     let text = format!("{err:#}").to_ascii_lowercase();
     (text.contains("open container network namespace")
         && text.contains("no such file or directory"))
+        || (text.contains("open runtime network namespace")
+            && text.contains("no such file or directory"))
         || (text.contains("enter container network namespace") && text.contains("no such process"))
+        || (text.contains("enter runtime network namespace") && text.contains("no such process"))
         || (text.contains("failed to move") && text.contains("no such process"))
         || (text.contains("failed to create veth") && text.contains("file exists"))
         || (text.contains("failed to set mtu") && text.contains("no such device"))
         || text.contains("container interface missing after namespace move")
+        || text.contains("instance interface missing after namespace move")
 }
 
 /// # Description:

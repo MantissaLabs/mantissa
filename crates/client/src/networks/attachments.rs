@@ -59,7 +59,7 @@ pub async fn attachments(cfg: &ClientConfig, id: &str) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ATTACHMENT\tTASK\tNODE\tCONTAINER\tIP\tMAC\tSTATE\tUPDATED\tERROR"
+        "ATTACHMENT\tTASK\tNODE\tINSTANCE\tIP\tMAC\tSTATE\tUPDATED\tERROR"
     )?;
     for attachment in output {
         let ip = attachment.assigned_ip.unwrap_or_else(|| "-".to_string());
@@ -71,7 +71,7 @@ pub async fn attachments(cfg: &ClientConfig, id: &str) -> Result<()> {
             attachment.attachment_id,
             attachment.task_id,
             attachment.node_id,
-            attachment.container_id,
+            attachment.instance_id,
             ip,
             mac,
             attachment.state,

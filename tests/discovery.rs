@@ -188,7 +188,7 @@ fn ready_attachment_with_publication(
         id: mantissa::network::types::compute_network_attachment_id(task_id, network_id),
         task_id,
         node_id,
-        container_id: format!("container-{task_id}"),
+        instance_id: format!("container-{task_id}"),
         network_id,
         task_updated_at: Some(chrono::Utc::now().to_rfc3339()),
         requested_ip: Some(backend_ip.to_string()),

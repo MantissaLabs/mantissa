@@ -274,6 +274,14 @@ pub struct RuntimeStateInfo {
     pub error: Option<String>,
 }
 
+/// Runtime-specific network attachment target used by the networking layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeAttachmentTarget {
+    NetworkNamespacePid(i32),
+    NetworkNamespacePath(String),
+    TapDevice(String),
+}
+
 /// One runtime network endpoint surfaced by inspect responses.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeNetworkEndpoint {
@@ -291,6 +299,7 @@ pub struct RuntimeInfo {
     pub state: RuntimeStateInfo,
     pub created: i64,
     pub config: RuntimeConfigInfo,
+    pub attachment_target: Option<RuntimeAttachmentTarget>,
     pub network_endpoints: Vec<RuntimeNetworkEndpoint>,
 }
 

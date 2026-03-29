@@ -161,7 +161,7 @@ fn write_network_attachment(
     builder.set_attachment_id(attachment.id.as_bytes());
     builder.set_task_id(attachment.task_id.as_bytes());
     builder.set_node_id(attachment.node_id.as_bytes());
-    builder.set_container_id(&attachment.container_id);
+    builder.set_instance_id(&attachment.instance_id);
     builder.set_network_id(attachment.network_id.as_bytes());
     builder.set_requested_ip(attachment.requested_ip.as_deref().unwrap_or_default());
     builder.set_assigned_ip(attachment.assigned_ip.as_deref().unwrap_or_default());

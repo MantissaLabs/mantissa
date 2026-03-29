@@ -13,9 +13,10 @@ use crate::network::types::{
 };
 use crate::registry::Registry;
 use crate::runtime::types::{
-    ResourceLimits, RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities, RuntimeConfigInfo,
-    RuntimeCreateRequest, RuntimeError, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo,
-    RuntimeLogFrame, RuntimeLogStream, RuntimeLogsOptions, RuntimeResult, RuntimeStateInfo,
+    ResourceLimits, RuntimeAttachOptions, RuntimeAttachmentTarget, RuntimeBackend,
+    RuntimeCapabilities, RuntimeConfigInfo, RuntimeCreateRequest, RuntimeError, RuntimeExecOptions,
+    RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogStream, RuntimeLogsOptions,
+    RuntimeResult, RuntimeStateInfo,
 };
 use crate::scheduler::digest::SchedulerDigestRegistry;
 use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
@@ -133,44 +134,48 @@ impl RuntimeBackend for MockRuntimeBackend {
         Ok(id)
     }
 
-    async fn start_instance(&self, container_id: &str) -> RuntimeResult<()> {
+    async fn start_instance(&self, instance_id: &str) -> RuntimeResult<()> {
         let mut inspect = self.inspect.lock().await;
         let mut found = false;
         for info in inspect.values_mut() {
-            if info.id == container_id || info.name == container_id {
+            if info.id == instance_id || info.name == instance_id {
                 info.status = "Up".to_string();
                 info.state.raw_status = Some("running".to_string());
                 info.state.running = Some(true);
                 if info.state.pid.unwrap_or_default() == 0 {
                     info.state.pid = Some(10_000);
                 }
+                info.attachment_target = Some(RuntimeAttachmentTarget::NetworkNamespacePid(
+                    info.state.pid.unwrap_or(10_000) as i32,
+                ));
                 found = true;
             }
         }
         if !found {
-            return Err(RuntimeError::NotFound(container_id.to_string()));
+            return Err(RuntimeError::NotFound(instance_id.to_string()));
         }
         Ok(())
     }
 
     async fn stop_instance(
         &self,
-        container_id: &str,
+        instance_id: &str,
         timeout: Option<std::time::Duration>,
     ) -> RuntimeResult<()> {
         let delay = *self.stop_delay.lock().await;
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
-        self.stopped.lock().await.push(container_id.to_string());
+        self.stopped.lock().await.push(instance_id.to_string());
         self.stop_timeouts.lock().await.push(timeout);
         let mut inspect = self.inspect.lock().await;
         for info in inspect.values_mut() {
-            if info.id == container_id || info.name == container_id {
+            if info.id == instance_id || info.name == instance_id {
                 info.status = "Exited".to_string();
                 info.state.raw_status = Some("exited".to_string());
                 info.state.running = Some(false);
                 info.state.pid = Some(0);
+                info.attachment_target = None;
             }
         }
         Ok(())
@@ -178,7 +183,7 @@ impl RuntimeBackend for MockRuntimeBackend {
 
     async fn exec_instance(
         &self,
-        container_id: &str,
+        instance_id: &str,
         command: &[String],
         timeout: Option<std::time::Duration>,
     ) -> RuntimeResult<RuntimeExecResult> {
@@ -189,7 +194,7 @@ impl RuntimeBackend for MockRuntimeBackend {
         self.exec_calls
             .lock()
             .await
-            .push((container_id.to_string(), command.to_vec(), timeout));
+            .push((instance_id.to_string(), command.to_vec(), timeout));
         if let Some(result) = self.exec_results.lock().await.pop_front() {
             return result;
         }
@@ -198,7 +203,7 @@ impl RuntimeBackend for MockRuntimeBackend {
 
     async fn restart_instance(
         &self,
-        _container_id: &str,
+        _instance_id: &str,
         _timeout: Option<std::time::Duration>,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -206,7 +211,7 @@ impl RuntimeBackend for MockRuntimeBackend {
 
     async fn remove_instance(
         &self,
-        container_id: &str,
+        instance_id: &str,
         _force: bool,
         _remove_volumes: bool,
     ) -> RuntimeResult<()> {
@@ -214,9 +219,9 @@ impl RuntimeBackend for MockRuntimeBackend {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
-        self.removed.lock().await.push(container_id.to_string());
+        self.removed.lock().await.push(instance_id.to_string());
         let mut inspect = self.inspect.lock().await;
-        inspect.retain(|key, response| key != container_id && response.id != container_id);
+        inspect.retain(|key, response| key != instance_id && response.id != instance_id);
         Ok(())
     }
 
@@ -227,16 +232,16 @@ impl RuntimeBackend for MockRuntimeBackend {
         Ok(self.listed.lock().await.clone())
     }
 
-    async fn inspect_instance(&self, container_id: &str) -> RuntimeResult<RuntimeInfo> {
+    async fn inspect_instance(&self, instance_id: &str) -> RuntimeResult<RuntimeInfo> {
         self.inspect_calls
             .lock()
             .await
-            .push(container_id.to_string());
+            .push(instance_id.to_string());
         let guard = self.inspect.lock().await;
         guard
-            .get(container_id)
+            .get(instance_id)
             .cloned()
-            .ok_or_else(|| RuntimeError::NotFound(container_id.into()))
+            .ok_or_else(|| RuntimeError::NotFound(instance_id.into()))
     }
 
     async fn image_present(&self, image: &str) -> RuntimeResult<bool> {
@@ -257,14 +262,14 @@ impl RuntimeBackend for MockRuntimeBackend {
 
     async fn stream_instance_logs(
         &self,
-        container_id: &str,
+        instance_id: &str,
         options: &RuntimeLogsOptions,
         logs_tx: tokio::sync::mpsc::Sender<RuntimeLogFrame>,
     ) -> RuntimeResult<()> {
         self.log_calls
             .lock()
             .await
-            .push((container_id.to_string(), options.clone()));
+            .push((instance_id.to_string(), options.clone()));
         if let Some(err) = self.log_errors.lock().await.pop_front() {
             return Err(err);
         }
@@ -273,7 +278,7 @@ impl RuntimeBackend for MockRuntimeBackend {
             .log_frames
             .lock()
             .await
-            .get(container_id)
+            .get(instance_id)
             .cloned()
             .unwrap_or_default();
         for frame in frames {
@@ -287,7 +292,7 @@ impl RuntimeBackend for MockRuntimeBackend {
 
     async fn attach_instance(
         &self,
-        container_id: &str,
+        instance_id: &str,
         options: &RuntimeAttachOptions,
         output_tx: tokio::sync::mpsc::Sender<RuntimeLogFrame>,
         mut input_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
@@ -295,7 +300,7 @@ impl RuntimeBackend for MockRuntimeBackend {
         self.attach_calls
             .lock()
             .await
-            .push((container_id.to_string(), options.clone()));
+            .push((instance_id.to_string(), options.clone()));
         if let Some(err) = self.attach_errors.lock().await.pop_front() {
             return Err(err);
         }
@@ -304,7 +309,7 @@ impl RuntimeBackend for MockRuntimeBackend {
             .attach_frames
             .lock()
             .await
-            .get(container_id)
+            .get(instance_id)
             .cloned()
             .unwrap_or_default();
         for frame in frames {
@@ -320,13 +325,13 @@ impl RuntimeBackend for MockRuntimeBackend {
         self.attach_inputs
             .lock()
             .await
-            .insert(container_id.to_string(), chunks);
+            .insert(instance_id.to_string(), chunks);
         Ok(())
     }
 
     async fn exec_instance_stream(
         &self,
-        container_id: &str,
+        instance_id: &str,
         options: &RuntimeExecOptions,
         output_tx: tokio::sync::mpsc::Sender<RuntimeLogFrame>,
         mut input_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
@@ -334,13 +339,13 @@ impl RuntimeBackend for MockRuntimeBackend {
         self.exec_stream_calls
             .lock()
             .await
-            .push((container_id.to_string(), options.clone()));
+            .push((instance_id.to_string(), options.clone()));
 
         let frames = self
             .exec_stream_frames
             .lock()
             .await
-            .get(container_id)
+            .get(instance_id)
             .cloned()
             .unwrap_or_default();
         for frame in frames {
@@ -356,7 +361,7 @@ impl RuntimeBackend for MockRuntimeBackend {
         self.exec_stream_inputs
             .lock()
             .await
-            .insert(container_id.to_string(), chunks);
+            .insert(instance_id.to_string(), chunks);
 
         if let Some(result) = self.exec_stream_results.lock().await.pop_front() {
             return result;
@@ -400,6 +405,8 @@ fn runtime_info_with_state(
             exit_code,
             error: error.map(str::to_string),
         },
+        attachment_target: (running && pid > 0)
+            .then_some(RuntimeAttachmentTarget::NetworkNamespacePid(pid as i32)),
         ..Default::default()
     }
 }
@@ -529,7 +536,7 @@ impl AttachmentProvisionerApi for FlakyAttachmentProvisioner {
 struct RetryingAttachmentProvisioner {
     attachments: AsyncMutex<HashSet<Uuid>>,
     fail_remaining: AsyncMutex<usize>,
-    ensure_calls: AsyncMutex<Vec<i32>>,
+    ensure_calls: AsyncMutex<Vec<RuntimeAttachmentTarget>>,
 }
 
 impl RetryingAttachmentProvisioner {
@@ -550,13 +557,16 @@ impl AttachmentProvisionerApi for RetryingAttachmentProvisioner {
     }
 
     async fn ensure_attachment(&self, request: &AttachmentProvisioningRequest<'_>) -> Result<()> {
-        self.ensure_calls.lock().await.push(request.container_pid);
+        self.ensure_calls
+            .lock()
+            .await
+            .push(request.attachment_target.clone());
         let mut remaining = self.fail_remaining.lock().await;
         if *remaining > 0 {
             *remaining -= 1;
+            let attachment_target = format!("{:?}", request.attachment_target);
             return Err(anyhow!(
-                "failed to move mntc-test to pid {}\n\nCaused by:\n    Received a netlink error message No such process (os error 3)",
-                request.container_pid
+                "failed to move mntc-test to attachment target {attachment_target}\n\nCaused by:\n    Received a netlink error message No such process (os error 3)"
             ));
         }
         drop(remaining);
@@ -2614,7 +2624,7 @@ async fn reconcile_running_task_executes_http_liveness_probe_without_container_e
             id: crate::network::types::compute_network_attachment_id(spec.id, network_id),
             task_id: spec.id,
             node_id: manager.local_node_id,
-            container_id: "container-0".to_string(),
+            instance_id: "container-0".to_string(),
             network_id,
             task_updated_at: Some(Utc::now().to_rfc3339()),
             requested_ip: Some("127.0.0.1".to_string()),
@@ -2690,7 +2700,7 @@ async fn reconcile_running_task_executes_tcp_liveness_probe_without_container_ex
             id: crate::network::types::compute_network_attachment_id(spec.id, network_id),
             task_id: spec.id,
             node_id: manager.local_node_id,
-            container_id: "container-0".to_string(),
+            instance_id: "container-0".to_string(),
             network_id,
             task_updated_at: Some(Utc::now().to_rfc3339()),
             requested_ip: Some("127.0.0.1".to_string()),
@@ -5008,7 +5018,7 @@ async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachme
                 id: crate::network::types::compute_network_attachment_id(task_id, network.id),
                 task_id,
                 node_id: manager.local_node_id,
-                container_id: format!("mantissa-{task_id}"),
+                instance_id: format!("mantissa-{task_id}"),
                 network_id: network.id,
                 task_updated_at: Some(now),
                 requested_ip: Some("10.54.0.2".to_string()),
@@ -5228,7 +5238,7 @@ async fn remove_event_purges_remote_attachment_without_local_spec() {
         id: crate::network::types::compute_network_attachment_id(task_id, network_id),
         task_id,
         node_id: Uuid::new_v4(),
-        container_id: format!("mantissa-{task_id}"),
+        instance_id: format!("mantissa-{task_id}"),
         network_id,
         task_updated_at: Some(Utc::now().to_rfc3339()),
         requested_ip: Some("10.77.0.2".to_string()),
@@ -5980,7 +5990,7 @@ async fn teardown_local_attachment_records_preserves_remote_rows() {
         id: crate::network::types::compute_network_attachment_id(task_id, local_network),
         task_id,
         node_id: manager.local_node_id,
-        container_id: format!("mantissa-{task_id}"),
+        instance_id: format!("mantissa-{task_id}"),
         network_id: local_network,
         task_updated_at: Some(Utc::now().to_rfc3339()),
         requested_ip: Some("10.78.0.2".to_string()),
@@ -5996,7 +6006,7 @@ async fn teardown_local_attachment_records_preserves_remote_rows() {
         id: crate::network::types::compute_network_attachment_id(task_id, remote_network),
         task_id,
         node_id: remote_node,
-        container_id: format!("mantissa-{task_id}"),
+        instance_id: format!("mantissa-{task_id}"),
         network_id: remote_network,
         task_updated_at: Some(Utc::now().to_rfc3339()),
         requested_ip: Some("10.78.0.3".to_string()),
@@ -6083,7 +6093,7 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
         id: crate::network::types::compute_network_attachment_id(task_id, network_id),
         task_id,
         node_id: manager.local_node_id,
-        container_id: format!("mantissa-{task_id}"),
+        instance_id: format!("mantissa-{task_id}"),
         network_id,
         task_updated_at: Some(now),
         requested_ip: Some("10.79.0.2".to_string()),

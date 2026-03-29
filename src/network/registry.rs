@@ -631,7 +631,7 @@ mod tests {
                 id: crate::network::types::compute_network_attachment_id(task_id, network_id),
                 task_id,
                 node_id,
-                container_id: "container-a".to_string(),
+                instance_id: "container-a".to_string(),
                 network_id,
                 task_updated_at: Some("2026-03-09T00:00:00Z".to_string()),
                 requested_ip: Some("10.0.0.2".to_string()),

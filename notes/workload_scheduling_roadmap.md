@@ -514,7 +514,7 @@ containers.
 
 ### Status
 
-Pending.
+Completed on 2026-03-29.
 
 ### Scope
 
@@ -551,6 +551,10 @@ Pending.
 7. `src/task/manager/state.rs`
 8. `src/runtime/types.rs`
 9. `src/runtime/oci/docker.rs`
+10. `src/runtime/testing/in_memory.rs`
+11. `src/task/manager/tests.rs`
+12. `crates/client/src/networks/types.rs`
+13. `crates/client/src/networks/attachments.rs`
 
 ### Exit Criteria
 
@@ -565,6 +569,83 @@ Pending.
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
+
+### Implemented
+
+1. Added `RuntimeAttachmentTarget` to `src/runtime/types.rs` and extended
+   `RuntimeInfo` so runtimes can publish a generic attachment target alongside
+   running state and network endpoints.
+2. Updated the OCI Docker backend in `src/runtime/oci/docker.rs` and the shared
+   test backend in `src/runtime/testing/in_memory.rs` to publish attachment
+   targets through `RuntimeInfo` instead of forcing the task manager to read
+   Docker-specific inspect fields.
+3. Refactored `src/network/attachment.rs` and
+   `src/network/attachment/linux.rs` so attachment provisioning consumes a
+   runtime-defined attachment target rather than a raw container PID.
+4. Renamed network attachment persistence and wire fields from `container_id`
+   to `instance_id` in:
+   - `src/network/types.rs`
+   - `src/network/service.rs`
+   - `crates/protocol/schema/network.capnp`
+   - `crates/client/src/networks/types.rs`
+   - `crates/client/src/networks/attachments.rs`
+5. Refactored `src/task/manager/runtime.rs` so attachment reconciliation,
+   repair, and retry logic refresh the runtime attachment target through
+   `inspect_instance()` before each retry instead of reading PID data directly.
+6. Updated attachment-related manager tests in `src/task/manager/tests.rs` to
+   exercise the new runtime attachment target flow and keep retry validation in
+   place.
+
+### Removed
+
+1. Removed `container_pid` from `AttachmentProvisioningRequest`.
+2. Removed `container_id` from generic network attachment persistence and
+   client decoding, replacing it with `instance_id`.
+3. Removed generic task-manager attachment setup logic that interpreted runtime
+   inspect PID fields directly during provisioning retries.
+4. Removed the last client-side attachment listing references to container-only
+   terminology in the network attachment path.
+
+### Findings
+
+1. The attachment target belongs in the runtime layer, not the network layer:
+   runtimes produce it, task reconciliation refreshes it, and the networking
+   layer only consumes it.
+2. The Linux provisioner currently supports `RuntimeAttachmentTarget::
+   NetworkNamespacePid` and returns explicit errors for netns-path or tap-based
+   targets. That is acceptable for this milestone because the generic contract
+   now exists and future runtimes can add concrete provisioner support without
+   reopening the task manager path.
+3. `src/task/manager/state.rs` did not require direct edits. The existing
+   boundary through `src/task/manager/runtime.rs` was already the right place
+   to contain the generic attachment-target handoff.
+
+### Validation Completed
+
+1. `cargo fmt --all`
+2. `cargo clippy --all-targets -- -D warnings`
+3. `cargo test`
+
+All three commands passed on 2026-03-29.
+
+### Proposed Commit
+
+```text
+network: generalize runtime attachment targets
+
+Replace the container-specific attachment wiring path with a generic
+runtime attachment target that is surfaced by runtime inspect results
+and consumed by the networking layer.
+
+This renames network attachment records from container_id to
+instance_id, removes container_pid from attachment provisioning, and
+teaches the task manager to refresh runtime attachment targets during
+retry instead of reading Docker-shaped inspect state directly.
+
+The Docker backend and shared in-memory runtime now publish attachment
+targets through RuntimeInfo, while the client and network protocol use
+instance terminology consistently for attachment listings.
+```
 
 ## Milestone 4: Internal Workload Core
 
