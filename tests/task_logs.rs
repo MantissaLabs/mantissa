@@ -4,13 +4,13 @@ mod common;
 use async_trait::async_trait;
 use capnp_rpc::new_client as capnp_new_client;
 use chrono::Utc;
-use common::testkit::{ContainerManagerOverrideGuard, TestNode};
+use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use crdt_store::uuid_key::UuidKey;
-use mantissa::task::container::ContainerState;
-use mantissa::task::docker::{
-    ContainerCreateRequest, ContainerError, ContainerInfo, ContainerLogFrame, ContainerLogStream,
-    ContainerLogsOptions, ContainerManager,
+use mantissa::runtime::types::{
+    RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeInfo, RuntimeLogFrame,
+    RuntimeLogStream, RuntimeLogsOptions,
 };
+use mantissa::task::container::ContainerState;
 use mantissa::task::types::{TaskValue, TaskValueDraft};
 use protocol::task::task_log_sink;
 use std::collections::HashMap;
@@ -20,77 +20,74 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-type LogCall = (String, ContainerLogsOptions);
+type LogCall = (String, RuntimeLogsOptions);
 type CapturedTaskLogFrames = Arc<AsyncMutex<Vec<(String, Vec<u8>)>>>;
 
 #[derive(Clone, Default)]
-struct StaticLogsContainerManager {
-    frames: Arc<AsyncMutex<HashMap<String, Vec<ContainerLogFrame>>>>,
+struct StaticLogsRuntimeBackend {
+    frames: Arc<AsyncMutex<HashMap<String, Vec<RuntimeLogFrame>>>>,
     calls: Arc<AsyncMutex<Vec<LogCall>>>,
 }
 
 #[async_trait]
-impl ContainerManager for StaticLogsContainerManager {
-    async fn create_container(
+impl RuntimeBackend for StaticLogsRuntimeBackend {
+    async fn create_instance(
         &self,
-        _request: ContainerCreateRequest,
-    ) -> Result<String, ContainerError> {
+        _request: RuntimeCreateRequest,
+    ) -> Result<String, RuntimeError> {
         Ok(Uuid::new_v4().to_string())
     }
 
-    async fn start_container(&self, _container_id: &str) -> Result<(), ContainerError> {
+    async fn start_instance(&self, _container_id: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
 
-    async fn stop_container(
+    async fn stop_instance(
         &self,
         _container_id: &str,
         _timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 
-    async fn restart_container(
+    async fn restart_instance(
         &self,
         _container_id: &str,
         _timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 
-    async fn remove_container(
+    async fn remove_instance(
         &self,
         _container_id: &str,
         _force: bool,
         _remove_volumes: bool,
-    ) -> Result<(), ContainerError> {
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 
-    async fn list_containers(
+    async fn list_instances(
         &self,
         _filters: Option<HashMap<String, Vec<String>>>,
-    ) -> Result<Vec<ContainerInfo>, ContainerError> {
+    ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
         Ok(Vec::new())
     }
 
-    async fn inspect_container(
-        &self,
-        container_id: &str,
-    ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
-        Err(ContainerError::NotFound(container_id.to_string()))
+    async fn inspect_instance(&self, container_id: &str) -> Result<RuntimeInfo, RuntimeError> {
+        Err(RuntimeError::NotFound(container_id.to_string()))
     }
 
-    async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
 
-    async fn stream_container_logs(
+    async fn stream_instance_logs(
         &self,
         container_id: &str,
-        options: &ContainerLogsOptions,
-        logs_tx: tokio::sync::mpsc::Sender<ContainerLogFrame>,
-    ) -> Result<(), ContainerError> {
+        options: &RuntimeLogsOptions,
+        logs_tx: tokio::sync::mpsc::Sender<RuntimeLogFrame>,
+    ) -> Result<(), RuntimeError> {
         self.calls
             .lock()
             .await
@@ -187,17 +184,17 @@ fn replicated_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str) -> Tas
 }
 
 local_test!(task_logs_relay_over_tcp_sessions, {
-    let owner_manager = Arc::new(StaticLogsContainerManager::default());
-    let requester_manager = Arc::new(StaticLogsContainerManager::default());
+    let owner_manager = Arc::new(StaticLogsRuntimeBackend::default());
+    let requester_manager = Arc::new(StaticLogsRuntimeBackend::default());
     let install_index = Arc::new(AtomicUsize::new(0));
     let owner_for_factory = owner_manager.clone();
     let requester_for_factory = requester_manager.clone();
     let index_for_factory = install_index.clone();
-    let _guard = ContainerManagerOverrideGuard::install_factory(Arc::new(move || {
+    let _guard = RuntimeBackendOverrideGuard::install_factory(Arc::new(move || {
         match index_for_factory.fetch_add(1, Ordering::SeqCst) {
-            0 => owner_for_factory.clone() as Arc<dyn ContainerManager + Send + Sync>,
-            1 => requester_for_factory.clone() as Arc<dyn ContainerManager + Send + Sync>,
-            _ => Arc::new(StaticLogsContainerManager::default()),
+            0 => owner_for_factory.clone() as Arc<dyn RuntimeBackend + Send + Sync>,
+            1 => requester_for_factory.clone() as Arc<dyn RuntimeBackend + Send + Sync>,
+            _ => Arc::new(StaticLogsRuntimeBackend::default()),
         }
     }));
 
@@ -253,12 +250,12 @@ local_test!(task_logs_relay_over_tcp_sessions, {
     owner_manager.frames.lock().await.insert(
         format!("mantissa-{task_id}"),
         vec![
-            ContainerLogFrame {
-                stream: ContainerLogStream::StdOut,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::StdOut,
                 message: b"first line\n".to_vec(),
             },
-            ContainerLogFrame {
-                stream: ContainerLogStream::StdErr,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::StdErr,
                 message: b"second line\n".to_vec(),
             },
         ],
@@ -295,7 +292,7 @@ local_test!(task_logs_relay_over_tcp_sessions, {
         owner_manager.calls.lock().await.clone(),
         vec![(
             format!("mantissa-{task_id}"),
-            ContainerLogsOptions {
+            RuntimeLogsOptions {
                 follow: true,
                 stdout: true,
                 stderr: true,

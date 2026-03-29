@@ -2,15 +2,15 @@
 mod common;
 
 use async_trait::async_trait;
-use bollard::service::ContainerInspectResponse;
 use common::convergence::wait_until;
 use common::testkit::{ClusterConfig, TestNode};
+use mantissa::runtime::testing::new_in_memory_runtime_backend;
+use mantissa::runtime::types::{
+    RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeInfo, RuntimeResult,
+    RuntimeStateInfo,
+};
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 use mantissa::store::volume_store::{open_volume_node_store, open_volume_spec_store};
-use mantissa::task::docker::{
-    ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager,
-    new_in_memory_container_manager,
-};
 use mantissa::task::manager::{TaskRuntimeConfig, TaskStartRequest};
 use mantissa::task::types::TaskVolumeMount;
 use mantissa::volumes::registry::VolumeRegistry;
@@ -33,19 +33,16 @@ use uuid::Uuid;
 use net::noise::NoiseKeys;
 
 #[derive(Clone, Default)]
-struct RecordingContainerManager {
+struct RecordingRuntimeBackend {
     containers: Arc<AsyncMutex<HashMap<String, bool>>>,
     names: Arc<AsyncMutex<HashMap<String, String>>>,
     volumes: Arc<AsyncMutex<Vec<Vec<String>>>>,
 }
 
-impl RecordingContainerManager {
+impl RecordingRuntimeBackend {
     /// Builds the runtime error used when a launch races with an existing container name.
-    fn name_conflict(name: &str) -> ContainerError {
-        ContainerError::DockerAPI(bollard::errors::Error::DockerResponseServerError {
-            status_code: 409,
-            message: format!("container name '{name}' already in use"),
-        })
+    fn name_conflict(name: &str) -> RuntimeError {
+        RuntimeError::backend(Some(409), format!("container name '{name}' already in use"))
     }
 
     async fn volume_mounts(&self) -> Vec<Vec<String>> {
@@ -71,11 +68,8 @@ impl RecordingContainerManager {
 }
 
 #[async_trait]
-impl ContainerManager for RecordingContainerManager {
-    async fn create_container(
-        &self,
-        request: ContainerCreateRequest,
-    ) -> Result<String, ContainerError> {
+impl RuntimeBackend for RecordingRuntimeBackend {
+    async fn create_instance(&self, request: RuntimeCreateRequest) -> RuntimeResult<String> {
         {
             let names = self.names.lock().await;
             if names.contains_key(&request.name) {
@@ -93,48 +87,48 @@ impl ContainerManager for RecordingContainerManager {
         Ok(id)
     }
 
-    async fn start_container(&self, container_id: &str) -> Result<(), ContainerError> {
+    async fn start_instance(&self, container_id: &str) -> RuntimeResult<()> {
         let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(ContainerError::NotFound(container_id.to_string()));
+            return Err(RuntimeError::NotFound(container_id.to_string()));
         };
         let mut containers = self.containers.lock().await;
         let Some(running) = containers.get_mut(&id) else {
-            return Err(ContainerError::NotFound(container_id.to_string()));
+            return Err(RuntimeError::NotFound(container_id.to_string()));
         };
         *running = true;
         Ok(())
     }
 
-    async fn stop_container(
+    async fn stop_instance(
         &self,
         container_id: &str,
         _timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
+    ) -> RuntimeResult<()> {
         let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(ContainerError::NotFound(container_id.to_string()));
+            return Err(RuntimeError::NotFound(container_id.to_string()));
         };
         let mut containers = self.containers.lock().await;
         let Some(running) = containers.get_mut(&id) else {
-            return Err(ContainerError::NotFound(container_id.to_string()));
+            return Err(RuntimeError::NotFound(container_id.to_string()));
         };
         *running = false;
         Ok(())
     }
 
-    async fn restart_container(
+    async fn restart_instance(
         &self,
         container_id: &str,
         _timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
-        self.start_container(container_id).await
+    ) -> RuntimeResult<()> {
+        self.start_instance(container_id).await
     }
 
-    async fn remove_container(
+    async fn remove_instance(
         &self,
         container_id: &str,
         _force: bool,
         _remove_volumes: bool,
-    ) -> Result<(), ContainerError> {
+    ) -> RuntimeResult<()> {
         let Some(id) = self.resolve_container_id(container_id).await else {
             return Ok(());
         };
@@ -143,16 +137,16 @@ impl ContainerManager for RecordingContainerManager {
         Ok(())
     }
 
-    async fn list_containers(
+    async fn list_instances(
         &self,
         _filters: Option<HashMap<String, Vec<String>>>,
-    ) -> Result<Vec<ContainerInfo>, ContainerError> {
+    ) -> RuntimeResult<Vec<RuntimeInfo>> {
         let containers = self.containers.lock().await;
         let names = self.names.lock().await;
         let mut infos = Vec::with_capacity(containers.len());
         for (name, id) in names.iter() {
             let running = containers.get(id).copied().unwrap_or(false);
-            infos.push(ContainerInfo {
+            infos.push(RuntimeInfo {
                 id: id.clone(),
                 name: name.clone(),
                 image: "image".to_string(),
@@ -161,47 +155,55 @@ impl ContainerManager for RecordingContainerManager {
                 } else {
                     "stopped".to_string()
                 },
-                state: if running {
-                    "running".to_string()
-                } else {
-                    "exited".to_string()
+                state: RuntimeStateInfo {
+                    raw_status: Some(if running {
+                        "running".to_string()
+                    } else {
+                        "exited".to_string()
+                    }),
+                    running: Some(running),
+                    pid: Some(if running { 1000 } else { 0 }),
+                    ..Default::default()
                 },
                 created: 0,
+                ..Default::default()
             });
         }
         Ok(infos)
     }
 
-    async fn inspect_container(
-        &self,
-        container_id: &str,
-    ) -> Result<ContainerInspectResponse, ContainerError> {
+    async fn inspect_instance(&self, container_id: &str) -> RuntimeResult<RuntimeInfo> {
         let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(ContainerError::NotFound(container_id.to_string()));
+            return Err(RuntimeError::NotFound(container_id.to_string()));
         };
         let containers = self.containers.lock().await;
         let Some(running) = containers.get(&id).copied() else {
-            return Err(ContainerError::NotFound(container_id.to_string()));
+            return Err(RuntimeError::NotFound(container_id.to_string()));
         };
-        Ok(ContainerInspectResponse {
-            id: Some(id),
-            state: Some(bollard::models::ContainerState {
+        Ok(RuntimeInfo {
+            id,
+            state: RuntimeStateInfo {
+                raw_status: Some(if running {
+                    "running".to_string()
+                } else {
+                    "exited".to_string()
+                }),
                 running: Some(running),
                 pid: Some(if running { 1000 } else { 0 }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         })
     }
 
-    async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+    async fn pull_image(&self, _image: &str) -> RuntimeResult<()> {
         Ok(())
     }
 }
 
 fn headless_config_with_in_memory_runtime() -> HeadlessConfig {
     HeadlessConfig {
-        container_manager: Some(new_in_memory_container_manager()),
+        runtime_backend: Some(new_in_memory_runtime_backend()),
         ..HeadlessConfig::default()
     }
 }
@@ -428,11 +430,11 @@ async fn start_standalone_volume_task(
 }
 
 async fn create_recording_node(
-    manager: Arc<RecordingContainerManager>,
+    manager: Arc<RecordingRuntimeBackend>,
     local_volume_root: PathBuf,
 ) -> HeadlessNode {
     HeadlessNode::new_with_config(HeadlessConfig {
-        container_manager: Some(manager),
+        runtime_backend: Some(manager),
         local_volume_root: Some(local_volume_root),
         task_runtime: Some(TaskRuntimeConfig {
             reconcile_tick: Duration::from_millis(50),
@@ -449,7 +451,7 @@ async fn create_recording_node_with_parts(
     db: Arc<redb::Database>,
     self_id: Uuid,
     keys: HeadlessKeys,
-    manager: Arc<RecordingContainerManager>,
+    manager: Arc<RecordingRuntimeBackend>,
     local_volume_root: PathBuf,
 ) -> HeadlessNode {
     HeadlessNode::new_with(
@@ -457,7 +459,7 @@ async fn create_recording_node_with_parts(
         self_id,
         keys,
         HeadlessConfig {
-            container_manager: Some(manager),
+            runtime_backend: Some(manager),
             local_volume_root: Some(local_volume_root),
             task_runtime: Some(TaskRuntimeConfig {
                 reconcile_tick: Duration::from_millis(50),
@@ -714,7 +716,7 @@ local_test!(volumes_import_requires_request_on_target_node, {
 
 local_test!(local_volume_wait_for_first_consumer_binds_on_first_start, {
     let local_volume_root = tempdir().expect("volume root");
-    let runtime = Arc::new(RecordingContainerManager::default());
+    let runtime = Arc::new(RecordingRuntimeBackend::default());
     let node =
         create_recording_node(runtime.clone(), local_volume_root.path().join("volumes")).await;
 
@@ -758,7 +760,7 @@ local_test!(local_volume_wait_for_first_consumer_binds_on_first_start, {
 
 local_test!(task_restart_preserves_local_volume_mount, {
     let local_volume_root = tempdir().expect("volume root");
-    let runtime = Arc::new(RecordingContainerManager::default());
+    let runtime = Arc::new(RecordingRuntimeBackend::default());
     let node =
         create_recording_node(runtime.clone(), local_volume_root.path().join("volumes")).await;
 
@@ -979,7 +981,7 @@ local_test!(bound_local_volume_forces_scheduler_locality, {
 
 local_test!(nodes_drain_blocks_on_local_volume_task, {
     let local_volume_root = tempdir().expect("volume root");
-    let runtime = Arc::new(RecordingContainerManager::default());
+    let runtime = Arc::new(RecordingRuntimeBackend::default());
     let node = create_recording_node(runtime, local_volume_root.path().join("volumes")).await;
 
     let volume_id = create_managed_volume(&node.volumes_client, "drain-data").await;
@@ -1002,7 +1004,7 @@ local_test!(nodes_drain_blocks_on_local_volume_task, {
 
 local_test!(volume_delete_retain_preserves_local_path, {
     let local_volume_root = tempdir().expect("volume root");
-    let runtime = Arc::new(RecordingContainerManager::default());
+    let runtime = Arc::new(RecordingRuntimeBackend::default());
     let node = create_recording_node(runtime, local_volume_root.path().join("volumes")).await;
 
     let volume_id = create_managed_volume(&node.volumes_client, "retain-data").await;
@@ -1046,7 +1048,7 @@ local_test!(volume_delete_retain_preserves_local_path, {
 
 local_test!(volume_delete_delete_removes_managed_path, {
     let local_volume_root = tempdir().expect("volume root");
-    let runtime = Arc::new(RecordingContainerManager::default());
+    let runtime = Arc::new(RecordingRuntimeBackend::default());
     let node = create_recording_node(runtime, local_volume_root.path().join("volumes")).await;
 
     let volume_id = create_managed_volume_with(
@@ -1185,7 +1187,7 @@ local_test!(restart_restores_volume_node_state, {
     let self_id = Uuid::new_v4();
     let noise = Arc::new(NoiseKeys::from_private_bytes([0x82; 32]));
     let signing = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
-    let runtime = Arc::new(RecordingContainerManager::default());
+    let runtime = Arc::new(RecordingRuntimeBackend::default());
     let local_volume_root = state_dir.path().join("volumes");
 
     let mut node = create_recording_node_with_parts(

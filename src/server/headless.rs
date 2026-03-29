@@ -9,13 +9,13 @@ use crate::{
     network::registry::NetworkRegistry,
     node,
     registry::Registry,
+    runtime::types::RuntimeBackend,
     scheduler::Scheduler,
     server::{
         RunHandles, Server,
         bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, boot},
     },
     services::ServiceController,
-    task::docker::ContainerManager,
     task::manager::{TaskManager, TaskRuntimeConfig},
 };
 use net::noise::NoiseKeys;
@@ -47,7 +47,7 @@ pub struct HeadlessConfig {
     pub gossip_fanout: Option<usize>,
     pub gossip_channel_capacity: Option<usize>,
     pub task_runtime: Option<TaskRuntimeConfig>,
-    pub container_manager: Option<Arc<dyn ContainerManager + Send + Sync>>,
+    pub runtime_backend: Option<Arc<dyn RuntimeBackend + Send + Sync>>,
     pub local_volume_root: Option<PathBuf>,
 }
 
@@ -64,7 +64,7 @@ impl Default for HeadlessConfig {
             gossip_fanout: None,
             gossip_channel_capacity: None,
             task_runtime: None,
-            container_manager: None,
+            runtime_backend: None,
             local_volume_root: None,
         }
     }
@@ -152,7 +152,7 @@ impl HeadlessNode {
             gossip_fanout,
             gossip_channel_capacity,
             task_runtime,
-            container_manager,
+            runtime_backend,
             local_volume_root,
         } = cfg;
         // Local Node + client
@@ -174,7 +174,7 @@ impl HeadlessNode {
         let defaults = BootstrapOptions::default();
         let options = BootstrapOptions {
             task_runtime,
-            container_manager,
+            runtime_backend,
             local_volume_root,
             gossip_channel_capacity: gossip_channel_capacity
                 .unwrap_or(defaults.gossip_channel_capacity),
@@ -483,7 +483,7 @@ impl HeadlessNode {
                 gossip_fanout: fanout,
                 gossip_channel_capacity,
                 task_runtime,
-                container_manager: None,
+                runtime_backend: None,
                 local_volume_root: Some(state.tmp_dir.join("volumes")),
             },
         )

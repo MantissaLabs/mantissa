@@ -4,11 +4,11 @@
 mod common;
 
 use common::convergence::{current_cluster_view, swim_down_transition_timeout};
-use common::testkit::{ContainerManagerOverrideGuard, TestNode};
+use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use protocol::health::NodeStatus;
 
 local_test!(health_alive_then_down_inproc, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     // Start two in-process nodes
     let anchor = TestNode::new_with_tick_ms(100).await;
@@ -55,7 +55,7 @@ local_test!(health_alive_then_down_inproc, {
 });
 
 local_test!(health_alive_then_down_tcp, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     // Start two TCP nodes; skip when the environment restricts socket creation.
     let anchor = match TestNode::try_new_tcp_with_tick_ms(100).await {
@@ -117,7 +117,7 @@ local_test!(health_alive_then_down_tcp, {
 });
 
 local_test!(health_cached_capability_respects_stop_inproc, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let anchor = TestNode::new_with_tick_ms(100).await;
     let mut joiner = TestNode::new_with_tick_ms(100).await;

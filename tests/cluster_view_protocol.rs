@@ -6,12 +6,12 @@ use common::testkit::TestNode;
 use crdt_store::uuid_key::UuidKey;
 use mantissa::cluster::{ClusterId, ClusterViewId};
 use mantissa::node::id::set_node_id;
+use mantissa::runtime::testing::new_in_memory_runtime_backend;
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 use mantissa::store::cluster_operation_store::ClusterOperationStore;
 use mantissa::store::cluster_view_store::ClusterViewStore;
 use mantissa::store::peer_store::open_peers_store;
 use mantissa::sync::VIEW_SCOPED_DOMAIN_COUNT;
-use mantissa::task::docker::new_in_memory_container_manager;
 use mantissa::topology::operation::{
     ClusterOperationKind as StoredOperationKind, ClusterOperationRecord,
     ClusterOperationStage as StoredOperationStage, SplitNodeAssignment,
@@ -69,7 +69,7 @@ async fn cluster_name_for_lineage(
 
 fn headless_config_with_in_memory_runtime() -> HeadlessConfig {
     HeadlessConfig {
-        container_manager: Some(new_in_memory_container_manager()),
+        runtime_backend: Some(new_in_memory_runtime_backend()),
         ..HeadlessConfig::default()
     }
 }

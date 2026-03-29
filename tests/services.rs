@@ -13,7 +13,7 @@ use common::convergence::{
     wait_for_operation_stage, wait_until,
 };
 use common::testkit::{
-    ClusterConfig, ContainerManagerOverrideGuard, InMemoryContainerManager, TestNode,
+    ClusterConfig, InMemoryRuntimeBackend, RuntimeBackendOverrideGuard, TestNode,
 };
 use crdt_store::uuid_key::UuidKey;
 use mantissa::cluster::ClusterViewId;
@@ -25,6 +25,11 @@ use mantissa::network::types::{
     NetworkSpecValue, NetworkStatus,
 };
 use mantissa::node::id::set_node_id;
+use mantissa::runtime::testing::new_in_memory_runtime_backend;
+use mantissa::runtime::types::{
+    RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeEvent,
+    RuntimeInfo,
+};
 use mantissa::scheduler::SlotReservationRequest;
 use mantissa::scheduler::SlotState;
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport};
@@ -36,10 +41,6 @@ use mantissa::services::types::{
     ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy,
 };
 use mantissa::task::container::ContainerState;
-use mantissa::task::docker::{
-    ContainerCreateRequest, ContainerError, ContainerInfo, ContainerManager, ContainerRuntimeEvent,
-    new_in_memory_container_manager,
-};
 use mantissa::task::manager::TaskManager;
 use mantissa::task::types::{
     TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskServiceMetadata, TaskSpec,
@@ -117,7 +118,7 @@ impl Drop for ConfigOverrideGuard {
 }
 
 local_test!(services_gossip_propagates_across_peers, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     const SERVICE_NAME: &str = "demo-service";
     const MANIFEST_NAME: &str = "demo-manifest";
@@ -236,7 +237,7 @@ local_test!(services_gossip_propagates_across_peers, {
 });
 
 local_test!(services_submit_deployment_waits_for_task_ack, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let manifest_id = Uuid::new_v4();
@@ -315,7 +316,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
 });
 
 local_test!(services_deployment_exhausts_retries_and_fails, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let manifest_id = Uuid::new_v4();
@@ -473,7 +474,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
         db.clone(),
         self_id,
         HeadlessKeys::new(noise_keys.clone(), signing.clone()),
-        Arc::new(SlowCreateContainerManager::default()),
+        Arc::new(SlowCreateRuntimeBackend::default()),
         local_volume_root.clone(),
     )
     .await;
@@ -553,7 +554,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
         db,
         self_id,
         HeadlessKeys::new(noise_keys, signing),
-        new_in_memory_container_manager(),
+        new_in_memory_runtime_backend(),
         local_volume_root,
     )
     .await;
@@ -596,7 +597,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
 
 local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
     let _guard =
-        ContainerManagerOverrideGuard::install(Arc::new(ExitSignalContainerManager::default()));
+        RuntimeBackendOverrideGuard::install(Arc::new(ExitSignalRuntimeBackend::default()));
     let node = TestNode::new().await;
 
     let service_id = node
@@ -681,7 +682,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
 });
 
 local_test!(services_deployment_replicates_across_cluster, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cluster = match TestNode::new_cluster_tcp_with_tick(3, 100).await {
         Ok(cluster) => cluster,
@@ -794,7 +795,7 @@ local_test!(services_deployment_replicates_across_cluster, {
 });
 
 local_test!(services_placement_startup_avoids_over_replication, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -872,7 +873,7 @@ local_test!(services_placement_startup_avoids_over_replication, {
 local_test!(
     services_placement_balances_replicas_and_slot_reservations,
     {
-        let _guard = ContainerManagerOverrideGuard::install_default();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
 
         let cfg = ClusterConfig {
             sync_tick_ms: Some(100),
@@ -1014,7 +1015,7 @@ local_test!(
 );
 
 local_test!(services_scale_out_balances_without_excess_replicas, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -1149,7 +1150,7 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
 });
 
 local_test!(services_large_deployment_converges_within_bound, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -1236,7 +1237,7 @@ local_test!(services_large_deployment_converges_within_bound, {
 });
 
 local_test!(services_stop_drains_stale_tasks_and_slots, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "stop-drain";
@@ -1396,7 +1397,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
 local_test!(
     services_deploy_from_stopped_bootstraps_without_stale_assignments,
     {
-        let _guard = ContainerManagerOverrideGuard::install_default();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
         let node = TestNode::new().await;
 
         let service_name = "deploy-from-stopped";
@@ -1497,7 +1498,7 @@ local_test!(
 );
 
 local_test!(services_stop_propagates_and_drains_three_nodes, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -1606,7 +1607,7 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
 });
 
 local_test!(services_node_drain_migrates_singleton_service, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -1713,7 +1714,7 @@ local_test!(services_node_drain_migrates_singleton_service, {
 });
 
 local_test!(services_node_drain_migrates_multi_replica_service, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -1797,7 +1798,7 @@ local_test!(services_node_drain_migrates_multi_replica_service, {
 });
 
 local_test!(services_node_down_reschedules_multi_replica_service, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -1891,7 +1892,7 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
 });
 
 local_test!(services_node_drain_blocks_on_standalone_task, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     node.node
@@ -1919,9 +1920,9 @@ local_test!(services_node_drain_blocks_on_standalone_task, {
 local_test!(
     services_node_drain_while_service_is_deploying_converges_evacuation,
     {
-        let _guard = ContainerManagerOverrideGuard::install_factory(Arc::new(
-            || -> Arc<dyn ContainerManager + Send + Sync> {
-                Arc::new(SlowCreateContainerManager::default())
+        let _guard = RuntimeBackendOverrideGuard::install_factory(Arc::new(
+            || -> Arc<dyn RuntimeBackend + Send + Sync> {
+                Arc::new(SlowCreateRuntimeBackend::default())
             },
         ));
 
@@ -2045,7 +2046,7 @@ local_test!(
 );
 
 local_test!(services_node_drain_reports_capacity_blocker, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -2148,7 +2149,7 @@ local_test!(services_node_drain_reports_capacity_blocker, {
 });
 
 local_test!(services_node_drain_timeout_keeps_node_unschedulable, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -2232,7 +2233,7 @@ local_test!(services_node_drain_timeout_keeps_node_unschedulable, {
 local_test!(
     services_node_drain_status_reports_task_stop_timeout_override,
     {
-        let _guard = ContainerManagerOverrideGuard::install_default();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
         let node = TestNode::new().await;
 
         drain_node_with_timeout_via_topology(
@@ -2254,7 +2255,7 @@ local_test!(
 );
 
 local_test!(services_node_list_reports_drained_node_after_evacuation, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -2353,7 +2354,7 @@ local_test!(services_node_list_reports_drained_node_after_evacuation, {
 local_test!(
     services_split_merge_rebalance_preserves_replica_convergence,
     {
-        let _guard = ContainerManagerOverrideGuard::install_default();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
 
         let cfg = ClusterConfig {
             sync_tick_ms: Some(100),
@@ -2533,7 +2534,7 @@ local_test!(
 local_test!(
     services_split_merge_traffic_publication_converges_after_heal,
     {
-        let _guard = ContainerManagerOverrideGuard::install_default();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
         let _config_guard = ConfigOverrideGuard::control_plane_network_only();
 
         let cfg = ClusterConfig {
@@ -2704,7 +2705,7 @@ local_test!(
 local_test!(
     services_crdt_concurrent_generations_converge_to_highest_epoch,
     {
-        let _guard = ContainerManagerOverrideGuard::install_default();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
 
         let cfg = ClusterConfig {
             sync_tick_ms: Some(100),
@@ -2774,7 +2775,7 @@ local_test!(
 local_test!(
     services_crdt_out_of_order_phase_updates_converge_to_highest_phase,
     {
-        let _guard = ContainerManagerOverrideGuard::install_default();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
 
         let cfg = ClusterConfig {
             sync_tick_ms: Some(100),
@@ -2843,7 +2844,7 @@ local_test!(
 );
 
 local_test!(services_crdt_split_merge_rollback_generation_converges, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -3060,7 +3061,7 @@ local_test!(services_crdt_split_merge_rollback_generation_converges, {
 });
 
 local_test!(services_sync_recovers_missing_entries, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
@@ -3166,7 +3167,7 @@ local_test!(services_sync_recovers_missing_entries, {
 });
 
 local_test!(services_redeploy_scales_replicas, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-scale";
@@ -3287,7 +3288,7 @@ local_test!(services_redeploy_scales_replicas, {
 });
 
 local_test!(services_redeploy_updates_resources, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-resources";
@@ -3417,7 +3418,7 @@ local_test!(services_redeploy_updates_resources, {
 });
 
 local_test!(services_redeploy_rejects_unchanged_running_spec, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-unchanged";
@@ -3533,7 +3534,7 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
 });
 
 local_test!(services_redeploy_rolls_back_on_failed_replacement, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-rollback";
@@ -3623,7 +3624,7 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
 });
 
 local_test!(services_redeploy_enforces_max_failures_budget, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-max-failures";
@@ -3746,7 +3747,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
 local_test!(
     services_redeploy_stop_first_stops_previous_before_replacement_visible,
     {
-        let _guard = ContainerManagerOverrideGuard::install_default();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
         let node = TestNode::new().await;
 
         let service_name = "redeploy-stop-first";
@@ -3875,7 +3876,7 @@ local_test!(
 );
 
 local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-parallelism-two";
@@ -3975,7 +3976,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
 });
 
 local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
     let service_name = "redeploy-no-rollback";
@@ -4064,7 +4065,7 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
 });
 
 local_test!(services_volume_unavailable_enters_and_recovers, {
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cluster = TestNode::new_cluster_inproc_with_config(1, ClusterConfig::default())
         .await
@@ -4194,8 +4195,8 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
 });
 
 local_test!(services_redeploy_rollback_failure_marks_failed, {
-    let manager = Arc::new(CreateFailureAfterBaselineContainerManager::default());
-    let _guard = ContainerManagerOverrideGuard::install(manager.clone());
+    let manager = Arc::new(CreateFailureAfterBaselineRuntimeBackend::default());
+    let _guard = RuntimeBackendOverrideGuard::install(manager.clone());
     let node = TestNode::new().await;
 
     let service_name = "redeploy-rollback-failure";
@@ -4340,7 +4341,7 @@ fn demo_networked_backend_task_template(
 local_test!(
     services_submit_deployment_rejects_unknown_template_dependency,
     {
-        let _guard = ContainerManagerOverrideGuard::install_default();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
         let node = TestNode::new().await;
 
         let mut frontend = demo_backend_task_template("frontend", 1);
@@ -4369,7 +4370,7 @@ local_test!(
 
 local_test!(services_depends_on_waits_for_dependency_publication, {
     let _config_guard = ConfigOverrideGuard::control_plane_network_only();
-    let _guard = ContainerManagerOverrideGuard::install_default();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
 
     let cluster = TestNode::new_cluster_inproc_with_config(1, ClusterConfig::default())
         .await
@@ -4452,7 +4453,7 @@ local_test!(
     services_redeploy_depends_on_waits_for_dependency_stage_publication,
     {
         let _config_guard = ConfigOverrideGuard::control_plane_network_only();
-        let _guard = ContainerManagerOverrideGuard::install_default();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
 
         let cluster = TestNode::new_cluster_inproc_with_config(1, ClusterConfig::default())
             .await
@@ -5191,7 +5192,7 @@ async fn create_restartable_service_node(
     db: Arc<redb::Database>,
     self_id: Uuid,
     keys: HeadlessKeys,
-    container_manager: Arc<dyn ContainerManager + Send + Sync>,
+    runtime_backend: Arc<dyn RuntimeBackend + Send + Sync>,
     local_volume_root: PathBuf,
 ) -> HeadlessNode {
     HeadlessNode::new_with(
@@ -5209,7 +5210,7 @@ async fn create_restartable_service_node(
             gossip_fanout: None,
             gossip_channel_capacity: None,
             task_runtime: None,
-            container_manager: Some(container_manager),
+            runtime_backend: Some(runtime_backend),
             local_volume_root: Some(local_volume_root),
         },
     )
@@ -5239,66 +5240,60 @@ fn rollout_strategy(
 }
 
 #[derive(Default)]
-struct SlowCreateContainerManager {
-    inner: InMemoryContainerManager,
+struct SlowCreateRuntimeBackend {
+    inner: InMemoryRuntimeBackend,
 }
 
 #[async_trait]
-impl ContainerManager for SlowCreateContainerManager {
-    async fn create_container(
-        &self,
-        request: ContainerCreateRequest,
-    ) -> Result<String, ContainerError> {
+impl RuntimeBackend for SlowCreateRuntimeBackend {
+    async fn create_instance(&self, request: RuntimeCreateRequest) -> Result<String, RuntimeError> {
         sleep(Duration::from_secs(3)).await;
-        self.inner.create_container(request).await
+        self.inner.create_instance(request).await
     }
 
-    async fn start_container(&self, container_id: &str) -> Result<(), ContainerError> {
-        self.inner.start_container(container_id).await
+    async fn start_instance(&self, container_id: &str) -> Result<(), RuntimeError> {
+        self.inner.start_instance(container_id).await
     }
 
-    async fn stop_container(
+    async fn stop_instance(
         &self,
         container_id: &str,
         timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
-        self.inner.stop_container(container_id, timeout).await
+    ) -> Result<(), RuntimeError> {
+        self.inner.stop_instance(container_id, timeout).await
     }
 
-    async fn restart_container(
+    async fn restart_instance(
         &self,
         container_id: &str,
         timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
-        self.inner.restart_container(container_id, timeout).await
+    ) -> Result<(), RuntimeError> {
+        self.inner.restart_instance(container_id, timeout).await
     }
 
-    async fn remove_container(
+    async fn remove_instance(
         &self,
         container_id: &str,
         force: bool,
         remove_volumes: bool,
-    ) -> Result<(), ContainerError> {
+    ) -> Result<(), RuntimeError> {
         self.inner
-            .remove_container(container_id, force, remove_volumes)
+            .remove_instance(container_id, force, remove_volumes)
             .await
     }
 
-    async fn list_containers(
+    async fn list_instances(
         &self,
         filters: Option<HashMap<String, Vec<String>>>,
-    ) -> Result<Vec<ContainerInfo>, ContainerError> {
-        self.inner.list_containers(filters).await
+    ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
+        self.inner.list_instances(filters).await
     }
 
-    async fn inspect_container(
-        &self,
-        container_id: &str,
-    ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
-        self.inner.inspect_container(container_id).await
+    async fn inspect_instance(&self, container_id: &str) -> Result<RuntimeInfo, RuntimeError> {
+        self.inner.inspect_instance(container_id).await
     }
 
-    async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
 }
@@ -5308,25 +5303,21 @@ impl ContainerManager for SlowCreateContainerManager {
 /// We use this manager to validate the runtime-event failure path deterministically
 /// in tests, without depending on Docker timing or external process behavior.
 #[derive(Default)]
-struct ExitSignalContainerManager {
-    inner: InMemoryContainerManager,
+struct ExitSignalRuntimeBackend {
+    inner: InMemoryRuntimeBackend,
     task_ids_by_container: AsyncMutex<HashMap<String, Uuid>>,
-    runtime_events_tx:
-        AsyncMutex<Option<tokio::sync::mpsc::UnboundedSender<ContainerRuntimeEvent>>>,
-    pending_runtime_events: AsyncMutex<Vec<ContainerRuntimeEvent>>,
+    runtime_events_tx: AsyncMutex<Option<tokio::sync::mpsc::UnboundedSender<RuntimeEvent>>>,
+    pending_runtime_events: AsyncMutex<Vec<RuntimeEvent>>,
 }
 
 #[async_trait]
-impl ContainerManager for ExitSignalContainerManager {
-    async fn create_container(
-        &self,
-        request: ContainerCreateRequest,
-    ) -> Result<String, ContainerError> {
+impl RuntimeBackend for ExitSignalRuntimeBackend {
+    async fn create_instance(&self, request: RuntimeCreateRequest) -> Result<String, RuntimeError> {
         let task_id = request
             .name
             .strip_prefix("mantissa-")
             .and_then(|raw| Uuid::parse_str(raw).ok());
-        let container_id = self.inner.create_container(request).await?;
+        let container_id = self.inner.create_instance(request).await?;
         if let Some(task_id) = task_id {
             self.task_ids_by_container
                 .lock()
@@ -5336,8 +5327,8 @@ impl ContainerManager for ExitSignalContainerManager {
         Ok(container_id)
     }
 
-    async fn start_container(&self, container_id: &str) -> Result<(), ContainerError> {
-        self.inner.start_container(container_id).await?;
+    async fn start_instance(&self, container_id: &str) -> Result<(), RuntimeError> {
+        self.inner.start_instance(container_id).await?;
 
         let task_id = self
             .task_ids_by_container
@@ -5346,7 +5337,7 @@ impl ContainerManager for ExitSignalContainerManager {
             .get(container_id)
             .copied();
         if let Some(task_id) = task_id {
-            let event = ContainerRuntimeEvent::TaskExited {
+            let event = RuntimeEvent::TaskExited {
                 task_id,
                 exit_code: 255,
             };
@@ -5361,60 +5352,60 @@ impl ContainerManager for ExitSignalContainerManager {
         Ok(())
     }
 
-    async fn stop_container(
+    async fn stop_instance(
         &self,
         container_id: &str,
         timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
-        self.inner.stop_container(container_id, timeout).await
+    ) -> Result<(), RuntimeError> {
+        self.inner.stop_instance(container_id, timeout).await
     }
 
-    async fn restart_container(
+    async fn restart_instance(
         &self,
         container_id: &str,
         timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
-        self.inner.restart_container(container_id, timeout).await
+    ) -> Result<(), RuntimeError> {
+        self.inner.restart_instance(container_id, timeout).await
     }
 
-    async fn remove_container(
+    async fn remove_instance(
         &self,
         container_id: &str,
         force: bool,
         remove_volumes: bool,
-    ) -> Result<(), ContainerError> {
+    ) -> Result<(), RuntimeError> {
         self.task_ids_by_container.lock().await.remove(container_id);
         self.inner
-            .remove_container(container_id, force, remove_volumes)
+            .remove_instance(container_id, force, remove_volumes)
             .await
     }
 
-    async fn list_containers(
+    async fn list_instances(
         &self,
         filters: Option<HashMap<String, Vec<String>>>,
-    ) -> Result<Vec<ContainerInfo>, ContainerError> {
-        self.inner.list_containers(filters).await
+    ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
+        self.inner.list_instances(filters).await
     }
 
-    async fn inspect_container(
-        &self,
-        container_id: &str,
-    ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
-        self.inner.inspect_container(container_id).await
+    async fn inspect_instance(&self, container_id: &str) -> Result<RuntimeInfo, RuntimeError> {
+        self.inner.inspect_instance(container_id).await
     }
 
-    async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
 
-    fn supports_runtime_events(&self) -> bool {
-        true
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            lifecycle_events: true,
+            ..Default::default()
+        }
     }
 
     async fn watch_runtime_events(
         &self,
-        events_tx: tokio::sync::mpsc::UnboundedSender<ContainerRuntimeEvent>,
-    ) -> Result<(), ContainerError> {
+        events_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<(), RuntimeError> {
         let pending = {
             let mut pending = self.pending_runtime_events.lock().await;
             std::mem::take(&mut *pending)
@@ -5436,12 +5427,12 @@ impl ContainerManager for ExitSignalContainerManager {
 /// The rollback-failure test first deploys a healthy baseline, then enables
 /// failures before submitting the redeploy, so failure and rollback behavior can
 /// be isolated from initial bootstrap.
-struct CreateFailureAfterBaselineContainerManager {
-    inner: InMemoryContainerManager,
+struct CreateFailureAfterBaselineRuntimeBackend {
+    inner: InMemoryRuntimeBackend,
     fail_creates: AtomicBool,
 }
 
-impl CreateFailureAfterBaselineContainerManager {
+impl CreateFailureAfterBaselineRuntimeBackend {
     /// Enables create failure injection for subsequent create requests.
     fn enable_create_failures(&self) {
         self.fail_creates.store(true, Ordering::Relaxed);
@@ -5449,68 +5440,57 @@ impl CreateFailureAfterBaselineContainerManager {
 }
 
 #[async_trait]
-impl ContainerManager for CreateFailureAfterBaselineContainerManager {
-    async fn create_container(
-        &self,
-        request: ContainerCreateRequest,
-    ) -> Result<String, ContainerError> {
+impl RuntimeBackend for CreateFailureAfterBaselineRuntimeBackend {
+    async fn create_instance(&self, request: RuntimeCreateRequest) -> Result<String, RuntimeError> {
         if self.fail_creates.load(Ordering::Relaxed) {
-            return Err(ContainerError::DockerAPI(
-                bollard::errors::Error::DockerResponseServerError {
-                    status_code: 500,
-                    message: "injected create failure".to_string(),
-                },
-            ));
+            return Err(RuntimeError::backend(Some(500), "injected create failure"));
         }
-        self.inner.create_container(request).await
+        self.inner.create_instance(request).await
     }
 
-    async fn start_container(&self, container_id: &str) -> Result<(), ContainerError> {
-        self.inner.start_container(container_id).await
+    async fn start_instance(&self, container_id: &str) -> Result<(), RuntimeError> {
+        self.inner.start_instance(container_id).await
     }
 
-    async fn stop_container(
+    async fn stop_instance(
         &self,
         container_id: &str,
         timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
-        self.inner.stop_container(container_id, timeout).await
+    ) -> Result<(), RuntimeError> {
+        self.inner.stop_instance(container_id, timeout).await
     }
 
-    async fn restart_container(
+    async fn restart_instance(
         &self,
         container_id: &str,
         timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
-        self.inner.restart_container(container_id, timeout).await
+    ) -> Result<(), RuntimeError> {
+        self.inner.restart_instance(container_id, timeout).await
     }
 
-    async fn remove_container(
+    async fn remove_instance(
         &self,
         container_id: &str,
         force: bool,
         remove_volumes: bool,
-    ) -> Result<(), ContainerError> {
+    ) -> Result<(), RuntimeError> {
         self.inner
-            .remove_container(container_id, force, remove_volumes)
+            .remove_instance(container_id, force, remove_volumes)
             .await
     }
 
-    async fn list_containers(
+    async fn list_instances(
         &self,
         filters: Option<HashMap<String, Vec<String>>>,
-    ) -> Result<Vec<ContainerInfo>, ContainerError> {
-        self.inner.list_containers(filters).await
+    ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
+        self.inner.list_instances(filters).await
     }
 
-    async fn inspect_container(
-        &self,
-        container_id: &str,
-    ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
-        self.inner.inspect_container(container_id).await
+    async fn inspect_instance(&self, container_id: &str) -> Result<RuntimeInfo, RuntimeError> {
+        self.inner.inspect_instance(container_id).await
     }
 
-    async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
+    async fn pull_image(&self, image: &str) -> Result<(), RuntimeError> {
         self.inner.pull_image(image).await
     }
 }

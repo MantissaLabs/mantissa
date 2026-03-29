@@ -19,9 +19,9 @@ use crate::network::types::{
     compute_network_attachment_id,
 };
 use crate::network::wireguard;
+use crate::runtime::types::RuntimeEvent;
 use crate::task::causality::{compare_task_causality, compare_task_status_causality};
 use crate::task::container::ContainerState;
-use crate::task::docker::ContainerRuntimeEvent;
 use crate::task::types::{
     TaskEvent, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec, TaskStatus,
 };
@@ -123,8 +123,8 @@ impl TaskManager {
 
             let inspect = match self
                 .runtime
-                .container_manager
-                .inspect_container(&container_id)
+                .runtime_backend
+                .inspect_instance(&container_id)
                 .await
             {
                 Ok(info) => info,
@@ -132,8 +132,8 @@ impl TaskManager {
                     if container_id != desired_name {
                         match self
                             .runtime
-                            .container_manager
-                            .inspect_container(&desired_name)
+                            .runtime_backend
+                            .inspect_instance(&desired_name)
                             .await
                         {
                             Ok(info) => info,
@@ -162,8 +162,8 @@ impl TaskManager {
                 }
             };
 
-            if let Some(id) = inspect.id.clone() {
-                container_id = id;
+            if !inspect.id.is_empty() {
+                container_id = inspect.id.clone();
             }
 
             {
@@ -304,7 +304,8 @@ impl TaskManager {
         let mut runtime_reconcile_pending = false;
         let mut gossip_flush_pending = false;
         let (runtime_events_tx, mut runtime_events_rx) = unbounded_channel();
-        let mut runtime_events_enabled = self.runtime.container_manager.supports_runtime_events();
+        let mut runtime_events_enabled =
+            self.runtime.runtime_backend.capabilities().lifecycle_events;
         if runtime_events_enabled {
             let manager = self.clone();
             tokio::task::spawn_local(async move {
@@ -347,10 +348,10 @@ impl TaskManager {
                 }
                 event = runtime_events_rx.recv(), if runtime_events_enabled => {
                     match event {
-                        Some(ContainerRuntimeEvent::ContainerStateChanged) => {
+                        Some(RuntimeEvent::InstanceStateChanged) => {
                             runtime_reconcile_pending = true;
                         }
-                        Some(ContainerRuntimeEvent::TaskExited { task_id, exit_code }) => {
+                        Some(RuntimeEvent::TaskExited { task_id, exit_code }) => {
                             if let Err(err) = self.handle_runtime_task_exit(task_id, exit_code).await {
                                 warn!(
                                     target: "task",
@@ -451,11 +452,11 @@ impl TaskManager {
     }
 
     /// Watches runtime lifecycle events and reconnects the stream when it drops.
-    async fn watch_runtime_event_stream(&self, events_tx: UnboundedSender<ContainerRuntimeEvent>) {
+    async fn watch_runtime_event_stream(&self, events_tx: UnboundedSender<RuntimeEvent>) {
         loop {
             let result = self
                 .runtime
-                .container_manager
+                .runtime_backend
                 .watch_runtime_events(events_tx.clone())
                 .await;
             if events_tx.is_closed() {
@@ -973,19 +974,17 @@ impl TaskManager {
     ) -> Result<Option<i32>> {
         let inspect = self
             .runtime
-            .container_manager
-            .inspect_container(container_id)
+            .runtime_backend
+            .inspect_instance(container_id)
             .await
             .with_context(|| {
                 format!("inspect container {container_id} for network attachment provisioning")
             })?;
-
-        let state = inspect.state.as_ref();
-        let pid = state.and_then(|s| s.pid).unwrap_or(0);
+        let pid = inspect.state.pid.unwrap_or(0);
 
         // Treat unknown running state as true for compatibility with older Docker/mocks, but
         // require a non-zero PID.
-        let running = state.and_then(|s| s.running).unwrap_or(true);
+        let running = inspect.state.running.unwrap_or(true);
         if pid == 0 || !running {
             tracing::trace!(
                 target: "task",

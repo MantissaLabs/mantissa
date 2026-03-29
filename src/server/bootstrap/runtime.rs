@@ -6,6 +6,11 @@ use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::service::NetworksRpc;
 use crate::registry::Registry;
+use crate::runtime::oci::DockerRuntimeBackend;
+use crate::runtime::testing::{
+    new_in_memory_runtime_backend, use_in_memory_runtime_backend_from_env,
+};
+use crate::runtime::types::RuntimeBackend;
 use crate::scheduler::Scheduler;
 use crate::scheduler::digest::{
     SchedulerDigestPublisher, SchedulerDigestRegistry, SchedulerDigestReplicator,
@@ -15,7 +20,6 @@ use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
 use crate::sync::{SyncService, SyncStores};
-use crate::task::docker::{self, ContainerManager, DockerContainerManager};
 use crate::task::manager::{TaskManager, TaskManagerConfig, TaskRuntimeConfig};
 use crate::task::service::TaskService;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyStores};
@@ -44,7 +48,7 @@ use tracing::{error, info};
 #[derive(Clone)]
 pub(crate) struct BootstrapOptions {
     pub task_runtime: Option<TaskRuntimeConfig>,
-    pub container_manager: Option<Arc<dyn ContainerManager + Send + Sync>>,
+    pub runtime_backend: Option<Arc<dyn RuntimeBackend + Send + Sync>>,
     pub local_volume_root: Option<PathBuf>,
     pub gossip_channel_capacity: usize,
     pub gossip_fanout: usize,
@@ -60,7 +64,7 @@ impl Default for BootstrapOptions {
     fn default() -> Self {
         Self {
             task_runtime: None,
-            container_manager: None,
+            runtime_backend: None,
             local_volume_root: None,
             gossip_channel_capacity: 128,
             gossip_fanout: DEFAULT_FANOUT,
@@ -366,7 +370,7 @@ async fn build_runtime_components(
         config::local_volume_enforce_capacity(),
     );
 
-    let container_manager = build_container_manager(options).await?;
+    let runtime_backend = build_runtime_backend(options).await?;
 
     let network_registry = NetworkRegistry::new(
         stores.networks.clone(),
@@ -414,7 +418,7 @@ async fn build_runtime_components(
         local_node_id: ctx.self_id,
         local_node_name: local_node_name.clone(),
         scheduler: scheduler.clone(),
-        container_manager,
+        runtime_backend,
         registry: registry.clone(),
         network_registry: network_registry.clone(),
         volume_registry: volume_registry.clone(),
@@ -720,22 +724,22 @@ fn resolve_local_volume_root(options: &BootstrapOptions) -> BootstrapResult<Path
 ///
 /// Tests can inject an in-memory runtime while production continues to default
 /// to Docker unless an environment override asks for the in-memory manager.
-async fn build_container_manager(
+async fn build_runtime_backend(
     options: &BootstrapOptions,
-) -> BootstrapResult<Arc<dyn ContainerManager + Send + Sync>> {
-    if let Some(container_manager) = &options.container_manager {
-        return Ok(container_manager.clone());
+) -> BootstrapResult<Arc<dyn RuntimeBackend + Send + Sync>> {
+    if let Some(runtime_backend) = &options.runtime_backend {
+        return Ok(runtime_backend.clone());
     }
 
-    if docker::use_in_memory_container_manager_from_env() {
+    if use_in_memory_runtime_backend_from_env() {
         info!(
             target: "task",
             "using in-memory container runtime from env override"
         );
-        return Ok(docker::new_in_memory_container_manager());
+        return Ok(new_in_memory_runtime_backend());
     }
 
-    Ok(Arc::new(DockerContainerManager::new().await.map_err(
+    Ok(Arc::new(DockerRuntimeBackend::new().await.map_err(
         |error| -> Box<dyn std::error::Error> { Box::new(error) },
     )?))
 }

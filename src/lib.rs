@@ -18,6 +18,7 @@ pub mod logger;
 pub mod network;
 pub mod node;
 pub mod registry;
+pub mod runtime;
 pub mod scheduler;
 pub mod secrets;
 pub mod server;

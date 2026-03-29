@@ -12,6 +12,11 @@ use crate::network::types::{
     NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
 };
 use crate::registry::Registry;
+use crate::runtime::types::{
+    ResourceLimits, RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities, RuntimeConfigInfo,
+    RuntimeCreateRequest, RuntimeError, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo,
+    RuntimeLogFrame, RuntimeLogStream, RuntimeLogsOptions, RuntimeResult, RuntimeStateInfo,
+};
 use crate::scheduler::digest::SchedulerDigestRegistry;
 use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
 use crate::secrets::crypto::SecretKeyring;
@@ -54,64 +59,48 @@ use tempfile::tempdir;
 use tokio::sync::{Notify, RwLock, mpsc};
 
 type ExecCall = (String, Vec<String>, Option<std::time::Duration>);
-type AttachCall = (String, crate::task::docker::ContainerAttachOptions);
-type ExecStreamCall = (String, crate::task::docker::ContainerExecOptions);
-type LogCall = (String, crate::task::docker::ContainerLogsOptions);
+type AttachCall = (String, RuntimeAttachOptions);
+type ExecStreamCall = (String, RuntimeExecOptions);
+type LogCall = (String, RuntimeLogsOptions);
 
 #[derive(Clone, Default)]
-struct MockContainerManager {
+struct MockRuntimeBackend {
     created: Arc<AsyncMutex<Vec<String>>>,
-    create_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
+    create_errors: Arc<AsyncMutex<VecDeque<RuntimeError>>>,
     exec_calls: Arc<AsyncMutex<Vec<ExecCall>>>,
     exec_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
-    exec_results: Arc<
-        AsyncMutex<
-            VecDeque<
-                crate::task::docker::ContainerResult<crate::task::docker::ContainerExecResult>,
-            >,
-        >,
-    >,
+    exec_results: Arc<AsyncMutex<VecDeque<RuntimeResult<RuntimeExecResult>>>>,
     stopped: Arc<AsyncMutex<Vec<String>>>,
     stop_timeouts: Arc<AsyncMutex<Vec<Option<std::time::Duration>>>>,
     stop_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
     removed: Arc<AsyncMutex<Vec<String>>>,
     remove_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
     open_stdin: Arc<AsyncMutex<Vec<bool>>>,
-    limits: Arc<AsyncMutex<Vec<crate::task::docker::ResourceLimits>>>,
+    limits: Arc<AsyncMutex<Vec<ResourceLimits>>>,
     volume_mounts: Arc<AsyncMutex<Vec<Vec<String>>>>,
-    inspect: Arc<AsyncMutex<HashMap<String, bollard::service::ContainerInspectResponse>>>,
+    inspect: Arc<AsyncMutex<HashMap<String, RuntimeInfo>>>,
     inspect_calls: Arc<AsyncMutex<Vec<String>>>,
-    listed: Arc<AsyncMutex<Vec<crate::task::docker::ContainerInfo>>>,
+    listed: Arc<AsyncMutex<Vec<RuntimeInfo>>>,
     attach_calls: Arc<AsyncMutex<Vec<AttachCall>>>,
-    attach_frames: Arc<AsyncMutex<HashMap<String, Vec<crate::task::docker::ContainerLogFrame>>>>,
+    attach_frames: Arc<AsyncMutex<HashMap<String, Vec<RuntimeLogFrame>>>>,
     attach_inputs: Arc<AsyncMutex<HashMap<String, Vec<Vec<u8>>>>>,
-    attach_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
+    attach_errors: Arc<AsyncMutex<VecDeque<RuntimeError>>>,
     exec_stream_calls: Arc<AsyncMutex<Vec<ExecStreamCall>>>,
-    exec_stream_frames:
-        Arc<AsyncMutex<HashMap<String, Vec<crate::task::docker::ContainerLogFrame>>>>,
+    exec_stream_frames: Arc<AsyncMutex<HashMap<String, Vec<RuntimeLogFrame>>>>,
     exec_stream_inputs: Arc<AsyncMutex<HashMap<String, Vec<Vec<u8>>>>>,
-    exec_stream_results: Arc<
-        AsyncMutex<
-            VecDeque<
-                crate::task::docker::ContainerResult<crate::task::docker::ContainerExecResult>,
-            >,
-        >,
-    >,
+    exec_stream_results: Arc<AsyncMutex<VecDeque<RuntimeResult<RuntimeExecResult>>>>,
     log_calls: Arc<AsyncMutex<Vec<LogCall>>>,
-    log_frames: Arc<AsyncMutex<HashMap<String, Vec<crate::task::docker::ContainerLogFrame>>>>,
-    log_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
+    log_frames: Arc<AsyncMutex<HashMap<String, Vec<RuntimeLogFrame>>>>,
+    log_errors: Arc<AsyncMutex<VecDeque<RuntimeError>>>,
     present_images: Arc<AsyncMutex<HashSet<String>>>,
-    pull_errors: Arc<AsyncMutex<VecDeque<crate::task::docker::ContainerError>>>,
+    pull_errors: Arc<AsyncMutex<VecDeque<RuntimeError>>>,
     pull_calls: Arc<AsyncMutex<Vec<String>>>,
     pull_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
 }
 
 #[async_trait]
-impl ContainerManager for MockContainerManager {
-    async fn create_container(
-        &self,
-        request: crate::task::docker::ContainerCreateRequest,
-    ) -> crate::task::docker::ContainerResult<String> {
+impl RuntimeBackend for MockRuntimeBackend {
+    async fn create_instance(&self, request: RuntimeCreateRequest) -> RuntimeResult<String> {
         if let Some(err) = self.create_errors.lock().await.pop_front() {
             return Err(err);
         }
@@ -126,13 +115,17 @@ impl ContainerManager for MockContainerManager {
         self.volume_mounts.lock().await.push(volumes);
 
         let mut inspect = self.inspect.lock().await;
-        let state = bollard::models::ContainerState {
-            pid: Some(10_000 + inspect.len() as i64),
-            ..Default::default()
-        };
-        let response = bollard::service::ContainerInspectResponse {
-            id: Some(id.clone()),
-            state: Some(state),
+        let response = RuntimeInfo {
+            id: id.clone(),
+            name: request.name.clone(),
+            image: request.image,
+            status: "created".to_string(),
+            state: RuntimeStateInfo {
+                raw_status: Some("created".to_string()),
+                running: Some(false),
+                pid: Some(10_000 + inspect.len() as i64),
+                ..Default::default()
+            },
             ..Default::default()
         };
         inspect.insert(id.clone(), response.clone());
@@ -140,33 +133,55 @@ impl ContainerManager for MockContainerManager {
         Ok(id)
     }
 
-    async fn start_container(
-        &self,
-        _container_id: &str,
-    ) -> crate::task::docker::ContainerResult<()> {
+    async fn start_instance(&self, container_id: &str) -> RuntimeResult<()> {
+        let mut inspect = self.inspect.lock().await;
+        let mut found = false;
+        for info in inspect.values_mut() {
+            if info.id == container_id || info.name == container_id {
+                info.status = "Up".to_string();
+                info.state.raw_status = Some("running".to_string());
+                info.state.running = Some(true);
+                if info.state.pid.unwrap_or_default() == 0 {
+                    info.state.pid = Some(10_000);
+                }
+                found = true;
+            }
+        }
+        if !found {
+            return Err(RuntimeError::NotFound(container_id.to_string()));
+        }
         Ok(())
     }
 
-    async fn stop_container(
+    async fn stop_instance(
         &self,
         container_id: &str,
         timeout: Option<std::time::Duration>,
-    ) -> crate::task::docker::ContainerResult<()> {
+    ) -> RuntimeResult<()> {
         let delay = *self.stop_delay.lock().await;
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
         self.stopped.lock().await.push(container_id.to_string());
         self.stop_timeouts.lock().await.push(timeout);
+        let mut inspect = self.inspect.lock().await;
+        for info in inspect.values_mut() {
+            if info.id == container_id || info.name == container_id {
+                info.status = "Exited".to_string();
+                info.state.raw_status = Some("exited".to_string());
+                info.state.running = Some(false);
+                info.state.pid = Some(0);
+            }
+        }
         Ok(())
     }
 
-    async fn exec_container(
+    async fn exec_instance(
         &self,
         container_id: &str,
         command: &[String],
         timeout: Option<std::time::Duration>,
-    ) -> crate::task::docker::ContainerResult<crate::task::docker::ContainerExecResult> {
+    ) -> RuntimeResult<RuntimeExecResult> {
         let delay = *self.exec_delay.lock().await;
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
@@ -178,46 +193,41 @@ impl ContainerManager for MockContainerManager {
         if let Some(result) = self.exec_results.lock().await.pop_front() {
             return result;
         }
-        Ok(crate::task::docker::ContainerExecResult { exit_code: Some(0) })
+        Ok(RuntimeExecResult { exit_code: Some(0) })
     }
 
-    async fn restart_container(
+    async fn restart_instance(
         &self,
         _container_id: &str,
         _timeout: Option<std::time::Duration>,
-    ) -> crate::task::docker::ContainerResult<()> {
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 
-    async fn remove_container(
+    async fn remove_instance(
         &self,
         container_id: &str,
         _force: bool,
         _remove_volumes: bool,
-    ) -> crate::task::docker::ContainerResult<()> {
+    ) -> RuntimeResult<()> {
         let delay = *self.remove_delay.lock().await;
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
         self.removed.lock().await.push(container_id.to_string());
         let mut inspect = self.inspect.lock().await;
-        inspect.retain(|key, response| {
-            key != container_id && response.id.as_deref() != Some(container_id)
-        });
+        inspect.retain(|key, response| key != container_id && response.id != container_id);
         Ok(())
     }
 
-    async fn list_containers(
+    async fn list_instances(
         &self,
         _filters: Option<HashMap<String, Vec<String>>>,
-    ) -> crate::task::docker::ContainerResult<Vec<crate::task::docker::ContainerInfo>> {
+    ) -> RuntimeResult<Vec<RuntimeInfo>> {
         Ok(self.listed.lock().await.clone())
     }
 
-    async fn inspect_container(
-        &self,
-        container_id: &str,
-    ) -> crate::task::docker::ContainerResult<bollard::service::ContainerInspectResponse> {
+    async fn inspect_instance(&self, container_id: &str) -> RuntimeResult<RuntimeInfo> {
         self.inspect_calls
             .lock()
             .await
@@ -226,14 +236,14 @@ impl ContainerManager for MockContainerManager {
         guard
             .get(container_id)
             .cloned()
-            .ok_or_else(|| crate::task::docker::ContainerError::NotFound(container_id.into()))
+            .ok_or_else(|| RuntimeError::NotFound(container_id.into()))
     }
 
-    async fn image_present(&self, image: &str) -> crate::task::docker::ContainerResult<bool> {
+    async fn image_present(&self, image: &str) -> RuntimeResult<bool> {
         Ok(self.present_images.lock().await.contains(image))
     }
 
-    async fn pull_image(&self, image: &str) -> crate::task::docker::ContainerResult<()> {
+    async fn pull_image(&self, image: &str) -> RuntimeResult<()> {
         self.pull_calls.lock().await.push(image.to_string());
         let delay = *self.pull_delay.lock().await;
         if let Some(delay) = delay {
@@ -245,12 +255,12 @@ impl ContainerManager for MockContainerManager {
         Ok(())
     }
 
-    async fn stream_container_logs(
+    async fn stream_instance_logs(
         &self,
         container_id: &str,
-        options: &crate::task::docker::ContainerLogsOptions,
-        logs_tx: tokio::sync::mpsc::Sender<crate::task::docker::ContainerLogFrame>,
-    ) -> crate::task::docker::ContainerResult<()> {
+        options: &RuntimeLogsOptions,
+        logs_tx: tokio::sync::mpsc::Sender<RuntimeLogFrame>,
+    ) -> RuntimeResult<()> {
         self.log_calls
             .lock()
             .await
@@ -275,13 +285,13 @@ impl ContainerManager for MockContainerManager {
         Ok(())
     }
 
-    async fn attach_container(
+    async fn attach_instance(
         &self,
         container_id: &str,
-        options: &crate::task::docker::ContainerAttachOptions,
-        output_tx: tokio::sync::mpsc::Sender<crate::task::docker::ContainerLogFrame>,
+        options: &RuntimeAttachOptions,
+        output_tx: tokio::sync::mpsc::Sender<RuntimeLogFrame>,
         mut input_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    ) -> crate::task::docker::ContainerResult<()> {
+    ) -> RuntimeResult<()> {
         self.attach_calls
             .lock()
             .await
@@ -314,13 +324,13 @@ impl ContainerManager for MockContainerManager {
         Ok(())
     }
 
-    async fn exec_container_stream(
+    async fn exec_instance_stream(
         &self,
         container_id: &str,
-        options: &crate::task::docker::ContainerExecOptions,
-        output_tx: tokio::sync::mpsc::Sender<crate::task::docker::ContainerLogFrame>,
+        options: &RuntimeExecOptions,
+        output_tx: tokio::sync::mpsc::Sender<RuntimeLogFrame>,
         mut input_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    ) -> crate::task::docker::ContainerResult<crate::task::docker::ContainerExecResult> {
+    ) -> RuntimeResult<RuntimeExecResult> {
         self.exec_stream_calls
             .lock()
             .await
@@ -335,7 +345,7 @@ impl ContainerManager for MockContainerManager {
             .unwrap_or_default();
         for frame in frames {
             if output_tx.send(frame).await.is_err() {
-                return Ok(crate::task::docker::ContainerExecResult { exit_code: None });
+                return Ok(RuntimeExecResult { exit_code: None });
             }
         }
 
@@ -352,8 +362,50 @@ impl ContainerManager for MockContainerManager {
             return result;
         }
 
-        Ok(crate::task::docker::ContainerExecResult { exit_code: Some(0) })
+        Ok(RuntimeExecResult { exit_code: Some(0) })
     }
+
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            exec: true,
+            interactive_exec: true,
+            logs: true,
+            attach: true,
+            lifecycle_events: false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_info_with_state(
+    id: &str,
+    name: &str,
+    image: &str,
+    status: &str,
+    raw_status: &str,
+    running: bool,
+    pid: i64,
+    exit_code: Option<i32>,
+    error: Option<&str>,
+) -> RuntimeInfo {
+    RuntimeInfo {
+        id: id.to_string(),
+        name: name.to_string(),
+        image: image.to_string(),
+        status: status.to_string(),
+        state: RuntimeStateInfo {
+            raw_status: Some(raw_status.to_string()),
+            running: Some(running),
+            pid: Some(pid),
+            exit_code,
+            error: error.map(str::to_string),
+        },
+        ..Default::default()
+    }
+}
+
+fn running_runtime_info(id: &str, name: &str, image: &str) -> RuntimeInfo {
+    runtime_info_with_state(id, name, image, "Up", "running", true, 1000, None, None)
 }
 
 #[derive(Default)]
@@ -651,7 +703,7 @@ fn temp_db(prefix: &str) -> (Arc<redb::Database>, tempfile::TempDir) {
 async fn setup_manager() -> (
     TaskManager,
     Rc<Scheduler>,
-    Arc<MockContainerManager>,
+    Arc<MockRuntimeBackend>,
     NetworkRegistry,
 ) {
     setup_manager_with_forwarding(None, None).await
@@ -663,7 +715,7 @@ async fn setup_manager_with_forwarding(
 ) -> (
     TaskManager,
     Rc<Scheduler>,
-    Arc<MockContainerManager>,
+    Arc<MockRuntimeBackend>,
     NetworkRegistry,
 ) {
     let actor = Uuid::new_v4();
@@ -753,7 +805,7 @@ async fn setup_manager_with_forwarding(
     )));
 
     let (tx, rx) = bounded(64);
-    let mock_cm = Arc::new(MockContainerManager::default());
+    let mock_cm = Arc::new(MockRuntimeBackend::default());
     let signing_key = SigningKey::try_from(&[7u8; 32][..]).expect("signing key");
     let registry = Registry::new(
         peers_store.clone(),
@@ -789,7 +841,7 @@ async fn setup_manager_with_forwarding(
         local_node_id: actor,
         local_node_name: "local-node".to_string(),
         scheduler: scheduler.clone(),
-        container_manager: mock_cm.clone(),
+        runtime_backend: mock_cm.clone(),
         registry,
         network_registry: network_registry.clone(),
         volume_registry,
@@ -1275,10 +1327,10 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
 
     {
         let mut errors = mock_cm.pull_errors.lock().await;
-        errors.push_back(crate::task::docker::ContainerError::OperationFailed(
+        errors.push_back(RuntimeError::OperationFailed(
             "temporary pull failure #1".into(),
         ));
-        errors.push_back(crate::task::docker::ContainerError::OperationFailed(
+        errors.push_back(RuntimeError::OperationFailed(
             "temporary pull failure #2".into(),
         ));
     }
@@ -2283,18 +2335,17 @@ async fn reconcile_running_task_marks_failed_when_container_exits_without_restar
         let mut inspect = mock_cm.inspect.lock().await;
         inspect.insert(
             container_id.clone(),
-            bollard::service::ContainerInspectResponse {
-                id: Some(container_id),
-                state: Some(bollard::models::ContainerState {
-                    status: Some(bollard::models::ContainerStateStatusEnum::EXITED),
-                    running: Some(false),
-                    pid: Some(0),
-                    exit_code: Some(255),
-                    error: Some("exec format error".to_string()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
+            runtime_info_with_state(
+                &container_id,
+                &format!("mantissa-{}", spec.id),
+                "img",
+                "Exited",
+                "exited",
+                false,
+                0,
+                Some(255),
+                Some("exec format error"),
+            ),
         );
     }
 
@@ -2414,14 +2465,11 @@ async fn reconcile_running_task_keeps_running_when_list_finds_container() {
     {
         let mut listed = mock_cm.listed.lock().await;
         listed.clear();
-        listed.push(crate::task::docker::ContainerInfo {
-            id: "container-0".to_string(),
-            name: format!("mantissa-{}", spec.id),
-            image: "img".to_string(),
-            status: "Up".to_string(),
-            state: "running".to_string(),
-            created: 1,
-        });
+        listed.push(running_runtime_info(
+            "container-0",
+            &format!("mantissa-{}", spec.id),
+            "img",
+        ));
     }
 
     manager
@@ -2782,12 +2830,8 @@ async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
 
     {
         let mut results = mock_cm.exec_results.lock().await;
-        results.push_back(Ok(crate::task::docker::ContainerExecResult {
-            exit_code: Some(7),
-        }));
-        results.push_back(Ok(crate::task::docker::ContainerExecResult {
-            exit_code: Some(7),
-        }));
+        results.push_back(Ok(RuntimeExecResult { exit_code: Some(7) }));
+        results.push_back(Ok(RuntimeExecResult { exit_code: Some(7) }));
     }
 
     let mut first = manager
@@ -2897,12 +2941,7 @@ async fn reconcile_running_task_retries_create_after_stale_name_conflict() {
     }
     {
         let mut errors = mock_cm.create_errors.lock().await;
-        errors.push_back(crate::task::docker::ContainerError::DockerAPI(
-            bollard::errors::Error::DockerResponseServerError {
-                status_code: 409,
-                message: "name already in use".to_string(),
-            },
-        ));
+        errors.push_back(RuntimeError::backend(Some(409), "name already in use"));
     }
 
     manager
@@ -2946,14 +2985,11 @@ async fn reconcile_local_tasks_uses_runtime_inventory_for_running_tasks() {
     {
         let mut listed = mock_cm.listed.lock().await;
         listed.clear();
-        listed.push(crate::task::docker::ContainerInfo {
-            id: "runtime-container-1".to_string(),
-            name: format!("mantissa-{}", spec.id),
-            image: "img".to_string(),
-            status: "Up".to_string(),
-            state: "running".to_string(),
-            created: 0,
-        });
+        listed.push(running_runtime_info(
+            "runtime-container-1",
+            &format!("mantissa-{}", spec.id),
+            "img",
+        ));
     }
     mock_cm.inspect_calls.lock().await.clear();
 
@@ -3366,9 +3402,11 @@ async fn request_task_stop_continues_after_pre_stop_hook_failure() {
     spec.pre_stop_command = Some(vec!["/bin/false".into()]);
     manager.persist_spec(&spec).await.expect("persist update");
 
-    mock_cm.exec_results.lock().await.push_back(Err(
-        crate::task::docker::ContainerError::OperationFailed("boom".into()),
-    ));
+    mock_cm
+        .exec_results
+        .lock()
+        .await
+        .push_back(Err(RuntimeError::OperationFailed("boom".into())));
 
     let requested = manager
         .request_task_stop(spec.id)
@@ -3407,14 +3445,11 @@ async fn reconcile_inventory_uses_drain_stop_timeout_for_unowned_runtime() {
     {
         let mut listed = mock_cm.listed.lock().await;
         listed.clear();
-        listed.push(crate::task::docker::ContainerInfo {
-            id: format!("runtime-{}", spec.id),
-            name: format!("mantissa-{}", spec.id),
-            image: "img".to_string(),
-            status: "Up".to_string(),
-            state: "running".to_string(),
-            created: 0,
-        });
+        listed.push(running_runtime_info(
+            &format!("runtime-{}", spec.id),
+            &format!("mantissa-{}", spec.id),
+            "img",
+        ));
     }
 
     let mut remote_spec = spec.clone();
@@ -3796,7 +3831,7 @@ async fn reconcile_stopping_task_retries_after_stop_timeout() {
         .await
         .expect_err("slow runtime stop should time out");
     assert!(
-        err.to_string().contains("docker stop timed out"),
+        err.to_string().contains("runtime stop timed out"),
         "expected bounded stop timeout, got: {err:#}"
     );
 
@@ -3851,7 +3886,7 @@ async fn reconcile_stopping_task_retries_after_remove_timeout() {
         .await
         .expect_err("slow runtime remove should time out");
     assert!(
-        err.to_string().contains("docker remove timed out"),
+        err.to_string().contains("runtime remove timed out"),
         "expected bounded remove timeout, got: {err:#}"
     );
 
@@ -4216,18 +4251,18 @@ async fn stream_local_task_logs_forwards_frames_and_options() {
     mock_cm.log_frames.lock().await.insert(
         container_name.clone(),
         vec![
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::StdOut,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::StdOut,
                 message: b"hello stdout\n".to_vec(),
             },
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::StdErr,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::StdErr,
                 message: b"hello stderr\n".to_vec(),
             },
         ],
     );
 
-    let options = crate::task::docker::ContainerLogsOptions {
+    let options = RuntimeLogsOptions {
         follow: true,
         stdout: true,
         stderr: true,
@@ -4250,12 +4285,12 @@ async fn stream_local_task_logs_forwards_frames_and_options() {
     assert_eq!(
         frames,
         vec![
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::StdOut,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::StdOut,
                 message: b"hello stdout\n".to_vec(),
             },
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::StdErr,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::StdErr,
                 message: b"hello stderr\n".to_vec(),
             },
         ]
@@ -4308,32 +4343,34 @@ async fn attach_local_task_forwards_input_output_and_options() {
     mock_cm.attach_frames.lock().await.insert(
         container_name.clone(),
         vec![
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::Console,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::Console,
                 message: b"ready\n".to_vec(),
             },
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::StdErr,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::StdErr,
                 message: b"warn\n".to_vec(),
             },
         ],
     );
     mock_cm.inspect.lock().await.insert(
         container_name.clone(),
-        bollard::service::ContainerInspectResponse {
-            state: Some(bollard::models::ContainerState {
+        RuntimeInfo {
+            id: container_name.clone(),
+            name: container_name.clone(),
+            status: "Up".to_string(),
+            state: RuntimeStateInfo {
+                raw_status: Some("running".to_string()),
                 running: Some(true),
+                pid: Some(1000),
                 ..Default::default()
-            }),
-            config: Some(bollard::models::ContainerConfig {
-                tty: Some(false),
-                ..Default::default()
-            }),
+            },
+            config: RuntimeConfigInfo { tty: Some(false) },
             ..Default::default()
         },
     );
 
-    let options = crate::task::docker::ContainerAttachOptions {
+    let options = RuntimeAttachOptions {
         logs: true,
         stream: true,
         stdin: true,
@@ -4379,12 +4416,12 @@ async fn attach_local_task_forwards_input_output_and_options() {
     assert_eq!(
         frames,
         vec![
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::Console,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::Console,
                 message: b"ready\n".to_vec(),
             },
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::StdErr,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::StdErr,
                 message: b"warn\n".to_vec(),
             },
         ]
@@ -4435,20 +4472,22 @@ async fn attach_local_task_uses_runtime_tty_when_persisted_spec_is_stale() {
     let container_name = format!("mantissa-{task_id}");
     mock_cm.inspect.lock().await.insert(
         container_name.clone(),
-        bollard::service::ContainerInspectResponse {
-            state: Some(bollard::models::ContainerState {
+        RuntimeInfo {
+            id: container_name.clone(),
+            name: container_name.clone(),
+            status: "Up".to_string(),
+            state: RuntimeStateInfo {
+                raw_status: Some("running".to_string()),
                 running: Some(true),
+                pid: Some(1000),
                 ..Default::default()
-            }),
-            config: Some(bollard::models::ContainerConfig {
-                tty: Some(true),
-                ..Default::default()
-            }),
+            },
+            config: RuntimeConfigInfo { tty: Some(true) },
             ..Default::default()
         },
     );
 
-    let options = crate::task::docker::ContainerAttachOptions {
+    let options = RuntimeAttachOptions {
         logs: false,
         stream: true,
         stdin: true,
@@ -4472,7 +4511,7 @@ async fn attach_local_task_uses_runtime_tty_when_persisted_spec_is_stale() {
         mock_cm.attach_calls.lock().await.clone(),
         vec![(
             container_name,
-            crate::task::docker::ContainerAttachOptions {
+            RuntimeAttachOptions {
                 tty: true,
                 ..options
             }
@@ -4526,21 +4565,23 @@ async fn exec_local_task_forwards_input_output_and_options() {
     mock_cm.exec_stream_frames.lock().await.insert(
         container_name.clone(),
         vec![
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::Console,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::Console,
                 message: b"/ # ".to_vec(),
             },
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::StdOut,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::StdOut,
                 message: b"done\n".to_vec(),
             },
         ],
     );
-    mock_cm.exec_stream_results.lock().await.push_back(Ok(
-        crate::task::docker::ContainerExecResult { exit_code: Some(0) },
-    ));
+    mock_cm
+        .exec_stream_results
+        .lock()
+        .await
+        .push_back(Ok(RuntimeExecResult { exit_code: Some(0) }));
 
-    let options = crate::task::docker::ContainerExecOptions {
+    let options = RuntimeExecOptions {
         command: vec!["sh".to_string(), "-c".to_string(), "echo done".to_string()],
         stdin: true,
         stdout: true,
@@ -4586,12 +4627,12 @@ async fn exec_local_task_forwards_input_output_and_options() {
     assert_eq!(
         frames,
         vec![
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::Console,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::Console,
                 message: b"/ # ".to_vec(),
             },
-            crate::task::docker::ContainerLogFrame {
-                stream: crate::task::docker::ContainerLogStream::StdOut,
+            RuntimeLogFrame {
+                stream: RuntimeLogStream::StdOut,
                 message: b"done\n".to_vec(),
             },
         ]

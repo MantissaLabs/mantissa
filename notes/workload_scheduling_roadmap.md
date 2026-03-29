@@ -336,7 +336,7 @@ duplicated in-memory runtime.
 
 ### Status
 
-Pending.
+Completed on 2026-03-29.
 
 ### Scope
 
@@ -409,6 +409,100 @@ Pending.
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
+
+### Implemented
+
+1. Added the generic runtime module tree:
+   - `src/runtime/mod.rs`
+   - `src/runtime/types.rs`
+   - `src/runtime/oci/mod.rs`
+   - `src/runtime/oci/docker.rs`
+   - `src/runtime/testing/mod.rs`
+   - `src/runtime/testing/in_memory.rs`
+2. Added the runtime-neutral backend contract and payload types:
+   - `RuntimeBackend`
+   - `RuntimeError` and `RuntimeResult`
+   - `RuntimeCreateRequest`
+   - `RuntimeInfo`, `RuntimeStateInfo`, and `RuntimeConfigInfo`
+   - `RuntimeLogFrame`, `RuntimeLogStream`, and `RuntimeExecResult`
+   - `RuntimeCapabilities` and `RuntimeEvent`
+3. Moved the Docker backend completely under `src/runtime/oci/docker.rs` and
+   converted it to implement the generic runtime trait.
+4. Updated generic runtime consumers to depend on `crate::runtime::types`:
+   - `src/task/manager/mod.rs`
+   - `src/task/manager/launch.rs`
+   - `src/task/manager/local.rs`
+   - `src/task/manager/runtime.rs`
+   - `src/task/manager/state.rs`
+   - `src/server/bootstrap/runtime.rs`
+   - `src/server/headless.rs`
+5. Switched runtime-facing manager logic from Docker-specific method names and
+   inspect payloads to runtime-neutral instance methods and `RuntimeInfo`.
+6. Consolidated all in-memory runtime usage onto the shared testing backend and
+   updated integration/unit tests to implement or consume the new runtime trait:
+   - `tests/common/testkit.rs`
+   - `tests/task_exec.rs`
+   - `tests/task_attach.rs`
+   - `tests/task_logs.rs`
+   - `tests/task_secrets.rs`
+   - `tests/volumes.rs`
+   - `tests/services.rs`
+   - `tests/gossip.rs`
+   - `tests/health.rs`
+   - `tests/cluster_view_protocol.rs`
+   - `src/task/manager/tests.rs`
+
+### Removed
+
+1. Deleted `src/task/docker.rs`.
+2. Removed the duplicate in-memory runtime implementation from
+   `tests/common/testkit.rs`.
+3. Removed all remaining `task::docker::*` imports from runtime consumers and
+   tests.
+4. Removed generic-layer dependence on `bollard::service::ContainerInspectResponse`.
+   Bollard inspect/list types now stay inside the Docker backend only.
+5. Removed the last test assertions and helpers that still expected
+   Docker-specific runtime error wording or error variants.
+
+### Findings
+
+1. `RuntimeInfo` needed to carry both lightweight list data and inspect-side
+   state/config details so the generic task manager could stop depending on
+   Docker inspect payloads without adding a second ad hoc runtime snapshot type.
+2. The cleanest cut for event support was a declarative capability flag on the
+   backend (`RuntimeCapabilities::lifecycle_events`) instead of a dedicated
+   `supports_runtime_events()` helper.
+3. Converting the runtime trait forced a useful cleanup in tests: most custom
+   backends only needed `RuntimeInfo` plus a small amount of state mutation,
+   not fabricated Bollard structs.
+
+### Validation completed
+
+1. `cargo fmt --all` passed.
+2. `cargo clippy --all-targets -- -D warnings` passed.
+3. `cargo test` passed.
+
+### Proposed commit
+
+Title:
+
+`runtime: extract generic backend interface`
+
+Body:
+
+`Move the task runtime abstraction out of task::docker and into a new`
+`runtime module with generic backend types, a shared in-memory backend,`
+`and a Docker implementation under runtime/oci.`
+
+`This removes the duplicate in-memory runtime, deletes the old`
+`src/task/docker.rs` module, and cuts generic task manager code over to`
+`runtime-neutral instance methods and RuntimeInfo snapshots instead of`
+`Bollard inspect payloads.`
+
+`Bootstrap, headless startup, task manager tests, and the integration`
+`test backends now all depend on the same RuntimeBackend contract, so`
+`Docker is just one backend implementation rather than the defining`
+`shape of the runtime layer.`
 
 ## Milestone 3: Network Attachment Generalization
 

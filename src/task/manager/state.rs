@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use async_channel::Sender;
-use bollard::models::ContainerStateStatusEnum;
 use chrono::Utc;
 use crdt_store::uuid_key::UuidKey;
 use rand::Rng;
@@ -15,13 +14,13 @@ use uuid::Uuid;
 
 use crate::gossip::Message;
 use crate::network::types::{NetworkAttachmentState, NetworkAttachmentValue};
+use crate::runtime::types::{RuntimeError, RuntimeInfo};
 use crate::scheduler::{
     GpuReservationRequest, LeaseReservation, SchedulerError, SlotId, SlotReservationRequest,
     SlotState,
 };
 use crate::task::causality::{parse_task_timestamp, task_event_id};
 use crate::task::container::ContainerState;
-use crate::task::docker::{ContainerError, ContainerInfo};
 use crate::task::types::{
     TaskEvent, TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicyKind,
     TaskServiceMetadata, TaskSpec, TaskValue,
@@ -383,8 +382,8 @@ impl TaskManager {
                 }
                 match self
                     .runtime
-                    .container_manager
-                    .exec_container(container_id, &probe.command, Some(probe.timeout()))
+                    .runtime_backend
+                    .exec_instance(container_id, &probe.command, Some(probe.timeout()))
                     .await
                 {
                     Ok(result) if matches!(result.exit_code, Some(0)) => Ok(()),
@@ -392,8 +391,8 @@ impl TaskManager {
                         Some(code) => Err(format!("liveness probe exited with status code {code}")),
                         None => Err("liveness probe completed without an exit status".to_string()),
                     },
-                    Err(ContainerError::Timeout) => Err("liveness probe timed out".to_string()),
-                    Err(ContainerError::NotFound(_)) => {
+                    Err(RuntimeError::Timeout) => Err("liveness probe timed out".to_string()),
+                    Err(RuntimeError::NotFound(_)) => {
                         Err("task container disappeared while executing liveness probe".to_string())
                     }
                     Err(err) => Err(format!("liveness probe failed: {err}")),
@@ -466,16 +465,12 @@ impl TaskManager {
 
         let inspect = self
             .runtime
-            .container_manager
-            .inspect_container(container_id)
+            .runtime_backend
+            .inspect_instance(container_id)
             .await
             .map_err(|err| format!("failed to inspect task container for liveness probe: {err}"))?;
-        if let Some(network_settings) = inspect.network_settings.as_ref()
-            && let Some(networks) = network_settings.networks.as_ref()
-        {
-            for endpoint in networks.values() {
-                push_liveness_target(&mut targets, endpoint.ip_address.as_deref());
-            }
+        for endpoint in &inspect.network_endpoints {
+            push_liveness_target(&mut targets, endpoint.ip_address.as_deref());
         }
 
         Ok(targets.into_iter().collect())
@@ -991,7 +986,7 @@ impl TaskManager {
         task_id: Uuid,
         image: &str,
     ) -> Result<(), anyhow::Error> {
-        match self.runtime.container_manager.image_present(image).await {
+        match self.runtime.runtime_backend.image_present(image).await {
             Ok(true) => {
                 debug!(
                     target: "task",
@@ -1034,7 +1029,7 @@ impl TaskManager {
 
             match timeout(
                 IMAGE_PULL_TIMEOUT,
-                self.runtime.container_manager.pull_image(image),
+                self.runtime.runtime_backend.pull_image(image),
             )
             .await
             {
@@ -1285,15 +1280,15 @@ impl TaskManager {
         match timeout(
             timeout_budget,
             self.runtime
-                .container_manager
-                .stop_container(container_identifier, Some(timeout_budget)),
+                .runtime_backend
+                .stop_instance(container_identifier, Some(timeout_budget)),
         )
         .await
         {
-            Ok(Ok(())) | Ok(Err(ContainerError::NotFound(_))) => Ok(()),
-            Ok(Err(err)) => Err(anyhow::anyhow!("docker stop failed: {err}")),
+            Ok(Ok(())) | Ok(Err(RuntimeError::NotFound(_))) => Ok(()),
+            Ok(Err(err)) => Err(anyhow::anyhow!("runtime stop failed: {err}")),
             Err(_) => Err(anyhow::anyhow!(
-                "docker stop timed out after {:?}",
+                "runtime stop timed out after {:?}",
                 timeout_budget
             )),
         }
@@ -1310,7 +1305,7 @@ impl TaskManager {
         let timeout_budget = timeout_budget.max(Duration::from_millis(1));
         match timeout(
             timeout_budget,
-            self.runtime.container_manager.remove_container(
+            self.runtime.runtime_backend.remove_instance(
                 container_identifier,
                 force,
                 remove_volumes,
@@ -1318,11 +1313,11 @@ impl TaskManager {
         )
         .await
         {
-            Ok(Ok(())) | Ok(Err(ContainerError::NotFound(_))) => Ok(()),
+            Ok(Ok(())) | Ok(Err(RuntimeError::NotFound(_))) => Ok(()),
             Ok(Err(err)) if container_remove_in_progress(&err) => Ok(()),
-            Ok(Err(err)) => Err(anyhow::anyhow!("docker remove failed: {err}")),
+            Ok(Err(err)) => Err(anyhow::anyhow!("runtime remove failed: {err}")),
             Err(_) => Err(anyhow::anyhow!(
-                "docker remove timed out after {:?}",
+                "runtime remove timed out after {:?}",
                 timeout_budget
             )),
         }
@@ -1487,8 +1482,8 @@ impl TaskManager {
 
         match self
             .runtime
-            .container_manager
-            .exec_container(container_identifier, command, Some(remaining))
+            .runtime_backend
+            .exec_instance(container_identifier, command, Some(remaining))
             .await
         {
             Ok(result) => {
@@ -1503,14 +1498,14 @@ impl TaskManager {
                     );
                 }
             }
-            Err(ContainerError::NotFound(_)) => {
+            Err(RuntimeError::NotFound(_)) => {
                 debug!(
                     target: "task",
                     task = %spec.id,
                     "skipping pre-stop hook because the container is already absent"
                 );
             }
-            Err(ContainerError::Timeout) => {
+            Err(RuntimeError::Timeout) => {
                 warn!(
                     target: "task",
                     task = %spec.id,
@@ -1799,7 +1794,7 @@ impl TaskManager {
     async fn resolve_terminal_exit_for_task(
         &self,
         spec: &TaskSpec,
-    ) -> Result<Option<(i32, Option<String>)>, ContainerError> {
+    ) -> Result<Option<(i32, Option<String>)>, RuntimeError> {
         let desired_name = format!("mantissa-{}", spec.id);
         let candidate = {
             let guard = self.local_state.local_containers.lock().await;
@@ -1816,14 +1811,9 @@ impl TaskManager {
         }
 
         for target in inspect_targets {
-            match self
-                .runtime
-                .container_manager
-                .inspect_container(&target)
-                .await
-            {
+            match self.runtime.runtime_backend.inspect_instance(&target).await {
                 Ok(info) => return Ok(terminal_exit_from_inspect(&info)),
-                Err(ContainerError::NotFound(_)) => continue,
+                Err(RuntimeError::NotFound(_)) => continue,
                 Err(err) => return Err(err),
             }
         }
@@ -1838,7 +1828,7 @@ impl TaskManager {
     pub(super) async fn resolve_live_container_id_for_task(
         &self,
         spec: &TaskSpec,
-    ) -> Result<Option<String>, ContainerError> {
+    ) -> Result<Option<String>, RuntimeError> {
         let desired_name = format!("mantissa-{}", spec.id);
         let candidate = {
             let guard = self.local_state.local_containers.lock().await;
@@ -1849,44 +1839,41 @@ impl TaskManager {
                 .unwrap_or_else(|| desired_name.clone())
         };
 
-        let resolve_id = |fallback: String,
-                          info: bollard::service::ContainerInspectResponse|
-         -> Option<String> {
-            let state = info.state.as_ref();
-            let running = state.and_then(|value| value.running).unwrap_or(true);
-            let pid = state.and_then(|value| value.pid).unwrap_or(1);
+        let resolve_id = |fallback: String, info: RuntimeInfo| -> Option<String> {
+            let running = info.state.running.unwrap_or(true);
+            let pid = info.state.pid.unwrap_or(1);
             if !running || pid == 0 {
                 return None;
             }
-            info.id
-                .map(|value| value.trim_start_matches('/').to_string())
-                .filter(|value| !value.is_empty())
-                .map(Some)
-                .unwrap_or_else(|| Some(fallback))
+            if info.id.is_empty() {
+                Some(fallback)
+            } else {
+                Some(info.id)
+            }
         };
 
         match self
             .runtime
-            .container_manager
-            .inspect_container(&candidate)
+            .runtime_backend
+            .inspect_instance(&candidate)
             .await
         {
             Ok(info) => Ok(resolve_id(candidate, info)),
-            Err(ContainerError::NotFound(_)) if candidate != desired_name => {
+            Err(RuntimeError::NotFound(_)) if candidate != desired_name => {
                 match self
                     .runtime
-                    .container_manager
-                    .inspect_container(&desired_name)
+                    .runtime_backend
+                    .inspect_instance(&desired_name)
                     .await
                 {
                     Ok(info) => Ok(resolve_id(desired_name, info)),
-                    Err(ContainerError::NotFound(_)) => {
+                    Err(RuntimeError::NotFound(_)) => {
                         self.find_container_id_by_name(&desired_name).await
                     }
                     Err(err) => Err(err),
                 }
             }
-            Err(ContainerError::NotFound(_)) => self.find_container_id_by_name(&desired_name).await,
+            Err(RuntimeError::NotFound(_)) => self.find_container_id_by_name(&desired_name).await,
             Err(err) => Err(err),
         }
     }
@@ -2240,22 +2227,25 @@ impl TaskManager {
     pub(super) async fn resolve_existing_container_id(
         &self,
         container_name: &str,
-    ) -> Result<Option<String>, ContainerError> {
+    ) -> Result<Option<String>, RuntimeError> {
         if let Some(id) = self.find_container_id_by_name(container_name).await? {
             return Ok(Some(id));
         }
 
         match self
             .runtime
-            .container_manager
-            .inspect_container(container_name)
+            .runtime_backend
+            .inspect_instance(container_name)
             .await
         {
             Ok(info) => {
-                let raw = info.id.unwrap_or_else(|| container_name.to_string());
-                Ok(Some(raw.trim_start_matches('/').to_string()))
+                if info.id.is_empty() {
+                    Ok(Some(container_name.to_string()))
+                } else {
+                    Ok(Some(info.id))
+                }
             }
-            Err(ContainerError::NotFound(_)) => Ok(None),
+            Err(RuntimeError::NotFound(_)) => Ok(None),
             Err(err) => Err(err),
         }
     }
@@ -2264,13 +2254,13 @@ impl TaskManager {
     async fn find_container_id_by_name(
         &self,
         container_name: &str,
-    ) -> Result<Option<String>, ContainerError> {
+    ) -> Result<Option<String>, RuntimeError> {
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("name".to_string(), vec![container_name.to_string()]);
         let candidates = self
             .runtime
-            .container_manager
-            .list_containers(Some(filters))
+            .runtime_backend
+            .list_instances(Some(filters))
             .await?;
         for candidate in candidates {
             if candidate.name == container_name {
@@ -2296,24 +2286,24 @@ impl TaskManager {
             let container_name = format!("mantissa-{}", spec.id);
             match self
                 .runtime
-                .container_manager
-                .inspect_container(&container_name)
+                .runtime_backend
+                .inspect_instance(&container_name)
                 .await
             {
                 Ok(info) => {
-                    let running = info
-                        .state
-                        .as_ref()
-                        .and_then(|state| state.running)
-                        .unwrap_or(false);
+                    let running = info.state.running.unwrap_or(false);
                     if running {
-                        let resolved = info.id.unwrap_or(container_name);
+                        let resolved = if info.id.is_empty() {
+                            container_name
+                        } else {
+                            info.id
+                        };
                         let mut guard = self.local_state.local_containers.lock().await;
                         guard.insert(spec.id, resolved);
                         has_container = true;
                     }
                 }
-                Err(ContainerError::NotFound(_)) => {}
+                Err(RuntimeError::NotFound(_)) => {}
                 Err(err) => {
                     warn!(
                         target: "task",
@@ -2553,7 +2543,7 @@ impl TaskManager {
     pub(super) async fn reconcile_local_container_inventory(&self) -> Result<(), anyhow::Error> {
         const UNOWNED_TASK_GRACE_SECS: i64 = 5;
 
-        let containers = self.runtime.container_manager.list_containers(None).await?;
+        let containers = self.runtime.runtime_backend.list_instances(None).await?;
         let task_index = self.load_task_value_index().await?;
 
         for container in containers {
@@ -2841,8 +2831,8 @@ impl TaskManager {
     async fn list_runtime_inventory(&self) -> Result<RuntimeInventory, anyhow::Error> {
         let containers = self
             .runtime
-            .container_manager
-            .list_containers(None)
+            .runtime_backend
+            .list_instances(None)
             .await
             .map_err(anyhow::Error::from)
             .context("list runtime containers for reconcile")?;
@@ -2933,7 +2923,7 @@ impl TaskManager {
     }
 
     /// Resolves the best local identity string for one runtime container row.
-    fn container_identity(container: &ContainerInfo) -> String {
+    fn container_identity(container: &RuntimeInfo) -> String {
         if !container.id.is_empty() {
             return container.id.clone();
         }
@@ -2941,8 +2931,9 @@ impl TaskManager {
     }
 
     /// Reports whether one runtime listing row represents a running container.
-    fn container_is_running(container: &ContainerInfo) -> bool {
-        if container.state.eq_ignore_ascii_case("running") {
+    fn container_is_running(container: &RuntimeInfo) -> bool {
+        if matches!(container.state.raw_status.as_deref(), Some(status) if status.eq_ignore_ascii_case("running"))
+        {
             return true;
         }
         container.status.starts_with("Up ")
@@ -3529,32 +3520,24 @@ fn should_restart_after_exit(spec: &TaskSpec, exit_code: i32) -> bool {
 }
 
 /// Extracts terminal exit metadata from one Docker inspect response.
-fn terminal_exit_from_inspect(
-    inspect: &bollard::service::ContainerInspectResponse,
-) -> Option<(i32, Option<String>)> {
-    let state = inspect.state.as_ref()?;
+fn terminal_exit_from_inspect(inspect: &RuntimeInfo) -> Option<(i32, Option<String>)> {
+    let state = &inspect.state;
     let running = state.running.unwrap_or(false);
     if running {
         return None;
     }
 
-    let status = state.status.as_ref();
-    if matches!(status, Some(ContainerStateStatusEnum::RESTARTING)) {
+    let status = state.raw_status.as_deref();
+    if matches!(status, Some(raw) if raw.eq_ignore_ascii_case("restarting")) {
         return None;
     }
 
-    let terminal_status = matches!(
-        status,
-        Some(ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD)
-    );
+    let terminal_status = matches!(status, Some(raw) if raw.eq_ignore_ascii_case("exited") || raw.eq_ignore_ascii_case("dead"));
     if !terminal_status && state.exit_code.is_none() {
         return None;
     }
 
-    let exit_code = state
-        .exit_code
-        .map(|value| value.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
-        .unwrap_or(1);
+    let exit_code = state.exit_code.unwrap_or(1);
     let exit_error = state.error.clone().filter(|value| !value.trim().is_empty());
     Some((exit_code, exit_error))
 }

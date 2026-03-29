@@ -2,10 +2,9 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use async_trait::async_trait;
-use mantissa::task::docker::{
-    ContainerCreateRequest, ContainerError, ContainerExecResult, ContainerInfo, ContainerManager,
-};
+pub use mantissa::runtime::testing::InMemoryRuntimeBackend;
+use mantissa::runtime::testing::new_in_memory_runtime_backend;
+use mantissa::runtime::types::RuntimeBackend;
 use mantissa::task::manager::TaskRuntimeConfig;
 use mantissa::topology_capnp::topology;
 use mantissa::{
@@ -31,264 +30,52 @@ where
     LocalSet::new().run_until(f).await
 }
 
-#[derive(Default)]
-pub struct InMemoryContainerManager {
-    containers: AsyncMutex<HashMap<String, InMemoryContainerEntry>>,
-    names: AsyncMutex<HashMap<String, String>>,
+fn default_runtime_backend() -> Arc<dyn RuntimeBackend + Send + Sync> {
+    new_in_memory_runtime_backend()
 }
 
 #[derive(Clone)]
-struct InMemoryContainerEntry {
-    id: String,
-    name: String,
-    image: String,
-    running: bool,
-}
-
-impl InMemoryContainerManager {
-    fn not_found(container_id: &str) -> ContainerError {
-        ContainerError::NotFound(container_id.to_string())
-    }
-
-    fn name_conflict(name: &str) -> ContainerError {
-        ContainerError::DockerAPI(bollard::errors::Error::DockerResponseServerError {
-            status_code: 409,
-            message: format!("container name '{name}' already in use"),
-        })
-    }
-
-    async fn resolve_container_id(&self, key: &str) -> Option<String> {
-        {
-            let containers = self.containers.lock().await;
-            if containers.contains_key(key) {
-                return Some(key.to_string());
-            }
-        }
-
-        let names = self.names.lock().await;
-        names.get(key).cloned()
-    }
-}
-
-#[async_trait]
-impl ContainerManager for InMemoryContainerManager {
-    async fn create_container(
-        &self,
-        request: ContainerCreateRequest,
-    ) -> Result<String, ContainerError> {
-        {
-            let names = self.names.lock().await;
-            if names.contains_key(&request.name) {
-                return Err(Self::name_conflict(&request.name));
-            }
-        }
-
-        let id = Uuid::new_v4().to_string();
-        let entry = InMemoryContainerEntry {
-            id: id.clone(),
-            name: request.name.clone(),
-            image: request.image,
-            running: false,
-        };
-
-        self.containers.lock().await.insert(id.clone(), entry);
-        self.names.lock().await.insert(request.name, id.clone());
-
-        Ok(id)
-    }
-
-    async fn start_container(&self, container_id: &str) -> Result<(), ContainerError> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let mut containers = self.containers.lock().await;
-        let Some(container) = containers.get_mut(&id) else {
-            return Err(Self::not_found(container_id));
-        };
-        container.running = true;
-        Ok(())
-    }
-
-    async fn stop_container(
-        &self,
-        container_id: &str,
-        _timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let mut containers = self.containers.lock().await;
-        let Some(container) = containers.get_mut(&id) else {
-            return Err(Self::not_found(container_id));
-        };
-        container.running = false;
-        Ok(())
-    }
-
-    async fn exec_container(
-        &self,
-        container_id: &str,
-        _command: &[String],
-        _timeout: Option<Duration>,
-    ) -> Result<ContainerExecResult, ContainerError> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let containers = self.containers.lock().await;
-        let Some(container) = containers.get(&id) else {
-            return Err(Self::not_found(container_id));
-        };
-        if !container.running {
-            return Err(ContainerError::OperationFailed(format!(
-                "container {container_id} is not running"
-            )));
-        }
-
-        Ok(ContainerExecResult { exit_code: Some(0) })
-    }
-
-    async fn restart_container(
-        &self,
-        container_id: &str,
-        _timeout: Option<Duration>,
-    ) -> Result<(), ContainerError> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let mut containers = self.containers.lock().await;
-        let Some(container) = containers.get_mut(&id) else {
-            return Err(Self::not_found(container_id));
-        };
-        container.running = true;
-        Ok(())
-    }
-
-    async fn remove_container(
-        &self,
-        container_id: &str,
-        _force: bool,
-        _remove_volumes: bool,
-    ) -> Result<(), ContainerError> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Ok(());
-        };
-
-        let removed = self.containers.lock().await.remove(&id);
-        if let Some(entry) = removed {
-            self.names.lock().await.remove(&entry.name);
-        }
-        Ok(())
-    }
-
-    async fn list_containers(
-        &self,
-        _filters: Option<HashMap<String, Vec<String>>>,
-    ) -> Result<Vec<ContainerInfo>, ContainerError> {
-        let containers = self.containers.lock().await;
-        let mut out = Vec::with_capacity(containers.len());
-        for entry in containers.values() {
-            out.push(ContainerInfo {
-                id: entry.id.clone(),
-                name: entry.name.clone(),
-                image: entry.image.clone(),
-                status: if entry.running {
-                    "running".to_string()
-                } else {
-                    "stopped".to_string()
-                },
-                state: if entry.running {
-                    "running".to_string()
-                } else {
-                    "exited".to_string()
-                },
-                created: 0,
-            });
-        }
-        Ok(out)
-    }
-
-    async fn inspect_container(
-        &self,
-        container_id: &str,
-    ) -> Result<bollard::service::ContainerInspectResponse, ContainerError> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let containers = self.containers.lock().await;
-        let Some(entry) = containers.get(&id) else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let state = bollard::models::ContainerState {
-            running: Some(entry.running),
-            pid: Some(if entry.running { 1000 } else { 0 }),
-            ..Default::default()
-        };
-
-        Ok(bollard::service::ContainerInspectResponse {
-            id: Some(entry.id.clone()),
-            name: Some(format!("/{}", entry.name)),
-            state: Some(state),
-            ..Default::default()
-        })
-    }
-
-    async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
-        Ok(())
-    }
-}
-
-fn default_container_manager() -> Arc<dyn ContainerManager + Send + Sync> {
-    Arc::new(InMemoryContainerManager::default())
-}
-
-#[derive(Clone)]
-enum ContainerManagerOverrideEntry {
-    Shared(Arc<dyn ContainerManager + Send + Sync>),
-    Factory(Arc<dyn Fn() -> Arc<dyn ContainerManager + Send + Sync> + Send + Sync>),
+enum RuntimeBackendOverrideEntry {
+    Shared(Arc<dyn RuntimeBackend + Send + Sync>),
+    Factory(Arc<dyn Fn() -> Arc<dyn RuntimeBackend + Send + Sync> + Send + Sync>),
 }
 
 thread_local! {
-    static TEST_CONTAINER_MANAGER_STACK: RefCell<Vec<ContainerManagerOverrideEntry>> =
+    static TEST_CONTAINER_MANAGER_STACK: RefCell<Vec<RuntimeBackendOverrideEntry>> =
         const { RefCell::new(Vec::new()) };
 }
 
-fn current_container_manager_override() -> Option<ContainerManagerOverrideEntry> {
+fn current_runtime_backend_override() -> Option<RuntimeBackendOverrideEntry> {
     TEST_CONTAINER_MANAGER_STACK.with(|stack| stack.borrow().last().cloned())
 }
 
-fn container_manager_for_next_node() -> Arc<dyn ContainerManager + Send + Sync> {
-    match current_container_manager_override() {
-        Some(ContainerManagerOverrideEntry::Shared(manager)) => manager,
-        Some(ContainerManagerOverrideEntry::Factory(factory)) => factory(),
-        None => default_container_manager(),
+fn runtime_backend_for_next_node() -> Arc<dyn RuntimeBackend + Send + Sync> {
+    match current_runtime_backend_override() {
+        Some(RuntimeBackendOverrideEntry::Shared(manager)) => manager,
+        Some(RuntimeBackendOverrideEntry::Factory(factory)) => factory(),
+        None => default_runtime_backend(),
     }
 }
 
-pub struct ContainerManagerOverrideGuard;
+pub struct RuntimeBackendOverrideGuard;
 
-impl ContainerManagerOverrideGuard {
-    pub fn install(manager: Arc<dyn ContainerManager + Send + Sync>) -> Self {
+impl RuntimeBackendOverrideGuard {
+    pub fn install(manager: Arc<dyn RuntimeBackend + Send + Sync>) -> Self {
         TEST_CONTAINER_MANAGER_STACK.with(|stack| {
             stack
                 .borrow_mut()
-                .push(ContainerManagerOverrideEntry::Shared(manager))
+                .push(RuntimeBackendOverrideEntry::Shared(manager))
         });
         Self
     }
 
     pub fn install_factory(
-        factory: Arc<dyn Fn() -> Arc<dyn ContainerManager + Send + Sync> + Send + Sync>,
+        factory: Arc<dyn Fn() -> Arc<dyn RuntimeBackend + Send + Sync> + Send + Sync>,
     ) -> Self {
         TEST_CONTAINER_MANAGER_STACK.with(|stack| {
             stack
                 .borrow_mut()
-                .push(ContainerManagerOverrideEntry::Factory(factory))
+                .push(RuntimeBackendOverrideEntry::Factory(factory))
         });
         Self
     }
@@ -296,19 +83,19 @@ impl ContainerManagerOverrideGuard {
     pub fn install_default() -> Self {
         // Use a factory so each node in a test cluster receives an isolated in-memory
         // runtime. Sharing one runtime across peers causes cross-node container teardown.
-        Self::install_factory(Arc::new(|| -> Arc<dyn ContainerManager + Send + Sync> {
-            Arc::new(InMemoryContainerManager::default())
+        Self::install_factory(Arc::new(|| -> Arc<dyn RuntimeBackend + Send + Sync> {
+            new_in_memory_runtime_backend()
         }))
     }
 }
 
-impl Drop for ContainerManagerOverrideGuard {
+impl Drop for RuntimeBackendOverrideGuard {
     fn drop(&mut self) {
         TEST_CONTAINER_MANAGER_STACK.with(|stack| {
             let removed = stack.borrow_mut().pop();
             debug_assert!(
                 removed.is_some(),
-                "container manager override guard dropped without a matching install"
+                "runtime backend override guard dropped without a matching install"
             );
         });
     }
@@ -324,9 +111,9 @@ pub struct TestNode {
 
 impl TestNode {
     /// Resolves the runtime to inject into the next headless node this test creates.
-    fn apply_test_container_manager(mut cfg: HeadlessConfig) -> HeadlessConfig {
-        if cfg.container_manager.is_none() {
-            cfg.container_manager = Some(container_manager_for_next_node());
+    fn apply_test_runtime_backend(mut cfg: HeadlessConfig) -> HeadlessConfig {
+        if cfg.runtime_backend.is_none() {
+            cfg.runtime_backend = Some(runtime_backend_for_next_node());
         }
         cfg
     }
@@ -350,14 +137,14 @@ impl TestNode {
             gossip_fanout,
             gossip_channel_capacity,
             task_runtime,
-            container_manager: None,
+            runtime_backend: None,
             local_volume_root: None,
         }
     }
 
     /// Start a node with in-process transport (fast path).
     pub async fn new() -> Self {
-        let node = HeadlessNode::new_with_config(Self::apply_test_container_manager(
+        let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
             Self::inproc_config(None, None, None, None, None),
         ))
         .await
@@ -366,7 +153,7 @@ impl TestNode {
     }
 
     pub async fn new_with_fanout(fanout: usize) -> Self {
-        let node = HeadlessNode::new_with_config(Self::apply_test_container_manager(
+        let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
             Self::inproc_config(None, None, Some(fanout), None, None),
         ))
         .await
@@ -382,7 +169,7 @@ impl TestNode {
     pub async fn try_new_tcp() -> Result<Self, Box<dyn std::error::Error>> {
         let addr = "127.0.0.1:0".to_string();
         let node =
-            HeadlessNode::new_with_config(Self::apply_test_container_manager(HeadlessConfig {
+            HeadlessNode::new_with_config(Self::apply_test_runtime_backend(HeadlessConfig {
                 listen_addr: addr.clone(),
                 transport: HeadlessTransport::Tcp { addr },
                 ..HeadlessConfig::default()
@@ -393,7 +180,7 @@ impl TestNode {
 
     /// Start a node with in-process transport and a custom periodic sync tick.
     pub async fn new_with_tick_ms(ms: u64) -> Self {
-        let node = HeadlessNode::new_with_config(Self::apply_test_container_manager(
+        let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
             Self::inproc_config(Some(Duration::from_millis(ms)), None, None, None, None),
         ))
         .await
@@ -411,7 +198,7 @@ impl TestNode {
     pub async fn try_new_tcp_with_tick_ms(ms: u64) -> Result<Self, Box<dyn std::error::Error>> {
         let addr = "127.0.0.1:0".to_string();
         let node =
-            HeadlessNode::new_with_config(Self::apply_test_container_manager(HeadlessConfig {
+            HeadlessNode::new_with_config(Self::apply_test_runtime_backend(HeadlessConfig {
                 listen_addr: addr.clone(),
                 transport: HeadlessTransport::Tcp { addr },
                 sync_tick: Some(Duration::from_millis(ms)),
@@ -860,7 +647,7 @@ async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
         gossip_channel_capacity,
         cfg.task_runtime_config(),
     );
-    HeadlessNode::new_with_config(TestNode::apply_test_container_manager(headless_cfg))
+    HeadlessNode::new_with_config(TestNode::apply_test_runtime_backend(headless_cfg))
         .await
         .expect("headless inproc node (custom)")
 }

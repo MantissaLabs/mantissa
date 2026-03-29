@@ -1,9 +1,9 @@
 use crate::registry::Registry;
-use crate::task::container::ContainerState;
-use crate::task::docker::{
-    ContainerAttachOptions, ContainerExecOptions, ContainerLogFrame, ContainerLogStream,
-    ContainerLogsOptions,
+use crate::runtime::types::{
+    RuntimeAttachOptions, RuntimeExecOptions, RuntimeExecResult, RuntimeLogFrame, RuntimeLogStream,
+    RuntimeLogsOptions,
 };
+use crate::task::container::ContainerState;
 use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
     TaskEvent, TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStateKind, TaskStatus,
@@ -469,7 +469,7 @@ fn read_id_from_data(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
 }
 
 /// Encodes task log request options into the wire format shared by local and relayed RPCs.
-fn write_logs_options(mut builder: task_logs_options::Builder<'_>, options: &ContainerLogsOptions) {
+fn write_logs_options(mut builder: task_logs_options::Builder<'_>, options: &RuntimeLogsOptions) {
     builder.set_follow(options.follow);
     builder.set_stdout(options.stdout);
     builder.set_stderr(options.stderr);
@@ -478,7 +478,7 @@ fn write_logs_options(mut builder: task_logs_options::Builder<'_>, options: &Con
 }
 
 /// Decodes and validates task log request options from the wire format.
-fn read_logs_options(reader: task_logs_options::Reader<'_>) -> Result<ContainerLogsOptions, Error> {
+fn read_logs_options(reader: task_logs_options::Reader<'_>) -> Result<RuntimeLogsOptions, Error> {
     let tail = reader.get_tail()?.to_str()?.trim().to_string();
     if !tail.eq_ignore_ascii_case("all") && tail.parse::<u64>().is_err() {
         return Err(Error::failed(format!(
@@ -489,7 +489,7 @@ fn read_logs_options(reader: task_logs_options::Reader<'_>) -> Result<ContainerL
     let stdout = reader.get_stdout();
     let stderr = reader.get_stderr();
 
-    Ok(ContainerLogsOptions {
+    Ok(RuntimeLogsOptions {
         follow: reader.get_follow(),
         stdout: stdout || !stderr,
         stderr: stderr || !stdout,
@@ -505,7 +505,7 @@ fn read_logs_options(reader: task_logs_options::Reader<'_>) -> Result<ContainerL
 /// Encodes task attach request options into the wire format.
 fn write_attach_options(
     mut builder: task_attach_options::Builder<'_>,
-    options: &ContainerAttachOptions,
+    options: &RuntimeAttachOptions,
 ) {
     builder.set_logs(options.logs);
     builder.set_stream(options.stream);
@@ -520,9 +520,9 @@ fn write_attach_options(
 /// Decodes task attach request options from the wire format.
 fn read_attach_options(
     reader: task_attach_options::Reader<'_>,
-) -> Result<ContainerAttachOptions, Error> {
+) -> Result<RuntimeAttachOptions, Error> {
     let detach_keys = reader.get_detach_keys()?.to_str()?.trim().to_string();
-    Ok(ContainerAttachOptions {
+    Ok(RuntimeAttachOptions {
         logs: reader.get_logs(),
         stream: reader.get_stream(),
         stdin: reader.get_stdin(),
@@ -536,7 +536,7 @@ fn read_attach_options(
 }
 
 /// Encodes task exec request options onto the wire.
-fn write_exec_options(mut builder: task_exec_options::Builder<'_>, options: &ContainerExecOptions) {
+fn write_exec_options(mut builder: task_exec_options::Builder<'_>, options: &RuntimeExecOptions) {
     let mut command_builder = builder
         .reborrow()
         .init_command(options.command.len() as u32);
@@ -553,13 +553,13 @@ fn write_exec_options(mut builder: task_exec_options::Builder<'_>, options: &Con
 }
 
 /// Decodes task exec request options from the wire format.
-fn read_exec_options(reader: task_exec_options::Reader<'_>) -> Result<ContainerExecOptions, Error> {
+fn read_exec_options(reader: task_exec_options::Reader<'_>) -> Result<RuntimeExecOptions, Error> {
     let mut command = Vec::new();
     for arg in reader.get_command()?.iter() {
         command.push(arg?.to_str()?.to_string());
     }
     let detach_keys = reader.get_detach_keys()?.to_str()?.trim().to_string();
-    Ok(ContainerExecOptions {
+    Ok(RuntimeExecOptions {
         command,
         stdin: reader.get_stdin(),
         stdout: reader.get_stdout(),
@@ -572,17 +572,14 @@ fn read_exec_options(reader: task_exec_options::Reader<'_>) -> Result<ContainerE
 }
 
 /// Pushes one runtime log frame into the caller-provided Cap'n Proto sink.
-async fn push_log_frame(
-    sink: &task_log_sink::Client,
-    frame: ContainerLogFrame,
-) -> Result<(), Error> {
+async fn push_log_frame(sink: &task_log_sink::Client, frame: RuntimeLogFrame) -> Result<(), Error> {
     let mut request = sink.push_frame_request();
     {
         let mut builder = request.get().init_frame();
         builder.set_stream(match frame.stream {
-            ContainerLogStream::StdOut => CapnpTaskLogStream::Stdout,
-            ContainerLogStream::StdErr => CapnpTaskLogStream::Stderr,
-            ContainerLogStream::Console => CapnpTaskLogStream::Console,
+            RuntimeLogStream::StdOut => CapnpTaskLogStream::Stdout,
+            RuntimeLogStream::StdErr => CapnpTaskLogStream::Stderr,
+            RuntimeLogStream::Console => CapnpTaskLogStream::Console,
         });
         builder.set_data(&frame.message);
     }
@@ -635,7 +632,7 @@ impl task_attach_session::Server for LocalTaskAttachSession {
 
 /// Shared completion state for one running task exec session.
 struct LocalTaskExecCompletion {
-    result: AsyncMutex<Option<Result<crate::task::docker::ContainerExecResult, String>>>,
+    result: AsyncMutex<Option<Result<RuntimeExecResult, String>>>,
     ready: Notify,
 }
 
@@ -649,7 +646,7 @@ impl LocalTaskExecCompletion {
     }
 
     /// Stores the final exec outcome and wakes any waiter exactly once.
-    async fn finish(&self, result: Result<crate::task::docker::ContainerExecResult, String>) {
+    async fn finish(&self, result: Result<RuntimeExecResult, String>) {
         let mut guard = self.result.lock().await;
         if guard.is_none() {
             *guard = Some(result);
@@ -658,7 +655,7 @@ impl LocalTaskExecCompletion {
     }
 
     /// Waits until the exec result has been published.
-    async fn wait(&self) -> Result<crate::task::docker::ContainerExecResult, String> {
+    async fn wait(&self) -> Result<RuntimeExecResult, String> {
         loop {
             if let Some(result) = self.result.lock().await.clone() {
                 return result;

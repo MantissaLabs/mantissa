@@ -1,12 +1,11 @@
-//! # Container Manager
+//! # Docker Runtime Backend
 //!
-//! This module provides functionality to manage container lifecycle operations
-//! using the Bollard Docker API.
+//! This module provides the Docker-backed implementation of the generic runtime
+//! backend using the Bollard Docker API.
 
 use std::collections::HashMap;
 use std::env;
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::Docker;
@@ -26,424 +25,152 @@ use bollard::query_parameters::{
 use bollard::service::ContainerInspectResponse;
 
 use crate::config;
+use crate::runtime::types::{
+    RestartPolicyType, RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities,
+    RuntimeConfigInfo, RuntimeCreateRequest, RuntimeError, RuntimeEvent, RuntimeExecOptions,
+    RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogStream, RuntimeLogsOptions,
+    RuntimeNetworkEndpoint, RuntimeResult, RuntimeStateInfo,
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use log::{debug, info, trace, warn};
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{
-    Mutex as AsyncMutex,
-    mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender},
-};
-
-/// Errors that can occur during container operations
-#[derive(Error, Debug)]
-pub enum ContainerError {
-    #[error("Docker API error: {0}")]
-    DockerAPI(#[from] bollard::errors::Error),
-
-    #[allow(dead_code)]
-    #[error("Container not found: {0}")]
-    NotFound(String),
-
-    #[allow(dead_code)]
-    #[error("Container operation timeout")]
-    Timeout,
-
-    #[error("Operation failed: {0}")]
-    OperationFailed(String),
-}
-
-/// Result type for container operations
-pub type ContainerResult<T> = Result<T, ContainerError>;
-
-/// Exit status returned by a command executed inside a running container.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ContainerExecResult {
-    pub exit_code: Option<i64>,
-}
-
-/// Stream selector used by runtime log frames.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ContainerLogStream {
-    StdOut,
-    StdErr,
-    Console,
-}
-
-/// One ordered chunk returned by the runtime log stream.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContainerLogFrame {
-    pub stream: ContainerLogStream,
-    pub message: Vec<u8>,
-}
+use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender};
 
 /// Runtime-owned channels and initial state used while one attach bridge is active.
 struct AttachBridgeIo {
-    output_tx: MpscSender<ContainerLogFrame>,
+    output_tx: MpscSender<RuntimeLogFrame>,
     input_rx: MpscReceiver<Vec<u8>>,
     saw_output: bool,
 }
 
-/// Request options supported by task/container log streaming.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContainerLogsOptions {
-    pub follow: bool,
-    pub stdout: bool,
-    pub stderr: bool,
-    pub timestamps: bool,
-    pub tail: String,
-}
-
-impl Default for ContainerLogsOptions {
-    /// Builds Docker-compatible defaults for task log streaming.
-    fn default() -> Self {
-        Self {
-            follow: false,
-            stdout: true,
-            stderr: true,
-            timestamps: false,
-            tail: "all".to_string(),
-        }
-    }
-}
-
-impl ContainerLogsOptions {
-    /// Normalizes operator input so runtimes always receive explicit stream selection.
-    pub fn normalized(&self) -> Self {
-        let mut normalized = self.clone();
-        if !normalized.stdout && !normalized.stderr {
-            normalized.stdout = true;
-            normalized.stderr = true;
-        }
-
-        let tail = normalized.tail.trim();
-        normalized.tail = if tail.is_empty() {
-            "all".to_string()
-        } else {
-            tail.to_string()
-        };
-        normalized
-    }
-}
-
-/// Request options supported by task/container attach streaming.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContainerAttachOptions {
-    pub logs: bool,
-    pub stream: bool,
-    pub stdin: bool,
-    pub stdout: bool,
-    pub stderr: bool,
-    pub detach_keys: Option<String>,
-    pub tty: bool,
-    pub tty_width: Option<u16>,
-    pub tty_height: Option<u16>,
-}
-
-impl Default for ContainerAttachOptions {
-    /// Builds Docker-compatible defaults for interactive task attach sessions.
-    fn default() -> Self {
-        Self {
-            logs: false,
-            stream: true,
-            stdin: true,
-            stdout: true,
-            stderr: true,
-            detach_keys: None,
-            tty: false,
-            tty_width: None,
-            tty_height: None,
-        }
-    }
-}
-
-/// Request options supported by task/container exec streaming.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContainerExecOptions {
-    pub command: Vec<String>,
-    pub stdin: bool,
-    pub stdout: bool,
-    pub stderr: bool,
-    pub tty: bool,
-    pub detach_keys: Option<String>,
-    pub tty_width: Option<u16>,
-    pub tty_height: Option<u16>,
-}
-
-impl Default for ContainerExecOptions {
-    /// Builds Docker-compatible defaults for interactive task exec sessions.
-    fn default() -> Self {
-        Self {
-            command: Vec::new(),
-            stdin: true,
-            stdout: true,
-            stderr: true,
-            tty: false,
-            detach_keys: None,
-            tty_width: None,
-            tty_height: None,
-        }
-    }
-}
-
 /// Converts one Docker attach/log frame into the runtime-neutral task output stream.
-fn container_log_frame_from_output(output: LogOutput) -> ContainerLogFrame {
+fn runtime_log_frame_from_output(output: LogOutput) -> RuntimeLogFrame {
     match output {
-        LogOutput::StdErr { message } => ContainerLogFrame {
-            stream: ContainerLogStream::StdErr,
+        LogOutput::StdErr { message } => RuntimeLogFrame {
+            stream: RuntimeLogStream::StdErr,
             message: message.to_vec(),
         },
-        LogOutput::StdOut { message } => ContainerLogFrame {
-            stream: ContainerLogStream::StdOut,
+        LogOutput::StdOut { message } => RuntimeLogFrame {
+            stream: RuntimeLogStream::StdOut,
             message: message.to_vec(),
         },
-        LogOutput::StdIn { message } | LogOutput::Console { message } => ContainerLogFrame {
-            stream: ContainerLogStream::Console,
+        LogOutput::StdIn { message } | LogOutput::Console { message } => RuntimeLogFrame {
+            stream: RuntimeLogStream::Console,
             message: message.to_vec(),
         },
     }
 }
 
-/// Normalizes low-level Docker API errors into stable container error variants.
-fn classify_container_error(container_id: &str, err: BollardError) -> ContainerError {
+/// Normalizes low-level Docker API errors into stable runtime error variants.
+fn classify_runtime_error(runtime_id: &str, err: BollardError) -> RuntimeError {
     match &err {
         BollardError::DockerResponseServerError { status_code, .. } if *status_code == 404 => {
-            ContainerError::NotFound(container_id.to_string())
+            RuntimeError::NotFound(runtime_id.to_string())
         }
-        _ => ContainerError::DockerAPI(err),
+        BollardError::DockerResponseServerError {
+            status_code,
+            message,
+        } => RuntimeError::backend(Some(*status_code), format!("docker api error: {message}")),
+        _ => RuntimeError::backend(None, format!("docker api error: {err}")),
     }
 }
 
-/// Parameters describing how to launch a container.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ContainerCreateRequest {
-    pub name: String,
-    pub image: String,
-    pub command: Option<Vec<String>>,
-    pub tty: bool,
-    pub open_stdin: bool,
-    pub env_vars: Option<Vec<String>>,
-    pub ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
-    pub volumes: Option<Vec<String>>,
-    pub restart_policy: Option<RestartPolicyConfig>,
-    pub resource_limits: ResourceLimits,
-    pub dns_servers: Option<Vec<String>>,
-    pub gpu_device_ids: Option<Vec<String>>,
-}
+/// Converts one inspect response into the generic runtime info shape used outside the backend.
+fn runtime_info_from_inspect(inspect: ContainerInspectResponse) -> RuntimeInfo {
+    let image = inspect
+        .config
+        .as_ref()
+        .and_then(|config| config.image.clone())
+        .unwrap_or_default();
+    let tty = inspect.config.as_ref().and_then(|config| config.tty);
+    let raw_status = inspect
+        .state
+        .as_ref()
+        .and_then(|state| state.status.as_ref())
+        .map(|status| status.to_string());
+    let running = inspect.state.as_ref().and_then(|state| state.running);
+    let pid = inspect.state.as_ref().and_then(|state| state.pid);
+    let exit_code = inspect
+        .state
+        .as_ref()
+        .and_then(|state| state.exit_code)
+        .and_then(|value| i32::try_from(value).ok());
+    let error = inspect.state.as_ref().and_then(|state| state.error.clone());
+    let network_endpoints = inspect
+        .network_settings
+        .as_ref()
+        .and_then(|settings| settings.networks.as_ref())
+        .map(|networks| {
+            networks
+                .iter()
+                .map(|(name, endpoint)| RuntimeNetworkEndpoint {
+                    name: name.clone(),
+                    ip_address: endpoint.ip_address.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
-/// Interface for container management operations
-#[async_trait]
-pub trait ContainerManager {
-    /// Create a new container
-    async fn create_container(&self, request: ContainerCreateRequest) -> ContainerResult<String>;
-
-    /// Start a container
-    async fn start_container(&self, container_id: &str) -> ContainerResult<()>;
-
-    /// Stop a container
-    async fn stop_container(
-        &self,
-        container_id: &str,
-        timeout: Option<Duration>,
-    ) -> ContainerResult<()>;
-
-    /// Execute a non-interactive command inside a running container.
-    async fn exec_container(
-        &self,
-        _container_id: &str,
-        _command: &[String],
-        _timeout: Option<Duration>,
-    ) -> ContainerResult<ContainerExecResult> {
-        Err(ContainerError::OperationFailed(
-            "container exec is not supported by this runtime".to_string(),
-        ))
-    }
-
-    /// Starts a streamed exec session inside one running container.
-    async fn exec_container_stream(
-        &self,
-        _container_id: &str,
-        _options: &ContainerExecOptions,
-        _output_tx: MpscSender<ContainerLogFrame>,
-        _input_rx: MpscReceiver<Vec<u8>>,
-    ) -> ContainerResult<ContainerExecResult> {
-        Err(ContainerError::OperationFailed(
-            "interactive container exec is not supported by this runtime".to_string(),
-        ))
-    }
-
-    /// Stream ordered container log frames into the provided bounded channel.
-    async fn stream_container_logs(
-        &self,
-        _container_id: &str,
-        _options: &ContainerLogsOptions,
-        _logs_tx: MpscSender<ContainerLogFrame>,
-    ) -> ContainerResult<()> {
-        Err(ContainerError::OperationFailed(
-            "container log streaming is not supported by this runtime".to_string(),
-        ))
-    }
-
-    /// Attach to one container's stdio streams using bounded channels for output and stdin.
-    async fn attach_container(
-        &self,
-        _container_id: &str,
-        _options: &ContainerAttachOptions,
-        _output_tx: MpscSender<ContainerLogFrame>,
-        _input_rx: MpscReceiver<Vec<u8>>,
-    ) -> ContainerResult<()> {
-        Err(ContainerError::OperationFailed(
-            "container attach is not supported by this runtime".to_string(),
-        ))
-    }
-
-    /// Restart a container
-    #[allow(dead_code)]
-    async fn restart_container(
-        &self,
-        container_id: &str,
-        timeout: Option<Duration>,
-    ) -> ContainerResult<()>;
-
-    /// Remove a container
-    async fn remove_container(
-        &self,
-        container_id: &str,
-        force: bool,
-        remove_volumes: bool,
-    ) -> ContainerResult<()>;
-
-    /// List containers with optional filters
-    #[allow(dead_code)]
-    async fn list_containers(
-        &self,
-        filters: Option<HashMap<String, Vec<String>>>,
-    ) -> ContainerResult<Vec<ContainerInfo>>;
-
-    /// Get container details
-    async fn inspect_container(
-        &self,
-        container_id: &str,
-    ) -> ContainerResult<ContainerInspectResponse>;
-
-    /// Returns whether the named image is already present in the local runtime image store.
-    ///
-    /// The default falls back to `false` so tests and alternate runtimes can opt in only when they
-    /// track an image cache explicitly.
-    async fn image_present(&self, _image: &str) -> ContainerResult<bool> {
-        Ok(false)
-    }
-
-    // Pull an image
-    async fn pull_image(&self, image: &str) -> ContainerResult<()>;
-
-    /// Indicates whether the runtime supports lifecycle event streaming.
-    fn supports_runtime_events(&self) -> bool {
-        false
-    }
-
-    /// Streams runtime lifecycle events into the provided queue until the stream ends.
-    async fn watch_runtime_events(
-        &self,
-        _events_tx: UnboundedSender<ContainerRuntimeEvent>,
-    ) -> ContainerResult<()> {
-        Ok(())
+    RuntimeInfo {
+        id: inspect.id.unwrap_or_default(),
+        name: inspect
+            .name
+            .unwrap_or_default()
+            .trim_start_matches('/')
+            .to_string(),
+        image,
+        status: raw_status.clone().unwrap_or_default(),
+        state: RuntimeStateInfo {
+            raw_status,
+            running,
+            pid,
+            exit_code,
+            error,
+        },
+        // Docker inspect exposes an RFC3339 timestamp string here, while the generic runtime
+        // metadata keeps the sortable creation field in the list/inventory path only.
+        created: 0,
+        config: RuntimeConfigInfo { tty },
+        network_endpoints,
     }
 }
 
-/// Configuration for container restart policy
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RestartPolicyConfig {
-    pub name: RestartPolicyType,
-    pub max_retry_count: Option<i32>,
-}
+/// Converts one Docker list response entry into the generic runtime info shape.
+fn runtime_info_from_list_entry(entry: bollard::models::ContainerSummary) -> RuntimeInfo {
+    let id = entry.id.unwrap_or_default();
+    let name = entry
+        .names
+        .unwrap_or_default()
+        .first()
+        .cloned()
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .to_string();
+    let image = entry.image.unwrap_or_default();
+    let status = entry.status.unwrap_or_default();
+    let raw_status = entry.state.map(|value| value.to_string());
+    let running = raw_status.as_deref().map(|state| state == "running");
+    let created = entry.created.unwrap_or_default();
 
-/// Types of restart policies
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum RestartPolicyType {
-    No,
-    Always,
-    OnFailure,
-    UnlessStopped,
-}
-
-/// Resource limits that should be enforced by the container engine.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ResourceLimits {
-    pub memory_bytes: Option<i64>,
-    pub nano_cpus: Option<i64>,
-    pub cpu_shares: Option<i64>,
-}
-
-impl ResourceLimits {
-    const MIN_CPU_SHARES: i64 = 2;
-    const MAX_CPU_SHARES: i64 = 262_144;
-
-    /// Builds resource limits from scheduler requests expressed in milli-CPU and bytes.
-    pub fn from_requests(cpu_millis: u64, memory_bytes: u64) -> Self {
-        let memory_bytes = if memory_bytes == 0 {
-            None
-        } else {
-            Some(Self::saturating_i64(memory_bytes as u128))
-        };
-
-        let nano_cpus = if cpu_millis == 0 {
-            None
-        } else {
-            let nanos = (cpu_millis as u128).saturating_mul(1_000_000u128);
-            Some(Self::saturating_i64(nanos))
-        };
-
-        let cpu_shares = if cpu_millis == 0 {
-            None
-        } else {
-            let shares = (cpu_millis as u128).saturating_mul(1024u128) / 1_000u128;
-            let shares = shares
-                .max(Self::MIN_CPU_SHARES as u128)
-                .min(Self::MAX_CPU_SHARES as u128);
-            Some(Self::saturating_i64(shares))
-        };
-
-        Self {
-            memory_bytes,
-            nano_cpus,
-            cpu_shares,
-        }
-    }
-
-    fn saturating_i64(value: u128) -> i64 {
-        if value > i64::MAX as u128 {
-            i64::MAX
-        } else {
-            value as i64
-        }
+    RuntimeInfo {
+        id,
+        name,
+        image,
+        status,
+        state: RuntimeStateInfo {
+            raw_status,
+            running,
+            ..Default::default()
+        },
+        created,
+        ..Default::default()
     }
 }
 
-/// Container information returned from listing containers
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ContainerInfo {
-    pub id: String,
-    pub name: String,
-    pub image: String,
-    pub status: String,
-    pub state: String,
-    pub created: i64,
-}
-
-/// Normalized container runtime events used by task reconciliation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ContainerRuntimeEvent {
-    ContainerStateChanged,
-    TaskExited { task_id: uuid::Uuid, exit_code: i32 },
-}
-
-/// Docker container manager implementation
+/// Docker runtime backend implementation.
 #[derive(Clone)]
-pub struct DockerContainerManager {
+pub struct DockerRuntimeBackend {
     docker: Docker,
 }
 
@@ -455,15 +182,16 @@ struct PullProgressLogState {
     total: Option<i64>,
 }
 
-impl DockerContainerManager {
-    /// Create a new Docker container manager
-    pub async fn new() -> ContainerResult<Self> {
-        let (docker, endpoint) = Self::connect().map_err(ContainerError::DockerAPI)?;
+impl DockerRuntimeBackend {
+    /// Creates one Docker-backed runtime backend after verifying daemon connectivity.
+    pub async fn new() -> RuntimeResult<Self> {
+        let (docker, endpoint) =
+            Self::connect().map_err(|err| RuntimeError::backend(None, err.to_string()))?;
 
         docker
             .ping()
             .await
-            .map_err(|e| ContainerError::OperationFailed(format!("docker ping failed: {e}")))?;
+            .map_err(|err| RuntimeError::OperationFailed(format!("docker ping failed: {err}")))?;
 
         info!(
             target: "task",
@@ -497,26 +225,26 @@ impl DockerContainerManager {
     }
 
     /// Executes one container-scoped Docker API call and normalizes not-found failures.
-    async fn run_container_call<T, F>(&self, container_id: &str, call: F) -> ContainerResult<T>
+    async fn run_runtime_call<T, F>(&self, runtime_id: &str, call: F) -> RuntimeResult<T>
     where
         F: Future<Output = Result<T, BollardError>>,
     {
         call.await
-            .map_err(|err| classify_container_error(container_id, err))
+            .map_err(|err| classify_runtime_error(runtime_id, err))
     }
 
-    /// Executes a unit-returning container operation with standard post-success logging.
-    async fn run_unit_container_call<F>(
+    /// Executes one unit-returning runtime operation with standard post-success logging.
+    async fn run_unit_runtime_call<F>(
         &self,
-        container_id: &str,
+        runtime_id: &str,
         success_message: &'static str,
         call: F,
-    ) -> ContainerResult<()>
+    ) -> RuntimeResult<()>
     where
         F: Future<Output = Result<(), BollardError>>,
     {
-        self.run_container_call(container_id, call).await?;
-        info!("{success_message}: {container_id}");
+        self.run_runtime_call(runtime_id, call).await?;
+        info!("{success_message}: {runtime_id}");
         Ok(())
     }
 
@@ -526,9 +254,9 @@ impl DockerContainerManager {
         container_id: &str,
         output: &mut (impl futures::Stream<Item = Result<LogOutput, BollardError>> + Unpin),
         input: &mut (impl tokio::io::AsyncWrite + Unpin),
-        options: &ContainerAttachOptions,
+        options: &RuntimeAttachOptions,
         io: AttachBridgeIo,
-    ) -> ContainerResult<()> {
+    ) -> RuntimeResult<()> {
         let AttachBridgeIo {
             output_tx,
             mut input_rx,
@@ -550,15 +278,15 @@ impl DockerContainerManager {
                 maybe_frame = output.next(), if output_open => {
                     let Some(frame) = maybe_frame else {
                         if !saw_output && !saw_input {
-                            return Err(ContainerError::OperationFailed(format!(
+                            return Err(RuntimeError::OperationFailed(format!(
                                 "attach stream closed before container {container_id} produced output or accepted input"
                             )));
                         }
                         break;
                     };
-                    let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
+                    let frame = frame.map_err(|err| classify_runtime_error(container_id, err))?;
                     saw_output = true;
-                    if output_tx.send(container_log_frame_from_output(frame)).await.is_err() {
+                    if output_tx.send(runtime_log_frame_from_output(frame)).await.is_err() {
                         return Ok(());
                     }
                 }
@@ -567,19 +295,19 @@ impl DockerContainerManager {
                         Some(chunk) => {
                             saw_input = true;
                             input.write_all(&chunk).await.map_err(|err| {
-                                ContainerError::OperationFailed(format!(
+                                RuntimeError::OperationFailed(format!(
                                     "attach stdin write failed for {container_id}: {err}"
                                 ))
                             })?;
                             input.flush().await.map_err(|err| {
-                                ContainerError::OperationFailed(format!(
+                                RuntimeError::OperationFailed(format!(
                                     "attach stdin flush failed for {container_id}: {err}"
                                 ))
                             })?;
                         }
                         None => {
                             input.shutdown().await.map_err(|err| {
-                                ContainerError::OperationFailed(format!(
+                                RuntimeError::OperationFailed(format!(
                                     "attach stdin shutdown failed for {container_id}: {err}"
                                 ))
                             })?;
@@ -594,13 +322,13 @@ impl DockerContainerManager {
                     match maybe_exit {
                         Some(Ok(_)) | None => {
                             if !saw_output && !saw_input {
-                                return Err(ContainerError::OperationFailed(format!(
+                                return Err(RuntimeError::OperationFailed(format!(
                                     "container {container_id} is not running"
                                 )));
                             }
                             if input_open {
                                 input.shutdown().await.map_err(|err| {
-                                    ContainerError::OperationFailed(format!(
+                                    RuntimeError::OperationFailed(format!(
                                         "attach stdin shutdown failed for {container_id}: {err}"
                                     ))
                                 })?;
@@ -609,18 +337,18 @@ impl DockerContainerManager {
                             if output_open {
                                 let _ = tokio::time::timeout(Duration::from_millis(100), async {
                                     while let Some(frame) = output.next().await {
-                                        let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
-                                        if output_tx.send(container_log_frame_from_output(frame)).await.is_err() {
-                                            return Ok::<(), ContainerError>(());
+                                        let frame = frame.map_err(|err| classify_runtime_error(container_id, err))?;
+                                        if output_tx.send(runtime_log_frame_from_output(frame)).await.is_err() {
+                                            return Ok::<(), RuntimeError>(());
                                         }
                                     }
-                                    Ok::<(), ContainerError>(())
+                                    Ok::<(), RuntimeError>(())
                                 }).await;
                             }
                             return Ok(());
                         }
                         Some(Err(err)) => {
-                            return Err(classify_container_error(container_id, err));
+                            return Err(classify_runtime_error(container_id, err));
                         }
                     }
                 }
@@ -637,24 +365,14 @@ impl DockerContainerManager {
 
     /// Verifies that the target container is currently running before opening an interactive
     /// attach or exec session against it.
-    async fn ensure_container_running_for_stream(&self, container_id: &str) -> ContainerResult<()> {
-        let info = self
-            .run_container_call(
-                container_id,
-                self.docker
-                    .inspect_container(container_id, None::<InspectContainerOptions>),
-            )
-            .await?;
-        let running = info
-            .state
-            .as_ref()
-            .and_then(|state| state.running)
-            .unwrap_or(false);
+    async fn ensure_container_running_for_stream(&self, container_id: &str) -> RuntimeResult<()> {
+        let info = self.inspect_instance(container_id).await?;
+        let running = info.state.running.unwrap_or(false);
         if running {
             return Ok(());
         }
 
-        Err(ContainerError::OperationFailed(format!(
+        Err(RuntimeError::OperationFailed(format!(
             "container {container_id} is not running"
         )))
     }
@@ -664,8 +382,8 @@ impl DockerContainerManager {
     async fn resize_attached_tty(
         &self,
         container_id: &str,
-        options: &ContainerAttachOptions,
-    ) -> ContainerResult<()> {
+        options: &RuntimeAttachOptions,
+    ) -> RuntimeResult<()> {
         let (Some(width), Some(height)) = (options.tty_width, options.tty_height) else {
             return Ok(());
         };
@@ -674,7 +392,7 @@ impl DockerContainerManager {
             return Ok(());
         }
 
-        self.run_container_call(
+        self.run_runtime_call(
             container_id,
             self.docker.resize_container_tty(
                 container_id,
@@ -693,8 +411,8 @@ impl DockerContainerManager {
     async fn refresh_attached_tty_prompt(
         &self,
         container_id: &str,
-        options: &ContainerAttachOptions,
-    ) -> ContainerResult<()> {
+        options: &RuntimeAttachOptions,
+    ) -> RuntimeResult<()> {
         let (Some(width), Some(height)) = (options.tty_width, options.tty_height) else {
             return Ok(());
         };
@@ -725,13 +443,13 @@ impl DockerContainerManager {
         &self,
         container_id: &str,
         output: &mut (impl futures::Stream<Item = Result<LogOutput, BollardError>> + Unpin),
-        output_tx: &MpscSender<ContainerLogFrame>,
-        options: &ContainerAttachOptions,
-    ) -> ContainerResult<bool> {
+        output_tx: &MpscSender<RuntimeLogFrame>,
+        options: &RuntimeAttachOptions,
+    ) -> RuntimeResult<bool> {
         match tokio::time::timeout(Duration::from_millis(100), output.next()).await {
             Ok(Some(frame)) => {
-                let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
-                let frame = container_log_frame_from_output(frame);
+                let frame = frame.map_err(|err| classify_runtime_error(container_id, err))?;
+                let frame = runtime_log_frame_from_output(frame);
                 if output_tx.send(frame).await.is_err() {
                     return Ok(true);
                 }
@@ -750,10 +468,10 @@ impl DockerContainerManager {
     async fn attach_tty_container_raw(
         &self,
         container_id: &str,
-        options: &ContainerAttachOptions,
-        output_tx: MpscSender<ContainerLogFrame>,
+        options: &RuntimeAttachOptions,
+        output_tx: MpscSender<RuntimeLogFrame>,
         input_rx: MpscReceiver<Vec<u8>>,
-    ) -> ContainerResult<()> {
+    ) -> RuntimeResult<()> {
         let mut builder = AttachContainerOptionsBuilder::new()
             .logs(options.logs)
             .stream(options.stream)
@@ -770,7 +488,7 @@ impl DockerContainerManager {
             mut output,
             mut input,
         } = self
-            .run_container_call(
+            .run_runtime_call(
                 container_id,
                 self.docker
                     .attach_container(container_id, Some(builder.build())),
@@ -799,8 +517,8 @@ impl DockerContainerManager {
     async fn resize_exec_tty(
         &self,
         exec_id: &str,
-        options: &ContainerExecOptions,
-    ) -> ContainerResult<()> {
+        options: &RuntimeExecOptions,
+    ) -> RuntimeResult<()> {
         let (Some(width), Some(height)) = (options.tty_width, options.tty_height) else {
             return Ok(());
         };
@@ -811,7 +529,7 @@ impl DockerContainerManager {
         self.docker
             .resize_exec(exec_id, ResizeExecOptions { width, height })
             .await
-            .map_err(ContainerError::DockerAPI)?;
+            .map_err(|err| RuntimeError::backend(None, err.to_string()))?;
         Ok(())
     }
 
@@ -820,8 +538,8 @@ impl DockerContainerManager {
     async fn refresh_exec_tty_prompt(
         &self,
         exec_id: &str,
-        options: &ContainerExecOptions,
-    ) -> ContainerResult<()> {
+        options: &RuntimeExecOptions,
+    ) -> RuntimeResult<()> {
         let (Some(width), Some(height)) = (options.tty_width, options.tty_height) else {
             return Ok(());
         };
@@ -848,13 +566,13 @@ impl DockerContainerManager {
         container_id: &str,
         exec_id: &str,
         output: &mut (impl futures::Stream<Item = Result<LogOutput, BollardError>> + Unpin),
-        output_tx: &MpscSender<ContainerLogFrame>,
-        options: &ContainerExecOptions,
-    ) -> ContainerResult<bool> {
+        output_tx: &MpscSender<RuntimeLogFrame>,
+        options: &RuntimeExecOptions,
+    ) -> RuntimeResult<bool> {
         match tokio::time::timeout(Duration::from_millis(100), output.next()).await {
             Ok(Some(frame)) => {
-                let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
-                let frame = container_log_frame_from_output(frame);
+                let frame = frame.map_err(|err| classify_runtime_error(container_id, err))?;
+                let frame = runtime_log_frame_from_output(frame);
                 if output_tx.send(frame).await.is_err() {
                     return Ok(true);
                 }
@@ -872,13 +590,13 @@ impl DockerContainerManager {
     async fn wait_for_exec_completion(
         &self,
         exec_id: &str,
-    ) -> ContainerResult<bollard::models::ExecInspectResponse> {
+    ) -> RuntimeResult<bollard::models::ExecInspectResponse> {
         loop {
             let inspect = self
                 .docker
                 .inspect_exec(exec_id)
                 .await
-                .map_err(ContainerError::DockerAPI)?;
+                .map_err(|err| RuntimeError::backend(None, err.to_string()))?;
             if inspect.running != Some(true) {
                 return Ok(inspect);
             }
@@ -894,9 +612,9 @@ impl DockerContainerManager {
         exec_id: &str,
         output: &mut (impl futures::Stream<Item = Result<LogOutput, BollardError>> + Unpin),
         input: &mut (impl tokio::io::AsyncWrite + Unpin),
-        options: &ContainerExecOptions,
+        options: &RuntimeExecOptions,
         io: AttachBridgeIo,
-    ) -> ContainerResult<ContainerExecResult> {
+    ) -> RuntimeResult<RuntimeExecResult> {
         let AttachBridgeIo {
             output_tx,
             mut input_rx,
@@ -915,10 +633,10 @@ impl DockerContainerManager {
                         output_open = false;
                         continue;
                     };
-                    let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
+                    let frame = frame.map_err(|err| classify_runtime_error(container_id, err))?;
                     saw_output = true;
-                    if output_tx.send(container_log_frame_from_output(frame)).await.is_err() {
-                        return Ok(ContainerExecResult { exit_code: None });
+                    if output_tx.send(runtime_log_frame_from_output(frame)).await.is_err() {
+                        return Ok(RuntimeExecResult { exit_code: None });
                     }
                 }
                 maybe_chunk = input_rx.recv(), if input_open => {
@@ -926,19 +644,19 @@ impl DockerContainerManager {
                         Some(chunk) => {
                             saw_input = true;
                             input.write_all(&chunk).await.map_err(|err| {
-                                ContainerError::OperationFailed(format!(
+                                RuntimeError::OperationFailed(format!(
                                     "exec stdin write failed for {container_id}: {err}"
                                 ))
                             })?;
                             input.flush().await.map_err(|err| {
-                                ContainerError::OperationFailed(format!(
+                                RuntimeError::OperationFailed(format!(
                                     "exec stdin flush failed for {container_id}: {err}"
                                 ))
                             })?;
                         }
                         None => {
                             input.shutdown().await.map_err(|err| {
-                                ContainerError::OperationFailed(format!(
+                                RuntimeError::OperationFailed(format!(
                                     "exec stdin shutdown failed for {container_id}: {err}"
                                 ))
                             })?;
@@ -950,7 +668,7 @@ impl DockerContainerManager {
                     let inspect = inspect?;
                     if input_open {
                         input.shutdown().await.map_err(|err| {
-                            ContainerError::OperationFailed(format!(
+                            RuntimeError::OperationFailed(format!(
                                 "exec stdin shutdown failed for {container_id}: {err}"
                             ))
                         })?;
@@ -959,22 +677,22 @@ impl DockerContainerManager {
                     if output_open {
                         let _ = tokio::time::timeout(Duration::from_millis(100), async {
                             while let Some(frame) = output.next().await {
-                                let frame = frame.map_err(|err| classify_container_error(container_id, err))?;
-                                if output_tx.send(container_log_frame_from_output(frame)).await.is_err() {
-                                    return Ok::<(), ContainerError>(());
+                                let frame = frame.map_err(|err| classify_runtime_error(container_id, err))?;
+                                if output_tx.send(runtime_log_frame_from_output(frame)).await.is_err() {
+                                    return Ok::<(), RuntimeError>(());
                                 }
                             }
-                            Ok::<(), ContainerError>(())
+                            Ok::<(), RuntimeError>(())
                         }).await;
                     }
 
                     if !saw_output && !saw_input && inspect.exit_code.is_none() {
-                        return Err(ContainerError::OperationFailed(format!(
+                        return Err(RuntimeError::OperationFailed(format!(
                             "exec stream closed before container {container_id} produced output, accepted input, or reported an exit code"
                         )));
                     }
 
-                    return Ok(ContainerExecResult {
+                    return Ok(RuntimeExecResult {
                         exit_code: inspect.exit_code,
                     });
                 }
@@ -982,19 +700,19 @@ impl DockerContainerManager {
             }
         }
 
-        Ok(ContainerExecResult { exit_code: None })
+        Ok(RuntimeExecResult { exit_code: None })
     }
 
     /// Starts one interactive exec session inside a running Docker container.
     async fn exec_container_interactive(
         &self,
         container_id: &str,
-        options: &ContainerExecOptions,
-        output_tx: MpscSender<ContainerLogFrame>,
+        options: &RuntimeExecOptions,
+        output_tx: MpscSender<RuntimeLogFrame>,
         input_rx: MpscReceiver<Vec<u8>>,
-    ) -> ContainerResult<ContainerExecResult> {
+    ) -> RuntimeResult<RuntimeExecResult> {
         if options.command.is_empty() {
-            return Err(ContainerError::OperationFailed(
+            return Err(RuntimeError::OperationFailed(
                 "exec command must contain at least one argument".to_string(),
             ));
         }
@@ -1002,7 +720,7 @@ impl DockerContainerManager {
         self.ensure_container_running_for_stream(container_id)
             .await?;
         let exec_id = self
-            .run_container_call(
+            .run_runtime_call(
                 container_id,
                 self.docker.create_exec(
                     container_id,
@@ -1024,10 +742,10 @@ impl DockerContainerManager {
             mut output,
             mut input,
         } = self
-            .run_container_call(container_id, self.docker.start_exec(&exec_id, None))
+            .run_runtime_call(container_id, self.docker.start_exec(&exec_id, None))
             .await?
         else {
-            return Err(ContainerError::OperationFailed(format!(
+            return Err(RuntimeError::OperationFailed(format!(
                 "exec unexpectedly detached for container {container_id}"
             )));
         };
@@ -1122,9 +840,9 @@ impl DockerContainerManager {
         &self,
         container_id: &str,
         command: &[String],
-    ) -> ContainerResult<ContainerExecResult> {
+    ) -> RuntimeResult<RuntimeExecResult> {
         let exec_id = self
-            .run_container_call(
+            .run_runtime_call(
                 container_id,
                 self.docker.create_exec(
                     container_id,
@@ -1140,300 +858,36 @@ impl DockerContainerManager {
             .id;
 
         match self
-            .run_container_call(container_id, self.docker.start_exec(&exec_id, None))
+            .run_runtime_call(container_id, self.docker.start_exec(&exec_id, None))
             .await?
         {
             StartExecResults::Attached { mut output, .. } => {
                 while let Some(frame) = output.next().await {
-                    frame.map_err(ContainerError::DockerAPI)?;
+                    frame.map_err(|err| RuntimeError::backend(None, err.to_string()))?;
                 }
             }
             StartExecResults::Detached => {
-                return Err(ContainerError::OperationFailed(format!(
+                return Err(RuntimeError::OperationFailed(format!(
                     "exec unexpectedly detached for container {container_id}"
                 )));
             }
         }
 
         let inspect = self
-            .run_container_call(container_id, self.docker.inspect_exec(&exec_id))
+            .run_runtime_call(container_id, self.docker.inspect_exec(&exec_id))
             .await?;
 
-        Ok(ContainerExecResult {
+        Ok(RuntimeExecResult {
             exit_code: inspect.exit_code,
         })
     }
 }
 
-/// Returns true when tests request the in-memory runtime through environment configuration.
-pub fn use_in_memory_container_manager_from_env() -> bool {
-    std::env::var_os("MANTISSA_TEST_INMEMORY_CONTAINER_MANAGER").is_some()
-}
-
-#[derive(Default)]
-struct InMemoryContainerManager {
-    containers: AsyncMutex<HashMap<String, InMemoryContainerEntry>>,
-    names: AsyncMutex<HashMap<String, String>>,
-}
-
-#[derive(Clone)]
-struct InMemoryContainerEntry {
-    id: String,
-    name: String,
-    image: String,
-    running: bool,
-}
-
-impl InMemoryContainerManager {
-    fn not_found(container_id: &str) -> ContainerError {
-        ContainerError::NotFound(container_id.to_string())
-    }
-
-    fn name_conflict(name: &str) -> ContainerError {
-        ContainerError::DockerAPI(bollard::errors::Error::DockerResponseServerError {
-            status_code: 409,
-            message: format!("container name '{name}' already in use"),
-        })
-    }
-
-    async fn resolve_container_id(&self, key: &str) -> Option<String> {
-        {
-            let containers = self.containers.lock().await;
-            if containers.contains_key(key) {
-                return Some(key.to_string());
-            }
-        }
-
-        let names = self.names.lock().await;
-        names.get(key).cloned()
-    }
-}
-
-/// Creates an in-memory container runtime used by stress tests that spawn daemon subprocesses.
-pub fn new_in_memory_container_manager() -> Arc<dyn ContainerManager + Send + Sync> {
-    Arc::new(InMemoryContainerManager::default())
-}
-
 #[async_trait]
-impl ContainerManager for InMemoryContainerManager {
-    async fn create_container(&self, request: ContainerCreateRequest) -> ContainerResult<String> {
-        {
-            let names = self.names.lock().await;
-            if names.contains_key(&request.name) {
-                return Err(Self::name_conflict(&request.name));
-            }
-        }
-
-        let id = uuid::Uuid::new_v4().to_string();
-        let entry = InMemoryContainerEntry {
-            id: id.clone(),
-            name: request.name.clone(),
-            image: request.image,
-            running: false,
-        };
-
-        self.containers.lock().await.insert(id.clone(), entry);
-        self.names.lock().await.insert(request.name, id.clone());
-
-        Ok(id)
-    }
-
-    async fn start_container(&self, container_id: &str) -> ContainerResult<()> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let mut containers = self.containers.lock().await;
-        let Some(container) = containers.get_mut(&id) else {
-            return Err(Self::not_found(container_id));
-        };
-        container.running = true;
-        Ok(())
-    }
-
-    async fn stop_container(
-        &self,
-        container_id: &str,
-        _timeout: Option<Duration>,
-    ) -> ContainerResult<()> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let mut containers = self.containers.lock().await;
-        let Some(container) = containers.get_mut(&id) else {
-            return Err(Self::not_found(container_id));
-        };
-        container.running = false;
-        Ok(())
-    }
-
-    async fn exec_container(
-        &self,
-        container_id: &str,
-        _command: &[String],
-        _timeout: Option<Duration>,
-    ) -> ContainerResult<ContainerExecResult> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let containers = self.containers.lock().await;
-        let Some(container) = containers.get(&id) else {
-            return Err(Self::not_found(container_id));
-        };
-        if !container.running {
-            return Err(ContainerError::OperationFailed(format!(
-                "container {container_id} is not running"
-            )));
-        }
-
-        Ok(ContainerExecResult { exit_code: Some(0) })
-    }
-
-    async fn exec_container_stream(
-        &self,
-        container_id: &str,
-        options: &ContainerExecOptions,
-        _output_tx: MpscSender<ContainerLogFrame>,
-        mut input_rx: MpscReceiver<Vec<u8>>,
-    ) -> ContainerResult<ContainerExecResult> {
-        if options.command.is_empty() {
-            return Err(ContainerError::OperationFailed(
-                "exec command must contain at least one argument".to_string(),
-            ));
-        }
-
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let containers = self.containers.lock().await;
-        let Some(container) = containers.get(&id) else {
-            return Err(Self::not_found(container_id));
-        };
-        if !container.running {
-            return Err(ContainerError::OperationFailed(format!(
-                "container {container_id} is not running"
-            )));
-        }
-        drop(containers);
-
-        while input_rx.recv().await.is_some() {}
-        Ok(ContainerExecResult { exit_code: Some(0) })
-    }
-
-    async fn restart_container(
-        &self,
-        container_id: &str,
-        _timeout: Option<Duration>,
-    ) -> ContainerResult<()> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let mut containers = self.containers.lock().await;
-        let Some(container) = containers.get_mut(&id) else {
-            return Err(Self::not_found(container_id));
-        };
-        container.running = true;
-        Ok(())
-    }
-
-    async fn remove_container(
-        &self,
-        container_id: &str,
-        _force: bool,
-        _remove_volumes: bool,
-    ) -> ContainerResult<()> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Ok(());
-        };
-
-        let removed = self.containers.lock().await.remove(&id);
-        if let Some(entry) = removed {
-            self.names.lock().await.remove(&entry.name);
-        }
-        Ok(())
-    }
-
-    async fn list_containers(
-        &self,
-        _filters: Option<HashMap<String, Vec<String>>>,
-    ) -> ContainerResult<Vec<ContainerInfo>> {
-        let containers = self.containers.lock().await;
-        let mut out = Vec::with_capacity(containers.len());
-        for entry in containers.values() {
-            out.push(ContainerInfo {
-                id: entry.id.clone(),
-                name: entry.name.clone(),
-                image: entry.image.clone(),
-                status: if entry.running {
-                    "running".to_string()
-                } else {
-                    "stopped".to_string()
-                },
-                state: if entry.running {
-                    "running".to_string()
-                } else {
-                    "exited".to_string()
-                },
-                created: 0,
-            });
-        }
-        Ok(out)
-    }
-
-    async fn inspect_container(
-        &self,
-        container_id: &str,
-    ) -> ContainerResult<ContainerInspectResponse> {
-        let Some(id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let containers = self.containers.lock().await;
-        let Some(entry) = containers.get(&id) else {
-            return Err(Self::not_found(container_id));
-        };
-
-        let state = bollard::models::ContainerState {
-            running: Some(entry.running),
-            pid: Some(if entry.running { 1000 } else { 0 }),
-            ..Default::default()
-        };
-
-        Ok(bollard::service::ContainerInspectResponse {
-            id: Some(entry.id.clone()),
-            name: Some(format!("/{}", entry.name)),
-            state: Some(state),
-            ..Default::default()
-        })
-    }
-
-    async fn pull_image(&self, _image: &str) -> ContainerResult<()> {
-        Ok(())
-    }
-
-    /// Streams the in-memory runtime's synthetic logs for local test harnesses.
-    async fn stream_container_logs(
-        &self,
-        container_id: &str,
-        _options: &ContainerLogsOptions,
-        _logs_tx: MpscSender<ContainerLogFrame>,
-    ) -> ContainerResult<()> {
-        let Some(_id) = self.resolve_container_id(container_id).await else {
-            return Err(Self::not_found(container_id));
-        };
-
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl ContainerManager for DockerContainerManager {
-    async fn create_container(&self, request: ContainerCreateRequest) -> ContainerResult<String> {
-        let ContainerCreateRequest {
+impl RuntimeBackend for DockerRuntimeBackend {
+    /// Creates one Docker container from the generic runtime create request.
+    async fn create_instance(&self, request: RuntimeCreateRequest) -> RuntimeResult<String> {
+        let RuntimeCreateRequest {
             name,
             image,
             command,
@@ -1535,7 +989,7 @@ impl ContainerManager for DockerContainerManager {
             .docker
             .create_container(options, config)
             .await
-            .map_err(ContainerError::DockerAPI)?;
+            .map_err(|err| RuntimeError::backend(None, err.to_string()))?;
 
         if !response.warnings.is_empty() {
             for warning in response.warnings {
@@ -1548,10 +1002,11 @@ impl ContainerManager for DockerContainerManager {
         Ok(response.id)
     }
 
-    async fn start_container(&self, container_id: &str) -> ContainerResult<()> {
+    /// Starts one existing Docker container.
+    async fn start_instance(&self, container_id: &str) -> RuntimeResult<()> {
         debug!("Starting container: {}", container_id);
 
-        self.run_unit_container_call(
+        self.run_unit_runtime_call(
             container_id,
             "Container started",
             self.docker
@@ -1560,11 +1015,12 @@ impl ContainerManager for DockerContainerManager {
         .await
     }
 
-    async fn stop_container(
+    /// Stops one Docker container.
+    async fn stop_instance(
         &self,
         container_id: &str,
         timeout: Option<Duration>,
-    ) -> ContainerResult<()> {
+    ) -> RuntimeResult<()> {
         let seconds = timeout.map(|value| value.as_secs() as i64);
         debug!(
             "Stopping container: {} (timeout: {:?}s)",
@@ -1572,7 +1028,7 @@ impl ContainerManager for DockerContainerManager {
         );
         let effective_seconds = Self::timeout_seconds_or_default(timeout, 10);
 
-        self.run_unit_container_call(
+        self.run_unit_runtime_call(
             container_id,
             "Container stopped",
             self.docker.stop_container(
@@ -1586,14 +1042,15 @@ impl ContainerManager for DockerContainerManager {
         .await
     }
 
-    async fn exec_container(
+    /// Executes one non-interactive command inside one Docker container.
+    async fn exec_instance(
         &self,
         container_id: &str,
         command: &[String],
         timeout: Option<Duration>,
-    ) -> ContainerResult<ContainerExecResult> {
+    ) -> RuntimeResult<RuntimeExecResult> {
         if command.is_empty() {
-            return Err(ContainerError::OperationFailed(
+            return Err(RuntimeError::OperationFailed(
                 "pre-stop command must contain at least one argument".to_string(),
             ));
         }
@@ -1607,28 +1064,30 @@ impl ContainerManager for DockerContainerManager {
         match timeout {
             Some(limit) => match tokio::time::timeout(limit, exec_future).await {
                 Ok(result) => result,
-                Err(_) => Err(ContainerError::Timeout),
+                Err(_) => Err(RuntimeError::Timeout),
             },
             None => exec_future.await,
         }
     }
 
-    async fn exec_container_stream(
+    /// Starts one interactive exec session inside one Docker container.
+    async fn exec_instance_stream(
         &self,
         container_id: &str,
-        options: &ContainerExecOptions,
-        output_tx: MpscSender<ContainerLogFrame>,
+        options: &RuntimeExecOptions,
+        output_tx: MpscSender<RuntimeLogFrame>,
         input_rx: MpscReceiver<Vec<u8>>,
-    ) -> ContainerResult<ContainerExecResult> {
+    ) -> RuntimeResult<RuntimeExecResult> {
         self.exec_container_interactive(container_id, options, output_tx, input_rx)
             .await
     }
 
-    async fn restart_container(
+    /// Restarts one Docker container.
+    async fn restart_instance(
         &self,
         container_id: &str,
         timeout: Option<Duration>,
-    ) -> ContainerResult<()> {
+    ) -> RuntimeResult<()> {
         let seconds = timeout.map(|value| value.as_secs() as i64);
         debug!(
             "Restarting container: {} (timeout: {:?}s)",
@@ -1636,7 +1095,7 @@ impl ContainerManager for DockerContainerManager {
         );
         let effective_seconds = Self::timeout_seconds_or_default(timeout, 10);
 
-        self.run_unit_container_call(
+        self.run_unit_runtime_call(
             container_id,
             "Container restarted",
             self.docker.restart_container(
@@ -1650,18 +1109,19 @@ impl ContainerManager for DockerContainerManager {
         .await
     }
 
-    async fn remove_container(
+    /// Removes one Docker container.
+    async fn remove_instance(
         &self,
         container_id: &str,
         force: bool,
         remove_volumes: bool,
-    ) -> ContainerResult<()> {
+    ) -> RuntimeResult<()> {
         debug!(
             "Removing container: {} (force: {}, remove volumes: {})",
             container_id, force, remove_volumes
         );
 
-        self.run_unit_container_call(
+        self.run_unit_runtime_call(
             container_id,
             "Container removed",
             self.docker.remove_container(
@@ -1676,10 +1136,11 @@ impl ContainerManager for DockerContainerManager {
         .await
     }
 
-    async fn list_containers(
+    /// Lists Docker containers through the generic runtime info shape.
+    async fn list_instances(
         &self,
         filters: Option<HashMap<String, Vec<String>>>,
-    ) -> ContainerResult<Vec<ContainerInfo>> {
+    ) -> RuntimeResult<Vec<RuntimeInfo>> {
         tracing::trace!(target: "task::docker", ?filters, "listing containers");
 
         let options = ListContainersOptions {
@@ -1692,64 +1153,43 @@ impl ContainerManager for DockerContainerManager {
             .docker
             .list_containers(Some(options))
             .await
-            .map_err(ContainerError::DockerAPI)?;
+            .map_err(|err| RuntimeError::backend(None, err.to_string()))?;
 
         let result = containers
             .into_iter()
-            .map(|c| {
-                let id = c.id.unwrap_or_default();
-                let name = c
-                    .names
-                    .unwrap_or_default()
-                    .first()
-                    .cloned()
-                    .unwrap_or_default()
-                    .trim_start_matches('/')
-                    .to_string();
-                let image = c.image.unwrap_or_default();
-                let status = c.status.unwrap_or_default();
-                let state = c.state.map(|value| value.to_string()).unwrap_or_default();
-                let created = c.created.unwrap_or_default();
-
-                ContainerInfo {
-                    id,
-                    name,
-                    image,
-                    status,
-                    state,
-                    created,
-                }
-            })
+            .map(runtime_info_from_list_entry)
             .collect();
 
         Ok(result)
     }
 
-    async fn inspect_container(
-        &self,
-        container_id: &str,
-    ) -> ContainerResult<ContainerInspectResponse> {
+    /// Returns inspect-level Docker metadata through the generic runtime info shape.
+    async fn inspect_instance(&self, container_id: &str) -> RuntimeResult<RuntimeInfo> {
         trace!("Inspecting container: {}", container_id);
-        self.run_container_call(
-            container_id,
-            self.docker
-                .inspect_container(container_id, Some(InspectContainerOptions { size: false })),
-        )
-        .await
+        let inspect = self
+            .run_runtime_call(
+                container_id,
+                self.docker
+                    .inspect_container(container_id, Some(InspectContainerOptions { size: false })),
+            )
+            .await?;
+        Ok(runtime_info_from_inspect(inspect))
     }
 
-    async fn image_present(&self, image: &str) -> ContainerResult<bool> {
+    /// Reports whether one Docker image already exists locally.
+    async fn image_present(&self, image: &str) -> RuntimeResult<bool> {
         trace!("Inspecting image: {}", image);
         match self.docker.inspect_image(image).await {
             Ok(_) => Ok(true),
             Err(BollardError::DockerResponseServerError {
                 status_code: 404, ..
             }) => Ok(false),
-            Err(err) => Err(ContainerError::DockerAPI(err)),
+            Err(err) => Err(RuntimeError::backend(None, err.to_string())),
         }
     }
 
-    async fn pull_image(&self, image: &str) -> ContainerResult<()> {
+    /// Pulls one image from the configured Docker registry.
+    async fn pull_image(&self, image: &str) -> RuntimeResult<()> {
         debug!("Pulling image: {}", image);
 
         let options = Some(CreateImageOptions {
@@ -1774,10 +1214,10 @@ impl ContainerManager for DockerContainerManager {
                         .as_ref()
                         .and_then(|detail| detail.message.as_deref())
                     {
-                        return Err(ContainerError::OperationFailed(error.to_string()));
+                        return Err(RuntimeError::OperationFailed(error.to_string()));
                     }
                 }
-                Err(err) => return Err(ContainerError::DockerAPI(err)),
+                Err(err) => return Err(RuntimeError::backend(None, err.to_string())),
             }
         }
 
@@ -1786,12 +1226,12 @@ impl ContainerManager for DockerContainerManager {
     }
 
     /// Streams Docker log frames while preserving stream identity and follow semantics.
-    async fn stream_container_logs(
+    async fn stream_instance_logs(
         &self,
         container_id: &str,
-        options: &ContainerLogsOptions,
-        logs_tx: MpscSender<ContainerLogFrame>,
-    ) -> ContainerResult<()> {
+        options: &RuntimeLogsOptions,
+        logs_tx: MpscSender<RuntimeLogFrame>,
+    ) -> RuntimeResult<()> {
         let options = options.normalized();
         let mut stream = self.docker.logs(
             container_id,
@@ -1807,9 +1247,9 @@ impl ContainerManager for DockerContainerManager {
         );
 
         while let Some(next) = stream.next().await {
-            let frame = next.map_err(|err| classify_container_error(container_id, err))?;
+            let frame = next.map_err(|err| classify_runtime_error(container_id, err))?;
             if logs_tx
-                .send(container_log_frame_from_output(frame))
+                .send(runtime_log_frame_from_output(frame))
                 .await
                 .is_err()
             {
@@ -1821,13 +1261,13 @@ impl ContainerManager for DockerContainerManager {
     }
 
     /// Attaches to one Docker container and bridges both stdout/stderr output and stdin input.
-    async fn attach_container(
+    async fn attach_instance(
         &self,
         container_id: &str,
-        options: &ContainerAttachOptions,
-        output_tx: MpscSender<ContainerLogFrame>,
+        options: &RuntimeAttachOptions,
+        output_tx: MpscSender<RuntimeLogFrame>,
         input_rx: MpscReceiver<Vec<u8>>,
-    ) -> ContainerResult<()> {
+    ) -> RuntimeResult<()> {
         if options.tty {
             return self
                 .attach_tty_container_raw(container_id, options, output_tx, input_rx)
@@ -1850,7 +1290,7 @@ impl ContainerManager for DockerContainerManager {
             mut output,
             mut input,
         } = self
-            .run_container_call(
+            .run_runtime_call(
                 container_id,
                 self.docker
                     .attach_container(container_id, Some(builder.build())),
@@ -1871,14 +1311,21 @@ impl ContainerManager for DockerContainerManager {
         .await
     }
 
-    fn supports_runtime_events(&self) -> bool {
-        true
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            exec: true,
+            interactive_exec: true,
+            logs: true,
+            attach: true,
+            lifecycle_events: true,
+        }
     }
 
+    /// Watches Docker container events and forwards task-relevant lifecycle edges.
     async fn watch_runtime_events(
         &self,
-        events_tx: UnboundedSender<ContainerRuntimeEvent>,
-    ) -> ContainerResult<()> {
+        events_tx: UnboundedSender<RuntimeEvent>,
+    ) -> RuntimeResult<()> {
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("type".to_string(), vec!["container".to_string()]);
         let options = EventsOptions {
@@ -1889,7 +1336,7 @@ impl ContainerManager for DockerContainerManager {
 
         let mut stream = self.docker.events(Some(options));
         while let Some(next) = stream.next().await {
-            let event = next.map_err(ContainerError::DockerAPI)?;
+            let event = next.map_err(|err| RuntimeError::backend(None, err.to_string()))?;
             if event.typ != Some(EventMessageTypeEnum::CONTAINER) {
                 continue;
             }
@@ -1926,17 +1373,14 @@ impl ContainerManager for DockerContainerManager {
 
                 if let Some(task_id) = task_id
                     && events_tx
-                        .send(ContainerRuntimeEvent::TaskExited { task_id, exit_code })
+                        .send(RuntimeEvent::TaskExited { task_id, exit_code })
                         .is_err()
                 {
                     return Ok(());
                 }
             }
 
-            if events_tx
-                .send(ContainerRuntimeEvent::ContainerStateChanged)
-                .is_err()
-            {
+            if events_tx.send(RuntimeEvent::InstanceStateChanged).is_err() {
                 return Ok(());
             }
         }
@@ -1955,28 +1399,28 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn classify_container_error_maps_404_to_not_found() {
+    fn classify_runtime_error_maps_404_to_not_found() {
         let error = bollard::errors::Error::DockerResponseServerError {
             status_code: 404,
             message: "No such container".to_string(),
         };
-        let mapped = classify_container_error("demo-container", error);
-        assert!(matches!(mapped, ContainerError::NotFound(ref id) if id == "demo-container"));
+        let mapped = classify_runtime_error("demo-container", error);
+        assert!(matches!(mapped, RuntimeError::NotFound(ref id) if id == "demo-container"));
     }
 
     #[test]
-    fn classify_container_error_preserves_non_404_as_docker_api() {
+    fn classify_runtime_error_preserves_non_404_backend_status() {
         let error = bollard::errors::Error::DockerResponseServerError {
             status_code: 409,
             message: "Conflict".to_string(),
         };
-        let mapped = classify_container_error("demo-container", error);
+        let mapped = classify_runtime_error("demo-container", error);
         assert!(matches!(
             mapped,
-            ContainerError::DockerAPI(bollard::errors::Error::DockerResponseServerError {
-                status_code: 409,
+            RuntimeError::Backend {
+                status_code: Some(409),
                 ..
-            })
+            }
         ));
     }
 
@@ -1993,11 +1437,11 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(DockerContainerManager::should_log_pull_update(
+        assert!(DockerRuntimeBackend::should_log_pull_update(
             &mut updates,
             &update
         ));
-        assert!(!DockerContainerManager::should_log_pull_update(
+        assert!(!DockerRuntimeBackend::should_log_pull_update(
             &mut updates,
             &update
         ));
@@ -2025,11 +1469,11 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(DockerContainerManager::should_log_pull_update(
+        assert!(DockerRuntimeBackend::should_log_pull_update(
             &mut updates,
             &first
         ));
-        assert!(DockerContainerManager::should_log_pull_update(
+        assert!(DockerRuntimeBackend::should_log_pull_update(
             &mut updates,
             &second
         ));
@@ -2037,8 +1481,8 @@ mod tests {
 
     /// Builds a Docker-backed manager for integration-style tests and skips cleanly when the
     /// local environment does not expose a reachable Docker daemon.
-    async fn docker_test_manager() -> Option<Arc<DockerContainerManager>> {
-        match DockerContainerManager::new().await {
+    async fn docker_test_manager() -> Option<Arc<DockerRuntimeBackend>> {
+        match DockerRuntimeBackend::new().await {
             Ok(manager) => Some(Arc::new(manager)),
             Err(err) => {
                 eprintln!("skipping Docker-backed attach test: {err}");
@@ -2119,11 +1563,11 @@ mod tests {
             assert_eq!(&buffer[..bytes_read], b"exit\n");
         });
 
-        let manager = DockerContainerManager {
+        let manager = DockerRuntimeBackend {
             docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
                 .expect("construct docker http client"),
         };
-        let options = ContainerAttachOptions {
+        let options = RuntimeAttachOptions {
             tty: true,
             ..Default::default()
         };
@@ -2141,7 +1585,7 @@ mod tests {
             .await
             .expect("initial prompt should arrive promptly")
             .expect("initial prompt frame");
-        assert_eq!(frame.stream, ContainerLogStream::Console);
+        assert_eq!(frame.stream, RuntimeLogStream::Console);
         assert_eq!(frame.message, b"/ # ");
 
         input_tx
@@ -2166,7 +1610,7 @@ mod tests {
 
         let container_name = format!("mantissa-tty-attach-test-{}", Uuid::new_v4());
         let container_id = manager
-            .create_container(ContainerCreateRequest {
+            .create_instance(RuntimeCreateRequest {
                 name: container_name.clone(),
                 image: "busybox:1.36".to_string(),
                 command: Some(vec!["sh".to_string(), "-i".to_string()]),
@@ -2177,13 +1621,13 @@ mod tests {
             .await
             .expect("create tty attach test container");
         manager
-            .start_container(&container_id)
+            .start_instance(&container_id)
             .await
             .expect("start tty attach test container");
 
         let (output_tx, mut output_rx) = mpsc::channel(8);
         let (input_tx, input_rx) = mpsc::channel(8);
-        let attach_options = ContainerAttachOptions {
+        let attach_options = RuntimeAttachOptions {
             tty: true,
             tty_width: Some(80),
             tty_height: Some(24),
@@ -2223,7 +1667,7 @@ mod tests {
             .await
             .expect("attach task should finish")
             .expect("attach join result");
-        if let Err(err) = manager.remove_container(&container_id, true, true).await {
+        if let Err(err) = manager.remove_instance(&container_id, true, true).await {
             panic!("cleanup attach test container failed: {err}");
         }
         attach_result.expect("attach tty container");
@@ -2241,7 +1685,7 @@ mod tests {
 
         let container_name = format!("mantissa-tty-reattach-test-{}", Uuid::new_v4());
         let container_id = manager
-            .create_container(ContainerCreateRequest {
+            .create_instance(RuntimeCreateRequest {
                 name: container_name.clone(),
                 image: "busybox:1.36".to_string(),
                 command: Some(vec!["sh".to_string(), "-i".to_string()]),
@@ -2252,11 +1696,11 @@ mod tests {
             .await
             .expect("create tty reattach test container");
         manager
-            .start_container(&container_id)
+            .start_instance(&container_id)
             .await
             .expect("start tty reattach test container");
 
-        let attach_options = ContainerAttachOptions {
+        let attach_options = RuntimeAttachOptions {
             tty: true,
             tty_width: Some(80),
             tty_height: Some(24),
@@ -2327,7 +1771,7 @@ mod tests {
             .await
             .expect("second attach task should finish")
             .expect("second attach join result");
-        if let Err(err) = manager.remove_container(&container_id, true, true).await {
+        if let Err(err) = manager.remove_instance(&container_id, true, true).await {
             panic!("cleanup reattach test container failed: {err}");
         }
         second_result.expect("reattach tty container");
@@ -2345,7 +1789,7 @@ mod tests {
 
         let container_name = format!("mantissa-tty-attach-stopped-{}", Uuid::new_v4());
         let container_id = manager
-            .create_container(ContainerCreateRequest {
+            .create_instance(RuntimeCreateRequest {
                 name: container_name,
                 image: "busybox:1.36".to_string(),
                 command: Some(vec!["/bin/true".to_string()]),
@@ -2356,7 +1800,7 @@ mod tests {
             .await
             .expect("create stopped tty attach test container");
         manager
-            .start_container(&container_id)
+            .start_instance(&container_id)
             .await
             .expect("start stopped tty attach test container");
 
@@ -2378,7 +1822,7 @@ mod tests {
         let result = manager
             .attach_tty_container_raw(
                 &container_id,
-                &ContainerAttachOptions {
+                &RuntimeAttachOptions {
                     tty: true,
                     tty_width: Some(80),
                     tty_height: Some(24),
@@ -2389,7 +1833,7 @@ mod tests {
             )
             .await;
 
-        if let Err(err) = manager.remove_container(&container_id, true, true).await {
+        if let Err(err) = manager.remove_instance(&container_id, true, true).await {
             panic!("cleanup stopped attach test container failed: {err}");
         }
         let message = result.expect_err("attach should reject exited container");

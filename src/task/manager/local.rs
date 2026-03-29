@@ -392,8 +392,8 @@ impl TaskManager {
             if let Some(container_id) = plan.container_id.as_ref() {
                 if let Err(err) = self
                     .runtime
-                    .container_manager
-                    .stop_container(container_id, Some(Duration::from_secs(10)))
+                    .runtime_backend
+                    .stop_instance(container_id, Some(Duration::from_secs(10)))
                     .await
                 {
                     warn!(
@@ -405,8 +405,8 @@ impl TaskManager {
 
                 if let Err(err) = self
                     .runtime
-                    .container_manager
-                    .remove_container(container_id, true, true)
+                    .runtime_backend
+                    .remove_instance(container_id, true, true)
                     .await
                 {
                     warn!(

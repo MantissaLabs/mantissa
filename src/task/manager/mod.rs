@@ -3,16 +3,16 @@ use crate::network::attachment::{AttachmentProvisioner, AttachmentProvisionerApi
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::registry::Registry;
+use crate::runtime::types::{
+    RuntimeAttachOptions, RuntimeBackend, RuntimeError, RuntimeExecOptions, RuntimeExecResult,
+    RuntimeLogFrame, RuntimeLogsOptions,
+};
 use crate::scheduler::{Scheduler, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::store::task_store::TaskStore;
 use crate::task::causality::{compare_task_causality, should_replace_task_event};
 use crate::task::container::ContainerState;
-use crate::task::docker::{
-    ContainerAttachOptions, ContainerError, ContainerExecOptions, ContainerLogFrame,
-    ContainerLogsOptions, ContainerManager,
-};
 use crate::task::types::{
     TaskEvent, TaskRestartPolicy, TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStatus,
     TaskValue, TaskValueDraft,
@@ -21,7 +21,6 @@ use crate::volumes::VolumeRegistry;
 use crate::workload::types::TaskExecutionSpec;
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
-use bollard::errors::Error as BollardError;
 use chrono::{DateTime, Utc};
 use crdt_store::uuid_key::UuidKey;
 use std::collections::{HashMap, HashSet};
@@ -212,7 +211,7 @@ struct TaskManagerCore {
 #[derive(Clone)]
 struct TaskManagerRuntime {
     // Container runtime abstraction used for create/start/stop/inspect/pull flows.
-    container_manager: Arc<dyn ContainerManager + Send + Sync>,
+    runtime_backend: Arc<dyn RuntimeBackend + Send + Sync>,
     // Node-local semaphore that bounds concurrent image pulls.
     pull_limiter: Arc<Semaphore>,
     // Runtime worker cadence configuration (repair/reconcile/debounce ticks).
@@ -329,7 +328,7 @@ pub struct TaskManagerConfig {
     pub local_node_id: Uuid,
     pub local_node_name: String,
     pub scheduler: Rc<Scheduler>,
-    pub container_manager: Arc<dyn ContainerManager + Send + Sync>,
+    pub runtime_backend: Arc<dyn RuntimeBackend + Send + Sync>,
     pub registry: Registry,
     pub network_registry: NetworkRegistry,
     pub volume_registry: VolumeRegistry,
@@ -351,7 +350,7 @@ impl TaskManager {
             local_node_id,
             local_node_name,
             scheduler,
-            container_manager,
+            runtime_backend,
             registry,
             network_registry,
             volume_registry,
@@ -390,7 +389,7 @@ impl TaskManager {
                 scheduler,
             },
             runtime: TaskManagerRuntime {
-                container_manager,
+                runtime_backend,
                 pull_limiter: Arc::new(Semaphore::new(IMAGE_PULL_MAX_CONCURRENCY)),
                 runtime_config: runtime_config.unwrap_or_default(),
             },
@@ -859,8 +858,8 @@ impl TaskManager {
     pub async fn stream_local_task_logs(
         &self,
         id: Uuid,
-        options: &ContainerLogsOptions,
-        logs_tx: MpscSender<ContainerLogFrame>,
+        options: &RuntimeLogsOptions,
+        logs_tx: MpscSender<RuntimeLogFrame>,
     ) -> Result<(), anyhow::Error> {
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
@@ -879,8 +878,8 @@ impl TaskManager {
         };
 
         self.runtime
-            .container_manager
-            .stream_container_logs(&container_identifier, options, logs_tx)
+            .runtime_backend
+            .stream_instance_logs(&container_identifier, options, logs_tx)
             .await
             .map_err(|err| anyhow!("task log stream failed for {id}: {err}"))
     }
@@ -892,8 +891,8 @@ impl TaskManager {
     pub async fn attach_local_task(
         &self,
         id: Uuid,
-        options: &ContainerAttachOptions,
-        output_tx: MpscSender<ContainerLogFrame>,
+        options: &RuntimeAttachOptions,
+        output_tx: MpscSender<RuntimeLogFrame>,
         input_rx: MpscReceiver<Vec<u8>>,
     ) -> Result<(), anyhow::Error> {
         let spec = self.load_spec(id).await?;
@@ -914,15 +913,11 @@ impl TaskManager {
         let mut runtime_options = options.clone();
         let runtime_info = self
             .runtime
-            .container_manager
-            .inspect_container(&container_identifier)
+            .runtime_backend
+            .inspect_instance(&container_identifier)
             .await
             .map_err(|err| anyhow!("task attach inspect failed for {id}: {err}"))?;
-        let runtime_tty = runtime_info
-            .config
-            .as_ref()
-            .and_then(|config| config.tty)
-            .unwrap_or(spec.tty);
+        let runtime_tty = runtime_info.config.tty.unwrap_or(spec.tty);
         if runtime_tty != spec.tty {
             debug!(
                 task = %id,
@@ -934,8 +929,8 @@ impl TaskManager {
         runtime_options.tty = runtime_tty;
 
         self.runtime
-            .container_manager
-            .attach_container(&container_identifier, &runtime_options, output_tx, input_rx)
+            .runtime_backend
+            .attach_instance(&container_identifier, &runtime_options, output_tx, input_rx)
             .await
             .map_err(|err| anyhow!("task attach failed for {id}: {err}"))
     }
@@ -947,10 +942,10 @@ impl TaskManager {
     pub async fn exec_local_task(
         &self,
         id: Uuid,
-        options: &ContainerExecOptions,
-        output_tx: MpscSender<ContainerLogFrame>,
+        options: &RuntimeExecOptions,
+        output_tx: MpscSender<RuntimeLogFrame>,
         input_rx: MpscReceiver<Vec<u8>>,
-    ) -> Result<crate::task::docker::ContainerExecResult, anyhow::Error> {
+    ) -> Result<RuntimeExecResult, anyhow::Error> {
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
@@ -974,8 +969,8 @@ impl TaskManager {
         };
 
         self.runtime
-            .container_manager
-            .exec_container_stream(&container_identifier, options, output_tx, input_rx)
+            .runtime_backend
+            .exec_instance_stream(&container_identifier, options, output_tx, input_rx)
             .await
             .map_err(|err| anyhow!("task exec failed for {id}: {err}"))
     }
@@ -1015,15 +1010,11 @@ impl TaskManager {
 
         let info = self
             .runtime
-            .container_manager
-            .inspect_container(&container_identifier)
+            .runtime_backend
+            .inspect_instance(&container_identifier)
             .await
             .map_err(|err| anyhow!("task {action} preflight failed for {id}: {err}"))?;
-        let running = info
-            .state
-            .as_ref()
-            .and_then(|state| state.running)
-            .unwrap_or(false);
+        let running = info.state.running.unwrap_or(false);
         if !running {
             return Err(anyhow!("task {id} runtime is not running"));
         }
@@ -1486,17 +1477,17 @@ fn ensure_dir_writable(base: &Path) -> io::Result<()> {
     }
 }
 
-fn wrap_create_error(task_name: &str, err: ContainerError) -> anyhow::Error {
+fn wrap_create_error(task_name: &str, err: RuntimeError) -> anyhow::Error {
     anyhow::Error::new(err).context(format!("docker create failed for task {task_name}"))
 }
 
-fn wrap_existing_inspect_error(task_name: &str, err: ContainerError) -> anyhow::Error {
+fn wrap_existing_inspect_error(task_name: &str, err: RuntimeError) -> anyhow::Error {
     anyhow::Error::new(err).context(format!(
         "failed to inspect existing container for task {task_name} after name conflict"
     ))
 }
 
-fn wrap_start_error(task_name: &str, err: ContainerError) -> anyhow::Error {
+fn wrap_start_error(task_name: &str, err: RuntimeError) -> anyhow::Error {
     anyhow::Error::new(err).context(format!("docker start failed for task {task_name}"))
 }
 
@@ -1541,28 +1532,16 @@ fn match_task_id_prefix(
     }
 }
 
-fn is_name_conflict(err: &ContainerError) -> bool {
-    matches!(
-        err,
-        ContainerError::DockerAPI(BollardError::DockerResponseServerError { status_code, .. })
-            if *status_code == 409
-    )
+fn is_name_conflict(err: &RuntimeError) -> bool {
+    err.status_code() == Some(409)
 }
 
-fn container_already_running(err: &ContainerError) -> bool {
-    matches!(
-        err,
-        ContainerError::DockerAPI(BollardError::DockerResponseServerError { status_code, .. })
-            if *status_code == 304
-    )
+fn container_already_running(err: &RuntimeError) -> bool {
+    err.status_code() == Some(304)
 }
 
-fn container_remove_in_progress(err: &ContainerError) -> bool {
-    matches!(
-        err,
-        ContainerError::DockerAPI(BollardError::DockerResponseServerError { status_code, .. })
-            if *status_code == 409
-    )
+fn container_remove_in_progress(err: &RuntimeError) -> bool {
+    err.status_code() == Some(409)
 }
 
 /// Local guard that clears the in-flight stop marker for a task when dropped.

@@ -2,8 +2,8 @@ use anyhow::anyhow;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::task::docker::{
-    ContainerCreateRequest, ResourceLimits, RestartPolicyConfig, RestartPolicyType,
+use crate::runtime::types::{
+    ResourceLimits, RestartPolicyConfig, RestartPolicyType, RuntimeCreateRequest,
 };
 use crate::task::types::{
     TaskEnvironmentVariable, TaskRestartPolicy, TaskRestartPolicyKind, TaskSecretFile,
@@ -117,7 +117,7 @@ impl TaskManager {
             super::append_nvidia_visible_devices(&mut env_vars, device_ids);
         }
 
-        let create_request = ContainerCreateRequest {
+        let create_request = RuntimeCreateRequest {
             name: request.container_name.to_string(),
             image: request.image.to_string(),
             command: if request.command.is_empty() {
@@ -141,8 +141,8 @@ impl TaskManager {
 
         let (container_id, created_fresh) = match self
             .runtime
-            .container_manager
-            .create_container(create_request)
+            .runtime_backend
+            .create_instance(create_request)
             .await
         {
             Ok(id) => (id, true),
@@ -162,8 +162,8 @@ impl TaskManager {
                             );
                             match self
                                 .runtime
-                                .container_manager
-                                .create_container(retry_create_request)
+                                .runtime_backend
+                                .create_instance(retry_create_request)
                                 .await
                             {
                                 Ok(id) => (id, true),
@@ -200,8 +200,8 @@ impl TaskManager {
 
         match self
             .runtime
-            .container_manager
-            .start_container(&container_id)
+            .runtime_backend
+            .start_instance(&container_id)
             .await
         {
             Ok(_) => {}
@@ -217,8 +217,8 @@ impl TaskManager {
                     if created_fresh
                         && let Err(remove_err) = self
                             .runtime
-                            .container_manager
-                            .remove_container(&container_id, true, true)
+                            .runtime_backend
+                            .remove_instance(&container_id, true, true)
                             .await
                     {
                         warn!(
