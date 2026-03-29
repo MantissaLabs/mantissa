@@ -1,5 +1,6 @@
 pub mod cluster_operation_store;
 pub mod cluster_view_store;
+pub mod job_store;
 pub mod local;
 pub mod network_store;
 pub mod open;

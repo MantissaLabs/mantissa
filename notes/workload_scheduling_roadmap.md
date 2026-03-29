@@ -1278,7 +1278,7 @@ Add a finite workload controller for jobs without overloading regular tasks.
 
 ### Status
 
-Pending.
+Completed on 2026-03-29.
 
 ### Scope
 
@@ -1319,6 +1319,106 @@ Pending.
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
+
+### Completed
+
+1. Added the first-class jobs subsystem under `src/jobs/`:
+   - `src/jobs/types.rs`
+   - `src/jobs/registry.rs`
+   - `src/jobs/manager.rs`
+   - `src/jobs/service.rs`
+2. Introduced a durable replicated job model that keeps finite-run semantics
+   out of regular tasks:
+   - `JobSpecValue`
+   - `JobStatus`
+   - `JobCompletionPolicy`
+   - `JobRetryPolicy`
+   - `JobEvent`
+3. Added a dedicated replicated job store in `src/store/job_store.rs` and
+   wired it through bootstrap, headless runtime setup, topology stores, sync
+   stores, and server clients.
+4. Added job gossip and sync plumbing so jobs replicate like other first-class
+   control-plane objects:
+   - `crates/protocol/schema/jobs.capnp`
+   - `crates/protocol/schema/gossip.capnp`
+   - `crates/protocol/schema/sync.capnp`
+   - `src/gossip/mod.rs`
+   - `src/sync/mod.rs`
+   - `src/sync/delta.rs`
+5. Added a jobs RPC capability and server/session exposure:
+   - `crates/protocol/schema/server.capnp`
+   - `src/server/session.rs`
+   - `src/server/mod.rs`
+   - `src/server/bootstrap/runtime.rs`
+   - `src/server/headless.rs`
+6. Added a `JobController` that owns completion and retry semantics while
+   reusing the shared execution/runtime path:
+   - jobs submit one shared `TaskExecutionSpec`
+   - jobs launch attempt tasks through `TaskManager`
+   - retry ownership stays in the job controller instead of leaking into task
+     or service specs
+7. Added client and CLI support for jobs:
+   - `crates/client/src/jobs/`
+   - `src/cli.rs`
+   - `src/app.rs`
+8. Added integration coverage for the new finite workload path in
+   `tests/jobs.rs` and updated shared cluster-domain assertions in
+   `tests/stress_large_cluster.rs`.
+
+### Removed
+
+1. Avoided adding job-only completion or retry fields to regular task specs,
+   service templates, or the shared execution template.
+2. Avoided cloning task orchestration code under `src/jobs/`; the job
+   controller reuses workload execution, task start, runtime inspection, sync,
+   and gossip infrastructure.
+3. Removed duplicated CLI volume-mount parsing by extracting shared helpers
+   into `crates/client/src/volumes/mod.rs` and cutting `tasks start` over to
+   the shared path before adding `jobs run`.
+
+### Findings
+
+1. The correct split is controller semantics versus execution semantics. Jobs
+   need their own durable status, retry, and completion policy, but their
+   launch shape is still the shared workload execution template.
+2. The cleanest first cut was to make jobs a finite controller over scheduled
+   task attempts, not a new runtime type. That keeps this milestone aligned
+   with the earlier workload/runtime split and avoids smuggling job policy into
+   the generic runtime layer.
+3. Adding a new replicated domain touched more shared bootstrap paths than the
+   controller itself: gossip routing, sync-store registration, session
+   capability exposure, topology wiring, and headless test setup were all
+   required for a true first-class feature.
+
+### Validation Completed
+
+1. `cargo fmt --all`
+2. `cargo clippy --all-targets -- -D warnings`
+3. `cargo test`
+
+All three commands passed on 2026-03-29.
+
+### Proposed Commit
+
+```text
+jobs: add first-class finite workload controller
+
+Add a first-class jobs control-plane slice backed by a replicated job
+store, a finite job controller, and a jobs RPC capability.
+
+Jobs now have their own durable spec/status model and retry policy,
+while still reusing the shared workload execution template, task
+scheduler, runtime backend, gossip transport, sync domain wiring, and
+headless bootstrap flow. This keeps finite-run semantics out of regular
+tasks and service templates instead of overloading the task model.
+
+The server/session capability graph, gossip schema, sync domain set,
+client crate, CLI, and test harness now expose jobs end to end. The
+client-side volume mount parsing used by `tasks start` was also shared
+with `jobs run` rather than duplicated, and new integration tests cover
+job submission, successful completion, and retry after failed task
+termination.
+```
 
 ## Milestone 9: Agent Sessions And Sandbox Scheduling
 

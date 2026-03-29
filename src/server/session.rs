@@ -1,9 +1,9 @@
 use super::Liveness;
 use crate::{cluster::ClusterViewId, topology::Topology};
 use protocol::{
-    gossip::gossip, health::health, network::networks, node::node, scheduling::scheduler,
-    secrets::secrets, server::cluster_session, services::services, sync::sync, task::task,
-    topology::topology, volumes::volumes,
+    gossip::gossip, health::health, jobs::jobs, network::networks, node::node,
+    scheduling::scheduler, secrets::secrets, server::cluster_session, services::services,
+    sync::sync, task::task, topology::topology, volumes::volumes,
 };
 use std::rc::Rc;
 
@@ -18,6 +18,7 @@ pub struct ClusterSessionServices {
     pub gossip: gossip::Client,
     pub node: node::Client,
     pub task: task::Client,
+    pub jobs: jobs::Client,
     pub scheduler: scheduler::Client,
     pub services: services::Client,
     pub secrets: secrets::Client,
@@ -134,6 +135,7 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_sync(self.services.sync.clone());
         caps.set_health(self.health.clone());
         caps.set_task(self.services.task.clone());
+        caps.set_jobs(self.services.jobs.clone());
         caps.set_scheduler(self.services.scheduler.clone());
         caps.set_services(self.services.services.clone());
         caps.set_secrets(self.services.secrets.clone());
@@ -208,6 +210,17 @@ impl cluster_session::Server for ClusterSessionImpl {
         self.ensure_online()?;
 
         results.get().set_scheduler(self.services.scheduler.clone());
+        Ok(())
+    }
+
+    async fn get_jobs(
+        self: Rc<Self>,
+        _params: cluster_session::GetJobsParams,
+        mut results: cluster_session::GetJobsResults,
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
+
+        results.get().set_jobs(self.services.jobs.clone());
         Ok(())
     }
 

@@ -7,6 +7,7 @@ using Node = import "node.capnp";
 using import "sync.capnp".Sync;
 using import "health.capnp".Health;
 using import "task.capnp".Task;
+using import "jobs.capnp".Jobs;
 using import "services.capnp".Services;
 using import "scheduling.capnp".Scheduler;
 using import "secrets.capnp".Secrets;
@@ -59,6 +60,9 @@ interface ClusterSession {
   getServices @8 () -> (services :Services);
   # Access the services control interface.
 
+  getJobs @13 () -> (jobs :Jobs);
+  # Access the jobs control interface.
+
   getSecrets @9 () -> (secrets :Secrets);
   # Access the secrets interface.
 
@@ -96,6 +100,9 @@ struct Capabilities {
 
   services @7 :Services;
   # Services interface capability.
+
+  jobs @12 :Jobs;
+  # Jobs interface capability.
 
   secrets @8 :Secrets;
   # Secrets interface capability.

@@ -24,6 +24,15 @@ pub use types::{
     VolumeSummary, format_bytes,
 };
 
+/// Resolved form of one CLI volume mount after selector lookup and normalization.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedVolumeMount {
+    pub volume_id: Uuid,
+    pub volume_name: String,
+    pub target: String,
+    pub read_only: bool,
+}
+
 /// Parses `KEY=VALUE` labels passed through the CLI into a normalized label list.
 pub(super) fn parse_volume_labels(labels: &[String]) -> Result<Vec<VolumeLabel>> {
     let mut parsed = Vec::with_capacity(labels.len());
@@ -84,6 +93,25 @@ pub(super) async fn resolve_node_selector(
     }
 }
 
+/// Resolves CLI volume mount flags into the canonical task and job wire payload.
+pub(crate) async fn resolve_cli_volume_mounts(
+    cfg: &ClientConfig,
+    mounts: &[String],
+) -> Result<Vec<ResolvedVolumeMount>> {
+    let mut resolved = Vec::with_capacity(mounts.len());
+    for raw in mounts {
+        let (selector, target, read_only) = parse_cli_volume_mount(raw)?;
+        let volume = inspect_raw(cfg, &selector).await?.spec;
+        resolved.push(ResolvedVolumeMount {
+            volume_id: volume.id,
+            volume_name: volume.name,
+            target,
+            read_only,
+        });
+    }
+    Ok(resolved)
+}
+
 /// Returns true when one topology node row matches the requested CLI selector.
 fn node_matches_selector(reader: &node_info::Reader<'_>, selector: &str) -> Result<bool> {
     let id = read_node_id(reader)?;
@@ -91,6 +119,46 @@ fn node_matches_selector(reader: &node_info::Reader<'_>, selector: &str) -> Resu
         return Ok(true);
     }
     Ok(reader.get_hostname()?.to_str()? == selector)
+}
+
+/// Parses one CLI volume mount flag in `SOURCE:TARGET[:ro|rw]` form.
+fn parse_cli_volume_mount(raw: &str) -> Result<(String, String, bool)> {
+    let parts: Vec<&str> = raw.split(':').collect();
+    match parts.as_slice() {
+        [source, target] => validate_cli_volume_mount(source, target, false),
+        [source, target, mode] => match *mode {
+            "ro" => validate_cli_volume_mount(source, target, true),
+            "rw" => validate_cli_volume_mount(source, target, false),
+            _ => Err(anyhow!(
+                "invalid volume mount '{}': expected SOURCE:TARGET[:ro|rw]",
+                raw
+            )),
+        },
+        _ => Err(anyhow!(
+            "invalid volume mount '{}': expected SOURCE:TARGET[:ro|rw]",
+            raw
+        )),
+    }
+}
+
+/// Validates one parsed CLI volume mount and returns its normalized components.
+fn validate_cli_volume_mount(
+    source: &str,
+    target: &str,
+    read_only: bool,
+) -> Result<(String, String, bool)> {
+    let source = source.trim();
+    let target = target.trim();
+    if source.is_empty() {
+        return Err(anyhow!("volume mount source cannot be empty"));
+    }
+    if target.is_empty() || !target.starts_with('/') {
+        return Err(anyhow!(
+            "volume mount target '{}' must be an absolute path",
+            target
+        ));
+    }
+    Ok((source.to_string(), target.to_string(), read_only))
 }
 
 /// Reads the node UUID from one topology node-info row.

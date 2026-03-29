@@ -3,16 +3,8 @@ use crate::connection;
 use crate::output;
 use crate::tasks::uuid_to_string;
 use crate::volumes;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::io::Write;
-use uuid::Uuid;
-
-struct ResolvedVolumeMount {
-    volume_id: Uuid,
-    volume_name: String,
-    target: String,
-    read_only: bool,
-}
 
 pub struct TaskStartOptions<'a> {
     pub name: &'a str,
@@ -25,7 +17,7 @@ pub struct TaskStartOptions<'a> {
 }
 
 pub async fn start(cfg: &ClientConfig, options: &TaskStartOptions<'_>) -> Result<()> {
-    let resolved_volumes = resolve_cli_volume_mounts(cfg, options.volumes).await?;
+    let resolved_volumes = volumes::resolve_cli_volume_mounts(cfg, options.volumes).await?;
     let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_task_request();
@@ -103,63 +95,4 @@ pub async fn start(cfg: &ClientConfig, options: &TaskStartOptions<'_>) -> Result
     output::emit_block(format!("started task:\n{output}"));
 
     Ok(())
-}
-
-/// Resolves CLI volume mount flags into the canonical task-wire payload.
-async fn resolve_cli_volume_mounts(
-    cfg: &ClientConfig,
-    mounts: &[String],
-) -> Result<Vec<ResolvedVolumeMount>> {
-    let mut resolved = Vec::with_capacity(mounts.len());
-    for raw in mounts {
-        let (selector, target, read_only) = parse_cli_volume_mount(raw)?;
-        let volume = volumes::inspect_raw(cfg, &selector).await?.spec;
-        resolved.push(ResolvedVolumeMount {
-            volume_id: volume.id,
-            volume_name: volume.name,
-            target,
-            read_only,
-        });
-    }
-    Ok(resolved)
-}
-
-/// Parses one CLI volume mount flag in `SOURCE:TARGET[:ro|rw]` form.
-fn parse_cli_volume_mount(raw: &str) -> Result<(String, String, bool)> {
-    let parts: Vec<&str> = raw.split(':').collect();
-    match parts.as_slice() {
-        [source, target] => validate_cli_volume_mount(source, target, false),
-        [source, target, mode] => match *mode {
-            "ro" => validate_cli_volume_mount(source, target, true),
-            "rw" => validate_cli_volume_mount(source, target, false),
-            _ => Err(anyhow!(
-                "invalid volume mount '{}': expected SOURCE:TARGET[:ro|rw]",
-                raw
-            )),
-        },
-        _ => Err(anyhow!(
-            "invalid volume mount '{}': expected SOURCE:TARGET[:ro|rw]",
-            raw
-        )),
-    }
-}
-
-/// Validates one parsed CLI volume mount and returns its normalized components.
-fn validate_cli_volume_mount(
-    source: &str,
-    target: &str,
-    read_only: bool,
-) -> Result<(String, String, bool)> {
-    let source = source.trim();
-    let target = target.trim();
-    if source.is_empty() {
-        return Err(anyhow!("volume mount source cannot be empty"));
-    }
-    if target.is_empty() || !target.starts_with('/') {
-        return Err(anyhow!(
-            "volume mount target '{}' must be an absolute path",
-            target
-        ));
-    }
-    Ok((source.to_string(), target.to_string(), read_only))
 }

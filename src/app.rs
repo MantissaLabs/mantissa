@@ -218,6 +218,30 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
         },
 
+        Command::Jobs { cmd } => match cmd {
+            JobsCommand::List => {
+                local.run_until(client::jobs::list(&cfg)).await?;
+            }
+            JobsCommand::Run(args) => {
+                local
+                    .run_until(client::jobs::run(
+                        &cfg,
+                        &client::jobs::JobRunOptions {
+                            name: &args.name,
+                            image: &args.image,
+                            command: &args.command,
+                            cpu_millis: args.cpu_millis,
+                            memory_bytes: args.memory_bytes,
+                            gpu_count: args.gpu_count,
+                            max_retries: args.max_retries,
+                            retry_backoff_secs: args.retry_backoff_secs,
+                            volumes: &args.volumes,
+                        },
+                    ))
+                    .await?;
+            }
+        },
+
         Command::Scheduler { cmd } => match cmd {
             SchedulerCommand::Slots(args) => {
                 local

@@ -4,6 +4,7 @@ use crate::secrets::crypto::SecretKeyring;
 use crate::server::auth::AuthStore;
 use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::cluster_view_store::ClusterViewStore;
+use crate::store::job_store::{JobStore, open_job_store};
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, SecretMasterStore};
 use crate::store::network_store::{
     NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore, open_network_attachment_store,
@@ -45,6 +46,7 @@ pub(crate) struct BootstrapStores {
     pub token_store: TokenStore,
     pub secret_master_store: SecretMasterStore,
     pub tasks: TaskStore,
+    pub jobs: JobStore,
     pub scheduler_store: SchedulerStore,
     pub scheduler_digests: SchedulerDigestStore,
     pub services: ServiceStore,
@@ -92,6 +94,9 @@ impl BootstrapStores {
         let tasks = open_task_store(ctx.db.clone(), ctx.self_id)?;
         tasks.rebuild_mst_from_disk().await?;
 
+        let jobs = open_job_store(ctx.db.clone(), ctx.self_id)?;
+        jobs.rebuild_mst_from_disk().await?;
+
         let scheduler_store = open_scheduler_store(ctx.db.clone(), ctx.self_id)?;
         scheduler_store.rebuild_mst_from_disk().await?;
 
@@ -129,6 +134,7 @@ impl BootstrapStores {
             token_store,
             secret_master_store,
             tasks,
+            jobs,
             scheduler_store,
             scheduler_digests,
             services,

@@ -11,6 +11,7 @@ use crate::scheduler::Scheduler;
 use crate::secrets::crypto::SecretKeyring;
 use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::cluster_view_store::{ClusterNameRecord, ClusterViewStore};
+use crate::store::job_store::JobStore;
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, SecretMasterStore};
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
@@ -150,6 +151,7 @@ pub struct TopologyStores {
     pub token_store: TokenStore,
     pub secret_master_store: SecretMasterStore,
     pub tasks: TaskStore,
+    pub jobs: JobStore,
     pub services: ServiceStore,
     pub secrets: SecretStore,
     pub networks: NetworkSpecStore,
@@ -358,6 +360,7 @@ pub struct Topology {
     cluster_operations: ClusterOperationStore,
     cluster_view_store: ClusterViewStore,
     tasks: TaskStore,
+    jobs: JobStore,
     services: ServiceStore,
     secrets: SecretStore,
     networks: NetworkSpecStore,
@@ -471,6 +474,7 @@ impl Topology {
             token_store,
             secret_master_store,
             tasks,
+            jobs,
             services,
             secrets,
             networks,
@@ -495,6 +499,7 @@ impl Topology {
             cluster_operations,
             cluster_view_store,
             tasks,
+            jobs,
             services,
             secrets,
             networks,
@@ -988,6 +993,9 @@ impl Topology {
             match self.gossip.recv().await {
                 Ok(Message::Void { .. }) => {
                     // Keepalive message; nothing to process for topology state.
+                }
+                Ok(Message::Job { .. }) => {
+                    // Job gossip is handled by the dedicated job controller.
                 }
                 Ok(Message::Volume { .. }) => {
                     // Volume gossip is handled by the dedicated volume replicator.
@@ -1515,6 +1523,7 @@ impl Topology {
         let stores = SyncStores {
             peers: self.peers.clone(),
             tasks: self.tasks.clone(),
+            jobs: self.jobs.clone(),
             services: self.services.clone(),
             secrets: self.secrets.clone(),
             networks: self.networks.clone(),
@@ -1554,6 +1563,7 @@ impl Topology {
         let stores = SyncStores {
             peers: self.peers.clone(),
             tasks: self.tasks.clone(),
+            jobs: self.jobs.clone(),
             services: self.services.clone(),
             secrets: self.secrets.clone(),
             networks: self.networks.clone(),
@@ -1603,6 +1613,7 @@ impl Topology {
         let stores = SyncStores {
             peers: self.peers.clone(),
             tasks: self.tasks.clone(),
+            jobs: self.jobs.clone(),
             services: self.services.clone(),
             secrets: self.secrets.clone(),
             networks: self.networks.clone(),

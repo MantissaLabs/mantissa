@@ -7,6 +7,8 @@
 
 use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::dedupe::BoundedSeenCache;
+use crate::jobs::service::{read_job_event, write_job_event};
+use crate::jobs::types::JobEvent;
 use crate::network::service::{read_network_event, write_network_event};
 use crate::network::types::NetworkEvent;
 use crate::scheduler::digest::{
@@ -103,6 +105,10 @@ pub enum Message {
         id: Uuid,
         event: TaskEvent,
     },
+    Job {
+        id: Uuid,
+        event: Box<JobEvent>,
+    },
     Service {
         id: Uuid,
         event: Box<ServiceEvent>,
@@ -131,6 +137,7 @@ impl Message {
             Message::Void { id }
             | Message::Topology { id, .. }
             | Message::Task { id, .. }
+            | Message::Job { id, .. }
             | Message::Service { id, .. }
             | Message::Network { id, .. }
             | Message::Secret { id, .. }
@@ -426,6 +433,7 @@ pub struct Gossip {
 pub struct Channels {
     pub topology_events: Sender<Message>,
     pub task_events: Sender<Message>,
+    pub job_events: Sender<Message>,
     pub service_events: Sender<Message>,
     pub network_events: Sender<Message>,
     pub secret_events: Sender<Message>,
@@ -460,6 +468,7 @@ impl gossip::Server for Gossip {
     ) -> Result<(), Error> {
         let topo_tx = self.chans.topology_events.clone();
         let task_tx = self.chans.task_events.clone();
+        let job_tx = self.chans.job_events.clone();
         let service_tx = self.chans.service_events.clone();
         let network_tx = self.chans.network_events.clone();
         let secret_tx = self.chans.secret_events.clone();
@@ -546,6 +555,7 @@ impl gossip::Server for Gossip {
                 Void(_) => "void",
                 Topology(_) => "topology",
                 Task(_) => "task",
+                Job(_) => "job",
                 Service(_) => "service",
                 Network(_) => "network",
                 Secret(_) => "secret",
@@ -598,6 +608,24 @@ impl gossip::Server for Gossip {
                 },
                 Task(Err(e)) => {
                     eprintln!("Error reading task: {e}");
+                }
+                Job(Ok(reader)) => match read_job_event(reader) {
+                    Ok(event) => {
+                        let message = Message::Job {
+                            id,
+                            event: Box::new(event),
+                        };
+                        if should_relay_inbound_message(relay_inbound, &message) {
+                            forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
+                        }
+                        job_tx.send(message).await.map_err(|e| {
+                            capnp::Error::failed(format!("Couldn't send event to jobs: {e}"))
+                        })?;
+                    }
+                    Err(e) => eprintln!("Failed to convert job event: {e}"),
+                },
+                Job(Err(e)) => {
+                    eprintln!("Error reading job: {e}");
                 }
                 Service(Ok(reader)) => match read_service_event(reader) {
                     Ok(event) => {
@@ -1083,6 +1111,10 @@ where
             Message::Task { event, .. } => {
                 task_service::add_event(&mut msgs, idx as u32, event);
             }
+            Message::Job { event, .. } => {
+                let job_builder = builder.init_job();
+                write_job_event(job_builder, event.as_ref())?;
+            }
             Message::Service { event, .. } => {
                 let service_builder = builder.init_service();
                 write_service_event(service_builder, event.as_ref())?;
@@ -1153,6 +1185,7 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
         },
         // Task updates replicate to every peer regardless of assignment so keep them.
         Message::Task { .. } => false,
+        Message::Job { .. } => false,
         Message::Service { .. } => false,
         Message::Network { .. } => false,
         Message::Secret { .. } => false,

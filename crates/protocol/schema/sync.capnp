@@ -36,6 +36,9 @@ enum Domain {
   services @2;
   # Service registry domain.
 
+  jobs @11;
+  # Job registry domain.
+
   secrets @3;
   # Secret registry domain.
 

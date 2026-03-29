@@ -11,6 +11,7 @@
 
 use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::store::cluster_view_store::ClusterViewDomainStore;
+use crate::store::job_store::JobStore;
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
 use crate::store::scheduler_digest_store::SchedulerDigestStore;
@@ -36,10 +37,11 @@ type EncodedTombstones = Vec<EncodedTombstone>;
 /// Stable ordering of every replicated domain exposed through sync.
 ///
 /// Both client and server treat an empty domain list as "all domains in this order".
-const ALL_DOMAINS: [Domain; 11] = [
+const ALL_DOMAINS: [Domain; 12] = [
     Domain::Peers,
     Domain::Tasks,
     Domain::Services,
+    Domain::Jobs,
     Domain::Secrets,
     Domain::Networks,
     Domain::NetworkPeers,
@@ -87,6 +89,7 @@ pub struct SyncService {
     cluster_view: ClusterViewState,
     peers: PeersStore,
     tasks: TaskStore,
+    jobs: JobStore,
     services: ServiceStore,
     secrets: SecretStore,
     networks: NetworkSpecStore,
@@ -106,6 +109,7 @@ pub struct SyncService {
 pub struct SyncStores {
     pub peers: PeersStore,
     pub tasks: TaskStore,
+    pub jobs: JobStore,
     pub services: ServiceStore,
     pub secrets: SecretStore,
     pub networks: NetworkSpecStore,
@@ -123,6 +127,7 @@ impl SyncService {
         let SyncStores {
             peers,
             tasks,
+            jobs,
             services,
             secrets,
             networks,
@@ -137,6 +142,7 @@ impl SyncService {
             cluster_view,
             peers,
             tasks,
+            jobs,
             services,
             secrets,
             networks,
@@ -166,6 +172,7 @@ impl SyncService {
             Domain::Peers => DomainStoreRef::Peers(&self.peers),
             Domain::Tasks => DomainStoreRef::Tasks(&self.tasks),
             Domain::Services => DomainStoreRef::Services(&self.services),
+            Domain::Jobs => DomainStoreRef::Jobs(&self.jobs),
             Domain::Secrets => DomainStoreRef::Secrets(&self.secrets),
             Domain::Networks => DomainStoreRef::Networks(&self.networks),
             Domain::NetworkPeers => DomainStoreRef::NetworkPeers(&self.network_peers),
@@ -185,6 +192,7 @@ enum DomainStoreRef<'a> {
     Peers(&'a PeersStore),
     Tasks(&'a TaskStore),
     Services(&'a ServiceStore),
+    Jobs(&'a JobStore),
     Secrets(&'a SecretStore),
     Networks(&'a NetworkSpecStore),
     NetworkPeers(&'a NetworkPeerStore),
@@ -209,6 +217,7 @@ macro_rules! with_domain_store {
             DomainStoreRef::Peers($store) => $body,
             DomainStoreRef::Tasks($store) => $body,
             DomainStoreRef::Services($store) => $body,
+            DomainStoreRef::Jobs($store) => $body,
             DomainStoreRef::Secrets($store) => $body,
             DomainStoreRef::Networks($store) => $body,
             DomainStoreRef::NetworkPeers($store) => $body,
@@ -239,6 +248,11 @@ impl DomainStoreRef<'_> {
                 domain: Domain::Services,
                 log_label: "services",
                 dump_suffix: "services",
+            },
+            Self::Jobs(_) => DomainDebugMeta {
+                domain: Domain::Jobs,
+                log_label: "jobs",
+                dump_suffix: "jobs",
             },
             Self::Secrets(_) => DomainDebugMeta {
                 domain: Domain::Secrets,

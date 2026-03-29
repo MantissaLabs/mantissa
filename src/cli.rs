@@ -139,6 +139,13 @@ pub enum Command {
         cmd: TasksCommand,
     },
 
+    /// Job scheduling subcommands
+    #[command(alias = "j", subcommand_required = true, arg_required_else_help = true)]
+    Jobs {
+        #[command(subcommand)]
+        cmd: JobsCommand,
+    },
+
     /// Scheduler inspection subcommands
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Scheduler {
@@ -362,6 +369,17 @@ pub enum TasksCommand {
     Stop(TasksStopArgs),
 }
 
+#[derive(Subcommand, Debug)]
+pub enum JobsCommand {
+    /// List submitted first-class jobs
+    #[command(alias = "ls")]
+    List,
+
+    /// Submit one finite job
+    #[command(alias = "run")]
+    Run(JobsRunArgs),
+}
+
 #[derive(Args, Debug)]
 pub struct TasksListArgs {
     /// The cluster to list tasks for
@@ -421,6 +439,49 @@ pub struct TasksStartArgs {
     /// GPU count requested
     #[arg(long = "gpu-count", value_name = "COUNT", default_value = "0")]
     pub gpu_count: u32,
+
+    /// Named volume mount in SOURCE:TARGET[:ro|rw] form (repeat flag to add multiple mounts)
+    #[arg(long = "volume", value_name = "MOUNT", action = ArgAction::Append)]
+    pub volumes: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct JobsRunArgs {
+    /// Friendly name for the job
+    #[arg(index = 1, value_name = "NAME")]
+    pub name: String,
+
+    /// Container image to run
+    #[arg(short = 'i', long = "image", value_name = "IMAGE")]
+    pub image: String,
+
+    /// Command arguments for the job workload (repeat flag to add arguments)
+    #[arg(short = 'c', long = "command", value_name = "ARG", action = ArgAction::Append)]
+    pub command: Vec<String>,
+
+    /// CPU requested in milli-CPUs (e.g. 500 = 0.5 vCPU)
+    #[arg(long = "cpu-millis", value_name = "MCPU", default_value = "1000")]
+    pub cpu_millis: u64,
+
+    /// Memory requested in bytes
+    #[arg(
+        long = "memory-bytes",
+        value_name = "BYTES",
+        default_value = "536870912"
+    )]
+    pub memory_bytes: u64,
+
+    /// GPU count requested
+    #[arg(long = "gpu-count", value_name = "COUNT", default_value = "0")]
+    pub gpu_count: u32,
+
+    /// Maximum number of retries after the initial attempt fails
+    #[arg(long = "max-retries", value_name = "COUNT", default_value = "0")]
+    pub max_retries: u32,
+
+    /// Backoff delay before the next retry attempt in seconds
+    #[arg(long = "retry-backoff-secs", value_name = "SECS", default_value = "2")]
+    pub retry_backoff_secs: u32,
 
     /// Named volume mount in SOURCE:TARGET[:ro|rw] form (repeat flag to add multiple mounts)
     #[arg(long = "volume", value_name = "MOUNT", action = ArgAction::Append)]
