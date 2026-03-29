@@ -1,7 +1,4 @@
 pub(crate) use crate::workload::model::{
-    compare_workload_causality as compare_task_causality,
-    compare_workload_status_causality as compare_task_status_causality,
-    parse_workload_timestamp as parse_task_timestamp,
     should_replace_workload_event as should_replace_task_event, workload_event_id as task_event_id,
 };
 

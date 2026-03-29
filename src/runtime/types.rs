@@ -177,6 +177,7 @@ impl Default for RuntimeExecOptions {
 pub struct RuntimeCreateRequest {
     pub name: String,
     pub image: String,
+    pub labels: Option<HashMap<String, String>>,
     pub command: Option<Vec<String>>,
     pub tty: bool,
     pub open_stdin: bool,
@@ -295,6 +296,7 @@ pub struct RuntimeInfo {
     pub id: String,
     pub name: String,
     pub image: String,
+    pub labels: HashMap<String, String>,
     pub status: String,
     pub state: RuntimeStateInfo,
     pub created: i64,

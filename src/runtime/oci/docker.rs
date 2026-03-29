@@ -84,6 +84,11 @@ fn runtime_info_from_inspect(inspect: ContainerInspectResponse) -> RuntimeInfo {
         .and_then(|config| config.image.clone())
         .unwrap_or_default();
     let tty = inspect.config.as_ref().and_then(|config| config.tty);
+    let labels = inspect
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.clone())
+        .unwrap_or_default();
     let raw_status = inspect
         .state
         .as_ref()
@@ -130,6 +135,7 @@ fn runtime_info_from_inspect(inspect: ContainerInspectResponse) -> RuntimeInfo {
             .trim_start_matches('/')
             .to_string(),
         image,
+        labels,
         status: raw_status.clone().unwrap_or_default(),
         state: RuntimeStateInfo {
             raw_status,
@@ -159,6 +165,7 @@ fn runtime_info_from_list_entry(entry: bollard::models::ContainerSummary) -> Run
         .trim_start_matches('/')
         .to_string();
     let image = entry.image.unwrap_or_default();
+    let labels = entry.labels.unwrap_or_default();
     let status = entry.status.unwrap_or_default();
     let raw_status = entry.state.map(|value| value.to_string());
     let running = raw_status.as_deref().map(|state| state == "running");
@@ -168,6 +175,7 @@ fn runtime_info_from_list_entry(entry: bollard::models::ContainerSummary) -> Run
         id,
         name,
         image,
+        labels,
         status,
         state: RuntimeStateInfo {
             raw_status,
@@ -178,6 +186,9 @@ fn runtime_info_from_list_entry(entry: bollard::models::ContainerSummary) -> Run
         ..Default::default()
     }
 }
+
+/// Label key used to persist workload ownership onto runtime instances.
+const WORKLOAD_ID_LABEL: &str = "mantissa.workload_id";
 
 /// Docker runtime backend implementation.
 #[derive(Clone)]
@@ -901,6 +912,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
         let RuntimeCreateRequest {
             name,
             image,
+            labels,
             command,
             tty,
             open_stdin,
@@ -978,6 +990,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
         // Create container config
         let config = ContainerCreateBody {
             image: Some(image.clone()),
+            labels,
             tty: Some(tty),
             open_stdin: Some(open_stdin),
             env: env_vars,
@@ -1361,19 +1374,18 @@ impl RuntimeBackend for DockerRuntimeBackend {
                 continue;
             }
 
-            let name = event
+            let attributes = event
                 .actor
                 .as_ref()
-                .and_then(|actor| actor.attributes.as_ref())
-                .and_then(|attrs| attrs.get("name"));
-            if name.map(|value| value.starts_with("mantissa-")) != Some(true) {
+                .and_then(|actor| actor.attributes.as_ref());
+            let workload_id = attributes
+                .and_then(|attrs| attrs.get(WORKLOAD_ID_LABEL))
+                .and_then(|value| uuid::Uuid::parse_str(value).ok());
+            if workload_id.is_none() {
                 continue;
             }
 
             if action == "die" {
-                let task_id = name
-                    .and_then(|value| value.strip_prefix("mantissa-"))
-                    .and_then(|suffix| uuid::Uuid::parse_str(suffix).ok());
                 let exit_code = event
                     .actor
                     .as_ref()
@@ -1382,7 +1394,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
                     .and_then(|value| value.parse::<i32>().ok())
                     .unwrap_or(1);
 
-                if let Some(task_id) = task_id
+                if let Some(task_id) = workload_id
                     && events_tx
                         .send(RuntimeEvent::TaskExited { task_id, exit_code })
                         .is_err()

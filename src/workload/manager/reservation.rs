@@ -10,11 +10,12 @@ use uuid::Uuid;
 
 use crate::scheduler::digest::{SchedulerDigestValue, read_scheduler_digest};
 use crate::scheduler::{GpuReservationRequest, SchedulerError, SlotId, SlotReservationRequest};
-use crate::task::container::ContainerState;
 use crate::task::service::read_spec;
-use crate::task::types::{TaskEvent, TaskSpec};
+use crate::workload::model::{
+    WorkloadEvent as TaskEvent, WorkloadPhase as ContainerState, WorkloadSpec as TaskSpec,
+};
 
-use super::TaskManager;
+use super::WorkloadManager;
 use super::planner::{BatchStartPlan, PreparedRemoteStartPlan, RemoteStartPlan};
 
 /// Error returned by slot reservation stages, signalling whether the caller should retry.
@@ -85,7 +86,7 @@ fn parse_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, anyhow::Error> {
     Ok(Uuid::from_bytes(raw))
 }
 
-impl TaskManager {
+impl WorkloadManager {
     /// Applies one structured remote prepare rejection so the next shortlist uses fresher peer state.
     pub(super) async fn apply_remote_prepare_rejection(
         &self,

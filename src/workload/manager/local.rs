@@ -6,18 +6,19 @@ use chrono::Utc;
 use tracing::warn;
 
 use crate::gpu::gpu_runtime_status;
-use crate::task::container::ContainerState;
-use crate::task::types::{TaskEvent, TaskSpec};
+use crate::workload::model::{
+    WorkloadEvent as TaskEvent, WorkloadPhase as ContainerState, WorkloadSpec as TaskSpec,
+};
 
 use super::ReconcileTaskGuard;
-use super::TaskManager;
-use super::launch::ContainerLaunchRequest;
+use super::WorkloadManager;
+use super::launch::InstanceLaunchRequest;
 use super::planner::BatchStartPlan;
 use super::state::is_local_volume_access_error;
 
-impl TaskManager {
-    /// Starts every local container in the batch and persists their specs in index order.
-    pub(super) async fn start_local_containers(
+impl WorkloadManager {
+    /// Starts every local runtime instance in the batch and persists their specs in index order.
+    pub(super) async fn start_local_instances(
         &self,
         plans: &mut [BatchStartPlan],
     ) -> Result<Vec<(usize, TaskSpec)>, anyhow::Error> {
@@ -26,7 +27,7 @@ impl TaskManager {
         }
 
         for plan in plans.iter_mut() {
-            plan.container_name = format!("mantissa-{}", plan.id);
+            plan.instance_name = format!("mantissa-{}", plan.id);
         }
 
         let _launch_guards = self.claim_batch_reconcile_guards(plans).await?;
@@ -39,7 +40,7 @@ impl TaskManager {
             }
         };
 
-        if let Err(err) = self.launch_batch_containers(plans).await {
+        if let Err(err) = self.launch_batch_instances(plans).await {
             self.cleanup_batch(plans).await;
             if is_local_volume_access_error(&err) {
                 self.persist_pending_volume_unavailable_specs(&pending_specs, &err)
@@ -96,7 +97,7 @@ impl TaskManager {
         Ok(guards)
     }
 
-    /// Persists pending task specs before container launch so other nodes see in-flight placement.
+    /// Persists pending task specs before instance launch so other nodes see in-flight placement.
     async fn persist_pending_batch(
         &self,
         plans: &[BatchStartPlan],
@@ -224,7 +225,7 @@ impl TaskManager {
         }
     }
 
-    async fn launch_batch_containers(
+    async fn launch_batch_instances(
         &self,
         plans: &mut [BatchStartPlan],
     ) -> Result<(), anyhow::Error> {
@@ -233,11 +234,11 @@ impl TaskManager {
             self.update_task_phase(plan.id, ContainerState::Creating, None, None)
                 .await?;
 
-            let container_id = self
-                .launch_task_container(&ContainerLaunchRequest {
+            let instance_id = self
+                .launch_task_instance(&InstanceLaunchRequest {
                     task_id: plan.id,
                     task_name: &plan.name,
-                    container_name: &plan.container_name,
+                    instance_name: &plan.instance_name,
                     image: &plan.image,
                     command: &plan.command,
                     tty: plan.tty,
@@ -254,12 +255,12 @@ impl TaskManager {
                 })
                 .await?;
 
-            plan.container_id = Some(container_id.clone());
+            plan.instance_id = Some(instance_id.clone());
 
             self.ensure_runtime_attachments_or_rollback(
                 plan.id,
                 &plan.name,
-                &container_id,
+                &instance_id,
                 &plan.networks,
                 plan.service_metadata.as_ref(),
             )
@@ -341,14 +342,14 @@ impl TaskManager {
             .context("failed to persist committed task specs")?;
 
         for (plan, spec) in plans.iter().zip(specs.iter()) {
-            self.finalize_running_task_post_commit(spec, plan.container_id.as_deref(), true, true)
+            self.finalize_running_task_post_commit(spec, plan.instance_id.as_deref(), true, true)
                 .await;
         }
 
         Ok(specs)
     }
 
-    /// Ensures the local runtime has the GPU bindings required to launch a GPU-bound container.
+    /// Ensures the local runtime has the GPU bindings required to launch a GPU-bound instance.
     pub(super) async fn ensure_gpu_runtime_ready(
         &self,
         gpu_device_ids: &[String],
@@ -389,16 +390,16 @@ impl TaskManager {
 
     async fn cleanup_batch(&self, plans: &[BatchStartPlan]) {
         for plan in plans {
-            if let Some(container_id) = plan.container_id.as_ref() {
+            if let Some(instance_id) = plan.instance_id.as_ref() {
                 if let Err(err) = self
                     .runtime
                     .runtime_backend
-                    .stop_instance(container_id, Some(Duration::from_secs(10)))
+                    .stop_instance(instance_id, Some(Duration::from_secs(10)))
                     .await
                 {
                     warn!(
                         target: "task",
-                        "failed to stop container {container_id} for task {}: {err}",
+                        "failed to stop instance {instance_id} for task {}: {err}",
                         plan.id
                     );
                 }
@@ -406,17 +407,17 @@ impl TaskManager {
                 if let Err(err) = self
                     .runtime
                     .runtime_backend
-                    .remove_instance(container_id, true, true)
+                    .remove_instance(instance_id, true, true)
                     .await
                 {
                     warn!(
                         target: "task",
-                        "failed to remove container {container_id} for task {}: {err}",
+                        "failed to remove instance {instance_id} for task {}: {err}",
                         plan.id
                     );
                 }
 
-                let mut guard = self.local_state.local_containers.lock().await;
+                let mut guard = self.local_state.local_instances.lock().await;
                 guard.remove(&plan.id);
             }
 

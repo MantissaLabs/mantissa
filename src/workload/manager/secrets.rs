@@ -1,7 +1,9 @@
-use super::{TaskManager, TaskStartRequest};
+use super::{WorkloadManager, WorkloadStartRequest};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::types::SecretValue;
-use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile};
+use crate::workload::model::{
+    WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile as TaskSecretFile,
+};
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -12,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::warn;
 use uuid::Uuid;
 
-/// On-disk artifacts populated when staging secret material for a container launch.
+/// On-disk artifacts populated when staging secret material for a runtime launch.
 #[derive(Clone)]
 pub(super) struct TaskSecretArtifacts {
     root_dir: PathBuf,
@@ -32,16 +34,19 @@ impl TaskSecretArtifacts {
     }
 }
 
-/// Fully resolved secret metadata ready to be supplied to the container runtime.
+/// Fully resolved secret metadata ready to be supplied to the runtime backend.
 pub(super) struct ResolvedTaskSecrets {
     pub env: Vec<String>,
     pub mounts: Vec<String>,
     pub artifacts: Option<TaskSecretArtifacts>,
 }
 
-impl TaskManager {
+impl WorkloadManager {
     /// Ensures every task start request references secrets that exist locally with compatible versions.
-    pub(super) fn ensure_secret_dependencies(&self, requests: &[TaskStartRequest]) -> Result<()> {
+    pub(super) fn ensure_secret_dependencies(
+        &self,
+        requests: &[WorkloadStartRequest],
+    ) -> Result<()> {
         for request in requests {
             for var in &request.env {
                 if let Some(secret) = &var.secret {
@@ -57,9 +62,9 @@ impl TaskManager {
 
     /// Resolves environment variables and secret file projections into concrete runtime artifacts.
     ///
-    /// This is invoked when the scheduler hands control to the TaskManager for a local launch.
+    /// This is invoked when the scheduler hands control to the WorkloadManager for a local launch.
     /// It performs validation, decrypts referenced secrets and stages any file material on disk
-    /// so the Docker integration can bind-mount them into the new container.
+    /// so the runtime backend can bind-mount them into the new instance.
     pub(super) async fn resolve_runtime_secrets(
         &self,
         task_id: Uuid,

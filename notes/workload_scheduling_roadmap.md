@@ -819,7 +819,7 @@ while keeping the existing task CLI/RPC behavior intact.
 
 ### Status
 
-Pending.
+Completed on 2026-03-29.
 
 ### Scope
 
@@ -868,6 +868,108 @@ Pending.
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
+
+### Completed
+
+1. Moved the generic reconciliation/runtime orchestration implementation from
+   `src/task/manager/` into `src/workload/manager/`:
+   - `launch.rs`
+   - `local.rs`
+   - `planner.rs`
+   - `remote_advisory.rs`
+   - `reservation.rs`
+   - `runtime.rs`
+   - `secrets.rs`
+   - `state.rs`
+   - `tests.rs`
+   - `volumes.rs`
+2. Replaced `src/task/manager/mod.rs` with a thin compatibility façade that
+   re-exports:
+   - `WorkloadManager` as `TaskManager`
+   - `WorkloadManagerConfig` as `TaskManagerConfig`
+   - `WorkloadRuntimeConfig` as `TaskRuntimeConfig`
+   - `WorkloadStartRequest` as `TaskStartRequest`
+   - `WorkloadTrafficPublicationUpdate` as
+     `TaskTrafficPublicationUpdate`
+   - task-facing helper re-exports needed by existing callers
+3. Removed the generic manager's dependency on deterministic instance names for
+   ownership recovery by adding explicit runtime labels:
+   - `RuntimeCreateRequest.labels`
+   - `RuntimeInfo.labels`
+   - Docker and in-memory runtimes now persist and report
+     `mantissa.workload_id`
+4. Updated runtime event ingestion and local runtime inventory reconciliation
+   to identify workloads from runtime labels instead of parsing
+   `mantissa-<uuid>` names.
+5. Renamed generic in-memory manager state away from container-only vocabulary:
+   - `local_containers` -> `local_instances`
+   - related helper/cache names under `src/workload/manager/`
+6. Cut the moved workload manager over to workload-owned model/types in
+   production code instead of importing task definitions back into the generic
+   layer:
+   - `src/workload/manager/mod.rs`
+   - `src/workload/manager/launch.rs`
+   - `src/workload/manager/local.rs`
+   - `src/workload/manager/planner.rs`
+   - `src/workload/manager/runtime.rs`
+   - `src/workload/manager/secrets.rs`
+   - `src/workload/manager/state.rs`
+   - `src/workload/manager/volumes.rs`
+7. Added a shared workload-manager test helper change so synthetic runtime
+   inventory rows include the same ownership label path used by real runtime
+   launches.
+
+### Removed
+
+1. Deleted the old generic manager implementation files from
+   `src/task/manager/`; the task module no longer owns the orchestration core.
+2. Removed the runtime-event fallback that inferred task identity from
+   deterministic Docker/container names.
+3. Removed the generic manager's direct dependency on task-layer causal/type
+   helpers in the moved workload-manager production code.
+
+### Findings
+
+1. The runtime label is the right boundary for generic ownership recovery. Once
+   inventory and event streams use explicit metadata, instance names can remain
+   a launch detail rather than part of the control-plane identity contract.
+2. Keeping `task::manager` as a façade is enough to preserve the existing CLI,
+   RPC, and service control-plane call sites while the core moves under
+   `workload/manager`.
+3. The only intentional task-facing dependency left inside the moved generic
+   layer is task-surface compatibility where callers still use task-named
+   filters or RPC codecs. The orchestration core no longer depends on the task
+   layer for its model/state types.
+
+### Validation Completed
+
+1. `cargo fmt --all`
+2. `cargo clippy --all-targets -- -D warnings`
+3. `cargo test`
+
+All three commands passed on 2026-03-29.
+
+### Proposed Commit
+
+```text
+workload: move manager core behind task facade
+
+Move the generic runtime orchestration and reconciliation code out of
+src/task/manager and into a new workload manager module, leaving the
+task manager as a thin compatibility facade over workload-owned types.
+
+The moved manager now tracks local instances instead of local
+containers, and runtime ownership recovery no longer depends on
+parsing deterministic instance names. Docker and the in-memory runtime
+stamp mantissa.workload_id labels on launches and report them back
+through runtime inventory and event streams so the generic manager can
+reconcile explicit workload identity.
+
+This also cuts the production workload manager over to workload-owned
+model/types instead of importing task definitions back into the
+generic layer, while preserving existing task-facing callers and test
+coverage through the facade.
+```
 
 ## Milestone 6: Planner And Node Capability Generalization
 

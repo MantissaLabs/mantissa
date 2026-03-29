@@ -12,15 +12,18 @@ use crate::scheduler::digest::SchedulerDigestValue;
 use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
 };
-use crate::task::types::{
-    TaskEnvironmentVariable, TaskLivenessProbe, TaskRestartPolicy, TaskSecretFile,
-    TaskServiceMetadata, TaskVolumeMount,
+use crate::workload::model::{
+    WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile as TaskSecretFile,
+    WorkloadServiceMetadata as TaskServiceMetadata, WorkloadVolumeMount as TaskVolumeMount,
+};
+use crate::workload::types::{
+    WorkloadLivenessProbe as TaskLivenessProbe, WorkloadRestartPolicy as TaskRestartPolicy,
 };
 
 use super::remote_advisory::{
     RemoteCandidateHint, compare_remote_candidate_hints, current_unix_ms,
 };
-use super::{TaskManager, TaskStartRequest};
+use super::{WorkloadManager, WorkloadStartRequest};
 
 /// Scheduling failures that indicate transient prerequisites are blocking placement decisions.
 #[derive(Error, Debug)]
@@ -53,8 +56,8 @@ pub(super) struct BatchStartPlan {
     pub(super) requested_memory_bytes: u64,
     pub(super) requested_gpu_count: u32,
     pub(super) gpu_device_ids: Vec<String>,
-    pub(super) container_name: String,
-    pub(super) container_id: Option<String>,
+    pub(super) instance_name: String,
+    pub(super) instance_id: Option<String>,
     pub(super) created_at: DateTime<Utc>,
     pub(super) index: usize,
     pub(super) preassigned: bool,
@@ -557,15 +560,15 @@ fn gpu_runtime_preflight(snapshot: &SchedulerSnapshot) -> (bool, Option<String>)
     }
 }
 
-impl TaskManager {
+impl WorkloadManager {
     /// Normalizes user requests into deterministic scheduling intents, applying IDs and defaults.
     pub(super) fn build_start_intents(
-        requests: Vec<TaskStartRequest>,
+        requests: Vec<WorkloadStartRequest>,
     ) -> Result<Vec<StartIntent>, anyhow::Error> {
         let mut intents = Vec::with_capacity(requests.len());
 
         for (index, request) in requests.into_iter().enumerate() {
-            let TaskStartRequest {
+            let WorkloadStartRequest {
                 name,
                 execution,
                 gpu_device_ids,
@@ -877,8 +880,8 @@ impl TaskManager {
                 requested_memory_bytes: intent.memory_bytes,
                 requested_gpu_count: intent.gpu_count,
                 gpu_device_ids: chosen_gpu_device_ids,
-                container_name: String::new(),
-                container_id: None,
+                instance_name: String::new(),
+                instance_id: None,
                 created_at: Utc::now(),
                 index: intent.index,
                 preassigned: true,
@@ -1118,8 +1121,8 @@ impl TaskManager {
                             requested_memory_bytes: intent.memory_bytes,
                             requested_gpu_count: intent.gpu_count,
                             gpu_device_ids: allocation.gpu_device_ids,
-                            container_name: String::new(),
-                            container_id: None,
+                            instance_name: String::new(),
+                            instance_id: None,
                             created_at: Utc::now(),
                             index: intent.index,
                             preassigned: false,
@@ -1221,8 +1224,8 @@ impl TaskManager {
                         requested_memory_bytes: intent.memory_bytes,
                         requested_gpu_count: intent.gpu_count,
                         gpu_device_ids: allocation.gpu_device_ids,
-                        container_name: String::new(),
-                        container_id: None,
+                        instance_name: String::new(),
+                        instance_id: None,
                         created_at: Utc::now(),
                         index: intent.index,
                         preassigned: false,

@@ -19,23 +19,27 @@ use crate::scheduler::{
     GpuReservationRequest, LeaseReservation, SchedulerError, SlotId, SlotReservationRequest,
     SlotState,
 };
-use crate::task::causality::{parse_task_timestamp, task_event_id};
-use crate::task::container::ContainerState;
-use crate::task::types::{
-    TaskEvent, TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicyKind,
-    TaskServiceMetadata, TaskSpec, TaskValue,
-};
 use crate::volumes::LocalVolumeAccessError;
+use crate::workload::model::{
+    WorkloadEvent as TaskEvent, WorkloadPhase as ContainerState,
+    WorkloadServiceMetadata as TaskServiceMetadata, WorkloadSpec as TaskSpec,
+    WorkloadValue as TaskValue, parse_workload_timestamp as parse_task_timestamp,
+    workload_event_id as task_event_id,
+};
+use crate::workload::types::{
+    WorkloadLivenessProbe as TaskLivenessProbe, WorkloadLivenessProbeKind as TaskLivenessProbeKind,
+    WorkloadRestartPolicyKind as TaskRestartPolicyKind,
+};
 
 use super::{
-    TaskManager, container_remove_in_progress, launch::ContainerLaunchRequest,
+    WorkloadManager, instance_remove_in_progress, launch::InstanceLaunchRequest,
     select_best_task_value, spec_to_status, spec_to_value, value_to_spec,
 };
 
 /// Snapshot of containers currently known by the local runtime.
 struct RuntimeInventory {
-    task_containers: HashMap<Uuid, String>,
-    container_ids: HashSet<String>,
+    task_instances: HashMap<Uuid, String>,
+    instance_ids: HashSet<String>,
 }
 
 /// Per-attempt timeout applied to one image pull request.
@@ -49,7 +53,7 @@ const IMAGE_PULL_RETRY_MAX_MS: u64 = 5_000;
 /// Random jitter added to each pull retry delay.
 const IMAGE_PULL_RETRY_JITTER_MS: u64 = 250;
 
-impl TaskManager {
+impl WorkloadManager {
     /// Validates a task marked as running and synchronizes local runtime cache state.
     ///
     /// Returns `Ok(true)` when the task is already healthy and no further start work is needed.
@@ -63,12 +67,12 @@ impl TaskManager {
             return Ok(false);
         }
 
-        match self.resolve_live_container_id_for_task(working).await {
-            Ok(Some(container_id)) => {
-                let mut guard = self.local_state.local_containers.lock().await;
-                guard.insert(working.id, container_id.clone());
+        match self.resolve_live_instance_id_for_task(working).await {
+            Ok(Some(instance_id)) => {
+                let mut guard = self.local_state.local_instances.lock().await;
+                guard.insert(working.id, instance_id.clone());
                 drop(guard);
-                self.reconcile_liveness_probe(working, &container_id).await
+                self.reconcile_liveness_probe(working, &instance_id).await
             }
             Ok(None) => {
                 if let Some((exit_code, exit_error)) =
@@ -196,7 +200,7 @@ impl TaskManager {
     async fn reconcile_liveness_probe(
         &self,
         working: &mut TaskSpec,
-        container_id: &str,
+        instance_id: &str,
     ) -> Result<bool, anyhow::Error> {
         let Some(probe) = working.liveness.clone() else {
             self.local_state
@@ -261,7 +265,7 @@ impl TaskManager {
         }
 
         let failure_reason = match self
-            .execute_liveness_probe(working.id, container_id, &probe)
+            .execute_liveness_probe(working.id, instance_id, &probe)
             .await
         {
             Ok(()) => {
@@ -312,11 +316,11 @@ impl TaskManager {
             .await
             .remove(&working.id);
         self.local_state
-            .local_containers
+            .local_instances
             .lock()
             .await
             .remove(&working.id);
-        self.rollback_container_launch(container_id, "liveness probe failure")
+        self.rollback_instance_launch(instance_id, "liveness probe failure")
             .await;
         if let Err(err) = self
             .record_terminal_observation_for_current_launch(
@@ -372,7 +376,7 @@ impl TaskManager {
     async fn execute_liveness_probe(
         &self,
         task_id: Uuid,
-        container_id: &str,
+        instance_id: &str,
         probe: &TaskLivenessProbe,
     ) -> Result<(), String> {
         match probe.kind {
@@ -383,7 +387,7 @@ impl TaskManager {
                 match self
                     .runtime
                     .runtime_backend
-                    .exec_instance(container_id, &probe.command, Some(probe.timeout()))
+                    .exec_instance(instance_id, &probe.command, Some(probe.timeout()))
                     .await
                 {
                     Ok(result) if matches!(result.exit_code, Some(0)) => Ok(()),
@@ -400,7 +404,7 @@ impl TaskManager {
             }
             TaskLivenessProbeKind::Http => {
                 let targets = self
-                    .resolve_liveness_probe_targets(task_id, container_id)
+                    .resolve_liveness_probe_targets(task_id, instance_id)
                     .await?;
                 if targets.is_empty() {
                     return Err("liveness http probe has no local target address".to_string());
@@ -417,7 +421,7 @@ impl TaskManager {
             }
             TaskLivenessProbeKind::Tcp => {
                 let targets = self
-                    .resolve_liveness_probe_targets(task_id, container_id)
+                    .resolve_liveness_probe_targets(task_id, instance_id)
                     .await?;
                 if targets.is_empty() {
                     return Err("liveness tcp probe has no local target address".to_string());
@@ -437,7 +441,7 @@ impl TaskManager {
     async fn resolve_liveness_probe_targets(
         &self,
         task_id: Uuid,
-        container_id: &str,
+        instance_id: &str,
     ) -> Result<Vec<Ipv4Addr>, String> {
         let mut targets = BTreeSet::new();
         let attachments = self
@@ -466,7 +470,7 @@ impl TaskManager {
         let inspect = self
             .runtime
             .runtime_backend
-            .inspect_instance(container_id)
+            .inspect_instance(instance_id)
             .await
             .map_err(|err| format!("failed to inspect task container for liveness probe: {err}"))?;
         for endpoint in &inspect.network_endpoints {
@@ -1271,9 +1275,9 @@ impl TaskManager {
     }
 
     /// Stops one runtime container with a bounded wall-clock timeout so retries are possible.
-    async fn stop_container_bounded(
+    async fn stop_instance_bounded(
         &self,
-        container_identifier: &str,
+        instance_identifier: &str,
         timeout_budget: Duration,
     ) -> Result<(), anyhow::Error> {
         let timeout_budget = timeout_budget.max(Duration::from_millis(1));
@@ -1281,7 +1285,7 @@ impl TaskManager {
             timeout_budget,
             self.runtime
                 .runtime_backend
-                .stop_instance(container_identifier, Some(timeout_budget)),
+                .stop_instance(instance_identifier, Some(timeout_budget)),
         )
         .await
         {
@@ -1295,9 +1299,9 @@ impl TaskManager {
     }
 
     /// Removes one runtime container with a bounded wall-clock timeout so stale stops can retry.
-    async fn remove_container_bounded(
+    async fn remove_instance_bounded(
         &self,
-        container_identifier: &str,
+        instance_identifier: &str,
         force: bool,
         remove_volumes: bool,
         timeout_budget: Duration,
@@ -1306,7 +1310,7 @@ impl TaskManager {
         match timeout(
             timeout_budget,
             self.runtime.runtime_backend.remove_instance(
-                container_identifier,
+                instance_identifier,
                 force,
                 remove_volumes,
             ),
@@ -1314,7 +1318,7 @@ impl TaskManager {
         .await
         {
             Ok(Ok(())) | Ok(Err(RuntimeError::NotFound(_))) => Ok(()),
-            Ok(Err(err)) if container_remove_in_progress(&err) => Ok(()),
+            Ok(Err(err)) if instance_remove_in_progress(&err) => Ok(()),
             Ok(Err(err)) => Err(anyhow::anyhow!("runtime remove failed: {err}")),
             Err(_) => Err(anyhow::anyhow!(
                 "runtime remove timed out after {:?}",
@@ -1342,12 +1346,12 @@ impl TaskManager {
             return Ok(spec);
         };
         let identifier_entry = {
-            let mut guard = self.local_state.local_containers.lock().await;
+            let mut guard = self.local_state.local_instances.lock().await;
             guard.remove(&id)
         };
         self.local_state.liveness_probes.lock().await.remove(&id);
 
-        let container_identifier = identifier_entry.unwrap_or_else(|| format!("mantissa-{id}"));
+        let instance_identifier = identifier_entry.unwrap_or_else(|| format!("mantissa-{id}"));
 
         let mut updated = spec.clone();
         if !matches!(spec.state, ContainerState::Stopping) {
@@ -1373,11 +1377,11 @@ impl TaskManager {
         // exceeds its configured graceful termination window.
         let stop_deadline =
             Instant::now() + self.effective_task_stop_timeout(spec.termination_grace_period_secs);
-        self.run_pre_stop_hook(&spec, &container_identifier, stop_deadline)
+        self.run_pre_stop_hook(&spec, &instance_identifier, stop_deadline)
             .await;
 
         match self
-            .stop_container_bounded(&container_identifier, remaining_stop_timeout(stop_deadline))
+            .stop_instance_bounded(&instance_identifier, remaining_stop_timeout(stop_deadline))
             .await
         {
             Ok(()) => {}
@@ -1388,8 +1392,8 @@ impl TaskManager {
             }
         }
 
-        self.remove_container_bounded(
-            &container_identifier,
+        self.remove_instance_bounded(
+            &instance_identifier,
             false,
             true,
             remaining_stop_timeout(stop_deadline),
@@ -1397,7 +1401,7 @@ impl TaskManager {
         .await
         .map_err(|err| {
             anyhow::anyhow!(
-                "failed to remove container {container_identifier} while stopping task {id}: {err}"
+                "failed to remove container {instance_identifier} while stopping task {id}: {err}"
             )
         })?;
 
@@ -1463,7 +1467,7 @@ impl TaskManager {
     async fn run_pre_stop_hook(
         &self,
         spec: &TaskSpec,
-        container_identifier: &str,
+        instance_identifier: &str,
         stop_deadline: Instant,
     ) {
         let Some(command) = spec.pre_stop_command.as_deref() else {
@@ -1483,7 +1487,7 @@ impl TaskManager {
         match self
             .runtime
             .runtime_backend
-            .exec_instance(container_identifier, command, Some(remaining))
+            .exec_instance(instance_identifier, command, Some(remaining))
             .await
         {
             Ok(result) => {
@@ -1558,7 +1562,7 @@ impl TaskManager {
         );
 
         {
-            let mut guard = self.local_state.local_containers.lock().await;
+            let mut guard = self.local_state.local_instances.lock().await;
             guard.remove(&task_id);
         }
 
@@ -1660,12 +1664,12 @@ impl TaskManager {
             "marking task as volume unavailable"
         );
 
-        let container_id = {
-            let mut guard = self.local_state.local_containers.lock().await;
+        let instance_id = {
+            let mut guard = self.local_state.local_instances.lock().await;
             guard.remove(&task_id)
         };
-        if let Some(container_id) = container_id {
-            self.rollback_container_launch(&container_id, "volume unavailable")
+        if let Some(instance_id) = instance_id {
+            self.rollback_instance_launch(&instance_id, "volume unavailable")
                 .await;
         }
 
@@ -1797,7 +1801,7 @@ impl TaskManager {
     ) -> Result<Option<(i32, Option<String>)>, RuntimeError> {
         let desired_name = format!("mantissa-{}", spec.id);
         let candidate = {
-            let guard = self.local_state.local_containers.lock().await;
+            let guard = self.local_state.local_instances.lock().await;
             guard
                 .get(&spec.id)
                 .cloned()
@@ -1825,13 +1829,13 @@ impl TaskManager {
     ///
     /// This keeps running-task reconciliation resilient when local in-memory tracking drifts
     /// or Docker returns canonical ids that differ from Mantissa's deterministic names.
-    pub(super) async fn resolve_live_container_id_for_task(
+    pub(super) async fn resolve_live_instance_id_for_task(
         &self,
         spec: &TaskSpec,
     ) -> Result<Option<String>, RuntimeError> {
         let desired_name = format!("mantissa-{}", spec.id);
         let candidate = {
-            let guard = self.local_state.local_containers.lock().await;
+            let guard = self.local_state.local_instances.lock().await;
             guard
                 .get(&spec.id)
                 .cloned()
@@ -1868,12 +1872,12 @@ impl TaskManager {
                 {
                     Ok(info) => Ok(resolve_id(desired_name, info)),
                     Err(RuntimeError::NotFound(_)) => {
-                        self.find_container_id_by_name(&desired_name).await
+                        self.find_instance_id_by_name(&desired_name).await
                     }
                     Err(err) => Err(err),
                 }
             }
-            Err(RuntimeError::NotFound(_)) => self.find_container_id_by_name(&desired_name).await,
+            Err(RuntimeError::NotFound(_)) => self.find_instance_id_by_name(&desired_name).await,
             Err(err) => Err(err),
         }
     }
@@ -1979,12 +1983,12 @@ impl TaskManager {
             }
         }
 
-        let container_name = format!("mantissa-{}", working.id);
-        let container_id = match self
-            .launch_task_container(&ContainerLaunchRequest {
+        let instance_name = format!("mantissa-{}", working.id);
+        let instance_id = match self
+            .launch_task_instance(&InstanceLaunchRequest {
                 task_id: working.id,
                 task_name: &working.name,
-                container_name: &container_name,
+                instance_name: &instance_name,
                 image: &working.image,
                 command: &working.command,
                 tty: working.tty,
@@ -2001,7 +2005,7 @@ impl TaskManager {
             })
             .await
         {
-            Ok(container_id) => container_id,
+            Ok(instance_id) => instance_id,
             Err(err) => {
                 let err = self.mark_task_failed(working, err).await;
                 return Err(err);
@@ -2009,15 +2013,15 @@ impl TaskManager {
         };
 
         {
-            let mut guard = self.local_state.local_containers.lock().await;
-            guard.insert(working.id, container_id.clone());
+            let mut guard = self.local_state.local_instances.lock().await;
+            guard.insert(working.id, instance_id.clone());
         }
 
         if let Err(err) = self
             .ensure_runtime_attachments_or_rollback(
                 working.id,
                 &working.name,
-                &container_id,
+                &instance_id,
                 &working.networks,
                 working.service_metadata.as_ref(),
             )
@@ -2037,15 +2041,13 @@ impl TaskManager {
                 ) || latest.node_id != self.local_node_id
                     || self.should_block_local_service_runtime(&latest)
                 {
-                    self.abort_launched_container(working.id, &container_id)
-                        .await;
+                    self.abort_launched_instance(working.id, &instance_id).await;
                     return Ok(());
                 }
                 working = latest;
             }
             Err(_) => {
-                self.abort_launched_container(working.id, &container_id)
-                    .await;
+                self.abort_launched_instance(working.id, &instance_id).await;
                 return Ok(());
             }
         }
@@ -2067,7 +2069,7 @@ impl TaskManager {
                 "failed to persist running state for task {}: {err}",
                 working.id
             );
-            self.rollback_container_launch(&container_id, "commit rollback")
+            self.rollback_instance_launch(&instance_id, "commit rollback")
                 .await;
             let err = err.context("task state commit failed after container launch");
             let err = self.mark_task_failed(working, err).await;
@@ -2075,7 +2077,7 @@ impl TaskManager {
         }
 
         let _ = self
-            .finalize_running_task_post_commit(&working, Some(&container_id), false, false)
+            .finalize_running_task_post_commit(&working, Some(&instance_id), false, false)
             .await;
 
         Ok(())
@@ -2088,7 +2090,7 @@ impl TaskManager {
     pub(super) async fn finalize_running_task_post_commit(
         &self,
         spec: &TaskSpec,
-        container_id: Option<&str>,
+        instance_id: Option<&str>,
         best_effort_gossip: bool,
         update_container_cache: bool,
     ) {
@@ -2114,11 +2116,11 @@ impl TaskManager {
             );
         }
 
-        if let Some(container_id) = container_id {
+        if let Some(instance_id) = instance_id {
             if let Err(err) = self
                 .ensure_runtime_attachments(
                     spec.id,
-                    container_id,
+                    instance_id,
                     &spec.networks,
                     spec.service_metadata.as_ref(),
                 )
@@ -2132,8 +2134,8 @@ impl TaskManager {
             }
 
             if update_container_cache {
-                let mut guard = self.local_state.local_containers.lock().await;
-                guard.insert(spec.id, container_id.to_string());
+                let mut guard = self.local_state.local_instances.lock().await;
+                guard.insert(spec.id, instance_id.to_string());
             }
         }
 
@@ -2151,12 +2153,12 @@ impl TaskManager {
         &self,
         task_id: Uuid,
         task_name: &str,
-        container_id: &str,
+        instance_id: &str,
         networks: &[Uuid],
         service_meta: Option<&TaskServiceMetadata>,
     ) -> Result<(), anyhow::Error> {
         if let Err(err) = self
-            .ensure_runtime_attachments(task_id, container_id, networks, service_meta)
+            .ensure_runtime_attachments(task_id, instance_id, networks, service_meta)
             .await
         {
             let err = err.context(format!(
@@ -2173,7 +2175,7 @@ impl TaskManager {
                     task_id
                 );
             }
-            self.rollback_container_launch(container_id, "attachment setup failure")
+            self.rollback_instance_launch(instance_id, "attachment setup failure")
                 .await;
             return Err(err);
         }
@@ -2182,25 +2184,25 @@ impl TaskManager {
     }
 
     /// Stops and removes a launched container best-effort when one launch stage must roll back.
-    pub(super) async fn rollback_container_launch(&self, container_id: &str, reason: &str) {
+    pub(super) async fn rollback_instance_launch(&self, instance_id: &str, reason: &str) {
         if let Err(stop_err) = self
-            .stop_container_bounded(container_id, Duration::from_secs(10))
+            .stop_instance_bounded(instance_id, Duration::from_secs(10))
             .await
         {
             warn!(
                 target: "task",
-                container = %container_id,
+                container = %instance_id,
                 reason,
                 "failed to stop container during launch rollback: {stop_err}"
             );
         }
         if let Err(remove_err) = self
-            .remove_container_bounded(container_id, true, true, Duration::from_secs(10))
+            .remove_instance_bounded(instance_id, true, true, Duration::from_secs(10))
             .await
         {
             warn!(
                 target: "task",
-                container = %container_id,
+                container = %instance_id,
                 reason,
                 "failed to remove container during launch rollback: {remove_err}"
             );
@@ -2208,9 +2210,9 @@ impl TaskManager {
     }
 
     /// Best-effort rollback when startup raced with a newer stop/remove intent.
-    async fn abort_launched_container(&self, task_id: Uuid, container_id: &str) {
+    async fn abort_launched_instance(&self, task_id: Uuid, instance_id: &str) {
         self.local_state
-            .local_containers
+            .local_instances
             .lock()
             .await
             .remove(&task_id);
@@ -2219,28 +2221,28 @@ impl TaskManager {
             .lock()
             .await
             .remove(&task_id);
-        self.rollback_container_launch(container_id, "launch aborted")
+        self.rollback_instance_launch(instance_id, "launch aborted")
             .await;
     }
 
     /// Resolves an existing container identifier when a create call hit a name conflict.
-    pub(super) async fn resolve_existing_container_id(
+    pub(super) async fn resolve_existing_instance_id(
         &self,
-        container_name: &str,
+        instance_name: &str,
     ) -> Result<Option<String>, RuntimeError> {
-        if let Some(id) = self.find_container_id_by_name(container_name).await? {
+        if let Some(id) = self.find_instance_id_by_name(instance_name).await? {
             return Ok(Some(id));
         }
 
         match self
             .runtime
             .runtime_backend
-            .inspect_instance(container_name)
+            .inspect_instance(instance_name)
             .await
         {
             Ok(info) => {
                 if info.id.is_empty() {
-                    Ok(Some(container_name.to_string()))
+                    Ok(Some(instance_name.to_string()))
                 } else {
                     Ok(Some(info.id))
                 }
@@ -2251,19 +2253,19 @@ impl TaskManager {
     }
 
     /// Locate a container id by name using the lightweight list API.
-    async fn find_container_id_by_name(
+    async fn find_instance_id_by_name(
         &self,
-        container_name: &str,
+        instance_name: &str,
     ) -> Result<Option<String>, RuntimeError> {
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-        filters.insert("name".to_string(), vec![container_name.to_string()]);
+        filters.insert("name".to_string(), vec![instance_name.to_string()]);
         let candidates = self
             .runtime
             .runtime_backend
             .list_instances(Some(filters))
             .await?;
         for candidate in candidates {
-            if candidate.name == container_name {
+            if candidate.name == instance_name {
                 if !candidate.id.is_empty() {
                     return Ok(Some(candidate.id));
                 }
@@ -2276,29 +2278,29 @@ impl TaskManager {
     /// Ensures that a locally tracked task has completely stopped and released resources.
     pub(super) async fn ensure_task_stopped(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
         let mut has_container = {
-            let guard = self.local_state.local_containers.lock().await;
+            let guard = self.local_state.local_instances.lock().await;
             guard.contains_key(&spec.id)
         };
 
         if !has_container {
             // After a daemon restart the in-memory cache is empty, so inspect by name
             // before declaring the task containerless.
-            let container_name = format!("mantissa-{}", spec.id);
+            let instance_name = format!("mantissa-{}", spec.id);
             match self
                 .runtime
                 .runtime_backend
-                .inspect_instance(&container_name)
+                .inspect_instance(&instance_name)
                 .await
             {
                 Ok(info) => {
                     let running = info.state.running.unwrap_or(false);
                     if running {
                         let resolved = if info.id.is_empty() {
-                            container_name
+                            instance_name
                         } else {
                             info.id
                         };
-                        let mut guard = self.local_state.local_containers.lock().await;
+                        let mut guard = self.local_state.local_instances.lock().await;
                         guard.insert(spec.id, resolved);
                         has_container = true;
                     }
@@ -2390,7 +2392,7 @@ impl TaskManager {
             | ContainerState::Exited(_)
             | ContainerState::Unknown => {
                 self.local_state
-                    .local_containers
+                    .local_instances
                     .lock()
                     .await
                     .remove(&spec.id);
@@ -2540,23 +2542,19 @@ impl TaskManager {
     /// This is the primary defense against daemon restarts that leave containers running without
     /// corresponding in-memory tracking. By comparing the local container list against the latest
     /// task assignments, we either adopt the container (if still owned locally) or stop it.
-    pub(super) async fn reconcile_local_container_inventory(&self) -> Result<(), anyhow::Error> {
+    pub(super) async fn reconcile_local_runtime_inventory(&self) -> Result<(), anyhow::Error> {
         const UNOWNED_TASK_GRACE_SECS: i64 = 5;
 
         let containers = self.runtime.runtime_backend.list_instances(None).await?;
         let task_index = self.load_task_value_index().await?;
 
         for container in containers {
-            let Some(task_id) = container
-                .name
-                .strip_prefix("mantissa-")
-                .and_then(|suffix| Uuid::parse_str(suffix).ok())
-            else {
+            let Some(task_id) = Self::runtime_workload_id(&container) else {
                 continue;
             };
 
             let Some(value) = task_index.get(&task_id).cloned() else {
-                self.stop_unowned_container(task_id, &container.name, true, None)
+                self.stop_unowned_instance(task_id, &container.name, true, None)
                     .await;
                 continue;
             };
@@ -2565,19 +2563,19 @@ impl TaskManager {
                 if task_value_recent(&value, UNOWNED_TASK_GRACE_SECS) {
                     continue;
                 }
-                self.stop_unowned_container(task_id, &container.name, false, Some(&value))
+                self.stop_unowned_instance(task_id, &container.name, false, Some(&value))
                     .await;
                 continue;
             }
 
-            let container_id = if container.id.is_empty() {
+            let instance_id = if container.id.is_empty() {
                 container.name.clone()
             } else {
                 container.id.clone()
             };
             {
-                let mut guard = self.local_state.local_containers.lock().await;
-                guard.insert(task_id, container_id.clone());
+                let mut guard = self.local_state.local_instances.lock().await;
+                guard.insert(task_id, instance_id.clone());
             }
 
             if matches!(value.state, ContainerState::Running)
@@ -2601,7 +2599,7 @@ impl TaskManager {
                 && let Err(err) = self
                     .ensure_runtime_attachments(
                         task_id,
-                        &container_id,
+                        &instance_id,
                         &value.networks,
                         value.service_metadata.as_ref(),
                     )
@@ -2610,7 +2608,7 @@ impl TaskManager {
                 warn!(
                     target: "task",
                     task = %task_id,
-                    container = %container_id,
+                    container = %instance_id,
                     "failed to refresh attachments while adopting container: {err:#}"
                 );
             }
@@ -2661,21 +2659,21 @@ impl TaskManager {
 
     /// Tears down a locally running container without mutating replicated task state.
     /// Tears down a local container and optionally removes shared attachments for missing tasks.
-    async fn stop_unowned_container(
+    async fn stop_unowned_instance(
         &self,
         task_id: Uuid,
-        container_name: &str,
+        instance_name: &str,
         remove_attachments: bool,
         task_value: Option<&TaskValue>,
     ) {
-        let identifier = if container_name.is_empty() {
+        let identifier = if instance_name.is_empty() {
             format!("mantissa-{task_id}")
         } else {
-            container_name.to_string()
+            instance_name.to_string()
         };
 
         {
-            let mut guard = self.local_state.local_containers.lock().await;
+            let mut guard = self.local_state.local_instances.lock().await;
             guard.remove(&task_id);
         }
 
@@ -2688,7 +2686,7 @@ impl TaskManager {
         }
 
         match self
-            .stop_container_bounded(
+            .stop_instance_bounded(
                 &identifier,
                 self.effective_task_stop_timeout(
                     task_value.and_then(|value| value.termination_grace_period_secs),
@@ -2706,7 +2704,7 @@ impl TaskManager {
         }
 
         if let Err(err) = self
-            .remove_container_bounded(&identifier, false, true, Duration::from_secs(10))
+            .remove_instance_bounded(&identifier, false, true, Duration::from_secs(10))
             .await
         {
             warn!(
@@ -2810,7 +2808,7 @@ impl TaskManager {
             });
         }
 
-        if let Err(err) = self.reconcile_local_container_inventory().await {
+        if let Err(err) = self.reconcile_local_runtime_inventory().await {
             warn!(
                 target: "task",
                 "failed to reconcile local container inventory: {err}"
@@ -2837,32 +2835,28 @@ impl TaskManager {
             .map_err(anyhow::Error::from)
             .context("list runtime containers for reconcile")?;
 
-        let mut task_containers = HashMap::new();
-        let mut container_ids = HashSet::new();
+        let mut task_instances = HashMap::new();
+        let mut instance_ids = HashSet::new();
 
         for container in containers {
-            if !Self::container_is_running(&container) {
+            if !Self::instance_is_running(&container) {
                 continue;
             }
-            let container_id = Self::container_identity(&container);
-            if container_id.is_empty() {
+            let instance_id = Self::instance_identity(&container);
+            if instance_id.is_empty() {
                 continue;
             }
-            container_ids.insert(container_id.clone());
+            instance_ids.insert(instance_id.clone());
 
-            let Some(task_id) = container
-                .name
-                .strip_prefix("mantissa-")
-                .and_then(|suffix| Uuid::parse_str(suffix).ok())
-            else {
+            let Some(task_id) = Self::runtime_workload_id(&container) else {
                 continue;
             };
-            task_containers.insert(task_id, container_id);
+            task_instances.insert(task_id, instance_id);
         }
 
         Ok(RuntimeInventory {
-            task_containers,
-            container_ids,
+            task_instances,
+            instance_ids,
         })
     }
 
@@ -2885,9 +2879,9 @@ impl TaskManager {
             return false;
         };
 
-        if let Some(container_id) = runtime_inventory.task_containers.get(&spec.id).cloned() {
-            let mut guard = self.local_state.local_containers.lock().await;
-            guard.insert(spec.id, container_id);
+        if let Some(instance_id) = runtime_inventory.task_instances.get(&spec.id).cloned() {
+            let mut guard = self.local_state.local_instances.lock().await;
+            guard.insert(spec.id, instance_id);
             if !spec.volumes.is_empty()
                 && let Err(err) = self.publish_task_volume_mounts(spec).await
             {
@@ -2901,11 +2895,11 @@ impl TaskManager {
         }
 
         let cached = {
-            let guard = self.local_state.local_containers.lock().await;
+            let guard = self.local_state.local_instances.lock().await;
             guard.get(&spec.id).cloned()
         };
-        if let Some(container_id) = cached
-            && runtime_inventory.container_ids.contains(&container_id)
+        if let Some(instance_id) = cached
+            && runtime_inventory.instance_ids.contains(&instance_id)
         {
             if !spec.volumes.is_empty()
                 && let Err(err) = self.publish_task_volume_mounts(spec).await
@@ -2923,15 +2917,23 @@ impl TaskManager {
     }
 
     /// Resolves the best local identity string for one runtime container row.
-    fn container_identity(container: &RuntimeInfo) -> String {
+    fn instance_identity(container: &RuntimeInfo) -> String {
         if !container.id.is_empty() {
             return container.id.clone();
         }
         container.name.clone()
     }
 
+    /// Extracts the workload identifier published by the runtime instance metadata.
+    fn runtime_workload_id(container: &RuntimeInfo) -> Option<Uuid> {
+        container
+            .labels
+            .get("mantissa.workload_id")
+            .and_then(|value| Uuid::parse_str(value).ok())
+    }
+
     /// Reports whether one runtime listing row represents a running container.
-    fn container_is_running(container: &RuntimeInfo) -> bool {
+    fn instance_is_running(container: &RuntimeInfo) -> bool {
         if matches!(container.state.raw_status.as_deref(), Some(status) if status.eq_ignore_ascii_case("running"))
         {
             return true;

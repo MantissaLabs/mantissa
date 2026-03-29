@@ -20,13 +20,15 @@ use crate::network::types::{
 };
 use crate::network::wireguard;
 use crate::runtime::types::{RuntimeAttachmentTarget, RuntimeEvent};
-use crate::task::causality::{compare_task_causality, compare_task_status_causality};
-use crate::task::container::ContainerState;
-use crate::task::types::{
-    TaskEvent, TaskRestartPolicyKind, TaskServiceMetadata, TaskSpec, TaskStatus,
+use crate::workload::model::{
+    WorkloadEvent as TaskEvent, WorkloadPhase as ContainerState,
+    WorkloadServiceMetadata as TaskServiceMetadata, WorkloadSpec as TaskSpec,
+    WorkloadStatus as TaskStatus, compare_workload_causality as compare_task_causality,
+    compare_workload_status_causality as compare_task_status_causality,
 };
+use crate::workload::types::WorkloadRestartPolicyKind as TaskRestartPolicyKind;
 
-use super::TaskManager;
+use super::WorkloadManager;
 use super::{
     TASK_GOSSIP_FLUSH_INTERVAL, merge_definition_into_value, merge_status_into_value,
     select_best_task_value, spec_to_value, value_to_spec,
@@ -39,7 +41,7 @@ const ATTACHMENT_PROVISION_RETRY_BASE_MS: u64 = 50;
 /// Upper bound for attachment provisioning retry backoff.
 const ATTACHMENT_PROVISION_RETRY_MAX_MS: u64 = 800;
 
-impl TaskManager {
+impl WorkloadManager {
     /// Periodically re-attach networks to running instances whose attachment interfaces vanished
     /// (for example after a runtime restart) so backends rejoin service discovery and load
     /// balancing without manual intervention.
@@ -110,7 +112,7 @@ impl TaskManager {
 
             let desired_name = format!("mantissa-{}", spec.id);
             let mut instance_id = {
-                let guard = self.local_state.local_containers.lock().await;
+                let guard = self.local_state.local_instances.lock().await;
                 guard
                     .get(&spec.id)
                     .cloned()
@@ -167,7 +169,7 @@ impl TaskManager {
             }
 
             {
-                let mut guard = self.local_state.local_containers.lock().await;
+                let mut guard = self.local_state.local_instances.lock().await;
                 guard.insert(spec.id, instance_id.clone());
             }
 
@@ -231,7 +233,7 @@ impl TaskManager {
             }
 
             let instance_id = {
-                let guard = self.local_state.local_containers.lock().await;
+                let guard = self.local_state.local_instances.lock().await;
                 guard
                     .get(&value.id)
                     .cloned()
@@ -313,7 +315,7 @@ impl TaskManager {
             });
         }
 
-        if let Err(err) = self.reconcile_local_container_inventory().await {
+        if let Err(err) = self.reconcile_local_runtime_inventory().await {
             warn!(
                 target: "task",
                 "failed to reconcile local containers at startup: {err:#}"
@@ -552,7 +554,7 @@ impl TaskManager {
                     });
                 } else if !matches!(persisted_spec.state, ContainerState::Running) {
                     self.local_state
-                        .local_containers
+                        .local_instances
                         .lock()
                         .await
                         .remove(&persisted_spec.id);
@@ -620,7 +622,7 @@ impl TaskManager {
                     });
                 } else if !matches!(persisted_spec.state, ContainerState::Running) {
                     self.local_state
-                        .local_containers
+                        .local_instances
                         .lock()
                         .await
                         .remove(&persisted_spec.id);
@@ -651,7 +653,7 @@ impl TaskManager {
                     }
                 }
 
-                self.local_state.local_containers.lock().await.remove(&id);
+                self.local_state.local_instances.lock().await.remove(&id);
                 if let Err(err) = self
                     .teardown_runtime_attachments(id, HashSet::new(), true)
                     .await
@@ -685,7 +687,7 @@ fn task_policy_allows_runtime_restart(spec: &TaskSpec, exit_code: i32) -> bool {
     }
 }
 
-impl TaskManager {
+impl WorkloadManager {
     /// Ensures that runtime network attachments exist for the provided task identifier.
     pub(super) async fn ensure_runtime_attachments(
         &self,
@@ -1319,7 +1321,7 @@ fn attachment_age_exceeds(attachment: &NetworkAttachmentValue, grace_secs: i64) 
 }
 
 /// Extract a stable revision timestamp from a task value so attachment updates track reschedules.
-fn task_revision_timestamp(value: &crate::task::types::TaskValue) -> Option<String> {
+fn task_revision_timestamp(value: &crate::workload::model::WorkloadValue) -> Option<String> {
     if !value.updated_at.is_empty() {
         Some(value.updated_at.clone())
     } else if !value.created_at.is_empty() {

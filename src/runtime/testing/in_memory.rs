@@ -28,6 +28,7 @@ struct InMemoryRuntimeEntry {
     id: String,
     name: String,
     image: String,
+    labels: HashMap<String, String>,
     running: bool,
 }
 
@@ -77,6 +78,7 @@ impl RuntimeBackend for InMemoryRuntimeBackend {
             id: id.clone(),
             name: request.name.clone(),
             image: request.image,
+            labels: request.labels.unwrap_or_default(),
             running: false,
         };
 
@@ -222,6 +224,7 @@ impl RuntimeBackend for InMemoryRuntimeBackend {
                 id: entry.id.clone(),
                 name: entry.name.clone(),
                 image: entry.image.clone(),
+                labels: entry.labels.clone(),
                 status: if entry.running {
                     "running".to_string()
                 } else {
@@ -262,6 +265,7 @@ impl RuntimeBackend for InMemoryRuntimeBackend {
             id: entry.id.clone(),
             name: entry.name.clone(),
             image: entry.image.clone(),
+            labels: entry.labels.clone(),
             status: if entry.running {
                 "running".to_string()
             } else {

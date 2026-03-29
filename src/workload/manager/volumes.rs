@@ -5,18 +5,18 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::gossip::Message;
-use crate::task::types::{TaskSpec, TaskVolumeMount};
 use crate::volumes::LocalVolumeAccessError;
 use crate::volumes::local::ensure_local_volume_path;
 use crate::volumes::types::{
     VolumeBindingMode, VolumeEvent, VolumeNodeState, VolumeNodeStateValue, VolumeSpecValue,
     VolumeStatus,
 };
+use crate::workload::model::{WorkloadSpec as TaskSpec, WorkloadVolumeMount as TaskVolumeMount};
 
-use super::TaskManager;
+use super::WorkloadManager;
 use super::planner::{Assignment, StartIntent};
 
-impl TaskManager {
+impl WorkloadManager {
     /// Applies existing volume bindings as hard placement constraints before the scheduler runs.
     pub(super) async fn apply_volume_locality_to_intents(
         &self,

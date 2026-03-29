@@ -393,10 +393,18 @@ fn runtime_info_with_state(
     exit_code: Option<i32>,
     error: Option<&str>,
 ) -> RuntimeInfo {
+    let labels = name
+        .strip_prefix("mantissa-")
+        .and_then(|suffix| Uuid::parse_str(suffix).ok())
+        .map(|workload_id| {
+            HashMap::from([("mantissa.workload_id".to_string(), workload_id.to_string())])
+        })
+        .unwrap_or_default();
     RuntimeInfo {
         id: id.to_string(),
         name: name.to_string(),
         image: image.to_string(),
+        labels,
         status: status.to_string(),
         state: RuntimeStateInfo {
             raw_status: Some(raw_status.to_string()),
@@ -711,7 +719,7 @@ fn temp_db(prefix: &str) -> (Arc<redb::Database>, tempfile::TempDir) {
 }
 
 async fn setup_manager() -> (
-    TaskManager,
+    WorkloadManager,
     Rc<Scheduler>,
     Arc<MockRuntimeBackend>,
     NetworkRegistry,
@@ -723,7 +731,7 @@ async fn setup_manager_with_forwarding(
     forwarding_events: Option<mpsc::UnboundedSender<ForwardingEvent>>,
     attachment_override: Option<Arc<dyn AttachmentProvisionerApi>>,
 ) -> (
-    TaskManager,
+    WorkloadManager,
     Rc<Scheduler>,
     Arc<MockRuntimeBackend>,
     NetworkRegistry,
@@ -844,7 +852,7 @@ async fn setup_manager_with_forwarding(
         std::env::temp_dir().join(format!("mantissa-task-manager-volumes-{actor}"));
     std::fs::create_dir_all(&local_volume_root).expect("create local volume root");
 
-    let manager = TaskManager::new(TaskManagerConfig {
+    let manager = WorkloadManager::new(WorkloadManagerConfig {
         store: task_store,
         tx,
         rx,
@@ -984,7 +992,7 @@ async fn task_value_index_cache_reuses_snapshot_until_store_changes() {
 
 /// Writes the local peer scheduling row used by task-manager drain-aware reconciliation tests.
 async fn set_local_drain_requested(
-    manager: &TaskManager,
+    manager: &WorkloadManager,
     drain_requested: bool,
     task_stop_timeout_secs: Option<u32>,
 ) {
@@ -1012,7 +1020,7 @@ async fn set_local_drain_requested(
 
 /// Stores one managed local volume spec in the registry so task tests can exercise locality.
 async fn create_managed_local_volume(
-    manager: &TaskManager,
+    manager: &WorkloadManager,
     name: &str,
     binding_mode: VolumeBindingMode,
     bound_node_id: Option<Uuid>,
@@ -1041,7 +1049,7 @@ async fn create_managed_local_volume(
 }
 
 /// Builds one minimal task spec used by cache and store-view tests.
-fn test_task_spec(manager: &TaskManager, name: &str) -> TaskSpec {
+fn test_task_spec(manager: &WorkloadManager, name: &str) -> TaskSpec {
     TaskSpec {
         id: Uuid::new_v4(),
         name: name.to_string(),
@@ -1100,8 +1108,8 @@ fn empty_task_execution(image: &str) -> TaskExecutionSpec {
 }
 
 /// Builds one standalone task request that mounts a single resolved volume reference.
-fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> TaskStartRequest {
-    TaskStartRequest {
+fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> WorkloadStartRequest {
+    WorkloadStartRequest {
         name: "volume-task".into(),
         execution: TaskExecutionSpec {
             volumes: vec![crate::task::types::TaskVolumeMount {
@@ -2236,7 +2244,7 @@ async fn reconcile_local_tasks_does_not_duplicate_batch_launch_in_progress() {
         .await
         .expect("upsert local network peer state");
 
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "launch-race".into(),
         execution: TaskExecutionSpec {
             networks: vec![spec.id],
@@ -2333,7 +2341,7 @@ async fn reconcile_running_task_marks_failed_when_container_exits_without_restar
         .expect("start container");
     assert!(matches!(spec.state, ContainerState::Running));
 
-    let container_id = mock_cm
+    let instance_id = mock_cm
         .created
         .lock()
         .await
@@ -2344,9 +2352,9 @@ async fn reconcile_running_task_marks_failed_when_container_exits_without_restar
     {
         let mut inspect = mock_cm.inspect.lock().await;
         inspect.insert(
-            container_id.clone(),
+            instance_id.clone(),
             runtime_info_with_state(
-                &container_id,
+                &instance_id,
                 &format!("mantissa-{}", spec.id),
                 "img",
                 "Exited",
@@ -2904,7 +2912,7 @@ async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
     assert!(
         manager
             .local_state
-            .local_containers
+            .local_instances
             .lock()
             .await
             .get(&spec.id)
@@ -3472,7 +3480,7 @@ async fn reconcile_inventory_uses_drain_stop_timeout_for_unowned_runtime() {
         .expect("persist remote ownership");
 
     manager
-        .reconcile_local_container_inventory()
+        .reconcile_local_runtime_inventory()
         .await
         .expect("reconcile inventory");
 
@@ -3498,7 +3506,7 @@ async fn request_task_stop_uses_container_name_when_cache_missing() {
 
     manager
         .local_state
-        .local_containers
+        .local_instances
         .lock()
         .await
         .remove(&spec.id);
@@ -3586,7 +3594,7 @@ async fn reconcile_requested_stop_removes_containerless_stopping_task() {
 
     manager
         .local_state
-        .local_containers
+        .local_instances
         .lock()
         .await
         .remove(&spec.id);
@@ -3651,7 +3659,7 @@ async fn reconcile_requested_stop_treats_non_running_container_as_containerless(
 
     manager
         .local_state
-        .local_containers
+        .local_instances
         .lock()
         .await
         .remove(&spec.id);
@@ -4070,7 +4078,7 @@ async fn start_tasks_batch_reserves_every_slot() {
 
     let specs = manager
         .start_tasks_batch(vec![
-            TaskStartRequest {
+            WorkloadStartRequest {
                 name: "svc-a".into(),
                 execution: empty_task_execution("img"),
                 gpu_device_ids: Vec::new(),
@@ -4079,7 +4087,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 service_metadata: None,
                 target_node: None,
             },
-            TaskStartRequest {
+            WorkloadStartRequest {
                 name: "svc-b".into(),
                 execution: empty_task_execution("img"),
                 gpu_device_ids: Vec::new(),
@@ -4123,7 +4131,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
         .expect("reserve slot");
 
     let specs = manager
-        .start_tasks_batch(vec![TaskStartRequest {
+        .start_tasks_batch(vec![WorkloadStartRequest {
             name: "svc-a".into(),
             execution: empty_task_execution("img"),
             gpu_device_ids: Vec::new(),
@@ -4257,9 +4265,9 @@ async fn stream_local_task_logs_forwards_frames_and_options() {
     };
     manager.persist_spec(&spec).await.expect("persist task");
 
-    let container_name = format!("mantissa-{task_id}");
+    let instance_name = format!("mantissa-{task_id}");
     mock_cm.log_frames.lock().await.insert(
-        container_name.clone(),
+        instance_name.clone(),
         vec![
             RuntimeLogFrame {
                 stream: RuntimeLogStream::StdOut,
@@ -4291,7 +4299,7 @@ async fn stream_local_task_logs_forwards_frames_and_options() {
     }
 
     let log_calls = mock_cm.log_calls.lock().await.clone();
-    assert_eq!(log_calls, vec![(container_name, options.clone())]);
+    assert_eq!(log_calls, vec![(instance_name, options.clone())]);
     assert_eq!(
         frames,
         vec![
@@ -4349,9 +4357,9 @@ async fn attach_local_task_forwards_input_output_and_options() {
     };
     manager.persist_spec(&spec).await.expect("persist task");
 
-    let container_name = format!("mantissa-{task_id}");
+    let instance_name = format!("mantissa-{task_id}");
     mock_cm.attach_frames.lock().await.insert(
-        container_name.clone(),
+        instance_name.clone(),
         vec![
             RuntimeLogFrame {
                 stream: RuntimeLogStream::Console,
@@ -4364,10 +4372,10 @@ async fn attach_local_task_forwards_input_output_and_options() {
         ],
     );
     mock_cm.inspect.lock().await.insert(
-        container_name.clone(),
+        instance_name.clone(),
         RuntimeInfo {
-            id: container_name.clone(),
-            name: container_name.clone(),
+            id: instance_name.clone(),
+            name: instance_name.clone(),
             status: "Up".to_string(),
             state: RuntimeStateInfo {
                 raw_status: Some("running".to_string()),
@@ -4411,14 +4419,14 @@ async fn attach_local_task_forwards_input_output_and_options() {
 
     assert_eq!(
         mock_cm.attach_calls.lock().await.clone(),
-        vec![(container_name.clone(), options.clone())]
+        vec![(instance_name.clone(), options.clone())]
     );
     assert_eq!(
         mock_cm
             .attach_inputs
             .lock()
             .await
-            .get(&container_name)
+            .get(&instance_name)
             .cloned()
             .unwrap_or_default(),
         vec![b"echo attached\n".to_vec()]
@@ -4479,12 +4487,12 @@ async fn attach_local_task_uses_runtime_tty_when_persisted_spec_is_stale() {
     };
     manager.persist_spec(&spec).await.expect("persist task");
 
-    let container_name = format!("mantissa-{task_id}");
+    let instance_name = format!("mantissa-{task_id}");
     mock_cm.inspect.lock().await.insert(
-        container_name.clone(),
+        instance_name.clone(),
         RuntimeInfo {
-            id: container_name.clone(),
-            name: container_name.clone(),
+            id: instance_name.clone(),
+            name: instance_name.clone(),
             status: "Up".to_string(),
             state: RuntimeStateInfo {
                 raw_status: Some("running".to_string()),
@@ -4520,7 +4528,7 @@ async fn attach_local_task_uses_runtime_tty_when_persisted_spec_is_stale() {
     assert_eq!(
         mock_cm.attach_calls.lock().await.clone(),
         vec![(
-            container_name,
+            instance_name,
             RuntimeAttachOptions {
                 tty: true,
                 ..options
@@ -4571,9 +4579,9 @@ async fn exec_local_task_forwards_input_output_and_options() {
     };
     manager.persist_spec(&spec).await.expect("persist task");
 
-    let container_name = format!("mantissa-{task_id}");
+    let instance_name = format!("mantissa-{task_id}");
     mock_cm.exec_stream_frames.lock().await.insert(
-        container_name.clone(),
+        instance_name.clone(),
         vec![
             RuntimeLogFrame {
                 stream: RuntimeLogStream::Console,
@@ -4622,14 +4630,14 @@ async fn exec_local_task_forwards_input_output_and_options() {
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(
         mock_cm.exec_stream_calls.lock().await.clone(),
-        vec![(container_name.clone(), options.clone())]
+        vec![(instance_name.clone(), options.clone())]
     );
     assert_eq!(
         mock_cm
             .exec_stream_inputs
             .lock()
             .await
-            .get(&container_name)
+            .get(&instance_name)
             .cloned()
             .unwrap_or_default(),
         vec![b"echo exec\n".to_vec()]
@@ -4670,7 +4678,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
 
     let err = manager
         .start_tasks_batch(vec![
-            TaskStartRequest {
+            WorkloadStartRequest {
                 name: "svc-c".into(),
                 execution: empty_task_execution("img"),
                 gpu_device_ids: Vec::new(),
@@ -4679,7 +4687,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 service_metadata: None,
                 target_node: None,
             },
-            TaskStartRequest {
+            WorkloadStartRequest {
                 name: "svc-d".into(),
                 execution: empty_task_execution("img"),
                 gpu_device_ids: Vec::new(),
@@ -4748,7 +4756,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         .await
         .expect("upsert peer state");
 
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "with-net".into(),
         execution: TaskExecutionSpec {
             networks: vec![spec.id],
@@ -4837,7 +4845,7 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
         .await
         .expect("upsert peer state");
 
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "service-backend".into(),
         execution: TaskExecutionSpec {
             networks: vec![spec.id],
@@ -4926,7 +4934,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
         .set_task_traffic_published(task_id, true)
         .await
         .expect("set task traffic publication");
-    assert_eq!(update, TaskTrafficPublicationUpdate::NoAttachments);
+    assert_eq!(update, WorkloadTrafficPublicationUpdate::NoAttachments);
 }
 
 #[tokio::test]
@@ -5083,7 +5091,7 @@ async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
         .await
         .expect("upsert peer state");
 
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "standalone-net".into(),
         execution: TaskExecutionSpec {
             networks: vec![spec.id],
@@ -5187,7 +5195,7 @@ async fn request_task_stop_cleans_up_after_teardown_failure() {
         .await
         .expect("upsert peer state");
 
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "flaky-task".into(),
         execution: TaskExecutionSpec {
             networks: vec![spec.id],
@@ -6165,7 +6173,7 @@ async fn attachment_ready_triggers_forwarding_event() {
         .await
         .expect("upsert peer state");
 
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "with-forwarding".into(),
         execution: TaskExecutionSpec {
             networks: vec![spec.id],
@@ -6257,7 +6265,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         .await
         .expect("upsert peer b");
 
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "two-nets".into(),
         execution: TaskExecutionSpec {
             networks: vec![spec_a.id, spec_b.id],
@@ -6278,8 +6286,8 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         .pop()
         .expect("task created with two network attachments");
 
-    let container_id = {
-        let guard = manager.local_state.local_containers.lock().await;
+    let instance_id = {
+        let guard = manager.local_state.local_instances.lock().await;
         guard
             .get(&task_spec.id)
             .cloned()
@@ -6292,7 +6300,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
     assert_eq!(initial.len(), 2);
 
     manager
-        .ensure_runtime_attachments(task_spec.id, &container_id, &[spec_a.id], None)
+        .ensure_runtime_attachments(task_spec.id, &instance_id, &[spec_a.id], None)
         .await
         .expect("reconcile attachments");
 
@@ -6346,7 +6354,7 @@ async fn runtime_attachments_retry_transient_provision_errors() {
         .await
         .expect("upsert peer state");
 
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "retry-net-task".into(),
         execution: TaskExecutionSpec {
             networks: vec![spec.id],
@@ -6439,7 +6447,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         .await
         .expect("upsert peer state");
 
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "real-net-task".into(),
         execution: TaskExecutionSpec {
             networks: vec![spec.id],
@@ -6546,7 +6554,7 @@ fn scheduling_retry_budget_is_shorter_for_targeted_starts() {
 #[tokio::test]
 async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "network-blocked".into(),
         execution: TaskExecutionSpec {
             cpu_millis: 100,
@@ -6568,7 +6576,7 @@ async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
     .expect("override should fail without waiting for the default retry window")
     .expect_err("network-blocked start should fail");
 
-    assert!(task_start_error_is_retryable(&result));
+    assert!(workload_start_error_is_retryable(&result));
 }
 
 #[tokio::test]
@@ -6846,7 +6854,7 @@ async fn multi_volume_bound_node_conflict_rejected() {
     .await;
 
     let err = manager
-        .start_tasks_batch(vec![TaskStartRequest {
+        .start_tasks_batch(vec![WorkloadStartRequest {
             name: "conflict".into(),
             execution: TaskExecutionSpec {
                 cpu_millis: 100,

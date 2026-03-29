@@ -1,26 +1,30 @@
 use anyhow::anyhow;
+use std::collections::HashMap;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::runtime::types::{
     ResourceLimits, RestartPolicyConfig, RestartPolicyType, RuntimeCreateRequest,
 };
-use crate::task::types::{
-    TaskEnvironmentVariable, TaskRestartPolicy, TaskRestartPolicyKind, TaskSecretFile,
-    TaskVolumeMount,
+use crate::workload::model::{
+    WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile as TaskSecretFile,
+    WorkloadVolumeMount as TaskVolumeMount,
+};
+use crate::workload::types::{
+    WorkloadRestartPolicy as TaskRestartPolicy, WorkloadRestartPolicyKind as TaskRestartPolicyKind,
 };
 
 use super::secrets::ResolvedTaskSecrets;
 use super::{
-    TaskManager, container_already_running, is_name_conflict, wrap_create_error,
+    WorkloadManager, instance_already_running, is_name_conflict, wrap_create_error,
     wrap_existing_inspect_error, wrap_start_error,
 };
 
 /// Shared launch inputs used by single-task and batch local startup paths.
-pub(super) struct ContainerLaunchRequest<'a> {
+pub(super) struct InstanceLaunchRequest<'a> {
     pub task_id: Uuid,
     pub task_name: &'a str,
-    pub container_name: &'a str,
+    pub instance_name: &'a str,
     pub image: &'a str,
     pub command: &'a [String],
     pub tty: bool,
@@ -36,14 +40,14 @@ pub(super) struct ContainerLaunchRequest<'a> {
     pub networks: &'a [Uuid],
 }
 
-impl TaskManager {
-    /// Builds one container launch request and guarantees the runtime process is started.
+impl WorkloadManager {
+    /// Builds one runtime instance launch request and guarantees the process is started.
     ///
     /// Both single-task and batch startup paths call this helper so create/start behavior cannot
     /// drift between the two code paths.
-    pub(super) async fn launch_task_container(
+    pub(super) async fn launch_task_instance(
         &self,
-        request: &ContainerLaunchRequest<'_>,
+        request: &InstanceLaunchRequest<'_>,
     ) -> Result<String, anyhow::Error> {
         let restart_policy = request.restart_policy.map(restart_policy_to_config);
         let resource_limits =
@@ -52,9 +56,9 @@ impl TaskManager {
         debug!(
             target: "task",
             task = %request.task_id,
-            container = %request.container_name,
+            instance = %request.instance_name,
             networks = ?request.networks,
-            "launching container with networks"
+            "launching runtime instance with networks"
         );
 
         let dns_servers = self.resolve_dns_servers(request.networks).await?;
@@ -117,9 +121,14 @@ impl TaskManager {
             super::append_nvidia_visible_devices(&mut env_vars, device_ids);
         }
 
+        let labels = HashMap::from([(
+            "mantissa.workload_id".to_string(),
+            request.task_id.to_string(),
+        )]);
         let create_request = RuntimeCreateRequest {
-            name: request.container_name.to_string(),
+            name: request.instance_name.to_string(),
             image: request.image.to_string(),
+            labels: Some(labels),
             command: if request.command.is_empty() {
                 None
             } else {
@@ -127,7 +136,7 @@ impl TaskManager {
             },
             tty: request.tty,
             // Keep stdin open so later `tasks attach` sessions can forward input into shells and
-            // other interactive entrypoints after the container has already been started.
+            // other interactive entrypoints after the runtime instance has already been started.
             open_stdin: true,
             env_vars,
             ports: None,
@@ -139,7 +148,7 @@ impl TaskManager {
         };
         let retry_create_request = create_request.clone();
 
-        let (container_id, created_fresh) = match self
+        let (instance_id, created_fresh) = match self
             .runtime
             .runtime_backend
             .create_instance(create_request)
@@ -149,7 +158,7 @@ impl TaskManager {
             Err(err) => {
                 if is_name_conflict(&err) {
                     match self
-                        .resolve_existing_container_id(request.container_name)
+                        .resolve_existing_instance_id(request.instance_name)
                         .await
                     {
                         Ok(Some(existing_id)) => (existing_id, false),
@@ -157,8 +166,8 @@ impl TaskManager {
                             debug!(
                                 target: "task",
                                 task = %request.task_id,
-                                container = %request.container_name,
-                                "name conflict had no resolvable existing container; retrying create once"
+                                instance = %request.instance_name,
+                                "name conflict had no resolvable existing instance; retrying create once"
                             );
                             match self
                                 .runtime
@@ -201,16 +210,16 @@ impl TaskManager {
         match self
             .runtime
             .runtime_backend
-            .start_instance(&container_id)
+            .start_instance(&instance_id)
             .await
         {
             Ok(_) => {}
             Err(err) => {
-                if container_already_running(&err) {
+                if instance_already_running(&err) {
                     debug!(
                         target: "task",
-                        "container {} already running while starting task {}",
-                        container_id,
+                        "instance {} already running while starting task {}",
+                        instance_id,
                         request.task_id
                     );
                 } else {
@@ -218,13 +227,13 @@ impl TaskManager {
                         && let Err(remove_err) = self
                             .runtime
                             .runtime_backend
-                            .remove_instance(&container_id, true, true)
+                            .remove_instance(&instance_id, true, true)
                             .await
                     {
                         warn!(
                             target: "task",
-                            "failed to remove container {} after start failure: {remove_err}",
-                            container_id
+                            "failed to remove instance {} after start failure: {remove_err}",
+                            instance_id
                         );
                     }
                     return Err(wrap_start_error(request.task_name, err));
@@ -232,7 +241,7 @@ impl TaskManager {
             }
         }
 
-        Ok(container_id)
+        Ok(instance_id)
     }
 }
 
