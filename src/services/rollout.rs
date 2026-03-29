@@ -49,7 +49,7 @@ struct RolloutProgress {
 struct RolloutArtifacts {
     assignment_index: BTreeMap<(String, u16), Uuid>,
     old_templates_by_name: HashMap<String, ServiceTaskSpecValue>,
-    replacement_requests: Vec<TaskStartRequest>,
+    replacement_requests: Vec<WorkloadStartRequest>,
     rollback_new_task_ids: HashSet<Uuid>,
     rollback_old_tasks: HashMap<Uuid, RollbackTaskRecord>,
 }
@@ -104,7 +104,7 @@ struct RemovalPhaseContext<'a> {
 /// One in-flight replacement chunk built from manifest-ordered rollout indices.
 struct ReplacementChunk<'a> {
     replacements: Vec<&'a ReplicaReplacement>,
-    requests: Vec<TaskStartRequest>,
+    requests: Vec<WorkloadStartRequest>,
 }
 
 impl ReplacementChunk<'_> {
@@ -272,7 +272,7 @@ fn build_replacement_requests(
     replacements: &[ReplicaReplacement],
     eligible_nodes: &[Uuid],
     volume_registry: &VolumeRegistry,
-) -> Vec<TaskStartRequest> {
+) -> Vec<WorkloadStartRequest> {
     let slot_targets =
         compute_effective_slot_targets(service_id, templates, eligible_nodes, volume_registry)
             .unwrap_or_default();
@@ -281,9 +281,8 @@ fn build_replacement_requests(
         .map(|replacement| {
             let key = SlotKey::new(service_id, &replacement.template.name, replacement.replica);
             let target_node = slot_targets.get(&key).copied();
-            make_replica_request(
+            replacement.template.replica_start_request(
                 service_name,
-                &replacement.template,
                 replacement.replica,
                 replacement.desired_id,
                 target_node,
@@ -1254,9 +1253,8 @@ impl ServiceController {
 
             let key = SlotKey::new(current_spec.id, &step.template, step.replica);
             let target_node = slot_targets.get(&key).copied();
-            let request = make_replica_request(
+            let request = template.replica_start_request(
                 service_name,
-                template,
                 step.replica,
                 step.task_id,
                 target_node,

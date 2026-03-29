@@ -1138,7 +1138,7 @@ of translating service templates into task-start structs.
 
 ### Status
 
-Pending.
+Completed on 2026-03-29.
 
 ### Scope
 
@@ -1179,6 +1179,96 @@ Pending.
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
+
+### Completed
+
+1. Moved service replica launch construction onto the shared service-template
+   model in `src/services/types.rs`:
+   - added `launch_execution()` to resolve service network requirements into
+     launch-time network IDs
+   - added `replica_start_request()` so one `ServiceTaskSpecValue` can produce
+     its own `WorkloadStartRequest`
+   - moved deterministic replica naming beside the template model instead of
+     rebuilding it in the controller
+2. Cut service rollout and reconciliation paths over to
+   `WorkloadStartRequest` and `WorkloadTrafficPublicationUpdate` in:
+   - `src/services/manager.rs`
+   - `src/services/rollout.rs`
+   - `src/services/slot_reconcile.rs`
+3. Removed the controller-side field-copy glue from `src/services/manager.rs`:
+   - deleted `make_replica_request()`
+   - deleted `format_replica_name()`
+   - deleted `short_id()`
+4. Updated fallback and rollout helper APIs so they operate on workload start
+   requests rather than task-start aliases:
+   - `start_tasks_with_fallback(...)`
+   - `build_start_requests(...)`
+   - `build_missing_template_requests(...)`
+   - `build_replacement_requests(...)`
+   - `allow_untargeted_fallback(...)`
+   - `requests_require_pinned_targets(...)`
+5. Removed the now-unused `task_start_error_is_retryable` compatibility
+   re-export from `src/task/manager/mod.rs` because the service controller now
+   uses the workload-native helper directly.
+6. Preserved service-only semantics in the service layer:
+   - readiness stayed on `ServiceTaskSpecValue`
+   - dependency ordering stayed in `src/services/dependencies.rs`
+   - public port/protocol stayed in `src/services/types.rs`
+   - rollout orchestration stayed in `src/services/rollout.rs`
+7. Updated service-manager tests so request helpers and replica-launch
+   assertions exercise the workload-native request path directly.
+
+### Removed
+
+1. Removed the last service-controller code path that rebuilt replica launch
+   metadata field by field in `src/services/manager.rs`.
+2. Removed the local compatibility re-export that only existed to support the
+   old task-shaped service launch path.
+3. Removed task-shaped request types from service rollout/fallback helper
+   signatures; the controller now depends on workload-native start requests at
+   that boundary.
+
+### Findings
+
+1. The service template model was already most of the way there. The real
+   remaining duplication was not in manifest storage or RPC codecs, but in the
+   controller seam where service templates were still being copied into
+   task-shaped requests.
+2. No client-side schema or manifest parsing changes were required for this
+   milestone because the shared execution-spec embedding had already landed in
+   earlier work. The remaining cutover was server-side orchestration.
+3. The workload-manager API is still task-named (`start_tasks_batch`,
+   `request_task_stop`, and similar), but the service controller now feeds it
+   workload-native request objects. Renaming those APIs is a separate cleanup,
+   not a blocker for shared template cutover.
+
+### Validation Completed
+
+1. `cargo fmt --all`
+2. `cargo clippy --all-targets -- -D warnings`
+3. `cargo test`
+
+All three commands passed on 2026-03-29.
+
+### Proposed Commit
+
+```text
+services: launch replicas from shared workload templates
+
+Move service replica request construction onto ServiceTaskSpecValue so
+the service controller launches shared workload requests directly from
+the embedded execution template instead of rebuilding the launch shape
+inside services/manager.rs.
+
+This removes make_replica_request and related naming glue, cuts
+rollout and fallback helpers over to WorkloadStartRequest and
+WorkloadTrafficPublicationUpdate, and drops the now-unused
+task_start_error_is_retryable compatibility re-export.
+
+Service-only behavior such as readiness, dependency ordering, public
+port exposure, and rollout state remains in the service layer while
+execution details stay shared through WorkloadExecutionSpec.
+```
 
 ## Milestone 8: First-Class Jobs
 

@@ -5,8 +5,7 @@ use super::{
     SERVICE_ENABLE_PROACTIVE_REBALANCE, SERVICE_REBALANCE_COOLDOWN_SECS,
     SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController, ServiceTaskSnapshot, TaskInventory,
     compute_effective_slot_targets, deploying_assignment_incomplete, expected_task_id_count,
-    is_local_volume_unavailable_error, make_replica_request,
-    mounted_local_volumes_require_pinned_target, node_is_down,
+    is_local_volume_unavailable_error, mounted_local_volumes_require_pinned_target, node_is_down,
     should_restart_missing_slot_immediately, task_age_allows_cleanup, task_age_allows_rebalance,
     task_state_healthy, task_state_rebalanceable,
 };
@@ -311,9 +310,8 @@ impl ServiceController {
         }
 
         if let Some(preferred_node) = preferred_node {
-            let request = make_replica_request(
+            let request = slot.template.replica_start_request(
                 &spec.service_name,
-                &slot.template,
                 slot.replica,
                 task_id,
                 Some(preferred_node),
@@ -364,13 +362,9 @@ impl ServiceController {
             return Ok(());
         }
 
-        let fallback = make_replica_request(
-            &spec.service_name,
-            &slot.template,
-            slot.replica,
-            task_id,
-            None,
-        );
+        let fallback =
+            slot.template
+                .replica_start_request(&spec.service_name, slot.replica, task_id, None);
 
         self.task_manager
             .start_tasks_batch(vec![fallback])
@@ -454,9 +448,8 @@ impl ServiceController {
         preferred_node: Uuid,
         key: &SlotKey,
     ) -> anyhow::Result<()> {
-        let request = make_replica_request(
+        let request = slot.template.replica_start_request(
             &spec.service_name,
-            &slot.template,
             slot.replica,
             task.id,
             Some(preferred_node),

@@ -11,13 +11,14 @@ use crate::services::types::{
     ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceTaskSpecValue,
     ServiceUpdateStrategy, compute_service_id,
 };
-use crate::task::manager::{
-    TaskManager, TaskStartRequest, TaskTrafficPublicationUpdate, task_start_error_is_retryable,
-};
-use crate::task::types::{TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskVolumeMount};
+use crate::task::manager::TaskManager;
+use crate::task::types::{TaskSpec, TaskStateFilter, TaskVolumeMount};
 use crate::volumes::types::VolumeDriver;
 use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
-use crate::workload::model::{RuntimeClass, WorkloadPhase as ContainerState};
+use crate::workload::manager::{
+    WorkloadStartRequest, WorkloadTrafficPublicationUpdate, workload_start_error_is_retryable,
+};
+use crate::workload::model::WorkloadPhase as ContainerState;
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -743,7 +744,7 @@ impl ServiceController {
                     service_name
                 );
 
-                if task_start_error_is_retryable(&err) {
+                if workload_start_error_is_retryable(&err) {
                     tracing::info!(
                         target: "services",
                         "deferring deployment retry for '{}' until scheduling prerequisites converge",
@@ -1363,7 +1364,7 @@ impl ServiceController {
             deployment.service_name
         );
 
-        if task_start_error_is_retryable(err) {
+        if workload_start_error_is_retryable(err) {
             tracing::info!(
                 target: "services",
                 "deferring deployment retry for '{}' until scheduling prerequisites converge",
@@ -1676,10 +1677,10 @@ impl ServiceController {
         }
     }
 
-    /// Starts a batch of tasks, retrying without node targets to keep deployments progressing.
+    /// Starts a batch of workloads, retrying without node targets to keep deployments progressing.
     async fn start_tasks_with_fallback(
         &self,
-        mut requests: Vec<TaskStartRequest>,
+        mut requests: Vec<WorkloadStartRequest>,
         context: &str,
     ) -> anyhow::Result<Vec<TaskSpec>> {
         if requests.is_empty() {
@@ -1758,9 +1759,11 @@ impl ServiceController {
             .set_task_traffic_published(task_id, true)
             .await
         {
-            Ok(TaskTrafficPublicationUpdate::Updated | TaskTrafficPublicationUpdate::Unchanged) => {
-            }
-            Ok(TaskTrafficPublicationUpdate::NoAttachments) => {
+            Ok(
+                WorkloadTrafficPublicationUpdate::Updated
+                | WorkloadTrafficPublicationUpdate::Unchanged,
+            ) => {}
+            Ok(WorkloadTrafficPublicationUpdate::NoAttachments) => {
                 self.spawn_task_traffic_publish_waiter(
                     service_name.to_string(),
                     task_id,
@@ -2172,14 +2175,14 @@ fn format_dependency_gate_stability_detail(
     )
 }
 
-/// Builds the individual task start requests for every replica defined in the service manifest.
+/// Builds the individual workload start requests for every replica defined in the service manifest.
 fn build_start_requests(
     service_name: &str,
     service_id: Uuid,
     tasks: &[ServiceTaskSpecValue],
     eligible_nodes: &[Uuid],
     volume_registry: &VolumeRegistry,
-) -> Vec<TaskStartRequest> {
+) -> Vec<WorkloadStartRequest> {
     let slot_targets =
         compute_effective_slot_targets(service_id, tasks, eligible_nodes, volume_registry)
             .unwrap_or_default();
@@ -2190,9 +2193,8 @@ fn build_start_requests(
             let desired_id = Uuid::new_v4();
             let key = SlotKey::new(service_id, &task.name, replica_number);
             let target_node = slot_targets.get(&key).copied();
-            requests.push(make_replica_request(
+            requests.push(task.replica_start_request(
                 service_name,
-                task,
                 replica_number,
                 desired_id,
                 target_node,
@@ -2202,14 +2204,14 @@ fn build_start_requests(
     requests
 }
 
-/// Builds task start requests only for replicas that are still missing from the current manifest.
+/// Builds workload start requests only for replicas still missing from the current manifest.
 fn build_missing_template_requests(
     service_name: &str,
     service_id: Uuid,
     template: &ServiceTaskSpecValue,
     assignments: &BTreeMap<(String, u16), Uuid>,
     slot_targets: &HashMap<SlotKey, Uuid>,
-) -> Vec<TaskStartRequest> {
+) -> Vec<WorkloadStartRequest> {
     let mut requests = Vec::new();
     for replica in 1..=template.replicas {
         if assignments.contains_key(&(template.name.clone(), replica)) {
@@ -2219,9 +2221,8 @@ fn build_missing_template_requests(
         let desired_id = Uuid::new_v4();
         let key = SlotKey::new(service_id, &template.name, replica);
         let target_node = slot_targets.get(&key).copied();
-        requests.push(make_replica_request(
+        requests.push(template.replica_start_request(
             service_name,
-            template,
             replica,
             desired_id,
             target_node,
@@ -2306,7 +2307,7 @@ pub(super) fn mounted_local_volumes_require_pinned_target(
 /// Returns true when any task request in the batch must preserve its explicit node target.
 fn requests_require_pinned_targets(
     volume_registry: &VolumeRegistry,
-    requests: &[TaskStartRequest],
+    requests: &[WorkloadStartRequest],
 ) -> anyhow::Result<bool> {
     for request in requests {
         if mounted_local_volumes_require_pinned_target(volume_registry, &request.volumes)? {
@@ -2387,42 +2388,6 @@ fn order_task_ids(
     ids
 }
 
-/// Generates a task start request for a specific manifest replica with deterministic metadata.
-fn make_replica_request(
-    service_name: &str,
-    template: &ServiceTaskSpecValue,
-    replica: u16,
-    desired_id: Uuid,
-    target_node: Option<Uuid>,
-) -> TaskStartRequest {
-    let name = format_replica_name(service_name, &template.name, replica, desired_id);
-    TaskStartRequest {
-        name,
-        execution: template
-            .execution
-            .map_networks(|network| network.network_id),
-        runtime_class: RuntimeClass::Oci,
-        sandbox_profile: None,
-        gpu_device_ids: Vec::new(),
-        id: Some(desired_id),
-        slot_ids: Vec::new(),
-        service_metadata: Some(TaskServiceMetadata::new(service_name, &template.name)),
-        target_node,
-    }
-}
-
-/// Formats a human-readable container name that encodes template, replica, and unique identity.
-fn format_replica_name(service_name: &str, template_name: &str, replica: u16, id: Uuid) -> String {
-    let suffix = short_id(&id);
-    format!("{service_name}-{template_name}-{replica}-{suffix}")
-}
-
-/// Produces a stable, human-readable identifier fragment for inclusion in container names.
-fn short_id(id: &Uuid) -> String {
-    let raw = id.as_simple().to_string();
-    raw[..8].to_string()
-}
-
 /// Collects the sorted set of nodes that remain eligible for service placement.
 fn build_eligible_nodes<I>(
     local_node_id: Uuid,
@@ -2463,7 +2428,7 @@ fn should_accept_update(current: Option<&ServiceSpecValue>, incoming: &ServiceSp
 /// one transient scheduling miss can collapse a balanced scale-out onto fewer nodes and leave the
 /// repair work to a later rebalance loop. Only batches that point at zero or one distinct target
 /// should use the untargeted fallback path.
-fn allow_untargeted_fallback(requests: &[TaskStartRequest]) -> bool {
+fn allow_untargeted_fallback(requests: &[WorkloadStartRequest]) -> bool {
     requests
         .iter()
         .filter_map(|request| request.target_node)
@@ -2512,6 +2477,7 @@ mod tests {
         LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
         VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
     };
+    use crate::workload::model::RuntimeClass;
     use crate::workload::types::{TaskExecutionSpec, WorkloadExecutionSpec};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2607,13 +2573,13 @@ mod tests {
         }
     }
 
-    /// Builds one minimal task start request that mounts exactly one volume.
+    /// Builds one minimal workload start request that mounts exactly one volume.
     fn make_volume_request(
         volume_id: Uuid,
         volume_name: &str,
         target_node: Option<Uuid>,
-    ) -> TaskStartRequest {
-        TaskStartRequest {
+    ) -> WorkloadStartRequest {
+        WorkloadStartRequest {
             name: "demo-task".to_string(),
             execution: TaskExecutionSpec {
                 volumes: vec![TaskVolumeMount {
@@ -2634,9 +2600,9 @@ mod tests {
         }
     }
 
-    /// Builds one minimal task start request for fallback-policy tests.
-    fn make_request(target_node: Option<Uuid>) -> TaskStartRequest {
-        TaskStartRequest {
+    /// Builds one minimal workload start request for fallback-policy tests.
+    fn make_request(target_node: Option<Uuid>) -> WorkloadStartRequest {
+        WorkloadStartRequest {
             name: "demo-task".to_string(),
             execution: empty_task_execution("ghcr.io/demo/app:latest"),
             runtime_class: RuntimeClass::Oci,
@@ -2713,7 +2679,7 @@ mod tests {
             public_protocol: None,
         };
 
-        let request = make_replica_request("demo-service", &template, 1, desired_id, None);
+        let request = template.replica_start_request("demo-service", 1, desired_id, None);
 
         assert_eq!(request.termination_grace_period_secs, Some(42));
         assert_eq!(

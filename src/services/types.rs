@@ -4,7 +4,9 @@ use std::ops::Deref;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::workload::types::WorkloadExecutionSpec;
+use crate::workload::manager::WorkloadStartRequest;
+use crate::workload::model::{RuntimeClass, WorkloadServiceMetadata};
+use crate::workload::types::{TaskExecutionSpec, WorkloadExecutionSpec};
 pub use crate::workload::types::{
     WorkloadLivenessProbe as ServiceLivenessProbe,
     WorkloadLivenessProbeKind as ServiceLivenessProbeKind,
@@ -383,12 +385,38 @@ impl ServiceTaskSpecValue {
         self.execution.liveness.as_ref()
     }
 
+    /// Builds the launch-time execution spec by resolving service network requirements to IDs.
+    pub fn launch_execution(&self) -> TaskExecutionSpec {
+        self.execution.map_networks(|network| network.network_id)
+    }
+
     pub fn required_network_ids(&self) -> Vec<Uuid> {
         self.execution
             .networks
             .iter()
             .map(|network| network.network_id)
             .collect()
+    }
+
+    /// Builds one workload start request for a specific service replica.
+    pub fn replica_start_request(
+        &self,
+        service_name: &str,
+        replica: u16,
+        desired_id: Uuid,
+        target_node: Option<Uuid>,
+    ) -> WorkloadStartRequest {
+        WorkloadStartRequest {
+            name: format_replica_name(service_name, &self.name, replica, desired_id),
+            execution: self.launch_execution(),
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
+            gpu_device_ids: Vec::new(),
+            id: Some(desired_id),
+            slot_ids: Vec::new(),
+            service_metadata: Some(WorkloadServiceMetadata::new(service_name, &self.name)),
+            target_node,
+        }
     }
 
     /// Return the port that should be reachable from the host via the network VIP, if one was
@@ -408,6 +436,18 @@ impl ServiceTaskSpecValue {
             ServicePortProtocol::TcpUdp => vec![ServicePortProtocol::Tcp, ServicePortProtocol::Udp],
         }
     }
+}
+
+/// Formats one stable service replica workload name from the template and desired identifier.
+fn format_replica_name(service_name: &str, template_name: &str, replica: u16, id: Uuid) -> String {
+    let suffix = short_id(&id);
+    format!("{service_name}-{template_name}-{replica}-{suffix}")
+}
+
+/// Produces a compact identifier fragment for replica names while preserving readability.
+fn short_id(id: &Uuid) -> String {
+    let raw = id.as_simple().to_string();
+    raw[..8].to_string()
 }
 
 impl Deref for ServiceTaskSpecValue {
