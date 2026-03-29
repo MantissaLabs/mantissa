@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
-use super::planner::StartIntent;
+use super::planner::{SchedulingError, StartIntent};
 use super::reservation::{RemotePrepareRejection, RemotePrepareRejectionReason};
 use super::*;
 
@@ -43,6 +43,7 @@ use crate::volumes::types::{
     LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
     VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
 };
+use crate::workload::model::RuntimeClass;
 use crate::workload::types::TaskExecutionSpec;
 use ::health::HealthMonitor;
 use anyhow::{Result, anyhow};
@@ -1120,6 +1121,8 @@ fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> Wor
             }],
             ..empty_task_execution("img")
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
@@ -2250,6 +2253,8 @@ async fn reconcile_local_tasks_does_not_duplicate_batch_launch_in_progress() {
             networks: vec![spec.id],
             ..empty_task_execution("img")
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
@@ -4081,6 +4086,8 @@ async fn start_tasks_batch_reserves_every_slot() {
             WorkloadStartRequest {
                 name: "svc-a".into(),
                 execution: empty_task_execution("img"),
+                runtime_class: RuntimeClass::Oci,
+                sandbox_profile: None,
                 gpu_device_ids: Vec::new(),
                 id: None,
                 slot_ids: Vec::new(),
@@ -4090,6 +4097,8 @@ async fn start_tasks_batch_reserves_every_slot() {
             WorkloadStartRequest {
                 name: "svc-b".into(),
                 execution: empty_task_execution("img"),
+                runtime_class: RuntimeClass::Oci,
+                sandbox_profile: None,
                 gpu_device_ids: Vec::new(),
                 id: None,
                 slot_ids: Vec::new(),
@@ -4134,6 +4143,8 @@ async fn start_tasks_batch_respects_existing_reservations() {
         .start_tasks_batch(vec![WorkloadStartRequest {
             name: "svc-a".into(),
             execution: empty_task_execution("img"),
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
             gpu_device_ids: Vec::new(),
             id: Some(task_id),
             slot_ids: vec![slot_spec.slot_id],
@@ -4681,6 +4692,8 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
             WorkloadStartRequest {
                 name: "svc-c".into(),
                 execution: empty_task_execution("img"),
+                runtime_class: RuntimeClass::Oci,
+                sandbox_profile: None,
                 gpu_device_ids: Vec::new(),
                 id: None,
                 slot_ids: Vec::new(),
@@ -4690,6 +4703,8 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
             WorkloadStartRequest {
                 name: "svc-d".into(),
                 execution: empty_task_execution("img"),
+                runtime_class: RuntimeClass::Oci,
+                sandbox_profile: None,
                 gpu_device_ids: Vec::new(),
                 id: None,
                 slot_ids: Vec::new(),
@@ -4762,6 +4777,8 @@ async fn runtime_attachments_created_and_removed_on_stop() {
             networks: vec![spec.id],
             ..empty_task_execution("img")
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
@@ -4851,6 +4868,8 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
             networks: vec![spec.id],
             ..empty_task_execution("img")
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
@@ -5097,6 +5116,8 @@ async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
             networks: vec![spec.id],
             ..empty_task_execution("img")
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
@@ -5201,6 +5222,8 @@ async fn request_task_stop_cleans_up_after_teardown_failure() {
             networks: vec![spec.id],
             ..empty_task_execution("img")
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
@@ -6179,6 +6202,8 @@ async fn attachment_ready_triggers_forwarding_event() {
             networks: vec![spec.id],
             ..empty_task_execution("img")
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
@@ -6271,6 +6296,8 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
             networks: vec![spec_a.id, spec_b.id],
             ..empty_task_execution("img")
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
@@ -6360,6 +6387,8 @@ async fn runtime_attachments_retry_transient_provision_errors() {
             networks: vec![spec.id],
             ..empty_task_execution("img")
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
@@ -6453,6 +6482,8 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
             networks: vec![spec.id],
             ..empty_task_execution("img")
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
@@ -6506,6 +6537,9 @@ fn scheduling_retry_budget_stays_wide_for_untargeted_starts() {
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
+        required_runtime_features: Vec::new(),
         preassigned_slots: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
@@ -6535,6 +6569,9 @@ fn scheduling_retry_budget_is_shorter_for_targeted_starts() {
         memory_bytes: 64 * 1_024 * 1_024,
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
+        required_runtime_features: Vec::new(),
         preassigned_slots: Vec::new(),
         restart_policy: None,
         termination_grace_period_secs: None,
@@ -6561,6 +6598,8 @@ async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
             networks: vec![Uuid::new_v4()],
             ..empty_task_execution("img")
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: Some(Uuid::new_v4()),
         slot_ids: Vec::new(),
@@ -6577,6 +6616,65 @@ async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
     .expect_err("network-blocked start should fail");
 
     assert!(workload_start_error_is_retryable(&result));
+}
+
+#[tokio::test]
+async fn start_tasks_batch_rejects_unsupported_local_runtime_class() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+    let request = WorkloadStartRequest {
+        name: "microvm-task".into(),
+        execution: TaskExecutionSpec {
+            cpu_millis: 100,
+            memory_bytes: 64 * 1_024 * 1_024,
+            ..empty_task_execution("img")
+        },
+        runtime_class: RuntimeClass::MicroVm,
+        sandbox_profile: Some("vm-default".into()),
+        gpu_device_ids: Vec::new(),
+        id: Some(Uuid::new_v4()),
+        slot_ids: Vec::new(),
+        service_metadata: None,
+        target_node: None,
+    };
+
+    let result = manager
+        .start_tasks_batch(vec![request])
+        .await
+        .expect_err("unsupported local runtime class should fail");
+
+    assert!(
+        !workload_start_error_is_retryable(&result),
+        "runtime requirement failures should not enter the retry loop"
+    );
+
+    let cause = result
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .expect("runtime scheduling error");
+    match cause {
+        SchedulingError::RuntimeRequirementsBlocked {
+            task,
+            runtime_class,
+            sandbox_profile,
+            feature_flags,
+        } => {
+            assert_eq!(task, "microvm-task");
+            assert_eq!(*runtime_class, "microvm");
+            assert_eq!(sandbox_profile.as_deref(), Some("vm-default"));
+            assert!(
+                feature_flags.is_empty(),
+                "plain runtime-class mismatch should not invent extra feature requirements"
+            );
+        }
+        other => panic!("unexpected scheduling error: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -6874,6 +6972,8 @@ async fn multi_volume_bound_node_conflict_rejected() {
                 ],
                 ..empty_task_execution("img")
             },
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
             gpu_device_ids: Vec::new(),
             id: None,
             slot_ids: Vec::new(),

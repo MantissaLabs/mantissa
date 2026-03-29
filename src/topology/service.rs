@@ -7,6 +7,7 @@ use crate::config;
 use crate::node::address::extract_port;
 use crate::node::id::{read_node_id, set_node_id};
 use crate::node::identity::pubkey_from_slice;
+use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::SlotCapacity;
 use crate::scheduler::summary::{SchedulerGpuState, SchedulerSlotState, SchedulerSummary};
 use crate::server::credential::ClusterCredential;
@@ -24,7 +25,9 @@ use crate::topology::operation::{
     ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
     SplitNetworkPolicy, SplitServicePolicy,
 };
-use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
+use crate::topology::peers::{
+    PeerSchedulingState, PeerValue, WireGuardPeerValue, write_runtime_support_to_node_info,
+};
 use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::types::VolumeDriver;
 use async_trait::async_trait;
@@ -68,6 +71,7 @@ struct JoinPayload {
     identity_sig: [u8; 64],
     wireguard: Option<WireGuardPeerValue>,
     scheduling: PeerSchedulingState,
+    runtime_support: RuntimeSupportProfile,
 }
 
 struct JoinInputs {
@@ -104,6 +108,7 @@ fn peer_value_from_join_payload(payload: &JoinPayload) -> PeerValue {
         identity_sig: payload.identity_sig.to_vec(),
         wireguard: payload.wireguard.clone(),
         scheduling: payload.scheduling.clone(),
+        runtime_support: payload.runtime_support.clone(),
     }
 }
 
@@ -118,6 +123,11 @@ fn restored_local_peer_value(current: Option<&PeerValue>, mut restored: PeerValu
         restored.wireguard =
             WireGuardPeerValue::preferred(current.wireguard.as_ref(), restored.wireguard.as_ref());
         restored.scheduling = PeerSchedulingState::merge(&restored.scheduling, &current.scheduling);
+        restored.runtime_support = RuntimeSupportProfile::preferred(
+            Some(&restored.runtime_support),
+            Some(&current.runtime_support),
+        )
+        .unwrap_or_default();
     }
     restored
 }
@@ -522,6 +532,7 @@ impl Topology {
             ),
             wireguard,
             scheduling: self.current_scheduling_state(),
+            runtime_support: self.runtime_support.clone(),
         })
     }
 
@@ -561,6 +572,7 @@ impl Topology {
         if let Some(reason) = payload.scheduling.reason.as_deref() {
             info.set_scheduling_reason(reason);
         }
+        write_runtime_support_to_node_info(info.reborrow(), &payload.runtime_support);
         if let Some(wg) = payload.wireguard.as_ref() {
             info.set_wireguard_public_key(&wg.public_key);
             info.set_wireguard_port(wg.port);
@@ -1718,6 +1730,7 @@ impl topology::Server for Topology {
                 if let Some(reason) = val.scheduling.reason.as_deref() {
                     node.set_scheduling_reason(reason);
                 }
+                write_runtime_support_to_node_info(node.reborrow(), &val.runtime_support);
                 if let Some(wg) = val.wireguard.as_ref() {
                     node.set_wireguard_public_key(&wg.public_key);
                     node.set_wireguard_port(wg.port);
@@ -2365,7 +2378,38 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 signing_pub: Box::new(signing_pub),
                 identity_sig: identity_sig.to_vec(),
                 wireguard,
-                scheduling,
+                scheduling: Box::new(scheduling),
+                runtime_support: Box::new(RuntimeSupportProfile::new(
+                    node.get_runtime_classes()?
+                        .iter()
+                        .filter_map(|value| {
+                            value
+                                .ok()
+                                .and_then(|value| value.to_str().ok())
+                                .and_then(|value| {
+                                    value.parse::<crate::workload::model::RuntimeClass>().ok()
+                                })
+                        })
+                        .collect::<Vec<_>>(),
+                    node.get_sandbox_profiles()?
+                        .iter()
+                        .filter_map(|value| {
+                            value
+                                .ok()
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string)
+                        })
+                        .collect::<Vec<_>>(),
+                    node.get_runtime_feature_flags()?
+                        .iter()
+                        .filter_map(|value| {
+                            value
+                                .ok()
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string)
+                        })
+                        .collect::<Vec<_>>(),
+                )),
             }
         }
         EventType::Remove => {
@@ -2459,6 +2503,7 @@ pub fn add_event(
             identity_sig,
             wireguard,
             scheduling,
+            runtime_support,
         } => {
             let mut topo = msg.init_topology();
 
@@ -2487,6 +2532,7 @@ pub fn add_event(
             if let Some(reason) = scheduling.reason.as_deref() {
                 node.set_scheduling_reason(reason);
             }
+            write_runtime_support_to_node_info(node.reborrow(), runtime_support.as_ref());
             if let Some(wg) = wireguard.as_ref() {
                 node.set_wireguard_public_key(&wg.public_key);
                 node.set_wireguard_port(wg.port);
@@ -2577,6 +2623,7 @@ pub fn add_event(
 #[cfg(test)]
 mod tests {
     use super::restored_local_peer_value;
+    use crate::runtime::types::RuntimeSupportProfile;
     use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
     use uuid::Uuid;
 
@@ -2594,6 +2641,7 @@ mod tests {
                 port: 7777,
                 enabled: false,
             }),
+            runtime_support: RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState {
                 schedulable: true,
                 drain_requested: false,
@@ -2634,6 +2682,7 @@ mod tests {
             signing_pub: [7u8; 32],
             identity_sig: vec![6u8; 64],
             wireguard: None,
+            runtime_support: RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState {
                 schedulable: false,
                 drain_requested: true,

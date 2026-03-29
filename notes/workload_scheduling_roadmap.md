@@ -980,7 +980,7 @@ runtime class or sandbox profile.
 
 ### Status
 
-Pending.
+Completed on 2026-03-29.
 
 ### Scope
 
@@ -1022,6 +1022,112 @@ Pending.
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
+
+### Completed
+
+1. Added cluster-visible runtime capability metadata and propagated it through
+   topology registration, join handling, gossip relay, peer storage, and
+   registry lookups:
+   - `src/runtime/types.rs`
+   - `crates/protocol/schema/topology.capnp`
+   - `src/topology/peers.rs`
+   - `src/topology/types.rs`
+   - `src/topology/mod.rs`
+   - `src/topology/service.rs`
+   - `src/server/service.rs`
+   - `src/gossip/mod.rs`
+   - `src/server/bootstrap/runtime.rs`
+   - `src/registry/mod.rs`
+2. Extended workload start requests and planner intents to carry runtime class,
+   sandbox profile, and derived runtime feature requirements:
+   - `src/workload/manager/mod.rs`
+   - `src/workload/manager/planner.rs`
+   - `src/task/service.rs`
+   - `src/services/manager.rs`
+   - `tests/task_secrets.rs`
+   - `tests/volumes.rs`
+3. Made planner placement runtime-aware:
+   - local preassigned starts now fail when the local node cannot satisfy the
+     requested runtime requirements,
+   - remote digest hints only count intents a peer can actually host,
+   - untargeted candidate allocation tracks runtime-incompatible peers and
+     returns a structured runtime-requirements error instead of generic
+     capacity failure.
+4. Removed planner-owned instance naming from scheduling inputs. The planner no
+   longer carries `instance_name`; local launch derives `mantissa-<uuid>` only
+   after placement in `src/workload/manager/local.rs`.
+5. Added runtime-aware test coverage:
+   - planner unit coverage for digest hostability against runtime profiles in
+     `src/workload/manager/planner.rs`
+   - workload-manager coverage for fast-failing unsupported local runtime
+     classes in `src/workload/manager/tests.rs`
+6. Tightened scheduling retry classification so runtime requirement failures are
+   not treated as transient convergence problems. Unsupported runtime classes
+   now fail fast instead of exhausting the scheduling retry budget in
+   `src/workload/manager/mod.rs`.
+7. Refactored supporting code to satisfy the stricter lint gate introduced by
+   the new metadata:
+   - `RuntimeClass` now implements `std::str::FromStr` in
+     `src/workload/model.rs`
+   - `TopologyEvent::Join` boxes scheduling and runtime-support payloads in
+     `src/topology/types.rs`
+   - local placement prerequisites are grouped in
+     `src/workload/manager/planner.rs` instead of extending
+     `seed_local_plans(...)` argument count further.
+
+### Removed
+
+1. Removed the planner's dependency on precomputed instance names as scheduling
+   data.
+2. Removed the implicit assumption that every schedulable node can host every
+   workload runtime. Placement now consults per-peer runtime support before a
+   node is considered a valid candidate.
+3. Removed the retry-path bug where runtime mismatches were treated like
+   transient network or snapshot convergence errors.
+4. Removed the ad hoc `RuntimeClass::from_str` helper in favor of the standard
+   `FromStr` trait implementation.
+
+### Findings
+
+1. Runtime capability propagation touches more than the planner. The topology
+   wire format, peer merge logic, join replay path, and registry cache all had
+   to converge on the same runtime-support projection before scheduler filters
+   could trust the data.
+2. The test suite exposed a real behavior bug, not just missing coverage:
+   runtime requirement failures were still being retried because the retry
+   classifier treated every `SchedulingError` as transient. That had to be
+   fixed before the milestone could be considered complete.
+3. Adding runtime metadata to `TopologyEvent::Join` pushed the enum over the
+   clippy size threshold. Boxing the scheduling and runtime-support payloads
+   kept the event cheap to clone and relay without weakening the lint gate.
+
+### Validation Completed
+
+1. `cargo fmt --all`
+2. `cargo clippy --all-targets -- -D warnings`
+3. `cargo test`
+
+All three commands passed on 2026-03-29.
+
+### Proposed Commit
+
+```text
+planner: make placement runtime aware
+
+Propagate runtime support metadata through topology registration,
+gossip, peer storage, and registry lookups so scheduler decisions no
+longer assume every node can host every workload runtime.
+
+This extends workload start requests and planner intents with runtime
+class, sandbox profile, and derived feature requirements, removes
+planner-owned instance naming, and teaches local and remote candidate
+selection to reject runtime-incompatible nodes explicitly.
+
+The scheduling retry path now treats runtime requirement failures as
+non-transient so unsupported runtime classes fail fast instead of
+burning the retry budget. Tests were added for runtime-aware digest
+hostability and unsupported local runtime rejection.
+```
 
 ## Milestone 7: Service Controller Cutover Onto Shared Workload Templates
 

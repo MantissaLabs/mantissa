@@ -955,6 +955,7 @@ fn message_for_forwarding(message: &Message) -> Option<Message> {
                     identity_sig,
                     wireguard,
                     scheduling,
+                    runtime_support,
                 } => TopologyEvent::Join {
                     id: *peer_id,
                     hostname: hostname.clone(),
@@ -967,6 +968,7 @@ fn message_for_forwarding(message: &Message) -> Option<Message> {
                     identity_sig: identity_sig.clone(),
                     wireguard: wireguard.clone(),
                     scheduling: scheduling.clone(),
+                    runtime_support: runtime_support.clone(),
                 },
                 other => other.clone(),
             };
@@ -1320,9 +1322,10 @@ mod tests {
                 ),
                 identity_sig: vec![0u8; 64],
                 wireguard: None,
-                scheduling: crate::topology::peers::PeerSchedulingState::schedulable_default(
-                    Uuid::new_v4(),
+                scheduling: Box::new(
+                    crate::topology::peers::PeerSchedulingState::schedulable_default(Uuid::new_v4()),
                 ),
+                runtime_support: Box::new(crate::runtime::types::RuntimeSupportProfile::default()),
             },
         };
 

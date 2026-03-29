@@ -86,6 +86,37 @@ impl JoinRequest {
                     value => Some(value),
                 },
             ),
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::new(
+                info.get_runtime_classes()?
+                    .iter()
+                    .filter_map(|value| {
+                        value
+                            .ok()
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| {
+                                value.parse::<crate::workload::model::RuntimeClass>().ok()
+                            })
+                    })
+                    .collect::<Vec<_>>(),
+                info.get_sandbox_profiles()?
+                    .iter()
+                    .filter_map(|value| {
+                        value
+                            .ok()
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<_>>(),
+                info.get_runtime_feature_flags()?
+                    .iter()
+                    .filter_map(|value| {
+                        value
+                            .ok()
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<_>>(),
+            ),
         };
 
         Ok(Self {
@@ -191,7 +222,8 @@ impl JoinRequest {
             signing_pub: Box::new(self.signing_vk),
             identity_sig: self.identity_sig.clone(),
             wireguard: self.peer.wireguard.clone(),
-            scheduling: self.peer.scheduling.clone(),
+            scheduling: Box::new(self.peer.scheduling.clone()),
+            runtime_support: Box::new(self.peer.runtime_support.clone()),
         }
     }
 }

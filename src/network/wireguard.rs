@@ -854,6 +854,7 @@ fn ip6tables_insert_rule(chain: &str, spec: &[&str]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{WireGuardPeerPlan, build_wireguard_peer_plan};
+    use crate::runtime::types::RuntimeSupportProfile;
     use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
     use std::collections::HashSet;
     use uuid::Uuid;
@@ -867,6 +868,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard,
+            runtime_support: RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(Uuid::nil()),
         }
     }

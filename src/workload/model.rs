@@ -32,6 +32,31 @@ pub enum RuntimeClass {
     Sandbox,
 }
 
+impl RuntimeClass {
+    /// Returns the canonical cluster-visible identifier for this runtime family.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeClass::Oci => "oci",
+            RuntimeClass::MicroVm => "microvm",
+            RuntimeClass::Sandbox => "sandbox",
+        }
+    }
+}
+
+impl std::str::FromStr for RuntimeClass {
+    type Err = ();
+
+    /// Parses one cluster-visible runtime-family identifier.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "oci" => Ok(RuntimeClass::Oci),
+            "microvm" => Ok(RuntimeClass::MicroVm),
+            "sandbox" => Ok(RuntimeClass::Sandbox),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Stable workload identity shared across status, persistence, and scheduling layers.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkloadIdentity {

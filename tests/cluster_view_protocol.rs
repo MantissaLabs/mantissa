@@ -7,6 +7,7 @@ use crdt_store::uuid_key::UuidKey;
 use mantissa::cluster::{ClusterId, ClusterViewId};
 use mantissa::node::id::set_node_id;
 use mantissa::runtime::testing::new_in_memory_runtime_backend;
+use mantissa::runtime::types::RuntimeSupportProfile;
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 use mantissa::store::cluster_operation_store::ClusterOperationStore;
 use mantissa::store::cluster_view_store::ClusterViewStore;
@@ -929,6 +930,7 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
         signing_pub: [0x22; 32],
         identity_sig: vec![0x33; 64],
         wireguard: None,
+        runtime_support: RuntimeSupportProfile::default(),
         scheduling: PeerSchedulingState::schedulable_default(self_id),
     };
     peers
@@ -1058,6 +1060,7 @@ local_test!(cluster_view_startup_preserves_persisted_self_drain_fence, {
                 signing_pub: [0x22; 32],
                 identity_sig: vec![0x33; 64],
                 wireguard: None,
+                runtime_support: RuntimeSupportProfile::default(),
                 scheduling: persisted_scheduling,
             },
         )

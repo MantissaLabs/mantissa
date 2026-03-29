@@ -1,6 +1,8 @@
+use crate::runtime::types::RuntimeSupportProfile;
 use crate::topology::{PeerHandle, Topology, peer_provider::PeerProvider};
 use async_trait::async_trait;
 use capnp::Error as CapnpError;
+use capnp::text_list;
 use ed25519_dalek::VerifyingKey;
 use protocol::node::node_id as node_id_capnp;
 use protocol::topology::node_info as node_info_capnp;
@@ -196,6 +198,10 @@ pub struct PeerValue {
     /// Placement policy state used to fence nodes during maintenance operations.
     #[serde(default)]
     pub scheduling: PeerSchedulingState,
+
+    /// Cluster-visible runtime support metadata used by workload placement.
+    #[serde(default)]
+    pub runtime_support: RuntimeSupportProfile,
 }
 
 #[async_trait(?Send)]
@@ -243,6 +249,7 @@ impl PeerValue {
         let mut identity_sig: Option<Vec<u8>> = None;
         let mut wireguard: Option<WireGuardPeerValue> = None;
         let mut scheduling: Option<PeerSchedulingState> = None;
+        let mut runtime_support: Option<RuntimeSupportProfile> = None;
 
         for value in values {
             if !value.address.is_empty() {
@@ -282,6 +289,10 @@ impl PeerValue {
                 None => value.scheduling.clone(),
                 Some(current) => PeerSchedulingState::merge(current, &value.scheduling),
             });
+            runtime_support = RuntimeSupportProfile::preferred(
+                runtime_support.as_ref(),
+                Some(&value.runtime_support),
+            );
         }
 
         Some(PeerValue {
@@ -292,6 +303,7 @@ impl PeerValue {
             identity_sig: identity_sig.unwrap_or_default(),
             wireguard,
             scheduling: scheduling.unwrap_or_default(),
+            runtime_support: runtime_support.unwrap_or_default(),
         })
     }
 
@@ -374,6 +386,7 @@ impl PeerValue {
                 value => Some(value),
             },
         );
+        let runtime_support = runtime_support_from_node_info(ni)?;
 
         Ok(PeerValue {
             address,
@@ -383,8 +396,65 @@ impl PeerValue {
             identity_sig: identity_sig.to_vec(),
             wireguard,
             scheduling,
+            runtime_support,
         })
     }
+}
+
+/// Writes one runtime support profile into the topology `NodeInfo` builder.
+pub fn write_runtime_support_to_node_info(
+    mut info: node_info_capnp::Builder<'_>,
+    runtime_support: &RuntimeSupportProfile,
+) {
+    let mut runtime_classes = info
+        .reborrow()
+        .init_runtime_classes(runtime_support.runtime_classes.len() as u32);
+    for (idx, runtime_class) in runtime_support.runtime_classes.iter().enumerate() {
+        runtime_classes.set(idx as u32, runtime_class.as_str());
+    }
+
+    let mut sandbox_profiles = info
+        .reborrow()
+        .init_sandbox_profiles(runtime_support.sandbox_profiles.len() as u32);
+    for (idx, sandbox_profile) in runtime_support.sandbox_profiles.iter().enumerate() {
+        sandbox_profiles.set(idx as u32, sandbox_profile);
+    }
+
+    let mut feature_flags = info
+        .reborrow()
+        .init_runtime_feature_flags(runtime_support.feature_flags.len() as u32);
+    for (idx, feature_flag) in runtime_support.feature_flags.iter().enumerate() {
+        feature_flags.set(idx as u32, feature_flag);
+    }
+}
+
+/// Decodes one runtime support profile from the topology `NodeInfo` reader.
+fn runtime_support_from_node_info(
+    ni: node_info_capnp::Reader<'_>,
+) -> Result<RuntimeSupportProfile, CapnpError> {
+    let runtime_classes = read_text_list(ni.get_runtime_classes()?)?;
+    let sandbox_profiles = read_text_list(ni.get_sandbox_profiles()?)?;
+    let feature_flags = read_text_list(ni.get_runtime_feature_flags()?)?;
+
+    let runtime_classes = runtime_classes
+        .into_iter()
+        .filter_map(|value| value.parse::<crate::workload::model::RuntimeClass>().ok())
+        .collect::<Vec<_>>();
+
+    Ok(RuntimeSupportProfile::new(
+        runtime_classes,
+        sandbox_profiles,
+        feature_flags,
+    ))
+}
+
+/// Reads one Cap'n Proto text list into owned Rust strings.
+fn read_text_list(list: text_list::Reader<'_>) -> Result<Vec<String>, CapnpError> {
+    let mut values = Vec::with_capacity(list.len() as usize);
+    for value in list.iter() {
+        values.push(value?.to_str()?.to_string());
+    }
+    Ok(values)
 }
 
 /// Decode one optional node id payload used by peer scheduling metadata.
@@ -430,6 +500,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState {
                 schedulable: true,
                 drain_requested: false,

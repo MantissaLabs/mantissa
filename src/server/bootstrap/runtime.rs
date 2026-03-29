@@ -231,6 +231,7 @@ struct TopologyBuildInputs<'a> {
     scheduler: Rc<Scheduler>,
     health_monitor: Arc<health::HealthMonitor>,
     runtime_health: config::RuntimeHealthConfig,
+    runtime_support: crate::runtime::types::RuntimeSupportProfile,
 }
 
 /// Boots the full server runtime from an initialized bootstrap context.
@@ -334,6 +335,8 @@ async fn build_runtime_components(
     let topology_stores = build_topology_stores(stores);
     let registry = build_registry(ctx, stores, health_monitor.clone());
     let scheduler = build_scheduler(ctx, stores, registry.clone()).await?;
+    let runtime_backend = build_runtime_backend(options).await?;
+    let runtime_support = runtime_backend.advertised_support();
     let topology = build_topology(TopologyBuildInputs {
         ctx,
         cluster_view: cluster_view.clone(),
@@ -344,6 +347,7 @@ async fn build_runtime_components(
         scheduler: scheduler.clone(),
         health_monitor: health_monitor.clone(),
         runtime_health,
+        runtime_support,
     })?;
     hydrate_topology(&topology).await?;
     let topology_client = capnp_rpc::new_client(topology.clone());
@@ -369,8 +373,6 @@ async fn build_runtime_components(
         local_volume_root.clone(),
         config::local_volume_enforce_capacity(),
     );
-
-    let runtime_backend = build_runtime_backend(options).await?;
 
     let network_registry = NetworkRegistry::new(
         stores.networks.clone(),
@@ -619,6 +621,7 @@ fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> 
         scheduler: inputs.scheduler,
         health_monitor: inputs.health_monitor,
         runtime_health: inputs.runtime_health,
+        runtime_support: inputs.runtime_support,
     })
     .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
 }

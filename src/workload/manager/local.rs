@@ -26,10 +26,6 @@ impl WorkloadManager {
             return Ok(Vec::new());
         }
 
-        for plan in plans.iter_mut() {
-            plan.instance_name = format!("mantissa-{}", plan.id);
-        }
-
         let _launch_guards = self.claim_batch_reconcile_guards(plans).await?;
 
         let pending_specs = match self.persist_pending_batch(plans).await {
@@ -230,6 +226,7 @@ impl WorkloadManager {
         plans: &mut [BatchStartPlan],
     ) -> Result<(), anyhow::Error> {
         for plan in plans.iter_mut() {
+            let instance_name = format!("mantissa-{}", plan.id);
             self.pull_image_for_task(plan.id, &plan.image).await?;
             self.update_task_phase(plan.id, ContainerState::Creating, None, None)
                 .await?;
@@ -238,7 +235,7 @@ impl WorkloadManager {
                 .launch_task_instance(&InstanceLaunchRequest {
                     task_id: plan.id,
                     task_name: &plan.name,
-                    instance_name: &plan.instance_name,
+                    instance_name: &instance_name,
                     image: &plan.image,
                     command: &plan.command,
                     tty: plan.tty,

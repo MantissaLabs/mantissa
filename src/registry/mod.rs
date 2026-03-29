@@ -1,7 +1,9 @@
 use crate::cluster::ClusterViewId;
+use crate::runtime::types::RuntimeSupportProfile;
 use crate::store::local::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
+use crate::workload::model::RuntimeClass;
 use ::health::HealthMonitor;
 use anyhow::{Result as AnyResult, anyhow};
 use crdt_store::uuid_key::UuidKey;
@@ -464,6 +466,12 @@ impl Registry {
             .map(|value| value.scheduling)
     }
 
+    /// Returns the converged runtime support metadata for one peer, if known locally.
+    pub fn peer_runtime_support(&self, peer_id: Uuid) -> Option<RuntimeSupportProfile> {
+        self.peer_latest_value_unscoped(peer_id)
+            .map(|value| value.runtime_support)
+    }
+
     /// Returns true when the provided node remains eligible for new placements.
     pub fn peer_schedulable(&self, peer_id: Uuid) -> bool {
         if self.peer_is_excluded(peer_id) {
@@ -473,6 +481,48 @@ impl Registry {
         self.peer_latest_value_unscoped(peer_id)
             .map(|value| value.scheduling.schedulable)
             .unwrap_or(true)
+    }
+
+    /// Returns true when the provided node advertises support for the requested runtime family.
+    pub fn peer_supports_runtime_class(&self, peer_id: Uuid, runtime_class: RuntimeClass) -> bool {
+        if self.peer_is_excluded(peer_id) {
+            return false;
+        }
+
+        self.peer_latest_value_unscoped(peer_id)
+            .map(|value| value.runtime_support.supports_runtime_class(runtime_class))
+            .unwrap_or_else(|| {
+                RuntimeSupportProfile::default().supports_runtime_class(runtime_class)
+            })
+    }
+
+    /// Returns true when the provided node advertises all requested runtime requirements.
+    pub fn peer_supports_runtime_requirements(
+        &self,
+        peer_id: Uuid,
+        runtime_class: RuntimeClass,
+        sandbox_profile: Option<&str>,
+        feature_flags: &[String],
+    ) -> bool {
+        if self.peer_is_excluded(peer_id) {
+            return false;
+        }
+
+        self.peer_latest_value_unscoped(peer_id)
+            .map(|value| {
+                value.runtime_support.supports_requirements(
+                    runtime_class,
+                    sandbox_profile,
+                    feature_flags,
+                )
+            })
+            .unwrap_or_else(|| {
+                RuntimeSupportProfile::default().supports_requirements(
+                    runtime_class,
+                    sandbox_profile,
+                    feature_flags,
+                )
+            })
     }
 
     /// Returns the converged peer value without applying excluded-peer scoping.
@@ -624,6 +674,7 @@ impl Registry {
                 identity_sig: Vec::new(),
                 wireguard: None,
                 scheduling: PeerSchedulingState::schedulable_default(self.node_id),
+                runtime_support: RuntimeSupportProfile::default(),
             }
         };
 

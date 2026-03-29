@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender};
 
+use crate::workload::model::RuntimeClass;
+
 /// Errors returned by runtime backends.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -315,6 +317,187 @@ pub struct RuntimeCapabilities {
     pub lifecycle_events: bool,
 }
 
+impl RuntimeCapabilities {
+    /// Converts one backend capability bitset into canonical cluster-visible feature flags.
+    pub fn feature_flags(&self) -> Vec<String> {
+        let mut flags = Vec::new();
+        if self.exec {
+            flags.push("exec".to_string());
+        }
+        if self.interactive_exec {
+            flags.push("interactive_exec".to_string());
+        }
+        if self.logs {
+            flags.push("logs".to_string());
+        }
+        if self.attach {
+            flags.push("attach".to_string());
+        }
+        if self.lifecycle_events {
+            flags.push("lifecycle_events".to_string());
+        }
+        flags
+    }
+}
+
+/// Cluster-visible runtime support metadata advertised by one node.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub struct RuntimeSupportProfile {
+    #[serde(default = "default_runtime_classes")]
+    pub runtime_classes: Vec<RuntimeClass>,
+    #[serde(default)]
+    pub sandbox_profiles: Vec<String>,
+    #[serde(default)]
+    pub feature_flags: Vec<String>,
+}
+
+impl Default for RuntimeSupportProfile {
+    /// Builds the current task-era default node profile for legacy or test rows.
+    fn default() -> Self {
+        Self::new(
+            [RuntimeClass::Oci],
+            Vec::<String>::new(),
+            RuntimeCapabilities {
+                exec: true,
+                interactive_exec: true,
+                logs: true,
+                attach: true,
+                lifecycle_events: true,
+            }
+            .feature_flags(),
+        )
+    }
+}
+
+impl RuntimeSupportProfile {
+    /// Normalizes one runtime support profile into a deterministic, deduplicated form.
+    pub fn new<I, J, K>(runtime_classes: I, sandbox_profiles: J, feature_flags: K) -> Self
+    where
+        I: IntoIterator<Item = RuntimeClass>,
+        J: IntoIterator,
+        J::Item: Into<String>,
+        K: IntoIterator,
+        K::Item: Into<String>,
+    {
+        let mut runtime_classes: Vec<RuntimeClass> = runtime_classes.into_iter().collect();
+        runtime_classes.sort_unstable();
+        runtime_classes.dedup();
+        if runtime_classes.is_empty() {
+            runtime_classes.push(RuntimeClass::Oci);
+        }
+
+        let mut sandbox_profiles: Vec<String> = sandbox_profiles
+            .into_iter()
+            .map(Into::into)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        sandbox_profiles.sort_unstable();
+        sandbox_profiles.dedup();
+
+        let mut feature_flags: Vec<String> = feature_flags
+            .into_iter()
+            .map(Into::into)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        feature_flags.sort_unstable();
+        feature_flags.dedup();
+
+        Self {
+            runtime_classes,
+            sandbox_profiles,
+            feature_flags,
+        }
+    }
+
+    /// Builds the default profile for one OCI runtime backend from its feature flags.
+    pub fn from_oci_capabilities(capabilities: RuntimeCapabilities) -> Self {
+        Self::new(
+            [RuntimeClass::Oci],
+            Vec::<String>::new(),
+            capabilities.feature_flags(),
+        )
+    }
+
+    /// Returns true when this node advertises support for the requested runtime family.
+    pub fn supports_runtime_class(&self, runtime_class: RuntimeClass) -> bool {
+        self.runtime_classes.contains(&runtime_class)
+    }
+
+    /// Returns true when this node advertises the requested sandbox profile, if any.
+    pub fn supports_sandbox_profile(&self, sandbox_profile: Option<&str>) -> bool {
+        let Some(sandbox_profile) = sandbox_profile
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return true;
+        };
+        self.sandbox_profiles
+            .iter()
+            .any(|value| value == sandbox_profile)
+    }
+
+    /// Returns true when this node advertises every required runtime feature flag.
+    pub fn supports_feature_flags(&self, required_flags: &[String]) -> bool {
+        required_flags
+            .iter()
+            .all(|required| self.feature_flags.iter().any(|value| value == required))
+    }
+
+    /// Returns true when this profile satisfies the requested runtime requirements.
+    pub fn supports_requirements(
+        &self,
+        runtime_class: RuntimeClass,
+        sandbox_profile: Option<&str>,
+        feature_flags: &[String],
+    ) -> bool {
+        self.supports_runtime_class(runtime_class)
+            && self.supports_sandbox_profile(sandbox_profile)
+            && self.supports_feature_flags(feature_flags)
+    }
+
+    /// Selects the more complete runtime profile between two concurrent peer rows.
+    pub fn preferred(left: Option<&Self>, right: Option<&Self>) -> Option<Self> {
+        fn precedence_key(
+            value: &RuntimeSupportProfile,
+        ) -> (
+            usize,
+            usize,
+            usize,
+            &Vec<RuntimeClass>,
+            &Vec<String>,
+            &Vec<String>,
+        ) {
+            (
+                value.runtime_classes.len(),
+                value.sandbox_profiles.len(),
+                value.feature_flags.len(),
+                &value.runtime_classes,
+                &value.sandbox_profiles,
+                &value.feature_flags,
+            )
+        }
+
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                if precedence_key(left) >= precedence_key(right) {
+                    Some(left.clone())
+                } else {
+                    Some(right.clone())
+                }
+            }
+            (Some(left), None) => Some(left.clone()),
+            (None, Some(right)) => Some(right.clone()),
+            (None, None) => None,
+        }
+    }
+}
+
+fn default_runtime_classes() -> Vec<RuntimeClass> {
+    vec![RuntimeClass::Oci]
+}
+
 /// Runtime lifecycle events used by task reconciliation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeEvent {
@@ -420,6 +603,11 @@ pub trait RuntimeBackend {
     /// Reports the optional capabilities implemented by this runtime backend.
     fn capabilities(&self) -> RuntimeCapabilities {
         RuntimeCapabilities::default()
+    }
+
+    /// Reports the cluster-visible runtime support metadata advertised by this backend.
+    fn advertised_support(&self) -> RuntimeSupportProfile {
+        RuntimeSupportProfile::from_oci_capabilities(self.capabilities())
     }
 
     /// Streams runtime lifecycle events into the provided queue until the stream ends.

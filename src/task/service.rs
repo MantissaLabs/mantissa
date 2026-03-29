@@ -14,6 +14,7 @@ use crate::workload::capnp_codec::{
     decode_volume_mounts, encode_env_vars, encode_secret_files, encode_task_liveness_probe,
     encode_task_restart_policy, encode_volume_mounts,
 };
+use crate::workload::model::RuntimeClass;
 use crate::workload::types::TaskExecutionSpec;
 use capnp::Error;
 use protocol::gossip::gossip_message;
@@ -842,6 +843,8 @@ impl task::Server for TaskService {
                 volumes,
                 networks,
             },
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
             gpu_device_ids,
             id: None,
             slot_ids,
@@ -968,6 +971,8 @@ impl task::Server for TaskService {
                     volumes,
                     networks,
                 },
+                runtime_class: RuntimeClass::Oci,
+                sandbox_profile: None,
                 gpu_device_ids,
                 id: task_id,
                 slot_ids,

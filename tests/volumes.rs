@@ -18,6 +18,7 @@ use mantissa::volumes::types::{
     LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
     VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
 };
+use mantissa::workload::model::RuntimeClass;
 use mantissa::workload::types::TaskExecutionSpec;
 use protocol::topology::topology;
 use protocol::volumes::{LocalVolumeSourceKind, volumes};
@@ -403,6 +404,8 @@ fn standalone_volume_task_request(
             }],
             networks: Vec::new(),
         },
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
@@ -884,6 +887,8 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
                 ],
                 networks: Vec::new(),
             },
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
             gpu_device_ids: Vec::new(),
             id: None,
             slot_ids: Vec::new(),

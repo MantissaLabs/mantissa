@@ -5,6 +5,7 @@ use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
 use crate::cluster::ClusterId;
+use crate::runtime::types::RuntimeSupportProfile;
 use crate::topology::peers::{PeerSchedulingState, WireGuardPeerValue};
 
 #[derive(Clone)]
@@ -52,7 +53,8 @@ pub enum TopologyEvent {
         signing_pub: Box<VerifyingKey>,
         identity_sig: Vec<u8>,
         wireguard: Option<WireGuardPeerValue>,
-        scheduling: PeerSchedulingState,
+        scheduling: Box<PeerSchedulingState>,
+        runtime_support: Box<RuntimeSupportProfile>,
     },
     Leave {
         id: Uuid,

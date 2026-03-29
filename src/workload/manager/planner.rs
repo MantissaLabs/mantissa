@@ -8,13 +8,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::gpu::gpu_runtime_status;
+use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::digest::SchedulerDigestValue;
 use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
 };
 use crate::workload::model::{
-    WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile as TaskSecretFile,
-    WorkloadServiceMetadata as TaskServiceMetadata, WorkloadVolumeMount as TaskVolumeMount,
+    RuntimeClass, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
+    WorkloadSecretFile as TaskSecretFile, WorkloadServiceMetadata as TaskServiceMetadata,
+    WorkloadVolumeMount as TaskVolumeMount,
 };
 use crate::workload::types::{
     WorkloadLivenessProbe as TaskLivenessProbe, WorkloadRestartPolicy as TaskRestartPolicy,
@@ -34,6 +36,16 @@ pub(super) enum SchedulingError {
     NetworksBlocked { networks: Vec<Uuid> },
     #[error("local node lacks required networks for task '{task}'")]
     LocalNetworksBlocked { task: String },
+    #[error(
+        "scheduler reservation failed: runtime requirements unavailable for task '{task}' \
+         (runtime={runtime_class}, sandbox={sandbox_profile:?}, features={feature_flags:?})"
+    )]
+    RuntimeRequirementsBlocked {
+        task: String,
+        runtime_class: &'static str,
+        sandbox_profile: Option<String>,
+        feature_flags: Vec<String>,
+    },
 }
 
 type SeedLocalPlans<'a> = (
@@ -42,6 +54,13 @@ type SeedLocalPlans<'a> = (
     Vec<SlotChoice>,
     Vec<GpuChoice>,
 );
+
+struct LocalPlacementPrereqs<'a> {
+    ready_networks: &'a HashSet<Uuid>,
+    runtime_support: &'a RuntimeSupportProfile,
+    gpu_ready: bool,
+    gpu_reason: Option<&'a str>,
+}
 
 /// Execution plan for a single local task launch, holding the target slots and container metadata.
 #[derive(Clone)]
@@ -56,7 +75,6 @@ pub(super) struct BatchStartPlan {
     pub(super) requested_memory_bytes: u64,
     pub(super) requested_gpu_count: u32,
     pub(super) gpu_device_ids: Vec<String>,
-    pub(super) instance_name: String,
     pub(super) instance_id: Option<String>,
     pub(super) created_at: DateTime<Utc>,
     pub(super) index: usize,
@@ -93,6 +111,9 @@ pub(super) struct StartIntent {
     pub(super) memory_bytes: u64,
     pub(super) gpu_count: u32,
     pub(super) gpu_device_ids: Vec<String>,
+    pub(super) runtime_class: RuntimeClass,
+    pub(super) sandbox_profile: Option<String>,
+    pub(super) required_runtime_features: Vec<String>,
     pub(super) preassigned_slots: Vec<SlotId>,
     pub(super) restart_policy: Option<TaskRestartPolicy>,
     pub(super) termination_grace_period_secs: Option<u32>,
@@ -104,6 +125,27 @@ pub(super) struct StartIntent {
     pub(super) networks: Vec<Uuid>,
     pub(super) service_metadata: Option<TaskServiceMetadata>,
     pub(super) target_node: Option<Uuid>,
+}
+
+impl StartIntent {
+    /// Returns true when one node runtime profile satisfies this intent's runtime requirements.
+    fn runtime_requirements_met(&self, runtime_support: &RuntimeSupportProfile) -> bool {
+        runtime_support.supports_requirements(
+            self.runtime_class,
+            self.sandbox_profile.as_deref(),
+            &self.required_runtime_features,
+        )
+    }
+
+    /// Builds the scheduler-facing runtime rejection error for this intent.
+    fn runtime_requirements_error(&self) -> SchedulingError {
+        SchedulingError::RuntimeRequirementsBlocked {
+            task: self.name.clone(),
+            runtime_class: self.runtime_class.as_str(),
+            sandbox_profile: self.sandbox_profile.clone(),
+            feature_flags: self.required_runtime_features.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -137,6 +179,7 @@ struct Candidate {
     slots: Vec<SlotChoice>,
     gpu_devices: Vec<GpuChoice>,
     ready_networks: HashSet<Uuid>,
+    runtime_support: RuntimeSupportProfile,
     free_slot_count: u32,
     free_cpu_millis: u64,
     free_memory_bytes: u64,
@@ -151,6 +194,7 @@ impl Candidate {
         slots: Vec<SlotChoice>,
         gpu_devices: Vec<GpuChoice>,
         ready_networks: HashSet<Uuid>,
+        runtime_support: RuntimeSupportProfile,
     ) -> Option<Self> {
         if slots.is_empty() {
             None
@@ -160,6 +204,7 @@ impl Candidate {
                 slots,
                 gpu_devices,
                 ready_networks,
+                runtime_support,
                 free_slot_count: 0,
                 free_cpu_millis: 0,
                 free_memory_bytes: 0,
@@ -177,6 +222,7 @@ impl Candidate {
         peer_id: Uuid,
         digest: SchedulerDigestValue,
         ready_networks: HashSet<Uuid>,
+        runtime_support: RuntimeSupportProfile,
     ) -> Option<Self> {
         if digest.free_slot_count == 0 {
             None
@@ -186,6 +232,7 @@ impl Candidate {
                 slots: Vec::new(),
                 gpu_devices: Vec::new(),
                 ready_networks,
+                runtime_support,
                 free_slot_count: digest.free_slot_count,
                 free_cpu_millis: digest.free_cpu_millis,
                 free_memory_bytes: digest.free_memory_bytes,
@@ -222,6 +269,11 @@ impl Candidate {
 
     fn can_host(&self, networks: &[Uuid]) -> bool {
         networks.iter().all(|net| self.ready_networks.contains(net))
+    }
+
+    /// Returns true when this candidate satisfies one intent's runtime requirements.
+    fn supports_runtime_requirements(&self, intent: &StartIntent) -> bool {
+        intent.runtime_requirements_met(&self.runtime_support)
     }
 
     /// Returns the minimum remote slot count implied by aggregate digest bounds for this request.
@@ -466,6 +518,7 @@ fn capacity_covers_workload(available: CandidateCapacity, demand: WorkloadDemand
 fn digest_can_host_intent(
     digest: &SchedulerDigestValue,
     ready_networks: &HashSet<Uuid>,
+    runtime_support: &RuntimeSupportProfile,
     intent: &StartIntent,
 ) -> bool {
     digest.free_slot_count > 0
@@ -477,6 +530,7 @@ fn digest_can_host_intent(
             .networks
             .iter()
             .all(|network_id| ready_networks.contains(network_id))
+        && intent.runtime_requirements_met(runtime_support)
 }
 
 #[derive(Clone)]
@@ -560,6 +614,26 @@ fn gpu_runtime_preflight(snapshot: &SchedulerSnapshot) -> (bool, Option<String>)
     }
 }
 
+/// Derives the runtime feature flags required to execute one workload intent safely.
+fn required_runtime_features(
+    pre_stop_command: Option<&Vec<String>>,
+    liveness: Option<&TaskLivenessProbe>,
+) -> Vec<String> {
+    let mut features = Vec::new();
+    if pre_stop_command.is_some() {
+        features.push("exec".to_string());
+    }
+    if matches!(
+        liveness.map(|probe| probe.kind),
+        Some(crate::workload::types::WorkloadLivenessProbeKind::Exec)
+    ) {
+        features.push("exec".to_string());
+    }
+    features.sort_unstable();
+    features.dedup();
+    features
+}
+
 impl WorkloadManager {
     /// Normalizes user requests into deterministic scheduling intents, applying IDs and defaults.
     pub(super) fn build_start_intents(
@@ -571,6 +645,8 @@ impl WorkloadManager {
             let WorkloadStartRequest {
                 name,
                 execution,
+                runtime_class,
+                sandbox_profile,
                 gpu_device_ids,
                 id,
                 slot_ids,
@@ -621,6 +697,12 @@ impl WorkloadManager {
                 memory_bytes: execution.memory_bytes,
                 gpu_count: resolved_gpu_count,
                 gpu_device_ids,
+                runtime_class,
+                sandbox_profile,
+                required_runtime_features: required_runtime_features(
+                    execution.pre_stop_command.as_ref(),
+                    execution.liveness.as_ref(),
+                ),
                 preassigned_slots: slot_ids,
                 restart_policy: execution.restart_policy,
                 termination_grace_period_secs: execution.termination_grace_period_secs,
@@ -664,15 +746,19 @@ impl WorkloadManager {
             .get(&self.local_node_id)
             .cloned()
             .unwrap_or_else(HashSet::new);
+        let local_runtime_support = self.runtime.runtime_backend.advertised_support();
         let (local_gpu_ready, local_gpu_reason) = gpu_runtime_preflight(&snapshot);
         let (mut assignment, remaining_intents, available_slots, available_gpus) = self
             .seed_local_plans(
                 intents,
                 &snapshot,
                 local_version,
-                &local_ready,
-                local_gpu_ready,
-                local_gpu_reason.as_deref(),
+                LocalPlacementPrereqs {
+                    ready_networks: &local_ready,
+                    runtime_support: &local_runtime_support,
+                    gpu_ready: local_gpu_ready,
+                    gpu_reason: local_gpu_reason.as_deref(),
+                },
             )?;
 
         if remaining_intents.is_empty() {
@@ -707,9 +793,7 @@ impl WorkloadManager {
         intents: &'a [StartIntent],
         snapshot: &SchedulerSnapshot,
         local_version: u64,
-        local_ready: &HashSet<Uuid>,
-        local_gpu_ready: bool,
-        local_gpu_reason: Option<&str>,
+        prereqs: LocalPlacementPrereqs<'_>,
     ) -> Result<SeedLocalPlans<'a>, anyhow::Error> {
         let mut slot_lookup = HashMap::new();
         let mut available_local_slots = Vec::new();
@@ -734,7 +818,7 @@ impl WorkloadManager {
             }
         }
         available_local_gpus.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-        if !local_gpu_ready {
+        if !prereqs.gpu_ready {
             available_local_gpus.clear();
         }
 
@@ -744,16 +828,26 @@ impl WorkloadManager {
                 continue;
             }
 
+            if !intent.runtime_requirements_met(prereqs.runtime_support) {
+                return Err(intent.runtime_requirements_error().into());
+            }
+
             let requires_gpu = intent.gpu_count > 0 || !intent.gpu_device_ids.is_empty();
-            if requires_gpu && !local_gpu_ready {
+            if requires_gpu && !prereqs.gpu_ready {
                 return Err(anyhow::anyhow!(
                     "local gpu runtime not ready for task '{}': {}",
                     intent.name,
-                    local_gpu_reason.unwrap_or("gpu runtime is not ready on this node"),
+                    prereqs
+                        .gpu_reason
+                        .unwrap_or("gpu runtime is not ready on this node"),
                 ));
             }
 
-            if !intent.networks.iter().all(|net| local_ready.contains(net)) {
+            if !intent
+                .networks
+                .iter()
+                .all(|net| prereqs.ready_networks.contains(net))
+            {
                 return Err(SchedulingError::LocalNetworksBlocked {
                     task: intent.name.clone(),
                 }
@@ -880,7 +974,6 @@ impl WorkloadManager {
                 requested_memory_bytes: intent.memory_bytes,
                 requested_gpu_count: intent.gpu_count,
                 gpu_device_ids: chosen_gpu_device_ids,
-                instance_name: String::new(),
                 instance_id: None,
                 created_at: Utc::now(),
                 index: intent.index,
@@ -949,9 +1042,16 @@ impl WorkloadManager {
                 .get(&peer_id)
                 .cloned()
                 .unwrap_or_else(HashSet::new);
+            let runtime_support = self
+                .core
+                .registry
+                .peer_runtime_support(peer_id)
+                .unwrap_or_default();
             let hostable_intent_count = intents
                 .iter()
-                .filter(|intent| digest_can_host_intent(&digest, &ready_networks, intent))
+                .filter(|intent| {
+                    digest_can_host_intent(&digest, &ready_networks, &runtime_support, intent)
+                })
                 .count() as u32;
             let targeted = targeted_nodes.contains(&peer_id);
             let feedback = prepare_feedback.get(&peer_id).copied();
@@ -988,9 +1088,14 @@ impl WorkloadManager {
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
         let mut provided_capacity = CandidateCapacity::default();
+        let local_runtime_support = self.runtime.runtime_backend.advertised_support();
         if self.core.registry.peer_schedulable(self.local_node_id)
-            && let Some(local_candidate) =
-                Candidate::new_local(local_slots, local_gpus, local_ready.clone())
+            && let Some(local_candidate) = Candidate::new_local(
+                local_slots,
+                local_gpus,
+                local_ready.clone(),
+                local_runtime_support,
+            )
         {
             provided_capacity.add_candidate(&local_candidate);
             queue.push_back(local_candidate);
@@ -1018,6 +1123,10 @@ impl WorkloadManager {
                 hint.peer_id,
                 hint.digest.clone(),
                 hint.ready_networks.clone(),
+                self.core
+                    .registry
+                    .peer_runtime_support(hint.peer_id)
+                    .unwrap_or_default(),
             ) {
                 provided_capacity.add_candidate(&candidate);
                 queue.push_back(candidate);
@@ -1070,6 +1179,11 @@ impl WorkloadManager {
             ));
         };
 
+        if !candidate.supports_runtime_requirements(intent) {
+            candidates.push_back(candidate);
+            return Err(intent.runtime_requirements_error().into());
+        }
+
         if !candidate.can_host(&intent.networks) {
             candidates.push_back(candidate);
             return Err(SchedulingError::NetworksBlocked {
@@ -1121,7 +1235,6 @@ impl WorkloadManager {
                             requested_memory_bytes: intent.memory_bytes,
                             requested_gpu_count: intent.gpu_count,
                             gpu_device_ids: allocation.gpu_device_ids,
-                            instance_name: String::new(),
                             instance_id: None,
                             created_at: Utc::now(),
                             index: intent.index,
@@ -1173,10 +1286,17 @@ impl WorkloadManager {
 
             let mut allocated: Option<(CandidateLocation, ResourceAllocation)> = None;
             let mut skipped_for_networks = false;
+            let mut skipped_for_runtime = false;
             for _ in 0..candidate_count {
                 let mut candidate = candidates
                     .pop_front()
                     .expect("candidate deque should not be empty");
+
+                if !candidate.supports_runtime_requirements(intent) {
+                    skipped_for_runtime = true;
+                    candidates.push_back(candidate);
+                    continue;
+                }
 
                 if !candidate.can_host(&intent.networks) {
                     skipped_for_networks = true;
@@ -1199,7 +1319,9 @@ impl WorkloadManager {
             }
 
             let Some((location, allocation)) = allocated else {
-                if skipped_for_networks {
+                if skipped_for_runtime {
+                    return Err(intent.runtime_requirements_error().into());
+                } else if skipped_for_networks {
                     return Err(SchedulingError::NetworksBlocked {
                         networks: intent.networks.clone(),
                     }
@@ -1224,7 +1346,6 @@ impl WorkloadManager {
                         requested_memory_bytes: intent.memory_bytes,
                         requested_gpu_count: intent.gpu_count,
                         gpu_device_ids: allocation.gpu_device_ids,
-                        instance_name: String::new(),
                         instance_id: None,
                         created_at: Utc::now(),
                         index: intent.index,
@@ -1276,7 +1397,9 @@ mod tests {
         Candidate, CandidateCapacity, StartIntent, WorkloadDemand, capacity_covers_workload,
         digest_can_host_intent,
     };
+    use crate::runtime::types::RuntimeSupportProfile;
     use crate::scheduler::digest::SchedulerDigestValue;
+    use crate::workload::model::RuntimeClass;
     use std::collections::HashSet;
     use uuid::Uuid;
 
@@ -1295,6 +1418,9 @@ mod tests {
             memory_bytes: 256 * 1_024 * 1_024,
             gpu_count: 1,
             gpu_device_ids: Vec::new(),
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
+            required_runtime_features: Vec::new(),
             preassigned_slots: Vec::new(),
             restart_policy: None,
             termination_grace_period_secs: None,
@@ -1323,19 +1449,89 @@ mod tests {
         assert!(!digest_can_host_intent(
             &digest,
             &Default::default(),
+            &RuntimeSupportProfile::default(),
             &intent
         ));
 
         let mut ready_networks = std::collections::HashSet::new();
         ready_networks.insert(required_network);
 
-        assert!(!digest_can_host_intent(&digest, &ready_networks, &intent));
+        assert!(!digest_can_host_intent(
+            &digest,
+            &ready_networks,
+            &RuntimeSupportProfile::default(),
+            &intent
+        ));
 
         let mut gpu_ready_digest = digest.clone();
         gpu_ready_digest.gpu_runtime_ready = true;
         assert!(digest_can_host_intent(
             &gpu_ready_digest,
             &ready_networks,
+            &RuntimeSupportProfile::default(),
+            &intent
+        ));
+    }
+
+    /// Digest hostability checks should also reject candidates whose runtime profile is incompatible.
+    #[test]
+    fn digest_hostability_honors_runtime_support_profile() {
+        let intent = StartIntent {
+            index: 0,
+            id: Uuid::new_v4(),
+            name: "microvm-task".into(),
+            image: "img".into(),
+            command: Vec::new(),
+            tty: false,
+            cpu_millis: 250,
+            memory_bytes: 128 * 1_024 * 1_024,
+            gpu_count: 0,
+            gpu_device_ids: Vec::new(),
+            runtime_class: RuntimeClass::MicroVm,
+            sandbox_profile: Some("vm-default".into()),
+            required_runtime_features: vec!["exec".into()],
+            preassigned_slots: Vec::new(),
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            service_metadata: None,
+            target_node: None,
+        };
+        let digest = SchedulerDigestValue {
+            node_id: Uuid::new_v4(),
+            snapshot_version: 1,
+            updated_at_unix_ms: 5,
+            free_slot_count: 1,
+            free_cpu_millis: 500,
+            free_memory_bytes: 512 * 1_024 * 1_024,
+            largest_free_slot_cpu_millis: 500,
+            largest_free_slot_memory_bytes: 512 * 1_024 * 1_024,
+            free_gpu_count: 0,
+            gpu_runtime_ready: true,
+        };
+        let incompatible = RuntimeSupportProfile::new(
+            [RuntimeClass::Oci],
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+        );
+        let compatible =
+            RuntimeSupportProfile::new([RuntimeClass::MicroVm], ["vm-default"], ["exec"]);
+
+        assert!(!digest_can_host_intent(
+            &digest,
+            &HashSet::new(),
+            &incompatible,
+            &intent
+        ));
+        assert!(digest_can_host_intent(
+            &digest,
+            &HashSet::new(),
+            &compatible,
             &intent
         ));
     }
@@ -1383,6 +1579,7 @@ mod tests {
                 gpu_runtime_ready: true,
             },
             HashSet::new(),
+            RuntimeSupportProfile::default(),
         )
         .expect("remote candidate");
 
@@ -1418,6 +1615,7 @@ mod tests {
                 gpu_runtime_ready: true,
             },
             HashSet::new(),
+            RuntimeSupportProfile::default(),
         )
         .expect("remote candidate");
 

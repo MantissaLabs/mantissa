@@ -14,7 +14,7 @@ use crate::store::task_store::TaskStore;
 use crate::task::types::TaskStateFilter;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
-    WorkloadEvent as TaskEvent, WorkloadPhase as ContainerState,
+    RuntimeClass, WorkloadEvent as TaskEvent, WorkloadPhase as ContainerState,
     WorkloadServiceMetadata as TaskServiceMetadata, WorkloadSpec as TaskSpec,
     WorkloadStatus as TaskStatus, WorkloadValue as TaskValue,
     should_replace_workload_event as should_replace_task_event,
@@ -313,6 +313,8 @@ pub enum WorkloadTrafficPublicationUpdate {
 pub struct WorkloadStartRequest {
     pub name: String,
     pub execution: TaskExecutionSpec,
+    pub runtime_class: RuntimeClass,
+    pub sandbox_profile: Option<String>,
     pub gpu_device_ids: Vec<String>,
     pub id: Option<Uuid>,
     pub slot_ids: Vec<SlotId>,
@@ -574,6 +576,8 @@ impl WorkloadManager {
                 volumes: Vec::new(),
                 networks: Vec::new(),
             },
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
             gpu_device_ids: Vec::new(),
             id: None,
             slot_ids: Vec::new(),
@@ -1339,7 +1343,16 @@ impl Drop for WorkloadManager {
 
 /// Identify scheduling errors that should be retried because prerequisites are still converging.
 fn is_retryable_scheduling_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| cause.is::<SchedulingError>())
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .is_some_and(|cause| {
+            matches!(
+                cause,
+                SchedulingError::SnapshotMissing
+                    | SchedulingError::NetworksBlocked { .. }
+                    | SchedulingError::LocalNetworksBlocked { .. }
+            )
+        })
 }
 
 /// Returns true when one task-start failure should be retried by a higher-level controller.

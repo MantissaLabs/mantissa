@@ -17,7 +17,7 @@ use crate::task::manager::{
 use crate::task::types::{TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskVolumeMount};
 use crate::volumes::types::VolumeDriver;
 use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
-use crate::workload::model::WorkloadPhase as ContainerState;
+use crate::workload::model::{RuntimeClass, WorkloadPhase as ContainerState};
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -2401,6 +2401,8 @@ fn make_replica_request(
         execution: template
             .execution
             .map_networks(|network| network.network_id),
+        runtime_class: RuntimeClass::Oci,
+        sandbox_profile: None,
         gpu_device_ids: Vec::new(),
         id: Some(desired_id),
         slot_ids: Vec::new(),
@@ -2622,6 +2624,8 @@ mod tests {
                 }],
                 ..empty_task_execution("ghcr.io/demo/app:latest")
             },
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
             gpu_device_ids: Vec::new(),
             id: Some(Uuid::new_v4()),
             slot_ids: Vec::new(),
@@ -2635,6 +2639,8 @@ mod tests {
         TaskStartRequest {
             name: "demo-task".to_string(),
             execution: empty_task_execution("ghcr.io/demo/app:latest"),
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
             gpu_device_ids: Vec::new(),
             id: Some(Uuid::new_v4()),
             slot_ids: Vec::new(),

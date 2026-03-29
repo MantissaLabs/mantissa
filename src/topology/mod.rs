@@ -6,6 +6,7 @@ use crate::node::address::compute_advertise_ip;
 use crate::node::address::extract_port;
 use crate::node::id::set_node_id;
 use crate::registry::Registry;
+use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::Scheduler;
 use crate::secrets::crypto::SecretKeyring;
 use crate::store::cluster_operation_store::ClusterOperationStore;
@@ -20,7 +21,7 @@ use crate::store::task_store::TaskStore;
 use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
 use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains, sync_selected_domains};
 use crate::token::TokenStore;
-use crate::topology::peers::{PeerSchedulingState, PeerValue};
+use crate::topology::peers::{PeerSchedulingState, PeerValue, write_runtime_support_to_node_info};
 use ::health::HealthMonitor;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
@@ -425,6 +426,9 @@ pub struct Topology {
 
     /// Runtime health tuning used by SWIM-style probing loops.
     runtime_health: config::RuntimeHealthConfig,
+
+    /// Cluster-visible runtime support metadata published for this node.
+    runtime_support: RuntimeSupportProfile,
 }
 
 pub struct TopologyConfig {
@@ -439,6 +443,7 @@ pub struct TopologyConfig {
     pub scheduler: Rc<Scheduler>,
     pub health_monitor: Arc<HealthMonitor>,
     pub runtime_health: config::RuntimeHealthConfig,
+    pub runtime_support: RuntimeSupportProfile,
 }
 
 impl Topology {
@@ -455,6 +460,7 @@ impl Topology {
             scheduler,
             health_monitor,
             runtime_health,
+            runtime_support,
         } = config;
         let TopologyStores {
             credentials,
@@ -520,6 +526,7 @@ impl Topology {
             secret_keyring,
             health_monitor,
             runtime_health,
+            runtime_support,
         };
 
         info!(
@@ -737,6 +744,7 @@ impl Topology {
             identity_sig: identity_sig.to_vec(),
             wireguard,
             scheduling: self.current_scheduling_state(),
+            runtime_support: self.runtime_support.clone(),
         })
     }
 
@@ -888,6 +896,7 @@ impl Topology {
         if let Some(reason) = scheduling.reason.as_deref() {
             info.set_scheduling_reason(reason);
         }
+        write_runtime_support_to_node_info(info.reborrow(), &self.runtime_support);
 
         // WireGuard underlay advertisement (best-effort).
         //
@@ -1000,6 +1009,7 @@ impl Topology {
                             ref identity_sig,
                             ref wireguard,
                             ref scheduling,
+                            ref runtime_support,
                         } => {
                             info!(target: "topology", "Node joined: {id} at {address}");
 
@@ -1023,7 +1033,8 @@ impl Topology {
                                 signing_pub: signing_pub.to_bytes(),
                                 identity_sig: identity_sig.clone(),
                                 wireguard: wireguard.clone(),
-                                scheduling: scheduling.clone(),
+                                scheduling: scheduling.as_ref().clone(),
+                                runtime_support: runtime_support.as_ref().clone(),
                             };
 
                             if let Err(e) = self.register_peer(id, &v, client.clone()).await {
@@ -1116,6 +1127,7 @@ impl Topology {
                             identity_sig,
                             wireguard,
                             scheduling,
+                            runtime_support,
                         } => {
                             // Never re-gossip a capability we only know as an import. Cap’n Proto
                             // will panic if we hand a borrowed client handle back to the peer that
@@ -1133,6 +1145,7 @@ impl Topology {
                                 identity_sig,
                                 wireguard,
                                 scheduling,
+                                runtime_support,
                             }
                         }
                         evt => evt,
@@ -1984,6 +1997,7 @@ mod tests {
         rebuild_gossip_warm_set, refill_gossip_warm_set, rotate_gossip_warm_set,
         select_sync_peers_round_robin_for_node,
     };
+    use crate::runtime::types::RuntimeSupportProfile;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
@@ -1999,6 +2013,7 @@ mod tests {
                 signing_pub: [idx as u8; 32],
                 identity_sig: Vec::new(),
                 wireguard: None,
+                runtime_support: RuntimeSupportProfile::default(),
                 scheduling: PeerSchedulingState::schedulable_default(peer_id),
             }),
         }
