@@ -11,13 +11,18 @@ use crate::scheduler::{Scheduler, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::store::task_store::TaskStore;
-use crate::task::causality::{compare_task_causality, should_replace_task_event};
+use crate::task::causality::should_replace_task_event;
 use crate::task::container::ContainerState;
 use crate::task::types::{
     TaskEvent, TaskRestartPolicy, TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStatus,
-    TaskValue, TaskValueDraft,
+    TaskValue,
 };
 use crate::volumes::VolumeRegistry;
+pub(crate) use crate::workload::model::{
+    merge_definition_into_value, merge_status_into_value,
+    select_best_workload_value as select_best_task_value, spec_to_status, spec_to_value,
+    value_to_spec,
+};
 use crate::workload::types::TaskExecutionSpec;
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
@@ -54,6 +59,9 @@ mod tests;
 use self::planner::{RemoteStartPlan, SchedulingError};
 use self::remote_advisory::RemotePrepareFeedbackRegistry;
 use self::reservation::{ExecutionError, RemoteReservation, ReservedResources};
+
+#[cfg(test)]
+pub(crate) use crate::workload::model::should_accept_incoming_workload_value as should_accept_incoming_task_value;
 /// Maximum number of concurrent image pulls executed per node.
 const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
 /// Retention window for remove watermarks used to suppress stale upsert replay.
@@ -1582,41 +1590,6 @@ impl Drop for ReconcileTaskGuard {
     }
 }
 
-/// Select the most relevant task value from concurrent CRDT versions for scheduling decisions.
-pub(crate) fn select_best_task_value(values: &[TaskValue]) -> Option<TaskValue> {
-    let mut best: Option<&TaskValue> = None;
-    for value in values {
-        match best {
-            None => best = Some(value),
-            Some(current) => {
-                if should_prefer_task_value(current, value) {
-                    best = Some(value);
-                }
-            }
-        }
-    }
-    best.cloned()
-}
-
-/// Returns `true` when the incoming task value should replace the currently selected value.
-pub(crate) fn should_accept_incoming_task_value(current: &TaskValue, incoming: &TaskValue) -> bool {
-    compare_task_causality(current, incoming).is_gt()
-}
-
-fn should_prefer_task_value(current: &TaskValue, candidate: &TaskValue) -> bool {
-    if should_accept_incoming_task_value(current, candidate) {
-        return true;
-    }
-    if should_accept_incoming_task_value(candidate, current) {
-        return false;
-    }
-    if candidate.definition_complete != current.definition_complete {
-        return candidate.definition_complete;
-    }
-
-    candidate.node_id > current.node_id
-}
-
 /// Ensures GPU-bound containers see the selected devices by injecting the
 /// NVIDIA_VISIBLE_DEVICES environment variable when missing.
 pub(super) fn append_nvidia_visible_devices(
@@ -1644,172 +1617,4 @@ pub(super) fn append_nvidia_visible_devices(
             *env_vars = Some(vec![entry]);
         }
     }
-}
-
-fn value_to_spec(id: Uuid, value: TaskValue) -> TaskSpec {
-    let mut slot_ids = value.slot_ids;
-    if slot_ids.is_empty()
-        && let Some(slot_id) = value.slot_id
-    {
-        slot_ids.push(slot_id);
-    }
-    let slot_id = slot_ids.first().copied();
-
-    TaskSpec {
-        id,
-        name: value.name,
-        image: value.image,
-        state: value.state,
-        phase_reason: value.phase_reason,
-        phase_progress: value.phase_progress,
-        created_at: value.created_at,
-        updated_at: value.updated_at,
-        command: value.command,
-        tty: value.tty,
-        node_id: value.node_id,
-        node_name: value.node_name,
-        slot_ids,
-        slot_id,
-        cpu_millis: value.cpu_millis,
-        memory_bytes: value.memory_bytes,
-        gpu_count: value.gpu_count,
-        gpu_device_ids: value.gpu_device_ids,
-        restart_policy: value.restart_policy,
-        termination_grace_period_secs: value.termination_grace_period_secs,
-        pre_stop_command: value.pre_stop_command,
-        liveness: value.liveness,
-        env: value.env,
-        secret_files: value.secret_files,
-        volumes: value.volumes,
-        networks: value.networks,
-        service_metadata: value.service_metadata,
-        lease_id: value.lease_id,
-        lease_coordinator_node_id: value.lease_coordinator_node_id,
-        task_epoch: value.task_epoch,
-        phase_version: value.phase_version,
-        launch_attempt: value.launch_attempt,
-        last_terminal_observed_launch: value.last_terminal_observed_launch,
-    }
-}
-
-/// Projects one full task definition into the compact status payload used for hot lifecycle gossip.
-pub(crate) fn spec_to_status(spec: &TaskSpec) -> TaskStatus {
-    TaskStatus::from_spec(spec)
-}
-
-/// Builds one persisted task value by applying a compact status update over the current task row.
-pub(crate) fn merge_status_into_value(
-    current: Option<&TaskValue>,
-    status: &TaskStatus,
-) -> TaskValue {
-    if let Some(current) = current {
-        let mut merged = current.clone();
-        merged.id = status.id;
-        merged.name = status.name.clone();
-        merged.image = status.image.clone();
-        merged.state = status.state.clone();
-        merged.phase_reason = status.phase_reason.clone();
-        merged.phase_progress = status.phase_progress.clone();
-        merged.created_at = status.created_at.clone();
-        merged.updated_at = status.updated_at.clone();
-        merged.node_id = status.node_id;
-        merged.node_name = status.node_name.clone();
-        merged.service_metadata = status.service_metadata.clone();
-        merged.task_epoch = status.task_epoch;
-        merged.phase_version = status.phase_version;
-        merged.launch_attempt = status.launch_attempt;
-        merged.last_terminal_observed_launch = status.last_terminal_observed_launch;
-        return merged;
-    }
-
-    let mut placeholder = TaskValue::new(TaskValueDraft {
-        id: status.id,
-        name: status.name.clone(),
-        image: status.image.clone(),
-        state: status.state.clone(),
-        phase_reason: status.phase_reason.clone(),
-        phase_progress: status.phase_progress.clone(),
-        created_at: status.created_at.clone(),
-        updated_at: status.updated_at.clone(),
-        command: Vec::new(),
-        tty: false,
-        node_id: status.node_id,
-        node_name: status.node_name.clone(),
-        slot_ids: Vec::new(),
-        networks: Vec::new(),
-        cpu_millis: 0,
-        memory_bytes: 0,
-        gpu_count: 0,
-        gpu_device_ids: Vec::new(),
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
-        env: Vec::new(),
-        secret_files: Vec::new(),
-        volumes: Vec::new(),
-        service_metadata: status.service_metadata.clone(),
-        lease_id: None,
-        lease_coordinator_node_id: None,
-        task_epoch: status.task_epoch,
-        phase_version: status.phase_version,
-        launch_attempt: status.launch_attempt,
-        last_terminal_observed_launch: status.last_terminal_observed_launch,
-    });
-    placeholder.definition_complete = false;
-    placeholder
-}
-
-/// Merges a late full task definition into a causally newer placeholder task row.
-pub(crate) fn merge_definition_into_value(current: &TaskValue, spec: &TaskSpec) -> TaskValue {
-    let mut merged = spec_to_value(spec);
-    merged.state = current.state.clone();
-    merged.phase_reason = current.phase_reason.clone();
-    merged.phase_progress = current.phase_progress.clone();
-    merged.updated_at = current.updated_at.clone();
-    merged.task_epoch = current.task_epoch;
-    merged.phase_version = current.phase_version;
-    merged.launch_attempt = current.launch_attempt;
-    merged.last_terminal_observed_launch = current.last_terminal_observed_launch;
-    merged.definition_complete = true;
-    merged
-}
-
-/// Converts one task specification into its persisted CRDT value representation.
-pub(crate) fn spec_to_value(spec: &TaskSpec) -> TaskValue {
-    let mut value = TaskValue::new(TaskValueDraft {
-        id: spec.id,
-        name: spec.name.clone(),
-        image: spec.image.clone(),
-        state: spec.state.clone(),
-        phase_reason: spec.phase_reason.clone(),
-        phase_progress: spec.phase_progress.clone(),
-        created_at: spec.created_at.clone(),
-        updated_at: spec.updated_at.clone(),
-        command: spec.command.clone(),
-        tty: spec.tty,
-        node_id: spec.node_id,
-        node_name: spec.node_name.clone(),
-        slot_ids: spec.slot_ids.clone(),
-        networks: spec.networks.clone(),
-        cpu_millis: spec.cpu_millis,
-        memory_bytes: spec.memory_bytes,
-        gpu_count: spec.gpu_count,
-        gpu_device_ids: spec.gpu_device_ids.clone(),
-        termination_grace_period_secs: spec.termination_grace_period_secs,
-        pre_stop_command: spec.pre_stop_command.clone(),
-        liveness: spec.liveness.clone(),
-        env: spec.env.clone(),
-        secret_files: spec.secret_files.clone(),
-        volumes: spec.volumes.clone(),
-        service_metadata: spec.service_metadata.clone(),
-        lease_id: spec.lease_id,
-        lease_coordinator_node_id: spec.lease_coordinator_node_id,
-        task_epoch: spec.task_epoch,
-        phase_version: spec.phase_version,
-        launch_attempt: spec.launch_attempt,
-        last_terminal_observed_launch: spec.last_terminal_observed_launch,
-    });
-
-    value.restart_policy = spec.restart_policy.clone();
-    value
 }

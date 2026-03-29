@@ -1,6 +1,6 @@
 use super::ServiceController;
 use crate::services::types::{ServiceEvent, ServiceRolloutState, ServiceSpecValue, ServiceStatus};
-use crate::task::container::ContainerState;
+use crate::workload::model::WorkloadPhase as ContainerState;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;

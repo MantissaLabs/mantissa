@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskVolumeMount};
+use crate::workload::model::{
+    WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadVolumeMount,
+};
 
 /// Shared execution-side launch shape reused by task requests and service templates.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,11 +28,11 @@ pub struct WorkloadExecutionSpec<N> {
     #[serde(default)]
     pub liveness: Option<WorkloadLivenessProbe>,
     #[serde(default)]
-    pub env: Vec<TaskEnvironmentVariable>,
+    pub env: Vec<WorkloadEnvironmentVariable>,
     #[serde(default)]
-    pub secret_files: Vec<TaskSecretFile>,
+    pub secret_files: Vec<WorkloadSecretFile>,
     #[serde(default)]
-    pub volumes: Vec<TaskVolumeMount>,
+    pub volumes: Vec<WorkloadVolumeMount>,
     #[serde(default)]
     pub networks: Vec<N>,
 }

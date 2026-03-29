@@ -657,7 +657,7 @@ surface.
 
 ### Status
 
-Pending.
+Completed on 2026-03-29.
 
 ### Scope
 
@@ -695,6 +695,11 @@ Pending.
 7. `src/task/manager/mod.rs`
 8. `src/services/manager.rs`
 9. `src/services/types.rs`
+10. `src/task/causality.rs`
+11. `src/workload/types.rs`
+12. `src/workload/capnp_codec.rs`
+13. `src/services/readiness.rs`
+14. `src/services/slot_reconcile.rs`
 
 ### Exit Criteria
 
@@ -707,6 +712,103 @@ Pending.
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
+
+### Implemented
+
+1. Added `src/workload/model.rs` with the internal workload-native core:
+   - `WorkloadKind`
+   - `RuntimeClass`
+   - `WorkloadIdentity`
+   - `WorkloadPhase`
+   - `WorkloadSpec`
+   - `WorkloadStatus`
+   - `WorkloadEvent`
+   - `WorkloadValue`
+   - `WorkloadValueDraft`
+   - workload-native env/secret/volume/service metadata types
+2. Moved lifecycle ordering and replicated-value projection logic into the
+   workload model:
+   - causal comparison helpers
+   - event replacement ordering
+   - `spec_to_status`
+   - `spec_to_value`
+   - `value_to_spec`
+   - `merge_status_into_value`
+   - `merge_definition_into_value`
+   - `select_best_workload_value`
+3. Converted `src/task/container.rs` into a compatibility alias over
+   `WorkloadPhase`.
+4. Converted `src/task/types.rs` into task-facing aliases over the workload
+   model plus the existing task-only filter helpers.
+5. Converted `src/task/causality.rs` into a thin task-facing re-export layer
+   over workload causal ordering.
+6. Updated `src/task/manager/mod.rs` to consume workload-model projection and
+   merge helpers instead of defining those task-shaped helpers inline.
+7. Updated `src/workload/types.rs` and `src/workload/capnp_codec.rs` to depend
+   on workload-native support types instead of importing task types back into
+   the generic workload layer.
+8. Updated generic service controller code to depend on workload lifecycle
+   vocabulary instead of importing `task::container::ContainerState`:
+   - `src/services/manager.rs`
+   - `src/services/readiness.rs`
+   - `src/services/slot_reconcile.rs`
+
+### Removed
+
+1. Removed the standalone lifecycle enum definition from `src/task/container.rs`
+   and replaced it with a task-facing alias over `WorkloadPhase`.
+2. Removed the duplicated structural task model definitions from
+   `src/task/types.rs` and replaced them with task-facing aliases over the
+   workload model.
+3. Removed the duplicated causal ordering implementation from
+   `src/task/causality.rs` and replaced it with a thin façade over the
+   workload model.
+4. Removed the task-manager-local copies of spec/status/value projection logic
+   from `src/task/manager/mod.rs`.
+5. Removed the reverse dependency from the generic workload layer back into
+   task-only support types in `src/workload/types.rs` and
+   `src/workload/capnp_codec.rs`.
+
+### Findings
+
+1. `TaskSpec`, `TaskStatus`, `TaskValue`, and related support types can be kept
+   stable externally by making them aliases over workload-native structs
+   instead of carrying a second full task-shaped definition in parallel.
+2. Current service replicas can be represented without adding a new stored
+   field by inferring `WorkloadKind::ServiceReplica` from the existing
+   `service_metadata`; direct standalone tasks still map to
+   `WorkloadKind::Task`.
+3. Current task-facing runtime selection still maps cleanly to
+   `RuntimeClass::Oci`. Jobs, agents, and alternate runtimes can extend that
+   model later without reintroducing task-shaped persistence helpers.
+
+### Validation Completed
+
+1. `cargo fmt --all`
+2. `cargo clippy --all-targets -- -D warnings`
+3. `cargo test`
+
+All three commands passed on 2026-03-29.
+
+### Proposed Commit
+
+```text
+workload: extract internal workload core model
+
+Introduce a workload-native core model for lifecycle phase, identity,
+spec, status, and replicated value handling, and move the shared
+projection and causal-ordering logic onto that layer.
+
+Task-facing types now project from the workload model instead of
+redefining the same structures locally. The task container phase type
+becomes a compatibility alias over WorkloadPhase, and the task manager
+stops owning spec/status/value merge helpers that are really model
+logic.
+
+The generic workload layer no longer depends back on task-only support
+types, and service controller code now imports workload lifecycle
+vocabulary directly where it participates in generic orchestration.
+```
 
 ## Milestone 5: Workload Manager Cutover Behind Existing Task Surface
 

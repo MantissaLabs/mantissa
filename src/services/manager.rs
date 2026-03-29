@@ -11,13 +11,13 @@ use crate::services::types::{
     ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceTaskSpecValue,
     ServiceUpdateStrategy, compute_service_id,
 };
-use crate::task::container::ContainerState;
 use crate::task::manager::{
     TaskManager, TaskStartRequest, TaskTrafficPublicationUpdate, task_start_error_is_retryable,
 };
 use crate::task::types::{TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskVolumeMount};
 use crate::volumes::types::VolumeDriver;
 use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
+use crate::workload::model::WorkloadPhase as ContainerState;
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};

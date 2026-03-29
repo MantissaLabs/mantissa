@@ -1,5 +1,5 @@
-use crate::task::types::{
-    TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskVolumeMount,
+use crate::workload::model::{
+    WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadSecretReference, WorkloadVolumeMount,
 };
 use crate::workload::types::{
     WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadRestartPolicy,
@@ -10,7 +10,10 @@ use protocol::task::{environment_var, secret_file, secret_ref, volume_mount};
 use uuid::Uuid;
 
 /// Encodes one secret reference into the task schema payload.
-pub fn encode_secret_ref(mut builder: secret_ref::Builder<'_>, reference: &TaskSecretReference) {
+pub fn encode_secret_ref(
+    mut builder: secret_ref::Builder<'_>,
+    reference: &WorkloadSecretReference,
+) {
     builder.set_name(&reference.name);
     if let Some(version_id) = reference.version_id {
         builder.set_version_id(version_id.as_bytes());
@@ -20,7 +23,7 @@ pub fn encode_secret_ref(mut builder: secret_ref::Builder<'_>, reference: &TaskS
 }
 
 /// Decodes one secret reference from the task schema payload.
-pub fn decode_secret_ref(reader: secret_ref::Reader<'_>) -> Result<TaskSecretReference, Error> {
+pub fn decode_secret_ref(reader: secret_ref::Reader<'_>) -> Result<WorkloadSecretReference, Error> {
     let name = reader.get_name()?.to_str()?.to_string();
     let data = reader.get_version_id()?;
     let version_id = if data.len() == 16 {
@@ -31,13 +34,13 @@ pub fn decode_secret_ref(reader: secret_ref::Reader<'_>) -> Result<TaskSecretRef
         None
     };
 
-    Ok(TaskSecretReference { name, version_id })
+    Ok(WorkloadSecretReference { name, version_id })
 }
 
 /// Encodes task environment variables into the task schema list.
 pub fn encode_env_vars(
     builder: &mut struct_list::Builder<environment_var::Owned>,
-    vars: &[TaskEnvironmentVariable],
+    vars: &[WorkloadEnvironmentVariable],
 ) {
     for (idx, var) in vars.iter().enumerate() {
         let mut entry = builder.reborrow().get(idx as u32);
@@ -55,7 +58,7 @@ pub fn encode_env_vars(
 /// Decodes task environment variables from the task schema list.
 pub fn decode_env_vars(
     list: struct_list::Reader<environment_var::Owned>,
-) -> Result<Vec<TaskEnvironmentVariable>, Error> {
+) -> Result<Vec<WorkloadEnvironmentVariable>, Error> {
     let mut env = Vec::with_capacity(list.len() as usize);
     for entry in list.iter() {
         let name = entry.get_name()?.to_str()?.to_string();
@@ -69,7 +72,7 @@ pub fn decode_env_vars(
         } else {
             None
         };
-        env.push(TaskEnvironmentVariable {
+        env.push(WorkloadEnvironmentVariable {
             name,
             value,
             secret,
@@ -81,7 +84,7 @@ pub fn decode_env_vars(
 /// Encodes task secret files into the task schema list.
 pub fn encode_secret_files(
     builder: &mut struct_list::Builder<secret_file::Owned>,
-    files: &[TaskSecretFile],
+    files: &[WorkloadSecretFile],
 ) {
     for (idx, file) in files.iter().enumerate() {
         let mut entry = builder.reborrow().get(idx as u32);
@@ -95,7 +98,7 @@ pub fn encode_secret_files(
 /// Decodes task secret files from the task schema list.
 pub fn decode_secret_files(
     list: struct_list::Reader<secret_file::Owned>,
-) -> Result<Vec<TaskSecretFile>, Error> {
+) -> Result<Vec<WorkloadSecretFile>, Error> {
     let mut files = Vec::with_capacity(list.len() as usize);
     for entry in list.iter() {
         let path = entry.get_path()?.to_str()?.to_string();
@@ -104,7 +107,7 @@ pub fn decode_secret_files(
             0 => None,
             value => Some(value),
         };
-        files.push(TaskSecretFile { path, secret, mode });
+        files.push(WorkloadSecretFile { path, secret, mode });
     }
     Ok(files)
 }
@@ -112,7 +115,7 @@ pub fn decode_secret_files(
 /// Encodes task volume mounts into the task schema list.
 pub fn encode_volume_mounts(
     builder: &mut struct_list::Builder<volume_mount::Owned>,
-    mounts: &[TaskVolumeMount],
+    mounts: &[WorkloadVolumeMount],
 ) {
     for (idx, mount) in mounts.iter().enumerate() {
         let mut entry = builder.reborrow().get(idx as u32);
@@ -126,7 +129,7 @@ pub fn encode_volume_mounts(
 /// Decodes task volume mounts from the task schema list.
 pub fn decode_volume_mounts(
     list: struct_list::Reader<volume_mount::Owned>,
-) -> Result<Vec<TaskVolumeMount>, Error> {
+) -> Result<Vec<WorkloadVolumeMount>, Error> {
     let mut mounts = Vec::with_capacity(list.len() as usize);
     for entry in list.iter() {
         let volume_id = {
@@ -138,7 +141,7 @@ pub fn decode_volume_mounts(
             bytes.copy_from_slice(data);
             Uuid::from_bytes(bytes)
         };
-        mounts.push(TaskVolumeMount {
+        mounts.push(WorkloadVolumeMount {
             volume_id,
             volume_name: entry.get_volume_name()?.to_str()?.to_string(),
             target: entry.get_target()?.to_str()?.to_string(),

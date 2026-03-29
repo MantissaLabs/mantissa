@@ -1,17 +1,2 @@
-use serde::{Deserialize, Serialize};
-
-/// Lifecycle state for a task container or micro VM.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum ContainerState {
-    Pending,
-    Pulling,
-    Creating,
-    VolumeUnavailable,
-    Running,
-    Paused,
-    Stopping,
-    Stopped,
-    Failed,
-    Exited(i32),
-    Unknown,
-}
+/// Task-facing compatibility alias for the internal workload lifecycle phase.
+pub use crate::workload::model::WorkloadPhase as ContainerState;

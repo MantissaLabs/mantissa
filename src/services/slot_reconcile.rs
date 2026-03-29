@@ -11,8 +11,8 @@ use super::{
     task_state_healthy, task_state_rebalanceable,
 };
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
-use crate::task::container::ContainerState;
 use crate::task::types::TaskSpec;
+use crate::workload::model::WorkloadPhase as ContainerState;
 use anyhow::anyhow;
 use health::Status as HealthStatus;
 use std::collections::{HashMap, HashSet};
