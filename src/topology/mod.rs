@@ -9,6 +9,7 @@ use crate::registry::Registry;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::Scheduler;
 use crate::secrets::crypto::SecretKeyring;
+use crate::store::agent_store::AgentStore;
 use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::cluster_view_store::{ClusterNameRecord, ClusterViewStore};
 use crate::store::job_store::JobStore;
@@ -152,6 +153,7 @@ pub struct TopologyStores {
     pub secret_master_store: SecretMasterStore,
     pub tasks: TaskStore,
     pub jobs: JobStore,
+    pub agents: AgentStore,
     pub services: ServiceStore,
     pub secrets: SecretStore,
     pub networks: NetworkSpecStore,
@@ -361,6 +363,7 @@ pub struct Topology {
     cluster_view_store: ClusterViewStore,
     tasks: TaskStore,
     jobs: JobStore,
+    agents: AgentStore,
     services: ServiceStore,
     secrets: SecretStore,
     networks: NetworkSpecStore,
@@ -475,6 +478,7 @@ impl Topology {
             secret_master_store,
             tasks,
             jobs,
+            agents,
             services,
             secrets,
             networks,
@@ -500,6 +504,7 @@ impl Topology {
             cluster_view_store,
             tasks,
             jobs,
+            agents,
             services,
             secrets,
             networks,
@@ -996,6 +1001,9 @@ impl Topology {
                 }
                 Ok(Message::Job { .. }) => {
                     // Job gossip is handled by the dedicated job controller.
+                }
+                Ok(Message::Agent { .. }) => {
+                    // Agent gossip is handled by the dedicated agent controller.
                 }
                 Ok(Message::Volume { .. }) => {
                     // Volume gossip is handled by the dedicated volume replicator.
@@ -1524,6 +1532,7 @@ impl Topology {
             peers: self.peers.clone(),
             tasks: self.tasks.clone(),
             jobs: self.jobs.clone(),
+            agents: self.agents.clone(),
             services: self.services.clone(),
             secrets: self.secrets.clone(),
             networks: self.networks.clone(),
@@ -1564,6 +1573,7 @@ impl Topology {
             peers: self.peers.clone(),
             tasks: self.tasks.clone(),
             jobs: self.jobs.clone(),
+            agents: self.agents.clone(),
             services: self.services.clone(),
             secrets: self.secrets.clone(),
             networks: self.networks.clone(),
@@ -1614,6 +1624,7 @@ impl Topology {
             peers: self.peers.clone(),
             tasks: self.tasks.clone(),
             jobs: self.jobs.clone(),
+            agents: self.agents.clone(),
             services: self.services.clone(),
             secrets: self.secrets.clone(),
             networks: self.networks.clone(),

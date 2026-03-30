@@ -2628,6 +2628,8 @@ mod tests {
             id,
             name: format!("{service_name}-{template}-1-test"),
             image: "ghcr.io/demo/app:latest".to_string(),
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
             state,
             phase_reason: None,
             phase_progress: None,

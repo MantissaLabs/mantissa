@@ -179,6 +179,8 @@ impl Default for RuntimeExecOptions {
 pub struct RuntimeCreateRequest {
     pub name: String,
     pub image: String,
+    pub runtime_class: RuntimeClass,
+    pub sandbox_profile: Option<String>,
     pub labels: Option<HashMap<String, String>>,
     pub command: Option<Vec<String>>,
     pub tty: bool,

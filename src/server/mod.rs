@@ -13,10 +13,10 @@ use tracing::error;
 use uuid::Uuid;
 
 use protocol::{
-    gossip::GossipClient, jobs::JobsClient, network::NetworksClient, node::NodeClient,
-    scheduling::scheduler::Client as SchedulerClient, secrets::secrets::Client as SecretsClient,
-    services::ServicesClient, sync::SyncClient, task::TaskClient, topology::TopologyClient,
-    volumes::VolumesClient,
+    agents::AgentsClient, gossip::GossipClient, jobs::JobsClient, network::NetworksClient,
+    node::NodeClient, scheduling::scheduler::Client as SchedulerClient,
+    secrets::secrets::Client as SecretsClient, services::ServicesClient, sync::SyncClient,
+    task::TaskClient, topology::TopologyClient, volumes::VolumesClient,
 };
 
 pub mod auth;
@@ -348,6 +348,7 @@ pub struct ServerClients {
     pub node_client: NodeClient,
     pub task_client: TaskClient,
     pub jobs_client: JobsClient,
+    pub agents_client: AgentsClient,
     pub scheduler_client: SchedulerClient,
     pub services_client: ServicesClient,
     pub secrets_client: SecretsClient,
@@ -368,6 +369,7 @@ impl From<ServerClients> for ClusterSessionServices {
             node: clients.node_client,
             task: clients.task_client,
             jobs: clients.jobs_client,
+            agents: clients.agents_client,
             scheduler: clients.scheduler_client,
             services: clients.services_client,
             secrets: clients.secrets_client,

@@ -160,6 +160,8 @@ pub fn write_status(mut builder: task_status::Builder<'_>, status: &TaskStatus) 
     builder.set_phase_version(status.phase_version);
     builder.set_launch_attempt(status.launch_attempt);
     builder.set_last_terminal_observed_launch(status.last_terminal_observed_launch.unwrap_or(0));
+    builder.set_runtime_class(status.runtime_class.as_str());
+    builder.set_sandbox_profile(status.sandbox_profile.as_deref().unwrap_or(""));
 }
 
 /// Decodes one compact task lifecycle status from the task gossip payload.
@@ -193,6 +195,8 @@ pub fn read_status(reader: task_status::Reader<'_>) -> Result<TaskStatus, Error>
             0 => None,
             value => Some(value),
         },
+        runtime_class: read_runtime_class(reader.get_runtime_class()?.to_str()?),
+        sandbox_profile: read_optional_text(reader.get_sandbox_profile()?),
     })
 }
 
@@ -210,6 +214,8 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     builder.set_phase_version(spec.phase_version);
     builder.set_launch_attempt(spec.launch_attempt);
     builder.set_last_terminal_observed_launch(spec.last_terminal_observed_launch.unwrap_or(0));
+    builder.set_runtime_class(spec.runtime_class.as_str());
+    builder.set_sandbox_profile(spec.sandbox_profile.as_deref().unwrap_or(""));
     builder.set_lease_id(
         spec.lease_id
             .as_ref()
@@ -410,6 +416,8 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         id,
         name,
         image,
+        runtime_class: read_runtime_class(reader.get_runtime_class()?.to_str()?),
+        sandbox_profile: read_optional_text(reader.get_sandbox_profile()?),
         state: state_from_str(state),
         phase_reason: if phase_reason.is_empty() {
             None
@@ -843,8 +851,8 @@ impl task::Server for TaskService {
                 volumes,
                 networks,
             },
-            runtime_class: RuntimeClass::Oci,
-            sandbox_profile: None,
+            runtime_class: read_runtime_class(req.get_runtime_class()?.to_str()?),
+            sandbox_profile: read_optional_text(req.get_sandbox_profile()?),
             gpu_device_ids,
             id: None,
             slot_ids,
@@ -971,8 +979,8 @@ impl task::Server for TaskService {
                     volumes,
                     networks,
                 },
-                runtime_class: RuntimeClass::Oci,
-                sandbox_profile: None,
+                runtime_class: read_runtime_class(entry.get_runtime_class()?.to_str()?),
+                sandbox_profile: read_optional_text(entry.get_sandbox_profile()?),
                 gpu_device_ids,
                 id: task_id,
                 slot_ids,
@@ -1295,6 +1303,15 @@ impl task::Server for TaskService {
 
         Ok(())
     }
+}
+
+fn read_runtime_class(value: &str) -> RuntimeClass {
+    value.parse().unwrap_or(RuntimeClass::Oci)
+}
+
+fn read_optional_text(reader: capnp::text::Reader<'_>) -> Option<String> {
+    let value = reader.to_str().ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn list_filter_from_request(request: &task_list_request::Reader) -> Result<TaskStateFilter, Error> {

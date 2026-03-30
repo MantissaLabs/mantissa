@@ -9,8 +9,9 @@ use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 use crate::runtime::types::{
     RuntimeAttachmentTarget, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest,
     RuntimeError, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeLogFrame,
-    RuntimeLogsOptions, RuntimeResult, RuntimeStateInfo,
+    RuntimeLogsOptions, RuntimeResult, RuntimeStateInfo, RuntimeSupportProfile,
 };
+use crate::workload::model::RuntimeClass;
 
 /// Returns whether tests requested the shared in-memory runtime backend through one env override.
 pub fn use_in_memory_runtime_backend_from_env() -> bool {
@@ -308,6 +309,15 @@ impl RuntimeBackend for InMemoryRuntimeBackend {
             attach: false,
             lifecycle_events: false,
         }
+    }
+
+    /// Advertises that the shared in-memory backend can host both OCI and sandbox workloads.
+    fn advertised_support(&self) -> RuntimeSupportProfile {
+        RuntimeSupportProfile::new(
+            [RuntimeClass::Oci, RuntimeClass::Sandbox],
+            ["default", "oci-default"],
+            self.capabilities().feature_flags(),
+        )
     }
 
     /// Accepts log-stream requests without emitting any synthetic frames.

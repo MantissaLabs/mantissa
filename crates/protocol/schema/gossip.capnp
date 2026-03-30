@@ -4,6 +4,7 @@ using import "topology.capnp".TopologyEvent;
 using import "topology.capnp".ClusterViewId;
 using import "task.capnp".TaskEvent;
 using import "jobs.capnp".JobEvent;
+using import "agents.capnp".AgentEvent;
 using import "services.capnp".ServiceEvent;
 using import "network.capnp".NetworkEvent;
 using import "secrets.capnp".SecretEvent;
@@ -49,6 +50,9 @@ struct GossipMessage {
 
     job @10 :JobEvent;
     # Job upsert/remove event.
+
+    agent @11 :AgentEvent;
+    # Agent session/run upsert/remove event.
 
     network @5 :NetworkEvent;
     # Network upsert/remove event.

@@ -30,7 +30,9 @@ use crate::runtime::types::{
     RuntimeCapabilities, RuntimeConfigInfo, RuntimeCreateRequest, RuntimeError, RuntimeEvent,
     RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogStream,
     RuntimeLogsOptions, RuntimeNetworkEndpoint, RuntimeResult, RuntimeStateInfo,
+    RuntimeSupportProfile,
 };
+use crate::workload::model::RuntimeClass;
 use async_trait::async_trait;
 use futures::StreamExt;
 use log::{debug, info, trace, warn};
@@ -912,6 +914,8 @@ impl RuntimeBackend for DockerRuntimeBackend {
         let RuntimeCreateRequest {
             name,
             image,
+            runtime_class: _runtime_class,
+            sandbox_profile: _sandbox_profile,
             labels,
             command,
             tty,
@@ -1343,6 +1347,15 @@ impl RuntimeBackend for DockerRuntimeBackend {
             attach: true,
             lifecycle_events: true,
         }
+    }
+
+    /// Advertises Docker-backed OCI sandboxes alongside regular OCI workloads.
+    fn advertised_support(&self) -> RuntimeSupportProfile {
+        RuntimeSupportProfile::new(
+            [RuntimeClass::Oci, RuntimeClass::Sandbox],
+            ["default", "oci-default"],
+            self.capabilities().feature_flags(),
+        )
     }
 
     /// Watches Docker container events and forwards task-relevant lifecycle edges.

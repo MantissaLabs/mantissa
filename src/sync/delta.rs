@@ -4,12 +4,14 @@
 //! capability and exposes `DeltaSinkImpl`, the local sink used by the remote peer to
 //! stream missing CRDT fragments back into the local stores.
 
+use crate::agents::types::AgentRecordValue;
 use crate::cluster::ClusterViewId;
 use crate::jobs::types::JobSpecValue;
 use crate::network::types::{NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue};
 use crate::scheduler::digest::SchedulerDigestValue;
 use crate::secrets::types::SecretValue;
 use crate::services::types::ServiceSpecValue;
+use crate::store::agent_store::AgentStore;
 use crate::store::cluster_view_store::{ClusterNameRecord, ClusterViewDomainStore};
 use crate::store::job_store::JobStore;
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
@@ -37,11 +39,12 @@ type RegisterDelta<V> = Vec<(UuidKey, MVReg<V, uuid::Uuid>)>;
 type TombstoneDelta = Vec<(UuidKey, u64)>;
 
 /// Same domain ordering as the server, used when a caller wants a full peer reconciliation.
-const ALL_SYNC_DOMAINS: [Domain; 12] = [
+const ALL_SYNC_DOMAINS: [Domain; 13] = [
     Domain::Peers,
     Domain::Tasks,
     Domain::Services,
     Domain::Jobs,
+    Domain::Agents,
     Domain::Secrets,
     Domain::Networks,
     Domain::NetworkPeers,
@@ -58,6 +61,7 @@ pub struct SyncStores {
     pub peers: PeersStore,
     pub tasks: TaskStore,
     pub jobs: JobStore,
+    pub agents: AgentStore,
     pub services: ServiceStore,
     pub secrets: SecretStore,
     pub networks: NetworkSpecStore,
@@ -96,6 +100,7 @@ impl SyncStores {
             Domain::Tasks => self.tasks.root_hex().await,
             Domain::Services => self.services.root_hex().await,
             Domain::Jobs => self.jobs.root_hex().await,
+            Domain::Agents => self.agents.root_hex().await,
             Domain::Secrets => self.secrets.root_hex().await,
             Domain::Networks => self.networks.root_hex().await,
             Domain::NetworkPeers => self.network_peers.root_hex().await,
@@ -114,6 +119,7 @@ impl SyncStores {
             Domain::Tasks => self.tasks.page_range_summary().await,
             Domain::Services => self.services.page_range_summary().await,
             Domain::Jobs => self.jobs.page_range_summary().await,
+            Domain::Agents => self.agents.page_range_summary().await,
             Domain::Secrets => self.secrets.page_range_summary().await,
             Domain::Networks => self.networks.page_range_summary().await,
             Domain::NetworkPeers => self.network_peers.page_range_summary().await,
@@ -192,6 +198,14 @@ impl delta_sink::Server for DeltaSinkImpl {
                     self.stores.jobs.clone(),
                     &chunk,
                     decode_register::<JobSpecValue>,
+                )
+                .await?
+            }
+            Domain::Agents => {
+                apply_chunk(
+                    self.stores.agents.clone(),
+                    &chunk,
+                    decode_register::<AgentRecordValue>,
                 )
                 .await?
             }
@@ -374,6 +388,17 @@ impl DeltaStore<JobSpecValue> for JobStore {
     async fn apply_delta(
         self,
         regs: Vec<(UuidKey, MVReg<JobSpecValue, uuid::Uuid>)>,
+        tombs: Vec<(UuidKey, u64)>,
+    ) -> io::Result<()> {
+        self.apply_delta_chunk_update_mst(regs, tombs).await
+    }
+}
+
+#[async_trait]
+impl DeltaStore<AgentRecordValue> for AgentStore {
+    async fn apply_delta(
+        self,
+        regs: Vec<(UuidKey, MVReg<AgentRecordValue, uuid::Uuid>)>,
         tombs: Vec<(UuidKey, u64)>,
     ) -> io::Result<()> {
         self.apply_delta_chunk_update_mst(regs, tombs).await

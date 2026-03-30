@@ -39,6 +39,9 @@ enum Domain {
   jobs @11;
   # Job registry domain.
 
+  agents @12;
+  # Agent session/run registry domain.
+
   secrets @3;
   # Secret registry domain.
 

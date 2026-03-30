@@ -875,6 +875,9 @@ impl WorkloadManager {
         options: &RuntimeLogsOptions,
         logs_tx: MpscSender<RuntimeLogFrame>,
     ) -> Result<(), anyhow::Error> {
+        if !self.runtime.runtime_backend.capabilities().logs {
+            return Err(anyhow!("runtime backend does not support log streaming"));
+        }
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
@@ -909,6 +912,11 @@ impl WorkloadManager {
         output_tx: MpscSender<RuntimeLogFrame>,
         input_rx: MpscReceiver<Vec<u8>>,
     ) -> Result<(), anyhow::Error> {
+        if !self.runtime.runtime_backend.capabilities().attach {
+            return Err(anyhow!(
+                "runtime backend does not support interactive attach"
+            ));
+        }
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
@@ -960,6 +968,11 @@ impl WorkloadManager {
         output_tx: MpscSender<RuntimeLogFrame>,
         input_rx: MpscReceiver<Vec<u8>>,
     ) -> Result<RuntimeExecResult, anyhow::Error> {
+        if !self.runtime.runtime_backend.capabilities().interactive_exec {
+            return Err(anyhow!(
+                "runtime backend does not support interactive exec sessions"
+            ));
+        }
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
@@ -1038,11 +1051,21 @@ impl WorkloadManager {
 
     /// Verifies that a locally owned task still has a running runtime before attach is accepted.
     pub async fn ensure_local_task_attachable(&self, id: Uuid) -> Result<(), anyhow::Error> {
+        if !self.runtime.runtime_backend.capabilities().attach {
+            return Err(anyhow!(
+                "runtime backend does not support interactive attach"
+            ));
+        }
         self.ensure_local_task_runtime_running(id, "attach").await
     }
 
     /// Verifies that a locally owned task still has a running runtime before exec is accepted.
     pub async fn ensure_local_task_executable(&self, id: Uuid) -> Result<(), anyhow::Error> {
+        if !self.runtime.runtime_backend.capabilities().interactive_exec {
+            return Err(anyhow!(
+                "runtime backend does not support interactive exec sessions"
+            ));
+        }
         self.ensure_local_task_runtime_running(id, "exec").await
     }
 

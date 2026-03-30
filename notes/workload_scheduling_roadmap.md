@@ -1428,7 +1428,7 @@ Add agent scheduling without conflating agents with regular tasks.
 
 ### Status
 
-Pending.
+Completed on 2026-03-29.
 
 ### Scope
 
@@ -1486,6 +1486,108 @@ Pending.
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
+
+### Implemented
+
+1. Added first-class agent modules under `src/agents/`:
+   - `types.rs`
+   - `registry.rs`
+   - `manager.rs`
+   - `service.rs`
+2. Added durable agent session and run state with controller-owned semantics:
+   - `AgentSessionSpecValue`
+   - `AgentRunSpecValue`
+   - workspace, tool, checkpoint, and interaction policies
+   - structured agent events and event history
+3. Added `src/store/agent_store.rs` and wired agents into bootstrap, topology,
+   sync, gossip, and headless runtime startup.
+4. Added protocol support for agents:
+   - `crates/protocol/schema/agents.capnp`
+   - server/session capability exposure
+   - gossip and sync domain wiring
+5. Added client and CLI support for agents:
+   - `crates/client/src/agents/`
+   - `agents list`
+   - `agents submit`
+   - `agents runs`
+   - `agents input`
+6. Extended workload and runtime substrate to carry runtime class and sandbox
+   profile through:
+   - workload model/spec/status
+   - runtime create requests
+   - planner intents
+   - launch paths
+   - task RPC schema
+7. Added explicit runtime capability checks for logs, attach, interactive
+   exec, exec-based liveness, and pre-stop hooks so controller behavior is now
+   capability-driven instead of implicitly Docker-shaped.
+8. Added integration coverage in `tests/agents.rs` for:
+   - sandbox run creation
+   - session reuse
+   - pending input resumption
+   - runtime class/profile propagation
+
+### Removed
+
+1. Kept agent-only policy out of regular task and service models. Tasks and
+   services reuse runtime/workload layers but do not carry workspace, tool,
+   checkpoint, or interaction fields.
+2. Removed the remaining assumption that every runtime supports:
+   - interactive attach
+   - interactive exec
+   - log streaming
+   - exec-based hooks and liveness
+3. Removed temporary debug instrumentation added while isolating the TCP
+   startup regression before closing the milestone.
+
+### Findings
+
+1. The new agent wiring increased bootstrap future size enough to overflow the
+   current-thread test stack during TCP headless startup. Boxing the
+   `build_runtime_components()` future in `src/server/bootstrap/runtime.rs`
+   fixed the regression without changing runtime behavior.
+2. The runtime capability split exposed stale assumptions in the TCP relay
+   tests. The custom runtime backends in:
+   - `tests/task_attach.rs`
+   - `tests/task_exec.rs`
+   - `tests/task_logs.rs`
+   now declare the capabilities they already implement so the tests validate
+   the intended relay behavior under the new capability gating.
+3. Treating `Sandbox` as a runtime class separate from `AgentSession` and
+   `AgentRun` was the right split. Agent state stayed controller-specific while
+   sandbox selection flowed through the shared workload/runtime path.
+
+### Validation completed
+
+1. `cargo fmt --all`
+   - passed
+2. `cargo clippy --all-targets -- -D warnings`
+   - passed
+3. `cargo test`
+   - passed
+
+### Proposed commit
+
+```text
+agents: add sandbox session and run controller
+
+Add first-class agent sessions and runs as a controller layer on top of the
+shared workload and runtime substrate.
+
+This introduces durable agent session and run state, agent gossip and sync
+domains, an agents RPC surface, CLI commands, and integration coverage for
+sandbox-backed agent execution and resumed input handling. Agent-specific
+workspace, tool, checkpoint, and interaction policy stays isolated inside the
+agent controller instead of being pushed into regular task or service models.
+
+The runtime and workload layers now carry sandbox runtime class and profile
+metadata, and controller behavior is gated by explicit runtime capabilities
+for logs, attach, interactive exec, and exec-based hooks. During validation,
+the larger bootstrap future exposed a current-thread stack overflow in TCP
+headless startup, which is fixed by boxing the runtime assembly future. The
+TCP relay test backends were also updated to advertise the capabilities they
+already implement so the new gating is exercised correctly.
+```
 
 ## Milestone 10: Final Cleanup And Naming Reconciliation
 

@@ -306,6 +306,12 @@ struct TaskSpec {
 
   leaseCoordinatorNodeId @31 :Data;
   # 16-byte UUID of the node that coordinated the prepared lease, empty when unset.
+
+  runtimeClass @32 :Text;
+  # Runtime class used to execute this workload.
+
+  sandboxProfile @33 :Text;
+  # Optional sandbox profile used when the workload targets sandbox execution.
 }
 
 struct TaskStatus {
@@ -353,6 +359,12 @@ struct TaskStatus {
 
   lastTerminalObservedLaunch @14 :UInt64;
   # Last launch attempt observed as terminal, 0 means unset.
+
+  runtimeClass @15 :Text;
+  # Runtime class used to execute this workload.
+
+  sandboxProfile @16 :Text;
+  # Optional sandbox profile used when the workload targets sandbox execution.
 }
 
 struct ServiceMetadata {
@@ -414,6 +426,12 @@ struct TaskStartRequest {
 
   liveness @16 :LivenessProbe;
   # Optional local liveness probe executed by the hosting runtime.
+
+  runtimeClass @17 :Text;
+  # Runtime class requested for this workload.
+
+  sandboxProfile @18 :Text;
+  # Optional sandbox profile requested for sandbox workloads.
 }
 
 struct LivenessProbe {

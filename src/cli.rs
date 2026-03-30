@@ -146,6 +146,13 @@ pub enum Command {
         cmd: JobsCommand,
     },
 
+    /// Agent session scheduling subcommands
+    #[command(alias = "a", subcommand_required = true, arg_required_else_help = true)]
+    Agents {
+        #[command(subcommand)]
+        cmd: AgentsCommand,
+    },
+
     /// Scheduler inspection subcommands
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Scheduler {
@@ -380,6 +387,23 @@ pub enum JobsCommand {
     Run(JobsRunArgs),
 }
 
+#[derive(Subcommand, Debug)]
+pub enum AgentsCommand {
+    /// List first-class agent sessions
+    #[command(alias = "ls")]
+    List,
+
+    /// Submit one durable agent session
+    #[command(alias = "run")]
+    Submit(Box<AgentsSubmitArgs>),
+
+    /// List first-class agent runs
+    Runs(AgentsRunsArgs),
+
+    /// Queue one user input on an existing session
+    Input(AgentsInputArgs),
+}
+
 #[derive(Args, Debug)]
 pub struct TasksListArgs {
     /// The cluster to list tasks for
@@ -486,6 +510,127 @@ pub struct JobsRunArgs {
     /// Named volume mount in SOURCE:TARGET[:ro|rw] form (repeat flag to add multiple mounts)
     #[arg(long = "volume", value_name = "MOUNT", action = ArgAction::Append)]
     pub volumes: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsSubmitArgs {
+    /// Friendly name for the agent session
+    #[arg(index = 1, value_name = "NAME")]
+    pub name: String,
+
+    /// Sandbox image to run for each agent turn
+    #[arg(short = 'i', long = "image", value_name = "IMAGE")]
+    pub image: String,
+
+    /// Command arguments for the sandbox entrypoint (repeat flag to add arguments)
+    #[arg(short = 'c', long = "command", value_name = "ARG", action = ArgAction::Append)]
+    pub command: Vec<String>,
+
+    /// Allocate a TTY for the sandbox entrypoint
+    #[arg(long = "tty", action = ArgAction::SetTrue)]
+    pub tty: bool,
+
+    /// CPU requested in milli-CPUs (e.g. 500 = 0.5 vCPU)
+    #[arg(long = "cpu-millis", value_name = "MCPU", default_value = "1000")]
+    pub cpu_millis: u64,
+
+    /// Memory requested in bytes
+    #[arg(
+        long = "memory-bytes",
+        value_name = "BYTES",
+        default_value = "536870912"
+    )]
+    pub memory_bytes: u64,
+
+    /// GPU count requested
+    #[arg(long = "gpu-count", value_name = "COUNT", default_value = "0")]
+    pub gpu_count: u32,
+
+    /// Requested sandbox profile for the run runtime
+    #[arg(long = "sandbox-profile", value_name = "PROFILE")]
+    pub sandbox_profile: Option<String>,
+
+    /// Optional initial input queued for the first run
+    #[arg(long = "input", value_name = "TEXT")]
+    pub input: Option<String>,
+
+    /// Named volume mount in SOURCE:TARGET[:ro|rw] form (repeat flag to add multiple mounts)
+    #[arg(long = "volume", value_name = "MOUNT", action = ArgAction::Append)]
+    pub volumes: Vec<String>,
+
+    /// Optional workspace mount in SOURCE:TARGET[:ro|rw] form
+    #[arg(long = "workspace", value_name = "MOUNT")]
+    pub workspace: Option<String>,
+
+    /// Preferred working directory inside the sandbox
+    #[arg(long = "workdir", value_name = "PATH")]
+    pub workdir: Option<String>,
+
+    /// Persist the workspace volume across runs
+    #[arg(long = "workspace-persistent", action = ArgAction::SetTrue)]
+    pub workspace_persistent: bool,
+
+    /// Explicitly allow one tool identifier (repeat flag to allow multiple tools)
+    #[arg(long = "allow-tool", value_name = "TOOL", action = ArgAction::Append)]
+    pub allowed_tools: Vec<String>,
+
+    /// Allow outbound network access inside the sandbox
+    #[arg(long = "allow-network", action = ArgAction::SetTrue)]
+    pub allow_network: bool,
+
+    /// Allow pseudo-terminal allocation for sandbox tools
+    #[arg(long = "allow-pty", action = ArgAction::SetTrue)]
+    pub allow_pty: bool,
+
+    /// Allow filesystem writes initiated by sandbox tools
+    #[arg(long = "allow-write", action = ArgAction::SetTrue)]
+    pub allow_write: bool,
+
+    /// Enable checkpointing for the session
+    #[arg(long = "checkpoint", action = ArgAction::SetTrue)]
+    pub checkpoint_enabled: bool,
+
+    /// Optional checkpoint interval in seconds
+    #[arg(long = "checkpoint-interval-secs", value_name = "SECS")]
+    pub checkpoint_interval_secs: Option<u32>,
+
+    /// Optional checkpoint mount in SOURCE:TARGET[:ro|rw] form
+    #[arg(long = "checkpoint-mount", value_name = "MOUNT")]
+    pub checkpoint_mount: Option<String>,
+
+    /// Allow the controller to continue without explicit user input between runs
+    #[arg(long = "auto-continue", action = ArgAction::SetTrue)]
+    pub auto_continue: bool,
+
+    /// Upper bound for autonomous turns inside one run
+    #[arg(long = "max-turns-per-run", value_name = "COUNT", default_value = "1")]
+    pub max_turns_per_run: u16,
+
+    /// Optional idle timeout before a run should yield control
+    #[arg(
+        long = "idle-timeout",
+        value_name = "DURATION",
+        value_parser = parse_cli_duration
+    )]
+    pub idle_timeout: Option<Duration>,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsRunsArgs {
+    /// Optional session identifier used to filter the run listing
+    #[arg(index = 1, value_name = "SESSION-ID")]
+    pub session_id: Option<Uuid>,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsInputArgs {
+    /// Identifier of the session to receive this input
+    #[arg(index = 1, value_name = "SESSION-ID")]
+    pub session_id: Uuid,
+
+    /// Input text to queue on the session
+    #[arg(index = 2, value_name = "TEXT")]
+    pub input: String,
 }
 
 #[derive(Args, Debug)]

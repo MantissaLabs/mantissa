@@ -1,4 +1,5 @@
 use super::{BootstrapContext, BootstrapResult, stores::BootstrapStores};
+use crate::agents::{AgentController, AgentControllerConfig, AgentRegistry, AgentsRpc};
 use crate::cluster::ClusterViewState;
 use crate::gossip::{DEFAULT_FANOUT, DedupeStateHandle, Message};
 use crate::jobs::{JobController, JobControllerConfig, JobRegistry, JobsRpc};
@@ -27,6 +28,7 @@ use crate::topology::{Keys, Topology, TopologyConfig, TopologyStores};
 use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
 use crate::{config, gossip, services};
 use async_channel::{Receiver, Sender};
+use protocol::agents::agents::Client as AgentsClient;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::jobs::jobs::Client as JobsClient;
 use protocol::network::networks::Client as NetworksClient;
@@ -93,6 +95,8 @@ pub(crate) struct RuntimeComponents {
     pub task_client: protocol::task::task::Client,
     pub job_controller: JobController,
     pub jobs_client: JobsClient,
+    pub agent_controller: AgentController,
+    pub agents_client: AgentsClient,
     pub service_controller: ServiceController,
     pub scheduler: Rc<Scheduler>,
     scheduler_client: SchedulerClient,
@@ -142,6 +146,8 @@ struct RuntimeChannels {
     task_rx: Receiver<Message>,
     job_tx: Sender<Message>,
     job_rx: Receiver<Message>,
+    agent_tx: Sender<Message>,
+    agent_rx: Receiver<Message>,
     service_tx: Sender<Message>,
     service_rx: Receiver<Message>,
     network_tx: Sender<Message>,
@@ -162,6 +168,7 @@ struct GossipRoutes {
     topology: Sender<Message>,
     task: Sender<Message>,
     job: Sender<Message>,
+    agent: Sender<Message>,
     service: Sender<Message>,
     network: Sender<Message>,
     secret: Sender<Message>,
@@ -181,6 +188,7 @@ impl RuntimeChannels {
         let (topology_tx, topology_rx) = async_channel::bounded(capacity);
         let (task_tx, task_rx) = async_channel::bounded(capacity);
         let (job_tx, job_rx) = async_channel::bounded(capacity);
+        let (agent_tx, agent_rx) = async_channel::bounded(capacity);
         let (service_tx, service_rx) = async_channel::bounded(capacity);
         let (network_tx, network_rx) = async_channel::bounded(capacity);
         let (secret_tx, secret_rx) = async_channel::bounded(capacity);
@@ -196,6 +204,8 @@ impl RuntimeChannels {
             task_rx,
             job_tx,
             job_rx,
+            agent_tx,
+            agent_rx,
             service_tx,
             service_rx,
             network_tx,
@@ -218,6 +228,7 @@ impl RuntimeChannels {
             topology: self.topology_tx.clone(),
             task: self.task_tx.clone(),
             job: self.job_tx.clone(),
+            agent: self.agent_tx.clone(),
             service: self.service_tx.clone(),
             network: self.network_tx.clone(),
             secret: self.secret_tx.clone(),
@@ -254,11 +265,11 @@ pub(crate) async fn boot(
     options: BootstrapOptions,
 ) -> BootstrapResult<BootedRuntime> {
     let stores = BootstrapStores::open(&ctx).await?;
+    // This async assembly path carries a large future state machine during
+    // headless startup. Boxing it keeps current-thread test stacks bounded.
     let (components, actors, gossip_rx, gossip_dedupe) =
-        build_runtime_components(&ctx, &stores, &options).await?;
-
+        Box::pin(build_runtime_components(&ctx, &stores, &options)).await?;
     apply_runtime_overrides(&components, &options);
-
     let server = build_server(&ctx, &stores, &components);
     spawn_runtime_tasks(
         &components,
@@ -331,6 +342,7 @@ async fn build_runtime_components(
         topology_rx,
         task_rx,
         job_rx,
+        agent_rx,
         service_rx,
         network_rx,
         secret_rx,
@@ -392,6 +404,7 @@ async fn build_runtime_components(
         stores.network_attachments.clone(),
     );
     let job_registry = JobRegistry::new(stores.jobs.clone());
+    let agent_registry = AgentRegistry::new(stores.agents.clone());
     let service_registry = services::ServiceRegistry::new(stores.services.clone());
     let (forwarding_tx, forwarding_rx) = mpsc::unbounded_channel();
     let network_controller = NetworkController::new(
@@ -460,6 +473,18 @@ async fn build_runtime_components(
     let jobs_service = JobsRpc::new(job_controller.clone(), topology.clone());
     let jobs_client = capnp_rpc::new_client(jobs_service);
 
+    let agent_controller = AgentController::new(AgentControllerConfig {
+        registry: agent_registry,
+        task_manager: task_manager.clone(),
+        cluster_registry: registry.clone(),
+        gossip_tx: gossip_tx.clone(),
+        gossip_rx: agent_rx,
+        local_node_id: ctx.self_id,
+        health_monitor: health_monitor.clone(),
+    });
+    let agents_service = AgentsRpc::new(agent_controller.clone(), topology.clone());
+    let agents_client = capnp_rpc::new_client(agents_service);
+
     let service_controller = ServiceController::new(ServiceControllerConfig {
         registry: service_registry.clone(),
         task_manager: task_manager.clone(),
@@ -512,6 +537,8 @@ async fn build_runtime_components(
             task_client,
             job_controller,
             jobs_client,
+            agent_controller,
+            agents_client,
             service_controller,
             scheduler,
             scheduler_client,
@@ -552,6 +579,7 @@ fn build_topology_stores(stores: &BootstrapStores) -> TopologyStores {
         secret_master_store: stores.secret_master_store.clone(),
         tasks: stores.tasks.clone(),
         jobs: stores.jobs.clone(),
+        agents: stores.agents.clone(),
         services: stores.services.clone(),
         secrets: stores.secrets.clone(),
         networks: stores.networks.clone(),
@@ -577,6 +605,7 @@ fn build_gossip_client(
             topology_events: routes.topology.clone(),
             task_events: routes.task.clone(),
             job_events: routes.job.clone(),
+            agent_events: routes.agent.clone(),
             service_events: routes.service.clone(),
             network_events: routes.network.clone(),
             secret_events: routes.secret.clone(),
@@ -713,6 +742,7 @@ fn build_sync_client(
             peers: topology_stores.peers.clone(),
             tasks: stores.tasks.clone(),
             jobs: stores.jobs.clone(),
+            agents: stores.agents.clone(),
             services: stores.services.clone(),
             secrets: stores.secrets.clone(),
             networks: stores.networks.clone(),
@@ -795,6 +825,7 @@ fn build_server(
         node_client: ctx.node_client.clone(),
         task_client: components.task_client.clone(),
         jobs_client: components.jobs_client.clone(),
+        agents_client: components.agents_client.clone(),
         scheduler_client: components.scheduler_client.clone(),
         services_client: components.services_client.clone(),
         secrets_client: components.secrets_client.clone(),
@@ -879,6 +910,11 @@ async fn spawn_runtime_tasks(
     let mut job_runner = components.job_controller.clone();
     tokio::task::spawn_local(async move {
         job_runner.run().await;
+    });
+
+    let mut agent_runner = components.agent_controller.clone();
+    tokio::task::spawn_local(async move {
+        agent_runner.run().await;
     });
 
     let mut service_runner = components.service_controller.clone();

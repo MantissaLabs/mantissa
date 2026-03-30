@@ -7,8 +7,8 @@ use chrono::Utc;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use crdt_store::uuid_key::UuidKey;
 use mantissa::runtime::types::{
-    RuntimeAttachOptions, RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeInfo,
-    RuntimeLogFrame, RuntimeLogStream, RuntimeStateInfo,
+    RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError,
+    RuntimeInfo, RuntimeLogFrame, RuntimeLogStream, RuntimeStateInfo,
 };
 use mantissa::task::container::ContainerState;
 use mantissa::task::types::{TaskValue, TaskValueDraft};
@@ -32,6 +32,14 @@ struct StaticAttachRuntimeBackend {
 
 #[async_trait]
 impl RuntimeBackend for StaticAttachRuntimeBackend {
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            logs: true,
+            attach: true,
+            ..RuntimeCapabilities::default()
+        }
+    }
+
     async fn create_instance(
         &self,
         _request: RuntimeCreateRequest,
@@ -188,6 +196,8 @@ fn replicated_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str) -> Tas
         id: task_id,
         name: "demo-task".to_string(),
         image: "img".to_string(),
+        runtime_class: mantissa::workload::model::RuntimeClass::Oci,
+        sandbox_profile: None,
         state: ContainerState::Running,
         phase_reason: None,
         phase_progress: None,

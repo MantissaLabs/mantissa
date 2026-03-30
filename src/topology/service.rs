@@ -1588,6 +1588,7 @@ impl topology::Server for Topology {
             peers: self.peers.clone(),
             tasks: self.tasks.clone(),
             jobs: self.jobs.clone(),
+            agents: self.agents.clone(),
             services: self.services.clone(),
             secrets: self.secrets.clone(),
             networks: self.networks.clone(),

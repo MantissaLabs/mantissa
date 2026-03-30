@@ -140,6 +140,10 @@ pub struct WorkloadSpec {
     pub id: Uuid,
     pub name: String,
     pub image: String,
+    #[serde(default)]
+    pub runtime_class: RuntimeClass,
+    #[serde(default)]
+    pub sandbox_profile: Option<String>,
     pub state: WorkloadPhase,
     #[serde(default)]
     pub phase_reason: Option<String>,
@@ -212,7 +216,7 @@ impl WorkloadSpec {
 
     /// Returns the runtime class exposed by the current task-era workload projection.
     pub fn runtime_class(&self) -> RuntimeClass {
-        RuntimeClass::Oci
+        self.runtime_class
     }
 }
 
@@ -222,6 +226,10 @@ pub struct WorkloadStatus {
     pub id: Uuid,
     pub name: String,
     pub image: String,
+    #[serde(default)]
+    pub runtime_class: RuntimeClass,
+    #[serde(default)]
+    pub sandbox_profile: Option<String>,
     pub state: WorkloadPhase,
     #[serde(default)]
     pub phase_reason: Option<String>,
@@ -251,6 +259,8 @@ impl WorkloadStatus {
             id: spec.id,
             name: spec.name.clone(),
             image: spec.image.clone(),
+            runtime_class: spec.runtime_class,
+            sandbox_profile: spec.sandbox_profile.clone(),
             state: spec.state.clone(),
             phase_reason: spec.phase_reason.clone(),
             phase_progress: spec.phase_progress.clone(),
@@ -282,7 +292,7 @@ impl WorkloadStatus {
 
     /// Returns the runtime class exposed by the current task-era workload projection.
     pub fn runtime_class(&self) -> RuntimeClass {
-        RuntimeClass::Oci
+        self.runtime_class
     }
 }
 
@@ -300,6 +310,10 @@ pub struct WorkloadValue {
     pub id: Uuid,
     pub name: String,
     pub image: String,
+    #[serde(default)]
+    pub runtime_class: RuntimeClass,
+    #[serde(default)]
+    pub sandbox_profile: Option<String>,
     pub state: WorkloadPhase,
     #[serde(default)]
     pub phase_reason: Option<String>,
@@ -363,6 +377,8 @@ pub struct WorkloadValueDraft {
     pub id: Uuid,
     pub name: String,
     pub image: String,
+    pub runtime_class: RuntimeClass,
+    pub sandbox_profile: Option<String>,
     pub state: WorkloadPhase,
     pub phase_reason: Option<String>,
     pub phase_progress: Option<String>,
@@ -401,6 +417,8 @@ impl WorkloadValue {
             id: draft.id,
             name: draft.name,
             image: draft.image,
+            runtime_class: draft.runtime_class,
+            sandbox_profile: draft.sandbox_profile,
             state: draft.state,
             phase_reason: draft.phase_reason,
             phase_progress: draft.phase_progress,
@@ -451,7 +469,7 @@ impl WorkloadValue {
 
     /// Returns the runtime class exposed by the current task-era workload projection.
     pub fn runtime_class(&self) -> RuntimeClass {
-        RuntimeClass::Oci
+        self.runtime_class
     }
 }
 
@@ -747,6 +765,8 @@ pub(crate) fn value_to_spec(id: Uuid, value: WorkloadValue) -> WorkloadSpec {
         id,
         name: value.name,
         image: value.image,
+        runtime_class: value.runtime_class,
+        sandbox_profile: value.sandbox_profile,
         state: value.state,
         phase_reason: value.phase_reason,
         phase_progress: value.phase_progress,
@@ -795,6 +815,8 @@ pub(crate) fn merge_status_into_value(
         merged.id = status.id;
         merged.name = status.name.clone();
         merged.image = status.image.clone();
+        merged.runtime_class = status.runtime_class;
+        merged.sandbox_profile = status.sandbox_profile.clone();
         merged.state = status.state.clone();
         merged.phase_reason = status.phase_reason.clone();
         merged.phase_progress = status.phase_progress.clone();
@@ -814,6 +836,8 @@ pub(crate) fn merge_status_into_value(
         id: status.id,
         name: status.name.clone(),
         image: status.image.clone(),
+        runtime_class: status.runtime_class,
+        sandbox_profile: status.sandbox_profile.clone(),
         state: status.state.clone(),
         phase_reason: status.phase_reason.clone(),
         phase_progress: status.phase_progress.clone(),
@@ -871,6 +895,8 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
         id: spec.id,
         name: spec.name.clone(),
         image: spec.image.clone(),
+        runtime_class: spec.runtime_class,
+        sandbox_profile: spec.sandbox_profile.clone(),
         state: spec.state.clone(),
         phase_reason: spec.phase_reason.clone(),
         phase_progress: spec.phase_progress.clone(),

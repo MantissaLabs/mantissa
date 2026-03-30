@@ -9,6 +9,7 @@ fn main() {
         .file("schema/scheduling.capnp")
         .file("schema/task.capnp")
         .file("schema/jobs.capnp")
+        .file("schema/agents.capnp")
         .file("schema/services.capnp")
         .file("schema/info.capnp")
         .file("schema/sync.capnp")

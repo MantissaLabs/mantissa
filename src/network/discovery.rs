@@ -2124,6 +2124,8 @@ mod tests {
             id: task_id,
             name: "backend".to_string(),
             image: "hashicorp/http-echo:1.0.0".to_string(),
+            runtime_class: crate::workload::model::RuntimeClass::Oci,
+            sandbox_profile: None,
             state: ContainerState::Running,
             phase_reason: None,
             phase_progress: None,

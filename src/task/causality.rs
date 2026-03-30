@@ -10,6 +10,7 @@ mod tests {
     use super::compare_task_spec_causality;
     use crate::task::container::ContainerState;
     use crate::task::types::TaskSpec;
+    use crate::workload::model::RuntimeClass;
     use chrono::Utc;
     use std::cmp::Ordering;
     use uuid::Uuid;
@@ -22,6 +23,8 @@ mod tests {
             id: Uuid::new_v4(),
             name: "task".to_string(),
             image: "img".to_string(),
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
             state: ContainerState::Running,
             phase_reason: None,
             phase_progress: None,

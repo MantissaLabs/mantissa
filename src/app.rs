@@ -242,6 +242,60 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
         },
 
+        Command::Agents { cmd } => match cmd {
+            AgentsCommand::List => {
+                local.run_until(client::agents::list_sessions(&cfg)).await?;
+            }
+            AgentsCommand::Submit(args) => {
+                local
+                    .run_until(client::agents::submit(
+                        &cfg,
+                        &client::agents::AgentSubmitOptions {
+                            name: &args.name,
+                            image: &args.image,
+                            command: &args.command,
+                            tty: args.tty,
+                            cpu_millis: args.cpu_millis,
+                            memory_bytes: args.memory_bytes,
+                            gpu_count: args.gpu_count,
+                            sandbox_profile: args.sandbox_profile.as_deref(),
+                            volumes: &args.volumes,
+                            workspace_mount: args.workspace.as_deref(),
+                            workspace_working_directory: args.workdir.as_deref(),
+                            workspace_persistent: args.workspace_persistent,
+                            allowed_tools: &args.allowed_tools,
+                            allow_network: args.allow_network,
+                            allow_pty: args.allow_pty,
+                            allow_write: args.allow_write,
+                            checkpoint_enabled: args.checkpoint_enabled,
+                            checkpoint_interval_secs: args.checkpoint_interval_secs,
+                            checkpoint_mount: args.checkpoint_mount.as_deref(),
+                            require_user_input_between_runs: !args.auto_continue,
+                            max_turns_per_run: args.max_turns_per_run,
+                            idle_timeout_secs: args
+                                .idle_timeout
+                                .map(|duration| duration.as_secs() as u32),
+                            initial_input: args.input.as_deref(),
+                        },
+                    ))
+                    .await?;
+            }
+            AgentsCommand::Runs(args) => {
+                local
+                    .run_until(client::agents::list_runs(&cfg, args.session_id))
+                    .await?;
+            }
+            AgentsCommand::Input(args) => {
+                local
+                    .run_until(client::agents::submit_input(
+                        &cfg,
+                        args.session_id,
+                        &args.input,
+                    ))
+                    .await?;
+            }
+        },
+
         Command::Scheduler { cmd } => match cmd {
             SchedulerCommand::Slots(args) => {
                 local

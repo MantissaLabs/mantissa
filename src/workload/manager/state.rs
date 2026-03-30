@@ -381,6 +381,11 @@ impl WorkloadManager {
     ) -> Result<(), String> {
         match probe.kind {
             TaskLivenessProbeKind::Exec => {
+                if !self.runtime.runtime_backend.capabilities().exec {
+                    return Err(
+                        "runtime backend does not support exec-based liveness probes".to_string(),
+                    );
+                }
                 if probe.command.is_empty() {
                     return Err("liveness exec probe is missing a command".to_string());
                 }
@@ -1473,6 +1478,14 @@ impl WorkloadManager {
         let Some(command) = spec.pre_stop_command.as_deref() else {
             return;
         };
+        if !self.runtime.runtime_backend.capabilities().exec {
+            warn!(
+                target: "task",
+                task = %spec.id,
+                "skipping pre-stop hook because the runtime backend does not support exec"
+            );
+            return;
+        }
 
         let remaining = remaining_stop_timeout(stop_deadline);
         if remaining.is_zero() {
@@ -1990,6 +2003,8 @@ impl WorkloadManager {
                 task_name: &working.name,
                 instance_name: &instance_name,
                 image: &working.image,
+                runtime_class: working.runtime_class,
+                sandbox_profile: working.sandbox_profile.as_deref(),
                 command: &working.command,
                 tty: working.tty,
                 cpu_millis: working.cpu_millis,

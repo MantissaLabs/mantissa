@@ -5541,6 +5541,8 @@ fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
         id: spec.id,
         name: spec.name.clone(),
         image: spec.image.clone(),
+        runtime_class: spec.runtime_class,
+        sandbox_profile: spec.sandbox_profile.clone(),
         state: spec.state.clone(),
         phase_reason: spec.phase_reason.clone(),
         phase_progress: spec.phase_progress.clone(),

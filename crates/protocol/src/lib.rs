@@ -11,6 +11,7 @@ capnp::generated_code!(pub mod sync_capnp);
 capnp::generated_code!(pub mod health_capnp);
 capnp::generated_code!(pub mod task_capnp);
 capnp::generated_code!(pub mod jobs_capnp);
+capnp::generated_code!(pub mod agents_capnp);
 capnp::generated_code!(pub mod services_capnp);
 capnp::generated_code!(pub mod secrets_capnp);
 capnp::generated_code!(pub mod network_capnp);
@@ -82,6 +83,12 @@ pub mod jobs {
     pub use super::jobs_capnp::jobs;
     pub use super::jobs_capnp::*;
     pub type JobsClient = super::jobs_capnp::jobs::Client;
+}
+
+pub mod agents {
+    pub use super::agents_capnp::agents;
+    pub use super::agents_capnp::*;
+    pub type AgentsClient = super::agents_capnp::agents::Client;
 }
 
 pub mod secrets {

@@ -5,6 +5,8 @@
 //! other nodes in the cluster based on events and updates to be applied.
 //!
 
+use crate::agents::service::{read_agent_event, write_agent_event};
+use crate::agents::types::AgentEvent;
 use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::dedupe::BoundedSeenCache;
 use crate::jobs::service::{read_job_event, write_job_event};
@@ -109,6 +111,10 @@ pub enum Message {
         id: Uuid,
         event: Box<JobEvent>,
     },
+    Agent {
+        id: Uuid,
+        event: Box<AgentEvent>,
+    },
     Service {
         id: Uuid,
         event: Box<ServiceEvent>,
@@ -138,6 +144,7 @@ impl Message {
             | Message::Topology { id, .. }
             | Message::Task { id, .. }
             | Message::Job { id, .. }
+            | Message::Agent { id, .. }
             | Message::Service { id, .. }
             | Message::Network { id, .. }
             | Message::Secret { id, .. }
@@ -434,6 +441,7 @@ pub struct Channels {
     pub topology_events: Sender<Message>,
     pub task_events: Sender<Message>,
     pub job_events: Sender<Message>,
+    pub agent_events: Sender<Message>,
     pub service_events: Sender<Message>,
     pub network_events: Sender<Message>,
     pub secret_events: Sender<Message>,
@@ -469,6 +477,7 @@ impl gossip::Server for Gossip {
         let topo_tx = self.chans.topology_events.clone();
         let task_tx = self.chans.task_events.clone();
         let job_tx = self.chans.job_events.clone();
+        let agent_tx = self.chans.agent_events.clone();
         let service_tx = self.chans.service_events.clone();
         let network_tx = self.chans.network_events.clone();
         let secret_tx = self.chans.secret_events.clone();
@@ -556,6 +565,7 @@ impl gossip::Server for Gossip {
                 Topology(_) => "topology",
                 Task(_) => "task",
                 Job(_) => "job",
+                Agent(_) => "agent",
                 Service(_) => "service",
                 Network(_) => "network",
                 Secret(_) => "secret",
@@ -626,6 +636,24 @@ impl gossip::Server for Gossip {
                 },
                 Job(Err(e)) => {
                     eprintln!("Error reading job: {e}");
+                }
+                Agent(Ok(reader)) => match read_agent_event(reader) {
+                    Ok(event) => {
+                        let message = Message::Agent {
+                            id,
+                            event: Box::new(event),
+                        };
+                        if should_relay_inbound_message(relay_inbound, &message) {
+                            forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
+                        }
+                        agent_tx.send(message).await.map_err(|e| {
+                            capnp::Error::failed(format!("Couldn't send event to agents: {e}"))
+                        })?;
+                    }
+                    Err(e) => eprintln!("Failed to convert agent event: {e}"),
+                },
+                Agent(Err(e)) => {
+                    eprintln!("Error reading agent: {e}");
                 }
                 Service(Ok(reader)) => match read_service_event(reader) {
                     Ok(event) => {
@@ -1115,6 +1143,10 @@ where
                 let job_builder = builder.init_job();
                 write_job_event(job_builder, event.as_ref())?;
             }
+            Message::Agent { event, .. } => {
+                let agent_builder = builder.init_agent();
+                write_agent_event(agent_builder, event.as_ref())?;
+            }
             Message::Service { event, .. } => {
                 let service_builder = builder.init_service();
                 write_service_event(service_builder, event.as_ref())?;
@@ -1186,6 +1218,7 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
         // Task updates replicate to every peer regardless of assignment so keep them.
         Message::Task { .. } => false,
         Message::Job { .. } => false,
+        Message::Agent { .. } => false,
         Message::Service { .. } => false,
         Message::Network { .. } => false,
         Message::Secret { .. } => false,
@@ -1383,6 +1416,8 @@ mod tests {
             id: task_id,
             name: "task".to_string(),
             image: "img".to_string(),
+            runtime_class: crate::workload::model::RuntimeClass::Oci,
+            sandbox_profile: None,
             state: ContainerState::Running,
             phase_reason: None,
             phase_progress: None,
@@ -1419,6 +1454,8 @@ mod tests {
             id: task_id,
             name: "task".to_string(),
             image: "img".to_string(),
+            runtime_class: crate::workload::model::RuntimeClass::Oci,
+            sandbox_profile: None,
             state: ContainerState::Pending,
             phase_reason: None,
             phase_progress: None,
@@ -1486,6 +1523,8 @@ mod tests {
             id: task_id,
             name: "task".to_string(),
             image: "img".to_string(),
+            runtime_class: crate::workload::model::RuntimeClass::Oci,
+            sandbox_profile: None,
             state: ContainerState::Stopping,
             phase_reason: None,
             phase_progress: None,
@@ -1564,6 +1603,8 @@ mod tests {
                 id: task_id,
                 name: "task".to_string(),
                 image: "img".to_string(),
+                runtime_class: crate::workload::model::RuntimeClass::Oci,
+                sandbox_profile: None,
                 state,
                 phase_reason: None,
                 phase_progress: None,

@@ -2,6 +2,7 @@ use super::{BootstrapContext, BootstrapResult};
 use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::secrets::crypto::SecretKeyring;
 use crate::server::auth::AuthStore;
+use crate::store::agent_store::{AgentStore, open_agent_store};
 use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::cluster_view_store::ClusterViewStore;
 use crate::store::job_store::{JobStore, open_job_store};
@@ -47,6 +48,7 @@ pub(crate) struct BootstrapStores {
     pub secret_master_store: SecretMasterStore,
     pub tasks: TaskStore,
     pub jobs: JobStore,
+    pub agents: AgentStore,
     pub scheduler_store: SchedulerStore,
     pub scheduler_digests: SchedulerDigestStore,
     pub services: ServiceStore,
@@ -97,6 +99,9 @@ impl BootstrapStores {
         let jobs = open_job_store(ctx.db.clone(), ctx.self_id)?;
         jobs.rebuild_mst_from_disk().await?;
 
+        let agents = open_agent_store(ctx.db.clone(), ctx.self_id)?;
+        agents.rebuild_mst_from_disk().await?;
+
         let scheduler_store = open_scheduler_store(ctx.db.clone(), ctx.self_id)?;
         scheduler_store.rebuild_mst_from_disk().await?;
 
@@ -135,6 +140,7 @@ impl BootstrapStores {
             secret_master_store,
             tasks,
             jobs,
+            agents,
             scheduler_store,
             scheduler_digests,
             services,

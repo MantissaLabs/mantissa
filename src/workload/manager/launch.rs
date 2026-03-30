@@ -7,8 +7,8 @@ use crate::runtime::types::{
     ResourceLimits, RestartPolicyConfig, RestartPolicyType, RuntimeCreateRequest,
 };
 use crate::workload::model::{
-    WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile as TaskSecretFile,
-    WorkloadVolumeMount as TaskVolumeMount,
+    RuntimeClass, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
+    WorkloadSecretFile as TaskSecretFile, WorkloadVolumeMount as TaskVolumeMount,
 };
 use crate::workload::types::{
     WorkloadRestartPolicy as TaskRestartPolicy, WorkloadRestartPolicyKind as TaskRestartPolicyKind,
@@ -26,6 +26,8 @@ pub(super) struct InstanceLaunchRequest<'a> {
     pub task_name: &'a str,
     pub instance_name: &'a str,
     pub image: &'a str,
+    pub runtime_class: RuntimeClass,
+    pub sandbox_profile: Option<&'a str>,
     pub command: &'a [String],
     pub tty: bool,
     pub cpu_millis: u64,
@@ -121,13 +123,30 @@ impl WorkloadManager {
             super::append_nvidia_visible_devices(&mut env_vars, device_ids);
         }
 
-        let labels = HashMap::from([(
-            "mantissa.workload_id".to_string(),
-            request.task_id.to_string(),
-        )]);
+        let mut labels = HashMap::from([
+            (
+                "mantissa.workload_id".to_string(),
+                request.task_id.to_string(),
+            ),
+            (
+                "mantissa.runtime_class".to_string(),
+                request.runtime_class.as_str().to_string(),
+            ),
+        ]);
+        if let Some(profile) = request
+            .sandbox_profile
+            .filter(|value| !value.trim().is_empty())
+        {
+            labels.insert(
+                "mantissa.sandbox_profile".to_string(),
+                profile.trim().to_string(),
+            );
+        }
         let create_request = RuntimeCreateRequest {
             name: request.instance_name.to_string(),
             image: request.image.to_string(),
+            runtime_class: request.runtime_class,
+            sandbox_profile: request.sandbox_profile.map(str::to_string),
             labels: Some(labels),
             command: if request.command.is_empty() {
                 None

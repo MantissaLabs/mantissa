@@ -6,6 +6,7 @@ pub use protocol::{
     topology_capnp, volumes_capnp,
 };
 
+pub mod agents;
 mod app;
 pub mod cli;
 pub mod cluster;
