@@ -44,6 +44,74 @@ fn classify_runtime_error_preserves_non_404_backend_status() {
     ));
 }
 
+#[tokio::test]
+async fn create_instance_preserves_conflict_status_code() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind tcp listener");
+    let address = listener.local_addr().expect("listener address");
+    let endpoint = format!("http://{address}");
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept create connection");
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 2048];
+        loop {
+            let bytes_read = socket.read(&mut buffer).await.expect("read create request");
+            assert!(bytes_read > 0, "create request should not close early");
+            request.extend_from_slice(&buffer[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let request_text = String::from_utf8_lossy(&request);
+        assert!(
+            request_text.contains("POST /containers/create?"),
+            "unexpected request: {request_text}"
+        );
+        assert!(
+            request_text.contains("name=mantissa-conflict"),
+            "request should carry deterministic container name: {request_text}"
+        );
+
+        let body = r#"{"message":"Conflict. The container name \"/mantissa-conflict\" is already in use."}"#;
+        let response = format!(
+            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write conflict response");
+    });
+
+    let manager = DockerRuntimeBackend {
+        docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
+            .expect("construct docker http client"),
+    };
+
+    let result = manager
+        .create_instance(RuntimeCreateRequest {
+            name: "mantissa-conflict".to_string(),
+            image: "busybox:1.36".to_string(),
+            ..Default::default()
+        })
+        .await;
+
+    let err = result.expect_err("create should surface conflict");
+    assert!(matches!(
+        err,
+        RuntimeError::Backend {
+            status_code: Some(409),
+            ..
+        }
+    ));
+
+    server.await.expect("tcp create server should finish");
+}
+
 #[test]
 fn deduplicates_identical_pull_updates() {
     let mut updates = HashMap::new();

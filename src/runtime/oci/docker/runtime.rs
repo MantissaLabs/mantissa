@@ -148,7 +148,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
             .docker
             .create_container(options, config)
             .await
-            .map_err(|err| RuntimeError::backend(None, err.to_string()))?;
+            .map_err(|err| classify_runtime_error(&name, err))?;
 
         if !response.warnings.is_empty() {
             for warning in response.warnings {
