@@ -15,6 +15,10 @@ pub use crate::workload::types::{
 };
 
 /// Value stored in the replicated service store describing desired service state.
+///
+/// A service is a controller-level object that owns rollout, readiness, and desired replica
+/// count semantics. The individual schedulable executions it creates are service-owned workload
+/// replicas, not standalone tasks.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServiceSpecValue {
     pub id: Uuid,
@@ -334,11 +338,14 @@ impl ServiceReadinessProbe {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServiceTaskSpecValue {
+    /// Template-local name used to identify one replica set within the service.
     pub name: String,
+    /// Shared execution/runtime template reused by every replica of this service template.
     pub execution: WorkloadExecutionSpec<ServiceTaskNetworkRequirement>,
     /// Template names within the same service that must be ready before this template starts.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Desired replica count for this template.
     pub replicas: u16,
     #[serde(default)]
     pub readiness: Option<ServiceReadinessProbe>,
@@ -399,6 +406,10 @@ impl ServiceTaskSpecValue {
     }
 
     /// Builds one workload start request for a specific service replica.
+    ///
+    /// The resulting workload is still launched through the shared workload manager, but the
+    /// attached service metadata marks it as `WorkloadKind::ServiceReplica` rather than a
+    /// standalone direct task.
     pub fn replica_start_request(
         &self,
         service_name: &str,

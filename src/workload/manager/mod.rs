@@ -306,15 +306,31 @@ pub enum WorkloadTrafficPublicationUpdate {
     Updated,
 }
 
+/// Generic launch request consumed by the shared workload manager.
+///
+/// Terminology:
+/// - The request is named `WorkloadStartRequest` because the same launch shape is reused by
+///   tasks, service replicas, job attempts, and agent runs.
+/// - A caller decides the higher-level meaning by choosing the controller/API that submits it.
+/// - The `tasks` RPC therefore sends `WorkloadStartRequest` and receives `TaskSpec`, because it
+///   is creating `WorkloadKind::Task`.
 #[derive(Clone)]
 pub struct WorkloadStartRequest {
+    /// Human-readable name for the resulting workload instance.
     pub name: String,
+    /// Shared execution/runtime template describing how the workload should run.
     pub execution: TaskExecutionSpec,
+    /// Runtime family requested by the caller.
     pub runtime_class: RuntimeClass,
+    /// Optional sandbox/isolation profile interpreted by the chosen runtime class.
     pub sandbox_profile: Option<String>,
+    /// Optional concrete GPU device identifiers requested by the caller.
     pub gpu_device_ids: Vec<String>,
+    /// Optional caller-selected durable workload id.
     pub id: Option<Uuid>,
+    /// Optional scheduler slots already chosen by a higher-level controller.
     pub slot_ids: Vec<SlotId>,
+    /// Optional service ownership metadata. Presence means this workload is a service replica.
     pub service_metadata: Option<TaskServiceMetadata>,
     /// Placement hint used by the scheduler when a task must land on a specific node.
     pub target_node: Option<Uuid>,
@@ -323,7 +339,7 @@ pub struct WorkloadStartRequest {
 impl Deref for WorkloadStartRequest {
     type Target = TaskExecutionSpec;
 
-    /// Exposes shared execution fields to existing task scheduling code during the cutover.
+    /// Exposes shared execution fields directly because this request is mostly execution data.
     fn deref(&self) -> &Self::Target {
         &self.execution
     }

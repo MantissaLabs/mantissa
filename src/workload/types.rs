@@ -6,7 +6,13 @@ use crate::workload::model::{
     WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadVolumeMount,
 };
 
-/// Shared execution-side launch shape reused by task requests and service templates.
+/// Shared execution-side launch shape reused by every controller.
+///
+/// Terminology:
+/// - This type describes *how something should execute*.
+/// - It does not describe *who owns the lifecycle semantics*.
+/// - A direct task, a service replica, a job attempt, and an agent run can all reuse the same
+///   execution shape while differing in control-plane behavior.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(bound(serialize = "N: Serialize", deserialize = "N: Deserialize<'de>"))]
 pub struct WorkloadExecutionSpec<N> {
@@ -62,7 +68,10 @@ impl<N> WorkloadExecutionSpec<N> {
     }
 }
 
-/// Common execution spec used by direct task launches after network aliases are resolved.
+/// Common execution spec used when the network list has already been resolved to UUIDs.
+///
+/// The alias keeps the `Task` name because direct task submission is still a first-class user
+/// surface, but the underlying type is the generic workload execution template.
 pub type TaskExecutionSpec = WorkloadExecutionSpec<Uuid>;
 
 /// Default liveness probe interval in milliseconds.
@@ -98,6 +107,9 @@ pub enum WorkloadLivenessProbeKind {
 }
 
 /// Liveness probe evaluated by the local runtime for one running workload instance.
+///
+/// This is execution/runtime policy, not controller policy.
+/// Service readiness, job retries, and agent interaction remain separate higher-level concerns.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkloadLivenessProbe {
     #[serde(default)]
@@ -149,6 +161,9 @@ impl WorkloadLivenessProbe {
 }
 
 /// Declarative restart behavior shared by direct tasks and service templates.
+///
+/// This policy belongs to the execution/runtime layer.
+/// Finite job retries and agent rerun decisions live in their own controllers.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkloadRestartPolicy {
     pub name: WorkloadRestartPolicyKind,

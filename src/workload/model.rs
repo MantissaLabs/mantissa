@@ -8,28 +8,46 @@ use uuid::Uuid;
 use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
 
 /// Internal workload categories supported by the control plane.
+///
+/// Terminology:
+/// - `Task` means a standalone user-submitted execution with no higher-level controller.
+/// - `ServiceReplica` means one service-owned schedulable replica.
+/// - `Job` means a finite completion-oriented controller that launches workload attempts.
+/// - `AgentSession` is the durable agent identity/workspace/policy record.
+/// - `AgentRun` is one schedulable execution slice launched by an agent session.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum WorkloadKind {
     #[default]
+    /// Direct standalone task submission with no higher-level controller ownership.
     Task,
+    /// One schedulable replica owned by the service controller.
     ServiceReplica,
+    /// Finite completion-oriented controller entry.
     Job,
+    /// Durable agent control-plane session.
     AgentSession,
+    /// One schedulable execution slice launched by an agent session.
     AgentRun,
 }
 
 /// Runtime families that may execute one workload instance.
+///
+/// `Sandbox` is an isolation contract exposed to higher layers, not necessarily a unique
+/// physical substrate. One sandbox may be implemented on top of OCI or MicroVM backends.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeClass {
     #[default]
+    /// OCI/container-style execution substrate.
     Oci,
+    /// MicroVM-style execution substrate.
     MicroVm,
+    /// Sandbox isolation contract chosen by higher layers.
     Sandbox,
 }
 
@@ -221,7 +239,12 @@ pub struct WorkloadSecretFile {
     pub mode: Option<u32>,
 }
 
-/// Full persisted workload definition used by task-facing APIs during the cutover.
+/// Full persisted workload definition shared by the workload core.
+///
+/// This is the generic durable definition underneath every schedulable execution. The public
+/// task surface still aliases this as `TaskSpec` for `WorkloadKind::Task`, which is why some
+/// task-facing APIs accept/return task names while the generic scheduler and runtime code speak
+/// in terms of workloads.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkloadSpec {
     pub id: Uuid,
@@ -296,18 +319,21 @@ impl WorkloadSpec {
         }
     }
 
-    /// Returns the workload kind represented by this task-era workload projection.
+    /// Returns the workload kind represented by this workload record.
     pub fn kind(&self) -> WorkloadKind {
         infer_workload_kind(self.service_metadata.as_ref())
     }
 
-    /// Returns the runtime class exposed by the current task-era workload projection.
+    /// Returns the runtime class requested by this workload record.
     pub fn runtime_class(&self) -> RuntimeClass {
         self.runtime_class
     }
 }
 
 /// Compact workload lifecycle payload used for hot gossip/status propagation.
+///
+/// This is the lightweight lifecycle/status projection of `WorkloadSpec`, not a separate
+/// workload type.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkloadStatus {
     pub id: Uuid,
@@ -372,12 +398,12 @@ impl WorkloadStatus {
         }
     }
 
-    /// Returns the workload kind represented by this task-era workload projection.
+    /// Returns the workload kind represented by this workload status record.
     pub fn kind(&self) -> WorkloadKind {
         infer_workload_kind(self.service_metadata.as_ref())
     }
 
-    /// Returns the runtime class exposed by the current task-era workload projection.
+    /// Returns the runtime class requested by this workload status record.
     pub fn runtime_class(&self) -> RuntimeClass {
         self.runtime_class
     }
@@ -391,7 +417,11 @@ pub enum WorkloadEvent {
     Remove { id: Uuid },
 }
 
-/// Replicated workload state stored in the CRDT task store during the cutover.
+/// Replicated workload state stored in the CRDT task store.
+///
+/// The store name still says `task_store` for compatibility with the user-facing task surface,
+/// but the value itself is workload-generic and is shared by service replicas, job attempts,
+/// and agent runs as well.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct WorkloadValue {
     pub id: Uuid,

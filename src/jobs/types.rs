@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Value stored in the replicated job store describing one finite workload submission.
+///
+/// A job is a controller-level object. It owns retry/completion semantics and may launch one or
+/// more underlying workload attempts over time. Those attempts still use the shared task/workload
+/// execution substrate.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobSpecValue {
     pub id: Uuid,
@@ -87,7 +91,7 @@ impl JobSpecValue {
     /// Reserves one future task identifier before an attempt is launched.
     ///
     /// This keeps launch idempotent across owner changes because another node can
-    /// either observe the reserved task or start the same reservation itself.
+    /// either observe the reserved workload attempt or start the same reservation itself.
     pub fn reserve_attempt(&mut self, task_id: Uuid) {
         self.phase_version = self.phase_version.saturating_add(1);
         self.attempts_started = self.attempts_started.saturating_add(1);
@@ -152,6 +156,9 @@ impl JobSpecValue {
 }
 
 /// Coarse lifecycle states exposed by the first-class job controller.
+///
+/// These states describe the job controller itself, not the lower-level runtime phase of any
+/// single workload attempt.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
 )]
@@ -166,6 +173,8 @@ pub enum JobStatus {
 }
 
 /// Completion strategy for one finite job.
+///
+/// This is controller policy above the runtime/task layer.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
 )]

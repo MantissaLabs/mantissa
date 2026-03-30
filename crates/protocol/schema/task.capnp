@@ -1,8 +1,20 @@
 @0xc040d5aebc3fbc7e;
 
+#
+# Task RPC terminology:
+# - `WorkloadStartRequest` is the shared execution/runtime launch shape reused across
+#   controllers (`task`, `service`, `job`, `agent`).
+# - This RPC still represents the standalone-task user surface, so its responses remain
+#   `TaskSpec` / `TaskStatus`.
+# - In other words: the request describes generic workload execution inputs, while the
+#   response projects the resulting workload as `WorkloadKind::Task`.
+
 interface Task {
   start @0 (request :WorkloadStartRequest) -> (spec :TaskSpec);
-  # Start a new task and return its spec.
+  # Start a new standalone task.
+  #
+  # The request uses the shared workload launch shape, but the response is the
+  # standalone-task projection of that workload.
 
   list @1 (request :TaskListRequest) -> (tasks :List(TaskSpec));
   # List tasks matching the provided state filters.
@@ -11,7 +23,7 @@ interface Task {
   # Stop a task and return its final spec.
 
   startMany @3 (requests :List(WorkloadStartRequest)) -> (specs :List(TaskSpec));
-  # Start multiple tasks in a batch.
+  # Start multiple standalone tasks in a batch using the shared workload launch shape.
 
   logs @4 (request :TaskLogsRequest);
   # Stream one task's container logs into the caller-provided sink.
@@ -36,7 +48,7 @@ struct TaskLogsRequest {
   # Task UUID or unique prefix.
 
   options @1 :TaskLogsOptions;
-  # Stream options mirroring the Docker logs API.
+  # Stream options mirroring runtime log-follow semantics.
 
   sink @2 :TaskLogSink;
   # Sink receiving streamed log frames.
@@ -72,7 +84,7 @@ struct TaskAttachRequest {
   # Task UUID or unique prefix.
 
   options @1 :TaskAttachOptions;
-  # Stream options mirroring the Docker attach API.
+  # Stream options mirroring runtime attach semantics.
 
   sink @2 :TaskLogSink;
   # Sink receiving streamed stdout/stderr/console frames.
@@ -86,7 +98,7 @@ struct TaskAttachOptions {
   # Keep streaming future stdout/stderr/console output.
 
   stdin @2 :Bool;
-  # Attach the caller's stdin to the container input stream.
+  # Attach the caller's stdin to the runtime instance input stream.
 
   stdout @3 :Bool;
   # Include stdout frames in the stream.
@@ -95,7 +107,7 @@ struct TaskAttachOptions {
   # Include stderr frames in the stream.
 
   detachKeys @5 :Text;
-  # Optional detach key override in Docker's attach format.
+  # Optional detach key override in the runtime's detach-key format.
 
   ttyWidth @6 :UInt16;
   # Initial terminal width in columns for TTY attach sessions, 0 = unspecified.
@@ -120,7 +132,7 @@ struct TaskExecRequest {
   # Task UUID or unique prefix.
 
   options @1 :TaskExecOptions;
-  # Stream options mirroring the interactive Docker exec API.
+  # Stream options mirroring interactive runtime exec semantics.
 
   sink @2 :TaskLogSink;
   # Sink receiving streamed stdout/stderr/console frames.
@@ -128,7 +140,7 @@ struct TaskExecRequest {
 
 struct TaskExecOptions {
   command @0 :List(Text);
-  # Command/argv to start inside the running task container.
+  # Command/argv to start inside the running task runtime instance.
 
   stdin @1 :Bool;
   # Attach the caller's stdin to the exec input stream.
@@ -143,7 +155,7 @@ struct TaskExecOptions {
   # Allocate a pseudo-terminal for the exec session.
 
   detachKeys @5 :Text;
-  # Optional detach key override in Docker's exec format.
+  # Optional detach key override in the runtime's exec format.
 
   ttyWidth @6 :UInt16;
   # Initial terminal width in columns for TTY exec sessions, 0 = unspecified.
@@ -187,7 +199,7 @@ struct EnvironmentVar {
 
 struct SecretFile {
   path @0 :Text;
-  # Container filesystem path for the secret file.
+  # Runtime filesystem path for the secret file.
 
   secret @1 :SecretRef;
   # Secret reference to materialize.
@@ -204,12 +216,17 @@ struct VolumeMount {
   # Logical volume name for operator-facing diagnostics.
 
   target @2 :Text;
-  # Container filesystem path where the volume should be mounted.
+  # Runtime filesystem path where the volume should be mounted.
 
   readOnly @3 :Bool;
   # Mount the volume read-only inside the container.
 }
 
+#
+# `TaskSpec` is the standalone-task projection of the generic workload definition.
+# Direct task submissions use this type as their durable/spec response, while service-owned
+# replicas, job attempts, and agent runs reuse the same underlying workload machinery but
+# are tracked by their own controllers.
 struct TaskSpec {
   id @0 :Data;
   # Task UUID v4 as 16 bytes.
@@ -218,7 +235,7 @@ struct TaskSpec {
   # Human-readable task name.
 
   image @2 :Text;
-  # Container image or binary identifier.
+  # Execution image/binary identifier from the workload execution spec.
 
   state @3 :Text;
   # Current runtime state label.
@@ -258,6 +275,7 @@ struct TaskSpec {
 
   serviceMetadata @15 :ServiceMetadata;
   # Optional service ownership metadata.
+  # When present, this task is a service-owned replica rather than a direct standalone task.
 
   updatedAt @16 :Text;
   # RFC3339 timestamp when the task was last updated.
@@ -290,7 +308,7 @@ struct TaskSpec {
   # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
 
   preStopCommand @26 :List(Text);
-  # Optional command executed inside the container before termination begins.
+  # Optional command executed inside the runtime instance before termination begins.
 
   volumes @27 :List(VolumeMount);
   # Named volumes mounted into the task runtime.
@@ -314,6 +332,10 @@ struct TaskSpec {
   # Optional sandbox profile used when the workload targets sandbox execution.
 }
 
+#
+# `TaskStatus` is the compact hot-path status projection for standalone tasks.
+# It carries only the fields required for lifecycle propagation and listing, while the full
+# `TaskSpec` remains the richer task-facing projection of the generic workload definition.
 struct TaskStatus {
   id @0 :Data;
   # Task UUID v4 as 16 bytes.
@@ -322,7 +344,7 @@ struct TaskStatus {
   # Human-readable task name.
 
   image @2 :Text;
-  # Container image or binary identifier.
+  # Execution image/binary identifier from the workload execution spec.
 
   state @3 :Text;
   # Current runtime state label.
@@ -376,11 +398,16 @@ struct ServiceMetadata {
 }
 
 struct WorkloadStartRequest {
+  # Shared execution/runtime launch shape used by the task RPC.
+  #
+  # The name keeps `Workload` because the same execution fields are reused by other
+  # controllers. When sent through the task RPC, this request means "start one
+  # standalone task", and the resulting durable object is returned as `TaskSpec`.
   name @0 :Text;
-  # Human-readable task name.
+  # Human-readable task name for the resulting standalone task.
 
   image @1 :Text;
-  # Container image or binary identifier.
+  # Execution image or binary identifier.
 
   command @2 :List(Text);
   # Command/argv for the task entrypoint.
@@ -395,7 +422,7 @@ struct WorkloadStartRequest {
   # Scheduler slot identifiers to bind.
 
   taskId @6 :Data;
-  # Desired task UUID (16 bytes).
+  # Desired task/workload UUID (16 bytes) for the resulting standalone task.
 
   restartPolicy @7 :RestartPolicy;
   # Restart behavior for the task.
@@ -419,7 +446,7 @@ struct WorkloadStartRequest {
   # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
 
   preStopCommand @14 :List(Text);
-  # Optional command executed inside the container before termination begins.
+  # Optional command executed inside the runtime instance before termination begins.
 
   volumes @15 :List(VolumeMount);
   # Named volumes mounted into the task runtime.
@@ -439,10 +466,10 @@ struct LivenessProbe {
   # Local liveness probe transport kind.
 
   command @1 :List(Text);
-  # Command executed inside the running container for exec probes.
+  # Command executed inside the running runtime instance for exec probes.
 
   port @2 :UInt16;
-  # Local container port checked by HTTP/TCP probes.
+  # Local runtime-instance port checked by HTTP/TCP probes.
 
   path @3 :Text;
   # HTTP request path, ignored for exec/TCP probes and "/" when empty.
@@ -462,13 +489,13 @@ struct LivenessProbe {
 
 enum LivenessProbeKind {
   exec @0;
-  # Execute one command inside the running container.
+  # Execute one command inside the running runtime instance.
 
   http @1;
-  # Probe the container over HTTP and require a 2xx response.
+  # Probe the runtime instance over HTTP and require a 2xx response.
 
   tcp @2;
-  # Probe the container by establishing a TCP connection.
+  # Probe the runtime instance by establishing a TCP connection.
 }
 
 struct TaskStopRequest {

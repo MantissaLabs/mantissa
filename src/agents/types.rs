@@ -126,14 +126,20 @@ pub enum AgentRunStatus {
 }
 
 /// Durable agent session definition and recent structured event history.
+///
+/// An agent session is the durable control-plane object. It owns workspace, tool policy,
+/// checkpoint policy, pending input, and recent event history. It does not itself consume
+/// schedulable runtime capacity until it launches an `AgentRunSpecValue`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AgentSessionSpecValue {
     pub id: Uuid,
     pub name: String,
+    /// Default execution template copied into new runs created from this session.
     pub execution: TaskExecutionSpec,
     #[serde(default = "default_agent_runtime_class")]
     pub runtime_class: RuntimeClass,
     #[serde(default)]
+    /// Optional sandbox/isolation profile requested for runs launched from this session.
     pub sandbox_profile: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -348,16 +354,23 @@ impl AgentSessionSpecValue {
     }
 }
 
-/// Durable agent run definition describing one scheduled sandbox execution.
+/// Durable agent run definition describing one scheduled execution slice of an agent session.
+///
+/// An agent run is the schedulable object that actually consumes runtime capacity. It is
+/// intentionally separate from `AgentSessionSpecValue` so an idle/waiting session can remain
+/// durable without pinning compute resources.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AgentRunSpecValue {
     pub id: Uuid,
+    /// Owning durable agent session.
     pub session_id: Uuid,
     pub session_name: String,
+    /// Execution template for this specific run.
     pub execution: TaskExecutionSpec,
     #[serde(default = "default_agent_runtime_class")]
     pub runtime_class: RuntimeClass,
     #[serde(default)]
+    /// Optional sandbox/isolation profile requested for this run.
     pub sandbox_profile: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -368,6 +381,7 @@ pub struct AgentRunSpecValue {
     #[serde(default)]
     pub status_detail: Option<String>,
     #[serde(default)]
+    /// Underlying scheduled task/workload id once the run has been placed.
     pub task_id: Option<Uuid>,
     #[serde(default)]
     pub prompt: Option<String>,
@@ -415,7 +429,7 @@ impl AgentRunSpecValue {
         self.updated_at = current_timestamp();
     }
 
-    /// Records the workload task identifier bound to this run after scheduling succeeds.
+    /// Records the underlying scheduled task identifier bound to this run after scheduling succeeds.
     pub fn bind_task(&mut self, task_id: Uuid, detail: Option<String>) {
         self.phase_version = self.phase_version.saturating_add(1);
         self.task_id = Some(task_id);
