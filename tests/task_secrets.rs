@@ -25,9 +25,9 @@ use mantissa::store::scheduler_store::open_scheduler_store;
 use mantissa::store::secret_store::open_secret_store;
 use mantissa::store::task_store::open_task_store;
 use mantissa::store::volume_store::{open_volume_node_store, open_volume_spec_store};
-use mantissa::task::manager::{TaskManager, TaskManagerConfig, TaskStartRequest};
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use mantissa::volumes::VolumeRegistry;
+use mantissa::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadStartRequest};
 use mantissa::workload::model::RuntimeClass;
 use mantissa::workload::types::TaskExecutionSpec;
 use net::noise::NoiseKeys;
@@ -128,7 +128,7 @@ impl RuntimeBackend for RecordingRuntimeBackend {
 }
 
 struct TestHarness {
-    manager: TaskManager,
+    manager: WorkloadManager,
     scheduler: Rc<Scheduler>,
     runtime_backend: Arc<RecordingRuntimeBackend>,
     secret_registry: SecretRegistry,
@@ -314,7 +314,7 @@ async fn setup_task_manager() -> TestHarness {
     let (tx, rx) = async_channel::bounded(128);
     let local_volume_root = tempdir().expect("local volume root");
 
-    let manager = TaskManager::new(TaskManagerConfig {
+    let manager = WorkloadManager::new(WorkloadManagerConfig {
         store: task_store,
         tx,
         rx,
@@ -397,7 +397,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
         .await
         .expect("seed secret registry");
 
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "with-secrets".into(),
         execution: TaskExecutionSpec {
             image: "busybox:latest".into(),
@@ -544,7 +544,7 @@ local_test!(task_manager_rejects_missing_secret_reference, {
         .await
         .expect("init slots");
 
-    let request = TaskStartRequest {
+    let request = WorkloadStartRequest {
         name: "missing-secret".into(),
         execution: TaskExecutionSpec {
             image: "busybox:latest".into(),

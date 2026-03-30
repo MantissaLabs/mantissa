@@ -1,6 +1,6 @@
 use super::ServiceController;
 use crate::services::types::{ServiceEvent, ServiceRolloutState, ServiceSpecValue, ServiceStatus};
-use crate::workload::model::WorkloadPhase as ContainerState;
+use crate::workload::model::WorkloadPhase;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -68,7 +68,7 @@ pub(super) async fn start_readiness_wait(
     let mut success_since: Option<Instant> = None;
     let mut failure_streak: u32 = 0;
     let mut degraded_streak: u32 = 0;
-    let mut last_observed_states: Vec<(Uuid, Option<ContainerState>)> = Vec::new();
+    let mut last_observed_states: Vec<(Uuid, Option<WorkloadPhase>)> = Vec::new();
     let mut last_observed_phase_versions: HashMap<Uuid, u64> = HashMap::new();
     let mut last_observed_terminal_launches: HashMap<Uuid, Option<u64>> = HashMap::new();
     let mut task_terminal_launch_seen: HashMap<Uuid, u64> = HashMap::new();
@@ -270,7 +270,7 @@ pub(super) async fn start_readiness_wait(
 
 /// Classifies task states into readiness categories consumed by deployment convergence logic.
 pub(super) fn classify_readiness_states(
-    states: &[(Uuid, Option<ContainerState>)],
+    states: &[(Uuid, Option<WorkloadPhase>)],
 ) -> ReadinessClass {
     let mut running = 0usize;
     let mut any_inflight = false;
@@ -278,13 +278,13 @@ pub(super) fn classify_readiness_states(
 
     for (_, state) in states {
         match state {
-            Some(ContainerState::Running) => {
+            Some(WorkloadPhase::Running) => {
                 running += 1;
             }
-            Some(ContainerState::Pending)
-            | Some(ContainerState::Pulling)
-            | Some(ContainerState::Creating)
-            | Some(ContainerState::VolumeUnavailable)
+            Some(WorkloadPhase::Pending)
+            | Some(WorkloadPhase::Pulling)
+            | Some(WorkloadPhase::Creating)
+            | Some(WorkloadPhase::VolumeUnavailable)
             | None => {
                 any_inflight = true;
             }
@@ -310,7 +310,7 @@ async fn poll_service_attempt(
     controller: &ServiceController,
     service_id: Uuid,
     manifest_id: Uuid,
-    last_states: &mut Vec<(Uuid, Option<ContainerState>)>,
+    last_states: &mut Vec<(Uuid, Option<WorkloadPhase>)>,
     last_phase_versions: &mut HashMap<Uuid, u64>,
     last_terminal_launches: &mut HashMap<Uuid, Option<u64>>,
 ) -> ReadinessOutcome {
@@ -457,7 +457,7 @@ async fn poll_service_attempt(
 
 /// Records terminal task transitions and returns the task that exceeded deployment failure budget.
 fn record_terminal_task_failure(
-    states: &[(Uuid, Option<ContainerState>)],
+    states: &[(Uuid, Option<WorkloadPhase>)],
     phase_versions: &HashMap<Uuid, u64>,
     terminal_launches: &HashMap<Uuid, Option<u64>>,
     seen_terminal_launch: &mut HashMap<Uuid, u64>,
@@ -484,7 +484,7 @@ fn record_terminal_task_failure(
         };
         if !matches!(
             state,
-            ContainerState::Failed | ContainerState::Stopped | ContainerState::Exited(_)
+            WorkloadPhase::Failed | WorkloadPhase::Stopped | WorkloadPhase::Exited(_)
         ) {
             continue;
         }
@@ -511,7 +511,7 @@ fn record_terminal_task_failure(
 async fn mark_service_failed(
     controller: &ServiceController,
     spec: ServiceSpecValue,
-    states: &[(Uuid, Option<ContainerState>)],
+    states: &[(Uuid, Option<WorkloadPhase>)],
 ) {
     let summary = format_task_state_summary(states);
     tracing::error!(
@@ -583,7 +583,7 @@ fn readiness_backoff(attempt: u32) -> Duration {
 /// Running-replica growth is treated as deployment progress and extends the global progress
 /// deadline so large services can converge incrementally without being prematurely failed.
 fn deployment_running_progress_advanced(
-    states: &[(Uuid, Option<ContainerState>)],
+    states: &[(Uuid, Option<WorkloadPhase>)],
     running_high_watermark: &mut usize,
     now: Instant,
     progress_window: Duration,
@@ -591,7 +591,7 @@ fn deployment_running_progress_advanced(
 ) -> bool {
     let running = states
         .iter()
-        .filter(|(_, state)| matches!(state, Some(ContainerState::Running)))
+        .filter(|(_, state)| matches!(state, Some(WorkloadPhase::Running)))
         .count();
     if running <= *running_high_watermark {
         return false;
@@ -608,7 +608,7 @@ fn deployment_progress_timed_out(now: Instant, progress_deadline: Instant) -> bo
 }
 
 /// Builds a compact human-readable summary of observed task states for readiness logs.
-fn format_task_state_summary(states: &[(Uuid, Option<ContainerState>)]) -> String {
+fn format_task_state_summary(states: &[(Uuid, Option<WorkloadPhase>)]) -> String {
     if states.is_empty() {
         return "no-task-states".to_string();
     }
@@ -619,17 +619,17 @@ fn format_task_state_summary(states: &[(Uuid, Option<ContainerState>)]) -> Strin
         let short_id = &short_id[..8];
         let label = match state {
             None => "missing".to_string(),
-            Some(ContainerState::Pending) => "pending".to_string(),
-            Some(ContainerState::Pulling) => "pulling".to_string(),
-            Some(ContainerState::Creating) => "creating".to_string(),
-            Some(ContainerState::VolumeUnavailable) => "volume_unavailable".to_string(),
-            Some(ContainerState::Running) => "running".to_string(),
-            Some(ContainerState::Paused) => "paused".to_string(),
-            Some(ContainerState::Stopping) => "stopping".to_string(),
-            Some(ContainerState::Stopped) => "stopped".to_string(),
-            Some(ContainerState::Failed) => "failed".to_string(),
-            Some(ContainerState::Exited(code)) => format!("exited:{code}"),
-            Some(ContainerState::Unknown) => "unknown".to_string(),
+            Some(WorkloadPhase::Pending) => "pending".to_string(),
+            Some(WorkloadPhase::Pulling) => "pulling".to_string(),
+            Some(WorkloadPhase::Creating) => "creating".to_string(),
+            Some(WorkloadPhase::VolumeUnavailable) => "volume_unavailable".to_string(),
+            Some(WorkloadPhase::Running) => "running".to_string(),
+            Some(WorkloadPhase::Paused) => "paused".to_string(),
+            Some(WorkloadPhase::Stopping) => "stopping".to_string(),
+            Some(WorkloadPhase::Stopped) => "stopped".to_string(),
+            Some(WorkloadPhase::Failed) => "failed".to_string(),
+            Some(WorkloadPhase::Exited(code)) => format!("exited:{code}"),
+            Some(WorkloadPhase::Unknown) => "unknown".to_string(),
         };
         parts.push(format!("{short_id}:{label}"));
     }
@@ -654,8 +654,8 @@ mod tests {
 
         let advanced = deployment_running_progress_advanced(
             &[
-                (task_a, Some(ContainerState::Running)),
-                (task_b, Some(ContainerState::Pending)),
+                (task_a, Some(WorkloadPhase::Running)),
+                (task_b, Some(WorkloadPhase::Pending)),
             ],
             &mut running_high_watermark,
             now,
@@ -674,8 +674,8 @@ mod tests {
 
         let unchanged = deployment_running_progress_advanced(
             &[
-                (task_a, Some(ContainerState::Running)),
-                (task_b, Some(ContainerState::Creating)),
+                (task_a, Some(WorkloadPhase::Running)),
+                (task_b, Some(WorkloadPhase::Creating)),
             ],
             &mut running_high_watermark,
             now + Duration::from_secs(1),
@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn terminal_launch_marker_counts_failures_without_terminal_snapshot() {
         let task_id = Uuid::new_v4();
-        let states = vec![(task_id, Some(ContainerState::Pulling))];
+        let states = vec![(task_id, Some(WorkloadPhase::Pulling))];
         let phase_versions = HashMap::from([(task_id, 11u64)]);
         let mut terminal_launches = HashMap::from([(task_id, Some(1u64))]);
         let mut seen_terminal_launch = HashMap::new();
@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn terminal_state_fallback_counts_once_per_phase() {
         let task_id = Uuid::new_v4();
-        let mut states = vec![(task_id, Some(ContainerState::Failed))];
+        let mut states = vec![(task_id, Some(WorkloadPhase::Failed))];
         let mut phase_versions = HashMap::from([(task_id, 5u64)]);
         let terminal_launches = HashMap::from([(task_id, None)]);
         let mut seen_terminal_launch = HashMap::new();
@@ -789,7 +789,7 @@ mod tests {
         );
         assert_eq!(failure_counts.get(&task_id).copied(), Some(1));
 
-        states[0].1 = Some(ContainerState::Stopped);
+        states[0].1 = Some(WorkloadPhase::Stopped);
         phase_versions.insert(task_id, 6u64);
         record_terminal_task_failure(
             &states,

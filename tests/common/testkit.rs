@@ -5,8 +5,8 @@
 pub use mantissa::runtime::testing::InMemoryRuntimeBackend;
 use mantissa::runtime::testing::new_in_memory_runtime_backend;
 use mantissa::runtime::types::RuntimeBackend;
-use mantissa::task::manager::TaskRuntimeConfig;
 use mantissa::topology_capnp::topology;
+use mantissa::workload::manager::WorkloadRuntimeConfig;
 use mantissa::{
     node,
     server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport},
@@ -124,7 +124,7 @@ impl TestNode {
         gossip_tick: Option<Duration>,
         gossip_fanout: Option<usize>,
         gossip_channel_capacity: Option<usize>,
-        task_runtime: Option<TaskRuntimeConfig>,
+        task_runtime: Option<WorkloadRuntimeConfig>,
     ) -> HeadlessConfig {
         HeadlessConfig {
             listen_addr: "127.0.0.1:0".to_string(),
@@ -621,8 +621,8 @@ impl ClusterConfig {
     }
 
     /// Converts the optional tick overrides into a task runtime loop configuration.
-    fn task_runtime_config(&self) -> Option<TaskRuntimeConfig> {
-        let mut config = TaskRuntimeConfig::default();
+    fn task_runtime_config(&self) -> Option<WorkloadRuntimeConfig> {
+        let mut config = WorkloadRuntimeConfig::default();
         let mut overridden = false;
         if let Some(ms) = self.task_reconcile_tick_ms {
             config.reconcile_tick = Duration::from_millis(ms);

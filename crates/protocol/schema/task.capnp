@@ -1,7 +1,7 @@
 @0xc040d5aebc3fbc7e;
 
 interface Task {
-  start @0 (request :TaskStartRequest) -> (spec :TaskSpec);
+  start @0 (request :WorkloadStartRequest) -> (spec :TaskSpec);
   # Start a new task and return its spec.
 
   list @1 (request :TaskListRequest) -> (tasks :List(TaskSpec));
@@ -10,7 +10,7 @@ interface Task {
   stop @2 (request :TaskStopRequest) -> (spec :TaskSpec);
   # Stop a task and return its final spec.
 
-  startMany @3 (requests :List(TaskStartRequest)) -> (specs :List(TaskSpec));
+  startMany @3 (requests :List(WorkloadStartRequest)) -> (specs :List(TaskSpec));
   # Start multiple tasks in a batch.
 
   logs @4 (request :TaskLogsRequest);
@@ -375,7 +375,7 @@ struct ServiceMetadata {
   # Task template name within the service.
 }
 
-struct TaskStartRequest {
+struct WorkloadStartRequest {
   name @0 :Text;
   # Human-readable task name.
 

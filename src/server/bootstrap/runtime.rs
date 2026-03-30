@@ -22,10 +22,10 @@ use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
 use crate::sync::{SyncService, SyncStores};
-use crate::task::manager::{TaskManager, TaskManagerConfig, TaskRuntimeConfig};
 use crate::task::service::TaskService;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyStores};
 use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
+use crate::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadRuntimeConfig};
 use crate::{config, gossip, services};
 use async_channel::{Receiver, Sender};
 use protocol::agents::agents::Client as AgentsClient;
@@ -51,7 +51,7 @@ use tracing::{error, info};
 /// one boot sequence while still customizing timing and runtime dependencies.
 #[derive(Clone)]
 pub(crate) struct BootstrapOptions {
-    pub task_runtime: Option<TaskRuntimeConfig>,
+    pub task_runtime: Option<WorkloadRuntimeConfig>,
     pub runtime_backend: Option<Arc<dyn RuntimeBackend + Send + Sync>>,
     pub local_volume_root: Option<PathBuf>,
     pub gossip_channel_capacity: usize,
@@ -91,7 +91,7 @@ pub(crate) struct RuntimeComponents {
     pub topology: Topology,
     pub topology_client: TopologyClient,
     pub sync_client: protocol::sync::sync::Client,
-    pub task_manager: TaskManager,
+    pub task_manager: WorkloadManager,
     pub task_client: protocol::task::task::Client,
     pub job_controller: JobController,
     pub jobs_client: JobsClient,
@@ -439,7 +439,7 @@ async fn build_runtime_components(
     scheduler.set_digest_registry(scheduler_digest_registry);
     scheduler.publish_current_digest().await;
 
-    let task_manager = TaskManager::new(TaskManagerConfig {
+    let task_manager = WorkloadManager::new(WorkloadManagerConfig {
         store: stores.tasks.clone(),
         tx: gossip_tx.clone(),
         rx: task_rx,

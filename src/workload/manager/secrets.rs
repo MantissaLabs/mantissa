@@ -220,13 +220,13 @@ impl WorkloadManager {
             if target.is_empty() {
                 cleanup_dir_quietly(&root_dir).await;
                 return Err(anyhow!(
-                    "secret file projection requires a non-empty container path"
+                    "secret file projection requires a non-empty runtime filesystem path"
                 ));
             }
             if !target.starts_with('/') {
                 cleanup_dir_quietly(&root_dir).await;
                 return Err(anyhow!(
-                    "secret file target '{}' must be an absolute container path",
+                    "secret file target '{}' must be an absolute runtime filesystem path",
                     target
                 ));
             }

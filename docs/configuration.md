@@ -52,8 +52,10 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
         indirect_fanout_min: 3,
         indirect_fanout_max: 32,
     ),
-    docker: (
-        host: "unix:///var/run/docker.sock",
+    runtimes: (
+        oci: (
+            host: "unix:///var/run/docker.sock",
+        ),
     ),
     gpu: (
         device_overrides: "uuid:GPU-abc=id:GPU-abc; pci:0000:81:00.0=disable; index:0=id:0",
@@ -78,5 +80,5 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `health.down_after_ms`
 - `health.indirect_fanout_min`
 - `health.indirect_fanout_max`
-- `docker.host` (legacy: `MANTISSA_DOCKER_HOST`, still falls back to `DOCKER_HOST`)
+- `runtimes.oci.host` (env: `MANTISSA_RUNTIME_OCI_HOST`, falls back to `DOCKER_HOST` when unset)
 - `gpu.device_overrides` (legacy: `MANTISSA_GPU_DEVICE_OVERRIDES`)

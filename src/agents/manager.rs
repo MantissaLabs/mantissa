@@ -5,9 +5,9 @@ use crate::agents::types::{
 };
 use crate::gossip::Message;
 use crate::registry::Registry;
-use crate::task::container::ContainerState;
-use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::workload::manager::workload_start_error_is_retryable;
+use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
+use crate::workload::model::WorkloadPhase;
 use crate::workload::model::{RuntimeClass, WorkloadEnvironmentVariable, WorkloadVolumeMount};
 use crate::workload::types::TaskExecutionSpec;
 use anyhow::{Result, anyhow};
@@ -33,7 +33,7 @@ pub struct AgentSubmission {
 /// Dependencies used to construct one agent controller.
 pub struct AgentControllerConfig {
     pub registry: AgentRegistry,
-    pub task_manager: TaskManager,
+    pub task_manager: WorkloadManager,
     pub cluster_registry: Registry,
     pub gossip_tx: Sender<Message>,
     pub gossip_rx: Receiver<Message>,
@@ -45,7 +45,7 @@ pub struct AgentControllerConfig {
 #[derive(Clone)]
 pub struct AgentController {
     registry: AgentRegistry,
-    task_manager: TaskManager,
+    task_manager: WorkloadManager,
     cluster_registry: Registry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
@@ -339,11 +339,11 @@ impl AgentController {
         };
 
         match spec.state {
-            ContainerState::Pending
-            | ContainerState::Pulling
-            | ContainerState::Creating
-            | ContainerState::VolumeUnavailable => Ok(()),
-            ContainerState::Running | ContainerState::Paused => {
+            WorkloadPhase::Pending
+            | WorkloadPhase::Pulling
+            | WorkloadPhase::Creating
+            | WorkloadPhase::VolumeUnavailable => Ok(()),
+            WorkloadPhase::Running | WorkloadPhase::Paused => {
                 if run.status != AgentRunStatus::Running
                     || session.status != AgentSessionStatus::Running
                 {
@@ -358,7 +358,7 @@ impl AgentController {
                 }
                 Ok(())
             }
-            ContainerState::Exited(exit_code) => {
+            WorkloadPhase::Exited(exit_code) => {
                 if exit_code == 0 {
                     let mut finished_run = run.clone();
                     finished_run.mark_succeeded(
@@ -388,10 +388,10 @@ impl AgentController {
                 }
                 Ok(())
             }
-            ContainerState::Failed
-            | ContainerState::Stopping
-            | ContainerState::Stopped
-            | ContainerState::Unknown => {
+            WorkloadPhase::Failed
+            | WorkloadPhase::Stopping
+            | WorkloadPhase::Stopped
+            | WorkloadPhase::Unknown => {
                 let mut failed_run = run.clone();
                 failed_run
                     .mark_failed(None, Some(format!("sandbox task entered {:?}", spec.state)));
@@ -441,7 +441,7 @@ impl AgentController {
         }
 
         let desired_task_id = Uuid::new_v4();
-        let request = TaskStartRequest {
+        let request = WorkloadStartRequest {
             name: build_agent_run_name(&session, run.id),
             execution: run.execution.clone(),
             runtime_class: RuntimeClass::Sandbox,

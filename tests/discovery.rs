@@ -20,8 +20,8 @@ use mantissa::store::network_store::{
 };
 use mantissa::store::service_store::open_service_store;
 use mantissa::store::task_store::open_task_store;
-use mantissa::task::container::ContainerState;
 use mantissa::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
+use mantissa::workload::model::WorkloadPhase;
 use mantissa::workload::types::WorkloadExecutionSpec;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -135,7 +135,7 @@ fn running_task(task_id: Uuid, node_id: Uuid, service_name: &str, network_id: Uu
         image: "hashicorp/http-echo:1.0.0".to_string(),
         runtime_class: mantissa::workload::model::RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: now.clone(),
@@ -390,7 +390,7 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
 
     // Stop one task and ensure DNS no longer returns its backend.
     let mut stopped = running_task(task_a, node_id, service_name, network_id);
-    stopped.state = ContainerState::Stopped;
+    stopped.state = WorkloadPhase::Stopped;
     stopped.updated_at = chrono::Utc::now().to_rfc3339();
     harness
         .tasks

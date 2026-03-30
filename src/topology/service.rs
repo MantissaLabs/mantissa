@@ -17,8 +17,6 @@ use crate::store::cluster_view_store::ClusterNameRecord;
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, MasterKeyRecord};
 use crate::store::peer_store::PeersStore;
 use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains};
-use crate::task::container::ContainerState;
-use crate::task::manager::select_best_task_value;
 use crate::task::types::TaskValue;
 use crate::topology::health::status_to_node_status;
 use crate::topology::operation::{
@@ -30,6 +28,8 @@ use crate::topology::peers::{
 };
 use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::types::VolumeDriver;
+use crate::workload::model::WorkloadPhase;
+use crate::workload::model::select_best_workload_value;
 use async_trait::async_trait;
 use capnp::Error;
 use capnp::data;
@@ -877,7 +877,7 @@ impl Topology {
 
         let mut tasks = Vec::new();
         for (_key, snapshot) in entries {
-            let Some(value) = select_best_task_value(snapshot.as_slice()) else {
+            let Some(value) = select_best_workload_value(snapshot.as_slice()) else {
                 continue;
             };
             if value.node_id != node_id || !task_blocks_node_drain(&value.state) {
@@ -2294,10 +2294,10 @@ fn join_human_list(parts: &[String]) -> String {
 ///
 /// Milestone 2 only ignores terminal task rows that no longer require runtime ownership.
 /// Non-terminal tasks must either evacuate through service reconciliation or block the request.
-fn task_blocks_node_drain(state: &ContainerState) -> bool {
+fn task_blocks_node_drain(state: &WorkloadPhase) -> bool {
     !matches!(
         state,
-        ContainerState::Stopped | ContainerState::Failed | ContainerState::Exited(_)
+        WorkloadPhase::Stopped | WorkloadPhase::Failed | WorkloadPhase::Exited(_)
     )
 }
 

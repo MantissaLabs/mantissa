@@ -226,7 +226,7 @@ impl DockerRuntimeBackend {
     }
 
     fn connect() -> Result<(Docker, String), bollard::errors::Error> {
-        if let Some(host) = config::docker_host() {
+        if let Some(host) = config::oci_runtime_host() {
             return Self::connect_with_host(&host).map(|docker| (docker, host));
         }
 

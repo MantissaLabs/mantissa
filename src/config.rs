@@ -26,7 +26,7 @@ pub struct Config {
     #[serde(default)]
     pub health: HealthConfig,
     #[serde(default)]
-    pub docker: DockerConfig,
+    pub runtimes: RuntimeRegistryConfig,
     #[serde(default)]
     pub gpu: GpuConfig,
 }
@@ -201,9 +201,18 @@ impl HealthConfig {
 
 /// # Description:
 ///
-/// Docker runtime configuration.
+/// Runtime registry configuration.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct DockerConfig {
+pub struct RuntimeRegistryConfig {
+    #[serde(default)]
+    pub oci: OciRuntimeConfig,
+}
+
+/// # Description:
+///
+/// OCI runtime configuration.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct OciRuntimeConfig {
     #[serde(default)]
     pub host: Option<String>,
 }
@@ -358,9 +367,9 @@ pub fn wireguard_manage_firewall() -> bool {
 
 /// # Description:
 ///
-/// Resolve the Docker host override, if configured.
-pub fn docker_host() -> Option<String> {
-    global_config().docker.host
+/// Resolve the OCI runtime host override, if configured.
+pub fn oci_runtime_host() -> Option<String> {
+    global_config().runtimes.oci.host
 }
 
 /// # Description:
@@ -589,11 +598,11 @@ impl Config {
             }
         }
 
-        if let Ok(host) = std::env::var("MANTISSA_DOCKER_HOST") {
+        if let Ok(host) = std::env::var("MANTISSA_RUNTIME_OCI_HOST") {
             applied = true;
             let host = host.trim();
             if !host.is_empty() {
-                self.docker.host = Some(host.to_string());
+                self.runtimes.oci.host = Some(host.to_string());
             }
         }
 
@@ -637,10 +646,10 @@ impl Config {
             anyhow::bail!("network.nodeport.ip must be a valid IPv4 address (got '{ip}')");
         }
 
-        if let Some(ref host) = self.docker.host
+        if let Some(ref host) = self.runtimes.oci.host
             && host.trim().is_empty()
         {
-            anyhow::bail!("docker.host cannot be empty");
+            anyhow::bail!("runtimes.oci.host cannot be empty");
         }
 
         if let Some(ref overrides) = self.gpu.device_overrides
@@ -797,8 +806,8 @@ fn should_reload_for_event(kind: &EventKind) -> bool {
 fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
     let mut changes = Vec::new();
 
-    if old.docker.host != new.docker.host {
-        changes.push("docker.host".to_string());
+    if old.runtimes.oci.host != new.runtimes.oci.host {
+        changes.push("runtimes.oci.host".to_string());
     }
 
     if old.gpu.device_overrides != new.gpu.device_overrides {
@@ -922,7 +931,7 @@ mod tests {
             std::env::set_var("MANTISSA_WIREGUARD_PORT", "51820");
             std::env::set_var("MANTISSA_BPF_NO_ATTACH", "1");
             std::env::set_var("MANTISSA_NODEPORT_IFACE", "eth0");
-            std::env::set_var("MANTISSA_DOCKER_HOST", "unix:///var/run/docker.sock");
+            std::env::set_var("MANTISSA_RUNTIME_OCI_HOST", "unix:///var/run/docker.sock");
             std::env::set_var("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc");
             std::env::set_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY", "1");
         }
@@ -936,7 +945,7 @@ mod tests {
         assert!(!config.network.nodeport.enabled);
         assert_eq!(config.network.nodeport.iface.as_deref(), Some("eth0"));
         assert_eq!(
-            config.docker.host.as_deref(),
+            config.runtimes.oci.host.as_deref(),
             Some("unix:///var/run/docker.sock")
         );
         assert_eq!(
@@ -950,7 +959,7 @@ mod tests {
             std::env::remove_var("MANTISSA_WIREGUARD_PORT");
             std::env::remove_var("MANTISSA_BPF_NO_ATTACH");
             std::env::remove_var("MANTISSA_NODEPORT_IFACE");
-            std::env::remove_var("MANTISSA_DOCKER_HOST");
+            std::env::remove_var("MANTISSA_RUNTIME_OCI_HOST");
             std::env::remove_var("MANTISSA_GPU_DEVICE_OVERRIDES");
             std::env::remove_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY");
         }

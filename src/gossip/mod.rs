@@ -21,7 +21,6 @@ use crate::secrets::service::{read_secret_event, write_secret_event};
 use crate::secrets::types::SecretEvent;
 use crate::services::service::{read_service_event, write_service_event};
 use crate::services::types::ServiceEvent;
-use crate::task::causality::{should_replace_task_event, task_event_id};
 use crate::task::service as task_service;
 use crate::task::types::TaskEvent;
 use crate::topology;
@@ -29,6 +28,7 @@ use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
 use crate::volumes::service::{read_volume_event, write_volume_event};
 use crate::volumes::types::VolumeEvent;
+use crate::workload::model::{should_replace_workload_event, workload_event_id};
 use async_channel::{Receiver, Sender, TrySendError};
 use async_trait::async_trait;
 use capnp::Error;
@@ -279,7 +279,7 @@ fn coalesce_pending_messages(pending: Vec<Message>) -> (Vec<Message>, usize) {
 /// Returns the logical task identifier for one gossip message when it carries a task event.
 fn task_message_task_id(message: &Message) -> Option<Uuid> {
     match message {
-        Message::Task { event, .. } => Some(task_event_id(event)),
+        Message::Task { event, .. } => Some(workload_event_id(event)),
         _ => None,
     }
 }
@@ -308,7 +308,7 @@ fn should_replace_task_message(current: &Message, candidate: &Message) -> bool {
         return false;
     };
 
-    should_replace_task_event(current_event, candidate_event)
+    should_replace_workload_event(current_event, candidate_event)
 }
 
 /// Returns true when the candidate scheduler digest message should replace the retained one.
@@ -1281,11 +1281,11 @@ mod tests {
         message_for_forwarding,
     };
     use crate::cluster::{ClusterId, ClusterViewId};
-    use crate::task::container::ContainerState;
     use crate::task::types::{TaskEvent, TaskSpec};
     use crate::topology::PeerHandle;
     use crate::topology::TopologyEvent;
     use crate::topology::peer_provider::PeerProvider;
+    use crate::workload::model::WorkloadPhase;
     use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
     use std::collections::HashSet;
@@ -1418,7 +1418,7 @@ mod tests {
             image: "img".to_string(),
             runtime_class: crate::workload::model::RuntimeClass::Oci,
             sandbox_profile: None,
-            state: ContainerState::Running,
+            state: WorkloadPhase::Running,
             phase_reason: None,
             phase_progress: None,
             created_at: now.to_rfc3339(),
@@ -1456,7 +1456,7 @@ mod tests {
             image: "img".to_string(),
             runtime_class: crate::workload::model::RuntimeClass::Oci,
             sandbox_profile: None,
-            state: ContainerState::Pending,
+            state: WorkloadPhase::Pending,
             phase_reason: None,
             phase_progress: None,
             created_at: now.to_rfc3339(),
@@ -1507,7 +1507,7 @@ mod tests {
                 event: TaskEvent::UpsertSpec(spec),
                 ..
             } => {
-                assert_eq!(spec.state, ContainerState::Running);
+                assert_eq!(spec.state, WorkloadPhase::Running);
                 assert_eq!(spec.phase_version, 7);
             }
             _ => panic!("unexpected coalesced message variant"),
@@ -1525,7 +1525,7 @@ mod tests {
             image: "img".to_string(),
             runtime_class: crate::workload::model::RuntimeClass::Oci,
             sandbox_profile: None,
-            state: ContainerState::Stopping,
+            state: WorkloadPhase::Stopping,
             phase_reason: None,
             phase_progress: None,
             created_at: now.to_rfc3339(),
@@ -1590,13 +1590,13 @@ mod tests {
 
         for phase_version in 1..=16u64 {
             let state = if phase_version >= 16 {
-                ContainerState::Running
+                WorkloadPhase::Running
             } else if phase_version >= 11 {
-                ContainerState::Creating
+                WorkloadPhase::Creating
             } else if phase_version >= 6 {
-                ContainerState::Pulling
+                WorkloadPhase::Pulling
             } else {
-                ContainerState::Pending
+                WorkloadPhase::Pending
             };
 
             let spec = TaskSpec {
@@ -1660,6 +1660,6 @@ mod tests {
             .expect("coalesced batch should keep one task upsert");
 
         assert_eq!(newest_task.phase_version, 16);
-        assert_eq!(newest_task.state, ContainerState::Running);
+        assert_eq!(newest_task.state, WorkloadPhase::Running);
     }
 }

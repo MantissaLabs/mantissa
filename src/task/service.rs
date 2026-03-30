@@ -3,8 +3,6 @@ use crate::runtime::types::{
     RuntimeAttachOptions, RuntimeExecOptions, RuntimeExecResult, RuntimeLogFrame, RuntimeLogStream,
     RuntimeLogsOptions,
 };
-use crate::task::container::ContainerState;
-use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::{
     TaskEvent, TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStateKind, TaskStatus,
 };
@@ -14,7 +12,9 @@ use crate::workload::capnp_codec::{
     decode_volume_mounts, encode_env_vars, encode_secret_files, encode_task_liveness_probe,
     encode_task_restart_policy, encode_volume_mounts,
 };
+use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
 use crate::workload::model::RuntimeClass;
+use crate::workload::model::WorkloadPhase;
 use crate::workload::types::TaskExecutionSpec;
 use capnp::Error;
 use protocol::gossip::gossip_message;
@@ -28,41 +28,41 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tracing::warn;
 use uuid::Uuid;
 
-fn state_to_str(state: &ContainerState) -> String {
+fn state_to_str(state: &WorkloadPhase) -> String {
     match state {
-        ContainerState::Pending => "pending".to_string(),
-        ContainerState::Pulling => "pulling".to_string(),
-        ContainerState::Creating => "creating".to_string(),
-        ContainerState::VolumeUnavailable => "volume_unavailable".to_string(),
-        ContainerState::Running => "running".to_string(),
-        ContainerState::Paused => "paused".to_string(),
-        ContainerState::Stopping => "stopping".to_string(),
-        ContainerState::Stopped => "stopped".to_string(),
-        ContainerState::Failed => "failed".to_string(),
-        ContainerState::Exited(code) => format!("exited:{code}"),
-        ContainerState::Unknown => "unknown".to_string(),
+        WorkloadPhase::Pending => "pending".to_string(),
+        WorkloadPhase::Pulling => "pulling".to_string(),
+        WorkloadPhase::Creating => "creating".to_string(),
+        WorkloadPhase::VolumeUnavailable => "volume_unavailable".to_string(),
+        WorkloadPhase::Running => "running".to_string(),
+        WorkloadPhase::Paused => "paused".to_string(),
+        WorkloadPhase::Stopping => "stopping".to_string(),
+        WorkloadPhase::Stopped => "stopped".to_string(),
+        WorkloadPhase::Failed => "failed".to_string(),
+        WorkloadPhase::Exited(code) => format!("exited:{code}"),
+        WorkloadPhase::Unknown => "unknown".to_string(),
     }
 }
 
-fn state_from_str(input: &str) -> ContainerState {
+fn state_from_str(input: &str) -> WorkloadPhase {
     match input {
-        "pending" => ContainerState::Pending,
-        "pulling" => ContainerState::Pulling,
-        "creating" => ContainerState::Creating,
-        "volume_unavailable" => ContainerState::VolumeUnavailable,
-        "running" => ContainerState::Running,
-        "paused" => ContainerState::Paused,
-        "stopping" => ContainerState::Stopping,
-        "stopped" => ContainerState::Stopped,
-        "failed" => ContainerState::Failed,
-        "unknown" => ContainerState::Unknown,
+        "pending" => WorkloadPhase::Pending,
+        "pulling" => WorkloadPhase::Pulling,
+        "creating" => WorkloadPhase::Creating,
+        "volume_unavailable" => WorkloadPhase::VolumeUnavailable,
+        "running" => WorkloadPhase::Running,
+        "paused" => WorkloadPhase::Paused,
+        "stopping" => WorkloadPhase::Stopping,
+        "stopped" => WorkloadPhase::Stopped,
+        "failed" => WorkloadPhase::Failed,
+        "unknown" => WorkloadPhase::Unknown,
         other => {
             if let Some(code) = other.strip_prefix("exited:")
                 && let Ok(code) = code.parse::<i32>()
             {
-                return ContainerState::Exited(code);
+                return WorkloadPhase::Exited(code);
             }
-            ContainerState::Unknown
+            WorkloadPhase::Unknown
         }
     }
 }
@@ -738,13 +738,13 @@ impl task_exec_session::Server for LocalTaskExecSession {
 
 #[derive(Clone)]
 pub struct TaskService {
-    manager: TaskManager,
+    manager: WorkloadManager,
     topology: Topology,
     registry: Registry,
 }
 
 impl TaskService {
-    pub fn new(manager: TaskManager, topology: Topology, registry: Registry) -> Self {
+    pub fn new(manager: WorkloadManager, topology: Topology, registry: Registry) -> Self {
         Self {
             manager,
             topology,
@@ -833,7 +833,7 @@ impl task::Server for TaskService {
             networks.push(Uuid::from_bytes(bytes));
         }
 
-        let request = TaskStartRequest {
+        let request = WorkloadStartRequest {
             name,
             execution: TaskExecutionSpec {
                 image,
@@ -961,7 +961,7 @@ impl task::Server for TaskService {
                 None
             };
 
-            requests.push(TaskStartRequest {
+            requests.push(WorkloadStartRequest {
                 name,
                 execution: TaskExecutionSpec {
                     image,

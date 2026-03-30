@@ -11,9 +11,7 @@ use uuid::Uuid;
 use crate::scheduler::digest::{SchedulerDigestValue, read_scheduler_digest};
 use crate::scheduler::{GpuReservationRequest, SchedulerError, SlotId, SlotReservationRequest};
 use crate::task::service::read_spec;
-use crate::workload::model::{
-    WorkloadEvent as TaskEvent, WorkloadPhase as ContainerState, WorkloadSpec as TaskSpec,
-};
+use crate::workload::model::{WorkloadEvent as TaskEvent, WorkloadPhase, WorkloadSpec as TaskSpec};
 
 use super::WorkloadManager;
 use super::planner::{BatchStartPlan, PreparedRemoteStartPlan, RemoteStartPlan};
@@ -744,7 +742,7 @@ impl WorkloadManager {
         read_spec(reader).map_err(|err| anyhow::anyhow!("failed to decode stop response: {err}"))
     }
 
-    /// Requests remote peers to stop tasks so rollbacks do not leak running containers.
+    /// Requests remote peers to stop tasks so rollbacks do not leak running runtime instances.
     pub(super) async fn signal_remote_stop(&self, specs: &[(usize, TaskSpec)]) {
         if specs.is_empty() {
             return;
@@ -755,7 +753,7 @@ impl WorkloadManager {
                 continue;
             }
 
-            if matches!(spec.state, ContainerState::Stopped) {
+            if matches!(spec.state, WorkloadPhase::Stopped) {
                 continue;
             }
 
@@ -805,7 +803,7 @@ impl WorkloadManager {
                 image: plan.image.clone(),
                 runtime_class: plan.runtime_class,
                 sandbox_profile: plan.sandbox_profile.clone(),
-                state: ContainerState::Pending,
+                state: WorkloadPhase::Pending,
                 phase_reason: None,
                 phase_progress: None,
                 created_at: Utc::now().to_rfc3339(),

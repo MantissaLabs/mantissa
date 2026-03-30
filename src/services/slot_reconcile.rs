@@ -11,7 +11,7 @@ use super::{
 };
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
 use crate::task::types::TaskSpec;
-use crate::workload::model::WorkloadPhase as ContainerState;
+use crate::workload::model::WorkloadPhase;
 use anyhow::anyhow;
 use health::Status as HealthStatus;
 use std::collections::{HashMap, HashSet};
@@ -194,7 +194,7 @@ impl ServiceController {
         let task = env.inventory.by_id.get(&task_id);
         if matches!(
             task.map(|task| &task.state),
-            Some(ContainerState::VolumeUnavailable)
+            Some(WorkloadPhase::VolumeUnavailable)
         ) && requires_pinned_target
         {
             // Imported and other pinned local volumes recover in place once the node-local

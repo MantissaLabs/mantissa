@@ -18,7 +18,7 @@ use crate::{
         bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, boot},
     },
     services::ServiceController,
-    task::manager::{TaskManager, TaskRuntimeConfig},
+    workload::manager::{WorkloadManager, WorkloadRuntimeConfig},
 };
 use net::noise::NoiseKeys;
 use protocol::secrets::secrets;
@@ -48,7 +48,7 @@ pub struct HeadlessConfig {
     pub gossip_tick: Option<Duration>,
     pub gossip_fanout: Option<usize>,
     pub gossip_channel_capacity: Option<usize>,
-    pub task_runtime: Option<TaskRuntimeConfig>,
+    pub task_runtime: Option<WorkloadRuntimeConfig>,
     pub runtime_backend: Option<Arc<dyn RuntimeBackend + Send + Sync>>,
     pub local_volume_root: Option<PathBuf>,
 }
@@ -99,7 +99,7 @@ pub struct HeadlessNode {
     pub job_controller: JobController,
     pub agent_controller: AgentController,
     pub service_controller: ServiceController,
-    pub task_manager: TaskManager,
+    pub task_manager: WorkloadManager,
     pub network_registry: NetworkRegistry,
     pub volume_registry: crate::volumes::VolumeRegistry,
     pub network_controller: NetworkController,
@@ -479,7 +479,7 @@ impl HeadlessNode {
         gossip_tick: Option<Duration>,
         fanout: Option<usize>,
         gossip_channel_capacity: Option<usize>,
-        task_runtime: Option<TaskRuntimeConfig>,
+        task_runtime: Option<WorkloadRuntimeConfig>,
     ) -> io::Result<Self> {
         let state = self_contained_state()?;
         let mut node = Self::new_with(
@@ -658,7 +658,7 @@ impl Drop for HeadlessNode {
                 }
             }
         }
-        crate::task::manager::cleanup_secret_runtime_roots_for_node(self.id);
+        crate::workload::manager::cleanup_secret_runtime_roots_for_node(self.id);
         if let Some(dir) = self._tmp_dir.take() {
             let _ = std::fs::remove_dir_all(dir);
         }

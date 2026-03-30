@@ -2,11 +2,11 @@ use crate::gossip::Message;
 use crate::jobs::registry::JobRegistry;
 use crate::jobs::types::{JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
 use crate::registry::Registry;
-use crate::task::container::ContainerState;
-use crate::task::manager::{TaskManager, TaskStartRequest};
 use crate::task::types::TaskSpec;
 use crate::workload::manager::workload_start_error_is_retryable;
+use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
 use crate::workload::model::RuntimeClass;
+use crate::workload::model::WorkloadPhase;
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::Utc;
@@ -31,7 +31,7 @@ pub struct JobSubmission {
 /// Dependencies used to construct one job controller.
 pub struct JobControllerConfig {
     pub registry: JobRegistry,
-    pub task_manager: TaskManager,
+    pub task_manager: WorkloadManager,
     pub cluster_registry: Registry,
     pub gossip_tx: Sender<Message>,
     pub gossip_rx: Receiver<Message>,
@@ -43,7 +43,7 @@ pub struct JobControllerConfig {
 #[derive(Clone)]
 pub struct JobController {
     registry: JobRegistry,
-    task_manager: TaskManager,
+    task_manager: WorkloadManager,
     cluster_registry: Registry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
@@ -324,7 +324,7 @@ impl JobController {
             return Ok(());
         }
 
-        let request = TaskStartRequest {
+        let request = WorkloadStartRequest {
             name: format!("{}-attempt-{}", latest.name, latest.attempts_started),
             execution: latest.execution.clone(),
             runtime_class: RuntimeClass::Oci,
@@ -391,10 +391,10 @@ impl JobController {
         }
 
         match task.state {
-            ContainerState::Exited(0) => {
+            WorkloadPhase::Exited(0) => {
                 current.mark_succeeded(task.id, Some("completed successfully".to_string()));
             }
-            ContainerState::Exited(code) => {
+            WorkloadPhase::Exited(code) => {
                 let detail = format!(
                     "attempt {} exited with code {code}",
                     current.attempts_started
@@ -403,13 +403,13 @@ impl JobController {
                     .fail_or_retry_task(current, Some(task.id), detail)
                     .await;
             }
-            ContainerState::Failed => {
+            WorkloadPhase::Failed => {
                 let detail = format!("attempt {} failed", current.attempts_started);
                 return self
                     .fail_or_retry_task(current, Some(task.id), detail)
                     .await;
             }
-            ContainerState::Stopped => {
+            WorkloadPhase::Stopped => {
                 let detail = format!(
                     "attempt {} stopped before success",
                     current.attempts_started
@@ -418,14 +418,14 @@ impl JobController {
                     .fail_or_retry_task(current, Some(task.id), detail)
                     .await;
             }
-            ContainerState::Pending
-            | ContainerState::Pulling
-            | ContainerState::Creating
-            | ContainerState::VolumeUnavailable
-            | ContainerState::Running
-            | ContainerState::Paused
-            | ContainerState::Stopping
-            | ContainerState::Unknown => {
+            WorkloadPhase::Pending
+            | WorkloadPhase::Pulling
+            | WorkloadPhase::Creating
+            | WorkloadPhase::VolumeUnavailable
+            | WorkloadPhase::Running
+            | WorkloadPhase::Paused
+            | WorkloadPhase::Stopping
+            | WorkloadPhase::Unknown => {
                 current.mark_running(
                     task.id,
                     Some(format!(

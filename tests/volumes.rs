@@ -11,13 +11,13 @@ use mantissa::runtime::types::{
 };
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 use mantissa::store::volume_store::{open_volume_node_store, open_volume_spec_store};
-use mantissa::task::manager::{TaskRuntimeConfig, TaskStartRequest};
 use mantissa::task::types::TaskVolumeMount;
 use mantissa::volumes::registry::VolumeRegistry;
 use mantissa::volumes::types::{
     LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
     VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
 };
+use mantissa::workload::manager::{WorkloadRuntimeConfig, WorkloadStartRequest};
 use mantissa::workload::model::RuntimeClass;
 use mantissa::workload::types::TaskExecutionSpec;
 use protocol::topology::topology;
@@ -41,9 +41,9 @@ struct RecordingRuntimeBackend {
 }
 
 impl RecordingRuntimeBackend {
-    /// Builds the runtime error used when a launch races with an existing container name.
+    /// Builds the runtime error used when a launch races with an existing instance name.
     fn name_conflict(name: &str) -> RuntimeError {
-        RuntimeError::backend(Some(409), format!("container name '{name}' already in use"))
+        RuntimeError::backend(Some(409), format!("instance name '{name}' already in use"))
     }
 
     async fn volume_mounts(&self) -> Vec<Vec<String>> {
@@ -380,8 +380,8 @@ fn standalone_volume_task_request(
     volume_id: Uuid,
     volume_name: &str,
     target: &str,
-) -> TaskStartRequest {
-    TaskStartRequest {
+) -> WorkloadStartRequest {
+    WorkloadStartRequest {
         name: "standalone-volume-task".into(),
         execution: TaskExecutionSpec {
             image: "busybox:latest".into(),
@@ -439,10 +439,10 @@ async fn create_recording_node(
     HeadlessNode::new_with_config(HeadlessConfig {
         runtime_backend: Some(manager),
         local_volume_root: Some(local_volume_root),
-        task_runtime: Some(TaskRuntimeConfig {
+        task_runtime: Some(WorkloadRuntimeConfig {
             reconcile_tick: Duration::from_millis(50),
             repair_tick: Duration::from_millis(50),
-            ..TaskRuntimeConfig::default()
+            ..WorkloadRuntimeConfig::default()
         }),
         ..HeadlessConfig::default()
     })
@@ -464,10 +464,10 @@ async fn create_recording_node_with_parts(
         HeadlessConfig {
             runtime_backend: Some(manager),
             local_volume_root: Some(local_volume_root),
-            task_runtime: Some(TaskRuntimeConfig {
+            task_runtime: Some(WorkloadRuntimeConfig {
                 reconcile_tick: Duration::from_millis(50),
                 repair_tick: Duration::from_millis(50),
-                ..TaskRuntimeConfig::default()
+                ..WorkloadRuntimeConfig::default()
             }),
             ..HeadlessConfig::default()
         },
@@ -856,7 +856,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
 
     let err = node
         .task_manager
-        .start_tasks_batch(vec![TaskStartRequest {
+        .start_tasks_batch(vec![WorkloadStartRequest {
             name: "conflict".into(),
             execution: TaskExecutionSpec {
                 image: "busybox:latest".into(),

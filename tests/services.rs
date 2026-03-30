@@ -40,13 +40,13 @@ use mantissa::services::types::{
     ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
     ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy,
 };
-use mantissa::task::container::ContainerState;
-use mantissa::task::manager::TaskManager;
 use mantissa::task::types::{
     TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskServiceMetadata, TaskSpec,
     TaskStateFilter, TaskValue, TaskVolumeMount,
 };
 use mantissa::topology_capnp::topology;
+use mantissa::workload::manager::WorkloadManager;
+use mantissa::workload::model::WorkloadPhase;
 use mantissa::workload::types::WorkloadExecutionSpec;
 use protocol::health::NodeStatus;
 use protocol::secrets::secrets;
@@ -1224,7 +1224,7 @@ local_test!(services_large_deployment_converges_within_bound, {
         );
         let non_running: Vec<String> = tasks
             .iter()
-            .filter(|task| !matches!(task.state, ContainerState::Running))
+            .filter(|task| !matches!(task.state, WorkloadPhase::Running))
             .map(|task| format!("{}:{:?}", task.id, task.state))
             .collect();
         assert!(
@@ -1318,7 +1318,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
     );
 
     let mut stale = original_task.clone();
-    stale.state = ContainerState::Running;
+    stale.state = WorkloadPhase::Running;
     stale.updated_at = Utc::now().to_rfc3339();
 
     node.node
@@ -1366,7 +1366,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
     );
 
     let mut stale_stopping = original_task.clone();
-    stale_stopping.state = ContainerState::Stopping;
+    stale_stopping.state = WorkloadPhase::Stopping;
     stale_stopping.slot_ids.clear();
     stale_stopping.slot_id = None;
     stale_stopping.cpu_millis = 0;
@@ -1859,7 +1859,7 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
                 let tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
                 if tasks.len() != 3
                     || tasks.iter().any(|task| {
-                        task.node_id == down_node_id || task.state != ContainerState::Running
+                        task.node_id == down_node_id || task.state != WorkloadPhase::Running
                     })
                 {
                     return false;
@@ -1897,7 +1897,7 @@ local_test!(services_node_drain_blocks_on_standalone_task, {
 
     node.node
         .task_manager
-        .start_container(
+        .start_workload(
             "standalone",
             "ghcr.io/mantissa/demo:web",
             vec!["--serve".into()],
@@ -3840,7 +3840,7 @@ local_test!(
                     .expect("snapshot old task state");
                 let old_state = states.first().and_then(|(_, state)| state.clone());
                 assert!(
-                    !matches!(old_state, Some(ContainerState::Running)),
+                    !matches!(old_state, Some(WorkloadPhase::Running)),
                     "stop_first rollout should not expose replacement while previous task is still running"
                 );
                 verified_order = true;
@@ -4142,7 +4142,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
         wait_for_task_state(
             &node.node.task_manager,
             task_id,
-            ContainerState::Running,
+            WorkloadPhase::Running,
             Duration::from_secs(10)
         )
         .await,
@@ -4164,7 +4164,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
         wait_for_task_state(
             &node.node.task_manager,
             task_id,
-            ContainerState::VolumeUnavailable,
+            WorkloadPhase::VolumeUnavailable,
             Duration::from_secs(10)
         )
         .await,
@@ -4177,7 +4177,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
         wait_for_task_state(
             &node.node.task_manager,
             task_id,
-            ContainerState::Running,
+            WorkloadPhase::Running,
             Duration::from_secs(15)
         )
         .await,
@@ -4790,7 +4790,7 @@ async fn collect_published_service_attachment_snapshot(
 
     let mut snapshot = Vec::with_capacity(expected_task_count);
     for task in tasks {
-        if !matches!(task.state, ContainerState::Running) {
+        if !matches!(task.state, WorkloadPhase::Running) {
             return None;
         }
 
@@ -4894,7 +4894,7 @@ fn debug_service_attachment_publication_state(
 }
 
 /// Lists active tasks that belong to one service according to service metadata.
-async fn list_active_service_tasks(manager: &TaskManager, service_name: &str) -> Vec<TaskSpec> {
+async fn list_active_service_tasks(manager: &WorkloadManager, service_name: &str) -> Vec<TaskSpec> {
     let filter = TaskStateFilter::active_only();
     manager
         .list_tasks(&filter)
@@ -4912,7 +4912,7 @@ async fn list_active_service_tasks(manager: &TaskManager, service_name: &str) ->
 
 /// Lists active tasks for one service template so tests can assert template-level launch order.
 async fn list_active_service_template_tasks(
-    manager: &TaskManager,
+    manager: &WorkloadManager,
     service_name: &str,
     template_name: &str,
 ) -> Vec<TaskSpec> {
@@ -4957,7 +4957,7 @@ async fn template_attachments_published(
     }
 
     tasks.iter().all(|task| {
-        matches!(task.state, ContainerState::Running)
+        matches!(task.state, WorkloadPhase::Running)
             && by_task.get(&task.id).is_some_and(|attachment| {
                 attachment.state == NetworkAttachmentState::Ready && attachment.traffic_published
             })
@@ -5071,7 +5071,7 @@ async fn wait_for_template_replacement_after_dependency_publication(
 
 /// Lists active tasks for one service that are assigned to a specific node id.
 async fn list_local_active_service_tasks(
-    manager: &TaskManager,
+    manager: &WorkloadManager,
     service_name: &str,
     node_id: Uuid,
 ) -> Vec<TaskSpec> {
@@ -5122,7 +5122,7 @@ async fn wait_for_service_running_tasks_stable_all(
 ) -> bool {
     let deadline = Instant::now() + timeout;
     let mut stable_rounds = 0usize;
-    let mut previous: Option<Vec<Vec<(Uuid, Uuid, ContainerState)>>> = None;
+    let mut previous: Option<Vec<Vec<(Uuid, Uuid, WorkloadPhase)>>> = None;
 
     while Instant::now() < deadline {
         let mut snapshot = Vec::with_capacity(cluster.len());
@@ -5134,7 +5134,7 @@ async fn wait_for_service_running_tasks_stable_all(
             if tasks.len() != expected
                 || tasks
                     .iter()
-                    .any(|task| !matches!(task.state, ContainerState::Running))
+                    .any(|task| !matches!(task.state, WorkloadPhase::Running))
             {
                 healthy = false;
             }
@@ -5993,7 +5993,11 @@ async fn list_service_ids(client: &services::Client) -> Vec<Uuid> {
     ids
 }
 
-async fn wait_for_task_count(manager: &TaskManager, expected: usize, timeout: Duration) -> bool {
+async fn wait_for_task_count(
+    manager: &WorkloadManager,
+    expected: usize,
+    timeout: Duration,
+) -> bool {
     let filter = TaskStateFilter::all();
     wait_until(timeout, Duration::from_millis(50), || async {
         let specs = manager
@@ -6009,9 +6013,9 @@ async fn wait_for_task_count(manager: &TaskManager, expected: usize, timeout: Du
 }
 
 async fn wait_for_task_state(
-    manager: &TaskManager,
+    manager: &WorkloadManager,
     task_id: Uuid,
-    expected: ContainerState,
+    expected: WorkloadPhase,
     timeout: Duration,
 ) -> bool {
     wait_until(timeout, Duration::from_millis(50), || async {

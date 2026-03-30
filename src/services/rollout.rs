@@ -1308,10 +1308,10 @@ impl ServiceController {
         for (task_id, state) in states {
             match state {
                 Some(
-                    ContainerState::Pending
-                    | ContainerState::Pulling
-                    | ContainerState::Creating
-                    | ContainerState::Running,
+                    WorkloadPhase::Pending
+                    | WorkloadPhase::Pulling
+                    | WorkloadPhase::Creating
+                    | WorkloadPhase::Running,
                 ) => {}
                 Some(other) => {
                     return Err(anyhow!(

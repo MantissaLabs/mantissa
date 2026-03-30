@@ -21,10 +21,10 @@ use crate::scheduler::{
 };
 use crate::volumes::LocalVolumeAccessError;
 use crate::workload::model::{
-    WorkloadEvent as TaskEvent, WorkloadPhase as ContainerState,
-    WorkloadServiceMetadata as TaskServiceMetadata, WorkloadSpec as TaskSpec,
-    WorkloadValue as TaskValue, parse_workload_timestamp as parse_task_timestamp,
-    workload_event_id as task_event_id,
+    WorkloadEvent as TaskEvent, WorkloadPhase, WorkloadServiceMetadata as TaskServiceMetadata,
+    WorkloadSpec as TaskSpec, WorkloadValue as TaskValue,
+    parse_workload_timestamp as parse_task_timestamp, select_best_workload_value,
+    workload_event_id,
 };
 use crate::workload::types::{
     WorkloadLivenessProbe as TaskLivenessProbe, WorkloadLivenessProbeKind as TaskLivenessProbeKind,
@@ -32,11 +32,11 @@ use crate::workload::types::{
 };
 
 use super::{
-    WorkloadManager, instance_remove_in_progress, launch::InstanceLaunchRequest,
-    select_best_task_value, spec_to_status, spec_to_value, value_to_spec,
+    WorkloadManager, instance_remove_in_progress, launch::InstanceLaunchRequest, spec_to_status,
+    spec_to_value, value_to_spec,
 };
 
-/// Snapshot of containers currently known by the local runtime.
+/// Snapshot of instances currently known by the local runtime.
 struct RuntimeInventory {
     task_instances: HashMap<Uuid, String>,
     instance_ids: HashSet<String>,
@@ -58,12 +58,12 @@ impl WorkloadManager {
     ///
     /// Returns `Ok(true)` when the task is already healthy and no further start work is needed.
     /// Returns `Ok(false)` when reconciliation should continue (for example if runtime restart
-    /// is required because the running container is missing).
+    /// is required because the running instance is missing).
     pub(super) async fn reconcile_recorded_running_task(
         &self,
         working: &mut TaskSpec,
     ) -> Result<bool, anyhow::Error> {
-        if !matches!(working.state, ContainerState::Running) {
+        if !matches!(working.state, WorkloadPhase::Running) {
             return Ok(false);
         }
 
@@ -79,7 +79,7 @@ impl WorkloadManager {
                     self.resolve_terminal_exit_for_task(working).await?
                 {
                     let mut observation_reason =
-                        format!("container exited with status code {exit_code}");
+                        format!("instance exited with status code {exit_code}");
                     if let Some(exit_error) = exit_error.as_ref() {
                         observation_reason.push_str(": ");
                         observation_reason.push_str(exit_error.trim());
@@ -102,11 +102,11 @@ impl WorkloadManager {
                             target: "task",
                             task = %working.id,
                             exit_code,
-                            "running task container exited; restarting task runtime per restart policy"
+                            "running task instance exited; restarting task runtime per restart policy"
                         );
                     } else {
                         let mut reason = format!(
-                            "container exited with status code {exit_code} while task was running"
+                            "instance exited with status code {exit_code} while task was running"
                         );
                         if let Some(exit_error) = exit_error {
                             reason.push_str(": ");
@@ -121,14 +121,14 @@ impl WorkloadManager {
                 if let Err(err) = self
                     .record_terminal_observation_for_current_launch(
                         working.id,
-                        Some("running task container missing locally".to_string()),
+                        Some("running task instance missing locally".to_string()),
                     )
                     .await
                 {
                     warn!(
                         target: "task",
                         task = %working.id,
-                        "failed to persist terminal observation for missing running container: {err:#}"
+                        "failed to persist terminal observation for missing running instance: {err:#}"
                     );
                 }
                 // Reload once before transitioning to `Pending` so stale running snapshots do not
@@ -142,10 +142,10 @@ impl WorkloadManager {
                         *working = latest;
                         if matches!(
                             working.state,
-                            ContainerState::Running
-                                | ContainerState::Stopping
-                                | ContainerState::Stopped
-                                | ContainerState::Failed
+                            WorkloadPhase::Running
+                                | WorkloadPhase::Stopping
+                                | WorkloadPhase::Stopped
+                                | WorkloadPhase::Failed
                         ) {
                             return Ok(true);
                         }
@@ -168,10 +168,10 @@ impl WorkloadManager {
                 warn!(
                     target: "task",
                     task = %working.id,
-                    "running task container missing locally; restarting task runtime"
+                    "running task instance missing locally; restarting task runtime"
                 );
                 working.phase_version = working.phase_version.saturating_add(1);
-                working.state = ContainerState::Pending;
+                working.state = WorkloadPhase::Pending;
                 working.phase_reason = None;
                 working.phase_progress = None;
                 working.updated_at = Utc::now().to_rfc3339();
@@ -189,7 +189,7 @@ impl WorkloadManager {
                 Ok(false)
             }
             Err(err) => Err(anyhow::Error::from(err)
-                .context(format!("inspect running container for task {}", working.id))),
+                .context(format!("inspect running instance for task {}", working.id))),
         }
     }
 
@@ -341,7 +341,7 @@ impl WorkloadManager {
             if working.node_id != self.local_node_id {
                 return Ok(true);
             }
-            if !matches!(working.state, ContainerState::Running) {
+            if !matches!(working.state, WorkloadPhase::Running) {
                 return Ok(true);
             }
         }
@@ -354,7 +354,7 @@ impl WorkloadManager {
             "{failure_reason}; restarting task runtime"
         );
         working.phase_version = working.phase_version.saturating_add(1);
-        working.state = ContainerState::Pending;
+        working.state = WorkloadPhase::Pending;
         working.phase_reason = Some(failure_reason);
         working.phase_progress = None;
         working.updated_at = Utc::now().to_rfc3339();
@@ -402,7 +402,7 @@ impl WorkloadManager {
                     },
                     Err(RuntimeError::Timeout) => Err("liveness probe timed out".to_string()),
                     Err(RuntimeError::NotFound(_)) => {
-                        Err("task container disappeared while executing liveness probe".to_string())
+                        Err("task instance disappeared while executing liveness probe".to_string())
                     }
                     Err(err) => Err(format!("liveness probe failed: {err}")),
                 }
@@ -477,7 +477,7 @@ impl WorkloadManager {
             .runtime_backend
             .inspect_instance(instance_id)
             .await
-            .map_err(|err| format!("failed to inspect task container for liveness probe: {err}"))?;
+            .map_err(|err| format!("failed to inspect task instance for liveness probe: {err}"))?;
         for endpoint in &inspect.network_endpoints {
             push_liveness_target(&mut targets, endpoint.ip_address.as_deref());
         }
@@ -486,7 +486,7 @@ impl WorkloadManager {
     }
 
     /// Ensures the provided task has non-empty slot assignments and that each slot is reserved
-    /// for this local task before container launch continues.
+    /// for this local task before instance launch continues.
     ///
     /// This closes races where reconciliation starts from a slot-assigned snapshot but later
     /// reads a newer CRDT value with missing or mismatched scheduler ownership.
@@ -820,7 +820,7 @@ impl WorkloadManager {
             })?;
             return Ok(if has_tombstone { 1 } else { 0 });
         };
-        let Some(current) = select_best_task_value(snapshot.as_slice()) else {
+        let Some(current) = select_best_workload_value(snapshot.as_slice()) else {
             return Ok(0);
         };
 
@@ -866,7 +866,7 @@ impl WorkloadManager {
             .store
             .get_snapshot(&key)
             .map_err(|e| anyhow::anyhow!("task lookup failed before remove: {e}"))?
-            .and_then(|snapshot| select_best_task_value(snapshot.as_slice()))
+            .and_then(|snapshot| select_best_workload_value(snapshot.as_slice()))
             .map(|value| {
                 (
                     parse_task_timestamp(&value.updated_at, &value.created_at)
@@ -897,7 +897,7 @@ impl WorkloadManager {
     pub(super) async fn update_task_phase(
         &self,
         task_id: Uuid,
-        state: ContainerState,
+        state: WorkloadPhase,
         phase_reason: Option<String>,
         phase_progress: Option<String>,
     ) -> Result<TaskSpec, anyhow::Error> {
@@ -928,7 +928,7 @@ impl WorkloadManager {
         let state_changed = spec.state != state;
         if state_changed {
             spec.phase_version = spec.phase_version.saturating_add(1);
-            if matches!(state, ContainerState::Pulling) {
+            if matches!(state, WorkloadPhase::Pulling) {
                 // Pulling marks the start of one concrete launch attempt.
                 spec.launch_attempt = spec.launch_attempt.saturating_add(1);
             }
@@ -1030,7 +1030,7 @@ impl WorkloadManager {
             let _ = self
                 .update_task_phase(
                     task_id,
-                    ContainerState::Pulling,
+                    WorkloadPhase::Pulling,
                     Some("pulling image".to_string()),
                     Some(format!("{attempt}/{IMAGE_PULL_MAX_ATTEMPTS}")),
                 )
@@ -1059,7 +1059,7 @@ impl WorkloadManager {
                 let _ = self
                     .update_task_phase(
                         task_id,
-                        ContainerState::Pulling,
+                        WorkloadPhase::Pulling,
                         Some("pull retry backoff".to_string()),
                         Some(format!("{attempt}/{IMAGE_PULL_MAX_ATTEMPTS}")),
                     )
@@ -1070,7 +1070,7 @@ impl WorkloadManager {
 
         Err(last_error
             .unwrap_or_else(|| anyhow!("image pull failed without detailed error"))
-            .context(format!("docker pull failed for image {image}")))
+            .context(format!("runtime image pull failed for image {image}")))
     }
 
     fn tx(&self) -> Sender<Message> {
@@ -1079,7 +1079,7 @@ impl WorkloadManager {
 
     /// Records the latest outbound gossip event for one task id inside the local dirty buffer.
     async fn buffer_gossip_event(&self, event: TaskEvent) {
-        let task_id = task_event_id(&event);
+        let task_id = workload_event_id(&event);
         let mut dirty = self.local_state.dirty_gossip_tasks.lock().await;
         match dirty.get_mut(&task_id) {
             Some(current) => current.merge(event),
@@ -1129,7 +1129,7 @@ impl WorkloadManager {
         Ok(!dirty.is_empty())
     }
 
-    /// Ensures that slots that no longer correspond to running containers are released.
+    /// Ensures that slots that no longer correspond to running instances are released.
     pub(super) async fn cleanup_orphaned_slots(&self) {
         const MAX_ATTEMPTS: usize = 5;
 
@@ -1279,7 +1279,7 @@ impl WorkloadManager {
         Ok(())
     }
 
-    /// Stops one runtime container with a bounded wall-clock timeout so retries are possible.
+    /// Stops one runtime instance with a bounded wall-clock timeout so retries are possible.
     async fn stop_instance_bounded(
         &self,
         instance_identifier: &str,
@@ -1303,7 +1303,7 @@ impl WorkloadManager {
         }
     }
 
-    /// Removes one runtime container with a bounded wall-clock timeout so stale stops can retry.
+    /// Removes one runtime instance with a bounded wall-clock timeout so stale stops can retry.
     async fn remove_instance_bounded(
         &self,
         instance_identifier: &str,
@@ -1332,12 +1332,12 @@ impl WorkloadManager {
         }
     }
 
-    /// Performs a graceful stop of a locally owned task and tears down its container.
+    /// Performs a graceful stop of a locally owned task and tears down its runtime instance.
     pub(super) async fn perform_local_stop(
         &self,
         spec: TaskSpec,
     ) -> Result<TaskSpec, anyhow::Error> {
-        if matches!(spec.state, ContainerState::Stopped) {
+        if matches!(spec.state, WorkloadPhase::Stopped) {
             return Ok(spec);
         }
 
@@ -1359,9 +1359,9 @@ impl WorkloadManager {
         let instance_identifier = identifier_entry.unwrap_or_else(|| format!("mantissa-{id}"));
 
         let mut updated = spec.clone();
-        if !matches!(spec.state, ContainerState::Stopping) {
+        if !matches!(spec.state, WorkloadPhase::Stopping) {
             updated.phase_version = updated.phase_version.saturating_add(1);
-            updated.state = ContainerState::Stopping;
+            updated.state = WorkloadPhase::Stopping;
             updated.phase_reason = None;
             updated.phase_progress = None;
             updated.updated_at = Utc::now().to_rfc3339();
@@ -1406,7 +1406,7 @@ impl WorkloadManager {
         .await
         .map_err(|err| {
             anyhow::anyhow!(
-                "failed to remove container {instance_identifier} while stopping task {id}: {err}"
+                "failed to remove instance {instance_identifier} while stopping task {id}: {err}"
             )
         })?;
 
@@ -1430,10 +1430,10 @@ impl WorkloadManager {
             );
         }
 
-        if !matches!(updated.state, ContainerState::Stopped) {
+        if !matches!(updated.state, WorkloadPhase::Stopped) {
             updated.phase_version = updated.phase_version.saturating_add(1);
         }
-        updated.state = ContainerState::Stopped;
+        updated.state = WorkloadPhase::Stopped;
         updated.phase_reason = None;
         updated.phase_progress = None;
         updated.updated_at = Utc::now().to_rfc3339();
@@ -1465,7 +1465,7 @@ impl WorkloadManager {
         Ok(updated)
     }
 
-    /// Executes the task pre-stop hook inside the running container before termination begins.
+    /// Executes the task pre-stop hook inside the running runtime instance before termination begins.
     ///
     /// The hook is best-effort. Any failure is logged and the stop workflow continues because
     /// drain and rollout correctness must not depend on user-provided shutdown commands.
@@ -1519,7 +1519,7 @@ impl WorkloadManager {
                 debug!(
                     target: "task",
                     task = %spec.id,
-                    "skipping pre-stop hook because the container is already absent"
+                    "skipping pre-stop hook because the runtime instance is already absent"
                 );
             }
             Err(RuntimeError::Timeout) => {
@@ -1616,7 +1616,7 @@ impl WorkloadManager {
 
         // Ensure the failed transition is causally newer than any concurrent local write.
         if let Ok(current) = self.load_spec(task_id).await {
-            if matches!(current.state, ContainerState::Failed)
+            if matches!(current.state, WorkloadPhase::Failed)
                 && current.last_terminal_observed_launch == Some(current.launch_attempt)
                 && current.launch_attempt >= spec.launch_attempt
             {
@@ -1633,7 +1633,7 @@ impl WorkloadManager {
             }
         }
         spec.phase_version = spec.phase_version.saturating_add(1);
-        spec.state = ContainerState::Failed;
+        spec.state = WorkloadPhase::Failed;
         spec.last_terminal_observed_launch = Some(spec.launch_attempt);
         spec.phase_reason = None;
         spec.phase_progress = None;
@@ -1707,7 +1707,7 @@ impl WorkloadManager {
         }
 
         if let Ok(current) = self.load_spec(task_id).await {
-            if matches!(current.state, ContainerState::VolumeUnavailable)
+            if matches!(current.state, WorkloadPhase::VolumeUnavailable)
                 && current.phase_reason.as_deref() == Some(reason.as_str())
             {
                 return error;
@@ -1724,7 +1724,7 @@ impl WorkloadManager {
         }
 
         spec.phase_version = spec.phase_version.saturating_add(1);
-        spec.state = ContainerState::VolumeUnavailable;
+        spec.state = WorkloadPhase::VolumeUnavailable;
         spec.phase_reason = Some(reason);
         spec.phase_progress = None;
         spec.updated_at = Utc::now().to_rfc3339();
@@ -1806,8 +1806,8 @@ impl WorkloadManager {
         Ok(servers)
     }
 
-    /// Inspect the currently tracked container names and return terminal exit details when
-    /// Docker reports the task container as exited or dead.
+    /// Inspect the currently tracked instance names and return terminal exit details when
+    /// the runtime reports the task instance as exited or dead.
     async fn resolve_terminal_exit_for_task(
         &self,
         spec: &TaskSpec,
@@ -1838,10 +1838,10 @@ impl WorkloadManager {
         Ok(None)
     }
 
-    /// Resolves the live container identifier for a task from cache and deterministic name.
+    /// Resolves the live instance identifier for a task from cache and deterministic name.
     ///
     /// This keeps running-task reconciliation resilient when local in-memory tracking drifts
-    /// or Docker returns canonical ids that differ from Mantissa's deterministic names.
+    /// or the runtime returns canonical ids that differ from Mantissa's deterministic names.
     pub(super) async fn resolve_live_instance_id_for_task(
         &self,
         spec: &TaskSpec,
@@ -1895,7 +1895,7 @@ impl WorkloadManager {
         }
     }
 
-    /// Starts or reuses a container so the task transitions into running state locally.
+    /// Starts or reuses a runtime instance so the task transitions into running state locally.
     pub(super) async fn ensure_task_running(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
         let mut working = self.load_spec(spec.id).await.unwrap_or(spec);
         if working.node_id != self.local_node_id {
@@ -1915,7 +1915,7 @@ impl WorkloadManager {
 
         if matches!(
             working.state,
-            ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
+            WorkloadPhase::Stopping | WorkloadPhase::Stopped | WorkloadPhase::Failed
         ) {
             return Ok(());
         }
@@ -1945,7 +1945,7 @@ impl WorkloadManager {
         }
         if matches!(
             working.state,
-            ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
+            WorkloadPhase::Stopping | WorkloadPhase::Stopped | WorkloadPhase::Failed
         ) {
             return Ok(());
         }
@@ -1972,14 +1972,14 @@ impl WorkloadManager {
         // the persisted assignment while the image was downloading.
         working = self.ensure_task_lease_commit(&working).await?;
         self.ensure_task_slot_reservations(&working).await?;
-        if !matches!(working.state, ContainerState::Creating)
+        if !matches!(working.state, WorkloadPhase::Creating)
             || working.phase_reason.is_some()
             || working.phase_progress.is_some()
         {
-            if !matches!(working.state, ContainerState::Creating) {
+            if !matches!(working.state, WorkloadPhase::Creating) {
                 working.phase_version = working.phase_version.saturating_add(1);
             }
-            working.state = ContainerState::Creating;
+            working.state = WorkloadPhase::Creating;
             working.phase_reason = None;
             working.phase_progress = None;
             working.updated_at = Utc::now().to_rfc3339();
@@ -2052,7 +2052,7 @@ impl WorkloadManager {
             Ok(latest) => {
                 if matches!(
                     latest.state,
-                    ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
+                    WorkloadPhase::Stopping | WorkloadPhase::Stopped | WorkloadPhase::Failed
                 ) || latest.node_id != self.local_node_id
                     || self.should_block_local_service_runtime(&latest)
                 {
@@ -2067,10 +2067,10 @@ impl WorkloadManager {
             }
         }
 
-        if !matches!(working.state, ContainerState::Running) {
+        if !matches!(working.state, WorkloadPhase::Running) {
             working.phase_version = working.phase_version.saturating_add(1);
         }
-        working.state = ContainerState::Running;
+        working.state = WorkloadPhase::Running;
         working.phase_reason = None;
         working.phase_progress = None;
         working.created_at = Utc::now().to_rfc3339();
@@ -2086,7 +2086,7 @@ impl WorkloadManager {
             );
             self.rollback_instance_launch(&instance_id, "commit rollback")
                 .await;
-            let err = err.context("task state commit failed after container launch");
+            let err = err.context("task state commit failed after instance launch");
             let err = self.mark_task_failed(working, err).await;
             return Err(err);
         }
@@ -2107,7 +2107,7 @@ impl WorkloadManager {
         spec: &TaskSpec,
         instance_id: Option<&str>,
         best_effort_gossip: bool,
-        update_container_cache: bool,
+        update_instance_cache: bool,
     ) {
         if best_effort_gossip {
             if let Err(err) = self
@@ -2148,7 +2148,7 @@ impl WorkloadManager {
                 );
             }
 
-            if update_container_cache {
+            if update_instance_cache {
                 let mut guard = self.local_state.local_instances.lock().await;
                 guard.insert(spec.id, instance_id.to_string());
             }
@@ -2163,7 +2163,7 @@ impl WorkloadManager {
         }
     }
 
-    /// Ensures runtime attachments exist for one launched task or rolls back container runtime.
+    /// Ensures runtime attachments exist for one launched task or rolls back the runtime instance.
     pub(super) async fn ensure_runtime_attachments_or_rollback(
         &self,
         task_id: Uuid,
@@ -2198,7 +2198,7 @@ impl WorkloadManager {
         Ok(())
     }
 
-    /// Stops and removes a launched container best-effort when one launch stage must roll back.
+    /// Stops and removes a launched runtime instance best-effort when one launch stage must roll back.
     pub(super) async fn rollback_instance_launch(&self, instance_id: &str, reason: &str) {
         if let Err(stop_err) = self
             .stop_instance_bounded(instance_id, Duration::from_secs(10))
@@ -2206,9 +2206,9 @@ impl WorkloadManager {
         {
             warn!(
                 target: "task",
-                container = %instance_id,
+                instance = %instance_id,
                 reason,
-                "failed to stop container during launch rollback: {stop_err}"
+                "failed to stop runtime instance during launch rollback: {stop_err}"
             );
         }
         if let Err(remove_err) = self
@@ -2217,9 +2217,9 @@ impl WorkloadManager {
         {
             warn!(
                 target: "task",
-                container = %instance_id,
+                instance = %instance_id,
                 reason,
-                "failed to remove container during launch rollback: {remove_err}"
+                "failed to remove runtime instance during launch rollback: {remove_err}"
             );
         }
     }
@@ -2240,7 +2240,7 @@ impl WorkloadManager {
             .await;
     }
 
-    /// Resolves an existing container identifier when a create call hit a name conflict.
+    /// Resolves an existing instance identifier when a create call hit a name conflict.
     pub(super) async fn resolve_existing_instance_id(
         &self,
         instance_name: &str,
@@ -2267,7 +2267,7 @@ impl WorkloadManager {
         }
     }
 
-    /// Locate a container id by name using the lightweight list API.
+    /// Locate a instance id by name using the lightweight list API.
     async fn find_instance_id_by_name(
         &self,
         instance_name: &str,
@@ -2292,14 +2292,14 @@ impl WorkloadManager {
 
     /// Ensures that a locally tracked task has completely stopped and released resources.
     pub(super) async fn ensure_task_stopped(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
-        let mut has_container = {
+        let mut has_instance = {
             let guard = self.local_state.local_instances.lock().await;
             guard.contains_key(&spec.id)
         };
 
-        if !has_container {
+        if !has_instance {
             // After a daemon restart the in-memory cache is empty, so inspect by name
-            // before declaring the task containerless.
+            // before declaring the task instance-less.
             let instance_name = format!("mantissa-{}", spec.id);
             match self
                 .runtime
@@ -2317,7 +2317,7 @@ impl WorkloadManager {
                         };
                         let mut guard = self.local_state.local_instances.lock().await;
                         guard.insert(spec.id, resolved);
-                        has_container = true;
+                        has_instance = true;
                     }
                 }
                 Err(RuntimeError::NotFound(_)) => {}
@@ -2325,13 +2325,13 @@ impl WorkloadManager {
                     warn!(
                         target: "task",
                         task = %spec.id,
-                        "failed to inspect container while stopping task: {err}"
+                        "failed to inspect runtime instance while stopping task: {err}"
                     );
                 }
             }
         }
 
-        if !has_container {
+        if !has_instance {
             let mut slot_ids = spec.slot_ids.clone();
             if slot_ids.is_empty()
                 && let Some(slot_id) = spec.slot_id
@@ -2344,7 +2344,7 @@ impl WorkloadManager {
                         target: "task",
                         task = %spec.id,
                         slot_id,
-                        "failed to release slot while removing containerless task: {err}"
+                        "failed to release slot while removing instance-less task: {err}"
                     );
                 }
             }
@@ -2353,7 +2353,7 @@ impl WorkloadManager {
                 warn!(
                     target: "task",
                     task = %spec.id,
-                    "failed to unpublish local volume mounts for containerless task: {err:#}"
+                    "failed to unpublish local volume mounts for instance-less task: {err:#}"
                 );
             }
             if let Err(err) = self
@@ -2362,7 +2362,7 @@ impl WorkloadManager {
             {
                 warn!(
                     target: "task",
-                    "failed to cleanup attachments for containerless task {}: {err}",
+                    "failed to cleanup attachments for instance-less task {}: {err}",
                     spec.id
                 );
             }
@@ -2374,16 +2374,16 @@ impl WorkloadManager {
                 warn!(
                     target: "task",
                     task = %spec.id,
-                    "failed to run orphaned attachment cleanup for containerless task: {err}"
+                    "failed to run orphaned attachment cleanup for instance-less task: {err}"
                 );
             }
             return Ok(());
         }
 
         let mut working = spec.clone();
-        if matches!(working.state, ContainerState::Stopped) {
+        if matches!(working.state, WorkloadPhase::Stopped) {
             // Force a stop pass even if the persisted state already says "stopped".
-            working.state = ContainerState::Stopping;
+            working.state = WorkloadPhase::Stopping;
             working.phase_reason = None;
             working.phase_progress = None;
         }
@@ -2391,21 +2391,21 @@ impl WorkloadManager {
         Ok(())
     }
 
-    /// Reconciles the desired state of a locally owned task with the actual container state.
+    /// Reconciles the desired state of a locally owned task with the actual instance state.
     pub(super) async fn reconcile_local_task(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
         match spec.state {
-            ContainerState::Pending
-            | ContainerState::Pulling
-            | ContainerState::Creating
-            | ContainerState::VolumeUnavailable => self.ensure_task_running(spec).await,
-            ContainerState::Running => self.ensure_task_running(spec).await,
-            ContainerState::Stopping | ContainerState::Stopped => {
+            WorkloadPhase::Pending
+            | WorkloadPhase::Pulling
+            | WorkloadPhase::Creating
+            | WorkloadPhase::VolumeUnavailable => self.ensure_task_running(spec).await,
+            WorkloadPhase::Running => self.ensure_task_running(spec).await,
+            WorkloadPhase::Stopping | WorkloadPhase::Stopped => {
                 self.ensure_task_stopped(spec).await
             }
-            ContainerState::Paused
-            | ContainerState::Failed
-            | ContainerState::Exited(_)
-            | ContainerState::Unknown => {
+            WorkloadPhase::Paused
+            | WorkloadPhase::Failed
+            | WorkloadPhase::Exited(_)
+            | WorkloadPhase::Unknown => {
                 self.local_state
                     .local_instances
                     .lock()
@@ -2503,7 +2503,7 @@ impl WorkloadManager {
         let mut invalid_ids = Vec::new();
         for (key, snapshot) in entries {
             let id = key.to_uuid();
-            if let Some(value) = select_best_task_value(snapshot.as_slice()) {
+            if let Some(value) = select_best_workload_value(snapshot.as_slice()) {
                 task_values.insert(id, value);
             } else {
                 invalid_ids.push(id);
@@ -2545,31 +2545,31 @@ impl WorkloadManager {
             .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("unknown task {id}"))?;
 
-        let value = select_best_task_value(snapshot.as_slice())
+        let value = select_best_workload_value(snapshot.as_slice())
             .ok_or_else(|| anyhow::anyhow!("task {id} has no value"))?;
         let spec = value_to_spec(id, value);
         self.cache_spec(change_clock, spec.clone());
         Ok(spec)
     }
 
-    /// Reconciles the Docker inventory with the task store so stale containers are adopted or removed.
+    /// Reconciles the runtime inventory with the task store so stale instances are adopted or removed.
     ///
-    /// This is the primary defense against daemon restarts that leave containers running without
-    /// corresponding in-memory tracking. By comparing the local container list against the latest
-    /// task assignments, we either adopt the container (if still owned locally) or stop it.
+    /// This is the primary defense against daemon restarts that leave instances running without
+    /// corresponding in-memory tracking. By comparing the local instance list against the latest
+    /// task assignments, we either adopt the instance (if still owned locally) or stop it.
     pub(super) async fn reconcile_local_runtime_inventory(&self) -> Result<(), anyhow::Error> {
         const UNOWNED_TASK_GRACE_SECS: i64 = 5;
 
-        let containers = self.runtime.runtime_backend.list_instances(None).await?;
+        let instances = self.runtime.runtime_backend.list_instances(None).await?;
         let task_index = self.load_task_value_index().await?;
 
-        for container in containers {
-            let Some(task_id) = Self::runtime_workload_id(&container) else {
+        for instance in instances {
+            let Some(task_id) = Self::runtime_workload_id(&instance) else {
                 continue;
             };
 
             let Some(value) = task_index.get(&task_id).cloned() else {
-                self.stop_unowned_instance(task_id, &container.name, true, None)
+                self.stop_unowned_instance(task_id, &instance.name, true, None)
                     .await;
                 continue;
             };
@@ -2578,22 +2578,22 @@ impl WorkloadManager {
                 if task_value_recent(&value, UNOWNED_TASK_GRACE_SECS) {
                     continue;
                 }
-                self.stop_unowned_instance(task_id, &container.name, false, Some(&value))
+                self.stop_unowned_instance(task_id, &instance.name, false, Some(&value))
                     .await;
                 continue;
             }
 
-            let instance_id = if container.id.is_empty() {
-                container.name.clone()
+            let instance_id = if instance.id.is_empty() {
+                instance.name.clone()
             } else {
-                container.id.clone()
+                instance.id.clone()
             };
             {
                 let mut guard = self.local_state.local_instances.lock().await;
                 guard.insert(task_id, instance_id.clone());
             }
 
-            if matches!(value.state, ContainerState::Running)
+            if matches!(value.state, WorkloadPhase::Running)
                 && !value.volumes.is_empty()
                 && let Err(err) = self
                     .publish_task_volume_mounts_for_task(task_id, &value.volumes)
@@ -2602,11 +2602,11 @@ impl WorkloadManager {
                 warn!(
                     target: "task",
                     task = %task_id,
-                    "failed to republish local volume mounts while adopting container: {err:#}"
+                    "failed to republish local volume mounts while adopting runtime instance: {err:#}"
                 );
             }
 
-            if matches!(value.state, ContainerState::Running)
+            if matches!(value.state, WorkloadPhase::Running)
                 && !value.networks.is_empty()
                 && self
                     .attachments_need_refresh(task_id, &value.networks, task_revision(&value))
@@ -2623,8 +2623,8 @@ impl WorkloadManager {
                 warn!(
                     target: "task",
                     task = %task_id,
-                    container = %instance_id,
-                    "failed to refresh attachments while adopting container: {err:#}"
+                    instance = %instance_id,
+                    "failed to refresh attachments while adopting runtime instance: {err:#}"
                 );
             }
         }
@@ -2672,8 +2672,8 @@ impl WorkloadManager {
         Ok(false)
     }
 
-    /// Tears down a locally running container without mutating replicated task state.
-    /// Tears down a local container and optionally removes shared attachments for missing tasks.
+    /// Tears down a locally running runtime instance without mutating replicated task state.
+    /// Tears down a local instance and optionally removes shared attachments for missing tasks.
     async fn stop_unowned_instance(
         &self,
         task_id: Uuid,
@@ -2713,7 +2713,7 @@ impl WorkloadManager {
             Err(err) => {
                 warn!(
                     target: "task",
-                    "failed to stop unowned container {identifier} for task {task_id}: {err}"
+                    "failed to stop unowned instance {identifier} for task {task_id}: {err}"
                 );
             }
         }
@@ -2724,7 +2724,7 @@ impl WorkloadManager {
         {
             warn!(
                 target: "task",
-                "failed to remove unowned container {identifier} for task {task_id}: {err}"
+                "failed to remove unowned instance {identifier} for task {task_id}: {err}"
             );
         }
 
@@ -2796,7 +2796,7 @@ impl WorkloadManager {
             .collect();
 
         for spec in local_specs {
-            if matches!(spec.state, ContainerState::Running)
+            if matches!(spec.state, WorkloadPhase::Running)
                 && self
                     .refresh_running_task_from_runtime_inventory(&spec, runtime_inventory.as_ref())
                     .await
@@ -2826,7 +2826,7 @@ impl WorkloadManager {
         if let Err(err) = self.reconcile_local_runtime_inventory().await {
             warn!(
                 target: "task",
-                "failed to reconcile local container inventory: {err}"
+                "failed to reconcile local instance inventory: {err}"
             );
         }
 
@@ -2840,30 +2840,30 @@ impl WorkloadManager {
         Ok(())
     }
 
-    /// Lists runtime containers once so reconcile can avoid per-task inspect calls.
+    /// Lists runtime instances once so reconcile can avoid per-task inspect calls.
     async fn list_runtime_inventory(&self) -> Result<RuntimeInventory, anyhow::Error> {
-        let containers = self
+        let instances = self
             .runtime
             .runtime_backend
             .list_instances(None)
             .await
             .map_err(anyhow::Error::from)
-            .context("list runtime containers for reconcile")?;
+            .context("list runtime instances for reconcile")?;
 
         let mut task_instances = HashMap::new();
         let mut instance_ids = HashSet::new();
 
-        for container in containers {
-            if !Self::instance_is_running(&container) {
+        for instance in instances {
+            if !Self::instance_is_running(&instance) {
                 continue;
             }
-            let instance_id = Self::instance_identity(&container);
+            let instance_id = Self::instance_identity(&instance);
             if instance_id.is_empty() {
                 continue;
             }
             instance_ids.insert(instance_id.clone());
 
-            let Some(task_id) = Self::runtime_workload_id(&container) else {
+            let Some(task_id) = Self::runtime_workload_id(&instance) else {
                 continue;
             };
             task_instances.insert(task_id, instance_id);
@@ -2931,35 +2931,35 @@ impl WorkloadManager {
         false
     }
 
-    /// Resolves the best local identity string for one runtime container row.
-    fn instance_identity(container: &RuntimeInfo) -> String {
-        if !container.id.is_empty() {
-            return container.id.clone();
+    /// Resolves the best local identity string for one runtime instance row.
+    fn instance_identity(instance: &RuntimeInfo) -> String {
+        if !instance.id.is_empty() {
+            return instance.id.clone();
         }
-        container.name.clone()
+        instance.name.clone()
     }
 
     /// Extracts the workload identifier published by the runtime instance metadata.
-    fn runtime_workload_id(container: &RuntimeInfo) -> Option<Uuid> {
-        container
+    fn runtime_workload_id(instance: &RuntimeInfo) -> Option<Uuid> {
+        instance
             .labels
             .get("mantissa.workload_id")
             .and_then(|value| Uuid::parse_str(value).ok())
     }
 
-    /// Reports whether one runtime listing row represents a running container.
-    fn instance_is_running(container: &RuntimeInfo) -> bool {
-        if matches!(container.state.raw_status.as_deref(), Some(status) if status.eq_ignore_ascii_case("running"))
+    /// Reports whether one runtime listing row represents a running instance.
+    fn instance_is_running(instance: &RuntimeInfo) -> bool {
+        if matches!(instance.state.raw_status.as_deref(), Some(status) if status.eq_ignore_ascii_case("running"))
         {
             return true;
         }
-        container.status.starts_with("Up ")
-            || container.status.eq_ignore_ascii_case("up")
-            || container.status.eq_ignore_ascii_case("running")
+        instance.status.starts_with("Up ")
+            || instance.status.eq_ignore_ascii_case("up")
+            || instance.status.eq_ignore_ascii_case("running")
     }
 
     /// Ensures the scheduler snapshot reserves slots and GPUs for locally running tasks so
-    /// rollbacks or restarts cannot leave active containers unaccounted for.
+    /// rollbacks or restarts cannot leave active instances unaccounted for.
     pub(super) async fn reconcile_local_slot_reservations(&self) -> Result<(), anyhow::Error> {
         const MAX_ATTEMPTS: usize = 5;
 
@@ -3302,10 +3302,10 @@ impl WorkloadManager {
 
             if !matches!(
                 spec.state,
-                ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
+                WorkloadPhase::Stopping | WorkloadPhase::Stopped | WorkloadPhase::Failed
             ) {
                 spec.phase_version = spec.phase_version.saturating_add(1);
-                spec.state = ContainerState::Stopping;
+                spec.state = WorkloadPhase::Stopping;
                 spec.phase_reason =
                     Some("superseded by local slot conflict resolution".to_string());
                 spec.phase_progress = None;
@@ -3386,59 +3386,59 @@ fn task_stop_timeout(task_grace_period_secs: Option<u32>) -> Duration {
     Duration::from_secs(u64::from(task_grace_period_secs.unwrap_or(10)))
 }
 
-/// Computes the stop budget still available for the container runtime.
+/// Computes the stop budget still available for the runtime backend.
 fn remaining_stop_timeout(stop_deadline: Instant) -> Duration {
     stop_deadline.saturating_duration_since(Instant::now())
 }
 
 /// Returns true when a task state should retain scheduler slot reservations.
-fn task_requires_slots(state: &ContainerState) -> bool {
+fn task_requires_slots(state: &WorkloadPhase) -> bool {
     matches!(
         state,
-        ContainerState::Pending
-            | ContainerState::Pulling
-            | ContainerState::Creating
-            | ContainerState::Running
-            | ContainerState::Paused
-            | ContainerState::Stopping
+        WorkloadPhase::Pending
+            | WorkloadPhase::Pulling
+            | WorkloadPhase::Creating
+            | WorkloadPhase::Running
+            | WorkloadPhase::Paused
+            | WorkloadPhase::Stopping
     )
 }
 
 /// Returns true when a requested phase update would regress lifecycle state due to stale work.
-fn is_stale_phase_regression(current: &ContainerState, requested: &ContainerState) -> bool {
+fn is_stale_phase_regression(current: &WorkloadPhase, requested: &WorkloadPhase) -> bool {
     match requested {
-        ContainerState::Pending => matches!(
+        WorkloadPhase::Pending => matches!(
             current,
-            ContainerState::Pulling
-                | ContainerState::Creating
-                | ContainerState::Running
-                | ContainerState::Paused
-                | ContainerState::Stopping
-                | ContainerState::Stopped
-                | ContainerState::Failed
-                | ContainerState::Exited(_)
-                | ContainerState::Unknown
+            WorkloadPhase::Pulling
+                | WorkloadPhase::Creating
+                | WorkloadPhase::Running
+                | WorkloadPhase::Paused
+                | WorkloadPhase::Stopping
+                | WorkloadPhase::Stopped
+                | WorkloadPhase::Failed
+                | WorkloadPhase::Exited(_)
+                | WorkloadPhase::Unknown
         ),
-        ContainerState::Pulling => matches!(
+        WorkloadPhase::Pulling => matches!(
             current,
-            ContainerState::Creating
-                | ContainerState::Running
-                | ContainerState::Paused
-                | ContainerState::Stopping
-                | ContainerState::Stopped
-                | ContainerState::Failed
-                | ContainerState::Exited(_)
-                | ContainerState::Unknown
+            WorkloadPhase::Creating
+                | WorkloadPhase::Running
+                | WorkloadPhase::Paused
+                | WorkloadPhase::Stopping
+                | WorkloadPhase::Stopped
+                | WorkloadPhase::Failed
+                | WorkloadPhase::Exited(_)
+                | WorkloadPhase::Unknown
         ),
-        ContainerState::Creating => matches!(
+        WorkloadPhase::Creating => matches!(
             current,
-            ContainerState::Running
-                | ContainerState::Paused
-                | ContainerState::Stopping
-                | ContainerState::Stopped
-                | ContainerState::Failed
-                | ContainerState::Exited(_)
-                | ContainerState::Unknown
+            WorkloadPhase::Running
+                | WorkloadPhase::Paused
+                | WorkloadPhase::Stopping
+                | WorkloadPhase::Stopped
+                | WorkloadPhase::Failed
+                | WorkloadPhase::Exited(_)
+                | WorkloadPhase::Unknown
         ),
         _ => false,
     }
@@ -3449,12 +3449,12 @@ fn is_stale_phase_regression(current: &ContainerState, requested: &ContainerStat
 /// The first transition into `Pulling` / `Creating` must still propagate so remote readiness sees
 /// that launch work has started. Later same-state progress updates remain local-only because the
 /// dirty gossip buffer already keeps the latest transition alive across several fanout rounds.
-fn should_gossip_task_phase_update(state_changed: bool, state: &ContainerState) -> bool {
+fn should_gossip_task_phase_update(state_changed: bool, state: &WorkloadPhase) -> bool {
     if state_changed {
         return true;
     }
 
-    !matches!(state, ContainerState::Pulling | ContainerState::Creating)
+    !matches!(state, WorkloadPhase::Pulling | WorkloadPhase::Creating)
 }
 
 /// Selects one deterministic winner between two local tasks that currently claim the same
@@ -3489,16 +3489,16 @@ fn pick_conflict_task_winner(
 
 /// Produces a local conflict-resolution priority where actively serving states outrank
 /// provisioning and teardown states.
-fn conflict_state_rank(state: &ContainerState) -> u8 {
+fn conflict_state_rank(state: &WorkloadPhase) -> u8 {
     match state {
-        ContainerState::Running | ContainerState::Paused => 4,
-        ContainerState::Creating | ContainerState::Pulling => 3,
-        ContainerState::VolumeUnavailable | ContainerState::Pending => 2,
-        ContainerState::Stopping => 1,
-        ContainerState::Stopped
-        | ContainerState::Failed
-        | ContainerState::Exited(_)
-        | ContainerState::Unknown => 0,
+        WorkloadPhase::Running | WorkloadPhase::Paused => 4,
+        WorkloadPhase::Creating | WorkloadPhase::Pulling => 3,
+        WorkloadPhase::VolumeUnavailable | WorkloadPhase::Pending => 2,
+        WorkloadPhase::Stopping => 1,
+        WorkloadPhase::Stopped
+        | WorkloadPhase::Failed
+        | WorkloadPhase::Exited(_)
+        | WorkloadPhase::Unknown => 0,
     }
 }
 

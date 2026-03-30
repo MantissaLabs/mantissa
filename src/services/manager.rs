@@ -11,14 +11,14 @@ use crate::services::types::{
     ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceTaskSpecValue,
     ServiceUpdateStrategy, compute_service_id,
 };
-use crate::task::manager::TaskManager;
 use crate::task::types::{TaskSpec, TaskStateFilter, TaskVolumeMount};
 use crate::volumes::types::VolumeDriver;
 use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
+use crate::workload::manager::WorkloadManager;
 use crate::workload::manager::{
     WorkloadStartRequest, WorkloadTrafficPublicationUpdate, workload_start_error_is_retryable,
 };
-use crate::workload::model::WorkloadPhase as ContainerState;
+use crate::workload::model::WorkloadPhase;
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -83,7 +83,7 @@ pub struct ServiceDeploymentSubmission {
 #[derive(Clone)]
 pub struct ServiceController {
     registry: ServiceRegistry,
-    task_manager: TaskManager,
+    task_manager: WorkloadManager,
     cluster_registry: Registry,
     volume_registry: VolumeRegistry,
     gossip_tx: Sender<Message>,
@@ -118,7 +118,7 @@ impl ServiceGenerationExecutionKey {
 
 pub struct ServiceControllerConfig {
     pub registry: ServiceRegistry,
-    pub task_manager: TaskManager,
+    pub task_manager: WorkloadManager,
     pub cluster_registry: Registry,
     pub volume_registry: VolumeRegistry,
     pub gossip_tx: Sender<Message>,
@@ -1161,7 +1161,7 @@ impl ServiceController {
             for task_id in dependency_task_ids {
                 let spec = self.task_manager.inspect_task(*task_id).await?;
                 match spec.state {
-                    ContainerState::Running => {
+                    WorkloadPhase::Running => {
                         running_replicas = running_replicas.saturating_add(1);
                         if self
                             .task_manager
@@ -1171,9 +1171,7 @@ impl ServiceController {
                             published_replicas = published_replicas.saturating_add(1);
                         }
                     }
-                    ContainerState::Failed
-                    | ContainerState::Stopped
-                    | ContainerState::Exited(_) => {
+                    WorkloadPhase::Failed | WorkloadPhase::Stopped | WorkloadPhase::Exited(_) => {
                         return Err(anyhow!(
                             "dependency task {} for template '{}' in service '{}' entered terminal state {:?}",
                             task_id,
@@ -1182,13 +1180,13 @@ impl ServiceController {
                             spec.state
                         ));
                     }
-                    ContainerState::Pending
-                    | ContainerState::Pulling
-                    | ContainerState::Creating
-                    | ContainerState::VolumeUnavailable
-                    | ContainerState::Paused
-                    | ContainerState::Stopping
-                    | ContainerState::Unknown => {}
+                    WorkloadPhase::Pending
+                    | WorkloadPhase::Pulling
+                    | WorkloadPhase::Creating
+                    | WorkloadPhase::VolumeUnavailable
+                    | WorkloadPhase::Paused
+                    | WorkloadPhase::Stopping
+                    | WorkloadPhase::Unknown => {}
                 }
             }
 
@@ -1623,7 +1621,7 @@ impl ServiceController {
     /// Stops every locally owned task associated with the service, including stale rows that are
     /// no longer referenced by the current service spec task id list.
     async fn stop_local_service_tasks(&self, spec: &ServiceSpecValue, inventory: &TaskInventory) {
-        let spawn_stop_reconcile = |task_manager: crate::task::manager::TaskManager,
+        let spawn_stop_reconcile = |task_manager: crate::workload::manager::WorkloadManager,
                                     service_name: String,
                                     task_id: Uuid| {
             tokio::task::spawn_local(async move {
@@ -1644,10 +1642,7 @@ impl ServiceController {
             if task.node_id != self.local_node_id {
                 continue;
             }
-            if matches!(
-                task.state,
-                ContainerState::Stopping | ContainerState::Stopped
-            ) {
+            if matches!(task.state, WorkloadPhase::Stopping | WorkloadPhase::Stopped) {
                 spawn_stop_reconcile(
                     self.task_manager.clone(),
                     spec.service_name.clone(),
@@ -1838,7 +1833,7 @@ async fn wait_rollout_task_running_with_state_fetcher<F, Fut>(
 ) -> anyhow::Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = anyhow::Result<Option<ContainerState>>>,
+    Fut: Future<Output = anyhow::Result<Option<WorkloadPhase>>>,
 {
     let readiness_deadline = Instant::now() + Duration::from_secs(startup_timeout_secs as u64);
     loop {
@@ -1852,10 +1847,10 @@ where
 
         let state = fetch_state().await?;
         match state {
-            Some(ContainerState::Running) => break,
-            Some(ContainerState::Pending)
-            | Some(ContainerState::Pulling)
-            | Some(ContainerState::Creating) => {}
+            Some(WorkloadPhase::Running) => break,
+            Some(WorkloadPhase::Pending)
+            | Some(WorkloadPhase::Pulling)
+            | Some(WorkloadPhase::Creating) => {}
             Some(other) => {
                 return Err(anyhow!(
                     "rollout task {} for service '{}' entered terminal state {:?}",
@@ -1873,7 +1868,7 @@ where
     let monitor_deadline = Instant::now() + Duration::from_secs(monitor_secs as u64);
     while Instant::now() < monitor_deadline {
         let state = fetch_state().await?;
-        if !matches!(state, Some(ContainerState::Running)) {
+        if !matches!(state, Some(WorkloadPhase::Running)) {
             return Err(anyhow!(
                 "rollout task {} for service '{}' became unstable during monitor window: {:?}",
                 task_id,
@@ -1962,29 +1957,29 @@ impl ServiceTaskSnapshot<'_> {
 }
 
 /// Returns true if a task state should be treated as a healthy, in-flight replica.
-fn task_state_healthy(state: &ContainerState) -> bool {
+fn task_state_healthy(state: &WorkloadPhase) -> bool {
     // Pending/creating are still converging, so we avoid spawning duplicates.
     matches!(
         state,
-        ContainerState::Pending
-            | ContainerState::Pulling
-            | ContainerState::Creating
-            | ContainerState::Running
+        WorkloadPhase::Pending
+            | WorkloadPhase::Pulling
+            | WorkloadPhase::Creating
+            | WorkloadPhase::Running
     )
 }
 
 /// Returns true if a task is stable enough to migrate during rebalancing.
-fn task_state_rebalanceable(state: &ContainerState) -> bool {
-    matches!(state, ContainerState::Running)
+fn task_state_rebalanceable(state: &WorkloadPhase) -> bool {
+    matches!(state, WorkloadPhase::Running)
 }
 
 /// Returns true when a rollout task is terminally stopped or absent from replicated state.
-fn rollout_task_stopped_or_absent(state: Option<&ContainerState>) -> bool {
+fn rollout_task_stopped_or_absent(state: Option<&WorkloadPhase>) -> bool {
     matches!(
         state,
-        None | Some(ContainerState::Stopped)
-            | Some(ContainerState::Failed)
-            | Some(ContainerState::Exited(_))
+        None | Some(WorkloadPhase::Stopped)
+            | Some(WorkloadPhase::Failed)
+            | Some(WorkloadPhase::Exited(_))
     )
 }
 
@@ -2045,10 +2040,10 @@ fn should_restart_missing_slot_immediately(status: ServiceStatus, task: Option<&
 }
 
 /// Returns true when a task state is terminal enough to justify an immediate deployment restart.
-fn task_state_terminal_for_restart(state: &ContainerState) -> bool {
+fn task_state_terminal_for_restart(state: &WorkloadPhase) -> bool {
     matches!(
         state,
-        ContainerState::Failed | ContainerState::Stopped | ContainerState::Exited(_)
+        WorkloadPhase::Failed | WorkloadPhase::Stopped | WorkloadPhase::Exited(_)
     )
 }
 
@@ -2622,7 +2617,7 @@ mod tests {
         node_id: Uuid,
         service_name: &str,
         template: &str,
-        state: ContainerState,
+        state: WorkloadPhase,
     ) -> TaskSpec {
         TaskSpec {
             id,
@@ -3104,7 +3099,7 @@ mod tests {
     /// Ensures pulling tasks are treated as in-flight deployment work.
     #[test]
     fn classify_readiness_treats_pulling_as_inflight() {
-        let states = vec![(Uuid::new_v4(), Some(ContainerState::Pulling))];
+        let states = vec![(Uuid::new_v4(), Some(WorkloadPhase::Pulling))];
 
         assert!(matches!(
             classify_readiness_states(&states),
@@ -3116,8 +3111,8 @@ mod tests {
     #[test]
     fn classify_readiness_treats_all_running_as_success() {
         let states = vec![
-            (Uuid::new_v4(), Some(ContainerState::Running)),
-            (Uuid::new_v4(), Some(ContainerState::Running)),
+            (Uuid::new_v4(), Some(WorkloadPhase::Running)),
+            (Uuid::new_v4(), Some(WorkloadPhase::Running)),
         ];
 
         assert!(matches!(
@@ -3130,8 +3125,8 @@ mod tests {
     #[test]
     fn classify_readiness_treats_mixed_terminal_states_as_degraded() {
         let states = vec![
-            (Uuid::new_v4(), Some(ContainerState::Running)),
-            (Uuid::new_v4(), Some(ContainerState::Failed)),
+            (Uuid::new_v4(), Some(WorkloadPhase::Running)),
+            (Uuid::new_v4(), Some(WorkloadPhase::Failed)),
         ];
 
         assert!(matches!(
@@ -3144,8 +3139,8 @@ mod tests {
     #[test]
     fn classify_readiness_treats_all_terminal_states_as_unhealthy() {
         let states = vec![
-            (Uuid::new_v4(), Some(ContainerState::Failed)),
-            (Uuid::new_v4(), Some(ContainerState::Stopped)),
+            (Uuid::new_v4(), Some(WorkloadPhase::Failed)),
+            (Uuid::new_v4(), Some(WorkloadPhase::Stopped)),
         ];
 
         assert!(matches!(
@@ -3167,9 +3162,9 @@ mod tests {
             1,
             || async {
                 if started.elapsed() < Duration::from_secs(2) {
-                    Ok(Some(ContainerState::Pulling))
+                    Ok(Some(WorkloadPhase::Pulling))
                 } else {
-                    Ok(Some(ContainerState::Running))
+                    Ok(Some(WorkloadPhase::Running))
                 }
             },
         )
@@ -3196,9 +3191,9 @@ mod tests {
             1,
             || async {
                 if started.elapsed() < Duration::from_secs(2) {
-                    Ok(Some(ContainerState::Pulling))
+                    Ok(Some(WorkloadPhase::Pulling))
                 } else {
-                    Ok(Some(ContainerState::Running))
+                    Ok(Some(WorkloadPhase::Running))
                 }
             },
         )
@@ -3238,21 +3233,21 @@ mod tests {
             Uuid::new_v4(),
             "demo",
             "api",
-            ContainerState::Failed,
+            WorkloadPhase::Failed,
         );
         let exited = make_task(
             Uuid::new_v4(),
             Uuid::new_v4(),
             "demo",
             "api",
-            ContainerState::Exited(1),
+            WorkloadPhase::Exited(1),
         );
         let stopped = make_task(
             Uuid::new_v4(),
             Uuid::new_v4(),
             "demo",
             "api",
-            ContainerState::Stopped,
+            WorkloadPhase::Stopped,
         );
 
         assert!(should_restart_missing_slot_immediately(
@@ -3277,14 +3272,14 @@ mod tests {
             Uuid::new_v4(),
             "demo",
             "api",
-            ContainerState::Running,
+            WorkloadPhase::Running,
         );
         let pending = make_task(
             Uuid::new_v4(),
             Uuid::new_v4(),
             "demo",
             "api",
-            ContainerState::Pending,
+            WorkloadPhase::Pending,
         );
 
         assert!(!should_restart_missing_slot_immediately(
@@ -3306,7 +3301,7 @@ mod tests {
                 Uuid::new_v4(),
                 "demo",
                 "api",
-                ContainerState::Failed
+                WorkloadPhase::Failed
             ))
         ));
     }
@@ -3316,13 +3311,11 @@ mod tests {
     fn rollout_stop_gate_accepts_absent_and_terminal_states() {
         assert!(rollout_task_stopped_or_absent(None));
         assert!(rollout_task_stopped_or_absent(Some(
-            &ContainerState::Stopped
+            &WorkloadPhase::Stopped
         )));
+        assert!(rollout_task_stopped_or_absent(Some(&WorkloadPhase::Failed)));
         assert!(rollout_task_stopped_or_absent(Some(
-            &ContainerState::Failed
-        )));
-        assert!(rollout_task_stopped_or_absent(Some(
-            &ContainerState::Exited(1)
+            &WorkloadPhase::Exited(1)
         )));
     }
 
@@ -3330,19 +3323,19 @@ mod tests {
     #[test]
     fn rollout_stop_gate_rejects_active_states() {
         assert!(!rollout_task_stopped_or_absent(Some(
-            &ContainerState::Pending
+            &WorkloadPhase::Pending
         )));
         assert!(!rollout_task_stopped_or_absent(Some(
-            &ContainerState::Pulling
+            &WorkloadPhase::Pulling
         )));
         assert!(!rollout_task_stopped_or_absent(Some(
-            &ContainerState::Creating
+            &WorkloadPhase::Creating
         )));
         assert!(!rollout_task_stopped_or_absent(Some(
-            &ContainerState::Running
+            &WorkloadPhase::Running
         )));
         assert!(!rollout_task_stopped_or_absent(Some(
-            &ContainerState::Stopping
+            &WorkloadPhase::Stopping
         )));
     }
 

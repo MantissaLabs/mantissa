@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,92 @@ pub enum WorkloadPhase {
     Failed,
     Exited(i32),
     Unknown,
+}
+
+/// Canonical, filterable workload lifecycle identifiers projected from concrete phases.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum WorkloadStateKind {
+    Pending,
+    Creating,
+    VolumeUnavailable,
+    Running,
+    Paused,
+    Stopping,
+    Stopped,
+    Failed,
+    Exited,
+    Unknown,
+}
+
+impl WorkloadStateKind {
+    /// Collapses one concrete lifecycle phase into the workload-facing filter category.
+    pub fn from_phase(state: &WorkloadPhase) -> Self {
+        match state {
+            WorkloadPhase::Pending => WorkloadStateKind::Pending,
+            // Pulling is an in-flight launch phase and should be grouped with creating filters.
+            WorkloadPhase::Pulling => WorkloadStateKind::Creating,
+            WorkloadPhase::Creating => WorkloadStateKind::Creating,
+            WorkloadPhase::VolumeUnavailable => WorkloadStateKind::VolumeUnavailable,
+            WorkloadPhase::Running => WorkloadStateKind::Running,
+            WorkloadPhase::Paused => WorkloadStateKind::Paused,
+            WorkloadPhase::Stopping => WorkloadStateKind::Stopping,
+            WorkloadPhase::Stopped => WorkloadStateKind::Stopped,
+            WorkloadPhase::Failed => WorkloadStateKind::Failed,
+            WorkloadPhase::Exited(_) => WorkloadStateKind::Exited,
+            WorkloadPhase::Unknown => WorkloadStateKind::Unknown,
+        }
+    }
+}
+
+/// Arbitrary workload state filter composed of zero or more lifecycle identifiers.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadStateFilter {
+    allowed: HashSet<WorkloadStateKind>,
+}
+
+impl WorkloadStateFilter {
+    /// Constructs one filter from the provided state identifiers.
+    pub fn new<I>(states: I) -> Self
+    where
+        I: IntoIterator<Item = WorkloadStateKind>,
+    {
+        Self {
+            allowed: states.into_iter().collect(),
+        }
+    }
+
+    /// Builds the default "active only" view used by task listings.
+    pub fn active_only() -> Self {
+        Self::new([
+            WorkloadStateKind::Pending,
+            WorkloadStateKind::Creating,
+            WorkloadStateKind::VolumeUnavailable,
+            WorkloadStateKind::Running,
+            WorkloadStateKind::Stopping,
+        ])
+    }
+
+    /// Builds the fully permissive filter that matches every lifecycle state.
+    pub fn all() -> Self {
+        Self::new([
+            WorkloadStateKind::Pending,
+            WorkloadStateKind::Creating,
+            WorkloadStateKind::VolumeUnavailable,
+            WorkloadStateKind::Running,
+            WorkloadStateKind::Paused,
+            WorkloadStateKind::Stopping,
+            WorkloadStateKind::Stopped,
+            WorkloadStateKind::Failed,
+            WorkloadStateKind::Exited,
+            WorkloadStateKind::Unknown,
+        ])
+    }
+
+    /// Returns true when one concrete lifecycle phase satisfies this filter.
+    pub fn accepts(&self, state: &WorkloadPhase) -> bool {
+        let kind = WorkloadStateKind::from_phase(state);
+        self.allowed.contains(&kind)
+    }
 }
 
 /// One resolved volume mount attached to a workload after manifest and CLI inputs are validated.
@@ -929,4 +1016,65 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
 
     value.restart_policy = spec.restart_policy.clone();
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeClass, WorkloadPhase, WorkloadSpec, compare_workload_spec_causality};
+    use chrono::Utc;
+    use std::cmp::Ordering;
+    use uuid::Uuid;
+
+    /// Equal workload causal tuples should still resolve deterministically by node identifier.
+    #[test]
+    fn compare_workload_spec_causality_breaks_ties_by_node_id() {
+        let now = Utc::now().to_rfc3339();
+        let current = WorkloadSpec {
+            id: Uuid::new_v4(),
+            name: "task".to_string(),
+            image: "img".to_string(),
+            runtime_class: RuntimeClass::Oci,
+            sandbox_profile: None,
+            state: WorkloadPhase::Running,
+            phase_reason: None,
+            phase_progress: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            command: Vec::new(),
+            tty: false,
+            node_id: Uuid::from_u128(1),
+            node_name: "node-a".to_string(),
+            slot_ids: vec![1],
+            slot_id: Some(1),
+            cpu_millis: 100,
+            memory_bytes: 64 * 1_024 * 1_024,
+            gpu_count: 0,
+            gpu_device_ids: Vec::new(),
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            service_metadata: None,
+            lease_id: None,
+            lease_coordinator_node_id: None,
+            task_epoch: 3,
+            phase_version: 9,
+            launch_attempt: 0,
+            last_terminal_observed_launch: None,
+        };
+        let candidate = WorkloadSpec {
+            node_id: Uuid::from_u128(2),
+            node_name: "node-b".to_string(),
+            ..current.clone()
+        };
+
+        assert_eq!(
+            compare_workload_spec_causality(&current, &candidate),
+            Ordering::Greater
+        );
+    }
 }

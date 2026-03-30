@@ -62,7 +62,7 @@ struct LocalPlacementPrereqs<'a> {
     gpu_reason: Option<&'a str>,
 }
 
-/// Execution plan for a single local task launch, holding the target slots and container metadata.
+/// Execution plan for a single local task launch, holding the target slots and runtime metadata.
 #[derive(Clone)]
 pub(super) struct BatchStartPlan {
     pub(super) id: Uuid,

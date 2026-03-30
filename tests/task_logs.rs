@@ -10,8 +10,8 @@ use mantissa::runtime::types::{
     RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeInfo,
     RuntimeLogFrame, RuntimeLogStream, RuntimeLogsOptions,
 };
-use mantissa::task::container::ContainerState;
 use mantissa::task::types::{TaskValue, TaskValueDraft};
+use mantissa::workload::model::WorkloadPhase;
 use protocol::task::task_log_sink;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -161,7 +161,7 @@ fn replicated_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str) -> Tas
         image: "img".to_string(),
         runtime_class: mantissa::workload::model::RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Failed,
+        state: WorkloadPhase::Failed,
         phase_reason: Some("completed".to_string()),
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),

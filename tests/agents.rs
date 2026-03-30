@@ -5,9 +5,9 @@ use chrono::Utc;
 use common::convergence::wait_until;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use crdt_store::uuid_key::UuidKey;
-use mantissa::task::container::ContainerState;
 use mantissa::task::types::{TaskSpec, TaskValue};
 use mantissa::workload::model::RuntimeClass;
+use mantissa::workload::model::WorkloadPhase;
 use protocol::agents::{
     AgentRunStatus as ProtoAgentRunStatus, AgentSessionStatus as ProtoAgentSessionStatus, agents,
 };
@@ -41,7 +41,7 @@ local_test!(
         assert_eq!(task.sandbox_profile.as_deref(), Some("oci-default"));
 
         let mut exited_task = task.clone();
-        exited_task.state = ContainerState::Exited(0);
+        exited_task.state = WorkloadPhase::Exited(0);
         exited_task.updated_at = Utc::now().to_rfc3339();
         node.node
             .tasks
@@ -303,7 +303,7 @@ async fn mark_task_exited(node: &TestNode, task_id: Uuid, exit_code: i32) {
         .inspect_task(task_id)
         .await
         .expect("inspect agent task");
-    task.state = ContainerState::Exited(exit_code);
+    task.state = WorkloadPhase::Exited(exit_code);
     task.updated_at = Utc::now().to_rfc3339();
     node.node
         .tasks

@@ -33,8 +33,8 @@ use crate::store::secret_store::open_secret_store;
 use crate::store::task_store::open_task_store;
 use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
 use crate::task::types::{
-    TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicyKind, TaskStateKind, TaskStatus,
-    TaskValue, TaskValueDraft,
+    TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicyKind, TaskStateFilter,
+    TaskStateKind, TaskStatus, TaskValue, TaskValueDraft,
 };
 use crate::topology::peers::PeerSchedulingState;
 use crate::volumes::VolumeRegistry;
@@ -44,6 +44,7 @@ use crate::volumes::types::{
     VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
 };
 use crate::workload::model::RuntimeClass;
+use crate::workload::model::select_best_workload_value;
 use crate::workload::types::TaskExecutionSpec;
 use ::health::HealthMonitor;
 use anyhow::{Result, anyhow};
@@ -908,7 +909,7 @@ async fn load_spec_cache_refreshes_after_store_change() {
 
     let loaded = manager.load_spec(spec.id).await.expect("load initial spec");
     assert!(
-        matches!(loaded.state, ContainerState::Pending),
+        matches!(loaded.state, WorkloadPhase::Pending),
         "initial cached load should reflect the pending state"
     );
 
@@ -926,7 +927,7 @@ async fn load_spec_cache_refreshes_after_store_change() {
         "cache entry should be keyed to the current store clock"
     );
 
-    spec.state = ContainerState::Running;
+    spec.state = WorkloadPhase::Running;
     spec.phase_version = 1;
     spec.updated_at = Utc::now().to_rfc3339();
     manager
@@ -939,7 +940,7 @@ async fn load_spec_cache_refreshes_after_store_change() {
         .await
         .expect("load refreshed spec");
     assert!(
-        matches!(refreshed.state, ContainerState::Running),
+        matches!(refreshed.state, WorkloadPhase::Running),
         "load_spec must not return a stale cached state after a write"
     );
     assert_eq!(
@@ -1057,7 +1058,7 @@ fn test_task_spec(manager: &WorkloadManager, name: &str) -> TaskSpec {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -1134,7 +1135,7 @@ fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> Wor
 }
 
 #[tokio::test]
-async fn start_container_reserves_slot_and_records_resources() {
+async fn start_workload_reserves_slot_and_records_resources() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -1145,7 +1146,7 @@ async fn start_container_reserves_slot_and_records_resources() {
         .expect("init slots");
 
     let spec = manager
-        .start_container(
+        .start_workload(
             "svc",
             "img",
             vec!["/bin/echo".into()],
@@ -1182,7 +1183,7 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
         image: "ghcr.io/demo/api:latest".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -1232,7 +1233,7 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
         .expect("inspect updated task");
     assert_eq!(
         latest.state,
-        ContainerState::Failed,
+        WorkloadPhase::Failed,
         "draining service task should fail instead of looping back to pending"
     );
     assert!(
@@ -1252,7 +1253,7 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
         image: "ghcr.io/demo/api:latest".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -1302,12 +1303,12 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
         .expect("inspect updated task");
     assert_eq!(
         latest.state,
-        ContainerState::Failed,
+        WorkloadPhase::Failed,
         "draining service task should fail instead of launching locally"
     );
     assert!(
         mock_cm.created.lock().await.is_empty(),
-        "draining pending task should not create a local container"
+        "draining pending task should not create a local instance"
     );
 }
 
@@ -1321,7 +1322,7 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
         image: "img".into(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -1377,7 +1378,7 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
         .await
         .expect("load refreshed task");
     assert!(
-        matches!(refreshed.state, ContainerState::Pulling),
+        matches!(refreshed.state, WorkloadPhase::Pulling),
         "task should remain in pulling phase until create starts"
     );
     assert_eq!(refreshed.phase_progress.as_deref(), Some("3/3"));
@@ -1394,7 +1395,7 @@ async fn same_state_pulling_progress_stays_local_only() {
         image: "img".into(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -1430,7 +1431,7 @@ async fn same_state_pulling_progress_stays_local_only() {
     manager
         .update_task_phase(
             spec.id,
-            ContainerState::Pulling,
+            WorkloadPhase::Pulling,
             Some("pulling image".to_string()),
             Some("1/3".to_string()),
         )
@@ -1439,7 +1440,7 @@ async fn same_state_pulling_progress_stays_local_only() {
     manager
         .update_task_phase(
             spec.id,
-            ContainerState::Pulling,
+            WorkloadPhase::Pulling,
             Some("pull retry backoff".to_string()),
             Some("2/3".to_string()),
         )
@@ -1467,7 +1468,7 @@ async fn same_state_pulling_progress_stays_local_only() {
             ..
         } => {
             assert_eq!(outbound_spec.id, spec.id);
-            assert_eq!(outbound_spec.state, ContainerState::Pulling);
+            assert_eq!(outbound_spec.state, WorkloadPhase::Pulling);
         }
         _ => panic!("unexpected outbound message for pulling transition"),
     }
@@ -1483,7 +1484,7 @@ async fn same_state_pulling_progress_stays_local_only() {
         .load_spec(spec.id)
         .await
         .expect("reload task after local-only pulling progress");
-    assert_eq!(refreshed.state, ContainerState::Pulling);
+    assert_eq!(refreshed.state, WorkloadPhase::Pulling);
     assert_eq!(
         refreshed.phase_reason.as_deref(),
         Some("pull retry backoff")
@@ -1502,7 +1503,7 @@ async fn dirty_gossip_flush_retries_latest_event_for_bounded_coverage_rounds() {
     let spec = build_remote_task_spec(
         task_id,
         remote_node,
-        ContainerState::Running,
+        WorkloadPhase::Running,
         2,
         4,
         now.to_rfc3339(),
@@ -1535,7 +1536,7 @@ async fn dirty_gossip_flush_retries_latest_event_for_bounded_coverage_rounds() {
                 ..
             } => {
                 assert_eq!(outbound_spec.id, task_id);
-                assert_eq!(outbound_spec.state, ContainerState::Running);
+                assert_eq!(outbound_spec.state, WorkloadPhase::Running);
             }
             _ => panic!("unexpected outbound message for running task"),
         }
@@ -1559,7 +1560,7 @@ async fn pull_image_for_task_skips_pull_when_image_exists_locally() {
         image: "img".into(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -1613,7 +1614,7 @@ async fn pull_image_for_task_skips_pull_when_image_exists_locally() {
         .load_spec(spec.id)
         .await
         .expect("load refreshed task");
-    assert_eq!(refreshed.state, ContainerState::Pending);
+    assert_eq!(refreshed.state, WorkloadPhase::Pending);
     assert!(refreshed.phase_reason.is_none());
     assert!(refreshed.phase_progress.is_none());
 }
@@ -1628,7 +1629,7 @@ async fn reconcile_rejects_missing_slot_assignments() {
         image: "img".into(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -1687,7 +1688,7 @@ async fn reconcile_pending_task_reserves_assigned_slots_before_launch() {
         image: "img".into(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -1759,7 +1760,7 @@ async fn reconcile_uses_latest_persisted_slot_assignment() {
         image: "img".into(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -1837,22 +1838,22 @@ async fn update_task_phase_ignores_stale_regression_from_running() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("phase-guard", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("phase-guard", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
-    assert!(matches!(spec.state, ContainerState::Running));
+    assert!(matches!(spec.state, WorkloadPhase::Running));
 
     let updated = manager
         .update_task_phase(
             spec.id,
-            ContainerState::Pulling,
+            WorkloadPhase::Pulling,
             Some("pulling image".to_string()),
             Some("1/3".to_string()),
         )
         .await
         .expect("update phase should not fail");
     assert!(
-        matches!(updated.state, ContainerState::Running),
+        matches!(updated.state, WorkloadPhase::Running),
         "running state should not regress to pulling"
     );
     assert_eq!(
@@ -1868,7 +1869,7 @@ async fn update_task_phase_ignores_stale_regression_from_running() {
         .load_spec(spec.id)
         .await
         .expect("load refreshed task");
-    assert!(matches!(refreshed.state, ContainerState::Running));
+    assert!(matches!(refreshed.state, WorkloadPhase::Running));
     assert_eq!(mock_cm.created.lock().await.len(), 1);
 }
 
@@ -1882,7 +1883,7 @@ async fn update_task_phase_ignores_stale_regression_from_creating_to_pulling() {
         image: "img".into(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Creating,
+        state: WorkloadPhase::Creating,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -1918,14 +1919,14 @@ async fn update_task_phase_ignores_stale_regression_from_creating_to_pulling() {
     let updated = manager
         .update_task_phase(
             spec.id,
-            ContainerState::Pulling,
+            WorkloadPhase::Pulling,
             Some("pull retry backoff".to_string()),
             Some("2/3".to_string()),
         )
         .await
         .expect("stale pulling update should not fail");
 
-    assert_eq!(updated.state, ContainerState::Creating);
+    assert_eq!(updated.state, WorkloadPhase::Creating);
     assert_eq!(updated.phase_reason, spec.phase_reason);
     assert_eq!(updated.phase_progress, spec.phase_progress);
 
@@ -1933,7 +1934,7 @@ async fn update_task_phase_ignores_stale_regression_from_creating_to_pulling() {
         .load_spec(spec.id)
         .await
         .expect("reload task after stale pulling update");
-    assert_eq!(refreshed.state, ContainerState::Creating);
+    assert_eq!(refreshed.state, WorkloadPhase::Creating);
     assert!(refreshed.phase_reason.is_none());
     assert!(refreshed.phase_progress.is_none());
 }
@@ -1951,7 +1952,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: now.to_rfc3339(),
@@ -1987,7 +1988,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: now.to_rfc3339(),
@@ -2027,7 +2028,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: now.to_rfc3339(),
@@ -2067,7 +2068,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: now.to_rfc3339(),
@@ -2103,7 +2104,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
 }
 
 #[test]
-fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
+fn select_best_workload_value_ignores_stale_timestamp_when_phase_is_older() {
     let now = Utc::now();
     let id = Uuid::new_v4();
     let node = Uuid::new_v4();
@@ -2114,7 +2115,7 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: now.to_rfc3339(),
@@ -2150,7 +2151,7 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: now.to_rfc3339(),
@@ -2180,13 +2181,13 @@ fn select_best_task_value_ignores_stale_timestamp_when_phase_is_older() {
         last_terminal_observed_launch: None,
     });
 
-    let chosen = select_best_task_value(&[
+    let chosen = select_best_workload_value(&[
         stale_pending_later_timestamp.clone(),
         running_newer_phase.clone(),
     ])
     .expect("best value");
 
-    assert_eq!(chosen.state, ContainerState::Running);
+    assert_eq!(chosen.state, WorkloadPhase::Running);
     assert_eq!(chosen.phase_version, 4);
 }
 
@@ -2201,7 +2202,7 @@ async fn reconcile_stale_pending_input_does_not_repull_running_task() {
         .expect("init slots");
 
     let running = manager
-        .start_container(
+        .start_workload(
             "stale-reconcile",
             "img",
             vec![],
@@ -2211,13 +2212,13 @@ async fn reconcile_stale_pending_input_does_not_repull_running_task() {
         )
         .await
         .expect("start container");
-    assert!(matches!(running.state, ContainerState::Running));
+    assert!(matches!(running.state, WorkloadPhase::Running));
 
     let pulls_before = mock_cm.pull_calls.lock().await.len();
 
     // Emulate a delayed reconcile worker spawned from an older Pending snapshot.
     let mut stale = running.clone();
-    stale.state = ContainerState::Pending;
+    stale.state = WorkloadPhase::Pending;
     stale.phase_reason = None;
     stale.phase_progress = None;
 
@@ -2237,7 +2238,7 @@ async fn reconcile_stale_pending_input_does_not_repull_running_task() {
         .await
         .expect("load refreshed task");
     assert!(
-        matches!(refreshed.state, ContainerState::Running),
+        matches!(refreshed.state, WorkloadPhase::Running),
         "task should remain running after stale reconcile input"
     );
 }
@@ -2333,10 +2334,10 @@ async fn reconcile_running_task_restarts_when_container_is_missing() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
-    assert!(matches!(spec.state, ContainerState::Running));
+    assert!(matches!(spec.state, WorkloadPhase::Running));
     assert_eq!(mock_cm.created.lock().await.len(), 1);
 
     {
@@ -2357,7 +2358,7 @@ async fn reconcile_running_task_restarts_when_container_is_missing() {
         .await
         .expect("load refreshed spec");
     assert!(
-        matches!(refreshed.state, ContainerState::Running),
+        matches!(refreshed.state, WorkloadPhase::Running),
         "task should converge back to running after restart"
     );
 }
@@ -2373,10 +2374,10 @@ async fn reconcile_running_task_marks_failed_when_container_exits_without_restar
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
-    assert!(matches!(spec.state, ContainerState::Running));
+    assert!(matches!(spec.state, WorkloadPhase::Running));
 
     let instance_id = mock_cm
         .created
@@ -2384,7 +2385,7 @@ async fn reconcile_running_task_marks_failed_when_container_exits_without_restar
         .await
         .first()
         .cloned()
-        .expect("container id");
+        .expect("instance id");
 
     {
         let mut inspect = mock_cm.inspect.lock().await;
@@ -2414,7 +2415,7 @@ async fn reconcile_running_task_marks_failed_when_container_exits_without_restar
         .await
         .expect("load refreshed spec");
     assert!(
-        matches!(refreshed.state, ContainerState::Failed),
+        matches!(refreshed.state, WorkloadPhase::Failed),
         "task should transition to failed after terminal container exit"
     );
     assert_eq!(
@@ -2447,10 +2448,10 @@ async fn reconcile_running_task_does_not_overwrite_newer_failed_state() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
-    assert!(matches!(spec.state, ContainerState::Running));
+    assert!(matches!(spec.state, WorkloadPhase::Running));
 
     {
         let mut inspect = mock_cm.inspect.lock().await;
@@ -2462,7 +2463,7 @@ async fn reconcile_running_task_does_not_overwrite_newer_failed_state() {
         .await
         .expect("load running task before failure");
     failed.phase_version = failed.phase_version.saturating_add(1);
-    failed.state = ContainerState::Failed;
+    failed.state = WorkloadPhase::Failed;
     failed.updated_at = Utc::now().to_rfc3339();
     manager
         .persist_spec(&failed)
@@ -2470,7 +2471,7 @@ async fn reconcile_running_task_does_not_overwrite_newer_failed_state() {
         .expect("persist newer failed task state");
 
     let mut stale_running = spec.clone();
-    stale_running.state = ContainerState::Running;
+    stale_running.state = WorkloadPhase::Running;
 
     let short_circuit = manager
         .reconcile_recorded_running_task(&mut stale_running)
@@ -2486,7 +2487,7 @@ async fn reconcile_running_task_does_not_overwrite_newer_failed_state() {
         .await
         .expect("load refreshed task after stale reconcile");
     assert!(
-        matches!(refreshed.state, ContainerState::Failed),
+        matches!(refreshed.state, WorkloadPhase::Failed),
         "newer failed state should not be overwritten by stale running reconcile"
     );
     assert_eq!(
@@ -2507,10 +2508,10 @@ async fn reconcile_running_task_keeps_running_when_list_finds_container() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
-    assert!(matches!(spec.state, ContainerState::Running));
+    assert!(matches!(spec.state, WorkloadPhase::Running));
     assert_eq!(mock_cm.created.lock().await.len(), 1);
 
     {
@@ -2540,7 +2541,7 @@ async fn reconcile_running_task_keeps_running_when_list_finds_container() {
         .await
         .expect("load refreshed spec");
     assert!(
-        matches!(refreshed.state, ContainerState::Running),
+        matches!(refreshed.state, WorkloadPhase::Running),
         "task should remain running when runtime listing confirms container"
     );
 }
@@ -2556,7 +2557,7 @@ async fn reconcile_running_task_executes_liveness_probe_once_per_interval() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -2643,7 +2644,7 @@ async fn reconcile_running_task_executes_http_liveness_probe_without_container_e
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -2730,7 +2731,7 @@ async fn reconcile_running_task_executes_tcp_liveness_probe_without_container_ex
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -2806,7 +2807,7 @@ async fn reconcile_running_task_skips_liveness_probe_during_start_period() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -2863,7 +2864,7 @@ async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -2906,7 +2907,7 @@ async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
         .load_spec(spec.id)
         .await
         .expect("load task after first liveness failure");
-    assert_eq!(after_first.state, ContainerState::Running);
+    assert_eq!(after_first.state, WorkloadPhase::Running);
     assert_eq!(
         manager
             .local_state
@@ -2936,7 +2937,7 @@ async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
         .load_spec(spec.id)
         .await
         .expect("load task after threshold failure");
-    assert_eq!(refreshed.state, ContainerState::Pending);
+    assert_eq!(refreshed.state, WorkloadPhase::Pending);
     assert_eq!(
         refreshed.phase_reason.as_deref(),
         Some("liveness probe exited with status code 7")
@@ -2954,7 +2955,7 @@ async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
             .await
             .get(&spec.id)
             .is_none(),
-        "threshold failure should evict the cached local container id"
+        "threshold failure should evict the cached local instance id"
     );
     assert!(
         manager
@@ -2984,10 +2985,10 @@ async fn reconcile_running_task_retries_create_after_stale_name_conflict() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
-    assert!(matches!(spec.state, ContainerState::Running));
+    assert!(matches!(spec.state, WorkloadPhase::Running));
     assert_eq!(mock_cm.created.lock().await.len(), 1);
 
     {
@@ -3016,7 +3017,7 @@ async fn reconcile_running_task_retries_create_after_stale_name_conflict() {
         .await
         .expect("load refreshed spec");
     assert!(
-        matches!(refreshed.state, ContainerState::Running),
+        matches!(refreshed.state, WorkloadPhase::Running),
         "task should converge back to running after retry"
     );
 }
@@ -3032,10 +3033,10 @@ async fn reconcile_local_tasks_uses_runtime_inventory_for_running_tasks() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
-    assert!(matches!(spec.state, ContainerState::Running));
+    assert!(matches!(spec.state, WorkloadPhase::Running));
 
     {
         let mut listed = mock_cm.listed.lock().await;
@@ -3072,7 +3073,7 @@ async fn reconcile_local_slot_reservations_releases_stale_local_slots() {
         .expect("init slots");
 
     let running = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -3167,7 +3168,7 @@ async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims
         .expect("init slots");
 
     let winner = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start winner container");
     let contested_slot = winner.slot_ids[0];
@@ -3180,7 +3181,7 @@ async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: now.clone(),
@@ -3222,7 +3223,7 @@ async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims
         assert!(
             matches!(
                 updated_loser.state,
-                ContainerState::Stopping | ContainerState::Stopped
+                WorkloadPhase::Stopping | WorkloadPhase::Stopped
             ),
             "conflicting local task should be demoted for draining"
         );
@@ -3260,7 +3261,7 @@ async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims
 }
 
 #[tokio::test]
-async fn start_container_reserves_multiple_slots_when_needed() {
+async fn start_workload_reserves_multiple_slots_when_needed() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_a = SlotSpec::new(1, SlotCapacity::new(200, 64 * 1_024 * 1_024, 0));
@@ -3271,7 +3272,7 @@ async fn start_container_reserves_multiple_slots_when_needed() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 400, 128 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 400, 128 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -3294,7 +3295,7 @@ async fn request_task_stop_releases_slot_and_clears_resources() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -3302,7 +3303,7 @@ async fn request_task_stop_releases_slot_and_clears_resources() {
         .request_task_stop(spec.id)
         .await
         .expect("request stop");
-    assert!(matches!(requested.state, ContainerState::Stopping));
+    assert!(matches!(requested.state, WorkloadPhase::Stopping));
 
     manager
         .reconcile_local_task(requested)
@@ -3330,7 +3331,7 @@ async fn request_task_stop_uses_task_termination_grace_period() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
     spec.termination_grace_period_secs = Some(42);
@@ -3365,7 +3366,7 @@ async fn request_task_stop_uses_drain_task_stop_timeout_override() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
     spec.termination_grace_period_secs = Some(42);
@@ -3401,7 +3402,7 @@ async fn request_task_stop_runs_pre_stop_hook_with_shared_shutdown_budget() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
     spec.termination_grace_period_secs = Some(5);
@@ -3453,7 +3454,7 @@ async fn request_task_stop_continues_after_pre_stop_hook_failure() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
     spec.pre_stop_command = Some(vec!["/bin/false".into()]);
@@ -3493,7 +3494,7 @@ async fn reconcile_inventory_uses_drain_stop_timeout_for_unowned_runtime() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -3539,7 +3540,7 @@ async fn request_task_stop_uses_container_name_when_cache_missing() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -3550,14 +3551,14 @@ async fn request_task_stop_uses_container_name_when_cache_missing() {
         .await
         .remove(&spec.id);
 
-    spec.state = ContainerState::Running;
+    spec.state = WorkloadPhase::Running;
     manager.persist_spec(&spec).await.expect("persist update");
 
     let requested = manager
         .request_task_stop(spec.id)
         .await
         .expect("request stop");
-    assert!(matches!(requested.state, ContainerState::Stopping));
+    assert!(matches!(requested.state, WorkloadPhase::Stopping));
     manager
         .reconcile_local_task(requested)
         .await
@@ -3575,11 +3576,11 @@ async fn request_task_stop_is_idempotent_while_stopping() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
-    spec.state = ContainerState::Stopping;
+    spec.state = WorkloadPhase::Stopping;
     spec.phase_version = spec.phase_version.saturating_add(1);
     spec.updated_at = Utc::now().to_rfc3339();
     manager
@@ -3593,7 +3594,7 @@ async fn request_task_stop_is_idempotent_while_stopping() {
         .request_task_stop(spec.id)
         .await
         .expect("idempotent stop");
-    assert!(matches!(current.state, ContainerState::Stopping));
+    assert!(matches!(current.state, WorkloadPhase::Stopping));
     assert!(
         mock_cm.stopped.lock().await.is_empty(),
         "stop should not invoke runtime stop again when task is already stopping"
@@ -3601,7 +3602,7 @@ async fn request_task_stop_is_idempotent_while_stopping() {
 }
 
 #[tokio::test]
-async fn reconcile_requested_stop_removes_containerless_stopping_task() {
+async fn reconcile_requested_stop_removes_instance_less_stopping_task() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -3612,11 +3613,11 @@ async fn reconcile_requested_stop_removes_containerless_stopping_task() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
-    spec.state = ContainerState::Stopping;
+    spec.state = WorkloadPhase::Stopping;
     spec.updated_at = Utc::now().to_rfc3339();
     manager
         .persist_spec(&spec)
@@ -3627,7 +3628,7 @@ async fn reconcile_requested_stop_removes_containerless_stopping_task() {
         .await
         .expect("load persisted stopping task");
     assert!(
-        matches!(persisted.state, ContainerState::Stopping),
+        matches!(persisted.state, WorkloadPhase::Stopping),
         "manual test setup should persist a stopping task before explicit cleanup"
     );
 
@@ -3655,11 +3656,11 @@ async fn reconcile_requested_stop_removes_containerless_stopping_task() {
             .get_snapshot(&UuidKey::from(spec.id))
             .expect("raw task snapshot after explicit stop cleanup")
             .is_none(),
-        "containerless stopping task should be removed from the task store by explicit stop cleanup"
+        "instance-less stopping task should be removed from the task store by explicit stop cleanup"
     );
     assert!(
         manager.load_spec(spec.id).await.is_err(),
-        "containerless stopping task should be removed by explicit stop cleanup"
+        "instance-less stopping task should be removed by explicit stop cleanup"
     );
     let snapshot = scheduler.snapshot().await.expect("scheduler snapshot");
     let slot = snapshot
@@ -3669,12 +3670,12 @@ async fn reconcile_requested_stop_removes_containerless_stopping_task() {
         .expect("slot present after cleanup");
     assert!(
         matches!(slot.state, SlotState::Free),
-        "containerless stopping cleanup should also release the reserved slot"
+        "instance-less stopping cleanup should also release the reserved slot"
     );
 }
 
 #[tokio::test]
-async fn reconcile_requested_stop_treats_non_running_container_as_containerless() {
+async fn reconcile_requested_stop_treats_non_running_instance_as_instance_less() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -3684,11 +3685,11 @@ async fn reconcile_requested_stop_treats_non_running_container_as_containerless(
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
-    spec.state = ContainerState::Stopping;
+    spec.state = WorkloadPhase::Stopping;
     spec.phase_version = spec.phase_version.saturating_add(1);
     spec.updated_at = Utc::now().to_rfc3339();
     manager
@@ -3726,7 +3727,7 @@ async fn request_task_stop_only_updates_replicated_state() {
         .expect("init slots");
 
     let spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -3736,14 +3737,14 @@ async fn request_task_stop_only_updates_replicated_state() {
         .request_task_stop(spec.id)
         .await
         .expect("request stop transition");
-    assert!(matches!(requested.state, ContainerState::Stopping));
+    assert!(matches!(requested.state, WorkloadPhase::Stopping));
     assert!(
         mock_cm.stopped.lock().await.is_empty(),
         "request_task_stop should not invoke runtime stop directly"
     );
 
     let persisted = manager.load_spec(spec.id).await.expect("load spec");
-    assert!(matches!(persisted.state, ContainerState::Stopping));
+    assert!(matches!(persisted.state, WorkloadPhase::Stopping));
 }
 
 #[tokio::test]
@@ -3757,11 +3758,11 @@ async fn reconcile_stopping_task_stops_immediately() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
-    spec.state = ContainerState::Stopping;
+    spec.state = WorkloadPhase::Stopping;
     spec.updated_at = Utc::now().to_rfc3339();
     manager
         .persist_spec(&spec)
@@ -3792,11 +3793,11 @@ async fn reconcile_stopping_task_retries_after_grace_window() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
-    spec.state = ContainerState::Stopping;
+    spec.state = WorkloadPhase::Stopping;
     spec.updated_at = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
     manager
         .persist_spec(&spec)
@@ -3827,11 +3828,11 @@ async fn reconcile_stopping_task_serializes_duplicate_stop_attempts() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
-    spec.state = ContainerState::Stopping;
+    spec.state = WorkloadPhase::Stopping;
     spec.updated_at = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
     manager
         .persist_spec(&spec)
@@ -3869,11 +3870,11 @@ async fn reconcile_stopping_task_retries_after_stop_timeout() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
-    spec.state = ContainerState::Stopping;
+    spec.state = WorkloadPhase::Stopping;
     spec.termination_grace_period_secs = Some(1);
     spec.updated_at = Utc::now().to_rfc3339();
     manager
@@ -3896,7 +3897,7 @@ async fn reconcile_stopping_task_retries_after_stop_timeout() {
         .load_spec(spec.id)
         .await
         .expect("load stopping task");
-    assert!(matches!(persisted.state, ContainerState::Stopping));
+    assert!(matches!(persisted.state, WorkloadPhase::Stopping));
 
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     *mock_cm.stop_delay.lock().await = None;
@@ -3924,11 +3925,11 @@ async fn reconcile_stopping_task_retries_after_remove_timeout() {
         .expect("init slots");
 
     let mut spec = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
-    spec.state = ContainerState::Stopping;
+    spec.state = WorkloadPhase::Stopping;
     spec.termination_grace_period_secs = Some(1);
     spec.updated_at = Utc::now().to_rfc3339();
     manager
@@ -3951,7 +3952,7 @@ async fn reconcile_stopping_task_retries_after_remove_timeout() {
         .load_spec(spec.id)
         .await
         .expect("load stopping task");
-    assert!(matches!(persisted.state, ContainerState::Stopping));
+    assert!(matches!(persisted.state, WorkloadPhase::Stopping));
 
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     *mock_cm.remove_delay.lock().await = None;
@@ -3979,7 +3980,7 @@ async fn list_tasks_respects_filters() {
         .expect("init slots");
 
     let running = manager
-        .start_container("running", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("running", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start running");
 
@@ -4021,7 +4022,7 @@ async fn resolve_task_id_accepts_unique_short_prefix() {
     let spec = build_remote_task_spec(
         id,
         Uuid::new_v4(),
-        ContainerState::Running,
+        WorkloadPhase::Running,
         1,
         1,
         Utc::now().to_rfc3339(),
@@ -4044,7 +4045,7 @@ async fn resolve_task_id_accepts_compact_prefix_across_hyphen_boundary() {
     let spec = build_remote_task_spec(
         id,
         Uuid::new_v4(),
-        ContainerState::Running,
+        WorkloadPhase::Running,
         1,
         1,
         Utc::now().to_rfc3339(),
@@ -4066,15 +4067,9 @@ async fn resolve_task_id_rejects_ambiguous_prefix() {
     let a = Uuid::parse_str("956bc5ba-0f2c-4d3f-8a07-fd9f1f72b8c1").expect("uuid");
     let b = Uuid::parse_str("956bc5ba-11aa-4d3f-8a07-fd9f1f72b8c2").expect("uuid");
     let now = Utc::now().to_rfc3339();
-    let first = build_remote_task_spec(
-        a,
-        Uuid::new_v4(),
-        ContainerState::Running,
-        1,
-        1,
-        now.clone(),
-    );
-    let second = build_remote_task_spec(b, Uuid::new_v4(), ContainerState::Running, 1, 1, now);
+    let first =
+        build_remote_task_spec(a, Uuid::new_v4(), WorkloadPhase::Running, 1, 1, now.clone());
+    let second = build_remote_task_spec(b, Uuid::new_v4(), WorkloadPhase::Running, 1, 1, now);
     manager.persist_spec(&first).await.expect("persist first");
     manager.persist_spec(&second).await.expect("persist second");
 
@@ -4087,7 +4082,7 @@ async fn resolve_task_id_rejects_ambiguous_prefix() {
 }
 
 #[tokio::test]
-async fn start_container_fails_when_no_matching_slot() {
+async fn start_workload_fails_when_no_matching_slot() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     // Seed an initialized scheduler snapshot whose slot capacity cannot satisfy the request.
@@ -4100,7 +4095,7 @@ async fn start_container_fails_when_no_matching_slot() {
         .expect("init slots");
 
     let result = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await;
 
     assert!(result.is_err());
@@ -4208,7 +4203,7 @@ async fn task_owned_locally_detects_remote_entries() {
         .expect("init slots");
 
     let local_spec = manager
-        .start_container("local", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("local", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start local task");
 
@@ -4226,7 +4221,7 @@ async fn task_owned_locally_detects_remote_entries() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -4281,7 +4276,7 @@ async fn stream_local_task_logs_forwards_frames_and_options() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Failed,
+        state: WorkloadPhase::Failed,
         phase_reason: Some("crashed".to_string()),
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -4375,7 +4370,7 @@ async fn attach_local_task_forwards_input_output_and_options() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -4507,7 +4502,7 @@ async fn attach_local_task_uses_runtime_tty_when_persisted_spec_is_stale() {
         image: "demo:latest".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -4601,7 +4596,7 @@ async fn exec_local_task_forwards_input_output_and_options() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: Utc::now().to_rfc3339(),
@@ -4725,7 +4720,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
         .expect("init slots");
 
     manager
-        .start_container("baseline", "img", vec![], 400, 128 * 1_024 * 1_024, None)
+        .start_workload("baseline", "img", vec![], 400, 128 * 1_024 * 1_024, None)
         .await
         .expect("pre-existing container");
 
@@ -4959,7 +4954,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: now.clone(),
@@ -5041,7 +5036,7 @@ async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachme
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: now.clone(),
@@ -5367,7 +5362,7 @@ async fn duplicate_remove_event_does_not_poison_future_epoch_upsert() {
         .expect("init slots");
 
     let original = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -5383,7 +5378,7 @@ async fn duplicate_remove_event_does_not_poison_future_epoch_upsert() {
     let mut replacement = original.clone();
     replacement.node_id = Uuid::new_v4();
     replacement.node_name = "remote-node".to_string();
-    replacement.state = ContainerState::Running;
+    replacement.state = WorkloadPhase::Running;
     replacement.updated_at = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
     replacement.task_epoch = replacement.task_epoch.saturating_add(1);
     replacement.phase_version = replacement.phase_version.saturating_add(1);
@@ -5417,7 +5412,7 @@ async fn next_epoch_after_remove_uses_watermark_increment() {
         .expect("init slots");
 
     let started = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
     manager
@@ -5447,7 +5442,7 @@ async fn next_epoch_after_remove_without_watermark_uses_tombstone_floor() {
         .expect("init slots");
 
     let started = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
     manager
@@ -5477,7 +5472,7 @@ async fn stale_remove_event_does_not_delete_active_local_task() {
         .expect("init slots");
 
     let running = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -5492,7 +5487,7 @@ async fn stale_remove_event_does_not_delete_active_local_task() {
         .expect("running task should remain persisted");
     assert_eq!(persisted.id, running.id);
     assert_eq!(persisted.node_id, manager.local_node_id);
-    assert_eq!(persisted.state, ContainerState::Running);
+    assert_eq!(persisted.state, WorkloadPhase::Running);
 }
 
 #[tokio::test]
@@ -5506,7 +5501,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
         .expect("init slots");
 
     let mut original = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -5517,7 +5512,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
 
     original.node_id = Uuid::new_v4();
     original.node_name = "remote-node".to_string();
-    original.state = ContainerState::Stopping;
+    original.state = WorkloadPhase::Stopping;
 
     manager
         .handle_event(TaskEvent::UpsertSpec(Box::new(original.clone())))
@@ -5533,7 +5528,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
     );
 
     let mut fresh = original.clone();
-    fresh.state = ContainerState::Running;
+    fresh.state = WorkloadPhase::Running;
     fresh.updated_at = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
     fresh.task_epoch = fresh.task_epoch.saturating_add(1);
 
@@ -5564,7 +5559,7 @@ async fn upsert_after_remove_without_watermark_is_accepted_for_reconvergence() {
         .expect("init slots");
 
     let mut original = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -5576,7 +5571,7 @@ async fn upsert_after_remove_without_watermark_is_accepted_for_reconvergence() {
 
     original.node_id = Uuid::new_v4();
     original.node_name = "remote-node".to_string();
-    original.state = ContainerState::Stopping;
+    original.state = WorkloadPhase::Stopping;
 
     manager
         .handle_event(TaskEvent::UpsertSpec(Box::new(original.clone())))
@@ -5605,7 +5600,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         .expect("init slots");
 
     let original = manager
-        .start_container("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
 
@@ -5622,7 +5617,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         image: original.image.clone(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Stopping,
+        state: WorkloadPhase::Stopping,
         phase_reason: None,
         phase_progress: None,
         created_at: original.created_at.clone(),
@@ -5691,7 +5686,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
 fn build_remote_task_spec(
     id: Uuid,
     node_id: Uuid,
-    state: ContainerState,
+    state: WorkloadPhase,
     task_epoch: u64,
     phase_version: u64,
     updated_at: String,
@@ -5751,7 +5746,7 @@ async fn out_of_order_task_upsert_keeps_newer_running_state() {
     let running = build_remote_task_spec(
         task_id,
         remote_node,
-        ContainerState::Running,
+        WorkloadPhase::Running,
         3,
         9,
         now.to_rfc3339(),
@@ -5764,7 +5759,7 @@ async fn out_of_order_task_upsert_keeps_newer_running_state() {
     let delayed_pending = build_remote_task_spec(
         task_id,
         remote_node,
-        ContainerState::Pending,
+        WorkloadPhase::Pending,
         running.task_epoch,
         running.phase_version.saturating_sub(1),
         (now + chrono::Duration::seconds(60)).to_rfc3339(),
@@ -5778,7 +5773,7 @@ async fn out_of_order_task_upsert_keeps_newer_running_state() {
         .load_spec(task_id)
         .await
         .expect("load causally resolved task");
-    assert_eq!(resolved.state, ContainerState::Running);
+    assert_eq!(resolved.state, WorkloadPhase::Running);
     assert_eq!(resolved.task_epoch, running.task_epoch);
     assert_eq!(resolved.phase_version, running.phase_version);
 }
@@ -5794,7 +5789,7 @@ async fn compact_status_upsert_updates_existing_task_without_dropping_definition
     let mut pulling = build_remote_task_spec(
         task_id,
         remote_node,
-        ContainerState::Pulling,
+        WorkloadPhase::Pulling,
         2,
         5,
         now.to_rfc3339(),
@@ -5822,7 +5817,7 @@ async fn compact_status_upsert_updates_existing_task_without_dropping_definition
         .load_spec(task_id)
         .await
         .expect("load merged pulling task");
-    assert_eq!(resolved.state, ContainerState::Pulling);
+    assert_eq!(resolved.state, WorkloadPhase::Pulling);
     assert_eq!(resolved.phase_reason.as_deref(), Some("backing off"));
     assert_eq!(resolved.phase_progress.as_deref(), Some("retry 2/3"));
     assert_eq!(
@@ -5844,7 +5839,7 @@ async fn late_full_spec_fills_definition_after_status_placeholder() {
     let mut running = build_remote_task_spec(
         task_id,
         remote_node,
-        ContainerState::Running,
+        WorkloadPhase::Running,
         4,
         7,
         now.to_rfc3339(),
@@ -5863,7 +5858,7 @@ async fn late_full_spec_fills_definition_after_status_placeholder() {
         .load_spec(task_id)
         .await
         .expect("load placeholder task");
-    assert_eq!(placeholder.state, ContainerState::Running);
+    assert_eq!(placeholder.state, WorkloadPhase::Running);
     assert!(placeholder.command.is_empty());
     assert_eq!(placeholder.cpu_millis, 0);
 
@@ -5876,7 +5871,7 @@ async fn late_full_spec_fills_definition_after_status_placeholder() {
         .load_spec(task_id)
         .await
         .expect("load resolved task");
-    assert_eq!(resolved.state, ContainerState::Running);
+    assert_eq!(resolved.state, WorkloadPhase::Running);
     assert_eq!(
         resolved.command,
         vec!["server".to_string(), "--foreground".to_string()]
@@ -5896,7 +5891,7 @@ async fn dirty_gossip_flush_keeps_definition_and_latest_status() {
     let mut pulling = build_remote_task_spec(
         task_id,
         remote_node,
-        ContainerState::Pulling,
+        WorkloadPhase::Pulling,
         6,
         3,
         now.to_rfc3339(),
@@ -5983,7 +5978,7 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
     let gossip_running = build_remote_task_spec(
         task_id,
         remote_node,
-        ContainerState::Running,
+        WorkloadPhase::Running,
         5,
         11,
         now.to_rfc3339(),
@@ -5999,7 +5994,7 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Pending,
+        state: WorkloadPhase::Pending,
         phase_reason: None,
         phase_progress: None,
         created_at: now.to_rfc3339(),
@@ -6057,7 +6052,7 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         .load_spec(task_id)
         .await
         .expect("load causally resolved task");
-    assert_eq!(resolved.state, ContainerState::Running);
+    assert_eq!(resolved.state, WorkloadPhase::Running);
     assert_eq!(resolved.task_epoch, gossip_running.task_epoch);
     assert_eq!(resolved.phase_version, gossip_running.phase_version);
 }
@@ -6140,7 +6135,7 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
         image: "img".to_string(),
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
-        state: ContainerState::Running,
+        state: WorkloadPhase::Running,
         phase_reason: None,
         phase_progress: None,
         created_at: now.clone(),
@@ -6374,7 +6369,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         guard
             .get(&task_spec.id)
             .cloned()
-            .expect("container id recorded")
+            .expect("instance id recorded")
     };
 
     let initial = network_registry

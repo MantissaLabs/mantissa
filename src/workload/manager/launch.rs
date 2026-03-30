@@ -264,7 +264,7 @@ impl WorkloadManager {
     }
 }
 
-/// Maps a task restart policy into the docker restart policy payload.
+/// Maps a task restart policy into the runtime restart-policy payload.
 fn restart_policy_to_config(policy: &TaskRestartPolicy) -> RestartPolicyConfig {
     RestartPolicyConfig {
         name: match policy.name {

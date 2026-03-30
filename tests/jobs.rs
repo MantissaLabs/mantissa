@@ -5,8 +5,8 @@ use chrono::Utc;
 use common::convergence::wait_until;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use crdt_store::uuid_key::UuidKey;
-use mantissa::task::container::ContainerState;
 use mantissa::task::types::{TaskSpec, TaskStateFilter, TaskValue};
+use mantissa::workload::model::WorkloadPhase;
 use protocol::jobs::{JobStatus as ProtoJobStatus, jobs};
 use std::time::Duration;
 use uuid::Uuid;
@@ -30,7 +30,7 @@ local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
         .inspect_task(active_task_id)
         .await
         .expect("inspect job task");
-    task.state = ContainerState::Exited(0);
+    task.state = WorkloadPhase::Exited(0);
     task.updated_at = Utc::now().to_rfc3339();
     node.node
         .tasks
@@ -69,7 +69,7 @@ local_test!(jobs_retry_after_failed_task, {
         .inspect_task(first_task_id)
         .await
         .expect("inspect first job task");
-    task.state = ContainerState::Exited(1);
+    task.state = WorkloadPhase::Exited(1);
     task.updated_at = Utc::now().to_rfc3339();
     node.node
         .tasks

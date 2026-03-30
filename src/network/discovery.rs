@@ -12,9 +12,9 @@ use crate::services::types::{
     ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
 };
 use crate::store::task_store::TaskStore;
-use crate::task::container::ContainerState;
-use crate::task::manager::select_best_task_value;
 use crate::task::types::TaskValue;
+use crate::workload::model::WorkloadPhase;
+use crate::workload::model::select_best_workload_value;
 use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use crdt_store::uuid_key::UuidKey;
@@ -804,7 +804,7 @@ async fn resolve_service_backends(
                 continue;
             }
         }
-        if task.state != ContainerState::Running {
+        if task.state != WorkloadPhase::Running {
             tracing::debug!(
                 target: "network",
                 network = %network_id,
@@ -859,7 +859,7 @@ async fn resolve_service_backends(
 fn load_task(tasks: &TaskStore, id: Uuid) -> Option<TaskValue> {
     let key = UuidKey::from(id);
     let snapshot = tasks.get_snapshot(&key).ok()??;
-    select_best_task_value(snapshot.as_slice())
+    select_best_workload_value(snapshot.as_slice())
 }
 
 /// Decide whether an attachment should be trusted over a stale task record during convergence.
@@ -1956,8 +1956,8 @@ mod tests {
     };
     use crate::store::service_store::open_service_store;
     use crate::store::task_store::{TaskStore, open_task_store};
-    use crate::task::container::ContainerState;
     use crate::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
+    use crate::workload::model::WorkloadPhase;
     use crate::workload::types::WorkloadExecutionSpec;
     use crdt_store::uuid_key::UuidKey;
     use std::sync::Arc;
@@ -2126,7 +2126,7 @@ mod tests {
             image: "hashicorp/http-echo:1.0.0".to_string(),
             runtime_class: crate::workload::model::RuntimeClass::Oci,
             sandbox_profile: None,
-            state: ContainerState::Running,
+            state: WorkloadPhase::Running,
             phase_reason: None,
             phase_progress: None,
             created_at: now.clone(),
@@ -2297,7 +2297,7 @@ mod tests {
         assert_eq!(initial_candidates, 1);
 
         let mut stopped = catalog_task(task_id, node_id, service_name, harness.network.id);
-        stopped.state = ContainerState::Stopped;
+        stopped.state = WorkloadPhase::Stopped;
         stopped.updated_at = chrono::Utc::now().to_rfc3339();
         harness
             .tasks

@@ -360,7 +360,7 @@ pub enum TasksCommand {
     /// matching Docker attach semantics.
     Attach(TasksAttachArgs),
 
-    /// Execute one command inside a running task container.
+    /// Execute one command inside a running task runtime instance.
     ///
     /// Use `--tty` for interactive shells. When stdin is attached to a TTY, the Docker default
     /// detach sequence (`ctrl-p,ctrl-q`) leaves the exec process running and returns locally.
@@ -368,11 +368,11 @@ pub enum TasksCommand {
     /// the terminal.
     Exec(TasksExecArgs),
 
-    /// Start a container task
+    /// Start a task
     #[command(alias = "run")]
     Start(TasksStartArgs),
 
-    /// Stop a container task
+    /// Stop a task
     Stop(TasksStopArgs),
 }
 
@@ -440,11 +440,11 @@ pub struct TasksStartArgs {
     #[arg(index = 1, value_name = "NAME")]
     pub name: String,
 
-    /// Container image to run
+    /// OCI image to run
     #[arg(short = 'i', long = "image", value_name = "IMAGE")]
     pub image: String,
 
-    /// Command arguments for the container (repeat flag to add arguments)
+    /// Command arguments for the task runtime instance (repeat flag to add arguments)
     #[arg(short = 'c', long = "command", value_name = "ARG", action = ArgAction::Append)]
     pub command: Vec<String>,
 

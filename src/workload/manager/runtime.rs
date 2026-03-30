@@ -21,17 +21,17 @@ use crate::network::types::{
 use crate::network::wireguard;
 use crate::runtime::types::{RuntimeAttachmentTarget, RuntimeEvent};
 use crate::workload::model::{
-    WorkloadEvent as TaskEvent, WorkloadPhase as ContainerState,
-    WorkloadServiceMetadata as TaskServiceMetadata, WorkloadSpec as TaskSpec,
-    WorkloadStatus as TaskStatus, compare_workload_causality as compare_task_causality,
-    compare_workload_status_causality as compare_task_status_causality,
+    WorkloadEvent as TaskEvent, WorkloadPhase, WorkloadServiceMetadata as TaskServiceMetadata,
+    WorkloadSpec as TaskSpec, WorkloadStatus as TaskStatus,
+    compare_workload_causality as compare_task_causality,
+    compare_workload_status_causality as compare_task_status_causality, select_best_workload_value,
 };
 use crate::workload::types::WorkloadRestartPolicyKind as TaskRestartPolicyKind;
 
 use super::WorkloadManager;
 use super::{
     TASK_GOSSIP_FLUSH_INTERVAL, merge_definition_into_value, merge_status_into_value,
-    select_best_task_value, spec_to_value, value_to_spec,
+    spec_to_value, value_to_spec,
 };
 
 /// Maximum attempts when provisioning one runtime attachment.
@@ -198,7 +198,7 @@ impl WorkloadManager {
             .filter(|value| {
                 value.node_id == self.local_node_id
                     && !value.networks.is_empty()
-                    && matches!(value.state, ContainerState::Running)
+                    && matches!(value.state, WorkloadPhase::Running)
             })
             .cloned()
             .collect();
@@ -318,7 +318,7 @@ impl WorkloadManager {
         if let Err(err) = self.reconcile_local_runtime_inventory().await {
             warn!(
                 target: "task",
-                "failed to reconcile local containers at startup: {err:#}"
+                "failed to reconcile local instances at startup: {err:#}"
             );
         }
 
@@ -403,15 +403,15 @@ impl WorkloadManager {
         }
         if matches!(
             spec.state,
-            ContainerState::Stopping | ContainerState::Stopped | ContainerState::Failed
+            WorkloadPhase::Stopping | WorkloadPhase::Stopped | WorkloadPhase::Failed
         ) {
             return Ok(());
         }
 
         let reason = if exit_code == 0 {
-            "container exited with status code 0 and restart policy disabled".to_string()
+            "instance exited with status code 0 and restart policy disabled".to_string()
         } else {
-            format!("container exited with status code {exit_code}")
+            format!("instance exited with status code {exit_code}")
         };
         if let Err(err) = self
             .record_terminal_observation_for_current_launch(task_id, Some(reason.clone()))
@@ -432,7 +432,7 @@ impl WorkloadManager {
         }
         if self.should_block_local_service_runtime(&spec) {
             let reason = format!(
-                "container exited with status code {exit_code} while node {} is draining",
+                "instance exited with status code {exit_code} while node {} is draining",
                 self.local_node_id
             );
             let _ = self.mark_task_failed(spec, anyhow::anyhow!(reason)).await;
@@ -444,7 +444,7 @@ impl WorkloadManager {
                 target: "task",
                 task = %task_id,
                 exit_code,
-                "runtime reported container exit that is restartable by policy"
+                "runtime reported instance exit that is restartable by policy"
             );
             return Ok(());
         }
@@ -467,12 +467,12 @@ impl WorkloadManager {
             if let Err(err) = result {
                 warn!(
                     target: "task",
-                    "container runtime event stream failed; retrying: {err}"
+                    "runtime event stream failed; retrying: {err}"
                 );
             } else {
                 warn!(
                     target: "task",
-                    "container runtime event stream ended; reconnecting"
+                    "runtime event stream ended; reconnecting"
                 );
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -503,7 +503,7 @@ impl WorkloadManager {
                     .store
                     .get_snapshot(&UuidKey::from(spec.id))
                     .map_err(|e| anyhow::anyhow!("task lookup failed before upsert apply: {e}"))?
-                    && let Some(current) = select_best_task_value(snapshot.as_slice())
+                    && let Some(current) = select_best_workload_value(snapshot.as_slice())
                 {
                     let ordering = compare_task_causality(&current, &incoming);
                     if ordering.is_gt() {
@@ -552,7 +552,7 @@ impl WorkloadManager {
                             );
                         }
                     });
-                } else if !matches!(persisted_spec.state, ContainerState::Running) {
+                } else if !matches!(persisted_spec.state, WorkloadPhase::Running) {
                     self.local_state
                         .local_instances
                         .lock()
@@ -578,7 +578,7 @@ impl WorkloadManager {
                     .store
                     .get_snapshot(&UuidKey::from(status.id))
                     .map_err(|e| anyhow::anyhow!("task lookup failed before status apply: {e}"))?
-                    .and_then(|snapshot| select_best_task_value(snapshot.as_slice()));
+                    .and_then(|snapshot| select_best_workload_value(snapshot.as_slice()));
                 if let Some(current) = current.as_ref()
                     && !compare_task_status_causality(current, &status).is_gt()
                 {
@@ -620,7 +620,7 @@ impl WorkloadManager {
                             );
                         }
                     });
-                } else if !matches!(persisted_spec.state, ContainerState::Running) {
+                } else if !matches!(persisted_spec.state, WorkloadPhase::Running) {
                     self.local_state
                         .local_instances
                         .lock()
@@ -636,11 +636,11 @@ impl WorkloadManager {
                     let active_local = spec.node_id == self.local_node_id
                         && matches!(
                             spec.state,
-                            ContainerState::Pending
-                                | ContainerState::Pulling
-                                | ContainerState::Creating
-                                | ContainerState::Running
-                                | ContainerState::Stopping
+                            WorkloadPhase::Pending
+                                | WorkloadPhase::Pulling
+                                | WorkloadPhase::Creating
+                                | WorkloadPhase::Running
+                                | WorkloadPhase::Stopping
                         );
                     if active_local {
                         debug!(
@@ -707,7 +707,7 @@ impl WorkloadManager {
         let (has_snapshot, task_revision) = match snapshot {
             Some(values) => (
                 true,
-                select_best_task_value(values.as_slice())
+                select_best_workload_value(values.as_slice())
                     .as_ref()
                     .and_then(task_revision_timestamp),
             ),
@@ -1111,16 +1111,17 @@ impl WorkloadManager {
                 .store
                 .get_snapshot(&UuidKey::from(attachment.task_id))
                 .with_context(|| format!("lookup task {}", attachment.task_id))?
-                .and_then(|snap| select_best_task_value(snap.as_slice()));
+                .and_then(|snap| select_best_workload_value(snap.as_slice()));
             let task_state = task_value.as_ref().map(|value| value.state.clone());
-            let task_revision = task_value.as_ref().and_then(task_revision_timestamp);
+            let task_revision: Option<String> =
+                task_value.as_ref().and_then(task_revision_timestamp);
 
             let should_remove = matches!(
                 task_state,
-                None | Some(ContainerState::Stopped)
-                    | Some(ContainerState::Failed)
-                    | Some(ContainerState::Exited(_))
-                    | Some(ContainerState::Unknown)
+                None | Some(WorkloadPhase::Stopped)
+                    | Some(WorkloadPhase::Failed)
+                    | Some(WorkloadPhase::Exited(_))
+                    | Some(WorkloadPhase::Unknown)
             );
 
             if !should_remove {

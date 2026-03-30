@@ -11,17 +11,14 @@ use crate::scheduler::{Scheduler, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::store::task_store::TaskStore;
-use crate::task::types::TaskStateFilter;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
-    RuntimeClass, WorkloadEvent as TaskEvent, WorkloadPhase as ContainerState,
-    WorkloadServiceMetadata as TaskServiceMetadata, WorkloadSpec as TaskSpec,
-    WorkloadStatus as TaskStatus, WorkloadValue as TaskValue,
-    should_replace_workload_event as should_replace_task_event,
+    RuntimeClass, WorkloadEvent as TaskEvent, WorkloadPhase,
+    WorkloadServiceMetadata as TaskServiceMetadata, WorkloadSpec as TaskSpec, WorkloadStateFilter,
+    WorkloadStatus as TaskStatus, WorkloadValue as TaskValue, should_replace_workload_event,
 };
 pub(crate) use crate::workload::model::{
-    merge_definition_into_value, merge_status_into_value,
-    select_best_workload_value as select_best_task_value, spec_to_status, spec_to_value,
+    merge_definition_into_value, merge_status_into_value, spec_to_status, spec_to_value,
     value_to_spec,
 };
 use crate::workload::types::TaskExecutionSpec;
@@ -73,14 +70,14 @@ const TASK_GOSSIP_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// Number of fanout rounds one logical task update should survive before it ages out.
 const TASK_GOSSIP_COVERAGE_ROUNDS: usize = 3;
 
-/// Remove tombstone metadata used to suppress stale task upsert replay.
+/// Remove tombstone metadata used to suppress stale workload upsert replay.
 #[derive(Clone)]
 struct RemoveTombstone {
     watermark: DateTime<Utc>,
     max_epoch: u64,
 }
 
-/// Buffered outbound gossip state for one task id before it enters the shared gossip queue.
+/// Buffered outbound gossip state for one workload id before it enters the shared gossip queue.
 #[derive(Clone)]
 struct DirtyTaskGossipRecord {
     definition: Option<TaskSpec>,
@@ -89,7 +86,7 @@ struct DirtyTaskGossipRecord {
 }
 
 impl DirtyTaskGossipRecord {
-    /// Builds one dirty gossip record from the first task event seen for a task id.
+    /// Builds one dirty gossip record from the first workload event seen for a workload id.
     fn new(event: TaskEvent) -> Self {
         let definition = match &event {
             TaskEvent::UpsertSpec(spec) => Some((**spec).clone()),
@@ -102,7 +99,7 @@ impl DirtyTaskGossipRecord {
         }
     }
 
-    /// Merges one later task event into the buffered outbound state for the same task id.
+    /// Merges one later workload event into the buffered outbound state for the same workload id.
     fn merge(&mut self, event: TaskEvent) {
         match &event {
             TaskEvent::Remove { .. } => {
@@ -112,7 +109,7 @@ impl DirtyTaskGossipRecord {
             TaskEvent::UpsertSpec(spec) => {
                 if let Some(current) = self.definition.as_ref() {
                     let current = TaskEvent::UpsertSpec(Box::new(current.clone()));
-                    if should_replace_task_event(&current, &event) {
+                    if should_replace_workload_event(&current, &event) {
                         self.definition = Some((**spec).clone());
                     }
                 } else {
@@ -120,14 +117,14 @@ impl DirtyTaskGossipRecord {
                 }
 
                 if matches!(self.latest, TaskEvent::Remove { .. })
-                    || should_replace_task_event(&self.latest, &event)
+                    || should_replace_workload_event(&self.latest, &event)
                 {
                     self.latest = event;
                 }
             }
             TaskEvent::UpsertStatus(_) => {
                 if matches!(self.latest, TaskEvent::Remove { .. })
-                    || should_replace_task_event(&self.latest, &event)
+                    || should_replace_workload_event(&self.latest, &event)
                 {
                     self.latest = event;
                 }
@@ -220,7 +217,7 @@ struct WorkloadManagerCore {
 
 #[derive(Clone)]
 struct WorkloadManagerRuntime {
-    // Container runtime abstraction used for create/start/stop/inspect/pull flows.
+    // Runtime backend used for create/start/stop/inspect/pull flows.
     runtime_backend: Arc<dyn RuntimeBackend + Send + Sync>,
     // Node-local semaphore that bounds concurrent image pulls.
     pull_limiter: Arc<Semaphore>,
@@ -230,7 +227,7 @@ struct WorkloadManagerRuntime {
 
 #[derive(Clone)]
 struct WorkloadManagerLocalState {
-    // Best-effort mapping from task id to current container identifier.
+    // Best-effort mapping from task id to current runtime instance identifier.
     local_instances: Arc<AsyncMutex<HashMap<Uuid, String>>>,
     // Per-task decoded spec cache reused while the backing store stays unchanged.
     task_spec_cache: Arc<StdMutex<HashMap<Uuid, CachedTaskSpecEntry>>>,
@@ -549,7 +546,7 @@ impl WorkloadManager {
     }
 
     #[allow(dead_code)]
-    pub async fn start_container(
+    pub async fn start_workload(
         &self,
         name: impl Into<String>,
         image: impl Into<String>,
@@ -779,7 +776,7 @@ impl WorkloadManager {
     /// Returns task specifications filtered according to the provided list policy.
     pub async fn list_tasks(
         &self,
-        filter: &TaskStateFilter,
+        filter: &WorkloadStateFilter,
     ) -> Result<Vec<TaskSpec>, anyhow::Error> {
         let (actives, _) = self
             .core
@@ -790,7 +787,8 @@ impl WorkloadManager {
         let mut specs = Vec::with_capacity(actives.len());
         for (k, snap) in actives {
             let id = k.to_uuid();
-            if let Some(value) = select_best_task_value(snap.as_slice()) {
+            if let Some(value) = crate::workload::model::select_best_workload_value(snap.as_slice())
+            {
                 let spec = value_to_spec(id, value);
                 if filter.accepts(&spec.state) {
                     specs.push(spec);
@@ -820,17 +818,18 @@ impl WorkloadManager {
         match_task_id_prefix(
             trimmed,
             actives.into_iter().filter_map(|(key, snapshot)| {
-                select_best_task_value(snapshot.as_slice()).map(|_| key.to_uuid())
+                crate::workload::model::select_best_workload_value(snapshot.as_slice())
+                    .map(|_| key.to_uuid())
             }),
         )
     }
 
-    /// Returns the replicated container state for each provided task identifier so higher level
+    /// Returns the replicated instance state for each provided task identifier so higher level
     /// controllers can determine whether a rollout has converged cluster-wide yet.
     pub async fn task_state_snapshot(
         &self,
         ids: &[Uuid],
-    ) -> Result<Vec<(Uuid, Option<ContainerState>)>, anyhow::Error> {
+    ) -> Result<Vec<(Uuid, Option<WorkloadPhase>)>, anyhow::Error> {
         let mut states = Vec::with_capacity(ids.len());
         for id in ids {
             let key = UuidKey::from(*id);
@@ -841,7 +840,9 @@ impl WorkloadManager {
                 .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?;
 
             let state = snapshot
-                .and_then(|snap| select_best_task_value(snap.as_slice()))
+                .and_then(|snap| {
+                    crate::workload::model::select_best_workload_value(snap.as_slice())
+                })
                 .map(|value| value.state);
             states.push((*id, state));
         }
@@ -945,7 +946,7 @@ impl WorkloadManager {
                 task = %id,
                 spec_tty = spec.tty,
                 runtime_tty,
-                "task attach detected persisted tty mismatch, using runtime container setting"
+                "task attach detected persisted tty mismatch, using runtime instance setting"
             );
         }
         runtime_options.tty = runtime_tty;
@@ -957,7 +958,7 @@ impl WorkloadManager {
             .map_err(|err| anyhow!("task attach failed for {id}: {err}"))
     }
 
-    /// Starts one streamed exec session inside a locally owned task container.
+    /// Starts one streamed exec session inside a locally owned task instance.
     ///
     /// The RPC layer uses this to keep remote exec transport-agnostic while the runtime owns
     /// command creation, tty allocation, and exit-code reporting.
@@ -980,7 +981,7 @@ impl WorkloadManager {
                 spec.node_id
             ));
         }
-        if !matches!(spec.state, ContainerState::Running) {
+        if !matches!(spec.state, WorkloadPhase::Running) {
             return Err(anyhow!(
                 "task {id} is not running (state: {:?})",
                 spec.state
@@ -1005,7 +1006,7 @@ impl WorkloadManager {
     /// Verifies that a locally owned task still has a running runtime before an interactive
     /// attach or exec session is accepted.
     ///
-    /// This lets the RPC path reject stale "running" task records when the container has already
+    /// This lets the RPC path reject stale "running" task records when the runtime instance has already
     /// exited, instead of returning an empty attach/exec stream that looks like success to the
     /// CLI.
     async fn ensure_local_task_runtime_running(
@@ -1020,7 +1021,7 @@ impl WorkloadManager {
                 spec.node_id
             ));
         }
-        if !matches!(spec.state, ContainerState::Running) {
+        if !matches!(spec.state, WorkloadPhase::Running) {
             return Err(anyhow!(
                 "task {id} is not running (state: {:?})",
                 spec.state
@@ -1077,25 +1078,19 @@ impl WorkloadManager {
         let spec = self.load_spec(id).await?;
 
         if spec.node_id != self.local_node_id {
-            if matches!(
-                spec.state,
-                ContainerState::Stopping | ContainerState::Stopped
-            ) {
+            if matches!(spec.state, WorkloadPhase::Stopping | WorkloadPhase::Stopped) {
                 return Ok(spec);
             }
             return self.stop_remote_task(&spec).await;
         }
 
-        if matches!(
-            spec.state,
-            ContainerState::Stopping | ContainerState::Stopped
-        ) {
+        if matches!(spec.state, WorkloadPhase::Stopping | WorkloadPhase::Stopped) {
             return Ok(spec);
         }
 
         let mut updated = spec.clone();
         updated.phase_version = updated.phase_version.saturating_add(1);
-        updated.state = ContainerState::Stopping;
+        updated.state = WorkloadPhase::Stopping;
         updated.phase_reason = None;
         updated.phase_progress = None;
         updated.updated_at = Utc::now().to_rfc3339();
@@ -1116,10 +1111,7 @@ impl WorkloadManager {
         if spec.node_id != self.local_node_id {
             return Ok(());
         }
-        if !matches!(
-            spec.state,
-            ContainerState::Stopping | ContainerState::Stopped
-        ) {
+        if !matches!(spec.state, WorkloadPhase::Stopping | WorkloadPhase::Stopped) {
             return Ok(());
         }
 
@@ -1524,17 +1516,17 @@ fn ensure_dir_writable(base: &Path) -> io::Result<()> {
 }
 
 fn wrap_create_error(task_name: &str, err: RuntimeError) -> anyhow::Error {
-    anyhow::Error::new(err).context(format!("docker create failed for task {task_name}"))
+    anyhow::Error::new(err).context(format!("runtime create failed for task {task_name}"))
 }
 
 fn wrap_existing_inspect_error(task_name: &str, err: RuntimeError) -> anyhow::Error {
     anyhow::Error::new(err).context(format!(
-        "failed to inspect existing container for task {task_name} after name conflict"
+        "failed to inspect existing runtime instance for task {task_name} after name conflict"
     ))
 }
 
 fn wrap_start_error(task_name: &str, err: RuntimeError) -> anyhow::Error {
-    anyhow::Error::new(err).context(format!("docker start failed for task {task_name}"))
+    anyhow::Error::new(err).context(format!("runtime start failed for task {task_name}"))
 }
 
 /// Matches one task identifier or prefix against a visible task-id set and returns a unique UUID.
@@ -1628,7 +1620,7 @@ impl Drop for ReconcileTaskGuard {
     }
 }
 
-/// Ensures GPU-bound containers see the selected devices by injecting the
+/// Ensures GPU-bound runtime instances see the selected devices by injecting the
 /// NVIDIA_VISIBLE_DEVICES environment variable when missing.
 pub(super) fn append_nvidia_visible_devices(
     env_vars: &mut Option<Vec<String>>,

@@ -6,9 +6,7 @@ use chrono::Utc;
 use tracing::warn;
 
 use crate::gpu::gpu_runtime_status;
-use crate::workload::model::{
-    WorkloadEvent as TaskEvent, WorkloadPhase as ContainerState, WorkloadSpec as TaskSpec,
-};
+use crate::workload::model::{WorkloadEvent as TaskEvent, WorkloadPhase, WorkloadSpec as TaskSpec};
 
 use super::ReconcileTaskGuard;
 use super::WorkloadManager;
@@ -119,7 +117,7 @@ impl WorkloadManager {
                 image: plan.image.clone(),
                 runtime_class: plan.runtime_class,
                 sandbox_profile: plan.sandbox_profile.clone(),
-                state: ContainerState::Pending,
+                state: WorkloadPhase::Pending,
                 phase_reason: None,
                 phase_progress: None,
                 created_at: Utc::now().to_rfc3339(),
@@ -196,7 +194,7 @@ impl WorkloadManager {
         for spec in specs {
             let mut blocked = spec.clone();
             blocked.phase_version = blocked.phase_version.saturating_add(1);
-            blocked.state = ContainerState::VolumeUnavailable;
+            blocked.state = WorkloadPhase::VolumeUnavailable;
             blocked.phase_reason = Some(reason.clone());
             blocked.phase_progress = None;
             blocked.slot_ids.clear();
@@ -230,7 +228,7 @@ impl WorkloadManager {
         for plan in plans.iter_mut() {
             let instance_name = format!("mantissa-{}", plan.id);
             self.pull_image_for_task(plan.id, &plan.image).await?;
-            self.update_task_phase(plan.id, ContainerState::Creating, None, None)
+            self.update_task_phase(plan.id, WorkloadPhase::Creating, None, None)
                 .await?;
 
             let instance_id = self
@@ -290,7 +288,7 @@ impl WorkloadManager {
                 match self.load_spec(plan.id).await {
                     Ok(current) => (
                         current.task_epoch,
-                        if matches!(current.state, ContainerState::Running) {
+                        if matches!(current.state, WorkloadPhase::Running) {
                             current.phase_version
                         } else {
                             current.phase_version.saturating_add(1)
@@ -306,7 +304,7 @@ impl WorkloadManager {
                 image: plan.image.clone(),
                 runtime_class: plan.runtime_class,
                 sandbox_profile: plan.sandbox_profile.clone(),
-                state: ContainerState::Running,
+                state: WorkloadPhase::Running,
                 phase_reason: None,
                 phase_progress: None,
                 created_at: plan.created_at.to_rfc3339(),

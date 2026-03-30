@@ -1598,7 +1598,7 @@ longer read like Docker container orchestration internals.
 
 ### Status
 
-Pending.
+Done.
 
 ### Scope
 
@@ -1643,3 +1643,87 @@ Pending.
 1. `cargo fmt --all`
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo test`
+
+### Implemented
+
+1. Moved the generic lifecycle filter into the workload model:
+   - added `WorkloadStateKind`
+   - added `WorkloadStateFilter`
+   - made `src/task/types.rs` a thin alias layer over workload-native state
+     filtering and task/workload value types.
+2. Deleted the temporary task compatibility shims that were only forwarding into
+   the workload layer:
+   - `src/task/causality.rs`
+   - `src/task/container.rs`
+   - `src/task/manager/mod.rs`
+   - removed the corresponding module exports from `src/task/mod.rs`
+3. Moved the causality tie-break test onto the workload model in
+   `src/workload/model.rs` so the deleted task shim no longer owned unique test
+   coverage.
+4. Replaced the top-level Docker-only config entry with a runtime registry model
+   in `src/config.rs`:
+   - `Config::docker` -> `Config::runtimes`
+   - `DockerConfig` -> `RuntimeRegistryConfig` + `OciRuntimeConfig`
+   - `docker_host()` -> `oci_runtime_host()`
+   - `MANTISSA_DOCKER_HOST` -> `MANTISSA_RUNTIME_OCI_HOST`
+   - `docker.host` -> `runtimes.oci.host`
+5. Cut the OCI Docker backend over to the new runtime config helper in
+   `src/runtime/oci/docker.rs`.
+6. Removed the last live references to the deleted task shims and old helper
+   names across:
+   - `src/network/discovery.rs`
+   - `src/topology/service.rs`
+   - `src/workload/manager/*`
+   - server/bootstrap/test call sites already moved during the milestone work
+7. Renamed the generic workload-manager helper `start_container()` to
+   `start_workload()` and updated tests/callers.
+8. Cleaned generic-layer wording in `src/workload/manager/` so comments, error
+   messages, and helper names refer to runtime instances and runtime inventory
+   instead of Docker containers.
+9. Updated documentation in `docs/configuration.md` and the CLI wording in
+   `src/cli.rs` to reflect the runtime registry terminology.
+
+### Removed
+
+1. Deleted task-to-workload compatibility modules that no longer had any live
+   callers.
+2. Removed the remaining Docker-only top-level config shape.
+3. Removed the generic workload manager's dependency on task-owned lifecycle
+   filtering by moving that filter into the workload model.
+
+### Findings
+
+1. The only compile fallout from deleting the task shims was a small number of
+   direct callers still using the old workload-selection helper name and one
+   missing test import after the state-filter move.
+2. The generic layer still had substantial container-era wording even after the
+   runtime extraction. Cleaning that wording in Milestone 10 was necessary to
+   make the shared workload/runtime core read like a real generic substrate
+   instead of a renamed Docker manager.
+
+### Validation
+
+1. `cargo fmt --all`
+2. `cargo clippy --all-targets -- -D warnings`
+3. `cargo test`
+
+### Proposed Commit
+
+```text
+cleanup: remove task shims and finalize runtime naming
+
+Delete the temporary task compatibility modules that only forwarded into the
+workload layer and move the remaining shared lifecycle filter into the workload
+model so the generic manager no longer depends on task-owned state types.
+
+Replace the top-level docker.host config with a runtime registry config rooted
+at runtimes.oci.host, switch the OCI Docker backend to the new helper, and
+update docs and tests to use the hard-cutover environment variable
+MANTISSA_RUNTIME_OCI_HOST.
+
+This also finishes the generic naming cleanup in the workload manager by
+renaming the test helper start_container to start_workload, moving the
+remaining causality test onto the workload model, and updating generic runtime
+comments and errors to refer to runtime instances and runtime inventory rather
+than Docker containers.
+```
