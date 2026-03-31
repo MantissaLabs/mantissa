@@ -245,16 +245,16 @@ local_test!(task_logs_relay_over_tcp_sessions, {
     let task_value = replicated_task_value(task_id, owner.id(), "owner-node");
     owner
         .node
-        .tasks
+        .workloads
         .upsert(&UuidKey::from(task_id), task_value.clone())
         .await
-        .expect("seed owner task store");
+        .expect("seed owner workload store");
     requester
         .node
-        .tasks
+        .workloads
         .upsert(&UuidKey::from(task_id), task_value)
         .await
-        .expect("seed requester task store");
+        .expect("seed requester workload store");
 
     owner_manager.frames.lock().await.insert(
         format!("mantissa-{task_id}"),

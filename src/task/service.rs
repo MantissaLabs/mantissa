@@ -102,7 +102,7 @@ pub fn add_event(
     event: &TaskEvent,
 ) {
     let msg = list.reborrow().get(index);
-    let mut task = msg.init_task();
+    let mut task = msg.init_workload();
 
     match event {
         TaskEvent::UpsertSpec(spec) => {
@@ -141,7 +141,7 @@ pub fn read_event(reader: task_event::Reader) -> Result<TaskEvent, Error> {
     }
 }
 
-/// Encodes one compact task lifecycle status into the task gossip payload.
+/// Encodes one compact workload lifecycle status into the workload gossip payload.
 pub fn write_status(mut builder: task_status::Builder<'_>, status: &TaskStatus) {
     builder.set_id(status.id.as_bytes());
     builder.set_name(&status.name);
@@ -165,7 +165,7 @@ pub fn write_status(mut builder: task_status::Builder<'_>, status: &TaskStatus) 
     builder.set_sandbox_profile(status.sandbox_profile.as_deref().unwrap_or(""));
 }
 
-/// Decodes one compact task lifecycle status from the task gossip payload.
+/// Decodes one compact workload lifecycle status from the workload gossip payload.
 pub fn read_status(reader: task_status::Reader<'_>) -> Result<TaskStatus, Error> {
     Ok(TaskStatus {
         id: read_id_from_data(reader.get_id()?)?,

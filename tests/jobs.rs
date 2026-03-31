@@ -33,7 +33,7 @@ local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
     task.state = WorkloadPhase::Exited(0);
     task.updated_at = Utc::now().to_rfc3339();
     node.node
-        .tasks
+        .workloads
         .upsert(&UuidKey::from(active_task_id), task_spec_to_value(&task))
         .await
         .expect("persist successful task state");
@@ -72,7 +72,7 @@ local_test!(jobs_retry_after_failed_task, {
     task.state = WorkloadPhase::Exited(1);
     task.updated_at = Utc::now().to_rfc3339();
     node.node
-        .tasks
+        .workloads
         .upsert(&UuidKey::from(first_task_id), task_spec_to_value(&task))
         .await
         .expect("persist failed task state");
@@ -104,7 +104,7 @@ local_test!(jobs_retry_after_failed_task, {
         .expect("list tasks");
     assert!(
         tasks.iter().any(|task| task.id == first_task_id),
-        "first failed task should remain visible in the replicated task store"
+        "first failed task should remain visible in the replicated workload store"
     );
 });
 
@@ -201,7 +201,7 @@ async fn wait_for_job_status(
     .await
 }
 
-/// Rebuilds one task store value from the current task spec so tests can inject state transitions.
+/// Rebuilds one workload-store value from the current task spec so tests can inject state transitions.
 fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
     TaskValue {
         id: spec.id,

@@ -60,13 +60,13 @@ Impact:
 
 - Removed most state regressions caused by out-of-order gossip/sync delivery.
 
-### 3. Coalesce gossip task updates aggressively
+### 3. Coalesce gossip workload updates aggressively
 
 Per-task state churn can produce many updates in a short window.
 
 Key lesson:
 
-- Coalesce outbound task updates by `task_id` per flush tick.
+- Coalesce outbound workload updates by `task_id` per flush tick.
 - Keep only the causally newest update.
 - Prefer `Remove` over `Upsert` for the same task when both are pending.
 
@@ -140,7 +140,7 @@ A critical root cause of task row resurrection after stop/remove:
 
 Key lesson:
 
-- Preserve local tombstones in task store merge behavior.
+- Preserve local tombstones in workload store merge behavior.
 - Check durable tombstone presence when in-memory watermark is missing.
 - Treat remove-without-visible-snapshot as authoritative to block late stale
   replay.

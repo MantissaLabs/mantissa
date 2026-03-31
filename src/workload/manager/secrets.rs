@@ -2,7 +2,7 @@ use super::{WorkloadManager, WorkloadStartRequest};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::types::SecretValue;
 use crate::workload::model::{
-    WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile as TaskSecretFile,
+    WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
@@ -69,7 +69,7 @@ impl WorkloadManager {
         &self,
         task_id: Uuid,
         env: &[TaskEnvironmentVariable],
-        secret_files: &[TaskSecretFile],
+        secret_files: &[WorkloadSecretFile],
     ) -> Result<ResolvedTaskSecrets> {
         // Clear any stale staging content in case a previous attempt failed.
         self.cleanup_secret_artifacts(task_id).await;
@@ -175,7 +175,7 @@ impl WorkloadManager {
     async fn stage_secret_files(
         &self,
         task_id: Uuid,
-        files: &[TaskSecretFile],
+        files: &[WorkloadSecretFile],
         value_cache: &mut HashMap<String, SecretValue>,
         plaintext_cache: &mut HashMap<Uuid, Arc<[u8]>>,
         keyring: &SecretKeyring,

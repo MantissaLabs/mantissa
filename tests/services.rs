@@ -1322,7 +1322,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
     stale.updated_at = Utc::now().to_rfc3339();
 
     node.node
-        .tasks
+        .workloads
         .upsert(&UuidKey::from(stale.id), task_spec_to_value(&stale))
         .await
         .expect("inject stale running task value");
@@ -1374,7 +1374,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
     stale_stopping.updated_at = Utc::now().to_rfc3339();
 
     node.node
-        .tasks
+        .workloads
         .upsert(
             &UuidKey::from(stale_stopping.id),
             task_spec_to_value(&stale_stopping),
@@ -3127,7 +3127,7 @@ local_test!(services_sync_recovers_missing_entries, {
         .expect("purge service from peer store");
     for task_id in &expected_task_ids {
         peer.node
-            .tasks
+            .workloads
             .purge_local(&UuidKey::from(*task_id))
             .await
             .expect("purge task from peer store");

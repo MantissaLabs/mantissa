@@ -16,10 +16,10 @@ use crate::store::scheduler_digest_store::{SchedulerDigestStore, open_scheduler_
 use crate::store::scheduler_store::{SchedulerStore, open_scheduler_store};
 use crate::store::secret_store::{SecretStore, open_secret_store};
 use crate::store::service_store::{ServiceStore, open_service_store};
-use crate::store::task_store::{TaskStore, open_task_store};
 use crate::store::volume_store::{
     VolumeNodeStore, VolumeSpecStore, open_volume_node_store, open_volume_spec_store,
 };
+use crate::store::workload_store::{WorkloadStore, open_workload_store};
 use crate::token::TokenStore;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -46,7 +46,7 @@ pub(crate) struct BootstrapStores {
     pub local_creds: LocalCredentialStore,
     pub token_store: TokenStore,
     pub secret_master_store: SecretMasterStore,
-    pub tasks: TaskStore,
+    pub workloads: WorkloadStore,
     pub jobs: JobStore,
     pub agents: AgentStore,
     pub scheduler_store: SchedulerStore,
@@ -93,8 +93,8 @@ impl BootstrapStores {
 
         peers.debug_dump_root("peers").await;
 
-        let tasks = open_task_store(ctx.db.clone(), ctx.self_id)?;
-        tasks.rebuild_mst_from_disk().await?;
+        let workloads = open_workload_store(ctx.db.clone(), ctx.self_id)?;
+        workloads.rebuild_mst_from_disk().await?;
 
         let jobs = open_job_store(ctx.db.clone(), ctx.self_id)?;
         jobs.rebuild_mst_from_disk().await?;
@@ -138,7 +138,7 @@ impl BootstrapStores {
             local_creds,
             token_store,
             secret_master_store,
-            tasks,
+            workloads,
             jobs,
             agents,
             scheduler_store,

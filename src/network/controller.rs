@@ -13,7 +13,7 @@ use crate::network::types::{
 use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
 use crate::services::registry::ServiceRegistry;
-use crate::store::task_store::TaskStore;
+use crate::store::workload_store::WorkloadStore;
 use anyhow::{Context, Result};
 use async_channel::Sender;
 #[cfg(target_os = "linux")]
@@ -104,7 +104,7 @@ impl NetworkController {
     pub fn new(
         registry: NetworkRegistry,
         cluster_registry: Registry,
-        task_store: TaskStore,
+        workload_store: WorkloadStore,
         service_registry: ServiceRegistry,
         node_id: Uuid,
         node_name: String,
@@ -123,7 +123,7 @@ impl NetworkController {
 
         let discovery = ServiceDiscovery::new(
             registry.clone(),
-            task_store,
+            workload_store,
             service_registry,
             bpf.clone(),
             cluster_registry.health_monitor(),

@@ -19,12 +19,12 @@ use crate::store::peer_store::PeersStore;
 use crate::store::scheduler_digest_store::SchedulerDigestStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
-use crate::store::task_store::TaskStore;
 use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
+use crate::store::workload_store::WorkloadStore;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
-use crate::task::types::TaskValue;
 use crate::topology::peers::PeerValue;
 use crate::volumes::types::{VolumeNodeStateValue, VolumeSpecValue};
+use crate::workload::model::WorkloadValue;
 use async_trait::async_trait;
 use bincode;
 use capnp_rpc::new_client;
@@ -41,7 +41,7 @@ type TombstoneDelta = Vec<(UuidKey, u64)>;
 /// Same domain ordering as the server, used when a caller wants a full peer reconciliation.
 const ALL_SYNC_DOMAINS: [Domain; 13] = [
     Domain::Peers,
-    Domain::Tasks,
+    Domain::Workloads,
     Domain::Services,
     Domain::Jobs,
     Domain::Agents,
@@ -59,7 +59,7 @@ const ALL_SYNC_DOMAINS: [Domain; 13] = [
 /// Local replicated stores that can participate in one anti-entropy pass.
 pub struct SyncStores {
     pub peers: PeersStore,
-    pub tasks: TaskStore,
+    pub workloads: WorkloadStore,
     pub jobs: JobStore,
     pub agents: AgentStore,
     pub services: ServiceStore,
@@ -97,7 +97,7 @@ impl SyncStores {
     async fn root_hex(&self, domain: Domain) -> String {
         match domain {
             Domain::Peers => self.peers.root_hex().await,
-            Domain::Tasks => self.tasks.root_hex().await,
+            Domain::Workloads => self.workloads.root_hex().await,
             Domain::Services => self.services.root_hex().await,
             Domain::Jobs => self.jobs.root_hex().await,
             Domain::Agents => self.agents.root_hex().await,
@@ -116,7 +116,7 @@ impl SyncStores {
     async fn page_range_summary(&self, domain: Domain) -> crdt_store::Result<Vec<PageDigestRange>> {
         match domain {
             Domain::Peers => self.peers.page_range_summary().await,
-            Domain::Tasks => self.tasks.page_range_summary().await,
+            Domain::Workloads => self.workloads.page_range_summary().await,
             Domain::Services => self.services.page_range_summary().await,
             Domain::Jobs => self.jobs.page_range_summary().await,
             Domain::Agents => self.agents.page_range_summary().await,
@@ -185,11 +185,11 @@ impl delta_sink::Server for DeltaSinkImpl {
                 )
                 .await?
             }
-            Domain::Tasks => {
+            Domain::Workloads => {
                 apply_chunk(
-                    self.stores.tasks.clone(),
+                    self.stores.workloads.clone(),
                     &chunk,
-                    decode_register::<TaskValue>,
+                    decode_register::<WorkloadValue>,
                 )
                 .await?
             }
@@ -362,10 +362,10 @@ impl DeltaStore<PeerValue> for PeersStore {
 }
 
 #[async_trait]
-impl DeltaStore<TaskValue> for TaskStore {
+impl DeltaStore<WorkloadValue> for WorkloadStore {
     async fn apply_delta(
         self,
-        regs: Vec<(UuidKey, MVReg<TaskValue, uuid::Uuid>)>,
+        regs: Vec<(UuidKey, MVReg<WorkloadValue, uuid::Uuid>)>,
         tombs: Vec<(UuidKey, u64)>,
     ) -> io::Result<()> {
         self.apply_delta_chunk_update_mst(regs, tombs).await

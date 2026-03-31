@@ -7,12 +7,10 @@ use crate::runtime::types::{
     ResourceLimits, RestartPolicyConfig, RestartPolicyType, RuntimeCreateRequest,
 };
 use crate::workload::model::{
-    RuntimeClass, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
-    WorkloadSecretFile as TaskSecretFile, WorkloadVolumeMount as TaskVolumeMount,
+    RuntimeClass, WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile,
+    WorkloadVolumeMount as TaskVolumeMount,
 };
-use crate::workload::types::{
-    WorkloadRestartPolicy as TaskRestartPolicy, WorkloadRestartPolicyKind as TaskRestartPolicyKind,
-};
+use crate::workload::types::{WorkloadRestartPolicy, WorkloadRestartPolicyKind};
 
 use super::secrets::ResolvedTaskSecrets;
 use super::{
@@ -35,9 +33,9 @@ pub(super) struct InstanceLaunchRequest<'a> {
     pub gpu_count: u32,
     pub gpu_device_ids: &'a [String],
     pub truncate_gpu_device_ids: bool,
-    pub restart_policy: Option<&'a TaskRestartPolicy>,
+    pub restart_policy: Option<&'a WorkloadRestartPolicy>,
     pub env: &'a [TaskEnvironmentVariable],
-    pub secret_files: &'a [TaskSecretFile],
+    pub secret_files: &'a [WorkloadSecretFile],
     pub volume_mounts: &'a [TaskVolumeMount],
     pub networks: &'a [Uuid],
 }
@@ -265,13 +263,13 @@ impl WorkloadManager {
 }
 
 /// Maps a task restart policy into the runtime restart-policy payload.
-fn restart_policy_to_config(policy: &TaskRestartPolicy) -> RestartPolicyConfig {
+fn restart_policy_to_config(policy: &WorkloadRestartPolicy) -> RestartPolicyConfig {
     RestartPolicyConfig {
         name: match policy.name {
-            TaskRestartPolicyKind::No => RestartPolicyType::No,
-            TaskRestartPolicyKind::Always => RestartPolicyType::Always,
-            TaskRestartPolicyKind::OnFailure => RestartPolicyType::OnFailure,
-            TaskRestartPolicyKind::UnlessStopped => RestartPolicyType::UnlessStopped,
+            WorkloadRestartPolicyKind::No => RestartPolicyType::No,
+            WorkloadRestartPolicyKind::Always => RestartPolicyType::Always,
+            WorkloadRestartPolicyKind::OnFailure => RestartPolicyType::OnFailure,
+            WorkloadRestartPolicyKind::UnlessStopped => RestartPolicyType::UnlessStopped,
         },
         max_retry_count: policy.max_retry_count,
     }

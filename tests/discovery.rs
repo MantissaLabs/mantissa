@@ -19,7 +19,7 @@ use mantissa::store::network_store::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
 use mantissa::store::service_store::open_service_store;
-use mantissa::store::task_store::open_task_store;
+use mantissa::store::workload_store::open_workload_store;
 use mantissa::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
 use mantissa::workload::model::WorkloadPhase;
 use mantissa::workload::types::ExecutionSpec;
@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 struct DiscoveryHarness {
     registry: NetworkRegistry,
-    tasks: mantissa::store::task_store::TaskStore,
+    workloads: mantissa::store::workload_store::WorkloadStore,
     services: ServiceRegistry,
     discovery: ServiceDiscovery,
     network: NetworkSpecValue,
@@ -74,11 +74,11 @@ async fn setup_discovery_harness(dns_port: u16) -> DiscoveryHarness {
         .path()
         .join(format!("task-{}.redb", Uuid::new_v4()));
     let task_db = Arc::new(redb::Database::create(task_path).expect("create task db"));
-    let tasks = open_task_store(task_db, actor).expect("open task store");
-    tasks
+    let workloads = open_workload_store(task_db, actor).expect("open workload store");
+    workloads
         .rebuild_mst_from_disk()
         .await
-        .expect("rebuild task store");
+        .expect("rebuild workload store");
 
     let service_dir = tempdir().expect("service tempdir");
     let service_path = service_dir
@@ -95,7 +95,7 @@ async fn setup_discovery_harness(dns_port: u16) -> DiscoveryHarness {
     let registry = NetworkRegistry::new(spec_store, peer_store, attachment_store);
     let discovery = ServiceDiscovery::new_with_dns_port(
         registry.clone(),
-        tasks.clone(),
+        workloads.clone(),
         services.clone(),
         mantissa::network::bpf::NetworkBpfManager::unavailable(),
         health::HealthMonitor::new(Uuid::nil()),
@@ -119,7 +119,7 @@ async fn setup_discovery_harness(dns_port: u16) -> DiscoveryHarness {
 
     DiscoveryHarness {
         registry,
-        tasks,
+        workloads,
         services,
         discovery,
         network,
@@ -314,7 +314,7 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
     upsert_service(&harness.services, service_name, network_id, vec![task_a]).await;
 
     harness
-        .tasks
+        .workloads
         .upsert(
             &UuidKey::from(task_a),
             running_task(task_a, node_id, service_name, network_id),
@@ -350,7 +350,7 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
 
     // Add a second backend and verify DNS observes the attachment/task-store change immediately.
     harness
-        .tasks
+        .workloads
         .upsert(
             &UuidKey::from(task_b),
             running_task(task_b, node_id, service_name, network_id),
@@ -393,7 +393,7 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
     stopped.state = WorkloadPhase::Stopped;
     stopped.updated_at = chrono::Utc::now().to_rfc3339();
     harness
-        .tasks
+        .workloads
         .upsert(&UuidKey::from(task_a), stopped)
         .await
         .expect("upsert stopped task a");
@@ -421,7 +421,7 @@ local_test!(discovery_dns_requires_attachment_traffic_publication, {
     upsert_service(&harness.services, service_name, network_id, vec![task_id]).await;
 
     harness
-        .tasks
+        .workloads
         .upsert(
             &UuidKey::from(task_id),
             running_task(task_id, node_id, service_name, network_id),

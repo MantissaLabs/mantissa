@@ -282,13 +282,13 @@ local_test!(task_attach_relay_over_tcp_sessions, {
     let owner_value = replicated_task_value(task_id, owner.id(), "owner-node");
     owner
         .node
-        .tasks
+        .workloads
         .upsert(&UuidKey::from(task_id), owner_value.clone())
         .await
         .expect("store task on owner");
     requester
         .node
-        .tasks
+        .workloads
         .upsert(&UuidKey::from(task_id), owner_value)
         .await
         .expect("store task on requester");

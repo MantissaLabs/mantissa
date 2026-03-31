@@ -21,14 +21,12 @@ use crate::scheduler::{
 };
 use crate::volumes::LocalVolumeAccessError;
 use crate::workload::model::{
-    WorkloadEvent as TaskEvent, WorkloadPhase, WorkloadServiceMetadata as TaskServiceMetadata,
-    WorkloadSpec as TaskSpec, WorkloadValue as TaskValue,
+    WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadValue,
     parse_workload_timestamp as parse_task_timestamp, select_best_workload_value,
     workload_event_id,
 };
 use crate::workload::types::{
-    WorkloadLivenessProbe as TaskLivenessProbe, WorkloadLivenessProbeKind as TaskLivenessProbeKind,
-    WorkloadRestartPolicyKind as TaskRestartPolicyKind,
+    WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadRestartPolicyKind,
 };
 
 use super::{
@@ -61,7 +59,7 @@ impl WorkloadManager {
     /// is required because the running instance is missing).
     pub(super) async fn reconcile_recorded_running_task(
         &self,
-        working: &mut TaskSpec,
+        working: &mut WorkloadSpec,
     ) -> Result<bool, anyhow::Error> {
         if !matches!(working.state, WorkloadPhase::Running) {
             return Ok(false);
@@ -177,7 +175,7 @@ impl WorkloadManager {
                 working.updated_at = Utc::now().to_rfc3339();
                 self.persist_spec(working).await?;
                 if let Err(err) = self
-                    .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(working.clone())))
+                    .enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(working.clone())))
                     .await
                 {
                     warn!(
@@ -199,7 +197,7 @@ impl WorkloadManager {
     /// failure accounting so the reconcile loop does not `exec` on every tick.
     async fn reconcile_liveness_probe(
         &self,
-        working: &mut TaskSpec,
+        working: &mut WorkloadSpec,
         instance_id: &str,
     ) -> Result<bool, anyhow::Error> {
         let Some(probe) = working.liveness.clone() else {
@@ -211,7 +209,7 @@ impl WorkloadManager {
             return Ok(true);
         };
         match probe.kind {
-            TaskLivenessProbeKind::Exec if probe.command.is_empty() => {
+            WorkloadLivenessProbeKind::Exec if probe.command.is_empty() => {
                 self.local_state
                     .liveness_probes
                     .lock()
@@ -224,7 +222,7 @@ impl WorkloadManager {
                 );
                 return Ok(true);
             }
-            TaskLivenessProbeKind::Http | TaskLivenessProbeKind::Tcp if probe.port == 0 => {
+            WorkloadLivenessProbeKind::Http | WorkloadLivenessProbeKind::Tcp if probe.port == 0 => {
                 self.local_state
                     .liveness_probes
                     .lock()
@@ -360,7 +358,7 @@ impl WorkloadManager {
         working.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(working).await?;
         if let Err(err) = self
-            .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(working.clone())))
+            .enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(working.clone())))
             .await
         {
             warn!(
@@ -377,10 +375,10 @@ impl WorkloadManager {
         &self,
         task_id: Uuid,
         instance_id: &str,
-        probe: &TaskLivenessProbe,
+        probe: &WorkloadLivenessProbe,
     ) -> Result<(), String> {
         match probe.kind {
-            TaskLivenessProbeKind::Exec => {
+            WorkloadLivenessProbeKind::Exec => {
                 if !self.runtime.runtime_backend.capabilities().exec {
                     return Err(
                         "runtime backend does not support exec-based liveness probes".to_string(),
@@ -407,7 +405,7 @@ impl WorkloadManager {
                     Err(err) => Err(format!("liveness probe failed: {err}")),
                 }
             }
-            TaskLivenessProbeKind::Http => {
+            WorkloadLivenessProbeKind::Http => {
                 let targets = self
                     .resolve_liveness_probe_targets(task_id, instance_id)
                     .await?;
@@ -424,7 +422,7 @@ impl WorkloadManager {
                     ))
                 }
             }
-            TaskLivenessProbeKind::Tcp => {
+            WorkloadLivenessProbeKind::Tcp => {
                 let targets = self
                     .resolve_liveness_probe_targets(task_id, instance_id)
                     .await?;
@@ -490,7 +488,10 @@ impl WorkloadManager {
     ///
     /// This closes races where reconciliation starts from a slot-assigned snapshot but later
     /// reads a newer CRDT value with missing or mismatched scheduler ownership.
-    async fn clear_task_lease_metadata(&self, spec: &TaskSpec) -> Result<TaskSpec, anyhow::Error> {
+    async fn clear_task_lease_metadata(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> Result<WorkloadSpec, anyhow::Error> {
         if spec.lease_id.is_none() && spec.lease_coordinator_node_id.is_none() {
             return Ok(spec.clone());
         }
@@ -507,7 +508,7 @@ impl WorkloadManager {
                 "failed to persist cleared task lease metadata: {err}"
             );
         } else if let Err(err) = self
-            .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(cleared.clone())))
+            .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(cleared.clone())))
             .await
         {
             warn!(
@@ -521,7 +522,10 @@ impl WorkloadManager {
     }
 
     /// Commits a prepared scheduler lease for one pending local task before launch work begins.
-    async fn ensure_task_lease_commit(&self, spec: &TaskSpec) -> Result<TaskSpec, anyhow::Error> {
+    async fn ensure_task_lease_commit(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> Result<WorkloadSpec, anyhow::Error> {
         let Some(lease_id) = spec.lease_id else {
             return Ok(spec.clone());
         };
@@ -661,7 +665,10 @@ impl WorkloadManager {
         self.clear_task_lease_metadata(spec).await
     }
 
-    async fn ensure_task_slot_reservations(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
+    async fn ensure_task_slot_reservations(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> Result<(), anyhow::Error> {
         if spec.slot_ids.is_empty() {
             return Err(anyhow!(
                 "task {} ({}) missing scheduler slot assignments",
@@ -772,7 +779,7 @@ impl WorkloadManager {
     }
 
     /// Persists one task snapshot in the backing store.
-    pub(super) async fn persist_spec(&self, spec: &TaskSpec) -> Result<(), anyhow::Error> {
+    pub(super) async fn persist_spec(&self, spec: &WorkloadSpec) -> Result<(), anyhow::Error> {
         let value = spec_to_value(spec);
         self.persist_value(spec.id, &value).await
     }
@@ -781,7 +788,7 @@ impl WorkloadManager {
     pub(super) async fn persist_value(
         &self,
         task_id: Uuid,
-        value: &TaskValue,
+        value: &WorkloadValue,
     ) -> Result<(), anyhow::Error> {
         self.core
             .store
@@ -834,7 +841,7 @@ impl WorkloadManager {
     /// Persists a batch of task snapshots in one durable transaction.
     pub(super) async fn persist_specs_batch(
         &self,
-        specs: &[TaskSpec],
+        specs: &[WorkloadSpec],
     ) -> Result<(), anyhow::Error> {
         if specs.is_empty() {
             return Ok(());
@@ -900,7 +907,7 @@ impl WorkloadManager {
         state: WorkloadPhase,
         phase_reason: Option<String>,
         phase_progress: Option<String>,
-    ) -> Result<TaskSpec, anyhow::Error> {
+    ) -> Result<WorkloadSpec, anyhow::Error> {
         let mut spec = self.load_spec(task_id).await?;
         let next_reason = phase_reason.filter(|value| !value.trim().is_empty());
         let next_progress = phase_progress.filter(|value| !value.trim().is_empty());
@@ -940,9 +947,9 @@ impl WorkloadManager {
         self.persist_spec(&spec).await?;
         if should_gossip_task_phase_update(state_changed, &spec.state) {
             let event = if state_changed {
-                TaskEvent::UpsertSpec(Box::new(spec.clone()))
+                WorkloadEvent::UpsertSpec(Box::new(spec.clone()))
             } else {
-                TaskEvent::UpsertStatus(Box::new(spec_to_status(&spec)))
+                WorkloadEvent::UpsertStatus(Box::new(spec_to_status(&spec)))
             };
             if let Err(err) = self.enqueue_gossip_best_effort(event).await {
                 warn!(
@@ -964,7 +971,7 @@ impl WorkloadManager {
         &self,
         task_id: Uuid,
         reason: Option<String>,
-    ) -> Result<TaskSpec, anyhow::Error> {
+    ) -> Result<WorkloadSpec, anyhow::Error> {
         let mut spec = self.load_spec(task_id).await?;
         if spec.last_terminal_observed_launch == Some(spec.launch_attempt) {
             return Ok(spec);
@@ -977,7 +984,9 @@ impl WorkloadManager {
         spec.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(&spec).await?;
         if let Err(err) = self
-            .enqueue_gossip_best_effort(TaskEvent::UpsertStatus(Box::new(spec_to_status(&spec))))
+            .enqueue_gossip_best_effort(WorkloadEvent::UpsertStatus(Box::new(spec_to_status(
+                &spec,
+            ))))
             .await
         {
             warn!(
@@ -1078,13 +1087,13 @@ impl WorkloadManager {
     }
 
     /// Records the latest outbound gossip event for one task id inside the local dirty buffer.
-    async fn buffer_gossip_event(&self, event: TaskEvent) {
+    async fn buffer_gossip_event(&self, event: WorkloadEvent) {
         let task_id = workload_event_id(&event);
-        let mut dirty = self.local_state.dirty_gossip_tasks.lock().await;
+        let mut dirty = self.local_state.dirty_gossip_workloads.lock().await;
         match dirty.get_mut(&task_id) {
             Some(current) => current.merge(event),
             None => {
-                dirty.insert(task_id, super::DirtyTaskGossipRecord::new(event));
+                dirty.insert(task_id, super::DirtyWorkloadGossipRecord::new(event));
             }
         }
         drop(dirty);
@@ -1097,7 +1106,7 @@ impl WorkloadManager {
     /// cover more than one peer sample without turning back into an unbounded relay flood.
     pub(super) async fn flush_dirty_gossip_events(&self) -> Result<bool, anyhow::Error> {
         let pending = {
-            let mut dirty = self.local_state.dirty_gossip_tasks.lock().await;
+            let mut dirty = self.local_state.dirty_gossip_workloads.lock().await;
             std::mem::take(&mut *dirty)
         };
         if pending.is_empty() {
@@ -1107,21 +1116,21 @@ impl WorkloadManager {
         let mut retained = HashMap::new();
         for (task_id, mut record) in pending {
             for event in record.events() {
-                let message = Message::Task {
+                let message = Message::Workload {
                     id: Uuid::new_v4(),
                     event,
                 };
                 self.tx()
                     .send(message)
                     .await
-                    .map_err(|e| anyhow::anyhow!("failed to flush task gossip: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("failed to flush workload gossip: {e}"))?;
             }
             if record.retain_after_flush() {
                 retained.insert(task_id, record);
             }
         }
 
-        let mut dirty = self.local_state.dirty_gossip_tasks.lock().await;
+        let mut dirty = self.local_state.dirty_gossip_workloads.lock().await;
         for (task_id, record) in retained {
             dirty.entry(task_id).or_insert(record);
         }
@@ -1228,7 +1237,7 @@ impl WorkloadManager {
 
     /// Collects the set of slot IDs that belong to tasks owned by this node.
     pub(super) async fn collect_local_slot_ids(&self) -> Result<HashSet<SlotId>, anyhow::Error> {
-        let task_index = self.load_task_value_index().await?;
+        let task_index = self.load_workload_value_index().await?;
         let mut slots = HashSet::new();
         for value in task_index.values() {
             if value.node_id == self.local_node_id {
@@ -1251,7 +1260,7 @@ impl WorkloadManager {
     pub(super) async fn collect_local_gpu_device_ids(
         &self,
     ) -> Result<HashSet<String>, anyhow::Error> {
-        let task_index = self.load_task_value_index().await?;
+        let task_index = self.load_workload_value_index().await?;
         let mut device_ids = HashSet::new();
         for value in task_index.values() {
             if value.node_id == self.local_node_id {
@@ -1265,15 +1274,15 @@ impl WorkloadManager {
     }
 
     /// Pushes a gossip event into the dispatcher queue.
-    pub(super) async fn enqueue_gossip(&self, event: TaskEvent) -> Result<(), anyhow::Error> {
+    pub(super) async fn enqueue_gossip(&self, event: WorkloadEvent) -> Result<(), anyhow::Error> {
         self.buffer_gossip_event(event).await;
         Ok(())
     }
 
-    /// Records one task gossip event without waiting on the shared outbound queue.
+    /// Records one workload gossip event without waiting on the shared outbound queue.
     pub(super) async fn enqueue_gossip_best_effort(
         &self,
-        event: TaskEvent,
+        event: WorkloadEvent,
     ) -> Result<(), anyhow::Error> {
         self.buffer_gossip_event(event).await;
         Ok(())
@@ -1335,8 +1344,8 @@ impl WorkloadManager {
     /// Performs a graceful stop of a locally owned task and tears down its runtime instance.
     pub(super) async fn perform_local_stop(
         &self,
-        spec: TaskSpec,
-    ) -> Result<TaskSpec, anyhow::Error> {
+        spec: WorkloadSpec,
+    ) -> Result<WorkloadSpec, anyhow::Error> {
         if matches!(spec.state, WorkloadPhase::Stopped) {
             return Ok(spec);
         }
@@ -1366,7 +1375,7 @@ impl WorkloadManager {
             updated.phase_progress = None;
             updated.updated_at = Utc::now().to_rfc3339();
             self.persist_spec(&updated).await?;
-            self.enqueue_gossip(TaskEvent::UpsertSpec(Box::new(updated.clone())))
+            self.enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(updated.clone())))
                 .await?;
         }
 
@@ -1450,11 +1459,11 @@ impl WorkloadManager {
         }
 
         self.persist_spec(&updated).await?;
-        self.enqueue_gossip(TaskEvent::UpsertSpec(Box::new(updated.clone())))
+        self.enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(updated.clone())))
             .await?;
         self.cleanup_orphaned_slots().await;
         self.remove_spec(id).await?;
-        self.enqueue_gossip(TaskEvent::Remove { id }).await?;
+        self.enqueue_gossip(WorkloadEvent::Remove { id }).await?;
         if let Err(err) = self.cleanup_orphaned_local_attachments().await {
             warn!(
                 target: "task",
@@ -1471,7 +1480,7 @@ impl WorkloadManager {
     /// drain and rollout correctness must not depend on user-provided shutdown commands.
     async fn run_pre_stop_hook(
         &self,
-        spec: &TaskSpec,
+        spec: &WorkloadSpec,
         instance_identifier: &str,
         stop_deadline: Instant,
     ) {
@@ -1561,7 +1570,7 @@ impl WorkloadManager {
     /// Marks a task as failed and frees any resources it owned.
     pub(super) async fn mark_task_failed(
         &self,
-        mut spec: TaskSpec,
+        mut spec: WorkloadSpec,
         error: anyhow::Error,
     ) -> anyhow::Error {
         let task_id = spec.id;
@@ -1646,7 +1655,7 @@ impl WorkloadManager {
                 task_id
             );
         } else if let Err(err) = self
-            .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+            .enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
             .await
         {
             warn!(
@@ -1663,7 +1672,7 @@ impl WorkloadManager {
     /// Marks a task as blocked on local volume availability while preserving its reservations.
     pub(super) async fn mark_task_volume_unavailable(
         &self,
-        mut spec: TaskSpec,
+        mut spec: WorkloadSpec,
         error: anyhow::Error,
     ) -> anyhow::Error {
         let task_id = spec.id;
@@ -1736,7 +1745,7 @@ impl WorkloadManager {
                 task_id
             );
         } else if let Err(err) = self
-            .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+            .enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
             .await
         {
             warn!(
@@ -1810,7 +1819,7 @@ impl WorkloadManager {
     /// the runtime reports the task instance as exited or dead.
     async fn resolve_terminal_exit_for_task(
         &self,
-        spec: &TaskSpec,
+        spec: &WorkloadSpec,
     ) -> Result<Option<(i32, Option<String>)>, RuntimeError> {
         let desired_name = format!("mantissa-{}", spec.id);
         let candidate = {
@@ -1844,7 +1853,7 @@ impl WorkloadManager {
     /// or the runtime returns canonical ids that differ from Mantissa's deterministic names.
     pub(super) async fn resolve_live_instance_id_for_task(
         &self,
-        spec: &TaskSpec,
+        spec: &WorkloadSpec,
     ) -> Result<Option<String>, RuntimeError> {
         let desired_name = format!("mantissa-{}", spec.id);
         let candidate = {
@@ -1896,7 +1905,10 @@ impl WorkloadManager {
     }
 
     /// Starts or reuses a runtime instance so the task transitions into running state locally.
-    pub(super) async fn ensure_task_running(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
+    pub(super) async fn ensure_task_running(
+        &self,
+        spec: WorkloadSpec,
+    ) -> Result<(), anyhow::Error> {
         let mut working = self.load_spec(spec.id).await.unwrap_or(spec);
         if working.node_id != self.local_node_id {
             return Ok(());
@@ -1985,7 +1997,7 @@ impl WorkloadManager {
             working.updated_at = Utc::now().to_rfc3339();
             self.persist_spec(&working).await?;
             if let Err(err) = self
-                .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(working.clone())))
+                .enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(working.clone())))
                 .await
             {
                 warn!(
@@ -2098,35 +2110,35 @@ impl WorkloadManager {
         Ok(())
     }
 
-    /// Publishes one committed running task update and refreshes runtime networking metadata.
+    /// Publishes one committed running workload update and refreshes runtime networking metadata.
     ///
     /// The batch and single-task launch paths both call this helper so gossip behavior and
     /// post-commit attachment refresh cannot drift across code paths.
     pub(super) async fn finalize_running_task_post_commit(
         &self,
-        spec: &TaskSpec,
+        spec: &WorkloadSpec,
         instance_id: Option<&str>,
         best_effort_gossip: bool,
         update_instance_cache: bool,
     ) {
         if best_effort_gossip {
             if let Err(err) = self
-                .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+                .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
                 .await
             {
                 warn!(
                     target: "task",
-                    "failed to record task gossip for {}: {err}",
+                    "failed to record workload gossip for {}: {err}",
                     spec.name
                 );
             }
         } else if let Err(err) = self
-            .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+            .enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
             .await
         {
             warn!(
                 target: "task",
-                "failed to enqueue task gossip for {}: {err}",
+                "failed to enqueue workload gossip for {}: {err}",
                 spec.name
             );
         }
@@ -2170,7 +2182,7 @@ impl WorkloadManager {
         task_name: &str,
         instance_id: &str,
         networks: &[Uuid],
-        service_meta: Option<&TaskServiceMetadata>,
+        service_meta: Option<&WorkloadServiceMetadata>,
     ) -> Result<(), anyhow::Error> {
         if let Err(err) = self
             .ensure_runtime_attachments(task_id, instance_id, networks, service_meta)
@@ -2291,7 +2303,10 @@ impl WorkloadManager {
     }
 
     /// Ensures that a locally tracked task has completely stopped and released resources.
-    pub(super) async fn ensure_task_stopped(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
+    pub(super) async fn ensure_task_stopped(
+        &self,
+        spec: WorkloadSpec,
+    ) -> Result<(), anyhow::Error> {
         let mut has_instance = {
             let guard = self.local_state.local_instances.lock().await;
             guard.contains_key(&spec.id)
@@ -2367,7 +2382,7 @@ impl WorkloadManager {
                 );
             }
             self.remove_spec(spec.id).await?;
-            self.enqueue_gossip(TaskEvent::Remove { id: spec.id })
+            self.enqueue_gossip(WorkloadEvent::Remove { id: spec.id })
                 .await?;
             self.cleanup_orphaned_slots().await;
             if let Err(err) = self.cleanup_orphaned_local_attachments().await {
@@ -2392,7 +2407,10 @@ impl WorkloadManager {
     }
 
     /// Reconciles the desired state of a locally owned task with the actual instance state.
-    pub(super) async fn reconcile_local_task(&self, spec: TaskSpec) -> Result<(), anyhow::Error> {
+    pub(super) async fn reconcile_local_task(
+        &self,
+        spec: WorkloadSpec,
+    ) -> Result<(), anyhow::Error> {
         match spec.state {
             WorkloadPhase::Pending
             | WorkloadPhase::Pulling
@@ -2422,10 +2440,10 @@ impl WorkloadManager {
     }
 
     /// Returns one decoded task spec from the local cache when it still matches the store clock.
-    fn cached_spec(&self, id: Uuid, change_clock: u64) -> Option<TaskSpec> {
+    fn cached_spec(&self, id: Uuid, change_clock: u64) -> Option<WorkloadSpec> {
         let guard = self
             .local_state
-            .task_spec_cache
+            .workload_spec_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard
@@ -2435,102 +2453,108 @@ impl WorkloadManager {
     }
 
     /// Records one decoded task spec so repeated lookups can reuse it until the store changes.
-    fn cache_spec(&self, change_clock: u64, spec: TaskSpec) {
+    fn cache_spec(&self, change_clock: u64, spec: WorkloadSpec) {
         let mut guard = self
             .local_state
-            .task_spec_cache
+            .workload_spec_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.insert(spec.id, super::CachedTaskSpecEntry { change_clock, spec });
+        guard.insert(
+            spec.id,
+            super::CachedWorkloadSpecEntry { change_clock, spec },
+        );
     }
 
     /// Removes one task from the decoded spec cache after delete paths.
     fn evict_cached_spec(&self, id: Uuid) {
         let mut guard = self
             .local_state
-            .task_spec_cache
+            .workload_spec_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.remove(&id);
     }
 
     /// Returns one decoded full-store index when it still matches the current store clock.
-    fn cached_task_value_index(&self, change_clock: u64) -> Option<Arc<HashMap<Uuid, TaskValue>>> {
+    fn cached_workload_value_index(
+        &self,
+        change_clock: u64,
+    ) -> Option<Arc<HashMap<Uuid, WorkloadValue>>> {
         let guard = self
             .local_state
-            .task_value_index
+            .workload_value_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard
             .as_ref()
             .filter(|entry| entry.change_clock == change_clock)
-            .map(|entry| entry.task_values.clone())
+            .map(|entry| entry.workload_values.clone())
     }
 
     /// Records one decoded full-store index for repeated periodic scans under the same store clock.
-    fn cache_task_value_index(
+    fn cache_workload_value_index(
         &self,
         change_clock: u64,
-        task_values: Arc<HashMap<Uuid, TaskValue>>,
+        workload_values: Arc<HashMap<Uuid, WorkloadValue>>,
     ) {
         let mut guard = self
             .local_state
-            .task_value_index
+            .workload_value_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(super::CachedTaskValueIndex {
+        *guard = Some(super::CachedWorkloadValueIndex {
             change_clock,
-            task_values,
+            workload_values,
         });
     }
 
-    /// Loads and decodes the full task store once, then reuses it until the store changes.
-    pub(super) async fn load_task_value_index(
+    /// Loads and decodes the full workload store once, then reuses it until the store changes.
+    pub(super) async fn load_workload_value_index(
         &self,
-    ) -> Result<Arc<HashMap<Uuid, TaskValue>>, anyhow::Error> {
+    ) -> Result<Arc<HashMap<Uuid, WorkloadValue>>, anyhow::Error> {
         let change_clock = self.core.store.change_clock();
-        if let Some(task_values) = self.cached_task_value_index(change_clock) {
-            return Ok(task_values);
+        if let Some(workload_values) = self.cached_workload_value_index(change_clock) {
+            return Ok(workload_values);
         }
 
         let (entries, _) = self
             .core
             .store
             .load_all()
-            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("workload store load_all failed: {e}"))?;
 
-        let mut task_values = HashMap::with_capacity(entries.len());
+        let mut workload_values = HashMap::with_capacity(entries.len());
         let mut invalid_ids = Vec::new();
         for (key, snapshot) in entries {
             let id = key.to_uuid();
             if let Some(value) = select_best_workload_value(snapshot.as_slice()) {
-                task_values.insert(id, value);
+                workload_values.insert(id, value);
             } else {
                 invalid_ids.push(id);
             }
         }
 
-        let task_values = Arc::new(task_values);
+        let workload_values = Arc::new(workload_values);
         if invalid_ids.is_empty() {
-            self.cache_task_value_index(change_clock, task_values.clone());
+            self.cache_workload_value_index(change_clock, workload_values.clone());
         } else {
             for id in invalid_ids {
                 let _ = self.remove_spec(id).await;
             }
         }
 
-        Ok(task_values)
+        Ok(workload_values)
     }
 
     /// Loads the current persisted spec for a task by identifier.
-    pub(super) async fn load_spec(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
+    pub(super) async fn load_spec(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
         let change_clock = self.core.store.change_clock();
         if let Some(spec) = self.cached_spec(id, change_clock) {
             return Ok(spec);
         }
 
-        if let Some(task_values) = self.cached_task_value_index(change_clock)
-            && let Some(value) = task_values.get(&id)
+        if let Some(workload_values) = self.cached_workload_value_index(change_clock)
+            && let Some(value) = workload_values.get(&id)
         {
             let spec = value_to_spec(id, value.clone());
             self.cache_spec(change_clock, spec.clone());
@@ -2552,7 +2576,7 @@ impl WorkloadManager {
         Ok(spec)
     }
 
-    /// Reconciles the runtime inventory with the task store so stale instances are adopted or removed.
+    /// Reconciles the runtime inventory with the workload store so stale instances are adopted or removed.
     ///
     /// This is the primary defense against daemon restarts that leave instances running without
     /// corresponding in-memory tracking. By comparing the local instance list against the latest
@@ -2561,7 +2585,7 @@ impl WorkloadManager {
         const UNOWNED_TASK_GRACE_SECS: i64 = 5;
 
         let instances = self.runtime.runtime_backend.list_instances(None).await?;
-        let task_index = self.load_task_value_index().await?;
+        let task_index = self.load_workload_value_index().await?;
 
         for instance in instances {
             let Some(task_id) = Self::runtime_workload_id(&instance) else {
@@ -2575,7 +2599,7 @@ impl WorkloadManager {
             };
 
             if value.node_id != self.local_node_id {
-                if task_value_recent(&value, UNOWNED_TASK_GRACE_SECS) {
+                if workload_value_recent(&value, UNOWNED_TASK_GRACE_SECS) {
                     continue;
                 }
                 self.stop_unowned_instance(task_id, &instance.name, false, Some(&value))
@@ -2609,7 +2633,7 @@ impl WorkloadManager {
             if matches!(value.state, WorkloadPhase::Running)
                 && !value.networks.is_empty()
                 && self
-                    .attachments_need_refresh(task_id, &value.networks, task_revision(&value))
+                    .attachments_need_refresh(task_id, &value.networks, workload_revision(&value))
                     .await?
                 && let Err(err) = self
                     .ensure_runtime_attachments(
@@ -2679,7 +2703,7 @@ impl WorkloadManager {
         task_id: Uuid,
         instance_name: &str,
         remove_attachments: bool,
-        task_value: Option<&TaskValue>,
+        task_value: Option<&WorkloadValue>,
     ) {
         let identifier = if instance_name.is_empty() {
             format!("mantissa-{task_id}")
@@ -2788,8 +2812,8 @@ impl WorkloadManager {
             }
         };
 
-        let task_index = self.load_task_value_index().await?;
-        let local_specs: Vec<TaskSpec> = task_index
+        let task_index = self.load_workload_value_index().await?;
+        let local_specs: Vec<WorkloadSpec> = task_index
             .iter()
             .filter(|(_, value)| value.node_id == self.local_node_id)
             .map(|(id, value)| value_to_spec(*id, value.clone()))
@@ -2840,7 +2864,7 @@ impl WorkloadManager {
         Ok(())
     }
 
-    /// Lists runtime instances once so reconcile can avoid per-task inspect calls.
+    /// Lists runtime instances once so reconcile can avoid per-workload inspect calls.
     async fn list_runtime_inventory(&self) -> Result<RuntimeInventory, anyhow::Error> {
         let instances = self
             .runtime
@@ -2878,7 +2902,7 @@ impl WorkloadManager {
     /// Refreshes a running task's local runtime cache from the latest inventory snapshot.
     async fn refresh_running_task_from_runtime_inventory(
         &self,
-        spec: &TaskSpec,
+        spec: &WorkloadSpec,
         runtime_inventory: Option<&RuntimeInventory>,
     ) -> bool {
         if !spec.volumes.is_empty()
@@ -2969,7 +2993,7 @@ impl WorkloadManager {
                 Some(snapshot) => snapshot,
                 None => return Ok(()),
             };
-            let task_index = self.load_task_value_index().await?;
+            let task_index = self.load_workload_value_index().await?;
 
             let mut desired: HashMap<SlotId, Uuid> = HashMap::new();
             let mut desired_gpus: HashMap<String, Uuid> = HashMap::new();
@@ -3005,7 +3029,7 @@ impl WorkloadManager {
                 })
                 .collect();
 
-            let mut local_tasks: HashMap<Uuid, TaskValue> = HashMap::new();
+            let mut local_tasks: HashMap<Uuid, WorkloadValue> = HashMap::new();
 
             for (task_id, value) in task_index.iter() {
                 if value.node_id != self.local_node_id {
@@ -3283,7 +3307,7 @@ impl WorkloadManager {
     /// asserting stale resource claims and can be drained by the normal stop reconciliation path.
     async fn demote_conflicting_local_tasks(
         &self,
-        local_tasks: &HashMap<Uuid, TaskValue>,
+        local_tasks: &HashMap<Uuid, WorkloadValue>,
         conflicting_tasks: &HashSet<Uuid>,
     ) {
         let mut task_ids: Vec<Uuid> = conflicting_tasks.iter().copied().collect();
@@ -3337,7 +3361,7 @@ impl WorkloadManager {
                 continue;
             }
             if let Err(err) = self
-                .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+                .enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
                 .await
             {
                 warn!(
@@ -3368,7 +3392,7 @@ pub(super) fn is_local_volume_access_error(err: &anyhow::Error) -> bool {
 }
 
 /// Returns true when a task value has been updated within the provided grace window.
-fn task_value_recent(value: &TaskValue, grace_secs: i64) -> bool {
+fn workload_value_recent(value: &WorkloadValue, grace_secs: i64) -> bool {
     let anchor = chrono::DateTime::parse_from_rfc3339(&value.updated_at)
         .or_else(|_| chrono::DateTime::parse_from_rfc3339(&value.created_at));
 
@@ -3462,7 +3486,7 @@ fn should_gossip_task_phase_update(state_changed: bool, state: &WorkloadPhase) -
 fn pick_conflict_task_winner(
     current: Uuid,
     candidate: Uuid,
-    tasks: &HashMap<Uuid, TaskValue>,
+    tasks: &HashMap<Uuid, WorkloadValue>,
     reserved_owner: Option<Uuid>,
 ) -> Uuid {
     if let Some(owner) = reserved_owner
@@ -3513,7 +3537,7 @@ fn image_pull_retry_backoff(attempt: usize) -> Duration {
 }
 
 /// Extract a stable revision timestamp to compare attachment freshness.
-fn task_revision(value: &TaskValue) -> Option<&str> {
+fn workload_revision(value: &WorkloadValue) -> Option<&str> {
     if !value.updated_at.is_empty() {
         Some(value.updated_at.as_str())
     } else if !value.created_at.is_empty() {
@@ -3524,15 +3548,15 @@ fn task_revision(value: &TaskValue) -> Option<&str> {
 }
 
 /// Returns true when a task should be restarted after a terminal runtime exit.
-fn should_restart_after_exit(spec: &TaskSpec, exit_code: i32) -> bool {
+fn should_restart_after_exit(spec: &WorkloadSpec, exit_code: i32) -> bool {
     let Some(policy) = spec.restart_policy.as_ref() else {
         return false;
     };
 
     match policy.name {
-        TaskRestartPolicyKind::No => false,
-        TaskRestartPolicyKind::Always | TaskRestartPolicyKind::UnlessStopped => true,
-        TaskRestartPolicyKind::OnFailure => exit_code != 0,
+        WorkloadRestartPolicyKind::No => false,
+        WorkloadRestartPolicyKind::Always | WorkloadRestartPolicyKind::UnlessStopped => true,
+        WorkloadRestartPolicyKind::OnFailure => exit_code != 0,
     }
 }
 

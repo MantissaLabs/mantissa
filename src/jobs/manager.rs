@@ -307,7 +307,7 @@ impl JobController {
             Err(_) => {
                 self.fail_or_retry_missing_task(
                     spec,
-                    format!("active task {task_id} is missing from the replicated task store"),
+                    format!("active task {task_id} is missing from the replicated workload store"),
                 )
                 .await
             }

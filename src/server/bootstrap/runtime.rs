@@ -410,7 +410,7 @@ async fn build_runtime_components(
     let network_controller = NetworkController::new(
         network_registry.clone(),
         registry.clone(),
-        stores.tasks.clone(),
+        stores.workloads.clone(),
         service_registry.clone(),
         ctx.self_id,
         local_node_name.clone(),
@@ -440,7 +440,7 @@ async fn build_runtime_components(
     scheduler.publish_current_digest().await;
 
     let task_manager = WorkloadManager::new(WorkloadManagerConfig {
-        store: stores.tasks.clone(),
+        store: stores.workloads.clone(),
         tx: gossip_tx.clone(),
         rx: task_rx,
         local_node_id: ctx.self_id,
@@ -577,7 +577,7 @@ fn build_topology_stores(stores: &BootstrapStores) -> TopologyStores {
         cluster_view: stores.cluster_view.clone(),
         token_store: stores.token_store.clone(),
         secret_master_store: stores.secret_master_store.clone(),
-        tasks: stores.tasks.clone(),
+        workloads: stores.workloads.clone(),
         jobs: stores.jobs.clone(),
         agents: stores.agents.clone(),
         services: stores.services.clone(),
@@ -603,7 +603,7 @@ fn build_gossip_client(
     let gossip = gossip::Gossip::new(
         gossip::Channels {
             topology_events: routes.topology.clone(),
-            task_events: routes.task.clone(),
+            workload_events: routes.task.clone(),
             job_events: routes.job.clone(),
             agent_events: routes.agent.clone(),
             service_events: routes.service.clone(),
@@ -740,7 +740,7 @@ fn build_sync_client(
         cluster_view,
         SyncStores {
             peers: topology_stores.peers.clone(),
-            tasks: stores.tasks.clone(),
+            workloads: stores.workloads.clone(),
             jobs: stores.jobs.clone(),
             agents: stores.agents.clone(),
             services: stores.services.clone(),

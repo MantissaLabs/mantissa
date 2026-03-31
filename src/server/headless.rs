@@ -108,7 +108,7 @@ pub struct HeadlessNode {
 
     // Stores (optional inspection in tests)
     pub peers: crate::store::peer_store::PeersStore,
-    pub tasks: crate::store::task_store::TaskStore,
+    pub workloads: crate::store::workload_store::WorkloadStore,
     pub jobs: crate::store::job_store::JobStore,
     pub agents: crate::store::agent_store::AgentStore,
     pub services: crate::store::service_store::ServiceStore,
@@ -257,7 +257,7 @@ impl HeadlessNode {
             registry: comps.registry.clone(),
             scheduler: comps.scheduler.clone(),
             peers: stores.peers.clone(),
-            tasks: stores.tasks.clone(),
+            workloads: stores.workloads.clone(),
             jobs: stores.jobs.clone(),
             agents: stores.agents.clone(),
             services: stores.services.clone(),

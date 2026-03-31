@@ -11,7 +11,7 @@ use crate::volumes::types::{
     VolumeBindingMode, VolumeEvent, VolumeNodeState, VolumeNodeStateValue, VolumeSpecValue,
     VolumeStatus,
 };
-use crate::workload::model::{WorkloadSpec as TaskSpec, WorkloadVolumeMount as TaskVolumeMount};
+use crate::workload::model::{WorkloadSpec, WorkloadVolumeMount as TaskVolumeMount};
 
 use super::WorkloadManager;
 use super::planner::{Assignment, StartIntent};
@@ -230,13 +230,13 @@ impl WorkloadManager {
     }
 
     /// Marks the task as an active consumer on each referenced local volume after a successful launch.
-    pub(super) async fn publish_task_volume_mounts(&self, spec: &TaskSpec) -> Result<()> {
+    pub(super) async fn publish_task_volume_mounts(&self, spec: &WorkloadSpec) -> Result<()> {
         self.publish_task_volume_mounts_for_task(spec.id, &spec.volumes)
             .await
     }
 
     /// Removes the task from the active consumer set for each referenced local volume.
-    pub(super) async fn unpublish_task_volume_mounts(&self, spec: &TaskSpec) -> Result<()> {
+    pub(super) async fn unpublish_task_volume_mounts(&self, spec: &WorkloadSpec) -> Result<()> {
         self.unpublish_task_volume_mounts_for_task(spec.id, &spec.volumes)
             .await
     }

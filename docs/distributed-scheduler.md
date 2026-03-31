@@ -117,7 +117,7 @@ sequenceDiagram
     participant OW as Generation owner
     participant PL as Task planner
     participant TS as Target scheduler
-    participant RS as Replicated task store
+    participant RS as Replicated workload store
     participant RT as Target runtime
 
     SC->>OW: Deploying service generation

@@ -1132,7 +1132,7 @@ async fn wait_for_all_peers_alive(
 fn domain_label(domain: Domain) -> &'static str {
     match domain {
         Domain::Peers => "peers",
-        Domain::Tasks => "tasks",
+        Domain::Workloads => "tasks",
         Domain::Services => "services",
         Domain::Jobs => "jobs",
         Domain::Agents => "agents",
@@ -1445,13 +1445,13 @@ fn stress_converges_large_service() {
             visibility.join(", ")
         );
 
-        let task_root_snapshot = collect_domain_roots(&cluster.nodes, Domain::Tasks).await;
+        let task_root_snapshot = collect_domain_roots(&cluster.nodes, Domain::Workloads).await;
         let task_roots = root_distribution(&task_root_snapshot);
         eprintln!("stress: task-root distribution after active convergence {task_roots:?}");
 
         let task_root_metrics = wait_roots_equal_all_for_domain_with_metrics(
             &cluster.nodes,
-            Domain::Tasks,
+            Domain::Workloads,
             Duration::from_secs(600),
             task_root_snapshot,
         )

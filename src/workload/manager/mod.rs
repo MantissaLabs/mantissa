@@ -10,19 +10,18 @@ use crate::runtime::types::{
 use crate::scheduler::{Scheduler, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
-use crate::store::task_store::TaskStore;
+use crate::store::workload_store::WorkloadStore;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
-    RuntimeClass, WorkloadEvent as TaskEvent, WorkloadPhase,
-    WorkloadServiceMetadata as TaskServiceMetadata, WorkloadSpec as TaskSpec, WorkloadStateFilter,
-    WorkloadStatus as TaskStatus, WorkloadValue as TaskValue, should_replace_workload_event,
+    RuntimeClass, WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec,
+    WorkloadStateFilter, WorkloadStatus, WorkloadValue, should_replace_workload_event,
 };
 pub(crate) use crate::workload::model::{
     merge_definition_into_value, merge_status_into_value, spec_to_status, spec_to_value,
     value_to_spec,
 };
 use crate::workload::types::ResolvedExecutionSpec;
-use crate::workload::types::WorkloadRestartPolicy as TaskRestartPolicy;
+use crate::workload::types::WorkloadRestartPolicy;
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
@@ -60,15 +59,15 @@ use self::remote_advisory::RemotePrepareFeedbackRegistry;
 use self::reservation::{ExecutionError, RemoteReservation, ReservedResources};
 
 #[cfg(test)]
-pub(crate) use crate::workload::model::should_accept_incoming_workload_value as should_accept_incoming_task_value;
+pub(crate) use crate::workload::model::should_accept_incoming_workload_value as should_accept_incoming_workload_value_for_tests;
 /// Maximum number of concurrent image pulls executed per node.
 const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
 /// Retention window for remove watermarks used to suppress stale upsert replay.
 const REMOVE_WATERMARK_RETENTION_SECS: i64 = 30 * 60;
-/// Maximum time one dirty task update may wait before it is flushed into the shared gossip queue.
-const TASK_GOSSIP_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
-/// Number of fanout rounds one logical task update should survive before it ages out.
-const TASK_GOSSIP_COVERAGE_ROUNDS: usize = 3;
+/// Maximum time one dirty workload update may wait before it is flushed into the shared gossip queue.
+const WORKLOAD_GOSSIP_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+/// Number of fanout rounds one logical workload update should survive before it ages out.
+const WORKLOAD_GOSSIP_COVERAGE_ROUNDS: usize = 3;
 
 /// Remove tombstone metadata used to suppress stale workload upsert replay.
 #[derive(Clone)]
@@ -79,36 +78,36 @@ struct RemoveTombstone {
 
 /// Buffered outbound gossip state for one workload id before it enters the shared gossip queue.
 #[derive(Clone)]
-struct DirtyTaskGossipRecord {
-    definition: Option<TaskSpec>,
-    latest: TaskEvent,
+struct DirtyWorkloadGossipRecord {
+    definition: Option<WorkloadSpec>,
+    latest: WorkloadEvent,
     remaining_rounds: usize,
 }
 
-impl DirtyTaskGossipRecord {
+impl DirtyWorkloadGossipRecord {
     /// Builds one dirty gossip record from the first workload event seen for a workload id.
-    fn new(event: TaskEvent) -> Self {
+    fn new(event: WorkloadEvent) -> Self {
         let definition = match &event {
-            TaskEvent::UpsertSpec(spec) => Some((**spec).clone()),
+            WorkloadEvent::UpsertSpec(spec) => Some((**spec).clone()),
             _ => None,
         };
         Self {
             definition,
             latest: event,
-            remaining_rounds: TASK_GOSSIP_COVERAGE_ROUNDS,
+            remaining_rounds: WORKLOAD_GOSSIP_COVERAGE_ROUNDS,
         }
     }
 
     /// Merges one later workload event into the buffered outbound state for the same workload id.
-    fn merge(&mut self, event: TaskEvent) {
+    fn merge(&mut self, event: WorkloadEvent) {
         match &event {
-            TaskEvent::Remove { .. } => {
+            WorkloadEvent::Remove { .. } => {
                 self.definition = None;
                 self.latest = event;
             }
-            TaskEvent::UpsertSpec(spec) => {
+            WorkloadEvent::UpsertSpec(spec) => {
                 if let Some(current) = self.definition.as_ref() {
-                    let current = TaskEvent::UpsertSpec(Box::new(current.clone()));
+                    let current = WorkloadEvent::UpsertSpec(Box::new(current.clone()));
                     if should_replace_workload_event(&current, &event) {
                         self.definition = Some((**spec).clone());
                     }
@@ -116,36 +115,36 @@ impl DirtyTaskGossipRecord {
                     self.definition = Some((**spec).clone());
                 }
 
-                if matches!(self.latest, TaskEvent::Remove { .. })
+                if matches!(self.latest, WorkloadEvent::Remove { .. })
                     || should_replace_workload_event(&self.latest, &event)
                 {
                     self.latest = event;
                 }
             }
-            TaskEvent::UpsertStatus(_) => {
-                if matches!(self.latest, TaskEvent::Remove { .. })
+            WorkloadEvent::UpsertStatus(_) => {
+                if matches!(self.latest, WorkloadEvent::Remove { .. })
                     || should_replace_workload_event(&self.latest, &event)
                 {
                     self.latest = event;
                 }
             }
         }
-        self.remaining_rounds = TASK_GOSSIP_COVERAGE_ROUNDS;
+        self.remaining_rounds = WORKLOAD_GOSSIP_COVERAGE_ROUNDS;
     }
 
     /// Expands the buffered outbound state into the concrete events that should be flushed.
-    fn events(&self) -> Vec<TaskEvent> {
+    fn events(&self) -> Vec<WorkloadEvent> {
         match &self.latest {
-            TaskEvent::Remove { id } => vec![TaskEvent::Remove { id: *id }],
-            TaskEvent::UpsertStatus(status) => {
+            WorkloadEvent::Remove { id } => vec![WorkloadEvent::Remove { id: *id }],
+            WorkloadEvent::UpsertStatus(status) => {
                 let mut events = Vec::with_capacity(2);
                 if let Some(spec) = self.definition.as_ref() {
-                    events.push(TaskEvent::UpsertSpec(Box::new(spec.clone())));
+                    events.push(WorkloadEvent::UpsertSpec(Box::new(spec.clone())));
                 }
-                events.push(TaskEvent::UpsertStatus(status.clone()));
+                events.push(WorkloadEvent::UpsertStatus(status.clone()));
                 events
             }
-            TaskEvent::UpsertSpec(spec) => vec![TaskEvent::UpsertSpec(spec.clone())],
+            WorkloadEvent::UpsertSpec(spec) => vec![WorkloadEvent::UpsertSpec(spec.clone())],
         }
     }
 
@@ -167,19 +166,19 @@ struct LivenessProbeEntry {
 }
 
 #[derive(Clone)]
-struct CachedTaskSpecEntry {
+struct CachedWorkloadSpecEntry {
     // Store change clock captured when this decoded spec was materialized.
     change_clock: u64,
     // Fully decoded task snapshot reused until the backing store changes.
-    spec: TaskSpec,
+    spec: WorkloadSpec,
 }
 
 #[derive(Clone)]
-struct CachedTaskValueIndex {
+struct CachedWorkloadValueIndex {
     // Store change clock captured when this decoded index was materialized.
     change_clock: u64,
-    // Latest decoded task values keyed by task identifier.
-    task_values: Arc<HashMap<Uuid, TaskValue>>,
+    // Latest decoded workload values keyed by workload identifier.
+    workload_values: Arc<HashMap<Uuid, WorkloadValue>>,
 }
 
 /// Runtime loop cadence configuration for the task manager reconciliation workers.
@@ -203,11 +202,11 @@ impl Default for WorkloadRuntimeConfig {
 
 #[derive(Clone)]
 struct WorkloadManagerCore {
-    // Durable task state backing store used for upsert/remove/load operations.
-    store: TaskStore,
-    // Outbound gossip/event queue used to broadcast task and volume changes.
+    // Durable workload backing store used for upsert/remove/load operations.
+    store: WorkloadStore,
+    // Outbound gossip/event queue used to broadcast workload and volume changes.
     tx: Sender<Message>,
-    // Inbound task event stream consumed by the runtime loop.
+    // Inbound workload event stream consumed by the runtime loop.
     rx: Receiver<Message>,
     // Cluster registry used for peer metadata and scheduling/drain lookups.
     registry: Registry,
@@ -227,35 +226,35 @@ struct WorkloadManagerRuntime {
 
 #[derive(Clone)]
 struct WorkloadManagerLocalState {
-    // Best-effort mapping from task id to current runtime instance identifier.
+    // Best-effort mapping from workload id to current runtime instance identifier.
     local_instances: Arc<AsyncMutex<HashMap<Uuid, String>>>,
-    // Per-task decoded spec cache reused while the backing store stays unchanged.
-    task_spec_cache: Arc<StdMutex<HashMap<Uuid, CachedTaskSpecEntry>>>,
-    // Full task-store snapshot reused across periodic scans until the store changes.
-    task_value_index: Arc<StdMutex<Option<CachedTaskValueIndex>>>,
-    // Per-task liveness probe bookkeeping used by reconciliation.
+    // Per-workload decoded spec cache reused while the backing store stays unchanged.
+    workload_spec_cache: Arc<StdMutex<HashMap<Uuid, CachedWorkloadSpecEntry>>>,
+    // Full workload-store snapshot reused across periodic scans until the store changes.
+    workload_value_index: Arc<StdMutex<Option<CachedWorkloadValueIndex>>>,
+    // Per-workload liveness probe bookkeeping used by reconciliation.
     liveness_probes: Arc<AsyncMutex<HashMap<Uuid, LivenessProbeEntry>>>,
-    // Stop deduplication guard so only one stop workflow runs per task.
+    // Stop deduplication guard so only one stop workflow runs per workload.
     inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
-    // Reconcile deduplication guard so only one reconcile workflow runs per task.
+    // Reconcile deduplication guard so only one reconcile workflow runs per workload.
     inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
     // Short-lived remove tombstones used to reject stale post-remove upserts.
     removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, RemoveTombstone>>>,
     // Recent retryable remote prepare failures used to deprioritize stale peers locally.
     remote_prepare_feedback: RemotePrepareFeedbackRegistry,
-    // Per-task dirty gossip buffer collapsed before updates enter the shared gossip queue.
-    dirty_gossip_tasks: Arc<AsyncMutex<HashMap<Uuid, DirtyTaskGossipRecord>>>,
-    // Wake signal used by the runtime loop to flush dirty task gossip promptly.
+    // Per-workload dirty gossip buffer collapsed before updates enter the shared gossip queue.
+    dirty_gossip_workloads: Arc<AsyncMutex<HashMap<Uuid, DirtyWorkloadGossipRecord>>>,
+    // Wake signal used by the runtime loop to flush dirty workload gossip promptly.
     dirty_gossip_notify: Arc<Notify>,
 }
 
 #[derive(Clone)]
 struct WorkloadManagerSecrets {
-    // Secret metadata/value source used to resolve task secret references.
+    // Secret metadata/value source used to resolve workload secret references.
     secret_registry: SecretRegistry,
     // In-memory decryption keys used while resolving runtime secret material.
     secret_keyring: Arc<RwLock<SecretKeyring>>,
-    // Root directory for deterministic per-task secret staging.
+    // Root directory for deterministic per-workload secret staging.
     secret_runtime_root: PathBuf,
 }
 
@@ -289,7 +288,7 @@ pub struct WorkloadManager {
     core: WorkloadManagerCore,
     // Runtime backend and loop timing configuration.
     runtime: WorkloadManagerRuntime,
-    // In-memory per-task runtime tracking and in-flight guards.
+    // In-memory per-workload runtime tracking and in-flight guards.
     local_state: WorkloadManagerLocalState,
     // Secret resolution dependencies and staging root.
     secrets: WorkloadManagerSecrets,
@@ -331,7 +330,7 @@ pub struct WorkloadStartRequest {
     /// Optional scheduler slots already chosen by a higher-level controller.
     pub slot_ids: Vec<SlotId>,
     /// Optional service ownership metadata. Presence means this workload is a service replica.
-    pub service_metadata: Option<TaskServiceMetadata>,
+    pub service_metadata: Option<WorkloadServiceMetadata>,
     /// Placement hint used by the scheduler when a task must land on a specific node.
     pub target_node: Option<Uuid>,
 }
@@ -347,7 +346,7 @@ impl Deref for WorkloadStartRequest {
 
 #[derive(Clone)]
 pub struct WorkloadManagerConfig {
-    pub store: TaskStore,
+    pub store: WorkloadStore,
     pub tx: Sender<Message>,
     pub rx: Receiver<Message>,
     pub local_node_id: Uuid,
@@ -420,14 +419,14 @@ impl WorkloadManager {
             },
             local_state: WorkloadManagerLocalState {
                 local_instances: Arc::new(AsyncMutex::new(HashMap::new())),
-                task_spec_cache: Arc::new(StdMutex::new(HashMap::new())),
-                task_value_index: Arc::new(StdMutex::new(None)),
+                workload_spec_cache: Arc::new(StdMutex::new(HashMap::new())),
+                workload_value_index: Arc::new(StdMutex::new(None)),
                 liveness_probes: Arc::new(AsyncMutex::new(HashMap::new())),
                 inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
                 inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
                 removed_task_watermarks: Arc::new(AsyncMutex::new(HashMap::new())),
                 remote_prepare_feedback: RemotePrepareFeedbackRegistry::new(),
-                dirty_gossip_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
+                dirty_gossip_workloads: Arc::new(AsyncMutex::new(HashMap::new())),
                 dirty_gossip_notify: Arc::new(Notify::new()),
             },
             secrets: WorkloadManagerSecrets {
@@ -478,7 +477,7 @@ impl WorkloadManager {
     ///
     /// Drain-aware reconciliation uses this to suppress local relaunches so start-first
     /// replacements can move service replicas away without the drained node racing them.
-    fn should_block_local_service_runtime(&self, spec: &TaskSpec) -> bool {
+    fn should_block_local_service_runtime(&self, spec: &WorkloadSpec) -> bool {
         spec.node_id == self.local_node_id
             && spec.service_metadata.is_some()
             && self
@@ -527,7 +526,7 @@ impl WorkloadManager {
             .remove(&task_id);
     }
 
-    /// Returns true when one inbound task update should be ignored because it predates a known remove.
+    /// Returns true when one inbound workload update should be ignored because it predates a known remove.
     async fn should_ignore_removed_task(&self, task_id: Uuid, task_epoch: u64) -> bool {
         let tombstone = {
             let guard = self.local_state.removed_task_watermarks.lock().await;
@@ -550,13 +549,13 @@ impl WorkloadManager {
     }
 
     /// Returns true when an inbound full task definition predates a known remove watermark.
-    async fn should_ignore_removed_upsert(&self, spec: &TaskSpec) -> bool {
+    async fn should_ignore_removed_upsert(&self, spec: &WorkloadSpec) -> bool {
         self.should_ignore_removed_task(spec.id, spec.task_epoch)
             .await
     }
 
     /// Returns true when an inbound compact task status predates a known remove watermark.
-    async fn should_ignore_removed_status(&self, status: &TaskStatus) -> bool {
+    async fn should_ignore_removed_status(&self, status: &WorkloadStatus) -> bool {
         self.should_ignore_removed_task(status.id, status.task_epoch)
             .await
     }
@@ -569,8 +568,8 @@ impl WorkloadManager {
         command: Vec<String>,
         cpu_millis: u64,
         memory_bytes: u64,
-        restart_policy: Option<TaskRestartPolicy>,
-    ) -> Result<TaskSpec, anyhow::Error> {
+        restart_policy: Option<WorkloadRestartPolicy>,
+    ) -> Result<WorkloadSpec, anyhow::Error> {
         let request = WorkloadStartRequest {
             name: name.into(),
             execution: ResolvedExecutionSpec {
@@ -608,7 +607,7 @@ impl WorkloadManager {
     pub async fn start_tasks_batch(
         &self,
         requests: Vec<WorkloadStartRequest>,
-    ) -> Result<Vec<TaskSpec>, anyhow::Error> {
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         self.start_tasks_batch_with_scheduling_retry_limit(requests, None)
             .await
     }
@@ -622,7 +621,7 @@ impl WorkloadManager {
         &self,
         requests: Vec<WorkloadStartRequest>,
         scheduling_retry_max_attempts_override: Option<usize>,
-    ) -> Result<Vec<TaskSpec>, anyhow::Error> {
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -755,13 +754,13 @@ impl WorkloadManager {
             match self.start_local_instances(&mut local_plans).await {
                 Ok(local_specs) => {
                     reserved_remote.clear();
-                    let mut ordered: Vec<Option<TaskSpec>> = vec![None; intents.len()];
+                    let mut ordered: Vec<Option<WorkloadSpec>> = vec![None; intents.len()];
 
                     for (idx, spec) in remote_specs.into_iter().chain(local_specs.into_iter()) {
                         ordered[idx] = Some(spec);
                     }
 
-                    let specs: Vec<TaskSpec> = ordered
+                    let specs: Vec<WorkloadSpec> = ordered
                         .into_iter()
                         .map(|spec| spec.expect("missing task spec after execution"))
                         .collect();
@@ -793,12 +792,12 @@ impl WorkloadManager {
     pub async fn list_tasks(
         &self,
         filter: &WorkloadStateFilter,
-    ) -> Result<Vec<TaskSpec>, anyhow::Error> {
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         let (actives, _) = self
             .core
             .store
             .load_all()
-            .map_err(|e| anyhow::anyhow!("task store load_all failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("workload store load_all failed: {e}"))?;
 
         let mut specs = Vec::with_capacity(actives.len());
         for (k, snap) in actives {
@@ -829,7 +828,7 @@ impl WorkloadManager {
             .core
             .store
             .load_all()
-            .map_err(|e| anyhow!("task store load_all failed: {e}"))?;
+            .map_err(|e| anyhow!("workload store load_all failed: {e}"))?;
 
         match_task_id_prefix(
             trimmed,
@@ -867,7 +866,7 @@ impl WorkloadManager {
 
     /// Fetches the latest replicated task spec for the provided identifier so higher level
     /// reconcilers can reason about service-to-task relationships without mutating state.
-    pub async fn inspect_task(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
+    pub async fn inspect_task(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
         self.load_spec(id).await
     }
 
@@ -1090,7 +1089,7 @@ impl WorkloadManager {
     ///
     /// Local tasks are transitioned declaratively and drained by reconciliation. Remote tasks are
     /// delegated to the owning node so the owner records the stop intent and gossips it.
-    pub async fn request_task_stop(&self, id: Uuid) -> Result<TaskSpec, anyhow::Error> {
+    pub async fn request_task_stop(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
         let spec = self.load_spec(id).await?;
 
         if spec.node_id != self.local_node_id {
@@ -1111,7 +1110,7 @@ impl WorkloadManager {
         updated.phase_progress = None;
         updated.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(&updated).await?;
-        self.enqueue_gossip(TaskEvent::UpsertSpec(Box::new(updated.clone())))
+        self.enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(updated.clone())))
             .await?;
         Ok(updated)
     }

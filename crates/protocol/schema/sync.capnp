@@ -30,8 +30,8 @@ enum Domain {
   peers @0;
   # Peer registry domain.
 
-  tasks @1;
-  # Task registry domain.
+  workloads @1;
+  # Workload registry domain.
 
   services @2;
   # Service registry domain.

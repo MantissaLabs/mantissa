@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::scheduler::digest::{SchedulerDigestValue, read_scheduler_digest};
 use crate::scheduler::{GpuReservationRequest, SchedulerError, SlotId, SlotReservationRequest};
 use crate::task::service::read_spec;
-use crate::workload::model::{WorkloadEvent as TaskEvent, WorkloadPhase, WorkloadSpec as TaskSpec};
+use crate::workload::model::{WorkloadEvent, WorkloadPhase, WorkloadSpec};
 
 use super::WorkloadManager;
 use super::planner::{BatchStartPlan, PreparedRemoteStartPlan, RemoteStartPlan};
@@ -695,8 +695,8 @@ impl WorkloadManager {
     /// Requests a remote peer to stop a task so the owner updates state and broadcasts it.
     pub(super) async fn stop_remote_task(
         &self,
-        spec: &TaskSpec,
-    ) -> Result<TaskSpec, anyhow::Error> {
+        spec: &WorkloadSpec,
+    ) -> Result<WorkloadSpec, anyhow::Error> {
         if spec.node_id == self.local_node_id {
             return Err(anyhow::anyhow!(
                 "remote stop invoked for local task {}",
@@ -743,7 +743,7 @@ impl WorkloadManager {
     }
 
     /// Requests remote peers to stop tasks so rollbacks do not leak running runtime instances.
-    pub(super) async fn signal_remote_stop(&self, specs: &[(usize, TaskSpec)]) {
+    pub(super) async fn signal_remote_stop(&self, specs: &[(usize, WorkloadSpec)]) {
         if specs.is_empty() {
             return;
         }
@@ -772,12 +772,12 @@ impl WorkloadManager {
     pub(super) async fn materialize_remote_specs(
         &self,
         plans: &[PreparedRemoteStartPlan],
-    ) -> Result<Vec<(usize, TaskSpec)>, ExecutionError> {
+    ) -> Result<Vec<(usize, WorkloadSpec)>, ExecutionError> {
         if plans.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut results: Vec<(usize, TaskSpec)> = Vec::new();
+        let mut results: Vec<(usize, WorkloadSpec)> = Vec::new();
 
         for plan in plans {
             let slot_ids = plan.slot_ids.clone();
@@ -797,7 +797,7 @@ impl WorkloadManager {
                 .await
                 .map_err(ExecutionError::Fatal)?;
 
-            let spec = TaskSpec {
+            let spec = WorkloadSpec {
                 id: plan.id,
                 name: plan.name.clone(),
                 image: plan.image.clone(),
@@ -837,7 +837,7 @@ impl WorkloadManager {
             results.push((plan.index, spec));
         }
 
-        let specs: Vec<TaskSpec> = results.iter().map(|(_, spec)| spec.clone()).collect();
+        let specs: Vec<WorkloadSpec> = results.iter().map(|(_, spec)| spec.clone()).collect();
         if let Err(err) = self.persist_specs_batch(&specs).await {
             return Err(ExecutionError::Fatal(
                 err.context("failed to persist remote task specs for batch"),
@@ -846,12 +846,12 @@ impl WorkloadManager {
 
         for (_, spec) in &results {
             if let Err(err) = self
-                .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+                .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
                 .await
             {
                 warn!(
                     target: "task",
-                    "failed to record task gossip for {}: {err}",
+                    "failed to record workload gossip for {}: {err}",
                     spec.name
                 );
             }

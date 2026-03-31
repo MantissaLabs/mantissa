@@ -18,8 +18,8 @@ use crate::store::peer_store::PeersStore;
 use crate::store::scheduler_digest_store::SchedulerDigestStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
-use crate::store::task_store::TaskStore;
 use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
+use crate::store::workload_store::WorkloadStore;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use crdt_store::mst_store::{Registers, Tombstones};
 use crdt_store::uuid_key::UuidKey;
@@ -40,7 +40,7 @@ type EncodedTombstones = Vec<EncodedTombstone>;
 /// Both client and server treat an empty domain list as "all domains in this order".
 const ALL_DOMAINS: [Domain; 13] = [
     Domain::Peers,
-    Domain::Tasks,
+    Domain::Workloads,
     Domain::Services,
     Domain::Jobs,
     Domain::Agents,
@@ -90,7 +90,7 @@ fn delta_chunk_target_bytes() -> usize {
 pub struct SyncService {
     cluster_view: ClusterViewState,
     peers: PeersStore,
-    tasks: TaskStore,
+    workloads: WorkloadStore,
     jobs: JobStore,
     agents: AgentStore,
     services: ServiceStore,
@@ -111,7 +111,7 @@ pub struct SyncService {
 /// surface without threading ten separate arguments through every call site.
 pub struct SyncStores {
     pub peers: PeersStore,
-    pub tasks: TaskStore,
+    pub workloads: WorkloadStore,
     pub jobs: JobStore,
     pub agents: AgentStore,
     pub services: ServiceStore,
@@ -130,7 +130,7 @@ impl SyncService {
     pub fn new(cluster_view: ClusterViewState, stores: SyncStores) -> Self {
         let SyncStores {
             peers,
-            tasks,
+            workloads,
             jobs,
             agents,
             services,
@@ -146,7 +146,7 @@ impl SyncService {
         Self {
             cluster_view,
             peers,
-            tasks,
+            workloads,
             jobs,
             agents,
             services,
@@ -176,7 +176,7 @@ impl SyncService {
     fn domain_store(&self, domain: Domain) -> DomainStoreRef<'_> {
         match domain {
             Domain::Peers => DomainStoreRef::Peers(&self.peers),
-            Domain::Tasks => DomainStoreRef::Tasks(&self.tasks),
+            Domain::Workloads => DomainStoreRef::Workloads(&self.workloads),
             Domain::Services => DomainStoreRef::Services(&self.services),
             Domain::Jobs => DomainStoreRef::Jobs(&self.jobs),
             Domain::Agents => DomainStoreRef::Agents(&self.agents),
@@ -197,7 +197,7 @@ impl SyncService {
 /// Typed reference to one sync domain's replicated store and diagnostics labels.
 enum DomainStoreRef<'a> {
     Peers(&'a PeersStore),
-    Tasks(&'a TaskStore),
+    Workloads(&'a WorkloadStore),
     Services(&'a ServiceStore),
     Jobs(&'a JobStore),
     Agents(&'a AgentStore),
@@ -223,7 +223,7 @@ macro_rules! with_domain_store {
     ($domain_store:expr, |$store:ident| $body:block) => {
         match $domain_store {
             DomainStoreRef::Peers($store) => $body,
-            DomainStoreRef::Tasks($store) => $body,
+            DomainStoreRef::Workloads($store) => $body,
             DomainStoreRef::Services($store) => $body,
             DomainStoreRef::Jobs($store) => $body,
             DomainStoreRef::Agents($store) => $body,
@@ -248,10 +248,10 @@ impl DomainStoreRef<'_> {
                 log_label: "peers",
                 dump_suffix: "peers",
             },
-            Self::Tasks(_) => DomainDebugMeta {
-                domain: Domain::Tasks,
-                log_label: "tasks",
-                dump_suffix: "tasks",
+            Self::Workloads(_) => DomainDebugMeta {
+                domain: Domain::Workloads,
+                log_label: "workloads",
+                dump_suffix: "workloads",
             },
             Self::Services(_) => DomainDebugMeta {
                 domain: Domain::Services,

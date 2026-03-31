@@ -759,7 +759,7 @@ impl Topology {
         evicted: &HashSet<Uuid>,
     ) -> Result<usize, capnp::Error> {
         let (actives, _) = self
-            .tasks
+            .workloads
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
@@ -774,7 +774,7 @@ impl Topology {
 
             // Split pruning is view-scoped, not a global delete. Purge locally so merge/sync
             // can repopulate rows from the other partition.
-            self.tasks
+            self.workloads
                 .purge_local(&UuidKey::from(key.to_uuid()))
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -867,11 +867,11 @@ impl Topology {
 
     /// Collects non-terminal task rows currently assigned to the provided node id.
     ///
-    /// Drain validation uses the replicated task store directly so blockers are determined from
+    /// Drain validation uses the replicated workload store directly so blockers are determined from
     /// converged cluster state instead of the local runtime cache.
     fn active_task_values_on_node(&self, node_id: Uuid) -> Result<Vec<TaskValue>, capnp::Error> {
         let (entries, _) = self
-            .tasks
+            .workloads
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
@@ -1586,7 +1586,7 @@ impl topology::Server for Topology {
 
         let sync_stores = SyncStores {
             peers: self.peers.clone(),
-            tasks: self.tasks.clone(),
+            workloads: self.workloads.clone(),
             jobs: self.jobs.clone(),
             agents: self.agents.clone(),
             services: self.services.clone(),

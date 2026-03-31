@@ -11,6 +11,6 @@ pub mod scheduler_digest_store;
 pub mod scheduler_store;
 pub mod secret_store;
 pub mod service_store;
-pub mod task_store;
 pub(crate) mod tx;
 pub mod volume_store;
+pub mod workload_store;

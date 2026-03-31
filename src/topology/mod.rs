@@ -19,8 +19,8 @@ use crate::store::peer_store::PeersStore;
 use crate::store::scheduler_digest_store::SchedulerDigestStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
-use crate::store::task_store::TaskStore;
 use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
+use crate::store::workload_store::WorkloadStore;
 use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains, sync_selected_domains};
 use crate::token::TokenStore;
 use crate::topology::peers::{PeerSchedulingState, PeerValue, write_runtime_support_to_node_info};
@@ -97,12 +97,13 @@ const DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_GLOBAL_METADATA_SYNC_FANOUT: usize = 8;
 /// Default maximum concurrent cross-view metadata sync operations per tick.
 const DEFAULT_GLOBAL_METADATA_SYNC_PARALLELISM: usize = 1;
-/// Number of peers targeted by the low-rate task-only repair path on each sync tick.
-const DEFAULT_TASK_REPAIR_FANOUT: usize = 1;
+/// Number of peers targeted by the low-rate workload-only repair path on each
+/// sync tick.
+const DEFAULT_WORKLOAD_REPAIR_FANOUT: usize = 1;
 /// Cross-view domains synchronized by the global metadata anti-entropy loop.
 const GLOBAL_METADATA_SYNC_DOMAINS: [Domain; 1] = [Domain::ClusterViews];
-/// Selected domains synchronized by the targeted task-only repair path.
-const TASK_REPAIR_SYNC_DOMAINS: [Domain; 1] = [Domain::Tasks];
+/// Selected domains synchronized by the targeted workload-only repair path.
+const WORKLOAD_REPAIR_SYNC_DOMAINS: [Domain; 1] = [Domain::Workloads];
 
 /// Reads the optional per-tick sync parallelism override from the environment.
 fn sync_parallelism_from_env(default: usize) -> usize {
@@ -151,7 +152,7 @@ pub struct TopologyStores {
     pub cluster_view: ClusterViewStore,
     pub token_store: TokenStore,
     pub secret_master_store: SecretMasterStore,
-    pub tasks: TaskStore,
+    pub workloads: WorkloadStore,
     pub jobs: JobStore,
     pub agents: AgentStore,
     pub services: ServiceStore,
@@ -361,7 +362,7 @@ pub struct Topology {
     peers: PeersStore,
     cluster_operations: ClusterOperationStore,
     cluster_view_store: ClusterViewStore,
-    tasks: TaskStore,
+    workloads: WorkloadStore,
     jobs: JobStore,
     agents: AgentStore,
     services: ServiceStore,
@@ -406,8 +407,8 @@ pub struct Topology {
     /// Runtime state for background sync loop management.
     sync: SyncState,
 
-    /// Rotating cursor used by task-only repair to deterministically cover all in-view peers.
-    task_repair_cursor: Arc<Mutex<usize>>,
+    /// Rotating cursor used by workload-only repair to deterministically cover all in-view peers.
+    workload_repair_cursor: Arc<Mutex<usize>>,
 
     /// Runtime state for cross-view cluster metadata anti-entropy management.
     metadata_sync: SyncState,
@@ -476,7 +477,7 @@ impl Topology {
             cluster_view: cluster_view_store,
             token_store,
             secret_master_store,
-            tasks,
+            workloads,
             jobs,
             agents,
             services,
@@ -502,7 +503,7 @@ impl Topology {
             peers,
             cluster_operations,
             cluster_view_store,
-            tasks,
+            workloads,
             jobs,
             agents,
             services,
@@ -524,7 +525,7 @@ impl Topology {
             public_key: noise_public_key,
             signing_key,
             sync: SyncState::new(DEFAULT_SYNC_INTERVAL, DEFAULT_SYNC_FANOUT),
-            task_repair_cursor: Arc::new(Mutex::new(0)),
+            workload_repair_cursor: Arc::new(Mutex::new(0)),
             metadata_sync: SyncState::new(
                 global_metadata_sync_interval_from_env(DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL),
                 global_metadata_sync_fanout_from_env(DEFAULT_GLOBAL_METADATA_SYNC_FANOUT),
@@ -1178,7 +1179,7 @@ impl Topology {
                         error!("Failed to forward gossip event: {e}");
                     }
                 }
-                Ok(Message::Task { .. })
+                Ok(Message::Workload { .. })
                 | Ok(Message::Service { .. })
                 | Ok(Message::Network { .. })
                 | Ok(Message::Secret { .. }) => {
@@ -1450,11 +1451,11 @@ impl Topology {
         }
         while inflight.next().await.is_some() {}
 
-        for entry in self.select_task_repair_peers(entries, &selected_peer_ids) {
+        for entry in self.select_workload_repair_peers(entries, &selected_peer_ids) {
             if excluded_peers.contains(&entry.peer_id) {
                 continue;
             }
-            self.sync_tasks_with_peer(entry, cluster_view).await;
+            self.sync_workloads_with_peer(entry, cluster_view).await;
         }
     }
 
@@ -1470,11 +1471,11 @@ impl Topology {
         select_sync_peers_for_node(self.node.id, entries, sync_fanout)
     }
 
-    /// Select peers to target during one low-rate task-only repair tick.
+    /// Select peers to target during one low-rate workload-only repair tick.
     ///
     /// This keeps task repair deterministic and bounded while avoiding peers already chosen for
     /// the full all-domain sync pass during the same tick.
-    fn select_task_repair_peers<'a>(
+    fn select_workload_repair_peers<'a>(
         &self,
         entries: &'a [PeerCacheEntry],
         already_selected: &HashSet<Uuid>,
@@ -1482,8 +1483,8 @@ impl Topology {
         select_sync_peers_round_robin_for_node(
             self.node.id,
             entries,
-            DEFAULT_TASK_REPAIR_FANOUT,
-            &self.task_repair_cursor,
+            DEFAULT_WORKLOAD_REPAIR_FANOUT,
+            &self.workload_repair_cursor,
         )
         .into_iter()
         .filter(|entry| !already_selected.contains(&entry.peer_id))
@@ -1530,7 +1531,7 @@ impl Topology {
 
         let stores = SyncStores {
             peers: self.peers.clone(),
-            tasks: self.tasks.clone(),
+            workloads: self.workloads.clone(),
             jobs: self.jobs.clone(),
             agents: self.agents.clone(),
             services: self.services.clone(),
@@ -1548,11 +1549,11 @@ impl Topology {
         sync_all_domains(stores, sync_cap, cluster_view, Some(trace)).await;
     }
 
-    /// Executes one targeted task-only repair exchange against a selected peer.
+    /// Executes one targeted workload-only repair exchange against a selected peer.
     ///
     /// This supplements the full random all-domain sync pass with one deterministic task-domain
     /// repair so tail task divergence is repaired without broadening the all-domain sync hot path.
-    async fn sync_tasks_with_peer(&self, entry: &PeerCacheEntry, cluster_view: ClusterViewId) {
+    async fn sync_workloads_with_peer(&self, entry: &PeerCacheEntry, cluster_view: ClusterViewId) {
         let peer_id = entry.peer_id;
         let value = entry.value.as_ref();
 
@@ -1571,7 +1572,7 @@ impl Topology {
 
         let stores = SyncStores {
             peers: self.peers.clone(),
-            tasks: self.tasks.clone(),
+            workloads: self.workloads.clone(),
             jobs: self.jobs.clone(),
             agents: self.agents.clone(),
             services: self.services.clone(),
@@ -1590,7 +1591,7 @@ impl Topology {
             stores,
             sync_cap,
             cluster_view,
-            &TASK_REPAIR_SYNC_DOMAINS,
+            &WORKLOAD_REPAIR_SYNC_DOMAINS,
             Some(trace),
         )
         .await;
@@ -1622,7 +1623,7 @@ impl Topology {
 
         let stores = SyncStores {
             peers: self.peers.clone(),
-            tasks: self.tasks.clone(),
+            workloads: self.workloads.clone(),
             jobs: self.jobs.clone(),
             agents: self.agents.clone(),
             services: self.services.clone(),

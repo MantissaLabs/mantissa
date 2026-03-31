@@ -21,16 +21,15 @@ use crate::network::types::{
 use crate::network::wireguard;
 use crate::runtime::types::{RuntimeAttachmentTarget, RuntimeEvent};
 use crate::workload::model::{
-    WorkloadEvent as TaskEvent, WorkloadPhase, WorkloadServiceMetadata as TaskServiceMetadata,
-    WorkloadSpec as TaskSpec, WorkloadStatus as TaskStatus,
+    WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStatus,
     compare_workload_causality as compare_task_causality,
     compare_workload_status_causality as compare_task_status_causality, select_best_workload_value,
 };
-use crate::workload::types::WorkloadRestartPolicyKind as TaskRestartPolicyKind;
+use crate::workload::types::WorkloadRestartPolicyKind;
 
 use super::WorkloadManager;
 use super::{
-    TASK_GOSSIP_FLUSH_INTERVAL, merge_definition_into_value, merge_status_into_value,
+    WORKLOAD_GOSSIP_FLUSH_INTERVAL, merge_definition_into_value, merge_status_into_value,
     spec_to_value, value_to_spec,
 };
 
@@ -192,8 +191,8 @@ impl WorkloadManager {
             }
         }
 
-        let task_values = self.load_task_value_index().await?;
-        let running_network_tasks: Vec<_> = task_values
+        let workload_values = self.load_workload_value_index().await?;
+        let running_network_tasks: Vec<_> = workload_values
             .values()
             .filter(|value| {
                 value.node_id == self.local_node_id
@@ -300,7 +299,7 @@ impl WorkloadManager {
         let mut repair_tick = interval(self.runtime.runtime_config.repair_tick);
         let mut reconcile_tick = interval(self.runtime.runtime_config.reconcile_tick);
         let mut runtime_event_tick = interval(self.runtime.runtime_config.runtime_event_debounce);
-        let mut gossip_flush_tick = interval(TASK_GOSSIP_FLUSH_INTERVAL);
+        let mut gossip_flush_tick = interval(WORKLOAD_GOSSIP_FLUSH_INTERVAL);
         runtime_event_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         gossip_flush_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut runtime_reconcile_pending = false;
@@ -344,7 +343,7 @@ impl WorkloadManager {
                         }
                         Err(err) => {
                             gossip_flush_pending = false;
-                            warn!(target: "task", "failed to flush dirty task gossip: {err:#}");
+                            warn!(target: "task", "failed to flush dirty workload gossip: {err:#}");
                         }
                     }
                 }
@@ -378,7 +377,7 @@ impl WorkloadManager {
                 message = self.core.rx.recv() => {
                     let Ok(message) = message else { break; };
                     match message {
-                        Message::Task { event, .. } => {
+                        Message::Workload { event, .. } => {
                             if let Err(e) = self.handle_event(event).await {
                                 tracing::error!(target: "task", "failed to handle task event: {e}");
                             }
@@ -483,9 +482,9 @@ impl WorkloadManager {
     }
 
     /// Handles a gossip event by updating local state and reconciling as needed.
-    pub(super) async fn handle_event(&self, event: TaskEvent) -> Result<(), anyhow::Error> {
+    pub(super) async fn handle_event(&self, event: WorkloadEvent) -> Result<(), anyhow::Error> {
         match event {
-            TaskEvent::UpsertSpec(spec_box) => {
+            WorkloadEvent::UpsertSpec(spec_box) => {
                 let spec = *spec_box;
                 if self.should_ignore_removed_upsert(&spec).await {
                     debug!(
@@ -562,8 +561,8 @@ impl WorkloadManager {
 
                 Ok(())
             }
-            TaskEvent::UpsertStatus(status_box) => {
-                let status: TaskStatus = *status_box;
+            WorkloadEvent::UpsertStatus(status_box) => {
+                let status: WorkloadStatus = *status_box;
                 if self.should_ignore_removed_status(&status).await {
                     debug!(
                         target: "task",
@@ -630,7 +629,7 @@ impl WorkloadManager {
 
                 Ok(())
             }
-            TaskEvent::Remove { id } => {
+            WorkloadEvent::Remove { id } => {
                 let current = self.load_spec(id).await.ok();
                 if let Some(spec) = current.as_ref() {
                     let active_local = spec.node_id == self.local_node_id
@@ -675,15 +674,15 @@ impl WorkloadManager {
 }
 
 /// Returns true when runtime exits should be auto-restarted for the task policy.
-fn task_policy_allows_runtime_restart(spec: &TaskSpec, exit_code: i32) -> bool {
+fn task_policy_allows_runtime_restart(spec: &WorkloadSpec, exit_code: i32) -> bool {
     let Some(policy) = spec.restart_policy.as_ref() else {
         return false;
     };
 
     match policy.name {
-        TaskRestartPolicyKind::No => false,
-        TaskRestartPolicyKind::Always | TaskRestartPolicyKind::UnlessStopped => true,
-        TaskRestartPolicyKind::OnFailure => exit_code != 0,
+        WorkloadRestartPolicyKind::No => false,
+        WorkloadRestartPolicyKind::Always | WorkloadRestartPolicyKind::UnlessStopped => true,
+        WorkloadRestartPolicyKind::OnFailure => exit_code != 0,
     }
 }
 
@@ -694,17 +693,17 @@ impl WorkloadManager {
         task_id: Uuid,
         instance_id: &str,
         network_ids: &[Uuid],
-        service_meta: Option<&TaskServiceMetadata>,
+        service_meta: Option<&WorkloadServiceMetadata>,
     ) -> Result<()> {
         // Only clean up orphaned attachments when the task already exists in the store. During
-        // initial creation (before we persist the TaskSpec) this would incorrectly delete
+        // initial creation (before we persist the WorkloadSpec) this would incorrectly delete
         // attachments we just created for earlier tasks in the same batch.
         let snapshot = self
             .core
             .store
             .get_snapshot(&UuidKey::from(task_id))
             .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?;
-        let (has_snapshot, task_revision) = match snapshot {
+        let (has_snapshot, workload_revision) = match snapshot {
             Some(values) => (
                 true,
                 select_best_workload_value(values.as_slice())
@@ -791,7 +790,7 @@ impl WorkloadManager {
                         value.template_name = Some(template.clone());
                         label_changed = true;
                     }
-                    if let Some(revision) = task_revision.as_deref()
+                    if let Some(revision) = workload_revision.as_deref()
                         && value.task_updated_at.as_deref() != Some(revision)
                     {
                         value.task_updated_at = Some(revision.to_string());
@@ -814,7 +813,7 @@ impl WorkloadManager {
                         node_id: self.local_node_id,
                         instance_id: instance_id.to_string(),
                         network_id: *network_id,
-                        task_updated_at: task_revision.clone(),
+                        task_updated_at: workload_revision.clone(),
                         requested_ip: None,
                         assigned_ip: None,
                         mac: None,
@@ -1113,7 +1112,7 @@ impl WorkloadManager {
                 .with_context(|| format!("lookup task {}", attachment.task_id))?
                 .and_then(|snap| select_best_workload_value(snap.as_slice()));
             let task_state = task_value.as_ref().map(|value| value.state.clone());
-            let task_revision: Option<String> =
+            let workload_revision: Option<String> =
                 task_value.as_ref().and_then(task_revision_timestamp);
 
             let should_remove = matches!(
@@ -1156,7 +1155,7 @@ impl WorkloadManager {
             }
 
             let mut removing = attachment.clone();
-            if let Some(revision) = task_revision.as_deref()
+            if let Some(revision) = workload_revision.as_deref()
                 && removing.task_updated_at.as_deref() != Some(revision)
             {
                 removing.task_updated_at = Some(revision.to_string());
@@ -1321,7 +1320,7 @@ fn attachment_age_exceeds(attachment: &NetworkAttachmentValue, grace_secs: i64) 
     }
 }
 
-/// Extract a stable revision timestamp from a task value so attachment updates track reschedules.
+/// Extract a stable revision timestamp from a workload value so attachment updates track reschedules.
 fn task_revision_timestamp(value: &crate::workload::model::WorkloadValue) -> Option<String> {
     if !value.updated_at.is_empty() {
         Some(value.updated_at.clone())

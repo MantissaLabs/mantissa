@@ -22,13 +22,12 @@ use crate::secrets::types::SecretEvent;
 use crate::services::service::{read_service_event, write_service_event};
 use crate::services::types::ServiceEvent;
 use crate::task::service as task_service;
-use crate::task::types::TaskEvent;
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
 use crate::volumes::service::{read_volume_event, write_volume_event};
 use crate::volumes::types::VolumeEvent;
-use crate::workload::model::{should_replace_workload_event, workload_event_id};
+use crate::workload::model::{WorkloadEvent, should_replace_workload_event, workload_event_id};
 use async_channel::{Receiver, Sender, TrySendError};
 use async_trait::async_trait;
 use capnp::Error;
@@ -103,9 +102,9 @@ pub enum Message {
         id: Uuid,
         event: TopologyEvent,
     },
-    Task {
+    Workload {
         id: Uuid,
-        event: TaskEvent,
+        event: WorkloadEvent,
     },
     Job {
         id: Uuid,
@@ -142,7 +141,7 @@ impl Message {
         match self {
             Message::Void { id }
             | Message::Topology { id, .. }
-            | Message::Task { id, .. }
+            | Message::Workload { id, .. }
             | Message::Job { id, .. }
             | Message::Agent { id, .. }
             | Message::Service { id, .. }
@@ -227,7 +226,7 @@ const DEFAULT_GOSSIP_SEND_PARALLELISM: usize = 1;
 const GOSSIP_DEDUPE_MAX_ENTRIES: usize = 100_000;
 /// Time window used to suppress duplicate gossip identifiers.
 const GOSSIP_DEDUPE_TTL: Duration = Duration::from_secs(10 * 60);
-/// Process-wide counter tracking how many outbound task gossip updates were coalesced.
+/// Process-wide counter tracking how many outbound workload gossip updates were coalesced.
 static GOSSIP_COALESCED_TASK_UPDATES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Coalesces one pending outbound gossip batch by task id and digest node id.
@@ -242,9 +241,9 @@ fn coalesce_pending_messages(pending: Vec<Message>) -> (Vec<Message>, usize) {
     let mut dropped = 0usize;
 
     for message in pending {
-        if let Some(task_id) = task_message_task_id(&message) {
+        if let Some(task_id) = workload_message_id(&message) {
             if let Some(position) = task_positions.get(&task_id).copied() {
-                if should_replace_task_message(&coalesced[position], &message) {
+                if should_replace_workload_message(&coalesced[position], &message) {
                     coalesced[position] = message;
                 }
                 dropped = dropped.saturating_add(1);
@@ -276,10 +275,11 @@ fn coalesce_pending_messages(pending: Vec<Message>) -> (Vec<Message>, usize) {
     (coalesced, dropped)
 }
 
-/// Returns the logical task identifier for one gossip message when it carries a task event.
-fn task_message_task_id(message: &Message) -> Option<Uuid> {
+/// Returns the logical workload identifier for one gossip message when it
+/// carries a workload event.
+fn workload_message_id(message: &Message) -> Option<Uuid> {
     match message {
-        Message::Task { event, .. } => Some(workload_event_id(event)),
+        Message::Workload { event, .. } => Some(workload_event_id(event)),
         _ => None,
     }
 }
@@ -292,14 +292,15 @@ fn scheduler_digest_message_node_id(message: &Message) -> Option<Uuid> {
     }
 }
 
-/// Returns true when the candidate task message should replace the currently retained one.
-fn should_replace_task_message(current: &Message, candidate: &Message) -> bool {
+/// Returns true when the candidate workload message should replace the
+/// currently retained one.
+fn should_replace_workload_message(current: &Message, candidate: &Message) -> bool {
     let (
-        Message::Task {
+        Message::Workload {
             event: current_event,
             ..
         },
-        Message::Task {
+        Message::Workload {
             event: candidate_event,
             ..
         },
@@ -368,7 +369,7 @@ fn gossip_send_timeout_from_env() -> Option<Duration> {
 
 /// Reads whether inbound gossip should be relayed into the outbound queue.
 ///
-/// Disabled by default to avoid amplifying high-volume task update streams.
+/// Disabled by default to avoid amplifying high-volume workload update streams.
 fn gossip_relay_inbound_from_env() -> bool {
     std::env::var("MANTISSA_GOSSIP_RELAY_INBOUND")
         .ok()
@@ -439,7 +440,7 @@ pub struct Gossip {
 
 pub struct Channels {
     pub topology_events: Sender<Message>,
-    pub task_events: Sender<Message>,
+    pub workload_events: Sender<Message>,
     pub job_events: Sender<Message>,
     pub agent_events: Sender<Message>,
     pub service_events: Sender<Message>,
@@ -475,7 +476,7 @@ impl gossip::Server for Gossip {
         _results: gossip::GossipResults,
     ) -> Result<(), Error> {
         let topo_tx = self.chans.topology_events.clone();
-        let task_tx = self.chans.task_events.clone();
+        let workload_tx = self.chans.workload_events.clone();
         let job_tx = self.chans.job_events.clone();
         let agent_tx = self.chans.agent_events.clone();
         let service_tx = self.chans.service_events.clone();
@@ -563,7 +564,7 @@ impl gossip::Server for Gossip {
             let message_type = match &which {
                 Void(_) => "void",
                 Topology(_) => "topology",
-                Task(_) => "task",
+                Workload(_) => "workload",
                 Job(_) => "job",
                 Agent(_) => "agent",
                 Service(_) => "service",
@@ -604,20 +605,20 @@ impl gossip::Server for Gossip {
                 Topology(Err(e)) => {
                     eprintln!("Error reading topology: {e}");
                 }
-                Task(Ok(reader)) => match task_service::read_event(reader) {
+                Workload(Ok(reader)) => match task_service::read_event(reader) {
                     Ok(event) => {
-                        let message = Message::Task { id, event };
+                        let message = Message::Workload { id, event };
                         if should_relay_inbound_message(relay_inbound, &message) {
                             forward_inbound_message(&outbound_tx, message_for_forwarding(&message));
                         }
-                        task_tx.send(message).await.map_err(|e| {
-                            capnp::Error::failed(format!("Couldn't send event to task: {e}"))
+                        workload_tx.send(message).await.map_err(|e| {
+                            capnp::Error::failed(format!("Couldn't send event to workload: {e}"))
                         })?;
                     }
-                    Err(e) => eprintln!("Failed to convert task event: {e}"),
+                    Err(e) => eprintln!("Failed to convert workload event: {e}"),
                 },
-                Task(Err(e)) => {
-                    eprintln!("Error reading task: {e}");
+                Workload(Err(e)) => {
+                    eprintln!("Error reading workload: {e}");
                 }
                 Job(Ok(reader)) => match read_job_event(reader) {
                     Ok(event) => {
@@ -785,7 +786,7 @@ pub(crate) async fn start<C>(
                         after_count = pending.len(),
                         coalesced_task_updates,
                         total_coalesced_task_updates,
-                        "coalesced outbound task gossip updates"
+                        "coalesced outbound workload gossip updates"
                     );
                     if should_emit_diag_sample(total_coalesced_task_updates) {
                         warn!(
@@ -794,7 +795,7 @@ pub(crate) async fn start<C>(
                             after_count = pending.len(),
                             coalesced_task_updates,
                             total_coalesced_task_updates,
-                            "coalesced outbound task gossip updates sampled"
+                            "coalesced outbound workload gossip updates sampled"
                         );
                     }
                 }
@@ -1136,7 +1137,7 @@ where
             Message::Topology { event, .. } => {
                 topology::add_event(&mut msgs, idx as u32, event, cluster_view);
             }
-            Message::Task { event, .. } => {
+            Message::Workload { event, .. } => {
                 task_service::add_event(&mut msgs, idx as u32, event);
             }
             Message::Job { event, .. } => {
@@ -1216,7 +1217,7 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
             TopologyEvent::ClusterNameUpdated { .. } => false,
         },
         // Task updates replicate to every peer regardless of assignment so keep them.
-        Message::Task { .. } => false,
+        Message::Workload { .. } => false,
         Message::Job { .. } => false,
         Message::Agent { .. } => false,
         Message::Service { .. } => false,
@@ -1489,11 +1490,11 @@ mod tests {
         };
 
         let pending = vec![
-            Message::Task {
+            Message::Workload {
                 id: Uuid::new_v4(),
                 event: TaskEvent::UpsertSpec(Box::new(newer.clone())),
             },
-            Message::Task {
+            Message::Workload {
                 id: Uuid::new_v4(),
                 event: TaskEvent::UpsertSpec(Box::new(stale)),
             },
@@ -1503,7 +1504,7 @@ mod tests {
         assert_eq!(dropped, 1);
         assert_eq!(coalesced.len(), 1);
         match &coalesced[0] {
-            Message::Task {
+            Message::Workload {
                 event: TaskEvent::UpsertSpec(spec),
                 ..
             } => {
@@ -1558,11 +1559,11 @@ mod tests {
         };
 
         let pending = vec![
-            Message::Task {
+            Message::Workload {
                 id: Uuid::new_v4(),
                 event: TaskEvent::UpsertSpec(Box::new(upsert)),
             },
-            Message::Task {
+            Message::Workload {
                 id: Uuid::new_v4(),
                 event: TaskEvent::Remove { id: task_id },
             },
@@ -1573,14 +1574,14 @@ mod tests {
         assert_eq!(coalesced.len(), 1);
         assert!(matches!(
             coalesced[0],
-            Message::Task {
+            Message::Workload {
                 event: TaskEvent::Remove { .. },
                 ..
             }
         ));
     }
 
-    /// Burst task lifecycle chatter should collapse to one causally newest task update.
+    /// Burst workload lifecycle chatter should collapse to one causally newest workload update.
     #[test]
     fn coalesce_pending_messages_collapses_many_task_phase_updates() {
         let task_id = Uuid::new_v4();
@@ -1636,7 +1637,7 @@ mod tests {
                 launch_attempt: 0,
                 last_terminal_observed_launch: None,
             };
-            pending.push(Message::Task {
+            pending.push(Message::Workload {
                 id: Uuid::new_v4(),
                 event: TaskEvent::UpsertSpec(Box::new(spec)),
             });
@@ -1651,7 +1652,7 @@ mod tests {
         let newest_task = coalesced
             .iter()
             .find_map(|message| match message {
-                Message::Task {
+                Message::Workload {
                     event: TaskEvent::UpsertSpec(spec),
                     ..
                 } => Some(spec),

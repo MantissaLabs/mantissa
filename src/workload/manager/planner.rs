@@ -14,13 +14,10 @@ use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
 };
 use crate::workload::model::{
-    RuntimeClass, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
-    WorkloadSecretFile as TaskSecretFile, WorkloadServiceMetadata as TaskServiceMetadata,
-    WorkloadVolumeMount as TaskVolumeMount,
+    RuntimeClass, WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile,
+    WorkloadServiceMetadata, WorkloadVolumeMount as TaskVolumeMount,
 };
-use crate::workload::types::{
-    WorkloadLivenessProbe as TaskLivenessProbe, WorkloadRestartPolicy as TaskRestartPolicy,
-};
+use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
 
 use super::remote_advisory::{
     RemoteCandidateHint, compare_remote_candidate_hints, current_unix_ms,
@@ -81,15 +78,15 @@ pub(super) struct BatchStartPlan {
     pub(super) created_at: DateTime<Utc>,
     pub(super) index: usize,
     pub(super) preassigned: bool,
-    pub(super) restart_policy: Option<TaskRestartPolicy>,
+    pub(super) restart_policy: Option<WorkloadRestartPolicy>,
     pub(super) termination_grace_period_secs: Option<u32>,
     pub(super) pre_stop_command: Option<Vec<String>>,
-    pub(super) liveness: Option<TaskLivenessProbe>,
+    pub(super) liveness: Option<WorkloadLivenessProbe>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
-    pub(super) secret_files: Vec<TaskSecretFile>,
+    pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
-    pub(super) service_metadata: Option<TaskServiceMetadata>,
+    pub(super) service_metadata: Option<WorkloadServiceMetadata>,
 }
 
 impl BatchStartPlan {
@@ -117,15 +114,15 @@ pub(super) struct StartIntent {
     pub(super) sandbox_profile: Option<String>,
     pub(super) required_runtime_features: Vec<String>,
     pub(super) preassigned_slots: Vec<SlotId>,
-    pub(super) restart_policy: Option<TaskRestartPolicy>,
+    pub(super) restart_policy: Option<WorkloadRestartPolicy>,
     pub(super) termination_grace_period_secs: Option<u32>,
     pub(super) pre_stop_command: Option<Vec<String>>,
-    pub(super) liveness: Option<TaskLivenessProbe>,
+    pub(super) liveness: Option<WorkloadLivenessProbe>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
-    pub(super) secret_files: Vec<TaskSecretFile>,
+    pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
-    pub(super) service_metadata: Option<TaskServiceMetadata>,
+    pub(super) service_metadata: Option<WorkloadServiceMetadata>,
     pub(super) target_node: Option<Uuid>,
 }
 
@@ -549,15 +546,15 @@ pub(super) struct RemoteStartPlan {
     pub(super) memory_bytes: u64,
     pub(super) gpu_count: u32,
     pub(super) peer_id: Uuid,
-    pub(super) restart_policy: Option<TaskRestartPolicy>,
+    pub(super) restart_policy: Option<WorkloadRestartPolicy>,
     pub(super) termination_grace_period_secs: Option<u32>,
     pub(super) pre_stop_command: Option<Vec<String>>,
-    pub(super) liveness: Option<TaskLivenessProbe>,
+    pub(super) liveness: Option<WorkloadLivenessProbe>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
-    pub(super) secret_files: Vec<TaskSecretFile>,
+    pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
-    pub(super) service_metadata: Option<TaskServiceMetadata>,
+    pub(super) service_metadata: Option<WorkloadServiceMetadata>,
 }
 
 #[derive(Clone)]
@@ -578,15 +575,15 @@ pub(super) struct PreparedRemoteStartPlan {
     pub(super) slot_ids: Vec<SlotId>,
     pub(super) gpu_device_ids: Vec<String>,
     pub(super) peer_id: Uuid,
-    pub(super) restart_policy: Option<TaskRestartPolicy>,
+    pub(super) restart_policy: Option<WorkloadRestartPolicy>,
     pub(super) termination_grace_period_secs: Option<u32>,
     pub(super) pre_stop_command: Option<Vec<String>>,
-    pub(super) liveness: Option<TaskLivenessProbe>,
+    pub(super) liveness: Option<WorkloadLivenessProbe>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
-    pub(super) secret_files: Vec<TaskSecretFile>,
+    pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
-    pub(super) service_metadata: Option<TaskServiceMetadata>,
+    pub(super) service_metadata: Option<WorkloadServiceMetadata>,
 }
 
 pub(super) struct Assignment {
@@ -623,7 +620,7 @@ fn gpu_runtime_preflight(snapshot: &SchedulerSnapshot) -> (bool, Option<String>)
 /// Derives the runtime feature flags required to execute one workload intent safely.
 fn required_runtime_features(
     pre_stop_command: Option<&Vec<String>>,
-    liveness: Option<&TaskLivenessProbe>,
+    liveness: Option<&WorkloadLivenessProbe>,
 ) -> Vec<String> {
     let mut features = Vec::new();
     if pre_stop_command.is_some() {

@@ -23,8 +23,8 @@ use mantissa::store::network_store::{
 use mantissa::store::peer_store::open_peers_store;
 use mantissa::store::scheduler_store::open_scheduler_store;
 use mantissa::store::secret_store::open_secret_store;
-use mantissa::store::task_store::open_task_store;
 use mantissa::store::volume_store::{open_volume_node_store, open_volume_spec_store};
+use mantissa::store::workload_store::open_workload_store;
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use mantissa::volumes::VolumeRegistry;
 use mantissa::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadStartRequest};
@@ -221,11 +221,11 @@ async fn setup_task_manager() -> TestHarness {
         .path()
         .join(format!("task-{}.redb", Uuid::new_v4()));
     let task_db = Arc::new(redb::Database::create(task_path).expect("create task db"));
-    let task_store = open_task_store(task_db.clone(), actor).expect("open task store");
-    task_store
+    let workload_store = open_workload_store(task_db.clone(), actor).expect("open workload store");
+    workload_store
         .rebuild_mst_from_disk()
         .await
-        .expect("rebuild task store");
+        .expect("rebuild workload store");
 
     let network_dir = tempdir().expect("network tempdir");
     let network_path = network_dir
@@ -315,7 +315,7 @@ async fn setup_task_manager() -> TestHarness {
     let local_volume_root = tempdir().expect("local volume root");
 
     let manager = WorkloadManager::new(WorkloadManagerConfig {
-        store: task_store,
+        store: workload_store,
         tx,
         rx,
         local_node_id: actor,

@@ -30,12 +30,9 @@ use crate::store::peer_store::open_peers_store;
 use crate::store::scheduler_digest_store::open_scheduler_digest_store;
 use crate::store::scheduler_store::open_scheduler_store;
 use crate::store::secret_store::open_secret_store;
-use crate::store::task_store::open_task_store;
 use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
-use crate::task::types::{
-    TaskLivenessProbe, TaskLivenessProbeKind, TaskRestartPolicyKind, TaskStateFilter,
-    TaskStateKind, TaskStatus, TaskValue, TaskValueDraft,
-};
+use crate::store::workload_store::open_workload_store;
+use crate::task::types::{TaskStateFilter, TaskStateKind, TaskValueDraft};
 use crate::topology::peers::PeerSchedulingState;
 use crate::volumes::VolumeRegistry;
 use crate::volumes::local::managed_volume_data_path;
@@ -43,9 +40,12 @@ use crate::volumes::types::{
     LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
     VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
 };
-use crate::workload::model::RuntimeClass;
 use crate::workload::model::select_best_workload_value;
-use crate::workload::types::ResolvedExecutionSpec;
+use crate::workload::model::{RuntimeClass, WorkloadStatus, WorkloadValue};
+use crate::workload::types::{
+    ResolvedExecutionSpec, WorkloadLivenessProbe, WorkloadLivenessProbeKind,
+    WorkloadRestartPolicyKind,
+};
 use ::health::HealthMonitor;
 use anyhow::{Result, anyhow};
 use async_channel::bounded;
@@ -765,11 +765,11 @@ async fn setup_manager_with_forwarding(
         LocalSessionStore::open(registry_db.clone(), noise_keys.as_ref()).expect("open sessions");
 
     let (task_db, _task_dir) = temp_db("tasks");
-    let task_store = open_task_store(task_db.clone(), actor).expect("open task store");
-    task_store
+    let workload_store = open_workload_store(task_db.clone(), actor).expect("open workload store");
+    workload_store
         .rebuild_mst_from_disk()
         .await
-        .expect("rebuild task store");
+        .expect("rebuild workload store");
 
     let (network_db, _network_dir) = temp_db("networks");
     let network_spec_store =
@@ -855,7 +855,7 @@ async fn setup_manager_with_forwarding(
     std::fs::create_dir_all(&local_volume_root).expect("create local volume root");
 
     let manager = WorkloadManager::new(WorkloadManagerConfig {
-        store: task_store,
+        store: workload_store,
         tx,
         rx,
         local_node_id: actor,
@@ -915,7 +915,7 @@ async fn load_spec_cache_refreshes_after_store_change() {
 
     let cached_clock = manager
         .local_state
-        .task_spec_cache
+        .workload_spec_cache
         .lock()
         .unwrap()
         .get(&spec.id)
@@ -959,16 +959,16 @@ async fn task_value_index_cache_reuses_snapshot_until_store_changes() {
         .expect("persist first task");
 
     let first = manager
-        .load_task_value_index()
+        .load_workload_value_index()
         .await
         .expect("load first cached index");
     let second = manager
-        .load_task_value_index()
+        .load_workload_value_index()
         .await
         .expect("load second cached index");
     assert!(
         Arc::ptr_eq(&first, &second),
-        "unchanged task stores should reuse the same decoded snapshot"
+        "unchanged workload stores should reuse the same decoded snapshot"
     );
 
     let second_spec = test_task_spec(&manager, "cache-index-b");
@@ -978,7 +978,7 @@ async fn task_value_index_cache_reuses_snapshot_until_store_changes() {
         .expect("persist second task");
 
     let refreshed = manager
-        .load_task_value_index()
+        .load_workload_value_index()
         .await
         .expect("load refreshed cached index");
     assert!(
@@ -1051,8 +1051,8 @@ async fn create_managed_local_volume(
 }
 
 /// Builds one minimal task spec used by cache and store-view tests.
-fn test_task_spec(manager: &WorkloadManager, name: &str) -> TaskSpec {
-    TaskSpec {
+fn test_task_spec(manager: &WorkloadManager, name: &str) -> WorkloadSpec {
+    WorkloadSpec {
         id: Uuid::new_v4(),
         name: name.to_string(),
         image: "img".to_string(),
@@ -1178,7 +1178,7 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
     let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
     set_local_drain_requested(&manager, true, None).await;
 
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: Uuid::new_v4(),
         name: "svc-api-1".to_string(),
         image: "ghcr.io/demo/api:latest".to_string(),
@@ -1199,8 +1199,8 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
         memory_bytes: 64 * 1024 * 1024,
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
-        restart_policy: Some(TaskRestartPolicy {
-            name: TaskRestartPolicyKind::Always,
+        restart_policy: Some(WorkloadRestartPolicy {
+            name: WorkloadRestartPolicyKind::Always,
             max_retry_count: None,
         }),
         termination_grace_period_secs: None,
@@ -1210,7 +1210,7 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
-        service_metadata: Some(TaskServiceMetadata::new("svc", "api")),
+        service_metadata: Some(WorkloadServiceMetadata::new("svc", "api")),
         lease_id: None,
         lease_coordinator_node_id: None,
         task_epoch: 0,
@@ -1248,7 +1248,7 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
     let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
     set_local_drain_requested(&manager, true, None).await;
 
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: Uuid::new_v4(),
         name: "svc-api-1".to_string(),
         image: "ghcr.io/demo/api:latest".to_string(),
@@ -1269,8 +1269,8 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
         memory_bytes: 64 * 1024 * 1024,
         gpu_count: 0,
         gpu_device_ids: Vec::new(),
-        restart_policy: Some(TaskRestartPolicy {
-            name: TaskRestartPolicyKind::Always,
+        restart_policy: Some(WorkloadRestartPolicy {
+            name: WorkloadRestartPolicyKind::Always,
             max_retry_count: None,
         }),
         termination_grace_period_secs: None,
@@ -1280,7 +1280,7 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
-        service_metadata: Some(TaskServiceMetadata::new("svc", "api")),
+        service_metadata: Some(WorkloadServiceMetadata::new("svc", "api")),
         lease_id: None,
         lease_coordinator_node_id: None,
         task_epoch: 0,
@@ -1317,7 +1317,7 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
 async fn pull_image_for_task_retries_and_tracks_phase_progress() {
     let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
 
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: Uuid::new_v4(),
         name: "pull-retry".into(),
         image: "img".into(),
@@ -1390,7 +1390,7 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
 async fn same_state_pulling_progress_stays_local_only() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: Uuid::new_v4(),
         name: "pull-local-only".into(),
         image: "img".into(),
@@ -1464,8 +1464,8 @@ async fn same_state_pulling_progress_stays_local_only() {
         .await
         .expect("receive initial pulling transition");
     match outbound {
-        Message::Task {
-            event: TaskEvent::UpsertSpec(outbound_spec),
+        Message::Workload {
+            event: WorkloadEvent::UpsertSpec(outbound_spec),
             ..
         } => {
             assert_eq!(outbound_spec.id, spec.id);
@@ -1510,19 +1510,19 @@ async fn dirty_gossip_flush_retries_latest_event_for_bounded_coverage_rounds() {
         now.to_rfc3339(),
     );
     manager
-        .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
         .await
         .expect("buffer running task");
 
-    for round in 0..TASK_GOSSIP_COVERAGE_ROUNDS {
+    for round in 0..WORKLOAD_GOSSIP_COVERAGE_ROUNDS {
         let has_pending = manager
             .flush_dirty_gossip_events()
             .await
             .expect("flush dirty gossip round");
         assert_eq!(
             has_pending,
-            round + 1 < TASK_GOSSIP_COVERAGE_ROUNDS,
-            "dirty task retention should expire after the configured coverage rounds"
+            round + 1 < WORKLOAD_GOSSIP_COVERAGE_ROUNDS,
+            "dirty workload retention should expire after the configured coverage rounds"
         );
 
         let outbound = manager
@@ -1530,10 +1530,10 @@ async fn dirty_gossip_flush_retries_latest_event_for_bounded_coverage_rounds() {
             .rx
             .recv()
             .await
-            .expect("receive running task gossip");
+            .expect("receive running workload gossip");
         match outbound {
-            Message::Task {
-                event: TaskEvent::UpsertSpec(outbound_spec),
+            Message::Workload {
+                event: WorkloadEvent::UpsertSpec(outbound_spec),
                 ..
             } => {
                 assert_eq!(outbound_spec.id, task_id);
@@ -1555,7 +1555,7 @@ async fn dirty_gossip_flush_retries_latest_event_for_bounded_coverage_rounds() {
 async fn pull_image_for_task_skips_pull_when_image_exists_locally() {
     let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
 
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: Uuid::new_v4(),
         name: "pull-skip".into(),
         image: "img".into(),
@@ -1624,7 +1624,7 @@ async fn pull_image_for_task_skips_pull_when_image_exists_locally() {
 async fn reconcile_rejects_missing_slot_assignments() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: Uuid::new_v4(),
         name: "orphan".into(),
         image: "img".into(),
@@ -1683,7 +1683,7 @@ async fn reconcile_pending_task_reserves_assigned_slots_before_launch() {
         .await
         .expect("init slots");
 
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: Uuid::new_v4(),
         name: "slot-guard".into(),
         image: "img".into(),
@@ -1755,7 +1755,7 @@ async fn reconcile_uses_latest_persisted_slot_assignment() {
         .await
         .expect("init slots");
 
-    let mut stale_argument = TaskSpec {
+    let mut stale_argument = WorkloadSpec {
         id: Uuid::new_v4(),
         name: "stale-assignment".into(),
         image: "img".into(),
@@ -1878,7 +1878,7 @@ async fn update_task_phase_ignores_stale_regression_from_running() {
 async fn update_task_phase_ignores_stale_regression_from_creating_to_pulling() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: Uuid::new_v4(),
         name: "phase-order".into(),
         image: "img".into(),
@@ -1947,7 +1947,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
     let node_a = Uuid::new_v4();
     let node_b = Uuid::new_v4();
 
-    let current = TaskValue::new(TaskValueDraft {
+    let current = WorkloadValue::new(TaskValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -1983,7 +1983,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         last_terminal_observed_launch: None,
     });
 
-    let lower_epoch = TaskValue::new(TaskValueDraft {
+    let lower_epoch = WorkloadValue::new(TaskValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -2019,11 +2019,11 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         last_terminal_observed_launch: None,
     });
     assert!(
-        !should_accept_incoming_task_value(&current, &lower_epoch),
+        !should_accept_incoming_workload_value_for_tests(&current, &lower_epoch),
         "lower epoch must not override current assignment"
     );
 
-    let same_epoch_lower_phase = TaskValue::new(TaskValueDraft {
+    let same_epoch_lower_phase = WorkloadValue::new(TaskValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -2059,11 +2059,11 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         last_terminal_observed_launch: None,
     });
     assert!(
-        !should_accept_incoming_task_value(&current, &same_epoch_lower_phase),
+        !should_accept_incoming_workload_value_for_tests(&current, &same_epoch_lower_phase),
         "lower phase version must not override newer lifecycle state"
     );
 
-    let higher_epoch = TaskValue::new(TaskValueDraft {
+    let higher_epoch = WorkloadValue::new(TaskValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -2099,7 +2099,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         last_terminal_observed_launch: None,
     });
     assert!(
-        should_accept_incoming_task_value(&current, &higher_epoch),
+        should_accept_incoming_workload_value_for_tests(&current, &higher_epoch),
         "higher assignment epoch should win regardless of state rank"
     );
 }
@@ -2110,7 +2110,7 @@ fn select_best_workload_value_ignores_stale_timestamp_when_phase_is_older() {
     let id = Uuid::new_v4();
     let node = Uuid::new_v4();
 
-    let running_newer_phase = TaskValue::new(TaskValueDraft {
+    let running_newer_phase = WorkloadValue::new(TaskValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -2146,7 +2146,7 @@ fn select_best_workload_value_ignores_stale_timestamp_when_phase_is_older() {
         last_terminal_observed_launch: None,
     });
 
-    let stale_pending_later_timestamp = TaskValue::new(TaskValueDraft {
+    let stale_pending_later_timestamp = WorkloadValue::new(TaskValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -2563,8 +2563,8 @@ async fn reconcile_running_task_executes_liveness_probe_once_per_interval() {
         .expect("start container");
 
     let mut probed = manager.load_spec(spec.id).await.expect("load running task");
-    probed.liveness = Some(TaskLivenessProbe {
-        kind: TaskLivenessProbeKind::Exec,
+    probed.liveness = Some(WorkloadLivenessProbe {
+        kind: WorkloadLivenessProbeKind::Exec,
         command: vec!["/bin/check".to_string(), "--ready".to_string()],
         port: 0,
         path: None,
@@ -2687,8 +2687,8 @@ async fn reconcile_running_task_executes_http_liveness_probe_without_container_e
         .expect("insert local attachment target");
 
     let mut probed = manager.load_spec(spec.id).await.expect("load running task");
-    probed.liveness = Some(TaskLivenessProbe {
-        kind: TaskLivenessProbeKind::Http,
+    probed.liveness = Some(WorkloadLivenessProbe {
+        kind: WorkloadLivenessProbeKind::Http,
         command: Vec::new(),
         port,
         path: Some("/".to_string()),
@@ -2763,8 +2763,8 @@ async fn reconcile_running_task_executes_tcp_liveness_probe_without_container_ex
         .expect("insert local attachment target");
 
     let mut probed = manager.load_spec(spec.id).await.expect("load running task");
-    probed.liveness = Some(TaskLivenessProbe {
-        kind: TaskLivenessProbeKind::Tcp,
+    probed.liveness = Some(WorkloadLivenessProbe {
+        kind: WorkloadLivenessProbeKind::Tcp,
         command: Vec::new(),
         port,
         path: None,
@@ -2814,8 +2814,8 @@ async fn reconcile_running_task_skips_liveness_probe_during_start_period() {
 
     let mut probed = manager.load_spec(spec.id).await.expect("load running task");
     probed.updated_at = Utc::now().to_rfc3339();
-    probed.liveness = Some(TaskLivenessProbe {
-        kind: TaskLivenessProbeKind::Exec,
+    probed.liveness = Some(WorkloadLivenessProbe {
+        kind: WorkloadLivenessProbeKind::Exec,
         command: vec!["/bin/check".to_string()],
         port: 0,
         path: None,
@@ -2870,8 +2870,8 @@ async fn reconcile_running_task_restarts_after_liveness_threshold_failures() {
         .expect("start container");
 
     let mut probed = manager.load_spec(spec.id).await.expect("load running task");
-    probed.liveness = Some(TaskLivenessProbe {
-        kind: TaskLivenessProbeKind::Exec,
+    probed.liveness = Some(WorkloadLivenessProbe {
+        kind: WorkloadLivenessProbeKind::Exec,
         command: vec!["/bin/check".to_string()],
         port: 0,
         path: None,
@@ -3176,7 +3176,7 @@ async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims
 
     let now = Utc::now().to_rfc3339();
     let loser_id = Uuid::new_v4();
-    let loser = TaskSpec {
+    let loser = WorkloadSpec {
         id: loser_id,
         name: "svc-loser".to_string(),
         image: "img".to_string(),
@@ -3657,7 +3657,7 @@ async fn reconcile_requested_stop_removes_instance_less_stopping_task() {
             .get_snapshot(&UuidKey::from(spec.id))
             .expect("raw task snapshot after explicit stop cleanup")
             .is_none(),
-        "instance-less stopping task should be removed from the task store by explicit stop cleanup"
+        "instance-less stopping task should be removed from the workload store by explicit stop cleanup"
     );
     assert!(
         manager.load_spec(spec.id).await.is_err(),
@@ -4216,7 +4216,7 @@ async fn task_owned_locally_detects_remote_entries() {
     );
 
     let remote_id = Uuid::new_v4();
-    let remote_value = TaskValue::new(TaskValueDraft {
+    let remote_value = WorkloadValue::new(TaskValueDraft {
         id: remote_id,
         name: "remote".to_string(),
         image: "img".to_string(),
@@ -4271,7 +4271,7 @@ async fn stream_local_task_logs_forwards_frames_and_options() {
     let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let task_id = Uuid::new_v4();
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: task_id,
         name: "loggable".to_string(),
         image: "img".to_string(),
@@ -4365,7 +4365,7 @@ async fn attach_local_task_forwards_input_output_and_options() {
     let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let task_id = Uuid::new_v4();
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: task_id,
         name: "attachable".to_string(),
         image: "img".to_string(),
@@ -4497,7 +4497,7 @@ async fn attach_local_task_forwards_input_output_and_options() {
 async fn attach_local_task_uses_runtime_tty_when_persisted_spec_is_stale() {
     let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
     let task_id = Uuid::new_v4();
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: task_id,
         name: "demo-task".to_string(),
         image: "demo:latest".to_string(),
@@ -4591,7 +4591,7 @@ async fn exec_local_task_forwards_input_output_and_options() {
     let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let task_id = Uuid::new_v4();
-    let spec = TaskSpec {
+    let spec = WorkloadSpec {
         id: task_id,
         name: "execable".to_string(),
         image: "img".to_string(),
@@ -4913,7 +4913,7 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        service_metadata: Some(TaskServiceMetadata::new("svc", "backend")),
+        service_metadata: Some(WorkloadServiceMetadata::new("svc", "backend")),
         target_node: None,
     };
 
@@ -4949,7 +4949,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
     let task_id = Uuid::new_v4();
     let network_id = Uuid::new_v4();
     let now = Utc::now().to_rfc3339();
-    let value = TaskValue::new(TaskValueDraft {
+    let value = WorkloadValue::new(TaskValueDraft {
         id: task_id,
         name: "service-task".to_string(),
         image: "img".to_string(),
@@ -4976,7 +4976,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
-        service_metadata: Some(TaskServiceMetadata::new("svc", "backend")),
+        service_metadata: Some(WorkloadServiceMetadata::new("svc", "backend")),
         lease_id: None,
         lease_coordinator_node_id: None,
         task_epoch: 0,
@@ -5031,7 +5031,7 @@ async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachme
 
     let task_id = Uuid::new_v4();
     let now = Utc::now().to_rfc3339();
-    let value = TaskValue::new(TaskValueDraft {
+    let value = WorkloadValue::new(TaskValueDraft {
         id: task_id,
         name: "service-task".to_string(),
         image: "img".to_string(),
@@ -5058,7 +5058,7 @@ async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachme
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
-        service_metadata: Some(TaskServiceMetadata::new("svc", "backend")),
+        service_metadata: Some(WorkloadServiceMetadata::new("svc", "backend")),
         lease_id: None,
         lease_coordinator_node_id: None,
         task_epoch: 0,
@@ -5372,7 +5372,7 @@ async fn duplicate_remove_event_does_not_poison_future_epoch_upsert() {
         .await
         .expect("remove task spec");
     manager
-        .handle_event(TaskEvent::Remove { id: original.id })
+        .handle_event(WorkloadEvent::Remove { id: original.id })
         .await
         .expect("apply duplicate remove event");
 
@@ -5385,7 +5385,7 @@ async fn duplicate_remove_event_does_not_poison_future_epoch_upsert() {
     replacement.phase_version = replacement.phase_version.saturating_add(1);
 
     manager
-        .handle_event(TaskEvent::UpsertSpec(Box::new(replacement.clone())))
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(replacement.clone())))
         .await
         .expect("apply replacement upsert");
 
@@ -5478,7 +5478,7 @@ async fn stale_remove_event_does_not_delete_active_local_task() {
         .expect("start container");
 
     manager
-        .handle_event(TaskEvent::Remove { id: running.id })
+        .handle_event(WorkloadEvent::Remove { id: running.id })
         .await
         .expect("handle stale remove");
 
@@ -5516,7 +5516,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
     original.state = WorkloadPhase::Stopping;
 
     manager
-        .handle_event(TaskEvent::UpsertSpec(Box::new(original.clone())))
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(original.clone())))
         .await
         .expect("stale upsert should be handled");
     let after_stale = manager
@@ -5534,7 +5534,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
     fresh.task_epoch = fresh.task_epoch.saturating_add(1);
 
     manager
-        .handle_event(TaskEvent::UpsertSpec(Box::new(fresh.clone())))
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(fresh.clone())))
         .await
         .expect("fresh upsert should be accepted");
     let after_fresh = manager
@@ -5575,7 +5575,7 @@ async fn upsert_after_remove_without_watermark_is_accepted_for_reconvergence() {
     original.state = WorkloadPhase::Stopping;
 
     manager
-        .handle_event(TaskEvent::UpsertSpec(Box::new(original.clone())))
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(original.clone())))
         .await
         .expect("upsert should be handled");
     let after_upsert = manager
@@ -5612,7 +5612,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
     manager.clear_remove_watermark(original.id).await;
 
     let remote_node = Uuid::new_v4();
-    let stale_delta = TaskValue::new(TaskValueDraft {
+    let stale_delta = WorkloadValue::new(TaskValueDraft {
         id: original.id,
         name: original.name.clone(),
         image: original.image.clone(),
@@ -5649,11 +5649,12 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
     });
 
     let (remote_db, _remote_dir) = temp_db("tasks-sync-tomb");
-    let remote_store = open_task_store(remote_db, Uuid::new_v4()).expect("open remote task store");
+    let remote_store =
+        open_workload_store(remote_db, Uuid::new_v4()).expect("open remote workload store");
     remote_store
         .rebuild_mst_from_disk()
         .await
-        .expect("rebuild remote task store");
+        .expect("rebuild remote workload store");
     remote_store
         .upsert(&UuidKey::from(original.id), stale_delta)
         .await
@@ -5691,8 +5692,8 @@ fn build_remote_task_spec(
     task_epoch: u64,
     phase_version: u64,
     updated_at: String,
-) -> TaskSpec {
-    TaskSpec {
+) -> WorkloadSpec {
+    WorkloadSpec {
         id,
         name: "remote-task".to_string(),
         image: "img".to_string(),
@@ -5732,8 +5733,8 @@ fn build_remote_task_spec(
 }
 
 /// Builds a compact remote-owned task status payload for lifecycle gossip tests.
-fn build_remote_task_status(spec: &TaskSpec) -> TaskStatus {
-    TaskStatus::from_spec(spec)
+fn build_remote_task_status(spec: &WorkloadSpec) -> WorkloadStatus {
+    WorkloadStatus::from_spec(spec)
 }
 
 #[tokio::test]
@@ -5753,7 +5754,7 @@ async fn out_of_order_task_upsert_keeps_newer_running_state() {
         now.to_rfc3339(),
     );
     manager
-        .handle_event(TaskEvent::UpsertSpec(Box::new(running.clone())))
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(running.clone())))
         .await
         .expect("apply running upsert");
 
@@ -5766,7 +5767,7 @@ async fn out_of_order_task_upsert_keeps_newer_running_state() {
         (now + chrono::Duration::seconds(60)).to_rfc3339(),
     );
     manager
-        .handle_event(TaskEvent::UpsertSpec(Box::new(delayed_pending)))
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(delayed_pending)))
         .await
         .expect("apply delayed stale pending upsert");
 
@@ -5800,7 +5801,7 @@ async fn compact_status_upsert_updates_existing_task_without_dropping_definition
     pulling.memory_bytes = 128 * 1_024 * 1_024;
 
     manager
-        .handle_event(TaskEvent::UpsertSpec(Box::new(pulling.clone())))
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(pulling.clone())))
         .await
         .expect("apply pulling upsert");
 
@@ -5810,7 +5811,7 @@ async fn compact_status_upsert_updates_existing_task_without_dropping_definition
     status.updated_at = (now + chrono::Duration::seconds(10)).to_rfc3339();
 
     manager
-        .handle_event(TaskEvent::UpsertStatus(Box::new(status)))
+        .handle_event(WorkloadEvent::UpsertStatus(Box::new(status)))
         .await
         .expect("apply compact status update");
 
@@ -5851,7 +5852,7 @@ async fn late_full_spec_fills_definition_after_status_placeholder() {
 
     let status = build_remote_task_status(&running);
     manager
-        .handle_event(TaskEvent::UpsertStatus(Box::new(status)))
+        .handle_event(WorkloadEvent::UpsertStatus(Box::new(status)))
         .await
         .expect("apply compact running status first");
 
@@ -5864,7 +5865,7 @@ async fn late_full_spec_fills_definition_after_status_placeholder() {
     assert_eq!(placeholder.cpu_millis, 0);
 
     manager
-        .handle_event(TaskEvent::UpsertSpec(Box::new(running.clone())))
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(running.clone())))
         .await
         .expect("apply late full task definition");
 
@@ -5908,15 +5909,15 @@ async fn dirty_gossip_flush_keeps_definition_and_latest_status() {
     newer_status.updated_at = (now + chrono::Duration::seconds(20)).to_rfc3339();
 
     manager
-        .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(pulling.clone())))
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(pulling.clone())))
         .await
         .expect("buffer full task definition");
     manager
-        .enqueue_gossip_best_effort(TaskEvent::UpsertStatus(Box::new(status)))
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertStatus(Box::new(status)))
         .await
         .expect("buffer intermediate task status");
     manager
-        .enqueue_gossip_best_effort(TaskEvent::UpsertStatus(Box::new(newer_status.clone())))
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertStatus(Box::new(newer_status.clone())))
         .await
         .expect("buffer latest task status");
 
@@ -5939,8 +5940,8 @@ async fn dirty_gossip_flush_keeps_definition_and_latest_status() {
         .expect("receive buffered latest status");
 
     match first {
-        Message::Task {
-            event: TaskEvent::UpsertSpec(spec),
+        Message::Workload {
+            event: WorkloadEvent::UpsertSpec(spec),
             ..
         } => {
             assert_eq!(spec.id, task_id);
@@ -5950,8 +5951,8 @@ async fn dirty_gossip_flush_keeps_definition_and_latest_status() {
     }
 
     match second {
-        Message::Task {
-            event: TaskEvent::UpsertStatus(status),
+        Message::Workload {
+            event: WorkloadEvent::UpsertStatus(status),
             ..
         } => {
             assert_eq!(status.id, task_id);
@@ -5964,7 +5965,7 @@ async fn dirty_gossip_flush_keeps_definition_and_latest_status() {
         tokio::time::timeout(std::time::Duration::from_millis(20), manager.core.rx.recv()).await;
     assert!(
         third.is_err(),
-        "dirty gossip flush should collapse intermediate task updates"
+        "dirty gossip flush should collapse intermediate workload updates"
     );
 }
 
@@ -5985,11 +5986,11 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         now.to_rfc3339(),
     );
     manager
-        .handle_event(TaskEvent::UpsertSpec(Box::new(gossip_running.clone())))
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(gossip_running.clone())))
         .await
         .expect("apply newer gossip upsert");
 
-    let stale_delta = TaskValue::new(TaskValueDraft {
+    let stale_delta = WorkloadValue::new(TaskValueDraft {
         id: task_id,
         name: "remote-task".to_string(),
         image: "img".to_string(),
@@ -6025,11 +6026,12 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         last_terminal_observed_launch: None,
     });
     let (remote_db, _remote_dir) = temp_db("tasks-sync-delta");
-    let remote_store = open_task_store(remote_db, Uuid::new_v4()).expect("open remote task store");
+    let remote_store =
+        open_workload_store(remote_db, Uuid::new_v4()).expect("open remote workload store");
     remote_store
         .rebuild_mst_from_disk()
         .await
-        .expect("rebuild remote task store");
+        .expect("rebuild remote workload store");
     remote_store
         .upsert(&UuidKey::from(task_id), stale_delta)
         .await
@@ -6130,7 +6132,7 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
     let remote_node = Uuid::new_v4();
     let now = Utc::now().to_rfc3339();
 
-    let remote_value = TaskValue::new(TaskValueDraft {
+    let remote_value = WorkloadValue::new(TaskValueDraft {
         id: task_id,
         name: "remote-task".to_string(),
         image: "img".to_string(),
@@ -6655,7 +6657,7 @@ async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
         gpu_device_ids: Vec::new(),
         id: Some(Uuid::new_v4()),
         slot_ids: Vec::new(),
-        service_metadata: Some(TaskServiceMetadata::new("demo-service", "api")),
+        service_metadata: Some(WorkloadServiceMetadata::new("demo-service", "api")),
         target_node: None,
     };
 

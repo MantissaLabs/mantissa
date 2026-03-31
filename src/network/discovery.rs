@@ -11,7 +11,7 @@ use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
     ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
 };
-use crate::store::task_store::TaskStore;
+use crate::store::workload_store::WorkloadStore;
 use crate::task::types::TaskValue;
 use crate::workload::model::WorkloadPhase;
 use crate::workload::model::select_best_workload_value;
@@ -42,7 +42,7 @@ const HEALTH_CACHE_STALE_AFTER: Duration = Duration::from_secs(SERVICE_TTL_SECS 
 #[derive(Clone)]
 pub struct ServiceDiscovery {
     registry: NetworkRegistry,
-    tasks: TaskStore,
+    workloads: WorkloadStore,
     services: ServiceRegistry,
     bpf: NetworkBpfManager,
     health_monitor: Arc<HealthMonitor>,
@@ -66,7 +66,7 @@ struct DnsServerHandle {
 #[derive(Default)]
 struct NetworkBackendCatalog {
     attachment_generation: u64,
-    task_generation: u64,
+    workload_generation: u64,
     service_generation: u64,
     health_fingerprint: u64,
     services: HashMap<String, ServiceBackendCatalogEntry>,
@@ -87,12 +87,12 @@ impl ServiceDiscovery {
     /// Build service discovery with the default DNS bind port (53).
     pub fn new(
         registry: NetworkRegistry,
-        tasks: TaskStore,
+        workloads: WorkloadStore,
         services: ServiceRegistry,
         bpf: NetworkBpfManager,
         health_monitor: Arc<HealthMonitor>,
     ) -> Self {
-        Self::new_with_dns_port(registry, tasks, services, bpf, health_monitor, 53)
+        Self::new_with_dns_port(registry, workloads, services, bpf, health_monitor, 53)
     }
 
     /// Build service discovery with an explicit DNS bind port.
@@ -100,7 +100,7 @@ impl ServiceDiscovery {
     /// Tests use this to run DNS flows unprivileged on high ports while production keeps 53.
     pub fn new_with_dns_port(
         registry: NetworkRegistry,
-        tasks: TaskStore,
+        workloads: WorkloadStore,
         services: ServiceRegistry,
         bpf: NetworkBpfManager,
         health_monitor: Arc<HealthMonitor>,
@@ -108,7 +108,7 @@ impl ServiceDiscovery {
     ) -> Self {
         Self {
             registry,
-            tasks,
+            workloads,
             services,
             bpf,
             health_monitor,
@@ -145,7 +145,7 @@ impl ServiceDiscovery {
 
         let server = spawn_dns_server(
             self.registry.clone(),
-            self.tasks.clone(),
+            self.workloads.clone(),
             self.services.clone(),
             self.bpf.clone(),
             spec.id,
@@ -202,7 +202,7 @@ impl ServiceDiscovery {
 #[allow(clippy::too_many_arguments)]
 async fn spawn_dns_server(
     registry: NetworkRegistry,
-    tasks: TaskStore,
+    workloads: WorkloadStore,
     services: ServiceRegistry,
     bpf: NetworkBpfManager,
     network_id: Uuid,
@@ -237,7 +237,7 @@ async fn spawn_dns_server(
     let refresh_health_monitor = health_monitor.clone();
     if let Err(err) = refresh_network_services(
         &task_registry,
-        &tasks,
+        &workloads,
         &service_registry,
         &bpf_manager,
         network_id,
@@ -258,7 +258,7 @@ async fn spawn_dns_server(
     }
     let mut refresh_shutdown = shutdown_rx.clone();
     let refresh_task_registry = task_registry.clone();
-    let refresh_tasks = tasks.clone();
+    let refresh_workloads = workloads.clone();
     let refresh_service_registry = service_registry.clone();
     let refresh_bpf_manager = bpf_manager.clone();
     let refresh_health = health.clone();
@@ -279,7 +279,7 @@ async fn spawn_dns_server(
                 _ = refresh.tick() => {
                     if let Err(err) = refresh_network_services(
                         &refresh_task_registry,
-                        &refresh_tasks,
+                        &refresh_workloads,
                         &refresh_service_registry,
                         &refresh_bpf_manager,
                         network_id,
@@ -303,7 +303,7 @@ async fn spawn_dns_server(
 
     let mut dns_shutdown = shutdown_rx.clone();
     let dns_task_registry = task_registry.clone();
-    let dns_tasks = tasks.clone();
+    let dns_workloads = workloads.clone();
     let dns_service_registry = service_registry.clone();
     let dns_bpf_manager = bpf_manager.clone();
     let dns_load_balancer = load_balancer.clone();
@@ -329,7 +329,7 @@ async fn spawn_dns_server(
                                 &buf[..len],
                                 peer,
                                 &dns_task_registry,
-                                &dns_tasks,
+                            &dns_workloads,
                                 &dns_service_registry,
                                 &dns_bpf_manager,
                                 network_id,
@@ -384,7 +384,7 @@ async fn handle_datagram(
     payload: &[u8],
     peer: SocketAddr,
     registry: &NetworkRegistry,
-    tasks: &TaskStore,
+    workloads: &WorkloadStore,
     services: &ServiceRegistry,
     bpf: &NetworkBpfManager,
     network_id: Uuid,
@@ -443,7 +443,7 @@ async fn handle_datagram(
     if let Err(err) = refresh_backend_catalog_if_needed(
         backend_catalog,
         registry,
-        tasks,
+        workloads,
         services,
         network_id,
         &health_snapshot,
@@ -664,7 +664,7 @@ fn extract_service_label(name: &Name, network_name: &str) -> Option<String> {
 
 async fn resolve_service_backends(
     registry: &NetworkRegistry,
-    tasks: &TaskStore,
+    workloads: &WorkloadStore,
     template_index: &HashMap<Uuid, (String, String)>,
     network_id: Uuid,
     service_name: &str,
@@ -737,7 +737,7 @@ async fn resolve_service_backends(
         };
         let task_entry = cache
             .entry(attachment.task_id)
-            .or_insert_with(|| load_task(tasks, attachment.task_id));
+            .or_insert_with(|| load_task(workloads, attachment.task_id));
         let task = match task_entry.as_ref() {
             Some(task) => task,
             None => {
@@ -856,9 +856,9 @@ async fn resolve_service_backends(
 }
 
 /// Load the most relevant task value so discovery follows the current scheduling decision.
-fn load_task(tasks: &TaskStore, id: Uuid) -> Option<TaskValue> {
+fn load_task(workloads: &WorkloadStore, id: Uuid) -> Option<TaskValue> {
     let key = UuidKey::from(id);
-    let snapshot = tasks.get_snapshot(&key).ok()??;
+    let snapshot = workloads.get_snapshot(&key).ok()??;
     select_best_workload_value(snapshot.as_slice())
 }
 
@@ -1489,20 +1489,20 @@ async fn probe_backend_http(ip: &Ipv4Addr, port: u16, path: &str, timeout: Durat
 async fn refresh_backend_catalog_if_needed(
     backend_catalog: &Arc<AsyncMutex<NetworkBackendCatalog>>,
     registry: &NetworkRegistry,
-    tasks: &TaskStore,
+    workloads: &WorkloadStore,
     services: &ServiceRegistry,
     network_id: Uuid,
     health_snapshot: &HashMap<Uuid, HealthStatus>,
 ) -> Result<()> {
     let attachment_generation = registry.attachment_change_clock();
-    let task_generation = tasks.change_clock();
+    let workload_generation = workloads.change_clock();
     let service_generation = services.change_clock();
     let health_fingerprint = health_snapshot_fingerprint(health_snapshot);
 
     {
         let guard = backend_catalog.lock().await;
         if guard.attachment_generation == attachment_generation
-            && guard.task_generation == task_generation
+            && guard.workload_generation == workload_generation
             && guard.service_generation == service_generation
             && guard.health_fingerprint == health_fingerprint
         {
@@ -1519,7 +1519,7 @@ async fn refresh_backend_catalog_if_needed(
     for service_name in service_names {
         let candidates = resolve_service_backends(
             registry,
-            tasks,
+            workloads,
             &template_index,
             network_id,
             &service_name,
@@ -1551,7 +1551,7 @@ async fn refresh_backend_catalog_if_needed(
 
     let mut guard = backend_catalog.lock().await;
     guard.attachment_generation = attachment_generation;
-    guard.task_generation = task_generation;
+    guard.workload_generation = workload_generation;
     guard.service_generation = service_generation;
     guard.health_fingerprint = health_fingerprint;
     guard.services = next_services;
@@ -1593,7 +1593,7 @@ fn health_status_discriminant(status: HealthStatus) -> u8 {
 )]
 async fn refresh_network_services(
     registry: &NetworkRegistry,
-    tasks: &TaskStore,
+    workloads: &WorkloadStore,
     services: &ServiceRegistry,
     bpf: &NetworkBpfManager,
     network_id: Uuid,
@@ -1608,7 +1608,7 @@ async fn refresh_network_services(
     refresh_backend_catalog_if_needed(
         backend_catalog,
         registry,
-        tasks,
+        workloads,
         services,
         network_id,
         &health_snapshot,
@@ -1962,7 +1962,7 @@ mod tests {
         open_network_attachment_store, open_network_peer_store, open_network_spec_store,
     };
     use crate::store::service_store::open_service_store;
-    use crate::store::task_store::{TaskStore, open_task_store};
+    use crate::store::workload_store::{WorkloadStore, open_workload_store};
     use crate::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
     use crate::workload::model::WorkloadPhase;
     use crate::workload::types::ExecutionSpec;
@@ -2039,7 +2039,7 @@ mod tests {
 
     struct CatalogHarness {
         registry: NetworkRegistry,
-        tasks: TaskStore,
+        workloads: WorkloadStore,
         services: ServiceRegistry,
         network: NetworkSpecValue,
     }
@@ -2078,11 +2078,11 @@ mod tests {
             .path()
             .join(format!("task-{}.redb", Uuid::new_v4()));
         let task_db = Arc::new(redb::Database::create(task_path).expect("create task db"));
-        let tasks = open_task_store(task_db, actor).expect("open task store");
-        tasks
+        let workloads = open_workload_store(task_db, actor).expect("open workload store");
+        workloads
             .rebuild_mst_from_disk()
             .await
-            .expect("rebuild task store");
+            .expect("rebuild workload store");
 
         let service_dir = tempdir().expect("service tempdir");
         let service_path = service_dir
@@ -2113,7 +2113,7 @@ mod tests {
 
         CatalogHarness {
             registry,
-            tasks,
+            workloads,
             services,
             network,
         }
@@ -2260,7 +2260,7 @@ mod tests {
         .await;
 
         harness
-            .tasks
+            .workloads
             .upsert(
                 &UuidKey::from(task_id),
                 catalog_task(task_id, node_id, service_name, harness.network.id),
@@ -2285,14 +2285,14 @@ mod tests {
         refresh_backend_catalog_if_needed(
             &catalog,
             &harness.registry,
-            &harness.tasks,
+            &harness.workloads,
             &harness.services,
             harness.network.id,
             &health,
         )
         .await
         .expect("initial catalog refresh");
-        let initial_task_generation = { catalog.lock().await.task_generation };
+        let initial_workload_generation = { catalog.lock().await.workload_generation };
         let initial_candidates = {
             let guard = catalog.lock().await;
             guard
@@ -2307,7 +2307,7 @@ mod tests {
         stopped.state = WorkloadPhase::Stopped;
         stopped.updated_at = chrono::Utc::now().to_rfc3339();
         harness
-            .tasks
+            .workloads
             .upsert(&UuidKey::from(task_id), stopped)
             .await
             .expect("upsert stopped task");
@@ -2315,7 +2315,7 @@ mod tests {
         refresh_backend_catalog_if_needed(
             &catalog,
             &harness.registry,
-            &harness.tasks,
+            &harness.workloads,
             &harness.services,
             harness.network.id,
             &health,
@@ -2325,8 +2325,8 @@ mod tests {
 
         let guard = catalog.lock().await;
         assert!(
-            guard.task_generation > initial_task_generation,
-            "task generation must advance after task upsert"
+            guard.workload_generation > initial_workload_generation,
+            "workload generation must advance after task upsert"
         );
         assert_eq!(
             guard
@@ -2353,7 +2353,7 @@ mod tests {
         refresh_backend_catalog_if_needed(
             &catalog,
             &harness.registry,
-            &harness.tasks,
+            &harness.workloads,
             &harness.services,
             harness.network.id,
             &HashMap::new(),
@@ -2392,7 +2392,7 @@ mod tests {
         refresh_backend_catalog_if_needed(
             &catalog,
             &harness.registry,
-            &harness.tasks,
+            &harness.workloads,
             &harness.services,
             harness.network.id,
             &HashMap::new(),

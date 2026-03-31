@@ -6,7 +6,7 @@ use chrono::Utc;
 use tracing::warn;
 
 use crate::gpu::gpu_runtime_status;
-use crate::workload::model::{WorkloadEvent as TaskEvent, WorkloadPhase, WorkloadSpec as TaskSpec};
+use crate::workload::model::{WorkloadEvent, WorkloadPhase, WorkloadSpec};
 
 use super::ReconcileTaskGuard;
 use super::WorkloadManager;
@@ -19,7 +19,7 @@ impl WorkloadManager {
     pub(super) async fn start_local_instances(
         &self,
         plans: &mut [BatchStartPlan],
-    ) -> Result<Vec<(usize, TaskSpec)>, anyhow::Error> {
+    ) -> Result<Vec<(usize, WorkloadSpec)>, anyhow::Error> {
         if plans.is_empty() {
             return Ok(Vec::new());
         }
@@ -95,7 +95,7 @@ impl WorkloadManager {
     async fn persist_pending_batch(
         &self,
         plans: &[BatchStartPlan],
-    ) -> Result<Vec<TaskSpec>, anyhow::Error> {
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         let mut specs = Vec::with_capacity(plans.len());
 
         for plan in plans {
@@ -111,7 +111,7 @@ impl WorkloadManager {
             let task_epoch = self
                 .next_task_epoch_for_assignment(plan.id, self.local_node_id, &slot_ids)
                 .await?;
-            let spec = TaskSpec {
+            let spec = WorkloadSpec {
                 id: plan.id,
                 name: plan.name.clone(),
                 image: plan.image.clone(),
@@ -157,12 +157,12 @@ impl WorkloadManager {
 
         for spec in &specs {
             if let Err(err) = self
-                .enqueue_gossip_best_effort(TaskEvent::UpsertSpec(Box::new(spec.clone())))
+                .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
                 .await
             {
                 warn!(
                     target: "task",
-                    "failed to record pending task gossip for {}: {err}",
+                    "failed to record pending workload gossip for {}: {err}",
                     spec.name
                 );
             }
@@ -172,7 +172,7 @@ impl WorkloadManager {
     }
 
     /// Cleans up pending specs when a local launch fails to keep the store consistent.
-    async fn rollback_pending_specs(&self, specs: &[TaskSpec]) {
+    async fn rollback_pending_specs(&self, specs: &[WorkloadSpec]) {
         for spec in specs {
             if let Err(err) = self.remove_spec(spec.id).await {
                 warn!(
@@ -187,7 +187,7 @@ impl WorkloadManager {
     /// Persists recoverable volume-blocked state for pending specs so reconciliation can retry.
     async fn persist_pending_volume_unavailable_specs(
         &self,
-        specs: &[TaskSpec],
+        specs: &[WorkloadSpec],
         error: &anyhow::Error,
     ) {
         let reason = error.to_string();
@@ -209,7 +209,7 @@ impl WorkloadManager {
                 continue;
             }
             if let Err(err) = self
-                .enqueue_gossip(TaskEvent::UpsertSpec(Box::new(blocked.clone())))
+                .enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(blocked.clone())))
                 .await
             {
                 warn!(
@@ -271,7 +271,10 @@ impl WorkloadManager {
         Ok(())
     }
 
-    async fn commit_batch(&self, plans: &[BatchStartPlan]) -> Result<Vec<TaskSpec>, anyhow::Error> {
+    async fn commit_batch(
+        &self,
+        plans: &[BatchStartPlan],
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         let mut specs = Vec::with_capacity(plans.len());
 
         for plan in plans {
@@ -298,7 +301,7 @@ impl WorkloadManager {
                     ),
                     Err(_) => (0, 1, 1, None),
                 };
-            let spec = TaskSpec {
+            let spec = WorkloadSpec {
                 id: plan.id,
                 name: plan.name.clone(),
                 image: plan.image.clone(),

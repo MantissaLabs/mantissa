@@ -2,7 +2,7 @@
 
 using import "topology.capnp".TopologyEvent;
 using import "topology.capnp".ClusterViewId;
-using import "task.capnp".TaskEvent;
+using TaskSchema = import "task.capnp";
 using import "jobs.capnp".JobEvent;
 using import "agents.capnp".AgentEvent;
 using import "services.capnp".ServiceEvent;
@@ -42,8 +42,8 @@ struct GossipMessage {
     topology @2 :TopologyEvent;
     # Topology membership event.
 
-    task @3 :TaskEvent;
-    # Task upsert/remove event.
+    workload @3 :TaskSchema.TaskEvent;
+    # Workload upsert/remove event.
 
     service @4 :ServiceEvent;
     # Service upsert/remove event.

@@ -44,7 +44,7 @@ local_test!(
         exited_task.state = WorkloadPhase::Exited(0);
         exited_task.updated_at = Utc::now().to_rfc3339();
         node.node
-            .tasks
+            .workloads
             .upsert(&UuidKey::from(task_id), task_spec_to_value(&exited_task))
             .await
             .expect("persist successful agent task state");
@@ -306,13 +306,13 @@ async fn mark_task_exited(node: &TestNode, task_id: Uuid, exit_code: i32) {
     task.state = WorkloadPhase::Exited(exit_code);
     task.updated_at = Utc::now().to_rfc3339();
     node.node
-        .tasks
+        .workloads
         .upsert(&UuidKey::from(task_id), task_spec_to_value(&task))
         .await
         .expect("persist exited agent task state");
 }
 
-/// Rebuilds one task store value from the current task spec so tests can inject state transitions.
+/// Rebuilds one workload-store value from the current task spec so tests can inject state transitions.
 fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
     TaskValue {
         id: spec.id,

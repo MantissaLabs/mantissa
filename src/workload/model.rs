@@ -417,11 +417,10 @@ pub enum WorkloadEvent {
     Remove { id: Uuid },
 }
 
-/// Replicated workload state stored in the CRDT task store.
+/// Replicated workload state stored in the CRDT workload store.
 ///
-/// The store name still says `task_store` for compatibility with the user-facing task surface,
-/// but the value itself is workload-generic and is shared by service replicas, job attempts,
-/// and agent runs as well.
+/// The durable row is workload-generic and is shared by standalone tasks, service replicas,
+/// job attempts, and agent-backed executions.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct WorkloadValue {
     pub id: Uuid,
