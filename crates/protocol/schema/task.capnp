@@ -266,11 +266,14 @@ struct TaskSpec {
   leaseCoordinatorNodeId @30 :Data;
   # 16-byte UUID of the node that coordinated the prepared lease, empty when unset.
 
-  runtimeClass @31 :Text;
-  # Runtime class used to execute this workload.
+  executionSubstrate @31 :Text;
+  # Execution substrate used to host this task.
 
-  sandboxProfile @32 :Text;
-  # Optional sandbox profile used when the workload targets sandbox execution.
+  isolationMode @32 :Text;
+  # Isolation contract used to host this task.
+
+  isolationProfile @33 :Text;
+  # Optional named isolation profile used when the task requests sandboxed execution.
 }
 
 struct TaskStartRequest {
@@ -327,11 +330,14 @@ struct TaskStartRequest {
   liveness @16 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe executed by the hosting runtime.
 
-  runtimeClass @17 :Text;
-  # Runtime class requested for this task.
+  executionSubstrate @17 :Text;
+  # Execution substrate requested for this task.
 
-  sandboxProfile @18 :Text;
-  # Optional sandbox profile requested for sandboxed task execution.
+  isolationMode @18 :Text;
+  # Isolation contract requested for this task.
+
+  isolationProfile @19 :Text;
+  # Optional named isolation profile requested for sandboxed task execution.
 }
 
 struct TaskStopRequest {

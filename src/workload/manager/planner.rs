@@ -14,9 +14,9 @@ use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
 };
 use crate::workload::model::{
-    RuntimeClass, WorkloadAgentRunMetadata, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
-    WorkloadJobMetadata, WorkloadSecretFile, WorkloadServiceMetadata,
-    WorkloadVolumeMount as TaskVolumeMount,
+    ExecutionSubstrate, IsolationMode, WorkloadAgentRunMetadata,
+    WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadJobMetadata,
+    WorkloadSecretFile, WorkloadServiceMetadata, WorkloadVolumeMount as TaskVolumeMount,
 };
 use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
 
@@ -36,12 +36,13 @@ pub(super) enum SchedulingError {
     LocalNetworksBlocked { task: String },
     #[error(
         "scheduler reservation failed: runtime requirements unavailable for task '{task}' \
-         (runtime={runtime_class}, sandbox={sandbox_profile:?}, features={feature_flags:?})"
+         (substrate={execution_substrate}, isolation={isolation_mode}, profile={isolation_profile:?}, features={feature_flags:?})"
     )]
     RuntimeRequirementsBlocked {
         task: String,
-        runtime_class: &'static str,
-        sandbox_profile: Option<String>,
+        execution_substrate: &'static str,
+        isolation_mode: &'static str,
+        isolation_profile: Option<String>,
         feature_flags: Vec<String>,
     },
 }
@@ -66,8 +67,9 @@ pub(super) struct BatchStartPlan {
     pub(super) id: Uuid,
     pub(super) name: String,
     pub(super) image: String,
-    pub(super) runtime_class: RuntimeClass,
-    pub(super) sandbox_profile: Option<String>,
+    pub(super) execution_substrate: ExecutionSubstrate,
+    pub(super) isolation_mode: IsolationMode,
+    pub(super) isolation_profile: Option<String>,
     pub(super) command: Vec<String>,
     pub(super) tty: bool,
     pub(super) slots: Vec<SlotChoice>,
@@ -113,8 +115,9 @@ pub(super) struct StartIntent {
     pub(super) memory_bytes: u64,
     pub(super) gpu_count: u32,
     pub(super) gpu_device_ids: Vec<String>,
-    pub(super) runtime_class: RuntimeClass,
-    pub(super) sandbox_profile: Option<String>,
+    pub(super) execution_substrate: ExecutionSubstrate,
+    pub(super) isolation_mode: IsolationMode,
+    pub(super) isolation_profile: Option<String>,
     pub(super) required_runtime_features: Vec<String>,
     pub(super) preassigned_slots: Vec<SlotId>,
     pub(super) restart_policy: Option<WorkloadRestartPolicy>,
@@ -135,8 +138,9 @@ impl StartIntent {
     /// Returns true when one node runtime profile satisfies this intent's runtime requirements.
     fn runtime_requirements_met(&self, runtime_support: &RuntimeSupportProfile) -> bool {
         runtime_support.supports_requirements(
-            self.runtime_class,
-            self.sandbox_profile.as_deref(),
+            self.execution_substrate,
+            self.isolation_mode,
+            self.isolation_profile.as_deref(),
             &self.required_runtime_features,
         )
     }
@@ -145,8 +149,9 @@ impl StartIntent {
     fn runtime_requirements_error(&self) -> SchedulingError {
         SchedulingError::RuntimeRequirementsBlocked {
             task: self.name.clone(),
-            runtime_class: self.runtime_class.as_str(),
-            sandbox_profile: self.sandbox_profile.clone(),
+            execution_substrate: self.execution_substrate.as_str(),
+            isolation_mode: self.isolation_mode.as_str(),
+            isolation_profile: self.isolation_profile.clone(),
             feature_flags: self.required_runtime_features.clone(),
         }
     }
@@ -543,8 +548,9 @@ pub(super) struct RemoteStartPlan {
     pub(super) id: Uuid,
     pub(super) name: String,
     pub(super) image: String,
-    pub(super) runtime_class: RuntimeClass,
-    pub(super) sandbox_profile: Option<String>,
+    pub(super) execution_substrate: ExecutionSubstrate,
+    pub(super) isolation_mode: IsolationMode,
+    pub(super) isolation_profile: Option<String>,
     pub(super) command: Vec<String>,
     pub(super) tty: bool,
     pub(super) cpu_millis: u64,
@@ -572,8 +578,9 @@ pub(super) struct PreparedRemoteStartPlan {
     pub(super) lease_coordinator_node_id: Uuid,
     pub(super) name: String,
     pub(super) image: String,
-    pub(super) runtime_class: RuntimeClass,
-    pub(super) sandbox_profile: Option<String>,
+    pub(super) execution_substrate: ExecutionSubstrate,
+    pub(super) isolation_mode: IsolationMode,
+    pub(super) isolation_profile: Option<String>,
     pub(super) command: Vec<String>,
     pub(super) tty: bool,
     pub(super) cpu_millis: u64,
@@ -657,8 +664,9 @@ impl WorkloadManager {
             let WorkloadStartRequest {
                 name,
                 execution,
-                runtime_class,
-                sandbox_profile,
+                execution_substrate,
+                isolation_mode,
+                isolation_profile,
                 gpu_device_ids,
                 id,
                 slot_ids,
@@ -720,8 +728,9 @@ impl WorkloadManager {
                 memory_bytes: execution.memory_bytes,
                 gpu_count: resolved_gpu_count,
                 gpu_device_ids,
-                runtime_class,
-                sandbox_profile,
+                execution_substrate,
+                isolation_mode,
+                isolation_profile,
                 required_runtime_features: required_runtime_features(
                     execution.pre_stop_command.as_ref(),
                     execution.liveness.as_ref(),
@@ -992,8 +1001,9 @@ impl WorkloadManager {
                 id: intent.id,
                 name: intent.name.clone(),
                 image: intent.image.clone(),
-                runtime_class: intent.runtime_class,
-                sandbox_profile: intent.sandbox_profile.clone(),
+                execution_substrate: intent.execution_substrate,
+                isolation_mode: intent.isolation_mode,
+                isolation_profile: intent.isolation_profile.clone(),
                 command: intent.command.clone(),
                 tty: intent.tty,
                 slots: chosen_slots,
@@ -1257,8 +1267,9 @@ impl WorkloadManager {
                             id: intent.id,
                             name: intent.name.clone(),
                             image: intent.image.clone(),
-                            runtime_class: intent.runtime_class,
-                            sandbox_profile: intent.sandbox_profile.clone(),
+                            execution_substrate: intent.execution_substrate,
+                            isolation_mode: intent.isolation_mode,
+                            isolation_profile: intent.isolation_profile.clone(),
                             command: intent.command.clone(),
                             tty: intent.tty,
                             slots: allocation.slots,
@@ -1289,8 +1300,9 @@ impl WorkloadManager {
                             id: intent.id,
                             name: intent.name.clone(),
                             image: intent.image.clone(),
-                            runtime_class: intent.runtime_class,
-                            sandbox_profile: intent.sandbox_profile.clone(),
+                            execution_substrate: intent.execution_substrate,
+                            isolation_mode: intent.isolation_mode,
+                            isolation_profile: intent.isolation_profile.clone(),
                             command: intent.command.clone(),
                             tty: intent.tty,
                             cpu_millis: intent.cpu_millis,
@@ -1376,8 +1388,9 @@ impl WorkloadManager {
                         id: intent.id,
                         name: intent.name.clone(),
                         image: intent.image.clone(),
-                        runtime_class: intent.runtime_class,
-                        sandbox_profile: intent.sandbox_profile.clone(),
+                        execution_substrate: intent.execution_substrate,
+                        isolation_mode: intent.isolation_mode,
+                        isolation_profile: intent.isolation_profile.clone(),
                         command: intent.command.clone(),
                         tty: intent.tty,
                         slots: allocation.slots,
@@ -1408,8 +1421,9 @@ impl WorkloadManager {
                         id: intent.id,
                         name: intent.name.clone(),
                         image: intent.image.clone(),
-                        runtime_class: intent.runtime_class,
-                        sandbox_profile: intent.sandbox_profile.clone(),
+                        execution_substrate: intent.execution_substrate,
+                        isolation_mode: intent.isolation_mode,
+                        isolation_profile: intent.isolation_profile.clone(),
                         command: intent.command.clone(),
                         tty: intent.tty,
                         cpu_millis: intent.cpu_millis,
@@ -1444,7 +1458,7 @@ mod tests {
     };
     use crate::runtime::types::RuntimeSupportProfile;
     use crate::scheduler::digest::SchedulerDigestValue;
-    use crate::workload::model::RuntimeClass;
+    use crate::workload::model::{ExecutionSubstrate, IsolationMode};
     use std::collections::HashSet;
     use uuid::Uuid;
 
@@ -1463,8 +1477,9 @@ mod tests {
             memory_bytes: 256 * 1_024 * 1_024,
             gpu_count: 1,
             gpu_device_ids: Vec::new(),
-            runtime_class: RuntimeClass::Oci,
-            sandbox_profile: None,
+            execution_substrate: ExecutionSubstrate::Oci,
+            isolation_mode: IsolationMode::Standard,
+            isolation_profile: None,
             required_runtime_features: Vec::new(),
             preassigned_slots: Vec::new(),
             restart_policy: None,
@@ -1534,8 +1549,9 @@ mod tests {
             memory_bytes: 128 * 1_024 * 1_024,
             gpu_count: 0,
             gpu_device_ids: Vec::new(),
-            runtime_class: RuntimeClass::MicroVm,
-            sandbox_profile: Some("vm-default".into()),
+            execution_substrate: ExecutionSubstrate::MicroVm,
+            isolation_mode: IsolationMode::Sandboxed,
+            isolation_profile: Some("vm-default".into()),
             required_runtime_features: vec!["exec".into()],
             preassigned_slots: Vec::new(),
             restart_policy: None,
@@ -1564,12 +1580,17 @@ mod tests {
             gpu_runtime_ready: true,
         };
         let incompatible = RuntimeSupportProfile::new(
-            [RuntimeClass::Oci],
+            [ExecutionSubstrate::Oci],
+            [IsolationMode::Standard],
             Vec::<String>::new(),
             Vec::<String>::new(),
         );
-        let compatible =
-            RuntimeSupportProfile::new([RuntimeClass::MicroVm], ["vm-default"], ["exec"]);
+        let compatible = RuntimeSupportProfile::new(
+            [ExecutionSubstrate::MicroVm],
+            [IsolationMode::Sandboxed],
+            ["vm-default"],
+            ["exec"],
+        );
 
         assert!(!digest_can_host_intent(
             &digest,

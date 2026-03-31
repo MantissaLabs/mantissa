@@ -42,12 +42,12 @@ pub async fn list_runs(cfg: &ClientConfig, session_id: Option<Uuid>) -> Result<(
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "RUN ID\tSESSION\tSTATUS\tTASK\tEXIT\tSANDBOX\tUPDATED"
+        "RUN ID\tSESSION\tSTATUS\tTASK\tEXIT\tSUBSTRATE\tMODE\tPROFILE\tUPDATED"
     )?;
     for row in rows {
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.id,
             row.session_name,
             row.status,
@@ -55,7 +55,10 @@ pub async fn list_runs(cfg: &ClientConfig, session_id: Option<Uuid>) -> Result<(
             row.exit_code
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
-            row.sandbox_profile.unwrap_or_else(|| "default".to_string()),
+            row.execution_substrate,
+            row.isolation_mode,
+            row.isolation_profile
+                .unwrap_or_else(|| "default".to_string()),
             row.updated_at,
         )?;
     }
@@ -71,7 +74,9 @@ struct AgentRunRow {
     status: &'static str,
     task_id: Option<String>,
     exit_code: Option<i32>,
-    sandbox_profile: Option<String>,
+    execution_substrate: String,
+    isolation_mode: String,
+    isolation_profile: Option<String>,
     updated_at: String,
 }
 
@@ -93,8 +98,10 @@ impl AgentRunRow {
                 (!data.is_empty()).then(|| uuid_short(data)).transpose()?
             },
             exit_code: reader.get_has_exit_code().then_some(reader.get_exit_code()),
-            sandbox_profile: {
-                let profile = reader.get_sandbox_profile()?.to_str()?.trim().to_string();
+            execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+            isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
+            isolation_profile: {
+                let profile = reader.get_isolation_profile()?.to_str()?.trim().to_string();
                 (!profile.is_empty()).then_some(profile)
             },
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),

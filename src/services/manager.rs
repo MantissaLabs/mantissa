@@ -2476,7 +2476,7 @@ mod tests {
         LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
         VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
     };
-    use crate::workload::model::RuntimeClass;
+    use crate::workload::model::ExecutionSubstrate;
     use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2587,8 +2587,9 @@ mod tests {
                 }],
                 ..empty_resolved_execution("ghcr.io/demo/app:latest")
             },
-            runtime_class: RuntimeClass::Oci,
-            sandbox_profile: None,
+            execution_substrate: ExecutionSubstrate::Oci,
+            isolation_mode: crate::workload::model::IsolationMode::Standard,
+            isolation_profile: None,
             gpu_device_ids: Vec::new(),
             id: Some(Uuid::new_v4()),
             slot_ids: Vec::new(),
@@ -2604,8 +2605,9 @@ mod tests {
         WorkloadStartRequest {
             name: "demo-task".to_string(),
             execution: empty_resolved_execution("ghcr.io/demo/app:latest"),
-            runtime_class: RuntimeClass::Oci,
-            sandbox_profile: None,
+            execution_substrate: ExecutionSubstrate::Oci,
+            isolation_mode: crate::workload::model::IsolationMode::Standard,
+            isolation_profile: None,
             gpu_device_ids: Vec::new(),
             id: Some(Uuid::new_v4()),
             slot_ids: Vec::new(),
@@ -2629,8 +2631,9 @@ mod tests {
             id,
             name: format!("{service_name}-{template}-1-test"),
             image: "ghcr.io/demo/app:latest".to_string(),
-            runtime_class: RuntimeClass::Oci,
-            sandbox_profile: None,
+            execution_substrate: ExecutionSubstrate::Oci,
+            isolation_mode: crate::workload::model::IsolationMode::Standard,
+            isolation_profile: None,
             state,
             phase_reason: None,
             phase_progress: None,

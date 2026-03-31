@@ -30,18 +30,21 @@ pub async fn list_sessions(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tSTATUS\tACTIVE RUN\tLAST RUN\tSANDBOX\tUPDATED"
+        "ID\tNAME\tSTATUS\tACTIVE RUN\tLAST RUN\tSUBSTRATE\tMODE\tPROFILE\tUPDATED"
     )?;
     for row in rows {
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.id,
             row.name,
             row.status,
             row.active_run_id.unwrap_or_else(|| "-".to_string()),
             row.last_run_id.unwrap_or_else(|| "-".to_string()),
-            row.sandbox_profile.unwrap_or_else(|| "default".to_string()),
+            row.execution_substrate,
+            row.isolation_mode,
+            row.isolation_profile
+                .unwrap_or_else(|| "default".to_string()),
             row.updated_at,
         )?;
     }
@@ -57,7 +60,9 @@ struct AgentSessionRow {
     status: &'static str,
     active_run_id: Option<String>,
     last_run_id: Option<String>,
-    sandbox_profile: Option<String>,
+    execution_substrate: String,
+    isolation_mode: String,
+    isolation_profile: Option<String>,
     updated_at: String,
 }
 
@@ -82,8 +87,10 @@ impl AgentSessionRow {
                 let data = reader.get_last_run_id()?;
                 (!data.is_empty()).then(|| uuid_short(data)).transpose()?
             },
-            sandbox_profile: {
-                let profile = reader.get_sandbox_profile()?.to_str()?.trim().to_string();
+            execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+            isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
+            isolation_profile: {
+                let profile = reader.get_isolation_profile()?.to_str()?.trim().to_string();
                 (!profile.is_empty()).then_some(profile)
             },
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),

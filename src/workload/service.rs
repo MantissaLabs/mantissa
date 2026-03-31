@@ -5,8 +5,9 @@ use crate::workload::capnp_codec::{
 };
 use crate::workload::manager::WorkloadManager;
 use crate::workload::model::{
-    RuntimeClass, WorkloadAgentRunMetadata, WorkloadEvent, WorkloadJobMetadata, WorkloadPhase,
-    WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter, WorkloadStateKind, WorkloadStatus,
+    ExecutionSubstrate, IsolationMode, WorkloadAgentRunMetadata, WorkloadEvent,
+    WorkloadJobMetadata, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter,
+    WorkloadStateKind, WorkloadStatus,
 };
 use capnp::Error;
 use protocol::gossip::gossip_message;
@@ -140,8 +141,9 @@ pub fn write_status(mut builder: workload_status::Builder<'_>, status: &Workload
     builder.set_phase_version(status.phase_version);
     builder.set_launch_attempt(status.launch_attempt);
     builder.set_last_terminal_observed_launch(status.last_terminal_observed_launch.unwrap_or(0));
-    builder.set_runtime_class(status.runtime_class.as_str());
-    builder.set_sandbox_profile(status.sandbox_profile.as_deref().unwrap_or(""));
+    builder.set_execution_substrate(status.execution_substrate.as_str());
+    builder.set_isolation_mode(status.isolation_mode.as_str());
+    builder.set_isolation_profile(status.isolation_profile.as_deref().unwrap_or(""));
 }
 
 /// Decodes one compact workload lifecycle status from the workload wire payload.
@@ -179,8 +181,9 @@ pub fn read_status(reader: workload_status::Reader<'_>) -> Result<WorkloadStatus
             0 => None,
             value => Some(value),
         },
-        runtime_class: read_runtime_class(reader.get_runtime_class()?.to_str()?),
-        sandbox_profile: read_optional_text(reader.get_sandbox_profile()?),
+        execution_substrate: read_execution_substrate(reader.get_execution_substrate()?.to_str()?),
+        isolation_mode: read_isolation_mode(reader.get_isolation_mode()?.to_str()?),
+        isolation_profile: read_optional_text(reader.get_isolation_profile()?),
     })
 }
 
@@ -199,8 +202,9 @@ pub fn write_spec(mut builder: workload_spec::Builder<'_>, spec: &WorkloadSpec) 
     builder.set_phase_version(spec.phase_version);
     builder.set_launch_attempt(spec.launch_attempt);
     builder.set_last_terminal_observed_launch(spec.last_terminal_observed_launch.unwrap_or(0));
-    builder.set_runtime_class(spec.runtime_class.as_str());
-    builder.set_sandbox_profile(spec.sandbox_profile.as_deref().unwrap_or(""));
+    builder.set_execution_substrate(spec.execution_substrate.as_str());
+    builder.set_isolation_mode(spec.isolation_mode.as_str());
+    builder.set_isolation_profile(spec.isolation_profile.as_deref().unwrap_or(""));
     builder.set_lease_id(
         spec.lease_id
             .as_ref()
@@ -340,8 +344,9 @@ pub fn read_spec(reader: workload_spec::Reader<'_>) -> Result<WorkloadSpec, Erro
         id,
         name: reader.get_name()?.to_str()?.to_string(),
         image: reader.get_image()?.to_str()?.to_string(),
-        runtime_class: read_runtime_class(reader.get_runtime_class()?.to_str()?),
-        sandbox_profile: read_optional_text(reader.get_sandbox_profile()?),
+        execution_substrate: read_execution_substrate(reader.get_execution_substrate()?.to_str()?),
+        isolation_mode: read_isolation_mode(reader.get_isolation_mode()?.to_str()?),
+        isolation_profile: read_optional_text(reader.get_isolation_profile()?),
         state: state_from_str(reader.get_state()?.to_str()?),
         phase_reason: read_optional_text(reader.get_phase_reason()?),
         phase_progress: read_optional_text(reader.get_phase_progress()?),
@@ -544,9 +549,14 @@ fn state_from_str(input: &str) -> WorkloadPhase {
     }
 }
 
-/// Parses one runtime-class identifier from the wire format.
-fn read_runtime_class(value: &str) -> RuntimeClass {
-    value.parse().unwrap_or(RuntimeClass::Oci)
+/// Parses one execution-substrate identifier from the wire format.
+fn read_execution_substrate(value: &str) -> ExecutionSubstrate {
+    value.parse().unwrap_or(ExecutionSubstrate::Oci)
+}
+
+/// Parses one isolation-mode identifier from the wire format.
+fn read_isolation_mode(value: &str) -> IsolationMode {
+    value.parse().unwrap_or(IsolationMode::Standard)
 }
 
 /// Parses one optional text field where empty text means unset.

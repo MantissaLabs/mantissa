@@ -406,18 +406,25 @@ pub fn write_runtime_support_to_node_info(
     mut info: node_info_capnp::Builder<'_>,
     runtime_support: &RuntimeSupportProfile,
 ) {
-    let mut runtime_classes = info
+    let mut execution_substrates = info
         .reborrow()
-        .init_runtime_classes(runtime_support.runtime_classes.len() as u32);
-    for (idx, runtime_class) in runtime_support.runtime_classes.iter().enumerate() {
-        runtime_classes.set(idx as u32, runtime_class.as_str());
+        .init_execution_substrates(runtime_support.execution_substrates.len() as u32);
+    for (idx, execution_substrate) in runtime_support.execution_substrates.iter().enumerate() {
+        execution_substrates.set(idx as u32, execution_substrate.as_str());
     }
 
-    let mut sandbox_profiles = info
+    let mut isolation_modes = info
         .reborrow()
-        .init_sandbox_profiles(runtime_support.sandbox_profiles.len() as u32);
-    for (idx, sandbox_profile) in runtime_support.sandbox_profiles.iter().enumerate() {
-        sandbox_profiles.set(idx as u32, sandbox_profile);
+        .init_isolation_modes(runtime_support.isolation_modes.len() as u32);
+    for (idx, isolation_mode) in runtime_support.isolation_modes.iter().enumerate() {
+        isolation_modes.set(idx as u32, isolation_mode.as_str());
+    }
+
+    let mut isolation_profiles = info
+        .reborrow()
+        .init_isolation_profiles(runtime_support.isolation_profiles.len() as u32);
+    for (idx, isolation_profile) in runtime_support.isolation_profiles.iter().enumerate() {
+        isolation_profiles.set(idx as u32, isolation_profile);
     }
 
     let mut feature_flags = info
@@ -432,18 +439,28 @@ pub fn write_runtime_support_to_node_info(
 fn runtime_support_from_node_info(
     ni: node_info_capnp::Reader<'_>,
 ) -> Result<RuntimeSupportProfile, CapnpError> {
-    let runtime_classes = read_text_list(ni.get_runtime_classes()?)?;
-    let sandbox_profiles = read_text_list(ni.get_sandbox_profiles()?)?;
+    let execution_substrates = read_text_list(ni.get_execution_substrates()?)?;
+    let isolation_modes = read_text_list(ni.get_isolation_modes()?)?;
+    let isolation_profiles = read_text_list(ni.get_isolation_profiles()?)?;
     let feature_flags = read_text_list(ni.get_runtime_feature_flags()?)?;
 
-    let runtime_classes = runtime_classes
+    let execution_substrates = execution_substrates
         .into_iter()
-        .filter_map(|value| value.parse::<crate::workload::model::RuntimeClass>().ok())
+        .filter_map(|value| {
+            value
+                .parse::<crate::workload::model::ExecutionSubstrate>()
+                .ok()
+        })
+        .collect::<Vec<_>>();
+    let isolation_modes = isolation_modes
+        .into_iter()
+        .filter_map(|value| value.parse::<crate::workload::model::IsolationMode>().ok())
         .collect::<Vec<_>>();
 
     Ok(RuntimeSupportProfile::new(
-        runtime_classes,
-        sandbox_profiles,
+        execution_substrates,
+        isolation_modes,
+        isolation_profiles,
         feature_flags,
     ))
 }

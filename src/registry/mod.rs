@@ -3,7 +3,7 @@ use crate::runtime::types::RuntimeSupportProfile;
 use crate::store::local::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
-use crate::workload::model::RuntimeClass;
+use crate::workload::model::{ExecutionSubstrate, IsolationMode};
 use ::health::HealthMonitor;
 use anyhow::{Result as AnyResult, anyhow};
 use crdt_store::uuid_key::UuidKey;
@@ -484,15 +484,23 @@ impl Registry {
     }
 
     /// Returns true when the provided node advertises support for the requested runtime family.
-    pub fn peer_supports_runtime_class(&self, peer_id: Uuid, runtime_class: RuntimeClass) -> bool {
+    pub fn peer_supports_execution_substrate(
+        &self,
+        peer_id: Uuid,
+        execution_substrate: ExecutionSubstrate,
+    ) -> bool {
         if self.peer_is_excluded(peer_id) {
             return false;
         }
 
         self.peer_latest_value_unscoped(peer_id)
-            .map(|value| value.runtime_support.supports_runtime_class(runtime_class))
+            .map(|value| {
+                value
+                    .runtime_support
+                    .supports_execution_substrate(execution_substrate)
+            })
             .unwrap_or_else(|| {
-                RuntimeSupportProfile::default().supports_runtime_class(runtime_class)
+                RuntimeSupportProfile::default().supports_execution_substrate(execution_substrate)
             })
     }
 
@@ -500,8 +508,9 @@ impl Registry {
     pub fn peer_supports_runtime_requirements(
         &self,
         peer_id: Uuid,
-        runtime_class: RuntimeClass,
-        sandbox_profile: Option<&str>,
+        execution_substrate: ExecutionSubstrate,
+        isolation_mode: IsolationMode,
+        isolation_profile: Option<&str>,
         feature_flags: &[String],
     ) -> bool {
         if self.peer_is_excluded(peer_id) {
@@ -511,15 +520,17 @@ impl Registry {
         self.peer_latest_value_unscoped(peer_id)
             .map(|value| {
                 value.runtime_support.supports_requirements(
-                    runtime_class,
-                    sandbox_profile,
+                    execution_substrate,
+                    isolation_mode,
+                    isolation_profile,
                     feature_flags,
                 )
             })
             .unwrap_or_else(|| {
                 RuntimeSupportProfile::default().supports_requirements(
-                    runtime_class,
-                    sandbox_profile,
+                    execution_substrate,
+                    isolation_mode,
+                    isolation_profile,
                     feature_flags,
                 )
             })

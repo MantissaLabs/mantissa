@@ -10,6 +10,7 @@ use crate::workload::capnp_codec::{
     decode_volume_mounts, encode_env_vars, encode_secret_files, encode_task_liveness_probe,
     encode_task_restart_policy, encode_volume_mounts,
 };
+use crate::workload::model::{ExecutionSubstrate, IsolationMode};
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
 use protocol::agents::{
@@ -49,7 +50,9 @@ impl agents::Server for AgentsRpc {
             .submit(
                 session.name,
                 session.execution,
-                session.sandbox_profile,
+                session.execution_substrate,
+                session.isolation_mode,
+                session.isolation_profile,
                 session.workspace,
                 session.tools,
                 session.checkpoint,
@@ -175,7 +178,9 @@ pub fn write_agent_session_spec(
     builder.set_id(value.id.as_bytes());
     builder.set_name(&value.name);
     write_session_execution(builder.reborrow(), &value.execution);
-    builder.set_sandbox_profile(value.sandbox_profile.as_deref().unwrap_or(""));
+    builder.set_execution_substrate(value.execution_substrate.as_str());
+    builder.set_isolation_mode(value.isolation_mode.as_str());
+    builder.set_isolation_profile(value.isolation_profile.as_deref().unwrap_or(""));
     builder.set_created_at(&value.created_at);
     builder.set_updated_at(&value.updated_at);
     builder.set_phase_version(value.phase_version);
@@ -212,7 +217,9 @@ pub fn read_agent_session_spec(
         read_optional_uuid(reader.get_id()?).unwrap_or_else(Uuid::new_v4),
         reader.get_name()?.to_str()?.to_string(),
         execution,
-        normalize_text(reader.get_sandbox_profile()?),
+        read_execution_substrate(reader.get_execution_substrate()?.to_str()?),
+        read_isolation_mode(reader.get_isolation_mode()?.to_str()?),
+        normalize_text(reader.get_isolation_profile()?),
         read_workspace_policy(reader.get_workspace()?)?,
         read_tool_policy(reader.get_tools()?)?,
         read_checkpoint_policy(reader.get_checkpoint()?)?,
@@ -243,7 +250,9 @@ pub fn write_agent_run_spec(
     builder.set_session_id(value.session_id.as_bytes());
     builder.set_session_name(&value.session_name);
     write_run_execution(builder.reborrow(), &value.execution);
-    builder.set_sandbox_profile(value.sandbox_profile.as_deref().unwrap_or(""));
+    builder.set_execution_substrate(value.execution_substrate.as_str());
+    builder.set_isolation_mode(value.isolation_mode.as_str());
+    builder.set_isolation_profile(value.isolation_profile.as_deref().unwrap_or(""));
     builder.set_created_at(&value.created_at);
     builder.set_updated_at(&value.updated_at);
     builder.set_phase_version(value.phase_version);
@@ -268,7 +277,9 @@ pub fn read_agent_run_spec(reader: agent_run_spec::Reader<'_>) -> Result<AgentRu
         read_uuid(reader.get_session_id()?)?,
         reader.get_session_name()?.to_str()?.to_string(),
         read_run_execution(reader.reborrow())?,
-        normalize_text(reader.get_sandbox_profile()?),
+        read_execution_substrate(reader.get_execution_substrate()?.to_str()?),
+        read_isolation_mode(reader.get_isolation_mode()?.to_str()?),
+        normalize_text(reader.get_isolation_profile()?),
         normalize_text(reader.get_prompt()?),
     );
     value.created_at = normalize_text(reader.get_created_at()?)
@@ -743,6 +754,14 @@ fn read_optional_uuid(data: &[u8]) -> Option<Uuid> {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(data);
     Some(Uuid::from_bytes(bytes))
+}
+
+fn read_execution_substrate(value: &str) -> ExecutionSubstrate {
+    value.parse().unwrap_or(ExecutionSubstrate::Oci)
+}
+
+fn read_isolation_mode(value: &str) -> IsolationMode {
+    value.parse().unwrap_or(IsolationMode::Sandboxed)
 }
 
 fn normalize_text(reader: capnp::text::Reader<'_>) -> Option<String> {

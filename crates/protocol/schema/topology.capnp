@@ -255,13 +255,16 @@ struct NodeInfo {
   drainTaskStopTimeoutSecs @21 :UInt32;
   # Optional drain-only override for task stop timeout in seconds, 0 uses task defaults.
 
-  runtimeClasses @22 :List(Text);
-  # Runtime families this node can execute, for example "oci" or "microvm".
+  executionSubstrates @22 :List(Text);
+  # Execution substrates this node can host, for example "oci" or "microvm".
 
-  sandboxProfiles @23 :List(Text);
-  # Optional named sandbox profiles this node can satisfy for workload placement.
+  isolationModes @23 :List(Text);
+  # Isolation contracts this node can satisfy, for example "standard" or "sandboxed".
 
-  runtimeFeatureFlags @24 :List(Text);
+  isolationProfiles @24 :List(Text);
+  # Optional named isolation profiles this node can satisfy for workload placement.
+
+  runtimeFeatureFlags @25 :List(Text);
   # Runtime-specific feature flags such as "exec" or "lifecycle_events".
 }
 

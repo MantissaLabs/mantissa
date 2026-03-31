@@ -87,18 +87,31 @@ impl JoinRequest {
                 },
             ),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::new(
-                info.get_runtime_classes()?
+                info.get_execution_substrates()?
                     .iter()
                     .filter_map(|value| {
                         value
                             .ok()
                             .and_then(|value| value.to_str().ok())
                             .and_then(|value| {
-                                value.parse::<crate::workload::model::RuntimeClass>().ok()
+                                value
+                                    .parse::<crate::workload::model::ExecutionSubstrate>()
+                                    .ok()
                             })
                     })
                     .collect::<Vec<_>>(),
-                info.get_sandbox_profiles()?
+                info.get_isolation_modes()?
+                    .iter()
+                    .filter_map(|value| {
+                        value
+                            .ok()
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| {
+                                value.parse::<crate::workload::model::IsolationMode>().ok()
+                            })
+                    })
+                    .collect::<Vec<_>>(),
+                info.get_isolation_profiles()?
                     .iter()
                     .filter_map(|value| {
                         value

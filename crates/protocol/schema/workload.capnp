@@ -235,16 +235,19 @@ struct WorkloadSpec {
   leaseCoordinatorNodeId @31 :Data;
   # 16-byte UUID of the node that coordinated the prepared lease, empty when unset.
 
-  runtimeClass @32 :Text;
-  # Runtime class used to execute this workload.
+  executionSubstrate @32 :Text;
+  # Execution substrate used to host this workload.
 
-  sandboxProfile @33 :Text;
-  # Optional sandbox profile used when the workload targets sandbox execution.
+  isolationMode @33 :Text;
+  # Isolation contract used to host this workload.
 
-  jobMetadata @34 :JobMetadata;
+  isolationProfile @34 :Text;
+  # Optional named isolation profile used when the workload requests sandboxed execution.
+
+  jobMetadata @35 :JobMetadata;
   # Optional job-attempt ownership metadata.
 
-  agentRunMetadata @35 :AgentRunMetadata;
+  agentRunMetadata @36 :AgentRunMetadata;
   # Optional agent-run ownership metadata.
 }
 
@@ -294,16 +297,19 @@ struct WorkloadStatus {
   lastTerminalObservedLaunch @14 :UInt64;
   # Last launch attempt observed as terminal, 0 means unset.
 
-  runtimeClass @15 :Text;
-  # Runtime class used to execute this workload.
+  executionSubstrate @15 :Text;
+  # Execution substrate used to host this workload.
 
-  sandboxProfile @16 :Text;
-  # Optional sandbox profile used when the workload targets sandbox execution.
+  isolationMode @16 :Text;
+  # Isolation contract used to host this workload.
 
-  jobMetadata @17 :JobMetadata;
+  isolationProfile @17 :Text;
+  # Optional named isolation profile used when the workload requests sandboxed execution.
+
+  jobMetadata @18 :JobMetadata;
   # Optional job-attempt ownership metadata.
 
-  agentRunMetadata @18 :AgentRunMetadata;
+  agentRunMetadata @19 :AgentRunMetadata;
   # Optional agent-run ownership metadata.
 }
 

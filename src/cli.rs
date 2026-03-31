@@ -546,9 +546,25 @@ pub struct AgentsSubmitArgs {
     #[arg(long = "gpu-count", value_name = "COUNT", default_value = "0")]
     pub gpu_count: u32,
 
-    /// Requested sandbox profile for the run runtime
-    #[arg(long = "sandbox-profile", value_name = "PROFILE")]
-    pub sandbox_profile: Option<String>,
+    /// Execution substrate requested for agent runs (`oci` or `microvm`)
+    #[arg(
+        long = "execution-substrate",
+        value_name = "SUBSTRATE",
+        default_value = "oci"
+    )]
+    pub execution_substrate: String,
+
+    /// Isolation contract requested for agent runs (`standard` or `sandboxed`)
+    #[arg(
+        long = "isolation-mode",
+        value_name = "MODE",
+        default_value = "sandboxed"
+    )]
+    pub isolation_mode: String,
+
+    /// Optional isolation profile requested for the run runtime
+    #[arg(long = "isolation-profile", value_name = "PROFILE")]
+    pub isolation_profile: Option<String>,
 
     /// Optional initial input queued for the first run
     #[arg(long = "input", value_name = "TEXT")]

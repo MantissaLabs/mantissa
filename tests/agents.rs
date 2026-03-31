@@ -6,9 +6,9 @@ use common::convergence::wait_until;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use crdt_store::uuid_key::UuidKey;
 use mantissa::task::types::TaskValue;
-use mantissa::workload::model::RuntimeClass;
 use mantissa::workload::model::WorkloadPhase;
 use mantissa::workload::model::WorkloadSpec;
+use mantissa::workload::model::{ExecutionSubstrate, IsolationMode};
 use protocol::agents::{
     AgentRunStatus as ProtoAgentRunStatus, AgentSessionStatus as ProtoAgentSessionStatus, agents,
 };
@@ -38,8 +38,9 @@ local_test!(
             .inspect_task(task_id)
             .await
             .expect("inspect agent task");
-        assert_eq!(task.runtime_class, RuntimeClass::Sandbox);
-        assert_eq!(task.sandbox_profile.as_deref(), Some("oci-default"));
+        assert_eq!(task.execution_substrate, ExecutionSubstrate::Oci);
+        assert_eq!(task.isolation_mode, IsolationMode::Sandboxed);
+        assert_eq!(task.isolation_profile.as_deref(), Some("oci-default"));
 
         let mut exited_task = task.clone();
         exited_task.state = WorkloadPhase::Exited(0);
@@ -163,7 +164,7 @@ async fn submit_agent_session(
     client: &agents::Client,
     name: &str,
     initial_input: Option<&str>,
-    sandbox_profile: Option<&str>,
+    isolation_profile: Option<&str>,
 ) -> Result<Uuid, capnp::Error> {
     let mut request = client.submit_request();
     {
@@ -174,7 +175,7 @@ async fn submit_agent_session(
         builder.set_cpu_millis(250);
         builder.set_memory_bytes(128 * 1024 * 1024);
         builder.set_gpu_count(0);
-        builder.set_sandbox_profile(sandbox_profile.unwrap_or_default());
+        builder.set_isolation_profile(isolation_profile.unwrap_or_default());
         builder.set_pending_input(initial_input.unwrap_or_default());
         builder.reborrow().init_command(0);
         builder.reborrow().init_env(0);
@@ -319,8 +320,9 @@ fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
         id: spec.id,
         name: spec.name.clone(),
         image: spec.image.clone(),
-        runtime_class: spec.runtime_class,
-        sandbox_profile: spec.sandbox_profile.clone(),
+        execution_substrate: spec.execution_substrate,
+        isolation_mode: spec.isolation_mode,
+        isolation_profile: spec.isolation_profile.clone(),
         state: spec.state.clone(),
         phase_reason: spec.phase_reason.clone(),
         phase_progress: spec.phase_progress.clone(),

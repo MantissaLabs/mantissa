@@ -11,7 +11,7 @@ use crate::workload::capnp_codec::{
     encode_task_restart_policy, encode_volume_mounts,
 };
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest, match_task_id_prefix};
-use crate::workload::model::{RuntimeClass, WorkloadPhase, WorkloadSpec};
+use crate::workload::model::{ExecutionSubstrate, IsolationMode, WorkloadPhase, WorkloadSpec};
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
 use protocol::task::{
@@ -89,8 +89,9 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     builder.set_phase_version(spec.phase_version);
     builder.set_launch_attempt(spec.launch_attempt);
     builder.set_last_terminal_observed_launch(spec.last_terminal_observed_launch.unwrap_or(0));
-    builder.set_runtime_class(spec.runtime_class.as_str());
-    builder.set_sandbox_profile(spec.sandbox_profile.as_deref().unwrap_or(""));
+    builder.set_execution_substrate(spec.execution_substrate.as_str());
+    builder.set_isolation_mode(spec.isolation_mode.as_str());
+    builder.set_isolation_profile(spec.isolation_profile.as_deref().unwrap_or(""));
     builder.set_lease_id(
         spec.lease_id
             .as_ref()
@@ -272,8 +273,9 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         id,
         name,
         image,
-        runtime_class: read_runtime_class(reader.get_runtime_class()?.to_str()?),
-        sandbox_profile: read_optional_text(reader.get_sandbox_profile()?),
+        execution_substrate: read_execution_substrate(reader.get_execution_substrate()?.to_str()?),
+        isolation_mode: read_isolation_mode(reader.get_isolation_mode()?.to_str()?),
+        isolation_profile: read_optional_text(reader.get_isolation_profile()?),
         state: state_from_str(state),
         phase_reason: if phase_reason.is_empty() {
             None
@@ -995,8 +997,12 @@ impl task::Server for TaskService {
     }
 }
 
-fn read_runtime_class(value: &str) -> RuntimeClass {
-    value.parse().unwrap_or(RuntimeClass::Oci)
+fn read_execution_substrate(value: &str) -> ExecutionSubstrate {
+    value.parse().unwrap_or(ExecutionSubstrate::Oci)
+}
+
+fn read_isolation_mode(value: &str) -> IsolationMode {
+    value.parse().unwrap_or(IsolationMode::Standard)
 }
 
 fn read_optional_text(reader: capnp::text::Reader<'_>) -> Option<String> {
@@ -1108,8 +1114,9 @@ fn read_task_start_request(
             volumes,
             networks,
         },
-        runtime_class: read_runtime_class(reader.get_runtime_class()?.to_str()?),
-        sandbox_profile: read_optional_text(reader.get_sandbox_profile()?),
+        execution_substrate: read_execution_substrate(reader.get_execution_substrate()?.to_str()?),
+        isolation_mode: read_isolation_mode(reader.get_isolation_mode()?.to_str()?),
+        isolation_profile: read_optional_text(reader.get_isolation_profile()?),
         gpu_device_ids,
         id,
         slot_ids,

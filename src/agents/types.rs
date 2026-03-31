@@ -1,4 +1,4 @@
-use crate::workload::model::{RuntimeClass, WorkloadVolumeMount};
+use crate::workload::model::{ExecutionSubstrate, IsolationMode, WorkloadVolumeMount};
 use crate::workload::types::ResolvedExecutionSpec;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -136,11 +136,13 @@ pub struct AgentSessionSpecValue {
     pub name: String,
     /// Default execution template copied into new runs created from this session.
     pub execution: ResolvedExecutionSpec,
-    #[serde(default = "default_agent_runtime_class")]
-    pub runtime_class: RuntimeClass,
+    #[serde(default = "default_agent_execution_substrate")]
+    pub execution_substrate: ExecutionSubstrate,
+    #[serde(default = "default_agent_isolation_mode")]
+    pub isolation_mode: IsolationMode,
     #[serde(default)]
     /// Optional sandbox/isolation profile requested for runs launched from this session.
-    pub sandbox_profile: Option<String>,
+    pub isolation_profile: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -176,7 +178,9 @@ impl AgentSessionSpecValue {
         id: Uuid,
         name: impl Into<String>,
         execution: ResolvedExecutionSpec,
-        sandbox_profile: Option<String>,
+        execution_substrate: ExecutionSubstrate,
+        isolation_mode: IsolationMode,
+        isolation_profile: Option<String>,
         workspace: AgentWorkspacePolicy,
         tools: AgentToolPolicy,
         checkpoint: AgentCheckpointPolicy,
@@ -188,8 +192,9 @@ impl AgentSessionSpecValue {
             id,
             name: name.into(),
             execution,
-            runtime_class: RuntimeClass::Sandbox,
-            sandbox_profile: normalize_optional_text(sandbox_profile),
+            execution_substrate,
+            isolation_mode,
+            isolation_profile: normalize_optional_text(isolation_profile),
             created_at: created_at.clone(),
             updated_at: created_at,
             phase_version: 0,
@@ -367,11 +372,13 @@ pub struct AgentRunSpecValue {
     pub session_name: String,
     /// Execution template for this specific run.
     pub execution: ResolvedExecutionSpec,
-    #[serde(default = "default_agent_runtime_class")]
-    pub runtime_class: RuntimeClass,
+    #[serde(default = "default_agent_execution_substrate")]
+    pub execution_substrate: ExecutionSubstrate,
+    #[serde(default = "default_agent_isolation_mode")]
+    pub isolation_mode: IsolationMode,
     #[serde(default)]
     /// Optional sandbox/isolation profile requested for this run.
-    pub sandbox_profile: Option<String>,
+    pub isolation_profile: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -395,12 +402,15 @@ pub struct AgentRunSpecValue {
 
 impl AgentRunSpecValue {
     /// Builds one pending sandbox run from the owning session and current queued input.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: Uuid,
         session_id: Uuid,
         session_name: impl Into<String>,
         execution: ResolvedExecutionSpec,
-        sandbox_profile: Option<String>,
+        execution_substrate: ExecutionSubstrate,
+        isolation_mode: IsolationMode,
+        isolation_profile: Option<String>,
         prompt: Option<String>,
     ) -> Self {
         let created_at = current_timestamp();
@@ -409,8 +419,9 @@ impl AgentRunSpecValue {
             session_id,
             session_name: session_name.into(),
             execution,
-            runtime_class: RuntimeClass::Sandbox,
-            sandbox_profile: normalize_optional_text(sandbox_profile),
+            execution_substrate,
+            isolation_mode,
+            isolation_profile: normalize_optional_text(isolation_profile),
             created_at: created_at.clone(),
             updated_at: created_at,
             phase_version: 0,
@@ -514,8 +525,12 @@ pub fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
-fn default_agent_runtime_class() -> RuntimeClass {
-    RuntimeClass::Sandbox
+fn default_agent_execution_substrate() -> ExecutionSubstrate {
+    ExecutionSubstrate::Oci
+}
+
+fn default_agent_isolation_mode() -> IsolationMode {
+    IsolationMode::Sandboxed
 }
 
 fn default_agent_require_input() -> bool {

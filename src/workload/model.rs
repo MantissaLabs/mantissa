@@ -30,44 +30,73 @@ pub enum WorkloadKind {
     AgentRun,
 }
 
-/// Runtime families that may execute one workload instance.
-///
-/// `Sandbox` is an isolation contract exposed to higher layers, not necessarily a unique
-/// physical substrate. One sandbox may be implemented on top of OCI or MicroVM backends.
+/// Execution substrates that may host one workload instance.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum RuntimeClass {
+pub enum ExecutionSubstrate {
     #[default]
     /// OCI/container-style execution substrate.
     Oci,
     /// MicroVM-style execution substrate.
     MicroVm,
-    /// Sandbox isolation contract chosen by higher layers.
-    Sandbox,
 }
 
-impl RuntimeClass {
-    /// Returns the canonical cluster-visible identifier for this runtime family.
+impl ExecutionSubstrate {
+    /// Returns the canonical cluster-visible identifier for this execution substrate.
     pub fn as_str(self) -> &'static str {
         match self {
-            RuntimeClass::Oci => "oci",
-            RuntimeClass::MicroVm => "microvm",
-            RuntimeClass::Sandbox => "sandbox",
+            ExecutionSubstrate::Oci => "oci",
+            ExecutionSubstrate::MicroVm => "microvm",
         }
     }
 }
 
-impl std::str::FromStr for RuntimeClass {
+impl std::str::FromStr for ExecutionSubstrate {
     type Err = ();
 
-    /// Parses one cluster-visible runtime-family identifier.
+    /// Parses one cluster-visible execution-substrate identifier.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "oci" => Ok(RuntimeClass::Oci),
-            "microvm" => Ok(RuntimeClass::MicroVm),
-            "sandbox" => Ok(RuntimeClass::Sandbox),
+            "oci" => Ok(ExecutionSubstrate::Oci),
+            "microvm" => Ok(ExecutionSubstrate::MicroVm),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Isolation contract requested for one workload execution.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationMode {
+    #[default]
+    /// Standard substrate execution without an elevated sandbox contract.
+    Standard,
+    /// Sandboxed execution, potentially backed by OCI or MicroVM substrates.
+    Sandboxed,
+}
+
+impl IsolationMode {
+    /// Returns the canonical cluster-visible identifier for this isolation mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IsolationMode::Standard => "standard",
+            IsolationMode::Sandboxed => "sandboxed",
+        }
+    }
+}
+
+impl std::str::FromStr for IsolationMode {
+    type Err = ();
+
+    /// Parses one cluster-visible isolation-mode identifier.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "standard" => Ok(IsolationMode::Standard),
+            "sandboxed" => Ok(IsolationMode::Sandboxed),
             _ => Err(()),
         }
     }
@@ -283,9 +312,11 @@ pub struct WorkloadSpec {
     pub name: String,
     pub image: String,
     #[serde(default)]
-    pub runtime_class: RuntimeClass,
+    pub execution_substrate: ExecutionSubstrate,
     #[serde(default)]
-    pub sandbox_profile: Option<String>,
+    pub isolation_mode: IsolationMode,
+    #[serde(default)]
+    pub isolation_profile: Option<String>,
     pub state: WorkloadPhase,
     #[serde(default)]
     pub phase_reason: Option<String>,
@@ -364,9 +395,14 @@ impl WorkloadSpec {
         )
     }
 
-    /// Returns the runtime class requested by this workload record.
-    pub fn runtime_class(&self) -> RuntimeClass {
-        self.runtime_class
+    /// Returns the execution substrate requested by this workload record.
+    pub fn execution_substrate(&self) -> ExecutionSubstrate {
+        self.execution_substrate
+    }
+
+    /// Returns the isolation contract requested by this workload record.
+    pub fn isolation_mode(&self) -> IsolationMode {
+        self.isolation_mode
     }
 }
 
@@ -380,9 +416,11 @@ pub struct WorkloadStatus {
     pub name: String,
     pub image: String,
     #[serde(default)]
-    pub runtime_class: RuntimeClass,
+    pub execution_substrate: ExecutionSubstrate,
     #[serde(default)]
-    pub sandbox_profile: Option<String>,
+    pub isolation_mode: IsolationMode,
+    #[serde(default)]
+    pub isolation_profile: Option<String>,
     pub state: WorkloadPhase,
     #[serde(default)]
     pub phase_reason: Option<String>,
@@ -416,8 +454,9 @@ impl WorkloadStatus {
             id: spec.id,
             name: spec.name.clone(),
             image: spec.image.clone(),
-            runtime_class: spec.runtime_class,
-            sandbox_profile: spec.sandbox_profile.clone(),
+            execution_substrate: spec.execution_substrate,
+            isolation_mode: spec.isolation_mode,
+            isolation_profile: spec.isolation_profile.clone(),
             state: spec.state.clone(),
             phase_reason: spec.phase_reason.clone(),
             phase_progress: spec.phase_progress.clone(),
@@ -453,9 +492,14 @@ impl WorkloadStatus {
         )
     }
 
-    /// Returns the runtime class requested by this workload status record.
-    pub fn runtime_class(&self) -> RuntimeClass {
-        self.runtime_class
+    /// Returns the execution substrate requested by this workload status record.
+    pub fn execution_substrate(&self) -> ExecutionSubstrate {
+        self.execution_substrate
+    }
+
+    /// Returns the isolation contract requested by this workload status record.
+    pub fn isolation_mode(&self) -> IsolationMode {
+        self.isolation_mode
     }
 }
 
@@ -477,9 +521,11 @@ pub struct WorkloadValue {
     pub name: String,
     pub image: String,
     #[serde(default)]
-    pub runtime_class: RuntimeClass,
+    pub execution_substrate: ExecutionSubstrate,
     #[serde(default)]
-    pub sandbox_profile: Option<String>,
+    pub isolation_mode: IsolationMode,
+    #[serde(default)]
+    pub isolation_profile: Option<String>,
     pub state: WorkloadPhase,
     #[serde(default)]
     pub phase_reason: Option<String>,
@@ -547,8 +593,9 @@ pub struct WorkloadValueDraft {
     pub id: Uuid,
     pub name: String,
     pub image: String,
-    pub runtime_class: RuntimeClass,
-    pub sandbox_profile: Option<String>,
+    pub execution_substrate: ExecutionSubstrate,
+    pub isolation_mode: IsolationMode,
+    pub isolation_profile: Option<String>,
     pub state: WorkloadPhase,
     pub phase_reason: Option<String>,
     pub phase_progress: Option<String>,
@@ -589,8 +636,9 @@ impl WorkloadValue {
             id: draft.id,
             name: draft.name,
             image: draft.image,
-            runtime_class: draft.runtime_class,
-            sandbox_profile: draft.sandbox_profile,
+            execution_substrate: draft.execution_substrate,
+            isolation_mode: draft.isolation_mode,
+            isolation_profile: draft.isolation_profile,
             state: draft.state,
             phase_reason: draft.phase_reason,
             phase_progress: draft.phase_progress,
@@ -645,9 +693,14 @@ impl WorkloadValue {
         )
     }
 
-    /// Returns the runtime class exposed by the current task-era workload projection.
-    pub fn runtime_class(&self) -> RuntimeClass {
-        self.runtime_class
+    /// Returns the execution substrate exposed by the current task-era workload projection.
+    pub fn execution_substrate(&self) -> ExecutionSubstrate {
+        self.execution_substrate
+    }
+
+    /// Returns the isolation contract exposed by the current workload projection.
+    pub fn isolation_mode(&self) -> IsolationMode {
+        self.isolation_mode
     }
 }
 
@@ -953,8 +1006,9 @@ pub(crate) fn value_to_spec(id: Uuid, value: WorkloadValue) -> WorkloadSpec {
         id,
         name: value.name,
         image: value.image,
-        runtime_class: value.runtime_class,
-        sandbox_profile: value.sandbox_profile,
+        execution_substrate: value.execution_substrate,
+        isolation_mode: value.isolation_mode,
+        isolation_profile: value.isolation_profile,
         state: value.state,
         phase_reason: value.phase_reason,
         phase_progress: value.phase_progress,
@@ -1005,8 +1059,9 @@ pub(crate) fn merge_status_into_value(
         merged.id = status.id;
         merged.name = status.name.clone();
         merged.image = status.image.clone();
-        merged.runtime_class = status.runtime_class;
-        merged.sandbox_profile = status.sandbox_profile.clone();
+        merged.execution_substrate = status.execution_substrate;
+        merged.isolation_mode = status.isolation_mode;
+        merged.isolation_profile = status.isolation_profile.clone();
         merged.state = status.state.clone();
         merged.phase_reason = status.phase_reason.clone();
         merged.phase_progress = status.phase_progress.clone();
@@ -1028,8 +1083,9 @@ pub(crate) fn merge_status_into_value(
         id: status.id,
         name: status.name.clone(),
         image: status.image.clone(),
-        runtime_class: status.runtime_class,
-        sandbox_profile: status.sandbox_profile.clone(),
+        execution_substrate: status.execution_substrate,
+        isolation_mode: status.isolation_mode,
+        isolation_profile: status.isolation_profile.clone(),
         state: status.state.clone(),
         phase_reason: status.phase_reason.clone(),
         phase_progress: status.phase_progress.clone(),
@@ -1089,8 +1145,9 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
         id: spec.id,
         name: spec.name.clone(),
         image: spec.image.clone(),
-        runtime_class: spec.runtime_class,
-        sandbox_profile: spec.sandbox_profile.clone(),
+        execution_substrate: spec.execution_substrate,
+        isolation_mode: spec.isolation_mode,
+        isolation_profile: spec.isolation_profile.clone(),
         state: spec.state.clone(),
         phase_reason: spec.phase_reason.clone(),
         phase_progress: spec.phase_progress.clone(),
@@ -1129,7 +1186,10 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeClass, WorkloadPhase, WorkloadSpec, compare_workload_spec_causality};
+    use super::{
+        ExecutionSubstrate, IsolationMode, WorkloadPhase, WorkloadSpec,
+        compare_workload_spec_causality,
+    };
     use chrono::Utc;
     use std::cmp::Ordering;
     use uuid::Uuid;
@@ -1142,8 +1202,9 @@ mod tests {
             id: Uuid::new_v4(),
             name: "task".to_string(),
             image: "img".to_string(),
-            runtime_class: RuntimeClass::Oci,
-            sandbox_profile: None,
+            execution_substrate: ExecutionSubstrate::Oci,
+            isolation_mode: IsolationMode::Standard,
+            isolation_profile: None,
             state: WorkloadPhase::Running,
             phase_reason: None,
             phase_progress: None,

@@ -56,55 +56,61 @@ struct AgentSessionSpec {
   networks @12 :List(Data);
   # Overlay network UUIDs as 16-byte binary data.
 
-  sandboxProfile @13 :Text;
-  # Requested sandbox profile. Empty means the node-default sandbox profile.
+  executionSubstrate @13 :Text;
+  # Execution substrate requested for runs launched from this session.
 
-  createdAt @14 :Text;
+  isolationMode @14 :Text;
+  # Isolation contract requested for runs launched from this session.
+
+  isolationProfile @15 :Text;
+  # Optional named isolation profile. Empty means the node-default profile for that mode.
+
+  createdAt @16 :Text;
   # First creation timestamp for the durable session.
 
-  updatedAt @15 :Text;
+  updatedAt @17 :Text;
   # Last replicated update timestamp.
 
-  phaseVersion @16 :UInt64;
+  phaseVersion @18 :UInt64;
   # Monotonic causal version for lifecycle mutations.
 
-  status @17 :AgentSessionStatus;
+  status @19 :AgentSessionStatus;
   # Current coarse lifecycle status.
 
-  statusDetail @18 :Text;
+  statusDetail @20 :Text;
   # Optional human-facing detail for the current status.
 
-  activeRunId @19 :Data;
+  activeRunId @21 :Data;
   # Currently active run identifier, empty when idle.
 
-  lastRunId @20 :Data;
+  lastRunId @22 :Data;
   # Most recent run identifier issued for this session.
 
-  pendingInput @21 :Text;
+  pendingInput @23 :Text;
   # Queued user input waiting to start the next run, empty when none is pending.
 
-  workspace @22 :AgentWorkspacePolicy;
+  workspace @24 :AgentWorkspacePolicy;
   # Durable workspace policy owned by the session.
 
-  tools @23 :AgentToolPolicy;
+  tools @25 :AgentToolPolicy;
   # Durable tool policy owned by the session.
 
-  checkpoint @24 :AgentCheckpointPolicy;
+  checkpoint @26 :AgentCheckpointPolicy;
   # Durable checkpointing policy owned by the session.
 
-  interaction @25 :AgentInteractionPolicy;
+  interaction @27 :AgentInteractionPolicy;
   # Durable human-in-the-loop policy owned by the session.
 
-  events @26 :List(AgentEventEntry);
+  events @28 :List(AgentEventEntry);
   # Recent structured event history retained on the session record.
 
-  terminationGracePeriodSecs @27 :UInt32;
+  terminationGracePeriodSecs @29 :UInt32;
   # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
 
-  preStopCommand @28 :List(Text);
+  preStopCommand @30 :List(Text);
   # Optional command executed inside the sandbox before termination begins.
 
-  liveness @29 :WorkloadSchema.LivenessProbe;
+  liveness @31 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe evaluated by the hosting runtime.
 }
 
@@ -151,49 +157,55 @@ struct AgentRunSpec {
   networks @13 :List(Data);
   # Overlay network UUIDs as 16-byte binary data.
 
-  sandboxProfile @14 :Text;
-  # Requested sandbox profile. Empty means the node-default sandbox profile.
+  executionSubstrate @14 :Text;
+  # Execution substrate requested for this run.
 
-  createdAt @15 :Text;
+  isolationMode @15 :Text;
+  # Isolation contract requested for this run.
+
+  isolationProfile @16 :Text;
+  # Optional named isolation profile. Empty means the node-default profile for that mode.
+
+  createdAt @17 :Text;
   # Run creation timestamp.
 
-  updatedAt @16 :Text;
+  updatedAt @18 :Text;
   # Last replicated update timestamp.
 
-  phaseVersion @17 :UInt64;
+  phaseVersion @19 :UInt64;
   # Monotonic causal version for lifecycle mutations.
 
-  status @18 :AgentRunStatus;
+  status @20 :AgentRunStatus;
   # Current coarse lifecycle status.
 
-  statusDetail @19 :Text;
+  statusDetail @21 :Text;
   # Optional human-facing detail for the current status.
 
-  taskId @20 :Data;
+  taskId @22 :Data;
   # Bound workload task identifier, empty until scheduling succeeds.
 
-  prompt @21 :Text;
+  prompt @23 :Text;
   # Structured user input that triggered this run, empty when none was queued.
 
-  exitCode @22 :Int32;
+  exitCode @24 :Int32;
   # Last observed sandbox exit code. Value is meaningful only when hasExitCode is true.
 
-  hasExitCode @23 :Bool;
+  hasExitCode @25 :Bool;
   # Distinguishes unset exit codes from an actual zero exit status.
 
-  startedAt @24 :Text;
+  startedAt @26 :Text;
   # Timestamp recorded when the run first entered running state.
 
-  finishedAt @25 :Text;
+  finishedAt @27 :Text;
   # Timestamp recorded when the run reached a terminal state.
 
-  terminationGracePeriodSecs @26 :UInt32;
+  terminationGracePeriodSecs @28 :UInt32;
   # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
 
-  preStopCommand @27 :List(Text);
+  preStopCommand @29 :List(Text);
   # Optional command executed inside the sandbox before termination begins.
 
-  liveness @28 :WorkloadSchema.LivenessProbe;
+  liveness @30 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe evaluated by the hosting runtime.
 }
 

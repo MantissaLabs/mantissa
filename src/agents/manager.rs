@@ -9,7 +9,7 @@ use crate::workload::manager::workload_start_error_is_retryable;
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
 use crate::workload::model::WorkloadPhase;
 use crate::workload::model::{
-    RuntimeClass, WorkloadAgentRunMetadata, WorkloadEnvironmentVariable, WorkloadVolumeMount,
+    WorkloadAgentRunMetadata, WorkloadEnvironmentVariable, WorkloadVolumeMount,
 };
 use crate::workload::types::ResolvedExecutionSpec;
 use anyhow::{Result, anyhow};
@@ -109,7 +109,9 @@ impl AgentController {
         &self,
         name: impl Into<String>,
         execution: ResolvedExecutionSpec,
-        sandbox_profile: Option<String>,
+        execution_substrate: crate::workload::model::ExecutionSubstrate,
+        isolation_mode: crate::workload::model::IsolationMode,
+        isolation_profile: Option<String>,
         workspace: AgentWorkspacePolicy,
         tools: AgentToolPolicy,
         checkpoint: AgentCheckpointPolicy,
@@ -122,7 +124,9 @@ impl AgentController {
             Uuid::new_v4(),
             name,
             execution,
-            sandbox_profile,
+            execution_substrate,
+            isolation_mode,
+            isolation_profile,
             workspace,
             tools,
             checkpoint,
@@ -418,7 +422,9 @@ impl AgentController {
             session.id,
             session.name.clone(),
             build_agent_run_execution(&session, run_id, prompt.clone()),
-            session.sandbox_profile.clone(),
+            session.execution_substrate,
+            session.isolation_mode,
+            session.isolation_profile.clone(),
             prompt,
         );
         let mut updated_session = session.clone();
@@ -446,8 +452,9 @@ impl AgentController {
         let request = WorkloadStartRequest {
             name: build_agent_run_name(&session, run.id),
             execution: run.execution.clone(),
-            runtime_class: RuntimeClass::Sandbox,
-            sandbox_profile: run.sandbox_profile.clone(),
+            execution_substrate: run.execution_substrate,
+            isolation_mode: run.isolation_mode,
+            isolation_profile: run.isolation_profile.clone(),
             gpu_device_ids: Vec::new(),
             id: Some(desired_task_id),
             slot_ids: Vec::new(),

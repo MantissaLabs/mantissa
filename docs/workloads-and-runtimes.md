@@ -76,7 +76,7 @@ The important consequence is that names describe different axes:
 | --- | --- |
 | `Task`, `ServiceReplica`, `JobAttempt`, `AgentRun` | Which schedulable workload row this is |
 | `ExecutionSpec` | How the schedulable execution should run |
-| `RuntimeClass` | Which runtime family is requested |
+| `ExecutionSubstrate` | Which runtime family is requested |
 | `RuntimeBackend` | Which local engine actually implements the request |
 
 That is why Mantissa talks about `TaskStartRequest` at the public task
@@ -187,22 +187,26 @@ By contrast, the following policy stays above the execution layer:
 This is the key reason the code now prefers `ExecutionSpec` over
 copying similar launch fields into every controller-specific type.
 
-## Runtime Classes, Substrates, and Backends
+## Execution Substrates, Isolation, and Backends
 
-Mantissa uses three related ideas that are easy to conflate: runtime class,
-runtime backend, and sandbox profile.
+Mantissa uses four related ideas that are easy to conflate: execution
+substrate, isolation mode, runtime backend, and isolation profile.
 
-A `RuntimeClass` is the cluster-visible family requested by a workload. Today
-the shared model recognizes `oci`, `microvm`, and `sandbox`.
+An `ExecutionSubstrate` is the cluster-visible family requested by a workload.
+Today the shared model recognizes `oci` and `microvm`.
+
+An `IsolationMode` is the higher-level isolation contract requested by a
+workload. Today the shared model recognizes `standard` and `sandboxed`.
 
 A `RuntimeBackend` is the local implementation that actually performs runtime
 operations. It is responsible for create, start, stop, inspect, attach, log
 streaming, exec, and event watching where supported.
 
-A sandbox profile is an isolation profile exposed to the scheduler and the
-runtime support profile. It is not the same thing as a physical substrate.
+An isolation profile is an optional named policy exposed to the scheduler and
+the runtime support profile. It is not the same thing as a physical
+substrate.
 
-### OCI, MicroVM, and Sandbox
+### OCI, MicroVM, and Sandboxed Isolation
 
 `oci` means container-style execution. The current production backend for that
 family is Docker.
@@ -211,23 +215,24 @@ family is Docker.
 support profile can express it, but there is no production MicroVM backend in
 the tree yet.
 
-`sandbox` is an isolation contract, not necessarily a separate substrate. A
-workload that requests the sandbox runtime class is asking for a backend that
-advertises sandbox support and a compatible profile. Today that support is
-advertised by the Docker backend and by the in-memory backend used for tests.
-A future MicroVM backend may also advertise sandbox profiles.
+`sandboxed` is an isolation contract, not a third substrate. A workload that
+requests `ExecutionSubstrate::Oci` with `IsolationMode::Sandboxed` is asking
+for container-backed sandboxing. A workload that requests
+`ExecutionSubstrate::MicroVm` with `IsolationMode::Sandboxed` is asking for a
+MicroVM-backed sandbox. Today only OCI-backed sandboxing is implemented.
 
 That is why "sandbox" and "MicroVM" are not synonyms. A sandbox may be
-implemented on top of OCI or on top of a MicroVM backend. The runtime class
-expresses what the workload asks for; the backend expresses how that request is
-actually fulfilled on a node.
+implemented on top of OCI or on top of a MicroVM backend. The execution
+substrate expresses where the workload runs; the isolation mode expresses how
+strongly isolated that execution should be; the backend expresses how that
+request is actually fulfilled on a node.
 
 ### Capabilities and Support Profiles
 
 Nodes advertise their runtime support with `RuntimeSupportProfile`. The profile
-contains three kinds of information: which runtime classes a node supports,
-which sandbox profiles it exposes, and which optional runtime features are
-available.
+contains four kinds of information: which execution substrates a node
+supports, which isolation modes it exposes, which named isolation profiles it
+supports, and which optional runtime features are available.
 
 Those feature flags matter because not every backend supports the same
 interaction surface. A backend may support logs but not attach, or exec but not
@@ -239,14 +244,14 @@ lifecycle events as capabilities rather than as universal assumptions.
 The runtime model is broader than the set of backends currently implemented.
 This table reflects what exists in the repository today.
 
-| Backend | Status | Advertised runtime classes | Sandbox profiles | Exec | Interactive exec | Logs | Attach | Lifecycle events | Primary code |
+| Backend | Status | Advertised execution substrates | Isolation modes | Isolation profiles | Exec | Interactive exec | Logs | Attach | Lifecycle events | Primary code |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Docker runtime backend | Production backend | `oci`, `sandbox` | `default`, `oci-default` | Yes | Yes | Yes | Yes | Yes | `src/runtime/oci/docker/` |
-| In-memory runtime backend | Test and local harness backend | `oci`, `sandbox` | `default`, `oci-default` | Yes | Yes | Yes | No | No | `src/runtime/testing/in_memory.rs` |
-| MicroVM backend | Not implemented yet | None in code today | None in code today | N/A | N/A | N/A | N/A | N/A | Not present |
+| Docker runtime backend | Production backend | `oci` | `standard`, `sandboxed` | `default`, `oci-default` | Yes | Yes | Yes | Yes | Yes | `src/runtime/oci/docker/` |
+| In-memory runtime backend | Test and local harness backend | `oci` | `standard`, `sandboxed` | `default`, `oci-default` | Yes | Yes | Yes | No | No | `src/runtime/testing/in_memory.rs` |
+| MicroVM backend | Not implemented yet | None in code today | None in code today | None in code today | N/A | N/A | N/A | N/A | N/A | Not present |
 
 The important reading of this table is that support is advertised per backend,
-not implied by the shared model. The presence of `RuntimeClass::MicroVm` in the
+not implied by the shared model. The presence of `ExecutionSubstrate::MicroVm` in the
 model means the scheduler and runtime APIs can express that family; it does not
 mean a MicroVM engine is already wired into the runtime layer.
 
@@ -398,10 +403,10 @@ attempts still reuse the shared workload execution substrate.
 session-oriented: sessions are durable control-plane records, while runs are
 the schedulable executions that consume capacity.
 
-The current default for agent sessions and runs is the sandbox runtime class,
-which matches their need for stronger isolation and explicit interaction
-policy. That default is a controller choice, not a special case in the shared
-workload manager.
+The current default for agent sessions and runs is `oci` plus
+`sandboxed` isolation, which matches their need for stronger isolation and
+explicit interaction policy. That default is a controller choice, not a
+special case in the shared workload manager.
 
 ### `src/runtime`
 
@@ -430,15 +435,17 @@ useful:
 | The durable finite-work controller record | Job |
 | The durable agent record that can wait for input | Agent session |
 | The schedulable execution created from an agent session | Agent run |
-| The family requested by the workload (`oci`, `microvm`, `sandbox`) | Runtime class |
+| The family requested by the workload (`oci` or `microvm`) | Execution substrate |
+| The requested isolation contract (`standard` or `sandboxed`) | Isolation mode |
 | The local engine implementation | Runtime backend |
-| A higher-level isolation request that may be implemented by OCI or MicroVM backends | Sandbox |
+| An optional named isolation policy such as `oci-default` | Isolation profile |
+| A higher-level isolation request that may be implemented by OCI or MicroVM backends | Sandboxed isolation |
 
 The model becomes much easier to reason about once those terms are kept on
 their own axes. A service replica can be task-shaped in execution terms
-without being a direct task. An agent run can use a sandbox runtime class
+without being a direct task. An agent run can use sandboxed isolation
 without the sandbox itself being the agent. A future MicroVM backend can
-support the sandbox contract without changing the job or service controller
+support sandboxed isolation without changing the job or service controller
 logic.
 
 That separation is the main organizing principle of the current workload and

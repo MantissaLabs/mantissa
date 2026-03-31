@@ -11,7 +11,7 @@ use crate::runtime::types::{
     RuntimeError, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeLogFrame,
     RuntimeLogsOptions, RuntimeResult, RuntimeStateInfo, RuntimeSupportProfile,
 };
-use crate::workload::model::RuntimeClass;
+use crate::workload::model::ExecutionSubstrate;
 
 /// Returns whether tests requested the shared in-memory runtime backend through one env override.
 pub fn use_in_memory_runtime_backend_from_env() -> bool {
@@ -311,10 +311,15 @@ impl RuntimeBackend for InMemoryRuntimeBackend {
         }
     }
 
-    /// Advertises that the shared in-memory backend can host both OCI and sandbox workloads.
+    /// Advertises that the shared in-memory backend can host OCI workloads in standard or
+    /// sandboxed isolation modes.
     fn advertised_support(&self) -> RuntimeSupportProfile {
         RuntimeSupportProfile::new(
-            [RuntimeClass::Oci, RuntimeClass::Sandbox],
+            [ExecutionSubstrate::Oci],
+            [
+                crate::workload::model::IsolationMode::Standard,
+                crate::workload::model::IsolationMode::Sandboxed,
+            ],
             ["default", "oci-default"],
             self.capabilities().feature_flags(),
         )

@@ -5,7 +5,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::workload::manager::WorkloadStartRequest;
-use crate::workload::model::{RuntimeClass, WorkloadServiceMetadata};
+use crate::workload::model::{ExecutionSubstrate, IsolationMode, WorkloadServiceMetadata};
 use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
 pub use crate::workload::types::{
     WorkloadLivenessProbe as ServiceLivenessProbe,
@@ -421,8 +421,9 @@ impl TaskTemplateSpecValue {
         WorkloadStartRequest {
             name: format_replica_name(service_name, &self.name, replica, desired_id),
             execution: self.resolved_execution(),
-            runtime_class: RuntimeClass::Oci,
-            sandbox_profile: None,
+            execution_substrate: ExecutionSubstrate::Oci,
+            isolation_mode: IsolationMode::Standard,
+            isolation_profile: None,
             gpu_device_ids: Vec::new(),
             id: Some(desired_id),
             slot_ids: Vec::new(),

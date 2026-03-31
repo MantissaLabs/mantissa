@@ -15,7 +15,9 @@ pub struct AgentSubmitOptions<'a> {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
     pub gpu_count: u32,
-    pub sandbox_profile: Option<&'a str>,
+    pub execution_substrate: &'a str,
+    pub isolation_mode: &'a str,
+    pub isolation_profile: Option<&'a str>,
     pub volumes: &'a [String],
     pub workspace_mount: Option<&'a str>,
     pub workspace_working_directory: Option<&'a str>,
@@ -52,7 +54,9 @@ pub async fn submit(cfg: &ClientConfig, options: &AgentSubmitOptions<'_>) -> Res
         builder.set_cpu_millis(options.cpu_millis);
         builder.set_memory_bytes(options.memory_bytes);
         builder.set_gpu_count(options.gpu_count);
-        builder.set_sandbox_profile(options.sandbox_profile.unwrap_or_default());
+        builder.set_execution_substrate(options.execution_substrate);
+        builder.set_isolation_mode(options.isolation_mode);
+        builder.set_isolation_profile(options.isolation_profile.unwrap_or_default());
         builder.set_pending_input(options.initial_input.unwrap_or_default());
 
         let mut command = builder
@@ -110,18 +114,20 @@ pub async fn submit(cfg: &ClientConfig, options: &AgentSubmitOptions<'_>) -> Res
     let mut tw = tabwriter::TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "SESSION ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tGPU\tSANDBOX"
+        "SESSION ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tGPU\tSUBSTRATE\tMODE\tPROFILE"
     )?;
     writeln!(
         &mut tw,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         session_id,
         options.name,
         options.image,
         options.cpu_millis,
         options.memory_bytes / (1024 * 1024),
         options.gpu_count,
-        options.sandbox_profile.unwrap_or("default"),
+        options.execution_substrate,
+        options.isolation_mode,
+        options.isolation_profile.unwrap_or("default"),
     )?;
     tw.flush()?;
 

@@ -13,9 +13,9 @@ use crate::secrets::registry::SecretRegistry;
 use crate::store::workload_store::WorkloadStore;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
-    RuntimeClass, WorkloadAgentRunMetadata, WorkloadEvent, WorkloadJobMetadata, WorkloadPhase,
-    WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter, WorkloadStatus, WorkloadValue,
-    should_replace_workload_event,
+    ExecutionSubstrate, IsolationMode, WorkloadAgentRunMetadata, WorkloadEvent,
+    WorkloadJobMetadata, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter,
+    WorkloadStatus, WorkloadValue, should_replace_workload_event,
 };
 pub(crate) use crate::workload::model::{
     merge_definition_into_value, merge_status_into_value, spec_to_status, spec_to_value,
@@ -320,10 +320,12 @@ pub struct WorkloadStartRequest {
     pub name: String,
     /// Shared execution/runtime template describing how the workload should run.
     pub execution: ResolvedExecutionSpec,
-    /// Runtime family requested by the caller.
-    pub runtime_class: RuntimeClass,
-    /// Optional sandbox/isolation profile interpreted by the chosen runtime class.
-    pub sandbox_profile: Option<String>,
+    /// Execution substrate requested by the caller.
+    pub execution_substrate: ExecutionSubstrate,
+    /// Isolation contract requested by the caller.
+    pub isolation_mode: IsolationMode,
+    /// Optional named isolation profile interpreted by the chosen substrate/mode pair.
+    pub isolation_profile: Option<String>,
     /// Optional concrete GPU device identifiers requested by the caller.
     pub gpu_device_ids: Vec<String>,
     /// Optional caller-selected durable workload id.
@@ -593,8 +595,9 @@ impl WorkloadManager {
                 volumes: Vec::new(),
                 networks: Vec::new(),
             },
-            runtime_class: RuntimeClass::Oci,
-            sandbox_profile: None,
+            execution_substrate: ExecutionSubstrate::Oci,
+            isolation_mode: IsolationMode::Standard,
+            isolation_profile: None,
             gpu_device_ids: Vec::new(),
             id: None,
             slot_ids: Vec::new(),

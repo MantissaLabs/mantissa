@@ -2382,18 +2382,31 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 wireguard,
                 scheduling: Box::new(scheduling),
                 runtime_support: Box::new(RuntimeSupportProfile::new(
-                    node.get_runtime_classes()?
+                    node.get_execution_substrates()?
                         .iter()
                         .filter_map(|value| {
                             value
                                 .ok()
                                 .and_then(|value| value.to_str().ok())
                                 .and_then(|value| {
-                                    value.parse::<crate::workload::model::RuntimeClass>().ok()
+                                    value
+                                        .parse::<crate::workload::model::ExecutionSubstrate>()
+                                        .ok()
                                 })
                         })
                         .collect::<Vec<_>>(),
-                    node.get_sandbox_profiles()?
+                    node.get_isolation_modes()?
+                        .iter()
+                        .filter_map(|value| {
+                            value
+                                .ok()
+                                .and_then(|value| value.to_str().ok())
+                                .and_then(|value| {
+                                    value.parse::<crate::workload::model::IsolationMode>().ok()
+                                })
+                        })
+                        .collect::<Vec<_>>(),
+                    node.get_isolation_profiles()?
                         .iter()
                         .filter_map(|value| {
                             value

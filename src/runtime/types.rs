@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender};
 
-use crate::workload::model::RuntimeClass;
+use crate::workload::model::{ExecutionSubstrate, IsolationMode};
 
 /// Errors returned by runtime backends.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -179,8 +179,9 @@ impl Default for RuntimeExecOptions {
 pub struct RuntimeCreateRequest {
     pub name: String,
     pub image: String,
-    pub runtime_class: RuntimeClass,
-    pub sandbox_profile: Option<String>,
+    pub execution_substrate: ExecutionSubstrate,
+    pub isolation_mode: IsolationMode,
+    pub isolation_profile: Option<String>,
     pub labels: Option<HashMap<String, String>>,
     pub command: Option<Vec<String>>,
     pub tty: bool,
@@ -345,10 +346,12 @@ impl RuntimeCapabilities {
 /// Cluster-visible runtime support metadata advertised by one node.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct RuntimeSupportProfile {
-    #[serde(default = "default_runtime_classes")]
-    pub runtime_classes: Vec<RuntimeClass>,
+    #[serde(default = "default_execution_substrates")]
+    pub execution_substrates: Vec<ExecutionSubstrate>,
+    #[serde(default = "default_isolation_modes")]
+    pub isolation_modes: Vec<IsolationMode>,
     #[serde(default)]
-    pub sandbox_profiles: Vec<String>,
+    pub isolation_profiles: Vec<String>,
     #[serde(default)]
     pub feature_flags: Vec<String>,
 }
@@ -357,7 +360,8 @@ impl Default for RuntimeSupportProfile {
     /// Builds the current task-era default node profile for legacy or test rows.
     fn default() -> Self {
         Self::new(
-            [RuntimeClass::Oci],
+            [ExecutionSubstrate::Oci],
+            [IsolationMode::Standard],
             Vec::<String>::new(),
             RuntimeCapabilities {
                 exec: true,
@@ -373,29 +377,43 @@ impl Default for RuntimeSupportProfile {
 
 impl RuntimeSupportProfile {
     /// Normalizes one runtime support profile into a deterministic, deduplicated form.
-    pub fn new<I, J, K>(runtime_classes: I, sandbox_profiles: J, feature_flags: K) -> Self
+    pub fn new<I, J, K, L>(
+        execution_substrates: I,
+        isolation_modes: J,
+        isolation_profiles: K,
+        feature_flags: L,
+    ) -> Self
     where
-        I: IntoIterator<Item = RuntimeClass>,
-        J: IntoIterator,
-        J::Item: Into<String>,
+        I: IntoIterator<Item = ExecutionSubstrate>,
+        J: IntoIterator<Item = IsolationMode>,
         K: IntoIterator,
         K::Item: Into<String>,
+        L: IntoIterator,
+        L::Item: Into<String>,
     {
-        let mut runtime_classes: Vec<RuntimeClass> = runtime_classes.into_iter().collect();
-        runtime_classes.sort_unstable();
-        runtime_classes.dedup();
-        if runtime_classes.is_empty() {
-            runtime_classes.push(RuntimeClass::Oci);
+        let mut execution_substrates: Vec<ExecutionSubstrate> =
+            execution_substrates.into_iter().collect();
+        execution_substrates.sort_unstable();
+        execution_substrates.dedup();
+        if execution_substrates.is_empty() {
+            execution_substrates.push(ExecutionSubstrate::Oci);
         }
 
-        let mut sandbox_profiles: Vec<String> = sandbox_profiles
+        let mut isolation_modes: Vec<IsolationMode> = isolation_modes.into_iter().collect();
+        isolation_modes.sort_unstable();
+        isolation_modes.dedup();
+        if isolation_modes.is_empty() {
+            isolation_modes.push(IsolationMode::Standard);
+        }
+
+        let mut isolation_profiles: Vec<String> = isolation_profiles
             .into_iter()
             .map(Into::into)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .collect();
-        sandbox_profiles.sort_unstable();
-        sandbox_profiles.dedup();
+        isolation_profiles.sort_unstable();
+        isolation_profiles.dedup();
 
         let mut feature_flags: Vec<String> = feature_flags
             .into_iter()
@@ -407,8 +425,9 @@ impl RuntimeSupportProfile {
         feature_flags.dedup();
 
         Self {
-            runtime_classes,
-            sandbox_profiles,
+            execution_substrates,
+            isolation_modes,
+            isolation_profiles,
             feature_flags,
         }
     }
@@ -416,28 +435,34 @@ impl RuntimeSupportProfile {
     /// Builds the default profile for one OCI runtime backend from its feature flags.
     pub fn from_oci_capabilities(capabilities: RuntimeCapabilities) -> Self {
         Self::new(
-            [RuntimeClass::Oci],
+            [ExecutionSubstrate::Oci],
+            [IsolationMode::Standard],
             Vec::<String>::new(),
             capabilities.feature_flags(),
         )
     }
 
     /// Returns true when this node advertises support for the requested runtime family.
-    pub fn supports_runtime_class(&self, runtime_class: RuntimeClass) -> bool {
-        self.runtime_classes.contains(&runtime_class)
+    pub fn supports_execution_substrate(&self, execution_substrate: ExecutionSubstrate) -> bool {
+        self.execution_substrates.contains(&execution_substrate)
     }
 
-    /// Returns true when this node advertises the requested sandbox profile, if any.
-    pub fn supports_sandbox_profile(&self, sandbox_profile: Option<&str>) -> bool {
-        let Some(sandbox_profile) = sandbox_profile
+    /// Returns true when this node advertises the requested isolation mode.
+    pub fn supports_isolation_mode(&self, isolation_mode: IsolationMode) -> bool {
+        self.isolation_modes.contains(&isolation_mode)
+    }
+
+    /// Returns true when this node advertises the requested isolation profile, if any.
+    pub fn supports_isolation_profile(&self, isolation_profile: Option<&str>) -> bool {
+        let Some(isolation_profile) = isolation_profile
             .map(str::trim)
             .filter(|value| !value.is_empty())
         else {
             return true;
         };
-        self.sandbox_profiles
+        self.isolation_profiles
             .iter()
-            .any(|value| value == sandbox_profile)
+            .any(|value| value == isolation_profile)
     }
 
     /// Returns true when this node advertises every required runtime feature flag.
@@ -450,33 +475,39 @@ impl RuntimeSupportProfile {
     /// Returns true when this profile satisfies the requested runtime requirements.
     pub fn supports_requirements(
         &self,
-        runtime_class: RuntimeClass,
-        sandbox_profile: Option<&str>,
+        execution_substrate: ExecutionSubstrate,
+        isolation_mode: IsolationMode,
+        isolation_profile: Option<&str>,
         feature_flags: &[String],
     ) -> bool {
-        self.supports_runtime_class(runtime_class)
-            && self.supports_sandbox_profile(sandbox_profile)
+        self.supports_execution_substrate(execution_substrate)
+            && self.supports_isolation_mode(isolation_mode)
+            && self.supports_isolation_profile(isolation_profile)
             && self.supports_feature_flags(feature_flags)
     }
 
     /// Selects the more complete runtime profile between two concurrent peer rows.
     pub fn preferred(left: Option<&Self>, right: Option<&Self>) -> Option<Self> {
-        fn precedence_key(
-            value: &RuntimeSupportProfile,
-        ) -> (
+        type PrecedenceKey<'a> = (
             usize,
             usize,
             usize,
-            &Vec<RuntimeClass>,
-            &Vec<String>,
-            &Vec<String>,
-        ) {
+            usize,
+            &'a Vec<ExecutionSubstrate>,
+            &'a Vec<IsolationMode>,
+            &'a Vec<String>,
+            &'a Vec<String>,
+        );
+
+        fn precedence_key(value: &RuntimeSupportProfile) -> PrecedenceKey<'_> {
             (
-                value.runtime_classes.len(),
-                value.sandbox_profiles.len(),
+                value.execution_substrates.len(),
+                value.isolation_modes.len(),
+                value.isolation_profiles.len(),
                 value.feature_flags.len(),
-                &value.runtime_classes,
-                &value.sandbox_profiles,
+                &value.execution_substrates,
+                &value.isolation_modes,
+                &value.isolation_profiles,
                 &value.feature_flags,
             )
         }
@@ -496,8 +527,12 @@ impl RuntimeSupportProfile {
     }
 }
 
-fn default_runtime_classes() -> Vec<RuntimeClass> {
-    vec![RuntimeClass::Oci]
+fn default_execution_substrates() -> Vec<ExecutionSubstrate> {
+    vec![ExecutionSubstrate::Oci]
+}
+
+fn default_isolation_modes() -> Vec<IsolationMode> {
+    vec![IsolationMode::Standard]
 }
 
 /// Runtime lifecycle events used by task reconciliation.

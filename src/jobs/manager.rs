@@ -4,7 +4,9 @@ use crate::jobs::types::{JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
 use crate::registry::Registry;
 use crate::workload::manager::workload_start_error_is_retryable;
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
-use crate::workload::model::{RuntimeClass, WorkloadJobMetadata, WorkloadPhase, WorkloadSpec};
+use crate::workload::model::{
+    ExecutionSubstrate, IsolationMode, WorkloadJobMetadata, WorkloadPhase, WorkloadSpec,
+};
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::Utc;
@@ -325,8 +327,9 @@ impl JobController {
         let request = WorkloadStartRequest {
             name: format!("{}-attempt-{}", latest.name, latest.attempts_started),
             execution: latest.execution.clone(),
-            runtime_class: RuntimeClass::Oci,
-            sandbox_profile: None,
+            execution_substrate: ExecutionSubstrate::Oci,
+            isolation_mode: IsolationMode::Standard,
+            isolation_profile: None,
             gpu_device_ids: Vec::new(),
             id: Some(task_id),
             slot_ids: Vec::new(),

@@ -7,8 +7,8 @@ use crate::runtime::types::{
     ResourceLimits, RestartPolicyConfig, RestartPolicyType, RuntimeCreateRequest,
 };
 use crate::workload::model::{
-    RuntimeClass, WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile,
-    WorkloadVolumeMount as TaskVolumeMount,
+    ExecutionSubstrate, IsolationMode, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
+    WorkloadSecretFile, WorkloadVolumeMount as TaskVolumeMount,
 };
 use crate::workload::types::{WorkloadRestartPolicy, WorkloadRestartPolicyKind};
 
@@ -24,8 +24,9 @@ pub(super) struct InstanceLaunchRequest<'a> {
     pub task_name: &'a str,
     pub instance_name: &'a str,
     pub image: &'a str,
-    pub runtime_class: RuntimeClass,
-    pub sandbox_profile: Option<&'a str>,
+    pub execution_substrate: ExecutionSubstrate,
+    pub isolation_mode: IsolationMode,
+    pub isolation_profile: Option<&'a str>,
     pub command: &'a [String],
     pub tty: bool,
     pub cpu_millis: u64,
@@ -127,24 +128,29 @@ impl WorkloadManager {
                 request.task_id.to_string(),
             ),
             (
-                "mantissa.runtime_class".to_string(),
-                request.runtime_class.as_str().to_string(),
+                "mantissa.execution_substrate".to_string(),
+                request.execution_substrate.as_str().to_string(),
+            ),
+            (
+                "mantissa.isolation_mode".to_string(),
+                request.isolation_mode.as_str().to_string(),
             ),
         ]);
         if let Some(profile) = request
-            .sandbox_profile
+            .isolation_profile
             .filter(|value| !value.trim().is_empty())
         {
             labels.insert(
-                "mantissa.sandbox_profile".to_string(),
+                "mantissa.isolation_profile".to_string(),
                 profile.trim().to_string(),
             );
         }
         let create_request = RuntimeCreateRequest {
             name: request.instance_name.to_string(),
             image: request.image.to_string(),
-            runtime_class: request.runtime_class,
-            sandbox_profile: request.sandbox_profile.map(str::to_string),
+            execution_substrate: request.execution_substrate,
+            isolation_mode: request.isolation_mode,
+            isolation_profile: request.isolation_profile.map(str::to_string),
             labels: Some(labels),
             command: if request.command.is_empty() {
                 None
