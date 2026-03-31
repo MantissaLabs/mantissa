@@ -177,7 +177,7 @@ impl WorkloadManager {
                     spec.id,
                     &instance_id,
                     &spec.networks,
-                    spec.service_metadata.as_ref(),
+                    spec.service_owner(),
                 )
                 .await
             {
@@ -245,7 +245,7 @@ impl WorkloadManager {
                     value.id,
                     &instance_id,
                     &value.networks,
-                    value.service_metadata.as_ref(),
+                    value.service_owner(),
                 )
                 .await
             {

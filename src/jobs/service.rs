@@ -132,25 +132,25 @@ pub fn write_job_spec(
     builder.set_max_retries(value.retry_policy.max_retries);
     builder.set_retry_backoff_secs(value.retry_policy.backoff_secs);
     builder.set_attempts_started(value.attempts_started);
-    builder.set_active_task_id(
+    builder.set_active_workload_id(
         value
-            .active_task_id
+            .active_workload_id
             .as_ref()
             .map(Uuid::as_bytes)
             .map(|bytes| bytes.as_slice())
             .unwrap_or(&[]),
     );
-    builder.set_last_task_id(
+    builder.set_last_workload_id(
         value
-            .last_task_id
+            .last_workload_id
             .as_ref()
             .map(Uuid::as_bytes)
             .map(|bytes| bytes.as_slice())
             .unwrap_or(&[]),
     );
-    builder.set_successful_task_id(
+    builder.set_successful_workload_id(
         value
-            .successful_task_id
+            .successful_workload_id
             .as_ref()
             .map(Uuid::as_bytes)
             .map(|bytes| bytes.as_slice())
@@ -231,9 +231,9 @@ pub fn read_job_spec(reader: job_spec::Reader<'_>) -> Result<JobSpecValue, Error
         (!detail.is_empty()).then_some(detail)
     };
     value.attempts_started = reader.get_attempts_started();
-    value.active_task_id = read_optional_uuid(reader.get_active_task_id()?);
-    value.last_task_id = read_optional_uuid(reader.get_last_task_id()?);
-    value.successful_task_id = read_optional_uuid(reader.get_successful_task_id()?);
+    value.active_workload_id = read_optional_uuid(reader.get_active_workload_id()?);
+    value.last_workload_id = read_optional_uuid(reader.get_last_workload_id()?);
+    value.successful_workload_id = read_optional_uuid(reader.get_successful_workload_id()?);
     value.retry_not_before = {
         let raw = reader.get_retry_not_before()?.to_str()?.trim().to_string();
         (!raw.is_empty()).then_some(raw)

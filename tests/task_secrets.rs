@@ -435,9 +435,7 @@ local_test!(workload_manager_stages_secret_env_and_files, {
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        service_metadata: None,
-        job_metadata: None,
-        agent_run_metadata: None,
+        owner: None,
         target_node: None,
     };
 
@@ -578,9 +576,7 @@ local_test!(workload_manager_rejects_missing_secret_reference, {
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        service_metadata: None,
-        job_metadata: None,
-        agent_run_metadata: None,
+        owner: None,
         target_node: None,
     };
 

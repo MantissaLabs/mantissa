@@ -723,15 +723,18 @@ impl ProcessNode {
 
         let mut out = Vec::with_capacity(tasks.len() as usize);
         for task in tasks.iter() {
-            let service_name = match task.get_service_metadata() {
-                Ok(meta) => Some(
+            let service_name = match task.get_owner()?.which()? {
+                protocol::workload::workload_owner::Which::ServiceReplica(Ok(meta)) => Some(
                     meta.get_service_name()
-                        .context("read task service metadata name")?
+                        .context("read workload service owner name")?
                         .to_str()
-                        .context("decode task service metadata name")?
+                        .context("decode workload service owner name")?
                         .to_string(),
                 ),
-                Err(_) => None,
+                protocol::workload::workload_owner::Which::ServiceReplica(Err(err)) => {
+                    return Err(anyhow::Error::new(err).context("read workload service owner"));
+                }
+                _ => None,
             };
 
             out.push(TaskSnapshot {

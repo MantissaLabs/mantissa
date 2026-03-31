@@ -1901,7 +1901,7 @@ impl TaskInventory {
 
         for spec in specs {
             let task_id = spec.id;
-            if let Some(meta) = spec.service_metadata.as_ref() {
+            if let Some(meta) = spec.service_owner() {
                 by_service
                     .entry(meta.service_name.clone())
                     .or_default()
@@ -2479,7 +2479,7 @@ mod tests {
         LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
         VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
     };
-    use crate::workload::model::{ExecutionSubstrate, WorkloadServiceMetadata};
+    use crate::workload::model::{ExecutionSubstrate, WorkloadOwner, WorkloadServiceMetadata};
     use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2596,9 +2596,7 @@ mod tests {
             gpu_device_ids: Vec::new(),
             id: Some(Uuid::new_v4()),
             slot_ids: Vec::new(),
-            service_metadata: None,
-            job_metadata: None,
-            agent_run_metadata: None,
+            owner: None,
             target_node,
         }
     }
@@ -2614,9 +2612,7 @@ mod tests {
             gpu_device_ids: Vec::new(),
             id: Some(Uuid::new_v4()),
             slot_ids: Vec::new(),
-            service_metadata: None,
-            job_metadata: None,
-            agent_run_metadata: None,
+            owner: None,
             target_node,
         }
     }
@@ -2660,9 +2656,10 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
-            service_metadata: Some(WorkloadServiceMetadata::new(service_name, template)),
-            job_metadata: None,
-            agent_run_metadata: None,
+            owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+                service_name,
+                template,
+            ))),
             lease_id: None,
             lease_coordinator_node_id: None,
             task_epoch: 0,

@@ -5,7 +5,9 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::workload::manager::WorkloadStartRequest;
-use crate::workload::model::{ExecutionSubstrate, IsolationMode, WorkloadServiceMetadata};
+use crate::workload::model::{
+    ExecutionSubstrate, IsolationMode, WorkloadOwner, WorkloadServiceMetadata,
+};
 use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
 pub use crate::workload::types::{
     WorkloadLivenessProbe as ServiceLivenessProbe,
@@ -409,8 +411,8 @@ impl TaskTemplateSpecValue {
     /// Builds one workload start request for a specific service replica.
     ///
     /// The resulting workload is still launched through the shared workload manager, but the
-    /// attached service metadata marks it as `WorkloadKind::ServiceReplica` rather than a
-    /// standalone direct task.
+    /// attached owner marks it as `WorkloadKind::ServiceReplica` rather than a standalone direct
+    /// task.
     pub fn replica_start_request(
         &self,
         service_name: &str,
@@ -427,9 +429,10 @@ impl TaskTemplateSpecValue {
             gpu_device_ids: Vec::new(),
             id: Some(desired_id),
             slot_ids: Vec::new(),
-            service_metadata: Some(WorkloadServiceMetadata::new(service_name, &self.name)),
-            job_metadata: None,
-            agent_run_metadata: None,
+            owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+                service_name,
+                &self.name,
+            ))),
             target_node,
         }
     }

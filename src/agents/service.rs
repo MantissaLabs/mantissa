@@ -258,9 +258,9 @@ pub fn write_agent_run_spec(
     builder.set_phase_version(value.phase_version);
     builder.set_status(agent_run_status_to_proto(value.status));
     builder.set_status_detail(value.status_detail.as_deref().unwrap_or(""));
-    match value.task_id {
-        Some(task_id) => builder.set_task_id(task_id.as_bytes()),
-        None => builder.set_task_id(&[]),
+    match value.workload_id {
+        Some(workload_id) => builder.set_workload_id(workload_id.as_bytes()),
+        None => builder.set_workload_id(&[]),
     }
     builder.set_prompt(value.prompt.as_deref().unwrap_or(""));
     builder.set_has_exit_code(value.exit_code.is_some());
@@ -289,7 +289,7 @@ pub fn read_agent_run_spec(reader: agent_run_spec::Reader<'_>) -> Result<AgentRu
     value.phase_version = reader.get_phase_version();
     value.status = proto_to_agent_run_status(reader.get_status()?);
     value.status_detail = normalize_text(reader.get_status_detail()?);
-    value.task_id = read_optional_uuid(reader.get_task_id()?);
+    value.workload_id = read_optional_uuid(reader.get_workload_id()?);
     value.prompt = normalize_text(reader.get_prompt()?);
     value.exit_code = reader.get_has_exit_code().then_some(reader.get_exit_code());
     value.started_at = normalize_text(reader.get_started_at()?);

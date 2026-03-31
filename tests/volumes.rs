@@ -410,9 +410,7 @@ fn standalone_volume_task_request(
         gpu_device_ids: Vec::new(),
         id: None,
         slot_ids: Vec::new(),
-        service_metadata: None,
-        job_metadata: None,
-        agent_run_metadata: None,
+        owner: None,
         target_node: None,
     }
 }
@@ -896,9 +894,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
             gpu_device_ids: Vec::new(),
             id: None,
             slot_ids: Vec::new(),
-            service_metadata: None,
-            job_metadata: None,
-            agent_run_metadata: None,
+            owner: None,
             target_node: None,
         }])
         .await

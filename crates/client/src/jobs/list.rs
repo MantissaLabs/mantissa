@@ -30,7 +30,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tIMAGE\tSTATUS\tATTEMPTS\tACTIVE TASK\tUPDATED"
+        "ID\tNAME\tIMAGE\tSTATUS\tATTEMPTS\tACTIVE WORKLOAD\tUPDATED"
     )?;
     for row in rows {
         writeln!(
@@ -41,7 +41,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             row.image,
             row.status,
             row.attempts_started,
-            row.active_task_id.unwrap_or_else(|| "-".to_string()),
+            row.active_workload_id.unwrap_or_else(|| "-".to_string()),
             row.updated_at,
         )?;
     }
@@ -57,7 +57,7 @@ struct JobRow {
     image: String,
     status: &'static str,
     attempts_started: u32,
-    active_task_id: Option<String>,
+    active_workload_id: Option<String>,
     updated_at: String,
 }
 
@@ -76,8 +76,8 @@ impl JobRow {
                 ProtoJobStatus::Failed => "failed",
             },
             attempts_started: reader.get_attempts_started(),
-            active_task_id: {
-                let data = reader.get_active_task_id()?;
+            active_workload_id: {
+                let data = reader.get_active_workload_id()?;
                 (!data.is_empty())
                     .then(|| uuid_to_string(data))
                     .transpose()?

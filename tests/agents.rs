@@ -30,14 +30,14 @@ local_test!(
         .await
         .expect("submit agent session");
 
-        let (run_id, task_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+        let (run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
 
         let task = node
             .node
             .workload_manager
-            .inspect_workload(task_id)
+            .inspect_workload(workload_id)
             .await
-            .expect("inspect agent task");
+            .expect("inspect agent workload");
         assert_eq!(task.execution_substrate, ExecutionSubstrate::Oci);
         assert_eq!(task.isolation_mode, IsolationMode::Sandboxed);
         assert_eq!(task.isolation_profile.as_deref(), Some("oci-default"));
@@ -47,9 +47,12 @@ local_test!(
         exited_task.updated_at = Utc::now().to_rfc3339();
         node.node
             .workloads
-            .upsert(&UuidKey::from(task_id), task_spec_to_value(&exited_task))
+            .upsert(
+                &UuidKey::from(workload_id),
+                task_spec_to_value(&exited_task),
+            )
             .await
-            .expect("persist successful agent task state");
+            .expect("persist successful agent workload state");
 
         assert!(
             wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
@@ -67,7 +70,7 @@ local_test!(
                     }) && runs.iter().any(|run| {
                         run.id == run_id
                             && run.status == ProtoAgentRunStatus::Succeeded
-                            && run.task_id == Some(task_id)
+                            && run.workload_id == Some(workload_id)
                             && run.exit_code == Some(0)
                     })
                 }
@@ -109,9 +112,9 @@ local_test!(agents_submit_input_reuses_session_and_starts_new_run, {
         .await
         .expect("submit first input");
 
-    let (first_run_id, first_task_id) =
+    let (first_run_id, first_workload_id) =
         wait_for_active_run(&node.node.agents_client, session_id).await;
-    mark_task_exited(&node, first_task_id, 0).await;
+    mark_workload_exited(&node, first_workload_id, 0).await;
 
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
@@ -137,10 +140,10 @@ local_test!(agents_submit_input_reuses_session_and_starts_new_run, {
         .await
         .expect("submit second input");
 
-    let (second_run_id, second_task_id) =
+    let (second_run_id, second_workload_id) =
         wait_for_active_run(&node.node.agents_client, session_id).await;
     assert_ne!(second_run_id, first_run_id);
-    assert_ne!(second_task_id, first_task_id);
+    assert_ne!(second_workload_id, first_workload_id);
 });
 
 #[derive(Clone, Copy)]
@@ -155,7 +158,7 @@ struct AgentSessionSnapshot {
 struct AgentRunSnapshot {
     id: Uuid,
     status: ProtoAgentRunStatus,
-    task_id: Option<Uuid>,
+    workload_id: Option<Uuid>,
     exit_code: Option<i32>,
 }
 
@@ -261,14 +264,14 @@ async fn list_runs(
         snapshots.push(AgentRunSnapshot {
             id: read_uuid(reader.get_id()?)?,
             status: reader.get_status()?,
-            task_id: read_optional_uuid(reader.get_task_id()?),
+            workload_id: read_optional_uuid(reader.get_workload_id()?),
             exit_code: reader.get_has_exit_code().then_some(reader.get_exit_code()),
         });
     }
     Ok(snapshots)
 }
 
-/// Waits until the selected session exposes one active run with a bound workload task.
+/// Waits until the selected session exposes one active run with a bound workload.
 async fn wait_for_active_run(client: &agents::Client, session_id: Uuid) -> (Uuid, Uuid) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -281,12 +284,12 @@ async fn wait_for_active_run(client: &agents::Client, session_id: Uuid) -> (Uuid
             .into_iter()
             .find(|session| session.id == session_id)
             && let Some(run_id) = session.active_run_id
-            && let Some(task_id) = runs
+            && let Some(workload_id) = runs
                 .into_iter()
                 .find(|run| run.id == run_id)
-                .and_then(|run| run.task_id)
+                .and_then(|run| run.workload_id)
         {
-            return (run_id, task_id);
+            return (run_id, workload_id);
         }
 
         assert!(
@@ -297,21 +300,21 @@ async fn wait_for_active_run(client: &agents::Client, session_id: Uuid) -> (Uuid
     }
 }
 
-/// Marks one persisted task as exited so the agent controller can observe completion.
-async fn mark_task_exited(node: &TestNode, task_id: Uuid, exit_code: i32) {
+/// Marks one persisted workload as exited so the agent controller can observe completion.
+async fn mark_workload_exited(node: &TestNode, workload_id: Uuid, exit_code: i32) {
     let mut task = node
         .node
         .workload_manager
-        .inspect_workload(task_id)
+        .inspect_workload(workload_id)
         .await
-        .expect("inspect agent task");
+        .expect("inspect agent workload");
     task.state = WorkloadPhase::Exited(exit_code);
     task.updated_at = Utc::now().to_rfc3339();
     node.node
         .workloads
-        .upsert(&UuidKey::from(task_id), task_spec_to_value(&task))
+        .upsert(&UuidKey::from(workload_id), task_spec_to_value(&task))
         .await
-        .expect("persist exited agent task state");
+        .expect("persist exited agent workload state");
 }
 
 /// Rebuilds one workload-store value from the current task spec so tests can inject state transitions.
@@ -346,9 +349,7 @@ fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
         secret_files: spec.secret_files.clone(),
         volumes: spec.volumes.clone(),
         networks: spec.networks.clone(),
-        service_metadata: spec.service_metadata.clone(),
-        job_metadata: spec.job_metadata.clone(),
-        agent_run_metadata: spec.agent_run_metadata.clone(),
+        owner: spec.owner.clone(),
         lease_id: spec.lease_id,
         lease_coordinator_node_id: spec.lease_coordinator_node_id,
         task_epoch: spec.task_epoch,

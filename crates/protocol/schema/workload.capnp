@@ -79,6 +79,22 @@ struct AgentRunMetadata {
   # UUID of the owning agent run record.
 }
 
+struct WorkloadOwner {
+  union {
+    none @0 :Void;
+    # Standalone workload with no higher-level controller owner.
+
+    serviceReplica @1 :ServiceMetadata;
+    # Service-owned workload replica.
+
+    jobAttempt @2 :JobMetadata;
+    # Job-owned workload attempt.
+
+    agentRun @3 :AgentRunMetadata;
+    # Agent-owned workload launched for one durable run.
+  }
+}
+
 struct LivenessProbe {
   kind @0 :LivenessProbeKind;
   # Local liveness probe transport kind.
@@ -184,8 +200,8 @@ struct WorkloadSpec {
   networks @14 :List(Data);
   # Required network UUIDs (16 bytes each).
 
-  serviceMetadata @15 :ServiceMetadata;
-  # Optional service ownership metadata.
+  owner @15 :WorkloadOwner;
+  # Exclusive controller owner for this workload row.
 
   updatedAt @16 :Text;
   # RFC3339 timestamp when the workload was last updated.
@@ -244,11 +260,6 @@ struct WorkloadSpec {
   isolationProfile @34 :Text;
   # Optional named isolation profile used when the workload requests sandboxed execution.
 
-  jobMetadata @35 :JobMetadata;
-  # Optional job-attempt ownership metadata.
-
-  agentRunMetadata @36 :AgentRunMetadata;
-  # Optional agent-run ownership metadata.
 }
 
 struct WorkloadStatus {
@@ -276,8 +287,8 @@ struct WorkloadStatus {
   nodeName @7 :Text;
   # Human-readable name of the hosting node.
 
-  serviceMetadata @8 :ServiceMetadata;
-  # Optional service ownership metadata.
+  owner @8 :WorkloadOwner;
+  # Exclusive controller owner for this workload row.
 
   phaseReason @9 :Text;
   # Optional current lifecycle phase reason.
@@ -306,11 +317,6 @@ struct WorkloadStatus {
   isolationProfile @17 :Text;
   # Optional named isolation profile used when the workload requests sandboxed execution.
 
-  jobMetadata @18 :JobMetadata;
-  # Optional job-attempt ownership metadata.
-
-  agentRunMetadata @19 :AgentRunMetadata;
-  # Optional agent-run ownership metadata.
 }
 
 struct WorkloadEvent {

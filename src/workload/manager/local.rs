@@ -6,7 +6,7 @@ use chrono::Utc;
 use tracing::warn;
 
 use crate::gpu::gpu_runtime_status;
-use crate::workload::model::{WorkloadEvent, WorkloadPhase, WorkloadSpec};
+use crate::workload::model::{WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadSpec};
 
 use super::ReconcileTaskGuard;
 use super::WorkloadManager;
@@ -141,9 +141,7 @@ impl WorkloadManager {
                 secret_files: plan.secret_files.clone(),
                 volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),
-                service_metadata: plan.service_metadata.clone(),
-                job_metadata: plan.job_metadata.clone(),
-                agent_run_metadata: plan.agent_run_metadata.clone(),
+                owner: plan.owner.clone(),
                 lease_id: None,
                 lease_coordinator_node_id: None,
                 task_epoch,
@@ -265,7 +263,9 @@ impl WorkloadManager {
                 &plan.name,
                 &instance_id,
                 &plan.networks,
-                plan.service_metadata.as_ref(),
+                plan.owner
+                    .as_ref()
+                    .and_then(WorkloadOwner::as_service_replica),
             )
             .await?;
 
@@ -335,9 +335,7 @@ impl WorkloadManager {
                 secret_files: plan.secret_files.clone(),
                 volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),
-                service_metadata: plan.service_metadata.clone(),
-                job_metadata: plan.job_metadata.clone(),
-                agent_run_metadata: plan.agent_run_metadata.clone(),
+                owner: plan.owner.clone(),
                 lease_id: None,
                 lease_coordinator_node_id: None,
                 task_epoch,

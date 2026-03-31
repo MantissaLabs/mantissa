@@ -998,7 +998,7 @@ impl Topology {
 
         let standalone: Vec<Uuid> = active_tasks
             .iter()
-            .filter(|task| task.service_metadata.is_none())
+            .filter(|task| task.service_owner().is_none())
             .map(|task| task.id)
             .collect();
         if !standalone.is_empty() {
@@ -1019,7 +1019,7 @@ impl Topology {
 
         let mut affected_services = HashSet::new();
         for task in &active_tasks {
-            let Some(meta) = task.service_metadata.as_ref() else {
+            let Some(meta) = task.service_owner() else {
                 continue;
             };
             let Some(spec) = service_by_name.get(&meta.service_name) else {
@@ -1101,7 +1101,7 @@ impl Topology {
         service_by_name: &HashMap<String, crate::services::types::ServiceSpecValue>,
     ) -> Option<String> {
         for task in service_tasks {
-            let Some(meta) = task.service_metadata.as_ref() else {
+            let Some(meta) = task.service_owner() else {
                 continue;
             };
             let Some(spec) = service_by_name.get(&meta.service_name) else {
@@ -1225,11 +1225,11 @@ impl Topology {
         let local_volume_blockers = self.local_volume_drain_blockers(node_id, &active_tasks)?;
         let blocking_standalone_tasks = active_tasks
             .iter()
-            .filter(|task| task.service_metadata.is_none())
+            .filter(|task| task.service_owner().is_none())
             .count() as u32;
         let service_tasks: Vec<WorkloadValue> = active_tasks
             .iter()
-            .filter(|task| task.service_metadata.is_some())
+            .filter(|task| task.service_owner().is_some())
             .cloned()
             .collect();
         let remaining_service_tasks = service_tasks.len() as u32;

@@ -5,7 +5,8 @@ use crate::registry::Registry;
 use crate::workload::manager::workload_start_error_is_retryable;
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
 use crate::workload::model::{
-    ExecutionSubstrate, IsolationMode, WorkloadJobMetadata, WorkloadPhase, WorkloadSpec,
+    ExecutionSubstrate, IsolationMode, WorkloadJobMetadata, WorkloadOwner, WorkloadPhase,
+    WorkloadSpec,
 };
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
@@ -248,27 +249,27 @@ impl JobController {
         }
     }
 
-    /// Reconciles one pending job by reserving or launching the next task attempt.
+    /// Reconciles one pending job by reserving or launching the next workload attempt.
     async fn reconcile_pending_job(&self, spec: JobSpecValue) -> Result<()> {
-        let Some(task_id) = spec.active_task_id else {
+        let Some(workload_id) = spec.active_workload_id else {
             let mut reserved = match self.registry.get(spec.id)? {
                 Some(current) => current,
                 None => return Ok(()),
             };
-            if reserved.is_terminal() || reserved.active_task_id.is_some() {
+            if reserved.is_terminal() || reserved.active_workload_id.is_some() {
                 return Ok(());
             }
-            let task_id = Uuid::new_v4();
-            reserved.reserve_attempt(task_id);
+            let workload_id = Uuid::new_v4();
+            reserved.reserve_attempt(workload_id);
             self.apply_upsert(reserved.clone()).await?;
             self.broadcast(JobEvent::Upsert(Box::new(reserved.clone())))
                 .await?;
-            return self.launch_reserved_attempt(reserved, task_id).await;
+            return self.launch_reserved_attempt(reserved, workload_id).await;
         };
 
-        match self.workload_manager.inspect_workload(task_id).await {
+        match self.workload_manager.inspect_workload(workload_id).await {
             Ok(task) => self.adopt_observed_task(spec, task).await,
-            Err(_) => self.launch_reserved_attempt(spec, task_id).await,
+            Err(_) => self.launch_reserved_attempt(spec, workload_id).await,
         }
     }
 
@@ -286,41 +287,43 @@ impl JobController {
             return Ok(());
         }
 
-        let task_id = Uuid::new_v4();
-        latest.reserve_attempt(task_id);
+        let workload_id = Uuid::new_v4();
+        latest.reserve_attempt(workload_id);
         self.apply_upsert(latest.clone()).await?;
         self.broadcast(JobEvent::Upsert(Box::new(latest.clone())))
             .await?;
-        self.launch_reserved_attempt(latest, task_id).await
+        self.launch_reserved_attempt(latest, workload_id).await
     }
 
-    /// Reconciles one running job by observing the current terminal or active task state.
+    /// Reconciles one running job by observing the current terminal or active workload state.
     async fn reconcile_running_job(&self, spec: JobSpecValue) -> Result<()> {
-        let Some(task_id) = spec.active_task_id else {
+        let Some(workload_id) = spec.active_workload_id else {
             return self
                 .fail_or_retry_missing_task(spec, "running job lost its active task id")
                 .await;
         };
 
-        match self.workload_manager.inspect_workload(task_id).await {
+        match self.workload_manager.inspect_workload(workload_id).await {
             Ok(task) => self.adopt_observed_task(spec, task).await,
             Err(_) => {
                 self.fail_or_retry_missing_task(
                     spec,
-                    format!("active task {task_id} is missing from the replicated workload store"),
+                    format!(
+                        "active workload {workload_id} is missing from the replicated workload store"
+                    ),
                 )
                 .await
             }
         }
     }
 
-    /// Launches one previously reserved task attempt using the shared workload manager.
-    async fn launch_reserved_attempt(&self, spec: JobSpecValue, task_id: Uuid) -> Result<()> {
+    /// Launches one previously reserved workload attempt using the shared workload manager.
+    async fn launch_reserved_attempt(&self, spec: JobSpecValue, workload_id: Uuid) -> Result<()> {
         let latest = match self.registry.get(spec.id)? {
             Some(current) => current,
             None => return Ok(()),
         };
-        if latest.is_terminal() || latest.active_task_id != Some(task_id) {
+        if latest.is_terminal() || latest.active_workload_id != Some(workload_id) {
             return Ok(());
         }
 
@@ -331,11 +334,12 @@ impl JobController {
             isolation_mode: IsolationMode::Standard,
             isolation_profile: None,
             gpu_device_ids: Vec::new(),
-            id: Some(task_id),
+            id: Some(workload_id),
             slot_ids: Vec::new(),
-            service_metadata: None,
-            job_metadata: Some(WorkloadJobMetadata::new(latest.id, latest.name.clone())),
-            agent_run_metadata: None,
+            owner: Some(WorkloadOwner::JobAttempt(WorkloadJobMetadata::new(
+                latest.id,
+                latest.name.clone(),
+            ))),
             target_node: None,
         };
 
@@ -347,12 +351,12 @@ impl JobController {
             Ok(mut specs) => {
                 let task = specs
                     .pop()
-                    .ok_or_else(|| anyhow!("job launch returned no task spec"))?;
+                    .ok_or_else(|| anyhow!("job launch returned no workload spec"))?;
                 let mut current = match self.registry.get(spec.id)? {
                     Some(current) => current,
                     None => return Ok(()),
                 };
-                if current.is_terminal() || current.active_task_id != Some(task_id) {
+                if current.is_terminal() || current.active_workload_id != Some(workload_id) {
                     return Ok(());
                 }
                 current.mark_running(
@@ -368,7 +372,7 @@ impl JobController {
                     Some(current) => current,
                     None => return Ok(()),
                 };
-                if current.is_terminal() || current.active_task_id != Some(task_id) {
+                if current.is_terminal() || current.active_workload_id != Some(workload_id) {
                     return Ok(());
                 }
                 let detail = format!(
@@ -378,7 +382,7 @@ impl JobController {
                 if current.can_retry() && workload_start_error_is_retryable(&error) {
                     current.mark_retrying(Some(detail), Utc::now());
                 } else {
-                    current.mark_failed(Some(task_id), Some(detail));
+                    current.mark_failed(Some(workload_id), Some(detail));
                 }
                 self.apply_upsert(current.clone()).await?;
                 self.broadcast(JobEvent::Upsert(Box::new(current))).await?;
@@ -448,17 +452,17 @@ impl JobController {
         Ok(())
     }
 
-    /// Applies failure or retry semantics after one task terminated unsuccessfully.
+    /// Applies failure or retry semantics after one workload attempt terminated unsuccessfully.
     async fn fail_or_retry_task(
         &self,
         mut spec: JobSpecValue,
-        task_id: Option<Uuid>,
+        workload_id: Option<Uuid>,
         detail: String,
     ) -> Result<()> {
         if spec.can_retry() {
             spec.mark_retrying(Some(detail), Utc::now());
         } else {
-            spec.mark_failed(task_id, Some(detail));
+            spec.mark_failed(workload_id, Some(detail));
         }
         self.apply_upsert(spec.clone()).await?;
         self.broadcast(JobEvent::Upsert(Box::new(spec))).await?;
@@ -610,7 +614,7 @@ mod tests {
 
         let selected = select_best_job_spec(&[stale, latest.clone()]).expect("selected latest job");
         assert_eq!(selected.attempts_started, latest.attempts_started);
-        assert_eq!(selected.active_task_id, latest.active_task_id);
+        assert_eq!(selected.active_workload_id, latest.active_workload_id);
     }
 
     /// Ensures owner selection stays deterministic regardless of candidate ordering.

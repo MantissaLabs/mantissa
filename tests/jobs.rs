@@ -20,24 +20,27 @@ local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
         .await
         .expect("submit job");
 
-    let active_task_id =
-        wait_for_active_task(&node.node.jobs_client, job_id, Duration::from_secs(5))
+    let active_workload_id =
+        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
             .await
-            .expect("job should launch one task");
+            .expect("job should launch one workload");
 
     let mut task = node
         .node
         .workload_manager
-        .inspect_workload(active_task_id)
+        .inspect_workload(active_workload_id)
         .await
-        .expect("inspect job task");
+        .expect("inspect job workload");
     task.state = WorkloadPhase::Exited(0);
     task.updated_at = Utc::now().to_rfc3339();
     node.node
         .workloads
-        .upsert(&UuidKey::from(active_task_id), task_spec_to_value(&task))
+        .upsert(
+            &UuidKey::from(active_workload_id),
+            task_spec_to_value(&task),
+        )
         .await
-        .expect("persist successful task state");
+        .expect("persist successful workload state");
 
     assert!(
         wait_for_job_status(
@@ -59,24 +62,24 @@ local_test!(jobs_retry_after_failed_task, {
         .await
         .expect("submit retrying job");
 
-    let first_task_id =
-        wait_for_active_task(&node.node.jobs_client, job_id, Duration::from_secs(5))
+    let first_workload_id =
+        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
             .await
-            .expect("job should launch first task");
+            .expect("job should launch first workload");
 
     let mut task = node
         .node
         .workload_manager
-        .inspect_workload(first_task_id)
+        .inspect_workload(first_workload_id)
         .await
-        .expect("inspect first job task");
+        .expect("inspect first job workload");
     task.state = WorkloadPhase::Exited(1);
     task.updated_at = Utc::now().to_rfc3339();
     node.node
         .workloads
-        .upsert(&UuidKey::from(first_task_id), task_spec_to_value(&task))
+        .upsert(&UuidKey::from(first_workload_id), task_spec_to_value(&task))
         .await
-        .expect("persist failed task state");
+        .expect("persist failed workload state");
 
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
@@ -88,13 +91,13 @@ local_test!(jobs_retry_after_failed_task, {
                         && job.status == ProtoJobStatus::Running
                         && job.attempts_started >= 2
                         && job
-                            .active_task_id
-                            .is_some_and(|task_id| task_id != first_task_id)
+                            .active_workload_id
+                            .is_some_and(|workload_id| workload_id != first_workload_id)
                 })
             }
         })
         .await,
-        "job should launch a second attempt after the first task exits unsuccessfully"
+        "job should launch a second attempt after the first workload exits unsuccessfully"
     );
 
     let tasks = node
@@ -104,8 +107,8 @@ local_test!(jobs_retry_after_failed_task, {
         .await
         .expect("list tasks");
     assert!(
-        tasks.iter().any(|task| task.id == first_task_id),
-        "first failed task should remain visible in the replicated workload store"
+        tasks.iter().any(|task| task.id == first_workload_id),
+        "first failed workload should remain visible in the replicated workload store"
     );
 });
 
@@ -114,7 +117,7 @@ struct JobSnapshot {
     id: Uuid,
     status: ProtoJobStatus,
     attempts_started: u32,
-    active_task_id: Option<Uuid>,
+    active_workload_id: Option<Uuid>,
 }
 
 /// Submits one first-class job through the jobs capability and returns the generated id.
@@ -155,14 +158,14 @@ async fn list_jobs(client: &jobs::Client) -> Result<Vec<JobSnapshot>, capnp::Err
             id: read_uuid(reader.get_id()?)?,
             status: reader.get_status()?,
             attempts_started: reader.get_attempts_started(),
-            active_task_id: read_optional_uuid(reader.get_active_task_id()?),
+            active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
         });
     }
     Ok(snapshots)
 }
 
-/// Waits until the selected job exposes one active task identifier.
-async fn wait_for_active_task(
+/// Waits until the selected job exposes one active workload identifier.
+async fn wait_for_active_workload(
     client: &jobs::Client,
     job_id: Uuid,
     timeout: Duration,
@@ -170,12 +173,12 @@ async fn wait_for_active_task(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let jobs = list_jobs(client).await.expect("list jobs");
-        if let Some(task_id) = jobs
+        if let Some(workload_id) = jobs
             .into_iter()
             .find(|job| job.id == job_id)
-            .and_then(|job| job.active_task_id)
+            .and_then(|job| job.active_workload_id)
         {
-            return Some(task_id);
+            return Some(workload_id);
         }
         if tokio::time::Instant::now() >= deadline {
             return None;
@@ -234,9 +237,7 @@ fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
         secret_files: spec.secret_files.clone(),
         volumes: spec.volumes.clone(),
         networks: spec.networks.clone(),
-        service_metadata: spec.service_metadata.clone(),
-        job_metadata: spec.job_metadata.clone(),
-        agent_run_metadata: spec.agent_run_metadata.clone(),
+        owner: spec.owner.clone(),
         lease_id: spec.lease_id,
         lease_coordinator_node_id: spec.lease_coordinator_node_id,
         task_epoch: spec.task_epoch,

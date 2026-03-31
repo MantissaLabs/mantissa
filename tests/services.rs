@@ -41,8 +41,8 @@ use mantissa::services::types::{
     TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind, TaskTemplateSpecValue,
 };
 use mantissa::task::types::{
-    TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskServiceMetadata,
-    TaskStateFilter, TaskValue, TaskVolumeMount,
+    TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskStateFilter, TaskValue,
+    TaskVolumeMount,
 };
 use mantissa::topology_capnp::topology;
 use mantissa::workload::manager::WorkloadManager;
@@ -3837,8 +3837,7 @@ local_test!(
             let replacement_visible = tasks.iter().any(|task| {
                 task.id != old_task_id
                     && task
-                        .service_metadata
-                        .as_ref()
+                        .service_owner()
                         .map(|meta| meta.service_name == service_name)
                         .unwrap_or(false)
             });
@@ -4917,8 +4916,7 @@ async fn list_active_service_tasks(
         .expect("list active tasks during service placement checks")
         .into_iter()
         .filter(|task| {
-            task.service_metadata
-                .as_ref()
+            task.service_owner()
                 .map(|meta| meta.service_name == service_name)
                 .unwrap_or(false)
         })
@@ -4935,8 +4933,7 @@ async fn list_active_task_template_tasks(
         .await
         .into_iter()
         .filter(|task| {
-            task.service_metadata
-                .as_ref()
+            task.service_owner()
                 .map(|meta| meta.template == template_name)
                 .unwrap_or(false)
         })
@@ -5589,15 +5586,7 @@ fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
         secret_files: spec.secret_files.clone(),
         volumes: Vec::new(),
         networks: spec.networks.clone(),
-        service_metadata: spec
-            .service_metadata
-            .as_ref()
-            .map(|meta| TaskServiceMetadata {
-                service_name: meta.service_name.clone(),
-                template: meta.template.clone(),
-            }),
-        job_metadata: spec.job_metadata.clone(),
-        agent_run_metadata: spec.agent_run_metadata.clone(),
+        owner: spec.owner.clone(),
         lease_id: spec.lease_id,
         lease_coordinator_node_id: spec.lease_coordinator_node_id,
         task_epoch: spec.task_epoch,

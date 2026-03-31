@@ -42,7 +42,7 @@ pub async fn list_runs(cfg: &ClientConfig, session_id: Option<Uuid>) -> Result<(
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "RUN ID\tSESSION\tSTATUS\tTASK\tEXIT\tSUBSTRATE\tMODE\tPROFILE\tUPDATED"
+        "RUN ID\tSESSION\tSTATUS\tWORKLOAD\tEXIT\tSUBSTRATE\tMODE\tPROFILE\tUPDATED"
     )?;
     for row in rows {
         writeln!(
@@ -51,7 +51,7 @@ pub async fn list_runs(cfg: &ClientConfig, session_id: Option<Uuid>) -> Result<(
             row.id,
             row.session_name,
             row.status,
-            row.task_id.unwrap_or_else(|| "-".to_string()),
+            row.workload_id.unwrap_or_else(|| "-".to_string()),
             row.exit_code
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
@@ -72,7 +72,7 @@ struct AgentRunRow {
     id: String,
     session_name: String,
     status: &'static str,
-    task_id: Option<String>,
+    workload_id: Option<String>,
     exit_code: Option<i32>,
     execution_substrate: String,
     isolation_mode: String,
@@ -93,8 +93,8 @@ impl AgentRunRow {
                 ProtoAgentRunStatus::Failed => "failed",
                 ProtoAgentRunStatus::Cancelled => "cancelled",
             },
-            task_id: {
-                let data = reader.get_task_id()?;
+            workload_id: {
+                let data = reader.get_workload_id()?;
                 (!data.is_empty()).then(|| uuid_short(data)).transpose()?
             },
             exit_code: reader.get_has_exit_code().then_some(reader.get_exit_code()),

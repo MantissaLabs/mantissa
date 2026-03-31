@@ -68,14 +68,14 @@ struct JobSpec {
   attemptsStarted @18 :UInt32;
   # Number of controller-issued workload attempts so far.
 
-  activeTaskId @19 :Data;
-  # Currently active workload task identifier, empty when idle.
+  activeWorkloadId @19 :Data;
+  # Currently active workload identifier, empty when idle.
 
-  lastTaskId @20 :Data;
-  # Last workload task identifier issued for this job.
+  lastWorkloadId @20 :Data;
+  # Last workload identifier issued for this job.
 
-  successfulTaskId @21 :Data;
-  # Workload task identifier that completed successfully, empty until success.
+  successfulWorkloadId @21 :Data;
+  # Workload identifier that completed successfully, empty until success.
 
   retryNotBefore @22 :Text;
   # Retry deadline as RFC3339 text, empty when no retry is pending.
@@ -83,7 +83,7 @@ struct JobSpec {
 
 enum JobStatus {
   pending @0;
-  # Job is queued or reserving its next task attempt.
+  # Job is queued or reserving its next workload attempt.
 
   running @1;
   # Job currently has one active workload attempt.

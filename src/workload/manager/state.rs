@@ -2051,7 +2051,7 @@ impl WorkloadManager {
                 &working.name,
                 &instance_id,
                 &working.networks,
-                working.service_metadata.as_ref(),
+                working.service_owner(),
             )
             .await
         {
@@ -2150,7 +2150,7 @@ impl WorkloadManager {
                     spec.id,
                     instance_id,
                     &spec.networks,
-                    spec.service_metadata.as_ref(),
+                    spec.service_owner(),
                 )
                 .await
             {
@@ -2641,7 +2641,7 @@ impl WorkloadManager {
                         task_id,
                         &instance_id,
                         &value.networks,
-                        value.service_metadata.as_ref(),
+                        value.service_owner(),
                     )
                     .await
             {

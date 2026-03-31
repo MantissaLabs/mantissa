@@ -516,9 +516,7 @@ impl WorkloadManager {
                                         secret_files: plan.secret_files.clone(),
                                         volumes: plan.volumes.clone(),
                                         networks: plan.networks.clone(),
-                                        service_metadata: plan.service_metadata.clone(),
-                                        job_metadata: plan.job_metadata.clone(),
-                                        agent_run_metadata: plan.agent_run_metadata.clone(),
+                                        owner: plan.owner.clone(),
                                     });
                                 }
 
@@ -831,9 +829,7 @@ impl WorkloadManager {
                 secret_files: plan.secret_files.clone(),
                 volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),
-                service_metadata: plan.service_metadata.clone(),
-                job_metadata: plan.job_metadata.clone(),
-                agent_run_metadata: plan.agent_run_metadata.clone(),
+                owner: plan.owner.clone(),
                 lease_id: Some(plan.lease_id),
                 lease_coordinator_node_id: Some(plan.lease_coordinator_node_id),
                 task_epoch,

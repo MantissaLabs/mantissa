@@ -758,7 +758,7 @@ async fn resolve_service_backends(
         if let Some(service) = attachment.service_name.as_deref() {
             template_match |= service.eq_ignore_ascii_case(service_name);
         }
-        if let Some(meta) = task.service_metadata.as_ref() {
+        if let Some(meta) = task.service_owner() {
             template_match |= meta.template.eq_ignore_ascii_case(service_name);
         }
         template_match |= task.name.eq_ignore_ascii_case(service_name);
@@ -1963,7 +1963,7 @@ mod tests {
     use crate::store::service_store::open_service_store;
     use crate::store::workload_store::{WorkloadStore, open_workload_store};
     use crate::workload::model::{
-        WorkloadPhase, WorkloadServiceMetadata, WorkloadValue, WorkloadValueDraft,
+        WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadValue, WorkloadValueDraft,
     };
     use crate::workload::types::ExecutionSpec;
     use crdt_store::uuid_key::UuidKey;
@@ -2155,9 +2155,10 @@ mod tests {
             env: Vec::new(),
             secret_files: Vec::new(),
             volumes: Vec::new(),
-            service_metadata: Some(WorkloadServiceMetadata::new(service_name, "backend")),
-            job_metadata: None,
-            agent_run_metadata: None,
+            owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+                service_name,
+                "backend",
+            ))),
             lease_id: None,
             lease_coordinator_node_id: None,
             task_epoch: 0,

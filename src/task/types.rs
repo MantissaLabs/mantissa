@@ -96,10 +96,7 @@ pub struct TaskSpec {
 impl TaskSpec {
     /// Projects one shared workload row into the public standalone-task view.
     pub fn try_from_workload_spec(spec: &WorkloadSpec) -> Result<Self, TaskProjectionError> {
-        if spec.service_metadata.is_some()
-            || spec.job_metadata.is_some()
-            || spec.agent_run_metadata.is_some()
-        {
+        if spec.owner.is_some() {
             return Err(TaskProjectionError::NotStandalone {
                 workload_id: spec.id,
                 workload_name: spec.name.clone(),

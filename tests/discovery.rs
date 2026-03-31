@@ -21,7 +21,7 @@ use mantissa::store::network_store::{
 use mantissa::store::service_store::open_service_store;
 use mantissa::store::workload_store::open_workload_store;
 use mantissa::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
-use mantissa::workload::model::WorkloadPhase;
+use mantissa::workload::model::{WorkloadOwner, WorkloadPhase};
 use mantissa::workload::types::ExecutionSpec;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -157,9 +157,10 @@ fn running_task(task_id: Uuid, node_id: Uuid, service_name: &str, network_id: Uu
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
-        service_metadata: Some(TaskServiceMetadata::new(service_name, "backend")),
-        job_metadata: None,
-        agent_run_metadata: None,
+        owner: Some(WorkloadOwner::ServiceReplica(TaskServiceMetadata::new(
+            service_name,
+            "backend",
+        ))),
         lease_id: None,
         lease_coordinator_node_id: None,
         task_epoch: 0,

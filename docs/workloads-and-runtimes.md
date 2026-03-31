@@ -119,6 +119,12 @@ about a different execution mechanism. A service replica may use the same
 runtime family and the same execution template as a direct task, but it is
 reconciled as part of a service rollout.
 
+At the shared workload-row level, this ownership is carried as one exclusive
+owner value. A direct task has no owner. A service replica, job attempt, or
+agent run stores exactly one owner variant, which keeps the shared workload
+model from representing impossible combinations such as "service-owned and
+job-owned at the same time".
+
 ### Job
 
 A job is a controller-level record for finite work. It owns retry and
@@ -130,6 +136,11 @@ This is why a job is not simply another name for a service. A service wants to
 keep a desired replica set alive and routable. A job wants to produce a
 terminal success or failure. Those are different control-plane problems even if
 both are implemented by creating lower-level workloads.
+
+The job record links to those workload attempts through workload-oriented
+fields such as `active_workload_id`, `last_workload_id`, and
+`successful_workload_id`. Those identifiers point to shared workload rows, not
+to a separate job-specific execution store.
 
 ### Agent Session and Agent Run
 
@@ -145,6 +156,10 @@ is the thing that actually turns into an underlying workload and then into a
 runtime instance, and it is recorded in the shared substrate as
 `WorkloadKind::AgentRun`. This split lets Mantissa keep an idle session durable
 without pinning compute, which is important for human-in-the-loop workflows.
+
+Once scheduled, an agent run records the bound shared workload row through its
+`workload_id`. The run remains the controller-owned record; the shared workload
+row remains the generic schedulable execution beneath it.
 
 ### Summary Table
 

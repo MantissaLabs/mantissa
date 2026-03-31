@@ -388,8 +388,8 @@ pub struct AgentRunSpecValue {
     #[serde(default)]
     pub status_detail: Option<String>,
     #[serde(default)]
-    /// Underlying scheduled task/workload id once the run has been placed.
-    pub task_id: Option<Uuid>,
+    /// Underlying scheduled workload id once the run has been placed.
+    pub workload_id: Option<Uuid>,
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
@@ -427,7 +427,7 @@ impl AgentRunSpecValue {
             phase_version: 0,
             status: AgentRunStatus::Pending,
             status_detail: Some("sandbox run pending".to_string()),
-            task_id: None,
+            workload_id: None,
             prompt: normalize_optional_text(prompt),
             exit_code: None,
             started_at: None,
@@ -440,21 +440,22 @@ impl AgentRunSpecValue {
         self.updated_at = current_timestamp();
     }
 
-    /// Records the underlying scheduled task identifier bound to this run after scheduling succeeds.
-    pub fn bind_task(&mut self, task_id: Uuid, detail: Option<String>) {
+    /// Records the underlying scheduled workload identifier bound to this run after scheduling
+    /// succeeds.
+    pub fn bind_workload(&mut self, workload_id: Uuid, detail: Option<String>) {
         self.phase_version = self.phase_version.saturating_add(1);
-        self.task_id = Some(task_id);
+        self.workload_id = Some(workload_id);
         self.status = AgentRunStatus::Pending;
         self.status_detail = normalize_optional_text(detail);
         self.touch();
     }
 
     /// Marks the run as actively executing inside its sandbox.
-    pub fn mark_running(&mut self, task_id: Uuid, detail: Option<String>) {
+    pub fn mark_running(&mut self, workload_id: Uuid, detail: Option<String>) {
         self.phase_version = self.phase_version.saturating_add(1);
         self.status = AgentRunStatus::Running;
         self.status_detail = normalize_optional_text(detail);
-        self.task_id = Some(task_id);
+        self.workload_id = Some(workload_id);
         if self.started_at.is_none() {
             self.started_at = Some(current_timestamp());
         }

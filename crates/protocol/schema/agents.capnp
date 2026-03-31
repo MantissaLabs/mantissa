@@ -181,8 +181,8 @@ struct AgentRunSpec {
   statusDetail @21 :Text;
   # Optional human-facing detail for the current status.
 
-  taskId @22 :Data;
-  # Bound workload task identifier, empty until scheduling succeeds.
+  workloadId @22 :Data;
+  # Bound workload identifier, empty until scheduling succeeds.
 
   prompt @23 :Text;
   # Structured user input that triggered this run, empty when none was queued.

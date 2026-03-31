@@ -25,11 +25,11 @@ pub struct JobSpecValue {
     #[serde(default)]
     pub retry_policy: JobRetryPolicy,
     #[serde(default)]
-    pub active_task_id: Option<Uuid>,
+    pub active_workload_id: Option<Uuid>,
     #[serde(default)]
-    pub last_task_id: Option<Uuid>,
+    pub last_workload_id: Option<Uuid>,
     #[serde(default)]
-    pub successful_task_id: Option<Uuid>,
+    pub successful_workload_id: Option<Uuid>,
     #[serde(default)]
     pub attempts_started: u32,
     #[serde(default)]
@@ -54,9 +54,9 @@ impl JobSpecValue {
             status_detail: None,
             completion_policy: JobCompletionPolicy::default(),
             retry_policy,
-            active_task_id: None,
-            last_task_id: None,
-            successful_task_id: None,
+            active_workload_id: None,
+            last_workload_id: None,
+            successful_workload_id: None,
             attempts_started: 0,
             retry_not_before: None,
         }
@@ -92,27 +92,27 @@ impl JobSpecValue {
     ///
     /// This keeps launch idempotent across owner changes because another node can
     /// either observe the reserved workload attempt or start the same reservation itself.
-    pub fn reserve_attempt(&mut self, task_id: Uuid) {
+    pub fn reserve_attempt(&mut self, workload_id: Uuid) {
         self.phase_version = self.phase_version.saturating_add(1);
         self.attempts_started = self.attempts_started.saturating_add(1);
         self.status = JobStatus::Pending;
         self.status_detail = Some(format!("launch attempt {} pending", self.attempts_started));
-        self.active_task_id = Some(task_id);
-        self.last_task_id = Some(task_id);
+        self.active_workload_id = Some(workload_id);
+        self.last_workload_id = Some(workload_id);
         self.retry_not_before = None;
         self.touch();
     }
 
     /// Marks one reserved or adopted task as the current running attempt.
-    pub fn mark_running(&mut self, task_id: Uuid, detail: Option<String>) {
+    pub fn mark_running(&mut self, workload_id: Uuid, detail: Option<String>) {
         self.phase_version = self.phase_version.saturating_add(1);
         self.status = JobStatus::Running;
         self.status_detail = normalize_detail(detail);
         self.retry_not_before = None;
-        self.active_task_id = Some(task_id);
-        if self.last_task_id != Some(task_id) {
+        self.active_workload_id = Some(workload_id);
+        if self.last_workload_id != Some(workload_id) {
             self.attempts_started = self.attempts_started.saturating_add(1);
-            self.last_task_id = Some(task_id);
+            self.last_workload_id = Some(workload_id);
         }
         self.touch();
     }
@@ -122,7 +122,7 @@ impl JobSpecValue {
         self.phase_version = self.phase_version.saturating_add(1);
         self.status = JobStatus::Retrying;
         self.status_detail = normalize_detail(detail);
-        self.active_task_id = None;
+        self.active_workload_id = None;
         let deadline = now + ChronoDuration::seconds(i64::from(self.retry_policy.backoff_secs));
         self.retry_not_before = Some(deadline.to_rfc3339());
         self.touch();
@@ -130,25 +130,25 @@ impl JobSpecValue {
     }
 
     /// Marks the job as completed successfully by one terminal task.
-    pub fn mark_succeeded(&mut self, task_id: Uuid, detail: Option<String>) {
+    pub fn mark_succeeded(&mut self, workload_id: Uuid, detail: Option<String>) {
         self.phase_version = self.phase_version.saturating_add(1);
         self.status = JobStatus::Succeeded;
         self.status_detail = normalize_detail(detail);
-        self.active_task_id = None;
-        self.successful_task_id = Some(task_id);
-        self.last_task_id = Some(task_id);
+        self.active_workload_id = None;
+        self.successful_workload_id = Some(workload_id);
+        self.last_workload_id = Some(workload_id);
         self.retry_not_before = None;
         self.touch();
     }
 
     /// Marks the job as terminally failed with no retries remaining.
-    pub fn mark_failed(&mut self, task_id: Option<Uuid>, detail: Option<String>) {
+    pub fn mark_failed(&mut self, workload_id: Option<Uuid>, detail: Option<String>) {
         self.phase_version = self.phase_version.saturating_add(1);
         self.status = JobStatus::Failed;
         self.status_detail = normalize_detail(detail);
-        self.active_task_id = None;
-        if let Some(task_id) = task_id {
-            self.last_task_id = Some(task_id);
+        self.active_workload_id = None;
+        if let Some(workload_id) = workload_id {
+            self.last_workload_id = Some(workload_id);
         }
         self.retry_not_before = None;
         self.touch();

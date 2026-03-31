@@ -14,9 +14,8 @@ use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
 };
 use crate::workload::model::{
-    ExecutionSubstrate, IsolationMode, WorkloadAgentRunMetadata,
-    WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadJobMetadata,
-    WorkloadSecretFile, WorkloadServiceMetadata, WorkloadVolumeMount as TaskVolumeMount,
+    ExecutionSubstrate, IsolationMode, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
+    WorkloadOwner, WorkloadSecretFile, WorkloadVolumeMount as TaskVolumeMount,
 };
 use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
 
@@ -89,9 +88,7 @@ pub(super) struct BatchStartPlan {
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
-    pub(super) service_metadata: Option<WorkloadServiceMetadata>,
-    pub(super) job_metadata: Option<WorkloadJobMetadata>,
-    pub(super) agent_run_metadata: Option<WorkloadAgentRunMetadata>,
+    pub(super) owner: Option<WorkloadOwner>,
 }
 
 impl BatchStartPlan {
@@ -128,9 +125,7 @@ pub(super) struct StartIntent {
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
-    pub(super) service_metadata: Option<WorkloadServiceMetadata>,
-    pub(super) job_metadata: Option<WorkloadJobMetadata>,
-    pub(super) agent_run_metadata: Option<WorkloadAgentRunMetadata>,
+    pub(super) owner: Option<WorkloadOwner>,
     pub(super) target_node: Option<Uuid>,
 }
 
@@ -565,9 +560,7 @@ pub(super) struct RemoteStartPlan {
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
-    pub(super) service_metadata: Option<WorkloadServiceMetadata>,
-    pub(super) job_metadata: Option<WorkloadJobMetadata>,
-    pub(super) agent_run_metadata: Option<WorkloadAgentRunMetadata>,
+    pub(super) owner: Option<WorkloadOwner>,
 }
 
 #[derive(Clone)]
@@ -597,9 +590,7 @@ pub(super) struct PreparedRemoteStartPlan {
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
-    pub(super) service_metadata: Option<WorkloadServiceMetadata>,
-    pub(super) job_metadata: Option<WorkloadJobMetadata>,
-    pub(super) agent_run_metadata: Option<WorkloadAgentRunMetadata>,
+    pub(super) owner: Option<WorkloadOwner>,
 }
 
 pub(super) struct Assignment {
@@ -670,20 +661,9 @@ impl WorkloadManager {
                 gpu_device_ids,
                 id,
                 slot_ids,
-                service_metadata,
-                job_metadata,
-                agent_run_metadata,
+                owner,
                 target_node,
             } = request;
-            let ownership_count = u8::from(service_metadata.is_some())
-                + u8::from(job_metadata.is_some())
-                + u8::from(agent_run_metadata.is_some());
-            if ownership_count > 1 {
-                return Err(anyhow!(
-                    "conflicting workload ownership metadata supplied for task {}",
-                    name
-                ));
-            }
             if !gpu_device_ids.is_empty() {
                 let mut seen = HashSet::with_capacity(gpu_device_ids.len());
                 for id in &gpu_device_ids {
@@ -744,9 +724,7 @@ impl WorkloadManager {
                 secret_files: execution.secret_files,
                 volumes: execution.volumes,
                 networks: execution.networks,
-                service_metadata,
-                job_metadata,
-                agent_run_metadata,
+                owner,
                 target_node,
             });
         }
@@ -1023,9 +1001,7 @@ impl WorkloadManager {
                 secret_files: intent.secret_files.clone(),
                 volumes: intent.volumes.clone(),
                 networks: intent.networks.clone(),
-                service_metadata: intent.service_metadata.clone(),
-                job_metadata: intent.job_metadata.clone(),
-                agent_run_metadata: intent.agent_run_metadata.clone(),
+                owner: intent.owner.clone(),
             });
         }
 
@@ -1289,9 +1265,7 @@ impl WorkloadManager {
                             secret_files: intent.secret_files.clone(),
                             volumes: intent.volumes.clone(),
                             networks: intent.networks.clone(),
-                            service_metadata: intent.service_metadata.clone(),
-                            job_metadata: intent.job_metadata.clone(),
-                            agent_run_metadata: intent.agent_run_metadata.clone(),
+                            owner: intent.owner.clone(),
                         });
                     }
                     CandidateLocation::Remote { peer_id } => {
@@ -1317,9 +1291,7 @@ impl WorkloadManager {
                             secret_files: intent.secret_files.clone(),
                             volumes: intent.volumes.clone(),
                             networks: intent.networks.clone(),
-                            service_metadata: intent.service_metadata.clone(),
-                            job_metadata: intent.job_metadata.clone(),
-                            agent_run_metadata: intent.agent_run_metadata.clone(),
+                            owner: intent.owner.clone(),
                         });
                     }
                 }
@@ -1410,9 +1382,7 @@ impl WorkloadManager {
                         secret_files: intent.secret_files.clone(),
                         volumes: intent.volumes.clone(),
                         networks: intent.networks.clone(),
-                        service_metadata: intent.service_metadata.clone(),
-                        job_metadata: intent.job_metadata.clone(),
-                        agent_run_metadata: intent.agent_run_metadata.clone(),
+                        owner: intent.owner.clone(),
                     });
                 }
                 CandidateLocation::Remote { peer_id } => {
@@ -1438,9 +1408,7 @@ impl WorkloadManager {
                         secret_files: intent.secret_files.clone(),
                         volumes: intent.volumes.clone(),
                         networks: intent.networks.clone(),
-                        service_metadata: intent.service_metadata.clone(),
-                        job_metadata: intent.job_metadata.clone(),
-                        agent_run_metadata: intent.agent_run_metadata.clone(),
+                        owner: intent.owner.clone(),
                     });
                 }
             }
@@ -1490,9 +1458,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: vec![required_network],
-            service_metadata: None,
-            job_metadata: None,
-            agent_run_metadata: None,
+            owner: None,
             target_node: None,
         };
         let digest = SchedulerDigestValue {
@@ -1562,9 +1528,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
-            service_metadata: None,
-            job_metadata: None,
-            agent_run_metadata: None,
+            owner: None,
             target_node: None,
         };
         let digest = SchedulerDigestValue {

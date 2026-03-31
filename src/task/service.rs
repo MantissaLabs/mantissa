@@ -1120,9 +1120,7 @@ fn read_task_start_request(
         gpu_device_ids,
         id,
         slot_ids,
-        service_metadata: None,
-        job_metadata: None,
-        agent_run_metadata: None,
+        owner: None,
         target_node: None,
     })
 }

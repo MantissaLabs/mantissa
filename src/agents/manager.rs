@@ -9,7 +9,7 @@ use crate::workload::manager::workload_start_error_is_retryable;
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
 use crate::workload::model::WorkloadPhase;
 use crate::workload::model::{
-    WorkloadAgentRunMetadata, WorkloadEnvironmentVariable, WorkloadVolumeMount,
+    WorkloadAgentRunMetadata, WorkloadEnvironmentVariable, WorkloadOwner, WorkloadVolumeMount,
 };
 use crate::workload::types::ResolvedExecutionSpec;
 use anyhow::{Result, anyhow};
@@ -325,19 +325,24 @@ impl AgentController {
             return Ok(());
         }
 
-        if run.task_id.is_none() {
+        if run.workload_id.is_none() {
             return self.ensure_run_started(session, run).await;
         }
 
-        let task_id = run.task_id.expect("checked task id");
-        let spec = match self.workload_manager.inspect_workload(task_id).await {
+        let workload_id = run.workload_id.expect("checked workload id");
+        let spec = match self.workload_manager.inspect_workload(workload_id).await {
             Ok(spec) => spec,
             Err(error) => {
                 let mut failed_run = run.clone();
-                failed_run.mark_failed(None, Some(format!("sandbox task lookup failed: {error}")));
+                failed_run.mark_failed(
+                    None,
+                    Some(format!("sandbox workload lookup failed: {error}")),
+                );
                 let mut failed_session = session.clone();
-                failed_session
-                    .mark_failed(run.id, Some(format!("sandbox task lookup failed: {error}")));
+                failed_session.mark_failed(
+                    run.id,
+                    Some(format!("sandbox workload lookup failed: {error}")),
+                );
                 self.persist_run_and_session(&failed_run, &failed_session)
                     .await?;
                 return Ok(());
@@ -354,11 +359,15 @@ impl AgentController {
                     || session.status != AgentSessionStatus::Running
                 {
                     let mut running_run = run.clone();
-                    running_run
-                        .mark_running(task_id, Some(format!("sandbox task {task_id} running")));
+                    running_run.mark_running(
+                        workload_id,
+                        Some(format!("sandbox workload {workload_id} running")),
+                    );
                     let mut running_session = session.clone();
-                    running_session
-                        .mark_run_running(run.id, Some(format!("sandbox task {task_id} running")));
+                    running_session.mark_run_running(
+                        run.id,
+                        Some(format!("sandbox workload {workload_id} running")),
+                    );
                     self.persist_run_and_session(&running_run, &running_session)
                         .await?;
                 }
@@ -444,11 +453,11 @@ impl AgentController {
         session: AgentSessionSpecValue,
         run: AgentRunSpecValue,
     ) -> Result<()> {
-        if run.task_id.is_some() {
+        if run.workload_id.is_some() {
             return Ok(());
         }
 
-        let desired_task_id = Uuid::new_v4();
+        let desired_workload_id = Uuid::new_v4();
         let request = WorkloadStartRequest {
             name: build_agent_run_name(&session, run.id),
             execution: run.execution.clone(),
@@ -456,15 +465,13 @@ impl AgentController {
             isolation_mode: run.isolation_mode,
             isolation_profile: run.isolation_profile.clone(),
             gpu_device_ids: Vec::new(),
-            id: Some(desired_task_id),
+            id: Some(desired_workload_id),
             slot_ids: Vec::new(),
-            service_metadata: None,
-            job_metadata: None,
-            agent_run_metadata: Some(WorkloadAgentRunMetadata::new(
+            owner: Some(WorkloadOwner::AgentRun(WorkloadAgentRunMetadata::new(
                 session.id,
                 session.name.clone(),
                 run.id,
-            )),
+            ))),
             target_node: None,
         };
 
@@ -478,7 +485,10 @@ impl AgentController {
                     .pop()
                     .ok_or_else(|| anyhow!("agent run start returned no workload spec"))?;
                 let mut bound_run = run.clone();
-                bound_run.bind_task(spec.id, Some(format!("sandbox task {} scheduled", spec.id)));
+                bound_run.bind_workload(
+                    spec.id,
+                    Some(format!("sandbox workload {} scheduled", spec.id)),
+                );
                 self.apply_run(bound_run.clone()).await?;
                 self.broadcast(AgentEvent::UpsertRun(Box::new(bound_run)))
                     .await?;

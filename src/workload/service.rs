@@ -6,8 +6,8 @@ use crate::workload::capnp_codec::{
 use crate::workload::manager::WorkloadManager;
 use crate::workload::model::{
     ExecutionSubstrate, IsolationMode, WorkloadAgentRunMetadata, WorkloadEvent,
-    WorkloadJobMetadata, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter,
-    WorkloadStateKind, WorkloadStatus,
+    WorkloadJobMetadata, WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec,
+    WorkloadStateFilter, WorkloadStateKind, WorkloadStatus,
 };
 use capnp::Error;
 use protocol::gossip::gossip_message;
@@ -123,18 +123,7 @@ pub fn write_status(mut builder: workload_status::Builder<'_>, status: &Workload
     builder.set_updated_at(&status.updated_at);
     builder.set_node_id(status.node_id.as_bytes());
     builder.set_node_name(&status.node_name);
-    write_service_metadata(
-        builder.reborrow().init_service_metadata(),
-        status.service_metadata.as_ref(),
-    );
-    write_job_metadata(
-        builder.reborrow().init_job_metadata(),
-        status.job_metadata.as_ref(),
-    );
-    write_agent_run_metadata(
-        builder.reborrow().init_agent_run_metadata(),
-        status.agent_run_metadata.as_ref(),
-    );
+    write_owner(builder.reborrow().init_owner(), status.owner.as_ref());
     builder.set_phase_reason(status.phase_reason.as_deref().unwrap_or(""));
     builder.set_phase_progress(status.phase_progress.as_deref().unwrap_or(""));
     builder.set_task_epoch(status.task_epoch);
@@ -159,21 +148,7 @@ pub fn read_status(reader: workload_status::Reader<'_>) -> Result<WorkloadStatus
         updated_at: reader.get_updated_at()?.to_str()?.to_string(),
         node_id: read_id_from_data(reader.get_node_id()?)?,
         node_name: reader.get_node_name()?.to_str()?.to_string(),
-        service_metadata: if reader.has_service_metadata() {
-            read_service_metadata(reader.get_service_metadata()?)?
-        } else {
-            None
-        },
-        job_metadata: if reader.has_job_metadata() {
-            read_job_metadata(reader.get_job_metadata()?)?
-        } else {
-            None
-        },
-        agent_run_metadata: if reader.has_agent_run_metadata() {
-            read_agent_run_metadata(reader.get_agent_run_metadata()?)?
-        } else {
-            None
-        },
+        owner: read_owner(reader.get_owner()?)?,
         task_epoch: reader.get_task_epoch(),
         phase_version: reader.get_phase_version(),
         launch_attempt: reader.get_launch_attempt(),
@@ -276,15 +251,7 @@ pub fn write_spec(mut builder: workload_spec::Builder<'_>, spec: &WorkloadSpec) 
     let mut volumes = builder.reborrow().init_volumes(spec.volumes.len() as u32);
     encode_volume_mounts(&mut volumes, &spec.volumes);
 
-    if let Some(meta) = spec.service_metadata.as_ref() {
-        write_service_metadata(builder.reborrow().init_service_metadata(), Some(meta));
-    }
-    if let Some(meta) = spec.job_metadata.as_ref() {
-        write_job_metadata(builder.reborrow().init_job_metadata(), Some(meta));
-    }
-    if let Some(meta) = spec.agent_run_metadata.as_ref() {
-        write_agent_run_metadata(builder.reborrow().init_agent_run_metadata(), Some(meta));
-    }
+    write_owner(builder.reborrow().init_owner(), spec.owner.as_ref());
 }
 
 /// Decodes one full workload row from the workload wire payload.
@@ -381,21 +348,7 @@ pub fn read_spec(reader: workload_spec::Reader<'_>) -> Result<WorkloadSpec, Erro
         secret_files: decode_secret_files(reader.get_secret_files()?)?,
         volumes: decode_volume_mounts(reader.get_volumes()?)?,
         networks,
-        service_metadata: if reader.has_service_metadata() {
-            read_service_metadata(reader.get_service_metadata()?)?
-        } else {
-            None
-        },
-        job_metadata: if reader.has_job_metadata() {
-            read_job_metadata(reader.get_job_metadata()?)?
-        } else {
-            None
-        },
-        agent_run_metadata: if reader.has_agent_run_metadata() {
-            read_agent_run_metadata(reader.get_agent_run_metadata()?)?
-        } else {
-            None
-        },
+        owner: read_owner(reader.get_owner()?)?,
         lease_id,
         lease_coordinator_node_id,
         task_epoch: reader.get_task_epoch(),
@@ -408,104 +361,148 @@ pub fn read_spec(reader: workload_spec::Reader<'_>) -> Result<WorkloadSpec, Erro
     })
 }
 
-/// Encodes optional service ownership metadata into a workload wire payload.
-fn write_service_metadata(
-    mut builder: protocol::workload::service_metadata::Builder<'_>,
-    metadata: Option<&WorkloadServiceMetadata>,
+/// Encodes one exclusive workload owner into the workload wire payload.
+fn write_owner(
+    mut builder: protocol::workload::workload_owner::Builder<'_>,
+    owner: Option<&WorkloadOwner>,
 ) {
-    if let Some(metadata) = metadata {
-        builder.set_service_name(&metadata.service_name);
-        builder.set_template_name(&metadata.template);
-        return;
+    match owner {
+        Some(WorkloadOwner::ServiceReplica(metadata)) => {
+            let service = builder.reborrow().init_service_replica();
+            write_service_metadata(service, metadata);
+        }
+        Some(WorkloadOwner::JobAttempt(metadata)) => {
+            let job = builder.reborrow().init_job_attempt();
+            write_job_metadata(job, metadata);
+        }
+        Some(WorkloadOwner::AgentRun(metadata)) => {
+            let agent_run = builder.reborrow().init_agent_run();
+            write_agent_run_metadata(agent_run, metadata);
+        }
+        None => {
+            builder.set_none(());
+        }
     }
-
-    builder.set_service_name("");
-    builder.set_template_name("");
 }
 
-/// Decodes optional service ownership metadata from a workload wire payload.
+/// Decodes one exclusive workload owner from the workload wire payload.
+fn read_owner(
+    reader: protocol::workload::workload_owner::Reader<'_>,
+) -> Result<Option<WorkloadOwner>, Error> {
+    match reader.which()? {
+        protocol::workload::workload_owner::Which::None(()) => Ok(None),
+        protocol::workload::workload_owner::Which::ServiceReplica(Ok(reader)) => Ok(Some(
+            WorkloadOwner::ServiceReplica(read_service_metadata(reader)?),
+        )),
+        protocol::workload::workload_owner::Which::ServiceReplica(Err(err)) => Err(err),
+        protocol::workload::workload_owner::Which::JobAttempt(Ok(reader)) => {
+            Ok(Some(WorkloadOwner::JobAttempt(read_job_metadata(reader)?)))
+        }
+        protocol::workload::workload_owner::Which::JobAttempt(Err(err)) => Err(err),
+        protocol::workload::workload_owner::Which::AgentRun(Ok(reader)) => Ok(Some(
+            WorkloadOwner::AgentRun(read_agent_run_metadata(reader)?),
+        )),
+        protocol::workload::workload_owner::Which::AgentRun(Err(err)) => Err(err),
+    }
+}
+
+/// Encodes service ownership metadata into a workload wire payload.
+fn write_service_metadata(
+    mut builder: protocol::workload::service_metadata::Builder<'_>,
+    metadata: &WorkloadServiceMetadata,
+) {
+    builder.set_service_name(&metadata.service_name);
+    builder.set_template_name(&metadata.template);
+}
+
+/// Decodes service ownership metadata from a workload wire payload.
 fn read_service_metadata(
     reader: protocol::workload::service_metadata::Reader<'_>,
-) -> Result<Option<WorkloadServiceMetadata>, Error> {
+) -> Result<WorkloadServiceMetadata, Error> {
     let service_name = reader.get_service_name()?.to_str()?.to_string();
     let template = reader.get_template_name()?.to_str()?.to_string();
     if service_name.is_empty() || template.is_empty() {
-        return Ok(None);
+        return Err(Error::failed(
+            "invalid workload owner: missing service replica metadata".to_string(),
+        ));
     }
 
-    Ok(Some(WorkloadServiceMetadata::new(service_name, template)))
+    Ok(WorkloadServiceMetadata::new(service_name, template))
 }
 
-/// Encodes optional job ownership metadata into a workload wire payload.
+/// Encodes job ownership metadata into a workload wire payload.
 fn write_job_metadata(
     mut builder: protocol::workload::job_metadata::Builder<'_>,
-    metadata: Option<&WorkloadJobMetadata>,
+    metadata: &WorkloadJobMetadata,
 ) {
-    if let Some(metadata) = metadata {
-        builder.set_job_id(metadata.job_id.as_bytes());
-        builder.set_job_name(&metadata.job_name);
-        return;
-    }
-
-    builder.set_job_id(&[]);
-    builder.set_job_name("");
+    builder.set_job_id(metadata.job_id.as_bytes());
+    builder.set_job_name(&metadata.job_name);
 }
 
-/// Decodes optional job ownership metadata from a workload wire payload.
+/// Decodes job ownership metadata from a workload wire payload.
 fn read_job_metadata(
     reader: protocol::workload::job_metadata::Reader<'_>,
-) -> Result<Option<WorkloadJobMetadata>, Error> {
+) -> Result<WorkloadJobMetadata, Error> {
     let job_id = match reader.get_job_id() {
         Ok(bytes) if bytes.len() == 16 => read_id_from_data(bytes)?,
-        _ => return Ok(None),
+        _ => {
+            return Err(Error::failed(
+                "invalid workload owner: missing job attempt id".to_string(),
+            ));
+        }
     };
     let job_name = reader.get_job_name()?.to_str()?.to_string();
     if job_name.is_empty() {
-        return Ok(None);
+        return Err(Error::failed(
+            "invalid workload owner: missing job attempt name".to_string(),
+        ));
     }
 
-    Ok(Some(WorkloadJobMetadata::new(job_id, job_name)))
+    Ok(WorkloadJobMetadata::new(job_id, job_name))
 }
 
-/// Encodes optional agent-run ownership metadata into a workload wire payload.
+/// Encodes agent-run ownership metadata into a workload wire payload.
 fn write_agent_run_metadata(
     mut builder: protocol::workload::agent_run_metadata::Builder<'_>,
-    metadata: Option<&WorkloadAgentRunMetadata>,
+    metadata: &WorkloadAgentRunMetadata,
 ) {
-    if let Some(metadata) = metadata {
-        builder.set_session_id(metadata.session_id.as_bytes());
-        builder.set_session_name(&metadata.session_name);
-        builder.set_run_id(metadata.run_id.as_bytes());
-        return;
-    }
-
-    builder.set_session_id(&[]);
-    builder.set_session_name("");
-    builder.set_run_id(&[]);
+    builder.set_session_id(metadata.session_id.as_bytes());
+    builder.set_session_name(&metadata.session_name);
+    builder.set_run_id(metadata.run_id.as_bytes());
 }
 
-/// Decodes optional agent-run ownership metadata from a workload wire payload.
+/// Decodes agent-run ownership metadata from a workload wire payload.
 fn read_agent_run_metadata(
     reader: protocol::workload::agent_run_metadata::Reader<'_>,
-) -> Result<Option<WorkloadAgentRunMetadata>, Error> {
+) -> Result<WorkloadAgentRunMetadata, Error> {
     let session_id = match reader.get_session_id() {
         Ok(bytes) if bytes.len() == 16 => read_id_from_data(bytes)?,
-        _ => return Ok(None),
+        _ => {
+            return Err(Error::failed(
+                "invalid workload owner: missing agent session id".to_string(),
+            ));
+        }
     };
     let session_name = reader.get_session_name()?.to_str()?.to_string();
     if session_name.is_empty() {
-        return Ok(None);
+        return Err(Error::failed(
+            "invalid workload owner: missing agent session name".to_string(),
+        ));
     }
     let run_id = match reader.get_run_id() {
         Ok(bytes) if bytes.len() == 16 => read_id_from_data(bytes)?,
-        _ => return Ok(None),
+        _ => {
+            return Err(Error::failed(
+                "invalid workload owner: missing agent run id".to_string(),
+            ));
+        }
     };
 
-    Ok(Some(WorkloadAgentRunMetadata::new(
+    Ok(WorkloadAgentRunMetadata::new(
         session_id,
         session_name,
         run_id,
-    )))
+    ))
 }
 
 /// Converts one internal workload state into its wire label.

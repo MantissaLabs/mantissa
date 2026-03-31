@@ -13,9 +13,8 @@ use crate::secrets::registry::SecretRegistry;
 use crate::store::workload_store::WorkloadStore;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
-    ExecutionSubstrate, IsolationMode, WorkloadAgentRunMetadata, WorkloadEvent,
-    WorkloadJobMetadata, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter,
-    WorkloadStatus, WorkloadValue, should_replace_workload_event,
+    ExecutionSubstrate, IsolationMode, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadSpec,
+    WorkloadStateFilter, WorkloadStatus, WorkloadValue, should_replace_workload_event,
 };
 pub(crate) use crate::workload::model::{
     merge_definition_into_value, merge_status_into_value, spec_to_status, spec_to_value,
@@ -331,12 +330,8 @@ pub struct WorkloadStartRequest {
     pub id: Option<Uuid>,
     /// Optional scheduler slots already chosen by a higher-level controller.
     pub slot_ids: Vec<SlotId>,
-    /// Optional service ownership metadata. Presence means this workload is a service replica.
-    pub service_metadata: Option<WorkloadServiceMetadata>,
-    /// Optional job ownership metadata. Presence means this workload is one job attempt.
-    pub job_metadata: Option<WorkloadJobMetadata>,
-    /// Optional agent-run ownership metadata. Presence means this workload is one agent run.
-    pub agent_run_metadata: Option<WorkloadAgentRunMetadata>,
+    /// Optional exclusive controller owner for this workload row.
+    pub owner: Option<WorkloadOwner>,
     /// Placement hint used by the scheduler when a task must land on a specific node.
     pub target_node: Option<Uuid>,
 }
@@ -485,7 +480,7 @@ impl WorkloadManager {
     /// replacements can move service replicas away without the drained node racing them.
     fn should_block_local_service_runtime(&self, spec: &WorkloadSpec) -> bool {
         spec.node_id == self.local_node_id
-            && spec.service_metadata.is_some()
+            && spec.service_owner().is_some()
             && self
                 .core
                 .registry
@@ -600,9 +595,7 @@ impl WorkloadManager {
             gpu_device_ids: Vec::new(),
             id: None,
             slot_ids: Vec::new(),
-            service_metadata: None,
-            job_metadata: None,
-            agent_run_metadata: None,
+            owner: None,
             target_node: None,
         };
 
