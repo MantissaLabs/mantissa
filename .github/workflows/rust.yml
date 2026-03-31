@@ -35,4 +35,6 @@ jobs:
       - name: Test
         env:
           MANTISSA_BPF_TOOLCHAIN: nightly
+          CARGO_BUILD_JOBS: 1
+          CARGO_INCREMENTAL: 0
         run: cargo test --workspace --lib --bins --tests --examples --features testkit
