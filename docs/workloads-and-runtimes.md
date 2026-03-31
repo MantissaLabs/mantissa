@@ -36,14 +36,15 @@ workload instance is created, started, stopped, inspected, and attached to.
 
 ```mermaid
 flowchart TB
-    subgraph Semantics["Controller semantics"]
-        Task["Task"]
-        Service["Service and service replicas"]
-        Job["Job and workload attempts"]
-        Agent["Agent session and agent runs"]
+    subgraph Semantics["Public and controller semantics"]
+        Task["Task API"]
+        Service["Service controller"]
+        Job["Job controller"]
+        Agent["Agent controller"]
     end
 
     subgraph Workloads["Shared workload substrate"]
+        TaskStart["TaskStartRequest"]
         Start["WorkloadStartRequest"]
         Exec["WorkloadExecutionSpec"]
         Manager["WorkloadManager"]
@@ -56,7 +57,8 @@ flowchart TB
         Future["Future MicroVM backend"]
     end
 
-    Task --> Start
+    Task --> TaskStart
+    TaskStart --> Start
     Service --> Start
     Job --> Start
     Agent --> Start
@@ -77,9 +79,10 @@ The important consequence is that names describe different axes:
 | `RuntimeClass` | Which runtime family is requested |
 | `RuntimeBackend` | Which local engine actually implements the request |
 
-That is why Mantissa can talk about `WorkloadStartRequest` at the shared layer
-while still exposing a first-class `tasks` user surface. The request shape is
-generic; the controller that submits it gives it meaning.
+That is why Mantissa talks about `TaskStartRequest` at the public task
+boundary but `WorkloadStartRequest` inside the shared layer. The task request
+is task-oriented; the task service converts it into the generic workload
+request that is also reused by services, jobs, and agents.
 
 ## Control-Plane Concepts
 
@@ -288,10 +291,11 @@ sequenceDiagram
 ```
 
 The public surface may still speak in controller-specific terms. For example,
-the task API creates a workload by sending a `WorkloadStartRequest`, but it
-returns a `TaskSpec` because the caller is creating a direct task. The request
-shape is generic; the resulting durable record is exposed through the task
-surface.
+the task API sends a `TaskStartRequest`, and the task service converts it into
+a `WorkloadStartRequest` before handing it to the shared workload manager. It
+still returns a `TaskSpec` because the caller is creating a direct task. The
+internal request shape is generic; the resulting durable record is exposed
+through the task surface.
 
 The service controller builds service-owned replica requests, the job
 controller reserves and observes workload attempts, and the agent controller

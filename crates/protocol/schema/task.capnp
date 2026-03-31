@@ -1,20 +1,8 @@
 @0xc040d5aebc3fbc7e;
 
-#
-# Task RPC terminology:
-# - `WorkloadStartRequest` is the shared execution/runtime launch shape reused across
-#   controllers (`task`, `service`, `job`, `agent`).
-# - This RPC still represents the standalone-task user surface, so its responses remain
-#   `TaskSpec` / `TaskStatus`.
-# - In other words: the request describes generic workload execution inputs, while the
-#   response projects the resulting workload as `WorkloadKind::Task`.
-
 interface Task {
-  start @0 (request :WorkloadStartRequest) -> (spec :TaskSpec);
-  # Start a new standalone task.
-  #
-  # The request uses the shared workload launch shape, but the response is the
-  # standalone-task projection of that workload.
+  start @0 (request :TaskStartRequest) -> (spec :TaskSpec);
+  # Start a new standalone task and return its durable task projection.
 
   list @1 (request :TaskListRequest) -> (tasks :List(TaskSpec));
   # List tasks matching the provided state filters.
@@ -22,8 +10,8 @@ interface Task {
   stop @2 (request :TaskStopRequest) -> (spec :TaskSpec);
   # Stop a task and return its final spec.
 
-  startMany @3 (requests :List(WorkloadStartRequest)) -> (specs :List(TaskSpec));
-  # Start multiple standalone tasks in a batch using the shared workload launch shape.
+  startMany @3 (requests :List(TaskStartRequest)) -> (specs :List(TaskSpec));
+  # Start multiple standalone tasks in one batch.
 
   logs @4 (request :TaskLogsRequest);
   # Stream one task's container logs into the caller-provided sink.
@@ -397,12 +385,9 @@ struct ServiceMetadata {
   # Task template name within the service.
 }
 
-struct WorkloadStartRequest {
-  # Shared execution/runtime launch shape used by the task RPC.
-  #
-  # The name keeps `Workload` because the same execution fields are reused by other
-  # controllers. When sent through the task RPC, this request means "start one
-  # standalone task", and the resulting durable object is returned as `TaskSpec`.
+struct TaskStartRequest {
+  # Standalone task launch request exposed by the task RPC.
+
   name @0 :Text;
   # Human-readable task name for the resulting standalone task.
 
@@ -455,10 +440,10 @@ struct WorkloadStartRequest {
   # Optional local liveness probe executed by the hosting runtime.
 
   runtimeClass @17 :Text;
-  # Runtime class requested for this workload.
+  # Runtime class requested for this task.
 
   sandboxProfile @18 :Text;
-  # Optional sandbox profile requested for sandbox workloads.
+  # Optional sandbox profile requested for sandboxed task execution.
 }
 
 struct LivenessProbe {

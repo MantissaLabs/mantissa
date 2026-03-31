@@ -21,7 +21,8 @@ use protocol::gossip::gossip_message;
 use protocol::task::{
     TaskLogStream as CapnpTaskLogStream, TaskStateFilter as CapnpTaskStateFilter, task,
     task_attach_options, task_attach_session, task_event, task_exec_options, task_exec_session,
-    task_list_request, task_log_sink, task_logs_options, task_spec, task_status,
+    task_list_request, task_log_sink, task_logs_options, task_spec, task_start_request,
+    task_status,
 };
 use std::rc::Rc;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
@@ -774,91 +775,7 @@ impl task::Server for TaskService {
         self.topology
             .ensure_no_active_cluster_operation("start tasks")?;
 
-        let req = params.get()?.get_request()?;
-        let name = req.get_name()?.to_str()?.to_string();
-        let image = req.get_image()?.to_str()?.to_string();
-        let mut command = Vec::new();
-        for arg in req.get_command()?.iter() {
-            command.push(arg?.to_str()?.to_string());
-        }
-        let cpu_millis = req.get_cpu_millis();
-        let memory_bytes = req.get_memory_bytes();
-        let gpu_count = req.get_gpu_count();
-        let mut gpu_device_ids = Vec::new();
-        for entry in req.get_gpu_device_ids()?.iter() {
-            gpu_device_ids.push(entry?.to_str()?.to_string());
-        }
-        let mut slot_ids = Vec::new();
-        for slot_id in req.get_slot_ids()?.iter() {
-            slot_ids.push(slot_id);
-        }
-        let restart_policy = if req.has_restart_policy() {
-            Some(decode_task_restart_policy(req.get_restart_policy()?)?)
-        } else {
-            None
-        };
-        let termination_grace_period_secs = match req.get_termination_grace_period_secs() {
-            0 => None,
-            value => Some(value),
-        };
-        let mut pre_stop_command = Vec::new();
-        for arg in req.get_pre_stop_command()?.iter() {
-            let text = arg?.to_str()?.to_string();
-            if !text.is_empty() {
-                pre_stop_command.push(text);
-            }
-        }
-        let pre_stop_command = if pre_stop_command.is_empty() {
-            None
-        } else {
-            Some(pre_stop_command)
-        };
-        let liveness = if req.has_liveness() {
-            Some(decode_task_liveness_probe(req.get_liveness()?)?)
-        } else {
-            None
-        };
-        let env = decode_env_vars(req.get_env()?)?;
-        let secret_files = decode_secret_files(req.get_secret_files()?)?;
-        let volumes = decode_volume_mounts(req.get_volumes()?)?;
-
-        let mut networks = Vec::new();
-        for entry in req.get_networks()?.iter() {
-            let data = entry?;
-            if data.len() != 16 {
-                return Err(Error::failed("invalid network id length".to_string()));
-            }
-            let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(data);
-            networks.push(Uuid::from_bytes(bytes));
-        }
-
-        let request = WorkloadStartRequest {
-            name,
-            execution: TaskExecutionSpec {
-                image,
-                command,
-                tty: false,
-                cpu_millis,
-                memory_bytes,
-                gpu_count,
-                restart_policy,
-                termination_grace_period_secs,
-                pre_stop_command,
-                liveness,
-                env,
-                secret_files,
-                volumes,
-                networks,
-            },
-            runtime_class: read_runtime_class(req.get_runtime_class()?.to_str()?),
-            sandbox_profile: read_optional_text(req.get_sandbox_profile()?),
-            gpu_device_ids,
-            id: None,
-            slot_ids,
-            service_metadata: None,
-            target_node: None,
-        };
+        let request = read_task_start_request(params.get()?.get_request()?)?;
 
         let mut specs = self
             .manager
@@ -888,105 +805,7 @@ impl task::Server for TaskService {
         let mut requests = Vec::with_capacity(list.len() as usize);
 
         for entry in list.iter() {
-            let name = entry.get_name()?.to_str()?.to_string();
-            let image = entry.get_image()?.to_str()?.to_string();
-            let cpu_millis = entry.get_cpu_millis();
-            let memory_bytes = entry.get_memory_bytes();
-            let gpu_count = entry.get_gpu_count();
-            let mut gpu_device_ids = Vec::new();
-            for device_id in entry.get_gpu_device_ids()?.iter() {
-                gpu_device_ids.push(device_id?.to_str()?.to_string());
-            }
-            let slots_reader = entry.get_slot_ids()?;
-            let mut slot_ids = Vec::with_capacity(slots_reader.len() as usize);
-            for slot_id in slots_reader.iter() {
-                slot_ids.push(slot_id);
-            }
-
-            let task_id = {
-                let bytes = entry.get_task_id()?;
-                if bytes.len() == 16 {
-                    let mut arr = [0u8; 16];
-                    arr.copy_from_slice(bytes);
-                    Some(Uuid::from_bytes(arr))
-                } else {
-                    None
-                }
-            };
-
-            let mut command = Vec::new();
-            for arg in entry.get_command()?.iter() {
-                command.push(arg?.to_str()?.to_string());
-            }
-
-            let env = decode_env_vars(entry.get_env()?)?;
-            let secret_files = decode_secret_files(entry.get_secret_files()?)?;
-            let volumes = decode_volume_mounts(entry.get_volumes()?)?;
-
-            let mut networks = Vec::new();
-            for net in entry.get_networks()?.iter() {
-                let data = net?;
-                if data.len() != 16 {
-                    return Err(Error::failed("invalid network id length".to_string()));
-                }
-                let mut bytes = [0u8; 16];
-                bytes.copy_from_slice(data);
-                networks.push(Uuid::from_bytes(bytes));
-            }
-
-            let restart_policy = if entry.has_restart_policy() {
-                Some(decode_task_restart_policy(entry.get_restart_policy()?)?)
-            } else {
-                None
-            };
-            let termination_grace_period_secs = match entry.get_termination_grace_period_secs() {
-                0 => None,
-                value => Some(value),
-            };
-            let mut pre_stop_command = Vec::new();
-            for arg in entry.get_pre_stop_command()?.iter() {
-                let text = arg?.to_str()?.to_string();
-                if !text.is_empty() {
-                    pre_stop_command.push(text);
-                }
-            }
-            let pre_stop_command = if pre_stop_command.is_empty() {
-                None
-            } else {
-                Some(pre_stop_command)
-            };
-            let liveness = if entry.has_liveness() {
-                Some(decode_task_liveness_probe(entry.get_liveness()?)?)
-            } else {
-                None
-            };
-
-            requests.push(WorkloadStartRequest {
-                name,
-                execution: TaskExecutionSpec {
-                    image,
-                    command,
-                    tty: false,
-                    cpu_millis,
-                    memory_bytes,
-                    gpu_count,
-                    restart_policy,
-                    termination_grace_period_secs,
-                    pre_stop_command,
-                    liveness,
-                    env,
-                    secret_files,
-                    volumes,
-                    networks,
-                },
-                runtime_class: read_runtime_class(entry.get_runtime_class()?.to_str()?),
-                sandbox_profile: read_optional_text(entry.get_sandbox_profile()?),
-                gpu_device_ids,
-                id: task_id,
-                slot_ids,
-                service_metadata: None,
-                target_node: None,
-            });
+            requests.push(read_task_start_request(entry)?);
         }
 
         let specs = self
@@ -1312,6 +1131,120 @@ fn read_runtime_class(value: &str) -> RuntimeClass {
 fn read_optional_text(reader: capnp::text::Reader<'_>) -> Option<String> {
     let value = reader.to_str().ok()?.trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+/// Decodes the public task start request into the shared workload launch shape.
+///
+/// The task RPC stays task-oriented at the boundary, but the shared workload
+/// manager consumes a generic request type that is also reused by services,
+/// jobs, and agents. This adapter is the intentional boundary between those
+/// two vocabularies.
+fn read_task_start_request(
+    reader: task_start_request::Reader<'_>,
+) -> Result<WorkloadStartRequest, Error> {
+    let name = reader.get_name()?.to_str()?.to_string();
+    let image = reader.get_image()?.to_str()?.to_string();
+    let cpu_millis = reader.get_cpu_millis();
+    let memory_bytes = reader.get_memory_bytes();
+    let gpu_count = reader.get_gpu_count();
+
+    let mut command = Vec::new();
+    for arg in reader.get_command()?.iter() {
+        command.push(arg?.to_str()?.to_string());
+    }
+
+    let mut gpu_device_ids = Vec::new();
+    for device_id in reader.get_gpu_device_ids()?.iter() {
+        gpu_device_ids.push(device_id?.to_str()?.to_string());
+    }
+
+    let slots_reader = reader.get_slot_ids()?;
+    let mut slot_ids = Vec::with_capacity(slots_reader.len() as usize);
+    for slot_id in slots_reader.iter() {
+        slot_ids.push(slot_id);
+    }
+
+    let id = {
+        let bytes = reader.get_task_id()?;
+        if bytes.len() == 16 {
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(bytes);
+            Some(Uuid::from_bytes(arr))
+        } else {
+            None
+        }
+    };
+
+    let restart_policy = if reader.has_restart_policy() {
+        Some(decode_task_restart_policy(reader.get_restart_policy()?)?)
+    } else {
+        None
+    };
+    let termination_grace_period_secs = match reader.get_termination_grace_period_secs() {
+        0 => None,
+        value => Some(value),
+    };
+
+    let mut pre_stop_command = Vec::new();
+    for arg in reader.get_pre_stop_command()?.iter() {
+        let text = arg?.to_str()?.to_string();
+        if !text.is_empty() {
+            pre_stop_command.push(text);
+        }
+    }
+    let pre_stop_command = if pre_stop_command.is_empty() {
+        None
+    } else {
+        Some(pre_stop_command)
+    };
+
+    let liveness = if reader.has_liveness() {
+        Some(decode_task_liveness_probe(reader.get_liveness()?)?)
+    } else {
+        None
+    };
+
+    let env = decode_env_vars(reader.get_env()?)?;
+    let secret_files = decode_secret_files(reader.get_secret_files()?)?;
+    let volumes = decode_volume_mounts(reader.get_volumes()?)?;
+
+    let mut networks = Vec::new();
+    for net in reader.get_networks()?.iter() {
+        let data = net?;
+        if data.len() != 16 {
+            return Err(Error::failed("invalid network id length".to_string()));
+        }
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(data);
+        networks.push(Uuid::from_bytes(bytes));
+    }
+
+    Ok(WorkloadStartRequest {
+        name,
+        execution: TaskExecutionSpec {
+            image,
+            command,
+            tty: false,
+            cpu_millis,
+            memory_bytes,
+            gpu_count,
+            restart_policy,
+            termination_grace_period_secs,
+            pre_stop_command,
+            liveness,
+            env,
+            secret_files,
+            volumes,
+            networks,
+        },
+        runtime_class: read_runtime_class(reader.get_runtime_class()?.to_str()?),
+        sandbox_profile: read_optional_text(reader.get_sandbox_profile()?),
+        gpu_device_ids,
+        id,
+        slot_ids,
+        service_metadata: None,
+        target_node: None,
+    })
 }
 
 fn list_filter_from_request(request: &task_list_request::Reader) -> Result<TaskStateFilter, Error> {

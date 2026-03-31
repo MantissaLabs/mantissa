@@ -312,8 +312,8 @@ pub enum WorkloadTrafficPublicationUpdate {
 /// - The request is named `WorkloadStartRequest` because the same launch shape is reused by
 ///   tasks, service replicas, job attempts, and agent runs.
 /// - A caller decides the higher-level meaning by choosing the controller/API that submits it.
-/// - The `tasks` RPC therefore sends `WorkloadStartRequest` and receives `TaskSpec`, because it
-///   is creating `WorkloadKind::Task`.
+/// - The public `tasks` RPC adapts `TaskStartRequest` into this internal request type before
+///   creating `WorkloadKind::Task`.
 #[derive(Clone)]
 pub struct WorkloadStartRequest {
     /// Human-readable name for the resulting workload instance.
