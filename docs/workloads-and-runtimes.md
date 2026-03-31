@@ -102,7 +102,7 @@ layer over the generic workload model.
 ### Service and Service Replica
 
 A service is not itself one runtime instance. A service is the durable desired
-state owned by the service controller: templates, replica counts, rollout
+state owned by the service controller: task templates, replica counts, rollout
 strategy, readiness, dependency ordering, and traffic publication rules.
 
 When the service controller wants work to run, it materializes service-owned

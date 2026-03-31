@@ -3,7 +3,7 @@ use super::ownership::{
 };
 use super::{
     SERVICE_ENABLE_PROACTIVE_REBALANCE, SERVICE_REBALANCE_COOLDOWN_SECS,
-    SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController, ServiceTaskSnapshot, TaskInventory,
+    SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController, ServiceReplicaSnapshot, TaskInventory,
     compute_effective_slot_targets, deploying_assignment_incomplete, expected_task_id_count,
     is_local_volume_unavailable_error, mounted_local_volumes_require_pinned_target, node_is_down,
     should_restart_missing_slot_immediately, task_age_allows_cleanup, task_age_allows_rebalance,
@@ -41,14 +41,14 @@ impl ServiceController {
         }
 
         // During initial deployment submission, the service spec is broadcast as Deploying with
-        // templates populated but task_ids still empty while launch is in-flight. Running the
+        // task templates populated but replica_ids still empty while launch is in-flight. Running the
         // normal cleanup/slot loops at that point causes false "excess task" stops and churn.
         if deploying_assignment_incomplete(&spec) {
             tracing::debug!(
                 target: "services",
                 service = %spec.service_name,
                 expected_slots = expected_task_id_count(&spec),
-                assigned_slots = spec.task_ids.len(),
+                assigned_slots = spec.replica_ids.len(),
                 "skipping deploy reconciliation until task ids are fully assigned"
             );
             return Ok(());
@@ -57,14 +57,14 @@ impl ServiceController {
         let slots = build_replica_slots(&spec);
         let slot_targets = compute_effective_slot_targets(
             spec.id,
-            &spec.tasks,
+            &spec.task_templates,
             eligible_nodes,
             &self.volume_registry,
         )?;
-        let desired_ids: HashSet<Uuid> = slots.iter().filter_map(|slot| slot.task_id).collect();
+        let desired_ids: HashSet<Uuid> = slots.iter().filter_map(|slot| slot.replica_id).collect();
         let service_tasks = inventory.service_task_snapshot(&spec.service_name, desired_ids);
         let service_degraded = slots.iter().any(|slot| {
-            let Some(task_id) = slot.task_id else {
+            let Some(task_id) = slot.replica_id else {
                 return true;
             };
             let Some(task) = inventory.by_id.get(&task_id) else {
@@ -81,7 +81,7 @@ impl ServiceController {
             .await;
 
         for slot in slots {
-            let Some(task_id) = slot.task_id else {
+            let Some(task_id) = slot.replica_id else {
                 tracing::warn!(
                     target: "services",
                     "service '{}' missing task id for template '{}' replica {}; skipping slot",
@@ -138,7 +138,7 @@ impl ServiceController {
     async fn reconcile_extra_tasks(
         &self,
         spec: &ServiceSpecValue,
-        service_tasks: &ServiceTaskSnapshot<'_>,
+        service_tasks: &ServiceReplicaSnapshot<'_>,
         eligible_nodes: &[Uuid],
     ) {
         for task in service_tasks.observed_tasks() {

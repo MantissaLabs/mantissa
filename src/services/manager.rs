@@ -3,13 +3,13 @@ use crate::registry::Registry;
 use crate::services::dependencies::{TemplateDependencyStage, build_template_dependency_stages};
 use crate::services::ordering::should_accept_service_update;
 use crate::services::reconcile::{
-    ReplicaReplacement, ServiceTaskAssignment, compute_change_plan, parse_template_and_replica,
+    ReplicaReplacement, ServiceReplicaAssignment, compute_change_plan, parse_template_and_replica,
 };
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
     ServiceEvent, ServicePreviousGeneration, ServiceRolloutOrder, ServiceRolloutPhase,
-    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceTaskSpecValue,
-    ServiceUpdateStrategy, compute_service_id,
+    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy,
+    TaskTemplateSpecValue, compute_service_id,
 };
 use crate::task::types::{TaskSpec, TaskStateFilter, TaskVolumeMount};
 use crate::volumes::types::VolumeDriver;
@@ -251,14 +251,14 @@ impl ServiceController {
         manifest_id: Uuid,
         manifest_name: impl Into<String>,
         service_name: impl Into<String>,
-        tasks: Vec<ServiceTaskSpecValue>,
+        task_templates: Vec<TaskTemplateSpecValue>,
     ) -> anyhow::Result<Uuid> {
         let submission = self
             .submit_deployment_with_strategy_outcome(
                 manifest_id,
                 manifest_name,
                 service_name,
-                tasks,
+                task_templates,
                 ServiceUpdateStrategy::default(),
             )
             .await?;
@@ -272,7 +272,7 @@ impl ServiceController {
         manifest_id: Uuid,
         manifest_name: impl Into<String>,
         service_name: impl Into<String>,
-        tasks: Vec<ServiceTaskSpecValue>,
+        task_templates: Vec<TaskTemplateSpecValue>,
         update_strategy: ServiceUpdateStrategy,
     ) -> anyhow::Result<Uuid> {
         let submission = self
@@ -280,7 +280,7 @@ impl ServiceController {
                 manifest_id,
                 manifest_name,
                 service_name,
-                tasks,
+                task_templates,
                 update_strategy,
             )
             .await?;
@@ -293,12 +293,12 @@ impl ServiceController {
         manifest_id: Uuid,
         manifest_name: impl Into<String>,
         service_name: impl Into<String>,
-        tasks: Vec<ServiceTaskSpecValue>,
+        task_templates: Vec<TaskTemplateSpecValue>,
         update_strategy: ServiceUpdateStrategy,
     ) -> anyhow::Result<ServiceDeploymentSubmission> {
         let manifest_name = manifest_name.into();
         let service_name = service_name.into();
-        build_template_dependency_stages(&tasks).map_err(|err| {
+        build_template_dependency_stages(&task_templates).map_err(|err| {
             anyhow!(
                 "invalid task dependency graph for service '{}': {err}",
                 service_name
@@ -327,7 +327,7 @@ impl ServiceController {
                 &existing,
                 &manifest_name,
                 &service_name,
-                &tasks,
+                &task_templates,
                 &update_strategy,
             ) {
                 tracing::info!(
@@ -351,10 +351,10 @@ impl ServiceController {
                 let mut pending_spec = existing;
                 pending_spec.manifest_id = manifest_id;
                 pending_spec.manifest_name = manifest_name.clone();
-                pending_spec.tasks = tasks.clone();
+                pending_spec.task_templates = task_templates.clone();
                 pending_spec.update_strategy = update_strategy.clone();
                 pending_spec.start_new_generation();
-                pending_spec.task_ids.clear();
+                pending_spec.replica_ids.clear();
                 pending_spec.set_rollout(ServiceRolloutState::default());
                 pending_spec.previous_generation = None;
                 pending_spec.set_status(ServiceStatus::Deploying);
@@ -382,12 +382,12 @@ impl ServiceController {
             let mut pending_spec = existing;
             pending_spec.manifest_id = manifest_id;
             pending_spec.manifest_name = manifest_name.clone();
-            pending_spec.tasks = tasks.clone();
+            pending_spec.task_templates = task_templates.clone();
             pending_spec.update_strategy = update_strategy.clone();
             pending_spec.start_new_generation();
             // A new deployment generation must start from an empty assignment set so peers can
             // observe a clean Deploying bootstrap before task ids are repopulated.
-            pending_spec.task_ids.clear();
+            pending_spec.replica_ids.clear();
             pending_spec.previous_generation =
                 Some(ServicePreviousGeneration::from_service(&current_spec));
             pending_spec.set_status(ServiceStatus::Deploying);
@@ -414,7 +414,7 @@ impl ServiceController {
             manifest_id,
             manifest_name.clone(),
             service_name.clone(),
-            tasks.clone(),
+            task_templates.clone(),
             Vec::new(),
         );
         pending_spec.update_strategy = update_strategy.clone();
@@ -643,7 +643,7 @@ impl ServiceController {
                 manifest_id: current.manifest_id,
                 manifest_name: current.manifest_name.clone(),
                 service_name: current.service_name.clone(),
-                templates: current.tasks.clone(),
+                task_templates: current.task_templates.clone(),
                 current_spec: previous.to_service_spec(current.id, current.service_name.clone()),
                 update_strategy: current.update_strategy.clone(),
             };
@@ -655,9 +655,9 @@ impl ServiceController {
                 manifest_id: current.manifest_id,
                 manifest_name: current.manifest_name.clone(),
                 service_name: current.service_name.clone(),
-                templates: current.tasks.clone(),
+                task_templates: current.task_templates.clone(),
                 update_strategy: current.update_strategy.clone(),
-                assigned_task_ids: current.task_ids.clone(),
+                assigned_task_ids: current.replica_ids.clone(),
             };
             return self.clone().execute_deployment(job).await;
         }
@@ -668,7 +668,7 @@ impl ServiceController {
     /// Executes the deployment workflow in the background by starting tasks via the task manager
     /// and persisting the resulting service specification into the replicated registry.
     async fn execute_deployment(self, job: ServiceDeploymentJob) -> anyhow::Result<()> {
-        let stages = build_template_dependency_stages(&job.templates).map_err(|err| {
+        let stages = build_template_dependency_stages(&job.task_templates).map_err(|err| {
             anyhow!(
                 "invalid task dependency graph for service '{}': {err}",
                 job.service_name
@@ -682,13 +682,13 @@ impl ServiceController {
             .await
     }
 
-    /// Launches a service whose templates do not declare cross-template dependencies.
+    /// Launches a service whose task templates do not declare cross-template dependencies.
     async fn execute_flat_deployment(self, job: ServiceDeploymentJob) -> anyhow::Result<()> {
         let ServiceDeploymentJob {
             manifest_id,
             manifest_name,
             service_name,
-            templates,
+            task_templates,
             update_strategy,
             assigned_task_ids: _,
         } = job;
@@ -698,7 +698,7 @@ impl ServiceController {
         let requests = build_start_requests(
             &service_name,
             service_id,
-            &templates,
+            &task_templates,
             &eligible_nodes,
             &self.volume_registry,
         );
@@ -708,7 +708,7 @@ impl ServiceController {
                 manifest_id,
                 manifest_name.clone(),
                 service_name.clone(),
-                templates,
+                task_templates,
                 Vec::new(),
             );
             let mut spec = spec;
@@ -756,7 +756,7 @@ impl ServiceController {
                 let service_id = compute_service_id(&service_name);
                 match self.registry.get(service_id) {
                     Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(&err) => {
-                        persisted_spec.task_ids = desired_task_ids.clone();
+                        persisted_spec.replica_ids = desired_task_ids.clone();
                         persisted_spec.set_rollout(ServiceRolloutState::default());
                         persisted_spec.set_status(ServiceStatus::VolumeUnavailable);
                         if let Err(upsert_err) = self.apply_upsert(persisted_spec.clone()).await {
@@ -786,7 +786,7 @@ impl ServiceController {
                             manifest_id,
                             manifest_name.clone(),
                             service_name.clone(),
-                            templates.clone(),
+                            task_templates.clone(),
                             desired_task_ids,
                         );
                         blocked_spec.update_strategy = update_strategy.clone();
@@ -818,7 +818,7 @@ impl ServiceController {
                             manifest_id,
                             manifest_name.clone(),
                             service_name.clone(),
-                            templates.clone(),
+                            task_templates.clone(),
                             Vec::new(),
                         );
                         failed_spec.update_strategy = update_strategy.clone();
@@ -852,7 +852,7 @@ impl ServiceController {
                 return Ok(());
             }
         };
-        let task_ids: Vec<Uuid> = task_specs.iter().map(|spec| spec.id).collect();
+        let replica_ids: Vec<Uuid> = task_specs.iter().map(|spec| spec.id).collect();
 
         let mut spec = match self.registry.get(service_id)? {
             Some(spec) if spec.manifest_id == manifest_id => spec,
@@ -860,15 +860,15 @@ impl ServiceController {
                 manifest_id,
                 manifest_name.clone(),
                 service_name.clone(),
-                templates.clone(),
+                task_templates.clone(),
                 Vec::new(),
             ),
         };
         spec.manifest_id = manifest_id;
         spec.manifest_name = manifest_name;
         spec.service_name = service_name.clone();
-        spec.tasks = templates;
-        spec.task_ids = task_ids;
+        spec.task_templates = task_templates;
+        spec.replica_ids = replica_ids;
         spec.update_strategy = update_strategy;
         spec.previous_generation = None;
         spec.set_rollout(ServiceRolloutState::default());
@@ -891,8 +891,8 @@ impl ServiceController {
         Ok(())
     }
 
-    /// Launches service templates in deterministic dependency order, waiting for each upstream
-    /// template to become discoverable before starting the templates that depend on it.
+    /// Launches service task templates in deterministic dependency order, waiting for each upstream
+    /// template to become discoverable before starting the task templates that depend on it.
     async fn execute_dependency_ordered_deployment(
         self,
         job: ServiceDeploymentJob,
@@ -902,7 +902,7 @@ impl ServiceController {
             manifest_id,
             manifest_name,
             service_name,
-            templates,
+            task_templates,
             update_strategy,
             assigned_task_ids,
         } = job;
@@ -913,7 +913,7 @@ impl ServiceController {
             manifest_id,
             manifest_name: &manifest_name,
             service_name: &service_name,
-            templates: &templates,
+            task_templates: &task_templates,
             update_strategy: &update_strategy,
         };
         let ordered_indices: Vec<usize> = stages
@@ -928,7 +928,7 @@ impl ServiceController {
             stages.len()
         );
 
-        let template_replica_counts: HashMap<String, u16> = templates
+        let template_replica_counts: HashMap<String, u16> = task_templates
             .iter()
             .map(|template| (template.name.clone(), template.replicas))
             .collect();
@@ -944,7 +944,7 @@ impl ServiceController {
         }
 
         let mut launched_task_ids: HashMap<String, Vec<Uuid>> = HashMap::new();
-        for template in &templates {
+        for template in &task_templates {
             let mut template_task_ids = Vec::new();
             for replica in 1..=template.replicas {
                 if let Some(task_id) = assignments.get(&(template.name.clone(), replica)) {
@@ -958,13 +958,13 @@ impl ServiceController {
 
         let slot_targets = compute_effective_slot_targets(
             service_id,
-            &templates,
+            &task_templates,
             &eligible_nodes,
             &self.volume_registry,
         )?;
 
         for template_index in ordered_indices {
-            let template = templates[template_index].clone();
+            let template = task_templates[template_index].clone();
             if !template.depends_on.is_empty()
                 && let Err(err) = self
                     .wait_for_template_dependencies_ready(
@@ -1034,7 +1034,7 @@ impl ServiceController {
                 .extend(stage_ids);
             record_task_assignments(&service_name, &task_specs, &mut assignments);
 
-            let ordered_task_ids = ordered_known_task_ids(&templates, &assignments);
+            let ordered_task_ids = ordered_known_task_ids(&task_templates, &assignments);
             let _ = self
                 .persist_deploying_task_ids(&deployment, ordered_task_ids)
                 .await?;
@@ -1043,7 +1043,7 @@ impl ServiceController {
         let readiness_spec = self
             .persist_deploying_task_ids(
                 &deployment,
-                ordered_known_task_ids(&templates, &assignments),
+                ordered_known_task_ids(&task_templates, &assignments),
             )
             .await?;
         self.update_service_status_detail_if_current(service_id, manifest_id, None)
@@ -1215,7 +1215,7 @@ impl ServiceController {
         Ok(None)
     }
 
-    /// Waits for dependency templates to be assigned, running, traffic-published, and stable.
+    /// Waits for dependency task templates to be assigned, running, traffic-published, and stable.
     async fn wait_for_dependency_task_ids_ready(
         &self,
         gate: DependencyGateContext<'_>,
@@ -1298,7 +1298,7 @@ impl ServiceController {
     async fn wait_for_template_dependencies_ready(
         &self,
         deployment: &ServiceDeploymentContext<'_>,
-        template: &ServiceTaskSpecValue,
+        template: &TaskTemplateSpecValue,
         template_replica_counts: &HashMap<String, u16>,
         launched_task_ids: &HashMap<String, Vec<Uuid>>,
     ) -> anyhow::Result<()> {
@@ -1317,11 +1317,11 @@ impl ServiceController {
         .await
     }
 
-    /// Persists the current `Deploying` service snapshot with the provided task id set.
+    /// Persists the current `Deploying` service snapshot with the provided replica id set.
     async fn persist_deploying_task_ids(
         &self,
         deployment: &ServiceDeploymentContext<'_>,
-        task_ids: Vec<Uuid>,
+        replica_ids: Vec<Uuid>,
     ) -> anyhow::Result<ServiceSpecValue> {
         let service_id = compute_service_id(deployment.service_name);
         let mut spec = match self.registry.get(service_id)? {
@@ -1330,15 +1330,15 @@ impl ServiceController {
                 deployment.manifest_id,
                 deployment.manifest_name.to_string(),
                 deployment.service_name.to_string(),
-                deployment.templates.to_vec(),
+                deployment.task_templates.to_vec(),
                 Vec::new(),
             ),
         };
         spec.manifest_id = deployment.manifest_id;
         spec.manifest_name = deployment.manifest_name.to_string();
         spec.service_name = deployment.service_name.to_string();
-        spec.tasks = deployment.templates.to_vec();
-        spec.task_ids = task_ids;
+        spec.task_templates = deployment.task_templates.to_vec();
+        spec.replica_ids = replica_ids;
         spec.update_strategy = deployment.update_strategy.clone();
         spec.previous_generation = None;
         spec.set_rollout(ServiceRolloutState::default());
@@ -1348,7 +1348,7 @@ impl ServiceController {
         Ok(spec)
     }
 
-    /// Handles the initial launch failure path before any dependency-ordered templates have been
+    /// Handles the initial launch failure path before any dependency-ordered task templates have been
     /// started, preserving the existing volume-unavailable recovery behavior.
     async fn handle_initial_deployment_launch_failure(
         &self,
@@ -1374,7 +1374,7 @@ impl ServiceController {
         let service_id = compute_service_id(deployment.service_name);
         match self.registry.get(service_id) {
             Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(err) => {
-                persisted_spec.task_ids = desired_task_ids.to_vec();
+                persisted_spec.replica_ids = desired_task_ids.to_vec();
                 persisted_spec.previous_generation = None;
                 persisted_spec.set_rollout(ServiceRolloutState::default());
                 persisted_spec.set_status(ServiceStatus::VolumeUnavailable);
@@ -1405,7 +1405,7 @@ impl ServiceController {
                     deployment.manifest_id,
                     deployment.manifest_name.to_string(),
                     deployment.service_name.to_string(),
-                    deployment.templates.to_vec(),
+                    deployment.task_templates.to_vec(),
                     desired_task_ids.to_vec(),
                 );
                 blocked_spec.update_strategy = deployment.update_strategy.clone();
@@ -1438,7 +1438,7 @@ impl ServiceController {
                     deployment.manifest_id,
                     deployment.manifest_name.to_string(),
                     deployment.service_name.to_string(),
-                    deployment.templates.to_vec(),
+                    deployment.task_templates.to_vec(),
                     Vec::new(),
                 );
                 failed_spec.update_strategy = deployment.update_strategy.clone();
@@ -1486,20 +1486,20 @@ impl ServiceController {
                 deployment.manifest_id,
                 deployment.manifest_name.to_string(),
                 deployment.service_name.to_string(),
-                deployment.templates.to_vec(),
+                deployment.task_templates.to_vec(),
                 Vec::new(),
             ),
         };
         failed_spec.manifest_name = deployment.manifest_name.to_string();
         failed_spec.service_name = deployment.service_name.to_string();
-        failed_spec.tasks = deployment.templates.to_vec();
+        failed_spec.task_templates = deployment.task_templates.to_vec();
         failed_spec.update_strategy = deployment.update_strategy.clone();
         failed_spec.previous_generation = None;
         failed_spec.set_rollout(ServiceRolloutState {
             last_error: reason,
             ..ServiceRolloutState::default()
         });
-        failed_spec.task_ids.clear();
+        failed_spec.replica_ids.clear();
         failed_spec.set_status(ServiceStatus::Failed);
         self.apply_upsert(failed_spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(failed_spec.clone()))
@@ -1513,7 +1513,7 @@ impl ServiceController {
         &self,
         service_name: &str,
         task_ids: &[Uuid],
-    ) -> Vec<ServiceTaskAssignment> {
+    ) -> Vec<ServiceReplicaAssignment> {
         let mut assignments = Vec::new();
         for task_id in task_ids {
             match self.task_manager.inspect_task(*task_id).await {
@@ -1521,7 +1521,7 @@ impl ServiceController {
                     if let Some((template, replica)) =
                         parse_template_and_replica(service_name, &spec.name)
                     {
-                        assignments.push(ServiceTaskAssignment {
+                        assignments.push(ServiceReplicaAssignment {
                             task_id: spec.id,
                             template,
                             replica,
@@ -1633,7 +1633,7 @@ impl ServiceController {
                 }
             });
         };
-        let desired_ids: HashSet<Uuid> = spec.task_ids.iter().copied().collect();
+        let desired_ids: HashSet<Uuid> = spec.replica_ids.iter().copied().collect();
         let service_tasks = inventory.service_task_snapshot(&spec.service_name, desired_ids);
         for task_id in service_tasks.all_known_task_ids() {
             let Some(task) = inventory.by_id.get(&task_id) else {
@@ -1914,8 +1914,8 @@ impl TaskInventory {
         &'a self,
         service_name: &'a str,
         desired_ids: HashSet<Uuid>,
-    ) -> ServiceTaskSnapshot<'a> {
-        ServiceTaskSnapshot {
+    ) -> ServiceReplicaSnapshot<'a> {
+        ServiceReplicaSnapshot {
             inventory: self,
             service_name,
             desired_ids,
@@ -1924,13 +1924,13 @@ impl TaskInventory {
 }
 
 /// Lightweight service-scoped task view used by reconcile and stop paths.
-struct ServiceTaskSnapshot<'a> {
+struct ServiceReplicaSnapshot<'a> {
     inventory: &'a TaskInventory,
     service_name: &'a str,
     desired_ids: HashSet<Uuid>,
 }
 
-impl ServiceTaskSnapshot<'_> {
+impl ServiceReplicaSnapshot<'_> {
     /// Returns true when the task id is still assigned to a desired service replica slot.
     fn is_desired(&self, task_id: Uuid) -> bool {
         self.desired_ids.contains(&task_id)
@@ -2047,9 +2047,9 @@ fn task_state_terminal_for_restart(state: &WorkloadPhase) -> bool {
     )
 }
 
-/// Returns the expected task id count implied by the manifest templates.
+/// Returns the expected task id count implied by the manifest task templates.
 fn expected_task_id_count(spec: &ServiceSpecValue) -> usize {
-    spec.tasks
+    spec.task_templates
         .iter()
         .map(|template| template.replicas as usize)
         .sum()
@@ -2057,7 +2057,8 @@ fn expected_task_id_count(spec: &ServiceSpecValue) -> usize {
 
 /// Returns true when deployment has not yet assigned task ids for every desired replica.
 fn deploying_assignment_incomplete(spec: &ServiceSpecValue) -> bool {
-    spec.status() == ServiceStatus::Deploying && spec.task_ids.len() < expected_task_id_count(spec)
+    spec.status() == ServiceStatus::Deploying
+        && spec.replica_ids.len() < expected_task_id_count(spec)
 }
 
 #[cfg(test)]
@@ -2075,13 +2076,13 @@ fn is_running_deployment_noop(
     existing: &ServiceSpecValue,
     manifest_name: &str,
     service_name: &str,
-    tasks: &[ServiceTaskSpecValue],
+    task_templates: &[TaskTemplateSpecValue],
     update_strategy: &ServiceUpdateStrategy,
 ) -> bool {
     existing.status() == ServiceStatus::Running
         && existing.manifest_name == manifest_name
         && existing.service_name == service_name
-        && existing.tasks == tasks
+        && existing.task_templates == task_templates
         && existing.update_strategy == *update_strategy
 }
 
@@ -2089,7 +2090,7 @@ struct ServiceDeploymentJob {
     manifest_id: Uuid,
     manifest_name: String,
     service_name: String,
-    templates: Vec<ServiceTaskSpecValue>,
+    task_templates: Vec<TaskTemplateSpecValue>,
     update_strategy: ServiceUpdateStrategy,
     assigned_task_ids: Vec<Uuid>,
 }
@@ -2103,7 +2104,7 @@ struct ServiceDeploymentContext<'a> {
     manifest_id: Uuid,
     manifest_name: &'a str,
     service_name: &'a str,
-    templates: &'a [ServiceTaskSpecValue],
+    task_templates: &'a [TaskTemplateSpecValue],
     update_strategy: &'a ServiceUpdateStrategy,
 }
 
@@ -2111,7 +2112,7 @@ struct ServiceRedeploymentJob {
     manifest_id: Uuid,
     manifest_name: String,
     service_name: String,
-    templates: Vec<ServiceTaskSpecValue>,
+    task_templates: Vec<TaskTemplateSpecValue>,
     current_spec: ServiceSpecValue,
     update_strategy: ServiceUpdateStrategy,
 }
@@ -2174,21 +2175,21 @@ fn format_dependency_gate_stability_detail(
 fn build_start_requests(
     service_name: &str,
     service_id: Uuid,
-    tasks: &[ServiceTaskSpecValue],
+    task_templates: &[TaskTemplateSpecValue],
     eligible_nodes: &[Uuid],
     volume_registry: &VolumeRegistry,
 ) -> Vec<WorkloadStartRequest> {
     let slot_targets =
-        compute_effective_slot_targets(service_id, tasks, eligible_nodes, volume_registry)
+        compute_effective_slot_targets(service_id, task_templates, eligible_nodes, volume_registry)
             .unwrap_or_default();
     let mut requests = Vec::new();
-    for task in tasks {
-        for replica_idx in 0..task.replicas {
+    for template in task_templates {
+        for replica_idx in 0..template.replicas {
             let replica_number = replica_idx + 1;
             let desired_id = Uuid::new_v4();
-            let key = SlotKey::new(service_id, &task.name, replica_number);
+            let key = SlotKey::new(service_id, &template.name, replica_number);
             let target_node = slot_targets.get(&key).copied();
-            requests.push(task.replica_start_request(
+            requests.push(template.replica_start_request(
                 service_name,
                 replica_number,
                 desired_id,
@@ -2203,7 +2204,7 @@ fn build_start_requests(
 fn build_missing_template_requests(
     service_name: &str,
     service_id: Uuid,
-    template: &ServiceTaskSpecValue,
+    template: &TaskTemplateSpecValue,
     assignments: &BTreeMap<(String, u16), Uuid>,
     slot_targets: &HashMap<SlotKey, Uuid>,
 ) -> Vec<WorkloadStartRequest> {
@@ -2229,12 +2230,12 @@ fn build_missing_template_requests(
 /// Computes effective slot targets after applying any hard local-volume locality overrides.
 fn compute_effective_slot_targets(
     service_id: Uuid,
-    templates: &[ServiceTaskSpecValue],
+    task_templates: &[TaskTemplateSpecValue],
     eligible_nodes: &[Uuid],
     volume_registry: &VolumeRegistry,
 ) -> anyhow::Result<HashMap<SlotKey, Uuid>> {
-    let mut targets = compute_slot_targets(service_id, templates, eligible_nodes);
-    for template in templates {
+    let mut targets = compute_slot_targets(service_id, task_templates, eligible_nodes);
+    for template in task_templates {
         let Some(target_node) = resolve_template_volume_target(volume_registry, &template.volumes)?
         else {
             continue;
@@ -2269,7 +2270,7 @@ fn resolve_template_volume_target(
         match bound_node {
             Some(current) if current != node_id => {
                 return Err(anyhow!(
-                    "mounted volumes are bound to different nodes for one service template"
+                    "mounted volumes are bound to different nodes for one task template"
                 ));
             }
             None => bound_node = Some(node_id),
@@ -2340,13 +2341,13 @@ fn record_task_assignments(
 }
 
 /// Returns the currently known task ids in manifest template/replica order without warning about
-/// later templates that have not launched yet.
+/// later task templates that have not launched yet.
 fn ordered_known_task_ids(
-    templates: &[ServiceTaskSpecValue],
+    task_templates: &[TaskTemplateSpecValue],
     assignments: &BTreeMap<(String, u16), Uuid>,
 ) -> Vec<Uuid> {
     let mut ids = Vec::new();
-    for template in templates {
+    for template in task_templates {
         for replica in 1..=template.replicas {
             if let Some(task_id) = assignments.get(&(template.name.clone(), replica)) {
                 ids.push(*task_id);
@@ -2359,11 +2360,11 @@ fn ordered_known_task_ids(
 /// Computes the ordered task identifiers for the manifest by iterating template/replica pairs.
 fn order_task_ids(
     service_name: &str,
-    templates: &[ServiceTaskSpecValue],
+    task_templates: &[TaskTemplateSpecValue],
     assignments: &BTreeMap<(String, u16), Uuid>,
 ) -> Vec<Uuid> {
     let mut ids = Vec::new();
-    for template in templates {
+    for template in task_templates {
         for replica in 1..=template.replicas {
             let key = (template.name.clone(), replica);
             match assignments.get(&key) {
@@ -2465,7 +2466,7 @@ fn should_stop_tasks(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecV
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::types::ServiceTaskNetworkRequirement;
+    use crate::services::types::TaskTemplateNetworkRequirement;
     use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
     use crate::task::types::TaskServiceMetadata;
     use crate::volumes::types::{
@@ -2546,10 +2547,10 @@ mod tests {
         }
     }
 
-    /// Builds one default service execution spec so test templates only override meaningful fields.
+    /// Builds one default service execution spec so test task templates only override meaningful fields.
     fn empty_service_execution(
         image: &str,
-    ) -> WorkloadExecutionSpec<ServiceTaskNetworkRequirement> {
+    ) -> WorkloadExecutionSpec<TaskTemplateNetworkRequirement> {
         WorkloadExecutionSpec {
             image: image.to_string(),
             command: Vec::new(),
@@ -2662,7 +2663,7 @@ mod tests {
     #[test]
     fn replica_request_preserves_termination_grace_period() {
         let desired_id = Uuid::new_v4();
-        let template = ServiceTaskSpecValue {
+        let template = TaskTemplateSpecValue {
             name: "api".into(),
             execution: WorkloadExecutionSpec {
                 termination_grace_period_secs: Some(42),
@@ -2688,13 +2689,13 @@ mod tests {
     /// Ensures replica slots map task ids in template/replica order.
     #[test]
     fn replica_slots_follow_template_order() {
-        let task_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let replica_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
         let spec = ServiceSpecValue::new(
             Uuid::new_v4(),
             "manifest",
             "demo-service",
             vec![
-                ServiceTaskSpecValue {
+                TaskTemplateSpecValue {
                     name: "api".into(),
                     execution: empty_service_execution("ghcr.io/demo/api:latest"),
                     depends_on: Vec::new(),
@@ -2703,7 +2704,7 @@ mod tests {
                     public_port: None,
                     public_protocol: None,
                 },
-                ServiceTaskSpecValue {
+                TaskTemplateSpecValue {
                     name: "web".into(),
                     execution: empty_service_execution("ghcr.io/demo/web:latest"),
                     depends_on: Vec::new(),
@@ -2713,14 +2714,14 @@ mod tests {
                     public_protocol: None,
                 },
             ],
-            task_ids.clone(),
+            replica_ids.clone(),
         );
 
         let slots = build_replica_slots(&spec);
         assert_eq!(slots.len(), 3);
-        assert_eq!(slots[0].task_id, Some(task_ids[0]));
-        assert_eq!(slots[1].task_id, Some(task_ids[1]));
-        assert_eq!(slots[2].task_id, Some(task_ids[2]));
+        assert_eq!(slots[0].replica_id, Some(replica_ids[0]));
+        assert_eq!(slots[1].replica_id, Some(replica_ids[1]));
+        assert_eq!(slots[2].replica_id, Some(replica_ids[2]));
         assert_eq!(slots[0].template.name, "api");
         assert_eq!(slots[1].template.name, "api");
         assert_eq!(slots[2].template.name, "web");
@@ -2784,8 +2785,8 @@ mod tests {
         let mut reversed = candidates.clone();
         reversed.reverse();
 
-        let templates = vec![
-            ServiceTaskSpecValue {
+        let task_templates = vec![
+            TaskTemplateSpecValue {
                 name: "backend".into(),
                 execution: empty_service_execution("ghcr.io/demo/backend:latest"),
                 depends_on: Vec::new(),
@@ -2794,7 +2795,7 @@ mod tests {
                 public_port: None,
                 public_protocol: None,
             },
-            ServiceTaskSpecValue {
+            TaskTemplateSpecValue {
                 name: "curl".into(),
                 execution: empty_service_execution("curlimages/curl:latest"),
                 depends_on: Vec::new(),
@@ -2805,8 +2806,8 @@ mod tests {
             },
         ];
 
-        let targets = compute_slot_targets(service_id, &templates, &candidates);
-        let targets_reversed = compute_slot_targets(service_id, &templates, &reversed);
+        let targets = compute_slot_targets(service_id, &task_templates, &candidates);
+        let targets_reversed = compute_slot_targets(service_id, &task_templates, &reversed);
 
         assert_eq!(targets, targets_reversed);
     }
@@ -2820,8 +2821,8 @@ mod tests {
         let node_c = Uuid::from_bytes([3u8; 16]);
         let candidates = vec![node_a, node_b, node_c];
 
-        let templates = vec![
-            ServiceTaskSpecValue {
+        let task_templates = vec![
+            TaskTemplateSpecValue {
                 name: "backend".into(),
                 execution: empty_service_execution("ghcr.io/demo/backend:latest"),
                 depends_on: Vec::new(),
@@ -2830,7 +2831,7 @@ mod tests {
                 public_port: None,
                 public_protocol: None,
             },
-            ServiceTaskSpecValue {
+            TaskTemplateSpecValue {
                 name: "curl".into(),
                 execution: empty_service_execution("curlimages/curl:latest"),
                 depends_on: Vec::new(),
@@ -2841,7 +2842,7 @@ mod tests {
             },
         ];
 
-        let targets = compute_slot_targets(service_id, &templates, &candidates);
+        let targets = compute_slot_targets(service_id, &task_templates, &candidates);
         let mut counts: HashMap<Uuid, usize> = HashMap::new();
         for node_id in targets.values() {
             *counts.entry(*node_id).or_insert(0) += 1;
@@ -2902,7 +2903,7 @@ mod tests {
     #[test]
     fn should_stop_again_when_progressing_stopping_to_stopped() {
         let manifest_id = Uuid::new_v4();
-        let tasks = vec![ServiceTaskSpecValue {
+        let tasks = vec![TaskTemplateSpecValue {
             name: "api".into(),
             execution: empty_service_execution("ghcr.io/demo/api:latest"),
             depends_on: Vec::new(),
@@ -2938,9 +2939,9 @@ mod tests {
         manifest_id: Uuid,
         status: ServiceStatus,
         updated_at: DateTime<Utc>,
-        task_ids: Vec<Uuid>,
+        replica_ids: Vec<Uuid>,
     ) -> ServiceSpecValue {
-        let tasks = vec![ServiceTaskSpecValue {
+        let task_templates = vec![TaskTemplateSpecValue {
             name: "api".into(),
             execution: empty_service_execution("ghcr.io/demo/api:latest"),
             depends_on: Vec::new(),
@@ -2950,8 +2951,13 @@ mod tests {
             public_protocol: None,
         }];
 
-        let mut spec =
-            ServiceSpecValue::new(manifest_id, "manifest", "demo-service", tasks, task_ids);
+        let mut spec = ServiceSpecValue::new(
+            manifest_id,
+            "manifest",
+            "demo-service",
+            task_templates,
+            replica_ids,
+        );
         spec.status = status;
         spec.updated_at = updated_at.to_rfc3339();
         spec
@@ -3343,7 +3349,7 @@ mod tests {
     #[test]
     fn deploying_assignment_incomplete_detected() {
         let manifest_id = Uuid::new_v4();
-        let tasks = vec![ServiceTaskSpecValue {
+        let tasks = vec![TaskTemplateSpecValue {
             name: "api".into(),
             execution: empty_service_execution("ghcr.io/demo/api:latest"),
             depends_on: Vec::new(),
@@ -3383,7 +3389,7 @@ mod tests {
     #[test]
     fn deploying_generation_requires_execution_for_redeploy_context() {
         let manifest_id = Uuid::new_v4();
-        let tasks = vec![ServiceTaskSpecValue {
+        let tasks = vec![TaskTemplateSpecValue {
             name: "api".into(),
             execution: empty_service_execution("ghcr.io/demo/api:latest"),
             depends_on: Vec::new(),

@@ -37,8 +37,8 @@ use mantissa::services::ServiceController;
 use mantissa::services::manager::ServiceDeploymentOutcome;
 use mantissa::services::types::{
     ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
-    ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
-    ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy,
+    ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy, TaskTemplateNetworkRequirement,
+    TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind, TaskTemplateSpecValue,
 };
 use mantissa::task::types::{
     TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskServiceMetadata, TaskSpec,
@@ -167,7 +167,7 @@ local_test!(services_gossip_propagates_across_peers, {
             manifest_id,
             MANIFEST_NAME,
             SERVICE_NAME,
-            vec![ServiceTaskSpecValue {
+            vec![TaskTemplateSpecValue {
                 name: "web".into(),
                 execution: WorkloadExecutionSpec {
                     command: vec!["--serve".into()],
@@ -261,7 +261,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
         version_id: None,
     };
 
-    let tasks = vec![ServiceTaskSpecValue {
+    let tasks = vec![TaskTemplateSpecValue {
         name: "web".into(),
         execution: WorkloadExecutionSpec {
             command: vec!["--serve".into()],
@@ -345,7 +345,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
             manifest_id,
             "capacity-starved",
             "capacity-starved",
-            vec![ServiceTaskSpecValue {
+            vec![TaskTemplateSpecValue {
                 name: "heavy".into(),
                 execution: WorkloadExecutionSpec {
                     command: vec!["--serve".into()],
@@ -392,7 +392,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
         .expect("service spec present after failure");
     assert_eq!(failed_spec.status(), ServiceStatus::Failed);
     assert!(
-        failed_spec.task_ids.is_empty(),
+        failed_spec.replica_ids.is_empty(),
         "failed service should clear task assignments so operators can see an explicit failed state"
     );
 
@@ -415,7 +415,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
             recovered_manifest_id,
             "capacity-starved",
             "capacity-starved",
-            vec![ServiceTaskSpecValue {
+            vec![TaskTemplateSpecValue {
                 name: "heavy".into(),
                 execution: WorkloadExecutionSpec {
                     command: vec!["--serve".into()],
@@ -455,7 +455,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
         "recovery deployment should activate the new manifest generation"
     );
     assert_eq!(
-        recovered.task_ids.len(),
+        recovered.replica_ids.len(),
         1,
         "recovery deployment should repopulate task ids"
     );
@@ -486,7 +486,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
             "restartable-deploy",
             "restartable-deploy",
             vec![
-                ServiceTaskSpecValue {
+                TaskTemplateSpecValue {
                     name: "backend".into(),
                     execution: WorkloadExecutionSpec {
                         command: vec!["serve".into()],
@@ -500,7 +500,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
                     public_port: None,
                     public_protocol: None,
                 },
-                ServiceTaskSpecValue {
+                TaskTemplateSpecValue {
                     name: "frontend".into(),
                     execution: WorkloadExecutionSpec {
                         command: vec!["serve".into()],
@@ -533,7 +533,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
                     return false;
                 };
 
-                spec.status() == ServiceStatus::Deploying && spec.task_ids.len() == 1
+                spec.status() == ServiceStatus::Deploying && spec.replica_ids.len() == 1
             }
         )
         .await,
@@ -544,7 +544,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
         .registry()
         .get(service_id)
         .expect("reload persisted deploying spec")
-        .and_then(|spec| spec.task_ids.first().copied())
+        .and_then(|spec| spec.replica_ids.first().copied())
         .expect("backend task id should be persisted before restart");
 
     node.stop().await.expect("stop first node");
@@ -574,8 +574,8 @@ local_test!(services_deploying_generation_resumes_after_restart, {
                 };
 
                 spec.status() == ServiceStatus::Running
-                    && spec.task_ids.len() == 2
-                    && spec.task_ids.contains(&persisted_backend_task_id)
+                    && spec.replica_ids.len() == 2
+                    && spec.replica_ids.contains(&persisted_backend_task_id)
             }
         )
         .await,
@@ -607,7 +607,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
             Uuid::new_v4(),
             "missing-runtime",
             "missing-runtime",
-            vec![ServiceTaskSpecValue {
+            vec![TaskTemplateSpecValue {
                 name: "api".into(),
                 execution: WorkloadExecutionSpec {
                     command: vec![
@@ -649,7 +649,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
             .expect("read service after failed wait")
             .expect("service should still be present");
         let mut task_details = Vec::new();
-        for task_id in &current.task_ids {
+        for task_id in &current.replica_ids {
             let detail = match node.node.task_manager.inspect_task(*task_id).await {
                 Ok(task) => format!("{}:{:?}:phase{}", task.id, task.state, task.phase_version),
                 Err(err) => format!("{task_id}:inspect-error:{err}"),
@@ -659,7 +659,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
         panic!(
             "deployment with runtime exit signals should converge to failed instead of looping; current status={:?}, task_ids={}, rollout_phase={:?}, rollout_failed_steps={}, rollout_error={:?}, task_details={:?}",
             current.status(),
-            current.task_ids.len(),
+            current.replica_ids.len(),
             current.rollout.phase,
             current.rollout.failed_steps,
             current.rollout.last_error,
@@ -676,7 +676,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
         .expect("failed service spec present");
     assert_eq!(failed_spec.status(), ServiceStatus::Failed);
     assert!(
-        failed_spec.task_ids.is_empty(),
+        failed_spec.replica_ids.is_empty(),
         "failed service should clear task ids after runtime-exit-driven readiness failure"
     );
 });
@@ -705,12 +705,12 @@ local_test!(services_deployment_replicates_across_cluster, {
 
     let manifest_id = Uuid::new_v4();
     ensure_demo_manifest_secrets(&cluster).await;
-    let templates = manifest_to_service_templates(&manifest);
+    let task_templates = manifest_to_task_templates(&manifest);
 
     let service_id = cluster[0]
         .node
         .service_controller
-        .submit_deployment(manifest_id, &manifest.name, &manifest.name, templates)
+        .submit_deployment(manifest_id, &manifest.name, &manifest.name, task_templates)
         .await
         .expect("submit deployment via controller");
 
@@ -732,7 +732,7 @@ local_test!(services_deployment_replicates_across_cluster, {
         .expect("lookup service spec on anchor")
         .expect("service spec present");
 
-    let expected_task_ids: BTreeSet<Uuid> = expected_spec.task_ids.iter().cloned().collect();
+    let expected_task_ids: BTreeSet<Uuid> = expected_spec.replica_ids.iter().cloned().collect();
     let expected_count = expected_task_ids.len();
 
     for node in &cluster {
@@ -784,7 +784,7 @@ local_test!(services_deployment_replicates_across_cluster, {
             .iter()
             .find(|svc| svc.id == service_id)
             .expect("service should replicate to every node");
-        let service_ids: BTreeSet<Uuid> = service.task_ids.iter().cloned().collect();
+        let service_ids: BTreeSet<Uuid> = service.replica_ids.iter().cloned().collect();
         assert_eq!(
             service_ids,
             expected_task_ids,
@@ -809,12 +809,12 @@ local_test!(services_placement_startup_avoids_over_replication, {
     TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
 
     let service_name = "placement-startup";
-    let templates = vec![demo_backend_task_template("backend", 3)];
+    let task_templates = vec![demo_backend_task_template("backend", 3)];
 
     let service_id = cluster[0]
         .node
         .service_controller
-        .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+        .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
         .await
         .expect("submit deployment");
 
@@ -888,11 +888,11 @@ local_test!(
             .await;
 
         let service_name = "placement-balance";
-        let templates = vec![demo_backend_task_template("backend", 3)];
+        let task_templates = vec![demo_backend_task_template("backend", 3)];
         let service_id = cluster[0]
             .node
             .service_controller
-            .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+            .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
             .await
             .expect("submit deployment");
 
@@ -919,7 +919,7 @@ local_test!(
             .expect("load service spec")
             .expect("service spec should be present");
         assert_eq!(
-            service_spec.task_ids.len(),
+            service_spec.replica_ids.len(),
             3,
             "service spec should track exactly three replicas"
         );
@@ -927,7 +927,7 @@ local_test!(
         let mut tasks_by_node: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
         let mut slots_by_node: HashMap<Uuid, usize> = HashMap::new();
 
-        for task_id in &service_spec.task_ids {
+        for task_id in &service_spec.replica_ids {
             let task = cluster[0]
                 .node
                 .task_manager
@@ -1120,13 +1120,13 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
         .expect("load final service spec")
         .expect("final service spec should be present");
     assert_eq!(
-        final_spec.task_ids.len(),
+        final_spec.replica_ids.len(),
         expected_replicas,
         "scaled service should track {expected_replicas} task ids"
     );
 
     let mut counts: HashMap<Uuid, usize> = HashMap::new();
-    for task_id in &final_spec.task_ids {
+    for task_id in &final_spec.replica_ids {
         let task = cluster[0]
             .node
             .task_manager
@@ -1165,7 +1165,7 @@ local_test!(services_large_deployment_converges_within_bound, {
 
     let service_name = "placement-large-converge";
     let expected_replicas = 24usize;
-    let templates = vec![demo_backend_task_template(
+    let task_templates = vec![demo_backend_task_template(
         "backend",
         expected_replicas as u16,
     )];
@@ -1173,7 +1173,7 @@ local_test!(services_large_deployment_converges_within_bound, {
     let service_id = cluster[0]
         .node
         .service_controller
-        .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+        .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
         .await
         .expect("submit large deployment");
 
@@ -1241,11 +1241,11 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
     let node = TestNode::new().await;
 
     let service_name = "stop-drain";
-    let templates = vec![demo_backend_task_template("backend", 1)];
+    let task_templates = vec![demo_backend_task_template("backend", 1)];
     let service_id = node
         .node
         .service_controller
-        .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+        .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
         .await
         .expect("submit deployment");
 
@@ -1277,7 +1277,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
         .expect("load running service")
         .expect("running service spec present");
     let task_id = *running_spec
-        .task_ids
+        .replica_ids
         .first()
         .expect("running service should expose one task id");
     let original_task = node
@@ -1402,7 +1402,7 @@ local_test!(
 
         let service_name = "deploy-from-stopped";
         let manifest_name = "deploy-from-stopped";
-        let templates = vec![demo_backend_task_template("backend", 2)];
+        let task_templates = vec![demo_backend_task_template("backend", 2)];
         let service_id = node
             .node
             .service_controller
@@ -1410,7 +1410,7 @@ local_test!(
                 Uuid::new_v4(),
                 manifest_name,
                 service_name,
-                templates.clone(),
+                task_templates.clone(),
             )
             .await
             .expect("submit baseline deployment");
@@ -1433,7 +1433,7 @@ local_test!(
             .expect("load running service")
             .expect("running service present");
         assert_eq!(
-            baseline.task_ids.len(),
+            baseline.replica_ids.len(),
             2,
             "baseline deployment should allocate both replicas"
         );
@@ -1455,7 +1455,7 @@ local_test!(
         );
 
         let redeploy_manifest_id = Uuid::new_v4();
-        let mut redeploy_templates = templates;
+        let mut redeploy_templates = task_templates;
         redeploy_templates[0].execution.image = "hashicorp/http-echo:0.2.3".to_string();
         node.node
             .service_controller
@@ -1490,7 +1490,7 @@ local_test!(
             "deploying from stopped should activate the new manifest generation"
         );
         assert_eq!(
-            redeployed.task_ids.len(),
+            redeployed.replica_ids.len(),
             2,
             "deploying from stopped should repopulate assignments for all replicas"
         );
@@ -1512,11 +1512,11 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
     TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
 
     let service_name = "stop-propagation-three-nodes";
-    let templates = vec![demo_backend_task_template("backend", 3)];
+    let task_templates = vec![demo_backend_task_template("backend", 3)];
     let service_id = cluster[0]
         .node
         .service_controller
-        .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+        .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
         .await
         .expect("submit deployment");
 
@@ -1651,7 +1651,7 @@ local_test!(services_node_drain_migrates_singleton_service, {
         .expect("load singleton service")
         .expect("singleton service should exist");
     let task_id = *service
-        .task_ids
+        .replica_ids
         .first()
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
@@ -1961,7 +1961,7 @@ local_test!(
                 .get(service_id)
                 .expect("load slow service")
                 && spec.status() == ServiceStatus::Deploying
-                && let Some(task_id) = spec.task_ids.first().copied()
+                && let Some(task_id) = spec.replica_ids.first().copied()
                 && let Ok(task) = cluster[0].node.task_manager.inspect_task(task_id).await
             {
                 deployment_target = Some((task.node_id, task_id));
@@ -2092,7 +2092,7 @@ local_test!(services_node_drain_reports_capacity_blocker, {
         .expect("load capacity-blocked service")
         .expect("capacity-blocked service should exist");
     let task_id = *service
-        .task_ids
+        .replica_ids
         .first()
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
@@ -2299,7 +2299,7 @@ local_test!(services_node_list_reports_drained_node_after_evacuation, {
         .expect("load singleton service")
         .expect("singleton service should exist");
     let task_id = *service
-        .task_ids
+        .replica_ids
         .first()
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
@@ -2369,11 +2369,11 @@ local_test!(
             .await;
 
         let service_name = "split-merge-rebalance";
-        let templates = vec![demo_backend_task_template("backend", 8)];
+        let task_templates = vec![demo_backend_task_template("backend", 8)];
         let service_id = cluster[0]
             .node
             .service_controller
-            .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+            .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
             .await
             .expect("submit deployment");
 
@@ -2558,13 +2558,13 @@ local_test!(
 
         let service_name = "split-merge-traffic";
         let network_id = create_logical_test_network(&cluster, "split-merge-traffic-network").await;
-        let templates = vec![demo_networked_backend_task_template(
+        let task_templates = vec![demo_networked_backend_task_template(
             "backend", 8, network_id,
         )];
         cluster[0]
             .node
             .service_controller
-            .submit_deployment(Uuid::new_v4(), service_name, service_name, templates)
+            .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
             .await
             .expect("submit deployment");
 
@@ -3081,13 +3081,13 @@ local_test!(services_sync_recovers_missing_entries, {
     let manifest = load_manifest_from_path(Path::new("examples/replicated_service.ron"))
         .expect("load service manifest");
 
-    let templates = manifest_to_service_templates(&manifest);
+    let task_templates = manifest_to_task_templates(&manifest);
     let manifest_id = Uuid::new_v4();
     ensure_demo_manifest_secrets(&cluster).await;
     let service_id = anchor
         .node
         .service_controller
-        .submit_deployment(manifest_id, &manifest.name, &manifest.name, templates)
+        .submit_deployment(manifest_id, &manifest.name, &manifest.name, task_templates)
         .await
         .expect("submit deployment via anchor");
 
@@ -3118,7 +3118,7 @@ local_test!(services_sync_recovers_missing_entries, {
         .expect("lookup service spec")
         .expect("service spec present");
 
-    let expected_task_ids: Vec<Uuid> = expected_spec.task_ids.clone();
+    let expected_task_ids: Vec<Uuid> = expected_spec.replica_ids.clone();
 
     peer.node
         .services
@@ -3173,7 +3173,7 @@ local_test!(services_redeploy_scales_replicas, {
     let service_name = "redeploy-scale";
     let manifest_name = "redeploy-scale";
 
-    let mut tasks = vec![ServiceTaskSpecValue {
+    let mut tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
         execution: WorkloadExecutionSpec {
             command: vec![
@@ -3220,7 +3220,7 @@ local_test!(services_redeploy_scales_replicas, {
         .get(service_id)
         .expect("read initial spec")
         .expect("initial spec present");
-    let initial_ids: BTreeSet<Uuid> = initial_spec.task_ids.iter().cloned().collect();
+    let initial_ids: BTreeSet<Uuid> = initial_spec.replica_ids.iter().cloned().collect();
     assert_eq!(
         initial_ids.len(),
         1,
@@ -3257,7 +3257,7 @@ local_test!(services_redeploy_scales_replicas, {
         panic!(
             "service should return to running after scale-out redeploy; current status={:?}, task_ids={}, rollout_phase={:?}, rollout_failed_steps={}, rollout_error={:?}",
             current.status(),
-            current.task_ids.len(),
+            current.replica_ids.len(),
             current.rollout.phase,
             current.rollout.failed_steps,
             current.rollout.last_error
@@ -3275,7 +3275,7 @@ local_test!(services_redeploy_scales_replicas, {
         .get(service_id)
         .expect("read updated spec")
         .expect("updated spec present");
-    let updated_ids: BTreeSet<Uuid> = updated_spec.task_ids.iter().cloned().collect();
+    let updated_ids: BTreeSet<Uuid> = updated_spec.replica_ids.iter().cloned().collect();
     assert_eq!(
         updated_ids.len(),
         3,
@@ -3294,7 +3294,7 @@ local_test!(services_redeploy_updates_resources, {
     let service_name = "redeploy-resources";
     let manifest_name = "redeploy-resources";
 
-    let mut tasks = vec![ServiceTaskSpecValue {
+    let mut tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
         execution: WorkloadExecutionSpec {
             command: vec![
@@ -3342,7 +3342,7 @@ local_test!(services_redeploy_updates_resources, {
         .expect("read baseline spec")
         .expect("baseline spec present");
     let initial_id = *initial_spec
-        .task_ids
+        .replica_ids
         .first()
         .expect("baseline spec should include one task id");
 
@@ -3377,7 +3377,7 @@ local_test!(services_redeploy_updates_resources, {
         panic!(
             "service should return to running after resource refresh; current status={:?}, task_ids={}, rollout_phase={:?}, rollout_failed_steps={}, rollout_error={:?}",
             current.status(),
-            current.task_ids.len(),
+            current.replica_ids.len(),
             current.rollout.phase,
             current.rollout.failed_steps,
             current.rollout.last_error
@@ -3391,11 +3391,11 @@ local_test!(services_redeploy_updates_resources, {
         .expect("read updated spec")
         .expect("updated spec present");
     assert_eq!(
-        updated_spec.task_ids.len(),
+        updated_spec.replica_ids.len(),
         1,
         "resource refresh should maintain a single replica"
     );
-    let replacement_id = updated_spec.task_ids[0];
+    let replacement_id = updated_spec.replica_ids[0];
     assert_ne!(
         replacement_id, initial_id,
         "resource change should replace the existing replica"
@@ -3424,7 +3424,7 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
     let service_name = "redeploy-unchanged";
     let manifest_name = "redeploy-unchanged";
 
-    let tasks = vec![ServiceTaskSpecValue {
+    let tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
         execution: WorkloadExecutionSpec {
             command: vec![
@@ -3520,7 +3520,7 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
         "unchanged redeploy should keep the active manifest id"
     );
     assert_eq!(
-        after.task_ids, baseline.task_ids,
+        after.replica_ids, baseline.replica_ids,
         "unchanged redeploy should not churn task assignments"
     );
     assert_eq!(
@@ -3540,7 +3540,7 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
     let service_name = "redeploy-rollback";
     let manifest_name = "redeploy-rollback";
 
-    let tasks = vec![ServiceTaskSpecValue {
+    let tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
         execution: WorkloadExecutionSpec {
             command: vec![
@@ -3584,7 +3584,7 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
         .expect("read baseline spec")
         .expect("baseline spec present");
     let baseline_manifest_id = baseline_spec.manifest_id;
-    let baseline_task_ids = baseline_spec.task_ids.clone();
+    let baseline_task_ids = baseline_spec.replica_ids.clone();
 
     let mut failing_tasks = tasks;
     failing_tasks[0].execution.cpu_millis = 500_000;
@@ -3618,7 +3618,7 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
         "failed rollout should restore previous manifest generation"
     );
     assert_eq!(
-        rolled_back.task_ids, baseline_task_ids,
+        rolled_back.replica_ids, baseline_task_ids,
         "failed rollout should restore previous task assignments"
     );
 });
@@ -3630,7 +3630,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
     let service_name = "redeploy-max-failures";
     let manifest_name = "redeploy-max-failures";
 
-    let tasks = vec![ServiceTaskSpecValue {
+    let tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
         execution: WorkloadExecutionSpec {
             command: vec![
@@ -3674,7 +3674,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
         .expect("read baseline spec")
         .expect("baseline spec present");
     let baseline_manifest_id = baseline_spec.manifest_id;
-    let baseline_task_ids = baseline_spec.task_ids.clone();
+    let baseline_task_ids = baseline_spec.replica_ids.clone();
 
     let mut failing_tasks = tasks;
     failing_tasks[0].execution.cpu_millis = 500_000;
@@ -3726,7 +3726,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
         "failing rollout should keep previous manifest after rollback"
     );
     assert_eq!(
-        rolled_back.task_ids, baseline_task_ids,
+        rolled_back.replica_ids, baseline_task_ids,
         "failing rollout should keep previous task ids after rollback"
     );
     assert_eq!(
@@ -3753,7 +3753,7 @@ local_test!(
         let service_name = "redeploy-stop-first";
         let manifest_name = "redeploy-stop-first";
 
-        let mut tasks = vec![ServiceTaskSpecValue {
+        let mut tasks = vec![TaskTemplateSpecValue {
             name: "echo".into(),
             execution: WorkloadExecutionSpec {
                 command: vec![
@@ -3796,7 +3796,7 @@ local_test!(
             .get(service_id)
             .expect("read baseline spec")
             .expect("baseline spec present");
-        let old_task_id = baseline_spec.task_ids[0];
+        let old_task_id = baseline_spec.replica_ids[0];
 
         tasks[0].execution.image = "alpine:3.19".into();
         let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, 1, true);
@@ -3882,7 +3882,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
     let service_name = "redeploy-parallelism-two";
     let manifest_name = "redeploy-parallelism-two";
 
-    let mut tasks = vec![ServiceTaskSpecValue {
+    let mut tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
         execution: WorkloadExecutionSpec {
             command: vec![
@@ -3982,7 +3982,7 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
     let service_name = "redeploy-no-rollback";
     let manifest_name = "redeploy-no-rollback";
 
-    let tasks = vec![ServiceTaskSpecValue {
+    let tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
         execution: WorkloadExecutionSpec {
             command: vec![
@@ -4084,7 +4084,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
 
     let service_name = "volume-unavailable-service";
     let manifest_name = "volume-unavailable-service";
-    let tasks = vec![ServiceTaskSpecValue {
+    let tasks = vec![TaskTemplateSpecValue {
         name: "db".into(),
         execution: WorkloadExecutionSpec {
             command: vec![
@@ -4134,7 +4134,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
         .expect("read running service spec")
         .expect("running service spec present");
     let task_id = *running
-        .task_ids
+        .replica_ids
         .first()
         .expect("service should own one task id");
 
@@ -4202,7 +4202,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
     let service_name = "redeploy-rollback-failure";
     let manifest_name = "redeploy-rollback-failure";
 
-    let tasks = vec![ServiceTaskSpecValue {
+    let tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
         execution: WorkloadExecutionSpec {
             command: vec![
@@ -4285,7 +4285,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
 });
 
 /// Builds a lightweight backend template used by placement-focused integration tests.
-fn empty_service_execution(image: &str) -> WorkloadExecutionSpec<ServiceTaskNetworkRequirement> {
+fn empty_service_execution(image: &str) -> WorkloadExecutionSpec<TaskTemplateNetworkRequirement> {
     WorkloadExecutionSpec {
         image: image.to_string(),
         command: Vec::new(),
@@ -4305,8 +4305,8 @@ fn empty_service_execution(image: &str) -> WorkloadExecutionSpec<ServiceTaskNetw
 }
 
 /// Builds a lightweight backend template used by placement-focused integration tests.
-fn demo_backend_task_template(name: &str, replicas: u16) -> ServiceTaskSpecValue {
-    ServiceTaskSpecValue {
+fn demo_backend_task_template(name: &str, replicas: u16) -> TaskTemplateSpecValue {
+    TaskTemplateSpecValue {
         name: name.to_string(),
         execution: WorkloadExecutionSpec {
             command: vec![
@@ -4332,9 +4332,9 @@ fn demo_networked_backend_task_template(
     name: &str,
     replicas: u16,
     network_id: Uuid,
-) -> ServiceTaskSpecValue {
+) -> TaskTemplateSpecValue {
     let mut template = demo_backend_task_template(name, replicas);
-    template.execution.networks = vec![ServiceTaskNetworkRequirement::new("default", network_id)];
+    template.execution.networks = vec![TaskTemplateNetworkRequirement::new("default", network_id)];
     template
 }
 
@@ -4436,7 +4436,7 @@ local_test!(services_depends_on_waits_for_dependency_publication, {
         "dependency-ordered deployment should still converge to running"
     );
 
-    let frontend_tasks = list_active_service_template_tasks(
+    let frontend_tasks = list_active_task_template_tasks(
         &node.node.task_manager,
         "depends-on-publication",
         "frontend",
@@ -4489,13 +4489,13 @@ local_test!(
         );
 
         let old_backend_task_ids: HashSet<Uuid> =
-            list_active_service_template_tasks(&node.node.task_manager, service_name, "backend")
+            list_active_task_template_tasks(&node.node.task_manager, service_name, "backend")
                 .await
                 .into_iter()
                 .map(|task| task.id)
                 .collect();
         let old_frontend_task_ids: HashSet<Uuid> =
-            list_active_service_template_tasks(&node.node.task_manager, service_name, "frontend")
+            list_active_task_template_tasks(&node.node.task_manager, service_name, "frontend")
                 .await
                 .into_iter()
                 .map(|task| task.id)
@@ -4910,8 +4910,8 @@ async fn list_active_service_tasks(manager: &WorkloadManager, service_name: &str
         .collect()
 }
 
-/// Lists active tasks for one service template so tests can assert template-level launch order.
-async fn list_active_service_template_tasks(
+/// Lists active tasks for one task template within a service.
+async fn list_active_task_template_tasks(
     manager: &WorkloadManager,
     service_name: &str,
     template_name: &str,
@@ -4928,7 +4928,7 @@ async fn list_active_service_template_tasks(
         .collect()
 }
 
-/// Returns true when every replica of one service template is running with a ready, published
+/// Returns true when every replica of one task template is running with a ready, published
 /// attachment on the provided logical network.
 async fn template_attachments_published(
     node: &TestNode,
@@ -4938,8 +4938,7 @@ async fn template_attachments_published(
     expected_task_count: usize,
 ) -> bool {
     let tasks =
-        list_active_service_template_tasks(&node.node.task_manager, service_name, template_name)
-            .await;
+        list_active_task_template_tasks(&node.node.task_manager, service_name, template_name).await;
     if tasks.len() != expected_task_count {
         return false;
     }
@@ -4986,7 +4985,7 @@ async fn wait_for_template_launch_after_dependency_publication(
             dependency_task_count,
         )
         .await;
-        let dependent_tasks = list_active_service_template_tasks(
+        let dependent_tasks = list_active_task_template_tasks(
             &node.node.task_manager,
             service_name,
             dependent_template,
@@ -5026,7 +5025,7 @@ async fn wait_for_template_replacement_after_dependency_publication(
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
-        let dependency_tasks = list_active_service_template_tasks(
+        let dependency_tasks = list_active_task_template_tasks(
             &node.node.task_manager,
             service_name,
             gate.dependency_template,
@@ -5045,7 +5044,7 @@ async fn wait_for_template_replacement_after_dependency_publication(
                 gate.dependency_task_count,
             )
             .await;
-        let dependent_tasks = list_active_service_template_tasks(
+        let dependent_tasks = list_active_task_template_tasks(
             &node.node.task_manager,
             service_name,
             gate.dependent_template,
@@ -5841,16 +5840,16 @@ async fn ensure_demo_manifest_secrets(cluster: &[TestNode]) {
     }
 }
 
-fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskSpecValue> {
+fn manifest_to_task_templates(manifest: &ServiceManifest) -> Vec<TaskTemplateSpecValue> {
     manifest
-        .tasks
+        .task_templates
         .iter()
         .map(|task| {
             // Tests run without kernel networking support, so we avoid provisioning
             // any overlay interfaces by submitting empty network requirements.
-            let networks: Vec<ServiceTaskNetworkRequirement> = Vec::new();
+            let networks: Vec<TaskTemplateNetworkRequirement> = Vec::new();
 
-            ServiceTaskSpecValue {
+            TaskTemplateSpecValue {
                 name: task.name.clone(),
                 execution: WorkloadExecutionSpec {
                     image: task.image.clone(),
@@ -5860,17 +5859,17 @@ fn manifest_to_service_templates(manifest: &ServiceManifest) -> Vec<ServiceTaskS
                     memory_bytes: task.resources.memory_bytes(),
                     gpu_count: 0,
                     restart_policy: task.restart_policy.as_ref().map(|policy| {
-                        ServiceTaskRestartPolicy {
+                        TaskTemplateRestartPolicy {
                             name: match policy.name {
-                                ManifestRestartPolicyName::No => ServiceTaskRestartPolicyKind::No,
+                                ManifestRestartPolicyName::No => TaskTemplateRestartPolicyKind::No,
                                 ManifestRestartPolicyName::Always => {
-                                    ServiceTaskRestartPolicyKind::Always
+                                    TaskTemplateRestartPolicyKind::Always
                                 }
                                 ManifestRestartPolicyName::OnFailure => {
-                                    ServiceTaskRestartPolicyKind::OnFailure
+                                    TaskTemplateRestartPolicyKind::OnFailure
                                 }
                                 ManifestRestartPolicyName::UnlessStopped => {
-                                    ServiceTaskRestartPolicyKind::UnlessStopped
+                                    TaskTemplateRestartPolicyKind::UnlessStopped
                                 }
                             },
                             max_retry_count: policy.max_retry_count.map(|value| {
@@ -5946,8 +5945,8 @@ fn service_spec_matches_expected(actual: &ServiceSpecValue, expected: &ServiceSp
         && actual.manifest_id == expected.manifest_id
         && actual.manifest_name == expected.manifest_name
         && actual.service_name == expected.service_name
-        && actual.tasks == expected.tasks
-        && actual.task_ids == expected.task_ids
+        && actual.task_templates == expected.task_templates
+        && actual.replica_ids == expected.replica_ids
         && actual.update_strategy == expected.update_strategy
         && actual.service_epoch == expected.service_epoch
         && actual.phase_version == expected.phase_version

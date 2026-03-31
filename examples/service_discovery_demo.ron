@@ -1,6 +1,6 @@
 (
     name: "discovery-demo",
-    tasks: [
+    task_templates: [
         (
             name: "backend",
             image: "hashicorp/http-echo:1.0.0",

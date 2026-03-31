@@ -48,7 +48,7 @@ struct RolloutProgress {
 
 struct RolloutArtifacts {
     assignment_index: BTreeMap<(String, u16), Uuid>,
-    old_templates_by_name: HashMap<String, ServiceTaskSpecValue>,
+    old_templates_by_name: HashMap<String, TaskTemplateSpecValue>,
     replacement_requests: Vec<WorkloadStartRequest>,
     rollback_new_task_ids: HashSet<Uuid>,
     rollback_old_tasks: HashMap<Uuid, RollbackTaskRecord>,
@@ -66,7 +66,7 @@ struct RolloutRunContext<'a> {
 /// Immutable state required to execute the replacement phase of one rollout.
 struct ReplacementPhaseContext<'a> {
     rollout: RolloutRunContext<'a>,
-    templates: &'a [ServiceTaskSpecValue],
+    task_templates: &'a [TaskTemplateSpecValue],
     template_graph: &'a RolloutTemplateGraph,
     replace: &'a [ReplicaReplacement],
     update_strategy: &'a ServiceUpdateStrategy,
@@ -77,14 +77,14 @@ impl<'a> ReplacementPhaseContext<'a> {
     /// Builds one replacement-phase context from the active rollout metadata.
     fn new(
         rollout: RolloutRunContext<'a>,
-        templates: &'a [ServiceTaskSpecValue],
+        task_templates: &'a [TaskTemplateSpecValue],
         template_graph: &'a RolloutTemplateGraph,
         replace: &'a [ReplicaReplacement],
         update_strategy: &'a ServiceUpdateStrategy,
     ) -> Self {
         Self {
             rollout,
-            templates,
+            task_templates,
             template_graph,
             replace,
             update_strategy,
@@ -96,9 +96,9 @@ impl<'a> ReplacementPhaseContext<'a> {
 /// Immutable state required to execute the removal phase of one rollout.
 struct RemovalPhaseContext<'a> {
     rollout: RolloutRunContext<'a>,
-    current_templates: &'a [ServiceTaskSpecValue],
+    current_templates: &'a [TaskTemplateSpecValue],
     template_graph: &'a RolloutTemplateGraph,
-    remove: &'a [ServiceTaskAssignment],
+    remove: &'a [ServiceReplicaAssignment],
 }
 
 /// One in-flight replacement chunk built from manifest-ordered rollout indices.
@@ -123,7 +123,7 @@ enum ChunkProgress {
 /// Stores the dependency-stage view of one manifest so rollout phases can honor template order.
 ///
 /// Rolling updates need both the topological stage layout and the expected replica count per
-/// template. The stage order keeps dependent templates from rolling ahead of their upstreams,
+/// template. The stage order keeps dependent task templates from rolling ahead of their upstreams,
 /// while replica counts let readiness gating verify that every required upstream replica is still
 /// present and published before the next stage begins.
 struct RolloutTemplateGraph {
@@ -135,15 +135,15 @@ impl RolloutTemplateGraph {
     /// Builds the dependency-stage graph for one manifest template set.
     fn from_templates(
         service_name: &str,
-        templates: &[ServiceTaskSpecValue],
+        task_templates: &[TaskTemplateSpecValue],
     ) -> anyhow::Result<Self> {
-        let stages = build_template_dependency_stages(templates).map_err(|err| {
+        let stages = build_template_dependency_stages(task_templates).map_err(|err| {
             anyhow!(
                 "invalid task dependency graph for service '{}': {err}",
                 service_name
             )
         })?;
-        let replica_counts = templates
+        let replica_counts = task_templates
             .iter()
             .map(|template| (template.name.clone(), template.replicas))
             .collect();
@@ -156,7 +156,7 @@ impl RolloutTemplateGraph {
     /// Groups replacement indices by dependency stage while preserving manifest order.
     fn replacement_stage_indices(
         &self,
-        templates: &[ServiceTaskSpecValue],
+        task_templates: &[TaskTemplateSpecValue],
         replace: &[ReplicaReplacement],
     ) -> Vec<Vec<usize>> {
         let mut by_template: HashMap<&str, Vec<usize>> = HashMap::new();
@@ -171,7 +171,7 @@ impl RolloutTemplateGraph {
         for stage in &self.stages {
             let mut indices = Vec::new();
             for template_index in &stage.template_indices {
-                let template_name = templates[*template_index].name.as_str();
+                let template_name = task_templates[*template_index].name.as_str();
                 if let Some(template_indices) = by_template.get(template_name) {
                     indices.extend(template_indices.iter().copied());
                 }
@@ -182,11 +182,11 @@ impl RolloutTemplateGraph {
         stages
     }
 
-    /// Groups removals in reverse dependency order so downstream templates drain before upstreams.
+    /// Groups removals in reverse dependency order so downstream task templates drain before upstreams.
     fn removal_stage_indices(
         &self,
-        templates: &[ServiceTaskSpecValue],
-        remove: &[ServiceTaskAssignment],
+        task_templates: &[TaskTemplateSpecValue],
+        remove: &[ServiceReplicaAssignment],
     ) -> Vec<Vec<usize>> {
         let mut by_template: HashMap<&str, Vec<usize>> = HashMap::new();
         for (index, assignment) in remove.iter().enumerate() {
@@ -200,7 +200,7 @@ impl RolloutTemplateGraph {
         for stage in self.stages.iter().rev() {
             let mut indices = Vec::new();
             for template_index in &stage.template_indices {
-                let template_name = templates[*template_index].name.as_str();
+                let template_name = task_templates[*template_index].name.as_str();
                 if let Some(template_indices) = by_template.get(template_name) {
                     indices.extend(template_indices.iter().copied());
                 }
@@ -211,10 +211,10 @@ impl RolloutTemplateGraph {
         stages
     }
 
-    /// Orders rollback restart steps in dependency order so upstream templates recover first.
+    /// Orders rollback restart steps in dependency order so upstream task templates recover first.
     fn rollback_steps(
         &self,
-        templates: &[ServiceTaskSpecValue],
+        task_templates: &[TaskTemplateSpecValue],
         rollback_old_tasks: &HashMap<Uuid, RollbackTaskRecord>,
     ) -> Vec<RollbackTaskRecord> {
         let mut by_template: HashMap<String, Vec<RollbackTaskRecord>> = HashMap::new();
@@ -228,7 +228,7 @@ impl RolloutTemplateGraph {
         let mut ordered = Vec::new();
         for stage in &self.stages {
             for template_index in &stage.template_indices {
-                let template_name = &templates[*template_index].name;
+                let template_name = &task_templates[*template_index].name;
                 let Some(mut records) = by_template.remove(template_name) else {
                     continue;
                 };
@@ -245,20 +245,20 @@ impl RolloutTemplateGraph {
     }
 
     /// Builds the current active task-id view for each template from rollout assignment state.
-    fn active_dependency_task_ids(
+    fn active_dependency_replica_ids(
         &self,
-        templates: &[ServiceTaskSpecValue],
+        task_templates: &[TaskTemplateSpecValue],
         assignment_index: &BTreeMap<(String, u16), Uuid>,
     ) -> HashMap<String, Vec<Uuid>> {
-        let mut by_template = HashMap::with_capacity(templates.len());
-        for template in templates {
-            let mut task_ids = Vec::with_capacity(template.replicas as usize);
+        let mut by_template = HashMap::with_capacity(task_templates.len());
+        for template in task_templates {
+            let mut replica_ids = Vec::with_capacity(template.replicas as usize);
             for replica in 1..=template.replicas {
-                if let Some(task_id) = assignment_index.get(&(template.name.clone(), replica)) {
-                    task_ids.push(*task_id);
+                if let Some(replica_id) = assignment_index.get(&(template.name.clone(), replica)) {
+                    replica_ids.push(*replica_id);
                 }
             }
-            by_template.insert(template.name.clone(), task_ids);
+            by_template.insert(template.name.clone(), replica_ids);
         }
         by_template
     }
@@ -268,13 +268,13 @@ impl RolloutTemplateGraph {
 fn build_replacement_requests(
     service_name: &str,
     service_id: Uuid,
-    templates: &[ServiceTaskSpecValue],
+    task_templates: &[TaskTemplateSpecValue],
     replacements: &[ReplicaReplacement],
     eligible_nodes: &[Uuid],
     volume_registry: &VolumeRegistry,
 ) -> Vec<WorkloadStartRequest> {
     let slot_targets =
-        compute_effective_slot_targets(service_id, templates, eligible_nodes, volume_registry)
+        compute_effective_slot_targets(service_id, task_templates, eligible_nodes, volume_registry)
             .unwrap_or_default();
     replacements
         .iter()
@@ -301,28 +301,31 @@ impl ServiceController {
             manifest_id,
             manifest_name,
             service_name,
-            templates,
+            task_templates,
             current_spec,
             update_strategy,
         } = job;
 
         let previous_status = current_spec.status();
         let current_assignments = self
-            .collect_assignments(&service_name, &current_spec.task_ids)
+            .collect_assignments(&service_name, &current_spec.replica_ids)
             .await;
-        let desired_graph = RolloutTemplateGraph::from_templates(&service_name, &templates)?;
+        let desired_graph = RolloutTemplateGraph::from_templates(&service_name, &task_templates)?;
         let current_graph =
-            RolloutTemplateGraph::from_templates(&service_name, &current_spec.tasks)?;
+            RolloutTemplateGraph::from_templates(&service_name, &current_spec.task_templates)?;
 
-        let plan =
-            compute_change_plan(&current_spec.tasks, &templates, current_assignments.clone());
+        let plan = compute_change_plan(
+            &current_spec.task_templates,
+            &task_templates,
+            current_assignments.clone(),
+        );
 
         if plan.is_noop() {
             self.apply_noop_redeployment(
                 &current_spec,
                 manifest_id,
                 manifest_name,
-                templates,
+                task_templates,
                 update_strategy,
                 previous_status,
             )
@@ -343,14 +346,14 @@ impl ServiceController {
         };
         let replacement_phase = ReplacementPhaseContext::new(
             rollout,
-            &templates,
+            &task_templates,
             &desired_graph,
             &replace,
             &update_strategy,
         );
         let removal_phase = RemovalPhaseContext {
             rollout,
-            current_templates: &current_spec.tasks,
+            current_templates: &current_spec.task_templates,
             template_graph: &current_graph,
             remove: &remove,
         };
@@ -372,7 +375,7 @@ impl ServiceController {
         let mut artifacts = self.build_rollout_artifacts(
             &service_name,
             &current_spec,
-            &templates,
+            &task_templates,
             &current_assignments,
             &replace,
         );
@@ -407,7 +410,7 @@ impl ServiceController {
         self.finalize_successful_redeployment(
             manifest_id,
             &manifest_name,
-            &templates,
+            &task_templates,
             &current_spec,
             update_strategy,
             &artifacts.assignment_index,
@@ -421,14 +424,14 @@ impl ServiceController {
         current_spec: &ServiceSpecValue,
         manifest_id: Uuid,
         manifest_name: String,
-        templates: Vec<ServiceTaskSpecValue>,
+        task_templates: Vec<TaskTemplateSpecValue>,
         update_strategy: ServiceUpdateStrategy,
         previous_status: ServiceStatus,
     ) -> anyhow::Result<()> {
         let mut updated = current_spec.clone();
         updated.manifest_id = manifest_id;
         updated.manifest_name = manifest_name;
-        updated.tasks = templates;
+        updated.task_templates = task_templates;
         updated.update_strategy = update_strategy;
         updated.start_new_generation();
         updated.previous_generation = None;
@@ -483,15 +486,15 @@ impl ServiceController {
         &self,
         service_name: &str,
         current_spec: &ServiceSpecValue,
-        templates: &[ServiceTaskSpecValue],
-        current_assignments: &[ServiceTaskAssignment],
+        task_templates: &[TaskTemplateSpecValue],
+        current_assignments: &[ServiceReplicaAssignment],
         replace: &[ReplicaReplacement],
     ) -> RolloutArtifacts {
         let eligible_nodes = self.collect_eligible_nodes();
         let replacement_requests = build_replacement_requests(
             service_name,
             current_spec.id,
-            templates,
+            task_templates,
             replace,
             &eligible_nodes,
             &self.volume_registry,
@@ -503,8 +506,8 @@ impl ServiceController {
                 assignment.task_id,
             );
         }
-        let old_templates_by_name: HashMap<String, ServiceTaskSpecValue> = current_spec
-            .tasks
+        let old_templates_by_name: HashMap<String, TaskTemplateSpecValue> = current_spec
+            .task_templates
             .iter()
             .cloned()
             .map(|template| (template.name.clone(), template))
@@ -642,11 +645,11 @@ impl ServiceController {
         stage: &TemplateDependencyStage,
         assignment_index: &BTreeMap<(String, u16), Uuid>,
     ) -> anyhow::Result<()> {
-        let dependency_task_ids = phase
+        let dependency_replica_ids = phase
             .template_graph
-            .active_dependency_task_ids(phase.templates, assignment_index);
+            .active_dependency_replica_ids(phase.task_templates, assignment_index);
         for template_index in &stage.template_indices {
-            let template = &phase.templates[*template_index];
+            let template = &phase.task_templates[*template_index];
             if template.depends_on.is_empty() {
                 continue;
             }
@@ -660,7 +663,7 @@ impl ServiceController {
                     template_replica_counts: &phase.template_graph.replica_counts,
                     update_strategy: phase.update_strategy,
                 },
-                &dependency_task_ids,
+                &dependency_replica_ids,
             )
             .await?;
         }
@@ -946,7 +949,7 @@ impl ServiceController {
     ) -> Option<anyhow::Error> {
         let replacement_stage_indices = phase
             .template_graph
-            .replacement_stage_indices(phase.templates, phase.replace);
+            .replacement_stage_indices(phase.task_templates, phase.replace);
 
         for (stage, stage_indices) in phase
             .template_graph
@@ -1040,28 +1043,28 @@ impl ServiceController {
         &self,
         manifest_id: Uuid,
         manifest_name: &str,
-        templates: &[ServiceTaskSpecValue],
+        task_templates: &[TaskTemplateSpecValue],
         current_spec: &ServiceSpecValue,
         update_strategy: ServiceUpdateStrategy,
         assignment_index: &BTreeMap<(String, u16), Uuid>,
     ) -> anyhow::Result<()> {
         let service_name = current_spec.service_name.as_str();
-        let ordered_task_ids = order_task_ids(service_name, templates, assignment_index);
+        let ordered_task_ids = order_task_ids(service_name, task_templates, assignment_index);
         let mut next_spec = match self.registry.get(current_spec.id)? {
             Some(spec) if spec.manifest_id == manifest_id => spec,
             _ => ServiceSpecValue::new(
                 manifest_id,
                 manifest_name.to_string(),
                 service_name.to_string(),
-                templates.to_vec(),
+                task_templates.to_vec(),
                 Vec::new(),
             ),
         };
         next_spec.manifest_id = manifest_id;
         next_spec.manifest_name = manifest_name.to_string();
         next_spec.service_name = service_name.to_string();
-        next_spec.tasks = templates.to_vec();
-        next_spec.task_ids = ordered_task_ids;
+        next_spec.task_templates = task_templates.to_vec();
+        next_spec.replica_ids = ordered_task_ids;
         next_spec.update_strategy = update_strategy;
         next_spec.service_epoch = current_spec.service_epoch.saturating_add(1);
         next_spec.previous_generation = None;
@@ -1142,8 +1145,8 @@ impl ServiceController {
     async fn stop_task_and_track_rollback(
         &self,
         service_name: &str,
-        assignment: &ServiceTaskAssignment,
-        old_templates_by_name: &HashMap<String, ServiceTaskSpecValue>,
+        assignment: &ServiceReplicaAssignment,
+        old_templates_by_name: &HashMap<String, TaskTemplateSpecValue>,
         rollback_old_tasks: &mut HashMap<Uuid, RollbackTaskRecord>,
     ) -> anyhow::Result<()> {
         if let Err(err) = self
@@ -1221,8 +1224,8 @@ impl ServiceController {
             return Ok(());
         }
 
-        let old_templates_by_name: HashMap<String, ServiceTaskSpecValue> = current_spec
-            .tasks
+        let old_templates_by_name: HashMap<String, TaskTemplateSpecValue> = current_spec
+            .task_templates
             .iter()
             .cloned()
             .map(|template| (template.name.clone(), template))
@@ -1233,13 +1236,13 @@ impl ServiceController {
         let eligible_nodes = self.collect_eligible_nodes();
         let slot_targets = compute_effective_slot_targets(
             current_spec.id,
-            &current_spec.tasks,
+            &current_spec.task_templates,
             &eligible_nodes,
             &self.volume_registry,
         )
         .unwrap_or_default();
 
-        for step in current_graph.rollback_steps(&current_spec.tasks, rollback_old_tasks) {
+        for step in current_graph.rollback_steps(&current_spec.task_templates, rollback_old_tasks) {
             let template = old_templates_by_name.get(&step.template).ok_or_else(|| {
                 anyhow!(
                     "rollback template '{}' missing while restoring service '{}'",
@@ -1295,16 +1298,16 @@ impl ServiceController {
     async fn verify_rollback_target_assignments(
         &self,
         service_name: &str,
-        task_ids: &[Uuid],
+        replica_ids: &[Uuid],
     ) -> anyhow::Result<()> {
-        if task_ids.is_empty() {
+        if replica_ids.is_empty() {
             return Err(anyhow!(
-                "rollback target for service '{}' has no assigned task ids",
+                "rollback target for service '{}' has no assigned replica ids",
                 service_name
             ));
         }
 
-        let states = self.task_manager.task_state_snapshot(task_ids).await?;
+        let states = self.task_manager.task_state_snapshot(replica_ids).await?;
         for (task_id, state) in states {
             match state {
                 Some(
@@ -1422,7 +1425,7 @@ impl ServiceController {
             {
                 Ok(()) => {
                     if let Err(validation_err) = self
-                        .verify_rollback_target_assignments(service_name, &current_spec.task_ids)
+                        .verify_rollback_target_assignments(service_name, &current_spec.replica_ids)
                         .await
                     {
                         tracing::warn!(
@@ -1492,7 +1495,7 @@ impl ServiceController {
                     max_failures: settings.max_failures,
                     last_error: Some(rollout_error.to_string()),
                 });
-                failed_spec.task_ids.clear();
+                failed_spec.replica_ids.clear();
                 failed_spec.set_status(ServiceStatus::Failed);
                 if let Err(err) = self.apply_upsert(failed_spec.clone()).await {
                     tracing::warn!(

@@ -1,6 +1,6 @@
 (
     name: "demo-service",
-    tasks: [
+    task_templates: [
         (
             name: "echo",
             image: "alpine:3.20",

@@ -1,7 +1,7 @@
 use crate::config::ClientConfig;
 use crate::connection;
 use crate::services::manifest::{
-    RestartPolicyName as ManifestRestartPolicyName, TaskRestartPolicy,
+    RestartPolicyName as ManifestRestartPolicyName, TaskTemplateRestartPolicy,
 };
 use crate::tasks::uuid_to_string;
 use anyhow::{Result, anyhow};
@@ -24,7 +24,7 @@ pub struct TaskStartParams {
     pub command: Vec<String>,
     pub cpu_millis: u64,
     pub memory_bytes: u64,
-    pub restart_policy: Option<TaskRestartPolicy>,
+    pub restart_policy: Option<TaskTemplateRestartPolicy>,
 }
 
 /// Run a task via the task service and return its runtime details.

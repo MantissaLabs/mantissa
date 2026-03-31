@@ -10,8 +10,8 @@ use crate::workload::types::{TaskExecutionSpec, WorkloadExecutionSpec};
 pub use crate::workload::types::{
     WorkloadLivenessProbe as ServiceLivenessProbe,
     WorkloadLivenessProbeKind as ServiceLivenessProbeKind,
-    WorkloadRestartPolicy as ServiceTaskRestartPolicy,
-    WorkloadRestartPolicyKind as ServiceTaskRestartPolicyKind,
+    WorkloadRestartPolicy as TaskTemplateRestartPolicy,
+    WorkloadRestartPolicyKind as TaskTemplateRestartPolicyKind,
 };
 
 /// Value stored in the replicated service store describing desired service state.
@@ -25,8 +25,8 @@ pub struct ServiceSpecValue {
     pub manifest_id: Uuid,
     pub manifest_name: String,
     pub service_name: String,
-    pub tasks: Vec<ServiceTaskSpecValue>,
-    pub task_ids: Vec<Uuid>,
+    pub task_templates: Vec<TaskTemplateSpecValue>,
+    pub replica_ids: Vec<Uuid>,
     pub updated_at: String,
     #[serde(default)]
     pub update_strategy: ServiceUpdateStrategy,
@@ -52,8 +52,8 @@ impl ServiceSpecValue {
         manifest_id: Uuid,
         manifest_name: impl Into<String>,
         service_name: impl Into<String>,
-        tasks: Vec<ServiceTaskSpecValue>,
-        task_ids: Vec<Uuid>,
+        task_templates: Vec<TaskTemplateSpecValue>,
+        replica_ids: Vec<Uuid>,
     ) -> Self {
         let manifest_name = manifest_name.into();
         let service_name = service_name.into();
@@ -64,8 +64,8 @@ impl ServiceSpecValue {
             manifest_id,
             manifest_name,
             service_name,
-            tasks,
-            task_ids,
+            task_templates,
+            replica_ids,
             updated_at: current_timestamp(),
             update_strategy: ServiceUpdateStrategy::default(),
             service_epoch: 0,
@@ -133,8 +133,8 @@ impl ServiceSpecValue {
 pub struct ServicePreviousGeneration {
     pub manifest_id: Uuid,
     pub manifest_name: String,
-    pub tasks: Vec<ServiceTaskSpecValue>,
-    pub task_ids: Vec<Uuid>,
+    pub task_templates: Vec<TaskTemplateSpecValue>,
+    pub replica_ids: Vec<Uuid>,
     #[serde(default)]
     pub update_strategy: ServiceUpdateStrategy,
     #[serde(default)]
@@ -149,8 +149,8 @@ impl ServicePreviousGeneration {
         Self {
             manifest_id: spec.manifest_id,
             manifest_name: spec.manifest_name.clone(),
-            tasks: spec.tasks.clone(),
-            task_ids: spec.task_ids.clone(),
+            task_templates: spec.task_templates.clone(),
+            replica_ids: spec.replica_ids.clone(),
             update_strategy: spec.update_strategy.clone(),
             service_epoch: spec.service_epoch,
             status: spec.status,
@@ -167,8 +167,8 @@ impl ServicePreviousGeneration {
             self.manifest_id,
             self.manifest_name.clone(),
             service_name,
-            self.tasks.clone(),
-            self.task_ids.clone(),
+            self.task_templates.clone(),
+            self.replica_ids.clone(),
         );
         spec.id = service_id;
         spec.update_strategy = self.update_strategy.clone();
@@ -337,11 +337,11 @@ impl ServiceReadinessProbe {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ServiceTaskSpecValue {
+pub struct TaskTemplateSpecValue {
     /// Template-local name used to identify one replica set within the service.
     pub name: String,
-    /// Shared execution/runtime template reused by every replica of this service template.
-    pub execution: WorkloadExecutionSpec<ServiceTaskNetworkRequirement>,
+    /// Shared execution/runtime template reused by every replica of this task template.
+    pub execution: WorkloadExecutionSpec<TaskTemplateNetworkRequirement>,
     /// Template names within the same service that must be ready before this template starts.
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -367,12 +367,12 @@ pub enum ServicePortProtocol {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ServiceTaskNetworkRequirement {
+pub struct TaskTemplateNetworkRequirement {
     pub name: String,
     pub network_id: Uuid,
 }
 
-impl ServiceTaskNetworkRequirement {
+impl TaskTemplateNetworkRequirement {
     pub fn new(name: impl Into<String>, network_id: Uuid) -> Self {
         Self {
             name: name.into(),
@@ -381,7 +381,7 @@ impl ServiceTaskNetworkRequirement {
     }
 }
 
-impl ServiceTaskSpecValue {
+impl TaskTemplateSpecValue {
     /// Returns the distributed readiness probe, if the template declares one.
     pub fn readiness(&self) -> Option<&ServiceReadinessProbe> {
         self.readiness.as_ref()
@@ -461,8 +461,8 @@ fn short_id(id: &Uuid) -> String {
     raw[..8].to_string()
 }
 
-impl Deref for ServiceTaskSpecValue {
-    type Target = WorkloadExecutionSpec<ServiceTaskNetworkRequirement>;
+impl Deref for TaskTemplateSpecValue {
+    type Target = WorkloadExecutionSpec<TaskTemplateNetworkRequirement>;
 
     /// Exposes the shared execution fields so service callers can keep using task-like accessors.
     fn deref(&self) -> &Self::Target {

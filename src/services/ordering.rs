@@ -124,7 +124,7 @@ fn blocks_cross_manifest_reactivation(
         current.status,
         ServiceStatus::Stopped | ServiceStatus::Failed
     ) && candidate.service_epoch > current.service_epoch
-        && !(candidate.status == ServiceStatus::Deploying && candidate.task_ids.is_empty())
+        && !(candidate.status == ServiceStatus::Deploying && candidate.replica_ids.is_empty())
 }
 
 /// Returns true when the spec carries persisted rollout evidence from a failed redeploy.
@@ -175,7 +175,7 @@ fn status_rank(status: ServiceStatus) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::types::ServiceTaskSpecValue;
+    use crate::services::types::TaskTemplateSpecValue;
     use crate::workload::types::WorkloadExecutionSpec;
     use chrono::{Duration as ChronoDuration, Utc};
     use uuid::Uuid;
@@ -187,7 +187,7 @@ mod tests {
         phase_version: u64,
         status: ServiceStatus,
     ) -> ServiceSpecValue {
-        let tasks = vec![ServiceTaskSpecValue {
+        let task_templates = vec![TaskTemplateSpecValue {
             name: "api".into(),
             execution: WorkloadExecutionSpec {
                 image: "ghcr.io/demo/api:latest".into(),
@@ -212,8 +212,13 @@ mod tests {
             public_protocol: None,
         }];
 
-        let mut spec =
-            ServiceSpecValue::new(manifest_id, "manifest", "demo-service", tasks, vec![]);
+        let mut spec = ServiceSpecValue::new(
+            manifest_id,
+            "manifest",
+            "demo-service",
+            task_templates,
+            vec![],
+        );
         spec.service_epoch = service_epoch;
         spec.phase_version = phase_version;
         spec.status = status;

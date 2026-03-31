@@ -95,7 +95,7 @@ fn select_best_service_spec(values: &[ServiceSpecValue]) -> Option<ServiceSpecVa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::types::ServiceTaskSpecValue;
+    use crate::services::types::TaskTemplateSpecValue;
     use crate::services::types::{ServiceRolloutState, ServiceStatus};
     use crate::store::service_store::open_service_store;
     use crate::workload::types::WorkloadExecutionSpec;
@@ -121,7 +121,7 @@ mod tests {
             manifest_id,
             "demo-manifest",
             "demo-service",
-            vec![ServiceTaskSpecValue {
+            vec![TaskTemplateSpecValue {
                 name: "web".into(),
                 execution: WorkloadExecutionSpec {
                     image: "ghcr.io/demo/web:latest".into(),
@@ -151,21 +151,21 @@ mod tests {
         registry.upsert(spec.clone()).await.expect("upsert");
 
         let fetched = registry.get(spec.id).expect("get").expect("value");
-        assert_eq!(fetched.tasks.len(), 1);
-        assert_eq!(fetched.tasks[0].image, "ghcr.io/demo/web:latest");
+        assert_eq!(fetched.task_templates.len(), 1);
+        assert_eq!(fetched.task_templates[0].image, "ghcr.io/demo/web:latest");
 
         let listed = registry.list().expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].service_name, "demo-service");
-        assert_eq!(listed[0].tasks.len(), 1);
-        assert_eq!(listed[0].tasks[0].name, "web");
+        assert_eq!(listed[0].task_templates.len(), 1);
+        assert_eq!(listed[0].task_templates[0].name, "web");
 
         // Update same service with new manifest id (should overwrite)
         let mut updated = ServiceSpecValue::new(
             Uuid::new_v4(),
             "demo-manifest",
             "demo-service",
-            vec![ServiceTaskSpecValue {
+            vec![TaskTemplateSpecValue {
                 name: "web".into(),
                 execution: WorkloadExecutionSpec {
                     image: "ghcr.io/demo/web:v2".into(),
@@ -196,8 +196,8 @@ mod tests {
 
         let listed = registry.list().expect("list again");
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].tasks[0].image, "ghcr.io/demo/web:v2");
-        assert_eq!(listed[0].tasks[0].replicas, 3);
+        assert_eq!(listed[0].task_templates[0].image, "ghcr.io/demo/web:v2");
+        assert_eq!(listed[0].task_templates[0].replicas, 3);
     }
 
     /// Builds a service value with explicit lifecycle metadata for preference tests.
@@ -205,9 +205,9 @@ mod tests {
         manifest_id: Uuid,
         status: ServiceStatus,
         updated_at: DateTime<Utc>,
-        task_ids: Vec<Uuid>,
+        replica_ids: Vec<Uuid>,
     ) -> ServiceSpecValue {
-        let tasks = vec![ServiceTaskSpecValue {
+        let task_templates = vec![TaskTemplateSpecValue {
             name: "api".into(),
             execution: WorkloadExecutionSpec {
                 image: "ghcr.io/demo/api:latest".into(),
@@ -232,7 +232,8 @@ mod tests {
             public_protocol: None,
         }];
 
-        let mut value = ServiceSpecValue::new(manifest_id, "manifest", "svc", tasks, task_ids);
+        let mut value =
+            ServiceSpecValue::new(manifest_id, "manifest", "svc", task_templates, replica_ids);
         value.status = status;
         value.updated_at = updated_at.to_rfc3339();
         value

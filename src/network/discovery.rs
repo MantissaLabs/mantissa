@@ -912,8 +912,8 @@ fn sort_backends(backends: &mut [BackendAddress]) {
 fn build_task_template_index(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (String, String)> {
     let mut index = HashMap::new();
     for spec in specs {
-        let mut ids = spec.task_ids.iter();
-        for template in &spec.tasks {
+        let mut ids = spec.replica_ids.iter();
+        for template in &spec.task_templates {
             for _ in 0..template.replicas {
                 let Some(task_id) = ids.next() else { break };
                 index.insert(*task_id, (spec.service_name.clone(), template.name.clone()));
@@ -1395,21 +1395,21 @@ fn service_readiness_probe(
     service_name: &str,
 ) -> Option<ServiceReadinessProbe> {
     for spec in service_specs {
-        for task in &spec.tasks {
-            if task.name.eq_ignore_ascii_case(service_name) {
-                return task.readiness().cloned();
+        for template in &spec.task_templates {
+            if template.name.eq_ignore_ascii_case(service_name) {
+                return template.readiness().cloned();
             }
         }
     }
     None
 }
 
-/// Resolve the public nodeport requested by a service template, if any.
+/// Resolve the public nodeport requested by one task template, if any.
 fn service_public_port(service_specs: &[ServiceSpecValue], service_name: &str) -> Option<u16> {
     for spec in service_specs {
-        for task in &spec.tasks {
-            if task.name.eq_ignore_ascii_case(service_name) {
-                return task.public_port();
+        for template in &spec.task_templates {
+            if template.name.eq_ignore_ascii_case(service_name) {
+                return template.public_port();
             }
         }
     }
@@ -1422,9 +1422,9 @@ fn service_public_protocols(
     service_name: &str,
 ) -> Vec<NodePortProtocol> {
     for spec in service_specs {
-        for task in &spec.tasks {
-            if task.name.eq_ignore_ascii_case(service_name) {
-                return task
+        for template in &spec.task_templates {
+            if template.name.eq_ignore_ascii_case(service_name) {
+                return template
                     .public_protocols()
                     .into_iter()
                     .map(nodeport_protocol)
@@ -1440,7 +1440,7 @@ fn nodeport_protocol(protocol: ServicePortProtocol) -> NodePortProtocol {
     match protocol {
         ServicePortProtocol::Tcp => NodePortProtocol::Tcp,
         ServicePortProtocol::Udp => NodePortProtocol::Udp,
-        // TcpUdp is expanded into both entries by ServiceTaskSpecValue::public_protocols.
+        // TcpUdp is expanded into both entries by TaskTemplateSpecValue::public_protocols.
         ServicePortProtocol::TcpUdp => NodePortProtocol::Tcp,
     }
 }
@@ -1641,9 +1641,13 @@ async fn refresh_network_services(
 fn services_for_network(service_specs: &[ServiceSpecValue], network_id: Uuid) -> HashSet<String> {
     let mut services = HashSet::new();
     for spec in service_specs {
-        for task in &spec.tasks {
-            if task.networks.iter().any(|net| net.network_id == network_id) {
-                services.insert(task.name.clone());
+        for template in &spec.task_templates {
+            if template
+                .networks
+                .iter()
+                .any(|net| net.network_id == network_id)
+            {
+                services.insert(template.name.clone());
             }
         }
     }
@@ -1831,7 +1835,7 @@ async fn program_service_vip(
     }
 }
 
-/// Return true if a service template declares a public port for the given network.
+/// Return true if one task template declares a public port for the given network.
 ///
 /// This is used to decide whether Mantissa should proactively program host neighbour entries for
 /// VIPs, enabling `curl http://<vip>:<port>` from the node without relying on ARP synthesis.
@@ -1841,10 +1845,13 @@ fn service_is_public(
     service_name: &str,
 ) -> bool {
     service_specs.iter().any(|spec| {
-        spec.tasks.iter().any(|task| {
-            task.name.eq_ignore_ascii_case(service_name)
-                && task.public_port().is_some()
-                && task.networks.iter().any(|net| net.network_id == network_id)
+        spec.task_templates.iter().any(|template| {
+            template.name.eq_ignore_ascii_case(service_name)
+                && template.public_port().is_some()
+                && template
+                    .networks
+                    .iter()
+                    .any(|net| net.network_id == network_id)
         })
     })
 }
@@ -1949,7 +1956,7 @@ mod tests {
     };
     use crate::services::registry::ServiceRegistry;
     use crate::services::types::{
-        ServiceSpecValue, ServiceTaskNetworkRequirement, ServiceTaskSpecValue,
+        ServiceSpecValue, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
     };
     use crate::store::network_store::{
         open_network_attachment_store, open_network_peer_store, open_network_spec_store,
@@ -2183,7 +2190,7 @@ mod tests {
         })
     }
 
-    /// Writes one service template that maps the backend name to the provided network.
+    /// Writes one task template that maps the backend name to the provided network.
     async fn upsert_catalog_service(
         services: &ServiceRegistry,
         service_name: &str,
@@ -2194,19 +2201,19 @@ mod tests {
             .await;
     }
 
-    /// Writes one service template with optional backend readiness metadata for catalog tests.
+    /// Writes one task template with optional backend readiness metadata for catalog tests.
     async fn upsert_catalog_service_with_readiness(
         services: &ServiceRegistry,
         service_name: &str,
         network_id: Uuid,
-        task_ids: Vec<Uuid>,
+        replica_ids: Vec<Uuid>,
         readiness: Option<ServiceReadinessProbe>,
     ) {
         let service = ServiceSpecValue::new(
             Uuid::new_v4(),
             "catalog-test-manifest",
             service_name,
-            vec![ServiceTaskSpecValue {
+            vec![TaskTemplateSpecValue {
                 name: "backend".to_string(),
                 execution: WorkloadExecutionSpec {
                     image: "hashicorp/http-echo:1.0.0".to_string(),
@@ -2222,15 +2229,15 @@ mod tests {
                     env: Vec::new(),
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
-                    networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
+                    networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
                 },
                 depends_on: Vec::new(),
-                replicas: task_ids.len() as u16,
+                replicas: replica_ids.len() as u16,
                 readiness,
                 public_port: None,
                 public_protocol: None,
             }],
-            task_ids,
+            replica_ids,
         );
         services
             .upsert(service)

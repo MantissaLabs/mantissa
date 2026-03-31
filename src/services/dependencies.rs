@@ -1,4 +1,4 @@
-use crate::services::types::ServiceTaskSpecValue;
+use crate::services::types::TaskTemplateSpecValue;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
@@ -12,33 +12,33 @@ pub(super) struct TemplateDependencyStage {
     pub(super) template_indices: Vec<usize>,
 }
 
-/// Validates service template dependency metadata and returns deterministic
+/// Validates task-template dependency metadata and returns deterministic
 /// topological stages for deployment ordering.
 ///
 /// Dependencies are scoped to template names within one service manifest. This
 /// enforces unique template names, rejects unknown/self/duplicate dependencies,
-/// and groups templates by dependency depth so deployment can launch them stage
+/// and groups task templates by dependency depth so deployment can launch them stage
 /// by stage.
 pub(super) fn build_template_dependency_stages(
-    templates: &[ServiceTaskSpecValue],
+    task_templates: &[TaskTemplateSpecValue],
 ) -> Result<Vec<TemplateDependencyStage>> {
-    let mut name_to_index = HashMap::with_capacity(templates.len());
-    for (index, template) in templates.iter().enumerate() {
+    let mut name_to_index = HashMap::with_capacity(task_templates.len());
+    for (index, template) in task_templates.iter().enumerate() {
         if template.name.trim().is_empty() {
-            return Err(anyhow!("service task template name cannot be empty"));
+            return Err(anyhow!("task template name cannot be empty"));
         }
         if name_to_index.insert(template.name.clone(), index).is_some() {
             return Err(anyhow!(
-                "service task template '{}' is declared multiple times",
+                "task template '{}' is declared multiple times",
                 template.name
             ));
         }
     }
 
-    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); templates.len()];
-    let mut indegree = vec![0usize; templates.len()];
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); task_templates.len()];
+    let mut indegree = vec![0usize; task_templates.len()];
 
-    for (index, template) in templates.iter().enumerate() {
+    for (index, template) in task_templates.iter().enumerate() {
         let mut seen_dependencies: HashMap<&str, ()> = HashMap::new();
         for dependency in &template.depends_on {
             let dependency_name = dependency.trim();
@@ -89,7 +89,7 @@ pub(super) fn build_template_dependency_stages(
             template_indices: current_stage.clone(),
         });
 
-        let mut next_ready = vec![false; templates.len()];
+        let mut next_ready = vec![false; task_templates.len()];
         for index in &current_stage {
             for dependent in &adjacency[*index] {
                 indegree[*dependent] = indegree[*dependent].saturating_sub(1);
@@ -106,7 +106,7 @@ pub(super) fn build_template_dependency_stages(
             .collect();
     }
 
-    if visited != templates.len() {
+    if visited != task_templates.len() {
         return Err(anyhow!(
             "task template dependencies contain a cycle and cannot be ordered"
         ));
@@ -120,9 +120,9 @@ mod tests {
     use super::*;
     use crate::workload::types::WorkloadExecutionSpec;
 
-    /// Builds a minimal service template value for dependency graph tests.
-    fn template(name: &str, depends_on: &[&str]) -> ServiceTaskSpecValue {
-        ServiceTaskSpecValue {
+    /// Builds a minimal task-template value for dependency graph tests.
+    fn template(name: &str, depends_on: &[&str]) -> TaskTemplateSpecValue {
+        TaskTemplateSpecValue {
             name: name.to_string(),
             execution: WorkloadExecutionSpec {
                 image: "ghcr.io/demo/image:latest".to_string(),

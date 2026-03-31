@@ -26,7 +26,7 @@ The bundled manifest `examples/replicated_service.ron` shows how those secrets a
 ```ron
 (
     name: "demo-service",
-    tasks: [
+    task_templates: [
         (
             name: "echo",
             env: [

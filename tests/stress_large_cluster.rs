@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use client::config::ClientConfig;
 use client::connection;
 use client::services::manifest::{
-    ServiceManifest, ServiceUpdateStrategy, TaskResources, TaskSpec as ManifestTaskSpec,
+    ServiceManifest, ServiceUpdateStrategy, TaskTemplateResources, TaskTemplateSpec,
 };
 use client::services::{ServiceDeploymentHandle, deploy_manifest};
 use common::convergence::wait_until;
@@ -108,7 +108,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
         name: name.to_string(),
         volumes: Vec::new(),
         update: ServiceUpdateStrategy::default(),
-        tasks: vec![ManifestTaskSpec {
+        task_templates: vec![TaskTemplateSpec {
             name: "stress-backend".to_string(),
             image: "hashicorp/http-echo:1.0.0".to_string(),
             command: vec![
@@ -119,7 +119,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
             ],
             depends_on: Vec::new(),
             replicas,
-            resources: TaskResources {
+            resources: TaskTemplateResources {
                 cpu_millis: STRESS_TASK_CPU_MILLIS,
                 memory_mb: STRESS_TASK_MEMORY_MB,
                 gpu_count: 0,
@@ -189,7 +189,7 @@ struct TaskSnapshot {
 struct ServiceSnapshot {
     id: Uuid,
     status: ProtoServiceStatus,
-    task_ids: usize,
+    replica_ids: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -680,12 +680,15 @@ impl ProcessNode {
                 continue;
             }
             let id = Uuid::from_slice(&data).context("decode service id")?;
-            let task_ids = spec.get_task_ids().context("read service task ids")?.len() as usize;
+            let replica_ids = spec
+                .get_replica_ids()
+                .context("read service replica ids")?
+                .len() as usize;
 
             out.push(ServiceSnapshot {
                 id,
                 status: spec.get_status().context("read service status")?,
-                task_ids,
+                replica_ids,
             });
         }
 
@@ -979,9 +982,9 @@ async fn wait_for_service_task_count(
                 .into_iter()
                 .find(|spec| spec.id == service_id);
             let service_status = service_snapshot.as_ref().map(|spec| spec.status);
-            let tracked_task_ids = service_snapshot
+            let tracked_replica_ids = service_snapshot
                 .as_ref()
-                .map(|spec| spec.task_ids)
+                .map(|spec| spec.replica_ids)
                 .unwrap_or(0);
 
             let scheduler = node
@@ -997,9 +1000,9 @@ async fn wait_for_service_task_count(
                 .unwrap_or_else(|| "local_slots=<unavailable>".to_string());
 
             eprintln!(
-                "stress: task progress {count}/{expected} (best={best}, all_service_tasks={}, task_ids={}, service_status={service_status:?}, states={by_state:?}, running_by_node={running_by_node:?}, pending_by_node={pending_by_node:?}, {scheduler})",
+                "stress: task progress {count}/{expected} (best={best}, all_service_tasks={}, replica_ids={}, service_status={service_status:?}, states={by_state:?}, running_by_node={running_by_node:?}, pending_by_node={pending_by_node:?}, {scheduler})",
                 all_service_tasks.len(),
-                tracked_task_ids,
+                tracked_replica_ids,
             );
 
             last_report = Instant::now();

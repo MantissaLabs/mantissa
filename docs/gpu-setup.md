@@ -100,7 +100,7 @@ mantissa tasks start my-task \
 ```ron
 (
     name: "gpu-service",
-    tasks: [
+    task_templates: [
         (
             name: "inference",
             image: "ghcr.io/org/inference:latest",

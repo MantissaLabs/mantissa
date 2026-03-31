@@ -53,16 +53,16 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "SERVICE\tSTATUS\tROLLOUT\tREASON\tTASKS\tPUBLIC\tTASK IDS\tUPDATED\tID"
+        "SERVICE\tSTATUS\tROLLOUT\tREASON\tTASK TEMPLATES\tPUBLIC\tREPLICAS\tUPDATED\tID"
     )?;
 
     for row in display_rows {
-        let tasks_summary = if row.tasks.is_empty() {
+        let templates_summary = if row.task_templates.is_empty() {
             "-".to_string()
         } else {
-            row.tasks
+            row.task_templates
                 .iter()
-                .map(|task| format!("{} ({}x)", task.name, task.replicas))
+                .map(|template| format!("{} ({}x)", template.name, template.replicas))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -80,9 +80,9 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             row.status,
             row.rollout_summary(),
             row.rollout_reason_summary(),
-            tasks_summary,
+            templates_summary,
             public_summary,
-            row.task_ids.len(),
+            row.replica_ids.len(),
             row.updated_at,
             row.id,
         )?;
@@ -99,9 +99,9 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
 pub struct ServiceRow {
     pub id: String,
     pub service_name: String,
-    pub tasks: Vec<ServiceTaskRow>,
+    pub task_templates: Vec<TaskTemplateRow>,
     pub updated_at: String,
-    pub task_ids: Vec<Uuid>,
+    pub replica_ids: Vec<Uuid>,
     pub status: ServiceStatusRow,
     pub status_detail: Option<String>,
     pub rollout: ServiceRolloutRow,
@@ -114,20 +114,22 @@ impl ServiceRow {
         let id = uuid_to_string(spec.get_id()?)?;
         let service_name = spec.get_service_name()?.to_str()?.to_string();
 
-        let mut tasks = Vec::new();
-        for tmpl in spec.get_tasks()?.iter() {
-            tasks.push(ServiceTaskRow::from_reader(tmpl)?);
+        let mut task_templates = Vec::new();
+        for tmpl in spec.get_task_templates()?.iter() {
+            task_templates.push(TaskTemplateRow::from_reader(tmpl)?);
         }
 
-        let mut task_ids = Vec::new();
-        for wid in spec.get_task_ids()?.iter() {
+        let mut replica_ids = Vec::new();
+        for wid in spec.get_replica_ids()?.iter() {
             let data = wid?.to_owned();
             if data.len() != 16 {
-                return Err(CapnpError::failed("invalid task uuid length".to_string()));
+                return Err(CapnpError::failed(
+                    "invalid service replica uuid length".to_string(),
+                ));
             }
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(&data);
-            task_ids.push(Uuid::from_bytes(bytes));
+            replica_ids.push(Uuid::from_bytes(bytes));
         }
 
         let rollout = ServiceRolloutRow::from_reader(spec.get_rollout()?)?;
@@ -136,9 +138,9 @@ impl ServiceRow {
         Ok(Self {
             id,
             service_name,
-            tasks,
+            task_templates,
             updated_at: spec.get_updated_at()?.to_str()?.to_string(),
-            task_ids,
+            replica_ids,
             status: ServiceStatusRow::from_proto(spec.get_status()?),
             status_detail: if status_detail.is_empty() {
                 None
@@ -169,7 +171,7 @@ impl ServiceRow {
 }
 
 #[derive(Clone, Debug)]
-pub struct ServiceTaskRow {
+pub struct TaskTemplateRow {
     pub name: String,
     pub image: String,
     pub command: Vec<String>,
@@ -178,7 +180,7 @@ pub struct ServiceTaskRow {
     pub public_port: Option<u16>,
 }
 
-impl ServiceTaskRow {
+impl TaskTemplateRow {
     fn from_reader(reader: task_template::Reader<'_>) -> Result<Self, CapnpError> {
         let mut command = Vec::new();
         for arg in reader.get_command()?.iter() {
@@ -359,9 +361,9 @@ fn truncate_for_table(value: &str, max_chars: usize) -> String {
 /// `curl` services from the host without issuing manual DNS lookups.
 async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
     if !rows.iter().any(|row| {
-        row.tasks
+        row.task_templates
             .iter()
-            .any(|task| task.public_port.is_some() && !task.networks.is_empty())
+            .any(|template| template.public_port.is_some() && !template.networks.is_empty())
     }) {
         return;
     }
@@ -382,15 +384,16 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
     let mut attachments_cache: HashMap<Uuid, Vec<NetworkAttachment>> = HashMap::new();
 
     for row in rows.iter_mut() {
-        let template_task_ids = build_template_task_ids(&row.tasks, &row.task_ids);
+        let template_replica_ids =
+            build_template_replica_ids(&row.task_templates, &row.replica_ids);
         let mut endpoints = Vec::new();
 
-        for task in &row.tasks {
-            let Some(port) = task.public_port else {
+        for template in &row.task_templates {
+            let Some(port) = template.public_port else {
                 continue;
             };
 
-            let network_name = match task.networks.as_slice() {
+            let network_name = match template.networks.as_slice() {
                 [single] => single,
                 _ => continue,
             };
@@ -399,7 +402,7 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
                 continue;
             };
 
-            let template_ids = match template_task_ids.get(&task.name.to_ascii_lowercase()) {
+            let template_ids = match template_replica_ids.get(&template.name.to_ascii_lowercase()) {
                 Some(ids) => ids,
                 None => continue,
             };
@@ -450,13 +453,16 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
                 continue;
             }
 
-            let Some(vip) =
-                compute_service_vip(&network.subnet_cidr, network.id, &task.name, &backend_ips)
-            else {
+            let Some(vip) = compute_service_vip(
+                &network.subnet_cidr,
+                network.id,
+                &template.name,
+                &backend_ips,
+            ) else {
                 continue;
             };
 
-            endpoints.push(format!("{}={vip}:{port}", task.name));
+            endpoints.push(format!("{}={vip}:{port}", template.name));
         }
 
         endpoints.sort();
@@ -465,23 +471,24 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
     }
 }
 
-/// Map template names to their task identifiers based on the ordered `taskIds` list returned by the
-/// service registry so we can select the correct backend attachments for VIP collision avoidance.
-fn build_template_task_ids(
-    templates: &[ServiceTaskRow],
-    task_ids: &[Uuid],
+/// Map template names to their replica identifiers based on the ordered `replicaIds` list
+/// returned by the service registry so we can select the correct backend attachments for VIP
+/// collision avoidance.
+fn build_template_replica_ids(
+    task_templates: &[TaskTemplateRow],
+    replica_ids: &[Uuid],
 ) -> HashMap<String, HashSet<Uuid>> {
     let mut out: HashMap<String, HashSet<Uuid>> = HashMap::new();
     let mut cursor = 0usize;
 
-    for template in templates {
+    for template in task_templates {
         let key = template.name.to_ascii_lowercase();
         let entry = out.entry(key).or_default();
         let count = template.replicas as usize;
 
         for _ in 0..count {
-            if let Some(task_id) = task_ids.get(cursor) {
-                entry.insert(*task_id);
+            if let Some(replica_id) = replica_ids.get(cursor) {
+                entry.insert(*replica_id);
             }
             cursor = cursor.saturating_add(1);
         }
@@ -559,9 +566,9 @@ mod tests {
         ServiceRow {
             id: Uuid::nil().to_string(),
             service_name: "svc".to_string(),
-            tasks: Vec::new(),
+            task_templates: Vec::new(),
             updated_at: "2026-03-12T00:00:00Z".to_string(),
-            task_ids: Vec::new(),
+            replica_ids: Vec::new(),
             status: ServiceStatusRow::Deploying,
             status_detail: status_detail.map(str::to_string),
             rollout: ServiceRolloutRow {

@@ -20,7 +20,7 @@ with safe defaults.
             auto_rollback: true,
         ),
     ),
-    tasks: [
+    task_templates: [
         (
             name: "api",
             image: "ghcr.io/mantissa/demo-api:v2",

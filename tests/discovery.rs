@@ -13,7 +13,7 @@ use mantissa::network::types::{
 };
 use mantissa::services::registry::ServiceRegistry;
 use mantissa::services::types::{
-    ServiceSpecValue, ServiceTaskNetworkRequirement, ServiceTaskSpecValue,
+    ServiceSpecValue, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
 use mantissa::store::network_store::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
@@ -209,13 +209,13 @@ async fn upsert_service(
     services: &ServiceRegistry,
     service_name: &str,
     network_id: Uuid,
-    task_ids: Vec<Uuid>,
+    replica_ids: Vec<Uuid>,
 ) {
     let service = ServiceSpecValue::new(
         Uuid::new_v4(),
         "dns-test-manifest",
         service_name,
-        vec![ServiceTaskSpecValue {
+        vec![TaskTemplateSpecValue {
             name: "backend".to_string(),
             execution: WorkloadExecutionSpec {
                 image: "hashicorp/http-echo:1.0.0".to_string(),
@@ -231,15 +231,15 @@ async fn upsert_service(
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
-                networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
+                networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
             },
             depends_on: Vec::new(),
-            replicas: task_ids.len() as u16,
+            replicas: replica_ids.len() as u16,
             readiness: None,
             public_port: None,
             public_protocol: None,
         }],
-        task_ids,
+        replica_ids,
     );
     services.upsert(service).await.expect("upsert service");
 }

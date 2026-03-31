@@ -1,7 +1,7 @@
 use super::manifest::{
     EnvironmentVariable, LivenessKind, LivenessProbe, ReadinessKind, ReadinessProbe,
     RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference, ServiceManifest,
-    ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskSpec, VolumeMount,
+    ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateSpec, VolumeMount,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -45,12 +45,12 @@ fn compute_network_id(name: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-/// Ensure every network referenced by the manifest exists so scheduling can attach tasks reliably.
+/// Ensure every network referenced by the manifest exists so scheduling can attach task templates reliably.
 async fn ensure_manifest_networks(cfg: &ClientConfig, manifest: &ServiceManifest) -> Result<()> {
     let mut required = Vec::new();
     let mut seen = HashSet::new();
-    for task in &manifest.tasks {
-        for network in &task.networks {
+    for template in &manifest.task_templates {
+        for network in &template.networks {
             let trimmed = network.trim();
             if trimmed.is_empty() {
                 continue;
@@ -261,7 +261,7 @@ fn write_update_strategy(
 fn write_env_vars(
     builder: &mut struct_list::Builder<environment_var::Owned>,
     vars: &[EnvironmentVariable],
-    task_name: &str,
+    template_name: &str,
 ) -> Result<()> {
     for (idx, var) in vars.iter().enumerate() {
         let mut entry = builder.reborrow().get(idx as u32);
@@ -271,7 +271,10 @@ fn write_env_vars(
         }
         if let Some(secret) = &var.secret {
             let secret_builder = entry.reborrow().init_secret();
-            let context = format!("task '{}' environment '{}': secret", task_name, var.name);
+            let context = format!(
+                "template '{}' environment '{}': secret",
+                template_name, var.name
+            );
             write_secret_reference(secret_builder, secret, &context)?;
         }
     }
@@ -281,13 +284,16 @@ fn write_env_vars(
 fn write_secret_files(
     builder: &mut struct_list::Builder<secret_file::Owned>,
     files: &[SecretFileProjection],
-    task_name: &str,
+    template_name: &str,
 ) -> Result<()> {
     for (idx, file) in files.iter().enumerate() {
         let mut entry = builder.reborrow().get(idx as u32);
         entry.set_path(&file.path);
         let secret_builder = entry.reborrow().init_secret();
-        let context = format!("task '{}' secret file '{}': secret", task_name, file.path);
+        let context = format!(
+            "template '{}' secret file '{}': secret",
+            template_name, file.path
+        );
         write_secret_reference(secret_builder, &file.secret, &context)?;
         entry.set_mode(file.mode.unwrap_or(0));
     }
@@ -315,11 +321,13 @@ pub async fn deploy_manifest(
         spec.set_service_name(&manifest.name);
         write_update_strategy(spec.reborrow().init_update_strategy(), &manifest.update);
 
-        let mut tasks_builder = spec.reborrow().init_tasks(manifest.tasks.len() as u32);
-        for (idx, task) in manifest.tasks.iter().enumerate() {
-            write_task(
-                tasks_builder.reborrow().get(idx as u32),
-                task,
+        let mut templates_builder = spec
+            .reborrow()
+            .init_task_templates(manifest.task_templates.len() as u32);
+        for (idx, template) in manifest.task_templates.iter().enumerate() {
+            write_task_template(
+                templates_builder.reborrow().get(idx as u32),
+                template,
                 &resolved_volumes,
             )?;
         }
@@ -384,20 +392,20 @@ pub async fn deploy_manifest(
     })
 }
 
-/// Writes a manifest task specification into the Cap'n Proto builder for submission.
-fn write_task(
+/// Writes one manifest task template into the Cap'n Proto builder for submission.
+fn write_task_template(
     mut builder: task_template::Builder<'_>,
-    task: &TaskSpec,
+    template: &TaskTemplateSpec,
     resolved_volumes: &HashMap<String, ResolvedManifestVolume>,
 ) -> Result<()> {
-    builder.set_name(&task.name);
-    builder.set_image(&task.image);
-    builder.set_replicas(task.replicas);
-    builder.set_cpu_millis(task.resources.cpu_millis);
-    builder.set_memory_bytes(task.resources.memory_bytes());
-    builder.set_gpu_count(task.resources.gpu_count);
-    builder.set_termination_grace_period_secs(task.termination_grace_period_secs.unwrap_or(0));
-    let pre_stop = task.pre_stop_command.as_deref().unwrap_or(&[]);
+    builder.set_name(&template.name);
+    builder.set_image(&template.image);
+    builder.set_replicas(template.replicas);
+    builder.set_cpu_millis(template.resources.cpu_millis);
+    builder.set_memory_bytes(template.resources.memory_bytes());
+    builder.set_gpu_count(template.resources.gpu_count);
+    builder.set_termination_grace_period_secs(template.termination_grace_period_secs.unwrap_or(0));
+    let pre_stop = template.pre_stop_command.as_deref().unwrap_or(&[]);
     let mut pre_stop_builder = builder
         .reborrow()
         .init_pre_stop_command(pre_stop.len() as u32);
@@ -405,19 +413,21 @@ fn write_task(
         pre_stop_builder.set(idx as u32, arg);
     }
 
-    let mut cmd_builder = builder.reborrow().init_command(task.command.len() as u32);
-    for (idx, arg) in task.command.iter().enumerate() {
+    let mut cmd_builder = builder
+        .reborrow()
+        .init_command(template.command.len() as u32);
+    for (idx, arg) in template.command.iter().enumerate() {
         cmd_builder.set(idx as u32, arg);
     }
 
     let mut depends_on_builder = builder
         .reborrow()
-        .init_depends_on(task.depends_on.len() as u32);
-    for (idx, dependency) in task.depends_on.iter().enumerate() {
+        .init_depends_on(template.depends_on.len() as u32);
+    for (idx, dependency) in template.depends_on.iter().enumerate() {
         depends_on_builder.set(idx as u32, dependency);
     }
 
-    if let Some(policy) = &task.restart_policy {
+    if let Some(policy) = &template.restart_policy {
         let mut policy_builder = builder.reborrow().init_restart_policy();
         let name = match policy.name {
             RestartPolicyName::No => protocol::services::RestartPolicyName::No,
@@ -433,38 +443,42 @@ fn write_task(
         }));
     }
 
-    let mut env_builder = builder.reborrow().init_env(task.env.len() as u32);
-    write_env_vars(&mut env_builder, &task.env, &task.name)?;
+    let mut env_builder = builder.reborrow().init_env(template.env.len() as u32);
+    write_env_vars(&mut env_builder, &template.env, &template.name)?;
 
-    let mut networks_builder = builder.reborrow().init_networks(task.networks.len() as u32);
-    for (idx, network) in task.networks.iter().enumerate() {
+    let mut networks_builder = builder
+        .reborrow()
+        .init_networks(template.networks.len() as u32);
+    for (idx, network) in template.networks.iter().enumerate() {
         let trimmed = network.trim();
         let mut network_builder = networks_builder.reborrow().get(idx as u32);
         network_builder.set_name(trimmed);
         network_builder.set_network_id(compute_network_id(trimmed).as_bytes());
     }
 
-    if let Some(readiness) = task.readiness.as_ref() {
+    if let Some(readiness) = template.readiness.as_ref() {
         let builder = builder.reborrow().init_readiness();
         write_readiness_probe(builder, readiness);
     }
-    if let Some(liveness) = task.liveness.as_ref() {
+    if let Some(liveness) = template.liveness.as_ref() {
         let builder = builder.reborrow().init_liveness();
         write_liveness_probe(builder, liveness);
     }
 
-    builder.set_public_port(task.public_port.unwrap_or(0));
-    builder.set_tty(task.tty);
+    builder.set_public_port(template.public_port.unwrap_or(0));
+    builder.set_tty(template.tty);
 
     let mut files_builder = builder
         .reborrow()
-        .init_secret_files(task.secret_files.len() as u32);
-    write_secret_files(&mut files_builder, &task.secret_files, &task.name)?;
-    let mut volume_builder = builder.reborrow().init_volumes(task.volumes.len() as u32);
+        .init_secret_files(template.secret_files.len() as u32);
+    write_secret_files(&mut files_builder, &template.secret_files, &template.name)?;
+    let mut volume_builder = builder
+        .reborrow()
+        .init_volumes(template.volumes.len() as u32);
     write_volume_mounts(
         &mut volume_builder,
-        &task.name,
-        &task.volumes,
+        &template.name,
+        &template.volumes,
         resolved_volumes,
     )?;
 
@@ -511,10 +525,10 @@ fn write_liveness_probe(
     builder.set_start_period_ms(probe.start_period_ms);
 }
 
-/// Writes resolved named volume mounts into the task template builder for service deployment.
+/// Writes resolved named volume mounts into the task-template builder for deployment.
 fn write_volume_mounts(
     builder: &mut struct_list::Builder<volume_mount::Owned>,
-    task_name: &str,
+    template_name: &str,
     mounts: &[VolumeMount],
     resolved_volumes: &HashMap<String, ResolvedManifestVolume>,
 ) -> Result<()> {
@@ -522,8 +536,8 @@ fn write_volume_mounts(
         let source = mount.source.trim();
         let resolved = resolved_volumes.get(source).ok_or_else(|| {
             anyhow!(
-                "task '{}' references unresolved volume '{}'",
-                task_name,
+                "template '{}' references unresolved volume '{}'",
+                template_name,
                 mount.source
             )
         })?;

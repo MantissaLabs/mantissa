@@ -178,7 +178,7 @@ pub(super) async fn start_readiness_wait(
                             );
                         }
 
-                        for task_id in &running_spec.task_ids {
+                        for task_id in &running_spec.replica_ids {
                             controller
                                 .publish_running_task_traffic_best_effort(&service_name, *task_id)
                                 .await;
@@ -356,11 +356,11 @@ async fn poll_service_attempt(
             ServiceStatus::Deploying => {}
         }
 
-        if current.task_ids.is_empty() {
+        if current.replica_ids.is_empty() {
             last_states.clear();
             last_phase_versions.clear();
             last_terminal_launches.clear();
-            if current.tasks.is_empty() {
+            if current.task_templates.is_empty() {
                 return ReadinessOutcome::Success(current);
             } else {
                 tracing::debug!(
@@ -375,7 +375,7 @@ async fn poll_service_attempt(
         last_states.clear();
         last_phase_versions.clear();
         last_terminal_launches.clear();
-        for task_id in &current.task_ids {
+        for task_id in &current.replica_ids {
             match controller.task_manager.inspect_task(*task_id).await {
                 Ok(spec) => {
                     last_states.push((*task_id, Some(spec.state.clone())));
@@ -545,7 +545,7 @@ async fn mark_service_failed(
     };
     failed_spec.previous_generation = None;
     failed_spec.set_rollout(ServiceRolloutState::default());
-    failed_spec.task_ids.clear();
+    failed_spec.replica_ids.clear();
     failed_spec.set_status(ServiceStatus::Failed);
 
     if let Err(err) = controller.apply_upsert(failed_spec.clone()).await {

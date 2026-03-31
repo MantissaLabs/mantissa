@@ -3,8 +3,8 @@ use crate::services::types::{
     ServiceEvent, ServicePortProtocol, ServicePreviousGeneration, ServiceReadinessProbe,
     ServiceReadinessProbeKind, ServiceRescheduleLock, ServiceRescheduleReason,
     ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
-    ServiceSpecValue, ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskSpecValue,
-    ServiceUpdateStrategy, ServiceUpdateStrategyMode,
+    ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
+    TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
@@ -47,9 +47,9 @@ impl services::Server for ServicesRPC {
         let manifest_name = spec.get_manifest_name()?.to_str()?.to_string();
         let service_name = spec.get_service_name()?.to_str()?.to_string();
 
-        let mut tasks = Vec::new();
-        for tmpl in spec.get_tasks()?.iter() {
-            tasks.push(read_task_template(tmpl)?);
+        let mut task_templates = Vec::new();
+        for tmpl in spec.get_task_templates()?.iter() {
+            task_templates.push(read_task_template(tmpl)?);
         }
 
         let update_strategy = if spec.has_update_strategy() {
@@ -64,7 +64,7 @@ impl services::Server for ServicesRPC {
                 manifest_id,
                 manifest_name,
                 service_name,
-                tasks,
+                task_templates,
                 update_strategy,
             )
             .await
@@ -148,16 +148,18 @@ pub(crate) fn write_service_spec(
     );
     builder.set_status_detail(value.status_detail.as_deref().unwrap_or(""));
 
-    let mut tasks_builder = builder.reborrow().init_tasks(value.tasks.len() as u32);
-    for (idx, task) in value.tasks.iter().enumerate() {
-        write_task_template(tasks_builder.reborrow().get(idx as u32), task)?;
+    let mut templates_builder = builder
+        .reborrow()
+        .init_task_templates(value.task_templates.len() as u32);
+    for (idx, template) in value.task_templates.iter().enumerate() {
+        write_task_template(templates_builder.reborrow().get(idx as u32), template)?;
     }
 
-    let mut tasks_builder = builder
+    let mut replica_ids_builder = builder
         .reborrow()
-        .init_task_ids(value.task_ids.len() as u32);
-    for (idx, wid) in value.task_ids.iter().enumerate() {
-        tasks_builder.set(idx as u32, wid.as_bytes());
+        .init_replica_ids(value.replica_ids.len() as u32);
+    for (idx, wid) in value.replica_ids.iter().enumerate() {
+        replica_ids_builder.set(idx as u32, wid.as_bytes());
     }
 
     if let Some(lock) = value.reschedule_lock.as_ref() {
@@ -213,18 +215,23 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
     let manifest_name = reader.get_manifest_name()?.to_str()?.to_string();
     let service_name = reader.get_service_name()?.to_str()?.to_string();
 
-    let mut tasks = Vec::new();
-    for tmpl in reader.get_tasks()?.iter() {
-        tasks.push(read_task_template(tmpl)?);
+    let mut task_templates = Vec::new();
+    for tmpl in reader.get_task_templates()?.iter() {
+        task_templates.push(read_task_template(tmpl)?);
     }
 
-    let mut task_ids = Vec::new();
-    for wid in reader.get_task_ids()?.iter() {
-        task_ids.push(read_uuid(wid?)?);
+    let mut replica_ids = Vec::new();
+    for wid in reader.get_replica_ids()?.iter() {
+        replica_ids.push(read_uuid(wid?)?);
     }
 
-    let mut value =
-        ServiceSpecValue::new(manifest_id, manifest_name, service_name, tasks, task_ids);
+    let mut value = ServiceSpecValue::new(
+        manifest_id,
+        manifest_name,
+        service_name,
+        task_templates,
+        replica_ids,
+    );
     value.id = id;
     value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
     value.service_epoch = reader.get_service_epoch();
@@ -324,16 +331,18 @@ fn write_previous_generation(
         &previous.update_strategy,
     );
 
-    let mut tasks_builder = builder.reborrow().init_tasks(previous.tasks.len() as u32);
-    for (idx, task) in previous.tasks.iter().enumerate() {
-        write_task_template(tasks_builder.reborrow().get(idx as u32), task)?;
+    let mut templates_builder = builder
+        .reborrow()
+        .init_task_templates(previous.task_templates.len() as u32);
+    for (idx, template) in previous.task_templates.iter().enumerate() {
+        write_task_template(templates_builder.reborrow().get(idx as u32), template)?;
     }
 
-    let mut task_ids_builder = builder
+    let mut replica_ids_builder = builder
         .reborrow()
-        .init_task_ids(previous.task_ids.len() as u32);
-    for (idx, task_id) in previous.task_ids.iter().enumerate() {
-        task_ids_builder.set(idx as u32, task_id.as_bytes());
+        .init_replica_ids(previous.replica_ids.len() as u32);
+    for (idx, replica_id) in previous.replica_ids.iter().enumerate() {
+        replica_ids_builder.set(idx as u32, replica_id.as_bytes());
     }
 
     Ok(())
@@ -345,14 +354,14 @@ fn read_previous_generation(
 ) -> Result<ServicePreviousGeneration, Error> {
     let manifest_id = read_uuid(reader.get_manifest_id()?)?;
     let manifest_name = reader.get_manifest_name()?.to_str()?.to_string();
-    let mut tasks = Vec::new();
-    for tmpl in reader.get_tasks()?.iter() {
-        tasks.push(read_task_template(tmpl)?);
+    let mut task_templates = Vec::new();
+    for tmpl in reader.get_task_templates()?.iter() {
+        task_templates.push(read_task_template(tmpl)?);
     }
 
-    let mut task_ids = Vec::new();
-    for task_id in reader.get_task_ids()?.iter() {
-        task_ids.push(read_uuid(task_id?)?);
+    let mut replica_ids = Vec::new();
+    for replica_id in reader.get_replica_ids()?.iter() {
+        replica_ids.push(read_uuid(replica_id?)?);
     }
 
     let update_strategy = if reader.has_update_strategy() {
@@ -364,8 +373,8 @@ fn read_previous_generation(
     Ok(ServicePreviousGeneration {
         manifest_id,
         manifest_name,
-        tasks,
-        task_ids,
+        task_templates,
+        replica_ids,
         update_strategy,
         service_epoch: reader.get_service_epoch(),
         status: proto_to_service_status(reader.get_status()?),
@@ -392,7 +401,7 @@ fn read_readiness_probe(
     })
 }
 
-fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSpecValue, Error> {
+fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateSpecValue, Error> {
     let mut command = Vec::new();
     for arg in reader.get_command()?.iter() {
         command.push(arg?.to_str()?.to_string());
@@ -442,7 +451,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
             )));
         }
 
-        networks.push(ServiceTaskNetworkRequirement::new(raw, network_id));
+        networks.push(TaskTemplateNetworkRequirement::new(raw, network_id));
     }
     networks.sort_by(|a, b| a.network_id.cmp(&b.network_id));
     let readiness = if reader.has_readiness() {
@@ -492,7 +501,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<ServiceTaskSp
         None
     };
 
-    Ok(ServiceTaskSpecValue {
+    Ok(TaskTemplateSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
         execution: WorkloadExecutionSpec {
             image: reader.get_image()?.to_str()?.to_string(),
@@ -671,16 +680,16 @@ fn read_reschedule_lock(
 
 fn write_task_template(
     mut builder: task_template::Builder<'_>,
-    task: &ServiceTaskSpecValue,
+    template: &TaskTemplateSpecValue,
 ) -> Result<(), Error> {
-    builder.set_name(&task.name);
-    builder.set_image(&task.image);
-    builder.set_replicas(task.replicas);
-    builder.set_cpu_millis(task.cpu_millis);
-    builder.set_memory_bytes(task.memory_bytes);
-    builder.set_gpu_count(task.gpu_count);
-    builder.set_termination_grace_period_secs(task.termination_grace_period_secs.unwrap_or(0));
-    let pre_stop = task.pre_stop_command.as_deref().unwrap_or(&[]);
+    builder.set_name(&template.name);
+    builder.set_image(&template.image);
+    builder.set_replicas(template.replicas);
+    builder.set_cpu_millis(template.cpu_millis);
+    builder.set_memory_bytes(template.memory_bytes);
+    builder.set_gpu_count(template.gpu_count);
+    builder.set_termination_grace_period_secs(template.termination_grace_period_secs.unwrap_or(0));
+    let pre_stop = template.pre_stop_command.as_deref().unwrap_or(&[]);
     let mut pre_stop_builder = builder
         .reborrow()
         .init_pre_stop_command(pre_stop.len() as u32);
@@ -688,28 +697,32 @@ fn write_task_template(
         pre_stop_builder.set(idx as u32, arg);
     }
 
-    let mut cmd_builder = builder.reborrow().init_command(task.command.len() as u32);
-    for (idx, arg) in task.command.iter().enumerate() {
+    let mut cmd_builder = builder
+        .reborrow()
+        .init_command(template.command.len() as u32);
+    for (idx, arg) in template.command.iter().enumerate() {
         cmd_builder.set(idx as u32, arg);
     }
 
     let mut depends_on_builder = builder
         .reborrow()
-        .init_depends_on(task.depends_on.len() as u32);
-    for (idx, dependency) in task.depends_on.iter().enumerate() {
+        .init_depends_on(template.depends_on.len() as u32);
+    for (idx, dependency) in template.depends_on.iter().enumerate() {
         depends_on_builder.set(idx as u32, dependency);
     }
 
-    if let Some(policy) = &task.restart_policy {
+    if let Some(policy) = &template.restart_policy {
         let policy_builder = builder.reborrow().init_restart_policy();
         encode_service_restart_policy(policy_builder, policy);
     }
 
-    let mut env_builder = builder.reborrow().init_env(task.env.len() as u32);
-    encode_env_vars(&mut env_builder, &task.env);
+    let mut env_builder = builder.reborrow().init_env(template.env.len() as u32);
+    encode_env_vars(&mut env_builder, &template.env);
 
-    let mut networks_builder = builder.reborrow().init_networks(task.networks.len() as u32);
-    for (idx, network) in task.networks.iter().enumerate() {
+    let mut networks_builder = builder
+        .reborrow()
+        .init_networks(template.networks.len() as u32);
+    for (idx, network) in template.networks.iter().enumerate() {
         let mut network_builder = networks_builder.reborrow().get(idx as u32);
         network_builder.set_name(&network.name);
         network_builder.set_network_id(network.network_id.as_bytes());
@@ -717,29 +730,31 @@ fn write_task_template(
 
     let mut files_builder = builder
         .reborrow()
-        .init_secret_files(task.secret_files.len() as u32);
-    encode_secret_files(&mut files_builder, &task.secret_files);
-    let mut volume_builder = builder.reborrow().init_volumes(task.volumes.len() as u32);
-    encode_volume_mounts(&mut volume_builder, &task.volumes);
+        .init_secret_files(template.secret_files.len() as u32);
+    encode_secret_files(&mut files_builder, &template.secret_files);
+    let mut volume_builder = builder
+        .reborrow()
+        .init_volumes(template.volumes.len() as u32);
+    encode_volume_mounts(&mut volume_builder, &template.volumes);
 
-    if let Some(readiness) = task.readiness() {
+    if let Some(readiness) = template.readiness() {
         let builder = builder.reborrow().init_readiness();
         write_readiness_probe(builder, readiness);
     }
-    if let Some(liveness) = task.liveness() {
+    if let Some(liveness) = template.liveness() {
         let builder = builder.reborrow().init_liveness();
         encode_service_liveness_probe(builder, liveness);
     }
 
-    builder.set_public_port(task.public_port().unwrap_or(0));
-    let public_protocol = task.public_protocol.unwrap_or_default();
+    builder.set_public_port(template.public_port().unwrap_or(0));
+    let public_protocol = template.public_protocol.unwrap_or_default();
     let proto = match public_protocol {
         ServicePortProtocol::Tcp => protocol::services::PublicProtocol::Tcp,
         ServicePortProtocol::Udp => protocol::services::PublicProtocol::Udp,
         ServicePortProtocol::TcpUdp => protocol::services::PublicProtocol::TcpUdp,
     };
     builder.set_public_protocol(proto);
-    builder.set_tty(task.tty);
+    builder.set_tty(template.tty);
 
     Ok(())
 }
@@ -791,9 +806,9 @@ mod tests {
         ServicePreviousGeneration, ServiceReadinessProbe, ServiceReadinessProbeKind,
         ServiceRescheduleLock, ServiceRescheduleReason, ServiceRollingUpdatePolicy,
         ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue,
-        ServiceStatus, ServiceTaskNetworkRequirement, ServiceTaskRestartPolicy,
-        ServiceTaskRestartPolicyKind, ServiceTaskSpecValue, ServiceUpdateStrategy,
-        ServiceUpdateStrategyMode,
+        ServiceStatus, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
+        TaskTemplateNetworkRequirement, TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind,
+        TaskTemplateSpecValue,
     };
     use crate::task::types::{
         TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskVolumeMount,
@@ -803,11 +818,11 @@ mod tests {
     use protocol::services::{service_spec, task_template};
     use uuid::Uuid;
 
-    /// Service task template wire round-trips must preserve the declared network UUID exactly.
+    /// Service template wire round-trips must preserve the declared network UUID exactly.
     #[test]
     fn task_template_round_trip_preserves_network_ids() {
         let network_id = Uuid::new_v4();
-        let task = ServiceTaskSpecValue {
+        let template = TaskTemplateSpecValue {
             name: "backend".to_string(),
             execution: WorkloadExecutionSpec {
                 image: "ghcr.io/example/backend:latest".to_string(),
@@ -823,7 +838,7 @@ mod tests {
                 env: Vec::new(),
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
-                networks: vec![ServiceTaskNetworkRequirement::new("default", network_id)],
+                networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
             },
             depends_on: Vec::new(),
             replicas: 1,
@@ -835,17 +850,17 @@ mod tests {
         let mut message = Builder::new_default();
         {
             let builder = message.init_root::<task_template::Builder<'_>>();
-            write_task_template(builder, &task).expect("encode task template");
+            write_task_template(builder, &template).expect("encode task template");
         }
         let reader = message
             .get_root::<task_template::Builder<'_>>()
-            .expect("read encoded task template builder")
+            .expect("read encoded task-template builder")
             .into_reader();
         let decoded = read_task_template(reader).expect("decode task template");
 
         assert_eq!(
-            decoded.networks, task.networks,
-            "service task network requirements should preserve their explicit network ids"
+            decoded.networks, template.networks,
+            "task-template network requirements should preserve their explicit network ids"
         );
     }
 
@@ -861,7 +876,7 @@ mod tests {
         let holder_id = Uuid::new_v4();
         let lock_token = Uuid::new_v4();
 
-        let task = ServiceTaskSpecValue {
+        let template = TaskTemplateSpecValue {
             name: "frontend".to_string(),
             execution: WorkloadExecutionSpec {
                 image: "ghcr.io/example/frontend:v2".to_string(),
@@ -874,8 +889,8 @@ mod tests {
                 cpu_millis: 500,
                 memory_bytes: 256 * 1024 * 1024,
                 gpu_count: 1,
-                restart_policy: Some(ServiceTaskRestartPolicy {
-                    name: ServiceTaskRestartPolicyKind::OnFailure,
+                restart_policy: Some(TaskTemplateRestartPolicy {
+                    name: TaskTemplateRestartPolicyKind::OnFailure,
                     max_retry_count: Some(5),
                 }),
                 termination_grace_period_secs: Some(30),
@@ -906,7 +921,7 @@ mod tests {
                     target: "/var/cache/frontend".to_string(),
                     read_only: false,
                 }],
-                networks: vec![ServiceTaskNetworkRequirement::new(
+                networks: vec![TaskTemplateNetworkRequirement::new(
                     "public",
                     task_network_id,
                 )],
@@ -939,7 +954,7 @@ mod tests {
             Uuid::new_v4(),
             "demo-manifest-v1",
             "demo-service",
-            vec![ServiceTaskSpecValue {
+            vec![TaskTemplateSpecValue {
                 name: "backend".to_string(),
                 execution: WorkloadExecutionSpec {
                     image: "ghcr.io/example/backend:v1".to_string(),
@@ -955,7 +970,7 @@ mod tests {
                     env: Vec::new(),
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
-                    networks: vec![ServiceTaskNetworkRequirement::new(
+                    networks: vec![TaskTemplateNetworkRequirement::new(
                         "backend",
                         previous_network_id,
                     )],
@@ -988,7 +1003,7 @@ mod tests {
             manifest_id,
             "demo-manifest-v2",
             "demo-service",
-            vec![task],
+            vec![template],
             vec![Uuid::new_v4(), Uuid::new_v4()],
         );
         spec.id = service_id;

@@ -134,9 +134,9 @@ mod tests {
         ServiceRow {
             id: Uuid::nil().to_string(),
             service_name: "svc".to_string(),
-            tasks: Vec::new(),
+            task_templates: Vec::new(),
             updated_at: "2026-03-07T00:00:00Z".to_string(),
-            task_ids: Vec::new(),
+            replica_ids: Vec::new(),
             status,
             status_detail: status_detail.map(str::to_string),
             rollout: ServiceRolloutRow {

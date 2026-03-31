@@ -11,13 +11,13 @@ pub struct ServiceManifest {
     #[serde(default)]
     pub volumes: Vec<VolumeSpec>,
     #[serde(default)]
-    pub tasks: Vec<TaskSpec>,
+    pub task_templates: Vec<TaskTemplateSpec>,
     #[serde(default)]
     pub update: ServiceUpdateStrategy,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
-pub struct TaskResources {
+pub struct TaskTemplateResources {
     #[serde(default)]
     pub cpu_millis: u64,
     #[serde(default)]
@@ -26,7 +26,7 @@ pub struct TaskResources {
     pub gpu_count: u32,
 }
 
-impl TaskResources {
+impl TaskTemplateResources {
     pub fn memory_bytes(&self) -> u64 {
         const MB: u64 = 1_048_576; // 1024 * 1024
         self.memory_mb.saturating_mul(MB)
@@ -34,7 +34,7 @@ impl TaskResources {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct TaskRestartPolicy {
+pub struct TaskTemplateRestartPolicy {
     pub name: RestartPolicyName,
     #[serde(default)]
     pub max_retry_count: Option<u32>,
@@ -229,20 +229,20 @@ pub enum LivenessKind {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct TaskSpec {
+pub struct TaskTemplateSpec {
     pub name: String,
     pub image: String,
     #[serde(default)]
     pub command: Vec<String>,
-    /// Task template names within the same manifest that must be ready before this task starts.
+    /// Template names within the same manifest that must be ready before this template starts.
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default = "default_replicas")]
     pub replicas: u16,
     #[serde(default)]
-    pub resources: TaskResources,
+    pub resources: TaskTemplateResources,
     #[serde(default)]
-    pub restart_policy: Option<TaskRestartPolicy>,
+    pub restart_policy: Option<TaskTemplateRestartPolicy>,
     #[serde(default)]
     pub termination_grace_period_secs: Option<u32>,
     #[serde(default)]
@@ -324,8 +324,10 @@ impl ServiceManifest {
             return Err(anyhow!("service manifest must set a non-empty name"));
         }
 
-        if self.tasks.is_empty() {
-            return Err(anyhow!("service manifest must define at least one task"));
+        if self.task_templates.is_empty() {
+            return Err(anyhow!(
+                "service manifest must define at least one template"
+            ));
         }
 
         let mut declared_volume_names = HashSet::new();
@@ -381,70 +383,70 @@ impl ServiceManifest {
             }
         }
 
-        for task in &self.tasks {
-            if task.name.trim().is_empty() {
-                return Err(anyhow!("task name cannot be empty"));
+        for template in &self.task_templates {
+            if template.name.trim().is_empty() {
+                return Err(anyhow!("template name cannot be empty"));
             }
 
-            if task.image.trim().is_empty() {
+            if template.image.trim().is_empty() {
                 return Err(anyhow!(
-                    "task '{}' must specify a container image",
-                    task.name
+                    "template '{}' must specify a container image",
+                    template.name
                 ));
             }
 
-            if task.replicas == 0 {
+            if template.replicas == 0 {
                 return Err(anyhow!(
-                    "task '{}' must request at least one replica",
-                    task.name
+                    "template '{}' must request at least one replica",
+                    template.name
                 ));
             }
 
-            if let Some(readiness) = task.readiness.as_ref()
+            if let Some(readiness) = template.readiness.as_ref()
                 && readiness.port == 0
             {
                 return Err(anyhow!(
-                    "task '{}' must set readiness.port to a non-zero value when provided",
-                    task.name
+                    "template '{}' must set readiness.port to a non-zero value when provided",
+                    template.name
                 ));
             }
-            if let Some(readiness) = task.readiness.as_ref()
+            if let Some(readiness) = template.readiness.as_ref()
                 && readiness.interval_ms == 0
             {
                 return Err(anyhow!(
-                    "task '{}' must set readiness.interval_ms to a value greater than zero",
-                    task.name
+                    "template '{}' must set readiness.interval_ms to a value greater than zero",
+                    template.name
                 ));
             }
-            if let Some(readiness) = task.readiness.as_ref()
+            if let Some(readiness) = template.readiness.as_ref()
                 && readiness.timeout_ms == 0
             {
                 return Err(anyhow!(
-                    "task '{}' must set readiness.timeout_ms to a value greater than zero",
-                    task.name
+                    "template '{}' must set readiness.timeout_ms to a value greater than zero",
+                    template.name
                 ));
             }
-            if let Some(readiness) = task.readiness.as_ref()
+            if let Some(readiness) = template.readiness.as_ref()
                 && readiness.failure_threshold == 0
             {
                 return Err(anyhow!(
-                    "task '{}' must set readiness.failure_threshold to a value greater than zero",
-                    task.name
+                    "template '{}' must set readiness.failure_threshold to a value greater than zero",
+                    template.name
                 ));
             }
 
-            if let Some(liveness) = task.liveness.as_ref() {
+            if let Some(liveness) = template.liveness.as_ref() {
                 match liveness.kind {
                     LivenessKind::Exec if liveness.command.is_empty() => {
                         return Err(anyhow!(
-                            "task '{}' must set liveness.command to a non-empty command when liveness.kind is exec",
-                            task.name
+                            "template '{}' must set liveness.command to a non-empty command when liveness.kind is exec",
+                            template.name
                         ));
                     }
                     LivenessKind::Http | LivenessKind::Tcp if liveness.port == 0 => {
                         return Err(anyhow!(
-                            "task '{}' must set liveness.port to a non-zero value when liveness.kind is {}",
-                            task.name,
+                            "template '{}' must set liveness.port to a non-zero value when liveness.kind is {}",
+                            template.name,
                             match liveness.kind {
                                 LivenessKind::Http => "http",
                                 LivenessKind::Tcp => "tcp",
@@ -454,26 +456,26 @@ impl ServiceManifest {
                     }
                     LivenessKind::Exec if liveness.port != 0 => {
                         return Err(anyhow!(
-                            "task '{}' cannot set liveness.port when liveness.kind is exec",
-                            task.name
+                            "template '{}' cannot set liveness.port when liveness.kind is exec",
+                            template.name
                         ));
                     }
                     LivenessKind::Exec if liveness.path.is_some() => {
                         return Err(anyhow!(
-                            "task '{}' cannot set liveness.path when liveness.kind is exec",
-                            task.name
+                            "template '{}' cannot set liveness.path when liveness.kind is exec",
+                            template.name
                         ));
                     }
                     LivenessKind::Tcp if liveness.path.is_some() => {
                         return Err(anyhow!(
-                            "task '{}' cannot set liveness.path when liveness.kind is tcp",
-                            task.name
+                            "template '{}' cannot set liveness.path when liveness.kind is tcp",
+                            template.name
                         ));
                     }
                     LivenessKind::Http | LivenessKind::Tcp if !liveness.command.is_empty() => {
                         return Err(anyhow!(
-                            "task '{}' cannot set liveness.command when liveness.kind is {}",
-                            task.name,
+                            "template '{}' cannot set liveness.command when liveness.kind is {}",
+                            template.name,
                             match liveness.kind {
                                 LivenessKind::Http => "http",
                                 LivenessKind::Tcp => "tcp",
@@ -484,68 +486,68 @@ impl ServiceManifest {
                     _ => {}
                 }
             }
-            if let Some(liveness) = task.liveness.as_ref()
+            if let Some(liveness) = template.liveness.as_ref()
                 && liveness.interval_ms == 0
             {
                 return Err(anyhow!(
-                    "task '{}' must set liveness.interval_ms to a value greater than zero",
-                    task.name
+                    "template '{}' must set liveness.interval_ms to a value greater than zero",
+                    template.name
                 ));
             }
-            if let Some(liveness) = task.liveness.as_ref()
+            if let Some(liveness) = template.liveness.as_ref()
                 && liveness.timeout_ms == 0
             {
                 return Err(anyhow!(
-                    "task '{}' must set liveness.timeout_ms to a value greater than zero",
-                    task.name
+                    "template '{}' must set liveness.timeout_ms to a value greater than zero",
+                    template.name
                 ));
             }
-            if let Some(liveness) = task.liveness.as_ref()
+            if let Some(liveness) = template.liveness.as_ref()
                 && liveness.failure_threshold == 0
             {
                 return Err(anyhow!(
-                    "task '{}' must set liveness.failure_threshold to a value greater than zero",
-                    task.name
+                    "template '{}' must set liveness.failure_threshold to a value greater than zero",
+                    template.name
                 ));
             }
 
-            if matches!(task.public_port, Some(0)) {
+            if matches!(template.public_port, Some(0)) {
                 return Err(anyhow!(
-                    "task '{}' must set public_port to a non-zero value when provided",
-                    task.name
+                    "template '{}' must set public_port to a non-zero value when provided",
+                    template.name
                 ));
             }
 
-            if task.public_port.is_some() && task.networks.len() != 1 {
+            if template.public_port.is_some() && template.networks.len() != 1 {
                 return Err(anyhow!(
-                    "task '{}' must attach to exactly one network when public_port is set",
-                    task.name
+                    "template '{}' must attach to exactly one network when public_port is set",
+                    template.name
                 ));
             }
 
-            if task.resources.cpu_millis != 0 || task.resources.memory_mb != 0 {
-                if task.resources.cpu_millis == 0 {
+            if template.resources.cpu_millis != 0 || template.resources.memory_mb != 0 {
+                if template.resources.cpu_millis == 0 {
                     return Err(anyhow!(
-                        "task '{}' must set cpu_millis when memory_mb is specified",
-                        task.name
+                        "template '{}' must set cpu_millis when memory_mb is specified",
+                        template.name
                     ));
                 }
 
-                if task.resources.memory_mb == 0 {
+                if template.resources.memory_mb == 0 {
                     return Err(anyhow!(
-                        "task '{}' must set memory_mb when cpu_millis is specified",
-                        task.name
+                        "template '{}' must set memory_mb when cpu_millis is specified",
+                        template.name
                     ));
                 }
             }
 
-            if let Some(policy) = &task.restart_policy {
+            if let Some(policy) = &template.restart_policy {
                 if policy.max_retry_count.is_some()
                     && !matches!(policy.name, RestartPolicyName::OnFailure)
                 {
                     return Err(anyhow!(
-                        "task '{}' can only set max_retry_count with an on_failure restart policy",
-                        task.name
+                        "template '{}' can only set max_retry_count with an on_failure restart policy",
+                        template.name
                     ));
                 }
 
@@ -553,49 +555,49 @@ impl ServiceManifest {
                     && count > i32::MAX as u32
                 {
                     return Err(anyhow!(
-                        "task '{}' must set max_retry_count <= {}",
-                        task.name,
+                        "template '{}' must set max_retry_count <= {}",
+                        template.name,
                         i32::MAX
                     ));
                 }
             }
 
-            if let Some(command) = &task.pre_stop_command {
+            if let Some(command) = &template.pre_stop_command {
                 if command.is_empty() {
                     return Err(anyhow!(
-                        "task '{}' pre_stop_command must contain at least one argument",
-                        task.name
+                        "template '{}' pre_stop_command must contain at least one argument",
+                        template.name
                     ));
                 }
 
                 if command.iter().any(|arg| arg.trim().is_empty()) {
                     return Err(anyhow!(
-                        "task '{}' pre_stop_command cannot contain empty arguments",
-                        task.name
+                        "template '{}' pre_stop_command cannot contain empty arguments",
+                        template.name
                     ));
                 }
             }
 
-            for env in &task.env {
+            for env in &template.env {
                 if env.name.trim().is_empty() {
                     return Err(anyhow!(
-                        "task '{}' defines an environment variable with an empty name",
-                        task.name
+                        "template '{}' defines an environment variable with an empty name",
+                        template.name
                     ));
                 }
 
                 if env.value.is_some() && env.secret.is_some() {
                     return Err(anyhow!(
-                        "task '{}' environment '{}' must set either value or secret reference, not both",
-                        task.name,
+                        "template '{}' environment '{}' must set either value or secret reference, not both",
+                        template.name,
                         env.name
                     ));
                 }
 
                 if env.value.is_none() && env.secret.is_none() {
                     return Err(anyhow!(
-                        "task '{}' environment '{}' must set either value or secret reference",
-                        task.name,
+                        "template '{}' environment '{}' must set either value or secret reference",
+                        template.name,
                         env.name
                     ));
                 }
@@ -603,16 +605,16 @@ impl ServiceManifest {
                 if let Some(secret) = &env.secret {
                     if secret.name.trim().is_empty() {
                         return Err(anyhow!(
-                            "task '{}' environment '{}' references a secret with an empty name",
-                            task.name,
+                            "template '{}' environment '{}' references a secret with an empty name",
+                            template.name,
                             env.name
                         ));
                     }
                     if let Some(version) = &secret.version {
                         Uuid::parse_str(version).map_err(|_| {
                             anyhow!(
-                                "task '{}' environment '{}' references invalid secret version '{}': expected UUID",
-                                task.name,
+                                "template '{}' environment '{}' references invalid secret version '{}': expected UUID",
+                                template.name,
                                 env.name,
                                 version
                             )
@@ -621,18 +623,18 @@ impl ServiceManifest {
                 }
             }
 
-            for file in &task.secret_files {
+            for file in &template.secret_files {
                 if file.path.trim().is_empty() {
                     return Err(anyhow!(
-                        "task '{}' secret file path cannot be empty",
-                        task.name
+                        "template '{}' secret file path cannot be empty",
+                        template.name
                     ));
                 }
 
                 if file.secret.name.trim().is_empty() {
                     return Err(anyhow!(
-                        "task '{}' secret file '{}' references a secret with an empty name",
-                        task.name,
+                        "template '{}' secret file '{}' references a secret with an empty name",
+                        template.name,
                         file.path
                     ));
                 }
@@ -640,8 +642,8 @@ impl ServiceManifest {
                 if let Some(version) = &file.secret.version {
                     Uuid::parse_str(version).map_err(|_| {
                         anyhow!(
-                            "task '{}' secret file '{}' references invalid secret version '{}': expected UUID",
-                            task.name,
+                            "template '{}' secret file '{}' references invalid secret version '{}': expected UUID",
+                            template.name,
                             file.path,
                             version
                         )
@@ -652,52 +654,52 @@ impl ServiceManifest {
                     && mode > 0o7777
                 {
                     return Err(anyhow!(
-                        "task '{}' secret file '{}' must set a POSIX mode <= 0o7777",
-                        task.name,
+                        "template '{}' secret file '{}' must set a POSIX mode <= 0o7777",
+                        template.name,
                         file.path
                     ));
                 }
             }
 
             let mut seen_mount_targets = HashSet::new();
-            for mount in &task.volumes {
+            for mount in &template.volumes {
                 let source = mount.source.trim();
                 if source.is_empty() {
                     return Err(anyhow!(
-                        "task '{}' references a volume with an empty source name",
-                        task.name
+                        "template '{}' references a volume with an empty source name",
+                        template.name
                     ));
                 }
                 if !declared_volume_names.contains(source) {
                     return Err(anyhow!(
-                        "task '{}' references undeclared volume '{}'",
-                        task.name,
+                        "template '{}' references undeclared volume '{}'",
+                        template.name,
                         source
                     ));
                 }
                 if mount.target.trim().is_empty() {
                     return Err(anyhow!(
-                        "task '{}' volume '{}' target cannot be empty",
-                        task.name,
+                        "template '{}' volume '{}' target cannot be empty",
+                        template.name,
                         source
                     ));
                 }
                 if !mount.target.starts_with('/') {
                     return Err(anyhow!(
-                        "task '{}' volume '{}' target '{}' must be an absolute path",
-                        task.name,
+                        "template '{}' volume '{}' target '{}' must be an absolute path",
+                        template.name,
                         source,
                         mount.target
                     ));
                 }
                 if !seen_mount_targets.insert(mount.target.clone()) {
                     return Err(anyhow!(
-                        "task '{}' mounts multiple volumes at '{}'",
-                        task.name,
+                        "template '{}' mounts multiple volumes at '{}'",
+                        template.name,
                         mount.target
                     ));
                 }
-                if task.replicas > 1 {
+                if template.replicas > 1 {
                     let volume = self
                         .volumes
                         .iter()
@@ -705,8 +707,8 @@ impl ServiceManifest {
                         .ok_or_else(|| anyhow!("volume lookup failed for '{}'", source))?;
                     if matches!(volume.access_mode, VolumeAccessMode::ReadWriteOnce) {
                         return Err(anyhow!(
-                            "task '{}' cannot use read_write_once volume '{}' with replicas > 1",
-                            task.name,
+                            "template '{}' cannot use read_write_once volume '{}' with replicas > 1",
+                            template.name,
                             source
                         ));
                     }
@@ -714,26 +716,26 @@ impl ServiceManifest {
             }
 
             let mut seen_networks = HashSet::new();
-            for network in &task.networks {
+            for network in &template.networks {
                 let trimmed = network.trim();
                 if trimmed.is_empty() {
                     return Err(anyhow!(
-                        "task '{}' references a network with an empty name",
-                        task.name
+                        "template '{}' references a network with an empty name",
+                        template.name
                     ));
                 }
 
                 if !seen_networks.insert(trimmed.to_string()) {
                     return Err(anyhow!(
-                        "task '{}' references network '{}' multiple times",
-                        task.name,
+                        "template '{}' references network '{}' multiple times",
+                        template.name,
                         trimmed
                     ));
                 }
             }
         }
 
-        validate_task_dependencies(&self.tasks)?;
+        validate_template_dependencies(&self.task_templates)?;
 
         if self.update.rolling.parallelism == 0 {
             return Err(anyhow!(
@@ -757,46 +759,49 @@ impl ServiceManifest {
     }
 }
 
-/// Validates same-manifest task dependencies and rejects invalid graphs early.
-fn validate_task_dependencies(tasks: &[TaskSpec]) -> Result<()> {
-    let mut name_to_index = HashMap::with_capacity(tasks.len());
-    for (index, task) in tasks.iter().enumerate() {
-        if name_to_index.insert(task.name.clone(), index).is_some() {
+/// Validates same-manifest template dependencies and rejects invalid graphs early.
+fn validate_template_dependencies(task_templates: &[TaskTemplateSpec]) -> Result<()> {
+    let mut name_to_index = HashMap::with_capacity(task_templates.len());
+    for (index, template) in task_templates.iter().enumerate() {
+        if name_to_index.insert(template.name.clone(), index).is_some() {
             return Err(anyhow!(
-                "task '{}' is declared multiple times in the manifest",
-                task.name
+                "template '{}' is declared multiple times in the manifest",
+                template.name
             ));
         }
     }
 
-    let mut indegree = vec![0usize; tasks.len()];
-    let mut adjacency = vec![Vec::new(); tasks.len()];
+    let mut indegree = vec![0usize; task_templates.len()];
+    let mut adjacency = vec![Vec::new(); task_templates.len()];
 
-    for (index, task) in tasks.iter().enumerate() {
+    for (index, template) in task_templates.iter().enumerate() {
         let mut seen_dependencies = HashSet::new();
-        for dependency in &task.depends_on {
+        for dependency in &template.depends_on {
             let dependency_name = dependency.trim();
             if dependency_name.is_empty() {
                 return Err(anyhow!(
-                    "task '{}' contains an empty depends_on entry",
-                    task.name
+                    "template '{}' contains an empty depends_on entry",
+                    template.name
                 ));
             }
-            if dependency_name == task.name {
-                return Err(anyhow!("task '{}' cannot depend on itself", task.name));
+            if dependency_name == template.name {
+                return Err(anyhow!(
+                    "template '{}' cannot depend on itself",
+                    template.name
+                ));
             }
             if !seen_dependencies.insert(dependency_name.to_string()) {
                 return Err(anyhow!(
-                    "task '{}' depends on '{}' more than once",
-                    task.name,
+                    "template '{}' depends on '{}' more than once",
+                    template.name,
                     dependency_name
                 ));
             }
 
             let Some(&dependency_index) = name_to_index.get(dependency_name) else {
                 return Err(anyhow!(
-                    "task '{}' depends on unknown task '{}'",
-                    task.name,
+                    "template '{}' depends on unknown template '{}'",
+                    template.name,
                     dependency_name
                 ));
             };
@@ -815,7 +820,7 @@ fn validate_task_dependencies(tasks: &[TaskSpec]) -> Result<()> {
 
     while !current.is_empty() {
         visited = visited.saturating_add(current.len());
-        let mut next_ready = vec![false; tasks.len()];
+        let mut next_ready = vec![false; task_templates.len()];
         for index in &current {
             for dependent in &adjacency[*index] {
                 indegree[*dependent] = indegree[*dependent].saturating_sub(1);
@@ -832,9 +837,9 @@ fn validate_task_dependencies(tasks: &[TaskSpec]) -> Result<()> {
             .collect();
     }
 
-    if visited != tasks.len() {
+    if visited != task_templates.len() {
         return Err(anyhow!(
-            "task depends_on graph contains a cycle and cannot be ordered"
+            "template depends_on graph contains a cycle and cannot be ordered"
         ));
     }
 
@@ -945,16 +950,16 @@ mod tests {
 
         assert_eq!(manifest.name, "postgres-local-volume");
         assert_eq!(manifest.volumes.len(), 1);
-        assert_eq!(manifest.tasks.len(), 1);
+        assert_eq!(manifest.task_templates.len(), 1);
         assert_eq!(manifest.volumes[0].name, "pgdata");
-        assert_eq!(manifest.tasks[0].name, "db");
-        assert_eq!(manifest.tasks[0].replicas, 1);
-        assert_eq!(manifest.tasks[0].public_port, Some(5432));
-        assert_eq!(manifest.tasks[0].networks, vec!["postgres-demo"]);
-        assert_eq!(manifest.tasks[0].volumes.len(), 1);
-        assert_eq!(manifest.tasks[0].volumes[0].source, "pgdata");
+        assert_eq!(manifest.task_templates[0].name, "db");
+        assert_eq!(manifest.task_templates[0].replicas, 1);
+        assert_eq!(manifest.task_templates[0].public_port, Some(5432));
+        assert_eq!(manifest.task_templates[0].networks, vec!["postgres-demo"]);
+        assert_eq!(manifest.task_templates[0].volumes.len(), 1);
+        assert_eq!(manifest.task_templates[0].volumes[0].source, "pgdata");
         assert_eq!(
-            manifest.tasks[0].volumes[0].target,
+            manifest.task_templates[0].volumes[0].target,
             "/var/lib/postgresql/data"
         );
         assert!(matches!(
@@ -970,16 +975,22 @@ mod tests {
         let manifest = load_manifest_from_path(&example_manifest("service_discovery_demo.ron"))
             .expect("manifest");
 
-        assert_eq!(manifest.tasks.len(), 2);
-        assert_eq!(manifest.tasks[0].name, "backend");
-        assert_eq!(manifest.tasks[0].image, "hashicorp/http-echo:1.0.0");
-        assert!(manifest.tasks[0].readiness.is_some());
+        assert_eq!(manifest.task_templates.len(), 2);
+        assert_eq!(manifest.task_templates[0].name, "backend");
+        assert_eq!(
+            manifest.task_templates[0].image,
+            "hashicorp/http-echo:1.0.0"
+        );
+        assert!(manifest.task_templates[0].readiness.is_some());
         assert!(matches!(
-            manifest.tasks[0].liveness.as_ref().map(|probe| probe.kind),
+            manifest.task_templates[0]
+                .liveness
+                .as_ref()
+                .map(|probe| probe.kind),
             Some(LivenessKind::Http)
         ));
-        assert_eq!(manifest.tasks[1].name, "frontend");
-        assert_eq!(manifest.tasks[1].depends_on, vec!["backend"]);
+        assert_eq!(manifest.task_templates[1].name, "frontend");
+        assert_eq!(manifest.task_templates[1].depends_on, vec!["backend"]);
     }
 
     #[test]
@@ -987,13 +998,13 @@ mod tests {
         let manifest = ServiceManifest {
             name: "demo".into(),
             volumes: Vec::new(),
-            tasks: vec![TaskSpec {
+            task_templates: vec![TaskTemplateSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
                 command: Vec::new(),
                 depends_on: Vec::new(),
                 replicas: 1,
-                resources: TaskResources::default(),
+                resources: TaskTemplateResources::default(),
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: Some(Vec::new()),
@@ -1022,13 +1033,13 @@ mod tests {
         let manifest = ServiceManifest {
             name: "demo".into(),
             volumes: Vec::new(),
-            tasks: vec![TaskSpec {
+            task_templates: vec![TaskTemplateSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
                 command: Vec::new(),
                 depends_on: Vec::new(),
                 replicas: 1,
-                resources: TaskResources::default(),
+                resources: TaskTemplateResources::default(),
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
@@ -1066,13 +1077,13 @@ mod tests {
         let manifest = ServiceManifest {
             name: "demo".into(),
             volumes: Vec::new(),
-            tasks: vec![TaskSpec {
+            task_templates: vec![TaskTemplateSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
                 command: Vec::new(),
                 depends_on: Vec::new(),
                 replicas: 1,
-                resources: TaskResources::default(),
+                resources: TaskTemplateResources::default(),
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
@@ -1112,13 +1123,13 @@ mod tests {
         let manifest = ServiceManifest {
             name: "demo".into(),
             volumes: Vec::new(),
-            tasks: vec![TaskSpec {
+            task_templates: vec![TaskTemplateSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
                 command: Vec::new(),
                 depends_on: Vec::new(),
                 replicas: 1,
-                resources: TaskResources::default(),
+                resources: TaskTemplateResources::default(),
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
@@ -1163,13 +1174,13 @@ mod tests {
                 capacity_mb: Some(1024),
                 labels: Vec::new(),
             }],
-            tasks: vec![TaskSpec {
+            task_templates: vec![TaskTemplateSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
                 command: Vec::new(),
                 depends_on: Vec::new(),
                 replicas: 2,
-                resources: TaskResources::default(),
+                resources: TaskTemplateResources::default(),
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
@@ -1204,14 +1215,14 @@ mod tests {
         let manifest = ServiceManifest {
             name: "demo".into(),
             volumes: Vec::new(),
-            tasks: vec![
-                TaskSpec {
+            task_templates: vec![
+                TaskTemplateSpec {
                     name: "backend".into(),
                     image: "ghcr.io/demo/backend:latest".into(),
                     command: Vec::new(),
                     depends_on: vec!["frontend".into()],
                     replicas: 1,
-                    resources: TaskResources::default(),
+                    resources: TaskTemplateResources::default(),
                     restart_policy: None,
                     termination_grace_period_secs: None,
                     pre_stop_command: None,
@@ -1224,13 +1235,13 @@ mod tests {
                     public_port: None,
                     tty: false,
                 },
-                TaskSpec {
+                TaskTemplateSpec {
                     name: "frontend".into(),
                     image: "ghcr.io/demo/frontend:latest".into(),
                     command: Vec::new(),
                     depends_on: vec!["backend".into()],
                     replicas: 1,
-                    resources: TaskResources::default(),
+                    resources: TaskTemplateResources::default(),
                     restart_policy: None,
                     termination_grace_period_secs: None,
                     pre_stop_command: None,

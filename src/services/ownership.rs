@@ -1,4 +1,4 @@
-use crate::services::types::{ServiceSpecValue, ServiceTaskSpecValue};
+use crate::services::types::{ServiceSpecValue, TaskTemplateSpecValue};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -24,9 +24,9 @@ impl SlotKey {
 /// Desired service slot projection used by reconciliation loops.
 #[derive(Clone, Debug)]
 pub(super) struct ReplicaSlot {
-    pub(super) template: ServiceTaskSpecValue,
+    pub(super) template: TaskTemplateSpecValue,
     pub(super) replica: u16,
-    pub(super) task_id: Option<Uuid>,
+    pub(super) replica_id: Option<Uuid>,
 }
 
 /// Expands the service spec into an ordered list of desired replica slots.
@@ -34,13 +34,13 @@ pub(super) fn build_replica_slots(spec: &ServiceSpecValue) -> Vec<ReplicaSlot> {
     let mut slots = Vec::new();
     let mut cursor = 0usize;
 
-    for template in &spec.tasks {
+    for template in &spec.task_templates {
         for replica in 1..=template.replicas {
-            let task_id = spec.task_ids.get(cursor).copied();
+            let replica_id = spec.replica_ids.get(cursor).copied();
             slots.push(ReplicaSlot {
                 template: template.clone(),
                 replica,
-                task_id,
+                replica_id,
             });
             cursor += 1;
         }
@@ -52,7 +52,7 @@ pub(super) fn build_replica_slots(spec: &ServiceSpecValue) -> Vec<ReplicaSlot> {
 /// Computes deterministic target nodes for every replica slot to keep placement balanced.
 pub(super) fn compute_slot_targets(
     service_id: Uuid,
-    templates: &[ServiceTaskSpecValue],
+    task_templates: &[TaskTemplateSpecValue],
     eligible_nodes: &[Uuid],
 ) -> HashMap<SlotKey, Uuid> {
     let mut targets = HashMap::new();
@@ -60,21 +60,21 @@ pub(super) fn compute_slot_targets(
         return targets;
     }
 
-    let total_replicas: usize = templates
+    let total_replicas: usize = task_templates
         .iter()
         .map(|template| template.replicas as usize)
         .sum();
     let service_max = max_replicas_per_node(total_replicas, eligible_nodes.len());
     let mut template_caps: HashMap<String, usize> = HashMap::new();
-    for template in templates {
+    for template in task_templates {
         template_caps.insert(
             template.name.clone(),
             max_replicas_per_node(template.replicas as usize, eligible_nodes.len()),
         );
     }
 
-    let mut slots: Vec<(ServiceTaskSpecValue, u16)> = Vec::new();
-    for template in templates {
+    let mut slots: Vec<(TaskTemplateSpecValue, u16)> = Vec::new();
+    for template in task_templates {
         for replica in 1..=template.replicas {
             slots.push((template.clone(), replica));
         }

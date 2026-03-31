@@ -19,7 +19,7 @@ interface Services {
 
 struct TaskTemplate {
   name @0 :Text;
-  # Logical task name (free-form string)
+  # Logical template name (free-form string)
 
   image @1 :Text;
   # Container image reference (e.g. ghcr.io/org/app:tag)
@@ -31,7 +31,7 @@ struct TaskTemplate {
   # Template names within the same service that must become ready before this template starts.
 
   replicas @3 :UInt16;
-  # Desired replica count for this task
+  # Desired replica count for this template
 
   cpuMillis @4 :UInt64;
   # Requested CPU in milli-cores per replica (0 uses scheduler default)
@@ -48,7 +48,7 @@ struct TaskTemplate {
   secretFiles @8 :List(TaskSchema.SecretFile);
   # Secret-backed file projections
 
-  networks @9 :List(TaskNetwork);
+  networks @9 :List(TaskTemplateNetwork);
   # Required overlay networks with user-facing alias and canonical UUID
 
   readiness @10 :ReadinessProbe;
@@ -79,7 +79,7 @@ struct TaskTemplate {
   # Allocate a terminal for the container entrypoint.
 }
 
-struct TaskNetwork {
+struct TaskTemplateNetwork {
   name @0 :Text;
   # User-facing network alias declared in the service manifest.
 
@@ -318,11 +318,11 @@ struct PreviousGeneration {
   manifestName @1 :Text;
   # Human-readable manifest name for the prior generation.
 
-  tasks @2 :List(TaskTemplate);
+  taskTemplates @2 :List(TaskTemplate);
   # Prior desired task templates used for rollback and redeploy planning.
 
-  taskIds @3 :List(Data);
-  # Prior task UUIDs (16 bytes each).
+  replicaIds @3 :List(Data);
+  # Prior service replica UUIDs (16 bytes each).
 
   updateStrategy @4 :UpdateStrategy;
   # Prior rollout strategy retained for rollback reconstruction.
@@ -347,11 +347,11 @@ struct ServiceSpec {
   serviceName @3 :Text;
   # Service identifier
 
-  tasks @4 :List(TaskTemplate);
-  # Desired task templates
+  taskTemplates @4 :List(TaskTemplate);
+  # Desired task templates composing the service.
 
-  taskIds @5 :List(Data);
-  # Current task UUIDs (16 bytes each)
+  replicaIds @5 :List(Data);
+  # Current service replica UUIDs (16 bytes each)
 
   updatedAt @6 :Text;
   # RFC3339 timestamp when this spec was last updated
@@ -407,8 +407,8 @@ struct ServiceDeploySpec {
   serviceName @2 :Text;
   # Service identifier
 
-  tasks @3 :List(TaskTemplate);
-  # Desired task templates composing the service
+  taskTemplates @3 :List(TaskTemplate);
+  # Desired task templates composing the service.
 
   updateStrategy @4 :UpdateStrategy;
   # Desired rollout strategy for this deployment generation.

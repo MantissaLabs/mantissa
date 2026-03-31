@@ -1,10 +1,10 @@
-use crate::services::types::ServiceTaskSpecValue;
+use crate::services::types::TaskTemplateSpecValue;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// Describes a running task replica and the template replica that spawned it.
 #[derive(Clone, Debug)]
-pub struct ServiceTaskAssignment {
+pub struct ServiceReplicaAssignment {
     pub task_id: Uuid,
     pub template: String,
     pub replica: u16,
@@ -13,18 +13,18 @@ pub struct ServiceTaskAssignment {
 /// Represents a desired replica that must be (re)created to match the latest manifest.
 #[derive(Clone, Debug)]
 pub struct ReplicaReplacement {
-    pub template: ServiceTaskSpecValue,
+    pub template: TaskTemplateSpecValue,
     pub replica: u16,
-    pub previous: Option<ServiceTaskAssignment>,
+    pub previous: Option<ServiceReplicaAssignment>,
     pub desired_id: Uuid,
 }
 
 /// Change-plan returned by the reconciler describing how to move from current to desired state.
 #[derive(Clone, Debug, Default)]
 pub struct ServiceChangePlan {
-    pub retain: Vec<ServiceTaskAssignment>,
+    pub retain: Vec<ServiceReplicaAssignment>,
     pub replace: Vec<ReplicaReplacement>,
-    pub remove: Vec<ServiceTaskAssignment>,
+    pub remove: Vec<ServiceReplicaAssignment>,
 }
 
 impl ServiceChangePlan {
@@ -36,18 +36,19 @@ impl ServiceChangePlan {
 
 /// Computes the precise set of replica mutations needed to honour a new manifest.
 pub fn compute_change_plan(
-    current_templates: &[ServiceTaskSpecValue],
-    desired_templates: &[ServiceTaskSpecValue],
-    assignments: Vec<ServiceTaskAssignment>,
+    current_templates: &[TaskTemplateSpecValue],
+    desired_templates: &[TaskTemplateSpecValue],
+    assignments: Vec<ServiceReplicaAssignment>,
 ) -> ServiceChangePlan {
     let mut plan = ServiceChangePlan::default();
 
-    let mut current_by_name: BTreeMap<String, &ServiceTaskSpecValue> = BTreeMap::new();
+    let mut current_by_name: BTreeMap<String, &TaskTemplateSpecValue> = BTreeMap::new();
     for template in current_templates {
         current_by_name.insert(template.name.clone(), template);
     }
 
-    let mut by_template: BTreeMap<String, BTreeMap<u16, ServiceTaskAssignment>> = BTreeMap::new();
+    let mut by_template: BTreeMap<String, BTreeMap<u16, ServiceReplicaAssignment>> =
+        BTreeMap::new();
     for assignment in assignments {
         by_template
             .entry(assignment.template.clone())
@@ -118,8 +119,8 @@ pub fn parse_template_and_replica(service_name: &str, task_name: &str) -> Option
 }
 
 fn template_attributes_changed(
-    current: &ServiceTaskSpecValue,
-    desired: &ServiceTaskSpecValue,
+    current: &TaskTemplateSpecValue,
+    desired: &TaskTemplateSpecValue,
 ) -> bool {
     current.image != desired.image
         || current.command != desired.command
