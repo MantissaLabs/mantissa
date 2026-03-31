@@ -376,7 +376,7 @@ async fn poll_service_attempt(
         last_phase_versions.clear();
         last_terminal_launches.clear();
         for task_id in &current.replica_ids {
-            match controller.task_manager.inspect_task(*task_id).await {
+            match controller.workload_manager.inspect_workload(*task_id).await {
                 Ok(spec) => {
                     last_states.push((*task_id, Some(spec.state.clone())));
                     last_phase_versions.insert(*task_id, spec.phase_version);

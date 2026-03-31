@@ -157,7 +157,7 @@ impl ServiceController {
                 continue;
             }
 
-            if let Err(err) = self.task_manager.request_task_stop(task.id).await {
+            if let Err(err) = self.workload_manager.request_workload_stop(task.id).await {
                 tracing::warn!(
                     target: "services",
                     "failed to stop excess task {} for '{}': {err}",
@@ -316,7 +316,11 @@ impl ServiceController {
                 Some(preferred_node),
             );
 
-            match self.task_manager.start_tasks_batch(vec![request]).await {
+            match self
+                .workload_manager
+                .start_workloads_batch(vec![request])
+                .await
+            {
                 Ok(specs) => {
                     if specs.len() != 1 {
                         tracing::warn!(
@@ -365,8 +369,8 @@ impl ServiceController {
             slot.template
                 .replica_start_request(&spec.service_name, slot.replica, task_id, None);
 
-        self.task_manager
-            .start_tasks_batch(vec![fallback])
+        self.workload_manager
+            .start_workloads_batch(vec![fallback])
             .await
             .map(|specs| {
                 if specs.len() != 1 {
@@ -454,8 +458,8 @@ impl ServiceController {
             Some(preferred_node),
         );
 
-        self.task_manager
-            .start_tasks_batch(vec![request])
+        self.workload_manager
+            .start_workloads_batch(vec![request])
             .await
             .map_err(|err| {
                 anyhow!(

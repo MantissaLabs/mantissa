@@ -31,7 +31,7 @@ pub struct JobSubmission {
 /// Dependencies used to construct one job controller.
 pub struct JobControllerConfig {
     pub registry: JobRegistry,
-    pub task_manager: WorkloadManager,
+    pub workload_manager: WorkloadManager,
     pub cluster_registry: Registry,
     pub gossip_tx: Sender<Message>,
     pub gossip_rx: Receiver<Message>,
@@ -43,7 +43,7 @@ pub struct JobControllerConfig {
 #[derive(Clone)]
 pub struct JobController {
     registry: JobRegistry,
-    task_manager: WorkloadManager,
+    workload_manager: WorkloadManager,
     cluster_registry: Registry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
@@ -57,7 +57,7 @@ impl JobController {
     pub fn new(config: JobControllerConfig) -> Self {
         let JobControllerConfig {
             registry,
-            task_manager,
+            workload_manager,
             cluster_registry,
             gossip_tx,
             gossip_rx,
@@ -66,7 +66,7 @@ impl JobController {
         } = config;
         Self {
             registry,
-            task_manager,
+            workload_manager,
             cluster_registry,
             gossip_tx,
             gossip_rx,
@@ -266,7 +266,7 @@ impl JobController {
             return self.launch_reserved_attempt(reserved, task_id).await;
         };
 
-        match self.task_manager.inspect_task(task_id).await {
+        match self.workload_manager.inspect_workload(task_id).await {
             Ok(task) => self.adopt_observed_task(spec, task).await,
             Err(_) => self.launch_reserved_attempt(spec, task_id).await,
         }
@@ -302,7 +302,7 @@ impl JobController {
                 .await;
         };
 
-        match self.task_manager.inspect_task(task_id).await {
+        match self.workload_manager.inspect_workload(task_id).await {
             Ok(task) => self.adopt_observed_task(spec, task).await,
             Err(_) => {
                 self.fail_or_retry_missing_task(
@@ -339,7 +339,11 @@ impl JobController {
             target_node: None,
         };
 
-        match self.task_manager.start_tasks_batch(vec![request]).await {
+        match self
+            .workload_manager
+            .start_workloads_batch(vec![request])
+            .await
+        {
             Ok(mut specs) => {
                 let task = specs
                     .pop()

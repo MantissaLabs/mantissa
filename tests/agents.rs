@@ -34,8 +34,8 @@ local_test!(
 
         let task = node
             .node
-            .task_manager
-            .inspect_task(task_id)
+            .workload_manager
+            .inspect_workload(task_id)
             .await
             .expect("inspect agent task");
         assert_eq!(task.execution_substrate, ExecutionSubstrate::Oci);
@@ -301,8 +301,8 @@ async fn wait_for_active_run(client: &agents::Client, session_id: Uuid) -> (Uuid
 async fn mark_task_exited(node: &TestNode, task_id: Uuid, exit_code: i32) {
     let mut task = node
         .node
-        .task_manager
-        .inspect_task(task_id)
+        .workload_manager
+        .inspect_workload(task_id)
         .await
         .expect("inspect agent task");
     task.state = WorkloadPhase::Exited(exit_code);

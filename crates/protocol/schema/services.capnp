@@ -40,7 +40,7 @@ struct TaskTemplate {
   # Requested memory in bytes per replica (0 uses scheduler default)
 
   restartPolicy @6 :RestartPolicy;
-  # Desired container restart behaviour (optional)
+  # Desired runtime restart behaviour (optional)
 
   env @7 :List(WorkloadSchema.EnvironmentVar);
   # Environment variables (literal or secret-backed)
@@ -55,7 +55,7 @@ struct TaskTemplate {
   # Optional distributed readiness probe used to admit service backends.
 
   liveness @11 :LivenessProbe;
-  # Optional local liveness probe used to restart unhealthy containers.
+  # Optional local liveness probe used to restart unhealthy runtime instances.
 
   publicPort @12 :UInt16;
   # Optional host-facing service port (0 disables public exposure)
@@ -70,13 +70,13 @@ struct TaskTemplate {
   # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
 
   preStopCommand @16 :List(Text);
-  # Optional command executed inside the container before termination begins.
+  # Optional command executed inside the runtime instance before termination begins.
 
   volumes @17 :List(WorkloadSchema.VolumeMount);
   # Named volumes mounted into each replica of this template.
 
   tty @19 :Bool;
-  # Allocate a terminal for the container entrypoint.
+  # Allocate a terminal for the replica entrypoint.
 }
 
 struct TaskTemplateNetwork {
@@ -120,10 +120,10 @@ struct LivenessProbe {
   # Local liveness probe transport kind.
 
   command @1 :List(Text);
-  # Command executed inside the running container for exec probes.
+  # Command executed inside the running runtime instance for exec probes.
 
   port @2 :UInt16;
-  # Local container port checked by HTTP/TCP probes.
+  # Local runtime port checked by HTTP/TCP probes.
 
   path @3 :Text;
   # HTTP request path, ignored for exec/TCP probes and "/" when empty.
@@ -143,13 +143,13 @@ struct LivenessProbe {
 
 enum LivenessProbeKind {
   exec @0;
-  # Execute one command inside the running container.
+  # Execute one command inside the running runtime instance.
 
   http @1;
-  # Probe the container over HTTP and require a 2xx response.
+  # Probe the runtime instance over HTTP and require a 2xx response.
 
   tcp @2;
-  # Probe the container by establishing a TCP connection.
+  # Probe the runtime instance by establishing a TCP connection.
 }
 
 enum PublicProtocol {

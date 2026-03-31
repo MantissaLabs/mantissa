@@ -16,7 +16,7 @@ interface Task {
   # Start multiple standalone tasks in one batch.
 
   logs @4 (request :TaskLogsRequest);
-  # Stream one task's container logs into the caller-provided sink.
+  # Stream one task's runtime logs into the caller-provided sink.
 
   attach @5 (request :TaskAttachRequest) -> (session :TaskAttachSession);
   # Attach to one task's live stdio stream and return a session for stdin forwarding.
@@ -298,7 +298,7 @@ struct TaskStartRequest {
   # Scheduler slot identifiers to bind.
 
   taskId @6 :Data;
-  # Desired task/workload UUID (16 bytes) for the resulting standalone task.
+  # Desired task UUID (16 bytes) for the resulting standalone task.
 
   restartPolicy @7 :WorkloadSchema.RestartPolicy;
   # Restart behavior for the task.

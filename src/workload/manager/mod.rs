@@ -182,7 +182,7 @@ struct CachedWorkloadValueIndex {
     workload_values: Arc<HashMap<Uuid, WorkloadValue>>,
 }
 
-/// Runtime loop cadence configuration for the task manager reconciliation workers.
+/// Runtime loop cadence configuration for the workload manager reconciliation workers.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkloadRuntimeConfig {
     pub repair_tick: Duration,
@@ -283,7 +283,7 @@ struct WorkloadManagerVolumes {
 pub struct WorkloadManager {
     // Stable local node identifier used for ownership checks and placements.
     local_node_id: Uuid,
-    // Human-facing local node name persisted into task/volume metadata.
+    // Human-facing local node name persisted into workload/volume metadata.
     local_node_name: String,
     // Core persistence and message dependencies.
     core: WorkloadManagerCore,
@@ -308,12 +308,11 @@ pub enum WorkloadTrafficPublicationUpdate {
 
 /// Generic launch request consumed by the shared workload manager.
 ///
-/// Terminology:
-/// - The request is named `WorkloadStartRequest` because the same launch shape is reused by
-///   tasks, service replicas, job attempts, and agent runs.
-/// - A caller decides the higher-level meaning by choosing the controller/API that submits it.
-/// - The public `tasks` RPC adapts `TaskStartRequest` into this internal request type before
-///   creating `WorkloadKind::Task`.
+/// Tasks, service replicas, job attempts, and agent runs all reuse the same
+/// execution shape, so the shared manager accepts one workload-oriented launch
+/// request. The public `tasks` RPC keeps its task-shaped boundary and adapts
+/// `TaskStartRequest` into this internal type before creating
+/// `WorkloadKind::Task`.
 #[derive(Clone)]
 pub struct WorkloadStartRequest {
     /// Human-readable name for the resulting workload instance.
@@ -454,7 +453,7 @@ impl WorkloadManager {
         }
     }
 
-    /// Claims a local in-flight marker so only one stop workflow executes per task at a time.
+    /// Claims a local in-flight marker so only one stop workflow executes per workload at a time.
     async fn try_begin_stop(&self, task_id: Uuid) -> Option<StopTaskGuard> {
         let mut guard = self.local_state.inflight_stops.lock().await;
         if guard.contains(&task_id) {
@@ -467,7 +466,7 @@ impl WorkloadManager {
         })
     }
 
-    /// Claims a local in-flight marker so only one reconcile workflow executes per task at a time.
+    /// Claims a local in-flight marker so only one reconcile workflow executes per workload at a time.
     async fn try_begin_reconcile(&self, task_id: Uuid) -> Option<ReconcileTaskGuard> {
         let mut guard = self.local_state.inflight_reconciles.lock().await;
         if guard.contains(&task_id) {
@@ -524,7 +523,7 @@ impl WorkloadManager {
         }
     }
 
-    /// Clears the remove watermark once a fresh task incarnation has been accepted.
+    /// Clears the remove watermark once a fresh workload incarnation has been accepted.
     async fn clear_remove_watermark(&self, task_id: Uuid) {
         self.local_state
             .removed_task_watermarks
@@ -607,27 +606,27 @@ impl WorkloadManager {
             target_node: None,
         };
 
-        let mut specs = self.start_tasks_batch(vec![request]).await?;
+        let mut specs = self.start_workloads_batch(vec![request]).await?;
         Ok(specs
             .pop()
             .expect("batch start with single request should yield one spec"))
     }
 
-    /// Starts one task batch using the default transient scheduling retry policy for the caller.
-    pub async fn start_tasks_batch(
+    /// Starts one workload batch using the default transient scheduling retry policy for the caller.
+    pub async fn start_workloads_batch(
         &self,
         requests: Vec<WorkloadStartRequest>,
     ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
-        self.start_tasks_batch_with_scheduling_retry_limit(requests, None)
+        self.start_workloads_batch_with_scheduling_retry_limit(requests, None)
             .await
     }
 
-    /// Starts one task batch while allowing higher layers to clamp scheduling retries.
+    /// Starts one workload batch while allowing higher layers to clamp scheduling retries.
     ///
     /// Service rollout ownership already retries failed generations at the controller layer. Those
     /// callers can pass a small override so one stale scheduling view does not monopolize the
     /// in-flight generation slot for nearly a minute before reconciliation gets another attempt.
-    pub(crate) async fn start_tasks_batch_with_scheduling_retry_limit(
+    pub(crate) async fn start_workloads_batch_with_scheduling_retry_limit(
         &self,
         requests: Vec<WorkloadStartRequest>,
         scheduling_retry_max_attempts_override: Option<usize>,
@@ -772,7 +771,7 @@ impl WorkloadManager {
 
                     let specs: Vec<WorkloadSpec> = ordered
                         .into_iter()
-                        .map(|spec| spec.expect("missing task spec after execution"))
+                        .map(|spec| spec.expect("missing workload spec after execution"))
                         .collect();
 
                     return Ok(specs);
@@ -794,12 +793,12 @@ impl WorkloadManager {
         }
 
         Err(anyhow::anyhow!(
-            "failed to schedule tasks after {MAX_ATTEMPTS} attempts"
+            "failed to schedule workloads after {MAX_ATTEMPTS} attempts"
         ))
     }
 
-    /// Returns task specifications filtered according to the provided list policy.
-    pub async fn list_tasks(
+    /// Returns workload specifications filtered according to the provided list policy.
+    pub async fn list_workloads(
         &self,
         filter: &WorkloadStateFilter,
     ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
@@ -823,8 +822,8 @@ impl WorkloadManager {
         Ok(specs)
     }
 
-    /// Resolves one operator-provided task identifier as a full UUID or unique visible prefix.
-    pub async fn resolve_task_id(&self, selector: &str) -> Result<Uuid, anyhow::Error> {
+    /// Resolves one operator-provided workload identifier as a full UUID or unique visible prefix.
+    pub async fn resolve_workload_id(&self, selector: &str) -> Result<Uuid, anyhow::Error> {
         let trimmed = selector.trim();
         if trimmed.is_empty() {
             return Err(anyhow!("task id must not be empty"));
@@ -849,9 +848,9 @@ impl WorkloadManager {
         )
     }
 
-    /// Returns the replicated instance state for each provided task identifier so higher level
+    /// Returns the replicated lifecycle phase for each provided workload identifier so higher level
     /// controllers can determine whether a rollout has converged cluster-wide yet.
-    pub async fn task_state_snapshot(
+    pub async fn workload_phase_snapshot(
         &self,
         ids: &[Uuid],
     ) -> Result<Vec<(Uuid, Option<WorkloadPhase>)>, anyhow::Error> {
@@ -862,7 +861,7 @@ impl WorkloadManager {
                 .core
                 .store
                 .get_snapshot(&key)
-                .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("workload lookup failed: {e}"))?;
 
             let state = snapshot
                 .and_then(|snap| {
@@ -874,28 +873,28 @@ impl WorkloadManager {
         Ok(states)
     }
 
-    /// Fetches the latest replicated task spec for the provided identifier so higher level
-    /// reconcilers can reason about service-to-task relationships without mutating state.
-    pub async fn inspect_task(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
+    /// Fetches the latest replicated workload spec for the provided identifier so higher level
+    /// reconcilers can reason about controller-to-workload relationships without mutating state.
+    pub async fn inspect_workload(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
         self.load_spec(id).await
     }
 
-    /// Returns the stable local node identifier used by ownership-sensitive task workflows.
+    /// Returns the stable local node identifier used by ownership-sensitive workload workflows.
     pub fn local_node_id(&self) -> Uuid {
         self.local_node_id
     }
 
     #[allow(dead_code)]
-    pub async fn task_owned_locally(&self, id: Uuid) -> Result<bool, anyhow::Error> {
+    pub async fn workload_owned_locally(&self, id: Uuid) -> Result<bool, anyhow::Error> {
         let spec = self.load_spec(id).await?;
         Ok(spec.node_id == self.local_node_id)
     }
 
-    /// Streams log frames for one locally owned task into the provided bounded channel.
+    /// Streams log frames for one locally owned workload into the provided bounded channel.
     ///
     /// The RPC layer uses this to connect a local runtime log stream to a Cap'n Proto sink
     /// without exposing transport-specific concerns to the runtime abstraction.
-    pub async fn stream_local_task_logs(
+    pub async fn stream_local_workload_logs(
         &self,
         id: Uuid,
         options: &RuntimeLogsOptions,
@@ -907,7 +906,7 @@ impl WorkloadManager {
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
-                "task {id} is owned by remote node {}",
+                "workload {id} is owned by remote node {}",
                 spec.node_id
             ));
         }
@@ -924,14 +923,14 @@ impl WorkloadManager {
             .runtime_backend
             .stream_instance_logs(&instance_identifier, options, logs_tx)
             .await
-            .map_err(|err| anyhow!("task log stream failed for {id}: {err}"))
+            .map_err(|err| anyhow!("workload log stream failed for {id}: {err}"))
     }
 
-    /// Attaches to one locally owned task and bridges runtime stdio through bounded channels.
+    /// Attaches to one locally owned workload and bridges runtime stdio through bounded channels.
     ///
     /// The RPC layer uses this to keep the attach data path transport-agnostic while still
     /// preserving backpressure for both output frames and stdin chunks.
-    pub async fn attach_local_task(
+    pub async fn attach_local_workload(
         &self,
         id: Uuid,
         options: &RuntimeAttachOptions,
@@ -946,7 +945,7 @@ impl WorkloadManager {
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
-                "task {id} is owned by remote node {}",
+                "workload {id} is owned by remote node {}",
                 spec.node_id
             ));
         }
@@ -964,14 +963,14 @@ impl WorkloadManager {
             .runtime_backend
             .inspect_instance(&instance_identifier)
             .await
-            .map_err(|err| anyhow!("task attach inspect failed for {id}: {err}"))?;
+            .map_err(|err| anyhow!("workload attach inspect failed for {id}: {err}"))?;
         let runtime_tty = runtime_info.config.tty.unwrap_or(spec.tty);
         if runtime_tty != spec.tty {
             debug!(
                 task = %id,
                 spec_tty = spec.tty,
                 runtime_tty,
-                "task attach detected persisted tty mismatch, using runtime instance setting"
+                "workload attach detected persisted tty mismatch, using runtime instance setting"
             );
         }
         runtime_options.tty = runtime_tty;
@@ -980,14 +979,14 @@ impl WorkloadManager {
             .runtime_backend
             .attach_instance(&instance_identifier, &runtime_options, output_tx, input_rx)
             .await
-            .map_err(|err| anyhow!("task attach failed for {id}: {err}"))
+            .map_err(|err| anyhow!("workload attach failed for {id}: {err}"))
     }
 
-    /// Starts one streamed exec session inside a locally owned task instance.
+    /// Starts one streamed exec session inside a locally owned workload instance.
     ///
     /// The RPC layer uses this to keep remote exec transport-agnostic while the runtime owns
     /// command creation, tty allocation, and exit-code reporting.
-    pub async fn exec_local_task(
+    pub async fn exec_local_workload(
         &self,
         id: Uuid,
         options: &RuntimeExecOptions,
@@ -1002,13 +1001,13 @@ impl WorkloadManager {
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
-                "task {id} is owned by remote node {}",
+                "workload {id} is owned by remote node {}",
                 spec.node_id
             ));
         }
         if !matches!(spec.state, WorkloadPhase::Running) {
             return Err(anyhow!(
-                "task {id} is not running (state: {:?})",
+                "workload {id} is not running (state: {:?})",
                 spec.state
             ));
         }
@@ -1025,16 +1024,16 @@ impl WorkloadManager {
             .runtime_backend
             .exec_instance_stream(&instance_identifier, options, output_tx, input_rx)
             .await
-            .map_err(|err| anyhow!("task exec failed for {id}: {err}"))
+            .map_err(|err| anyhow!("workload exec failed for {id}: {err}"))
     }
 
-    /// Verifies that a locally owned task still has a running runtime before an interactive
+    /// Verifies that a locally owned workload still has a running runtime before an interactive
     /// attach or exec session is accepted.
     ///
     /// This lets the RPC path reject stale "running" task records when the runtime instance has already
     /// exited, instead of returning an empty attach/exec stream that looks like success to the
     /// CLI.
-    async fn ensure_local_task_runtime_running(
+    async fn ensure_local_workload_runtime_running(
         &self,
         id: Uuid,
         action: &str,
@@ -1042,13 +1041,13 @@ impl WorkloadManager {
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
-                "task {id} is owned by remote node {}",
+                "workload {id} is owned by remote node {}",
                 spec.node_id
             ));
         }
         if !matches!(spec.state, WorkloadPhase::Running) {
             return Err(anyhow!(
-                "task {id} is not running (state: {:?})",
+                "workload {id} is not running (state: {:?})",
                 spec.state
             ));
         }
@@ -1066,47 +1065,48 @@ impl WorkloadManager {
             .runtime_backend
             .inspect_instance(&instance_identifier)
             .await
-            .map_err(|err| anyhow!("task {action} preflight failed for {id}: {err}"))?;
+            .map_err(|err| anyhow!("workload {action} preflight failed for {id}: {err}"))?;
         let running = info.state.running.unwrap_or(false);
         if !running {
-            return Err(anyhow!("task {id} runtime is not running"));
+            return Err(anyhow!("workload {id} runtime is not running"));
         }
 
         Ok(())
     }
 
-    /// Verifies that a locally owned task still has a running runtime before attach is accepted.
-    pub async fn ensure_local_task_attachable(&self, id: Uuid) -> Result<(), anyhow::Error> {
+    /// Verifies that a locally owned workload still has a running runtime before attach is accepted.
+    pub async fn ensure_local_workload_attachable(&self, id: Uuid) -> Result<(), anyhow::Error> {
         if !self.runtime.runtime_backend.capabilities().attach {
             return Err(anyhow!(
                 "runtime backend does not support interactive attach"
             ));
         }
-        self.ensure_local_task_runtime_running(id, "attach").await
+        self.ensure_local_workload_runtime_running(id, "attach")
+            .await
     }
 
-    /// Verifies that a locally owned task still has a running runtime before exec is accepted.
-    pub async fn ensure_local_task_executable(&self, id: Uuid) -> Result<(), anyhow::Error> {
+    /// Verifies that a locally owned workload still has a running runtime before exec is accepted.
+    pub async fn ensure_local_workload_executable(&self, id: Uuid) -> Result<(), anyhow::Error> {
         if !self.runtime.runtime_backend.capabilities().interactive_exec {
             return Err(anyhow!(
                 "runtime backend does not support interactive exec sessions"
             ));
         }
-        self.ensure_local_task_runtime_running(id, "exec").await
+        self.ensure_local_workload_runtime_running(id, "exec").await
     }
 
-    /// Requests a task transition into `Stopping` and broadcasts the desired state.
+    /// Requests a workload transition into `Stopping` and broadcasts the desired state.
     ///
-    /// Local tasks are transitioned declaratively and drained by reconciliation. Remote tasks are
+    /// Local workloads are transitioned declaratively and drained by reconciliation. Remote workloads are
     /// delegated to the owning node so the owner records the stop intent and gossips it.
-    pub async fn request_task_stop(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
+    pub async fn request_workload_stop(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
         let spec = self.load_spec(id).await?;
 
         if spec.node_id != self.local_node_id {
             if matches!(spec.state, WorkloadPhase::Stopping | WorkloadPhase::Stopped) {
                 return Ok(spec);
             }
-            return self.stop_remote_task(&spec).await;
+            return self.stop_remote_workload(&spec).await;
         }
 
         if matches!(spec.state, WorkloadPhase::Stopping | WorkloadPhase::Stopped) {
@@ -1125,7 +1125,7 @@ impl WorkloadManager {
         Ok(updated)
     }
 
-    /// Re-drives final local stop cleanup for one task that is already in a terminal stop state.
+    /// Re-drives final local stop cleanup for one workload row that is already in a terminal stop state.
     ///
     /// Inactive-service reconciliation uses this to keep draining lingering local `Stopping`
     /// rows after the service registry entry has already transitioned into teardown. Callers that

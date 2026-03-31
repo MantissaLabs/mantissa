@@ -42,7 +42,7 @@ impl workload::Server for WorkloadService {
         let id = read_id_from_data(request.get_id()?)?;
         let spec = self
             .manager
-            .request_task_stop(id)
+            .request_workload_stop(id)
             .await
             .map_err(|err| Error::failed(err.to_string()))?;
         write_spec(results.get().init_spec(), &spec);
@@ -58,7 +58,7 @@ impl workload::Server for WorkloadService {
         let filter = list_filter_from_request(&params.get()?.get_request()?)?;
         let workloads = self
             .manager
-            .list_tasks(&filter)
+            .list_workloads(&filter)
             .await
             .map_err(|err| Error::failed(err.to_string()))?;
 

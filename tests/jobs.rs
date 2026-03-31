@@ -27,8 +27,8 @@ local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
 
     let mut task = node
         .node
-        .task_manager
-        .inspect_task(active_task_id)
+        .workload_manager
+        .inspect_workload(active_task_id)
         .await
         .expect("inspect job task");
     task.state = WorkloadPhase::Exited(0);
@@ -66,8 +66,8 @@ local_test!(jobs_retry_after_failed_task, {
 
     let mut task = node
         .node
-        .task_manager
-        .inspect_task(first_task_id)
+        .workload_manager
+        .inspect_workload(first_task_id)
         .await
         .expect("inspect first job task");
     task.state = WorkloadPhase::Exited(1);
@@ -99,8 +99,8 @@ local_test!(jobs_retry_after_failed_task, {
 
     let tasks = node
         .node
-        .task_manager
-        .list_tasks(&TaskStateFilter::all())
+        .workload_manager
+        .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list tasks");
     assert!(

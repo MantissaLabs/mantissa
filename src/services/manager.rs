@@ -83,7 +83,7 @@ pub struct ServiceDeploymentSubmission {
 #[derive(Clone)]
 pub struct ServiceController {
     registry: ServiceRegistry,
-    task_manager: WorkloadManager,
+    workload_manager: WorkloadManager,
     cluster_registry: Registry,
     volume_registry: VolumeRegistry,
     gossip_tx: Sender<Message>,
@@ -118,7 +118,7 @@ impl ServiceGenerationExecutionKey {
 
 pub struct ServiceControllerConfig {
     pub registry: ServiceRegistry,
-    pub task_manager: WorkloadManager,
+    pub workload_manager: WorkloadManager,
     pub cluster_registry: Registry,
     pub volume_registry: VolumeRegistry,
     pub gossip_tx: Sender<Message>,
@@ -132,7 +132,7 @@ impl ServiceController {
     pub fn new(config: ServiceControllerConfig) -> Self {
         let ServiceControllerConfig {
             registry,
-            task_manager,
+            workload_manager,
             cluster_registry,
             volume_registry,
             gossip_tx,
@@ -142,7 +142,7 @@ impl ServiceController {
         } = config;
         Self {
             registry,
-            task_manager,
+            workload_manager,
             cluster_registry,
             volume_registry,
             gossip_tx,
@@ -510,8 +510,8 @@ impl ServiceController {
     /// Collects a cluster-wide task inventory snapshot to support reconciliation decisions.
     async fn collect_task_inventory(&self) -> anyhow::Result<TaskInventory> {
         let specs = self
-            .task_manager
-            .list_tasks(&TaskStateFilter::all())
+            .workload_manager
+            .list_workloads(&TaskStateFilter::all())
             .await?;
         Ok(TaskInventory::from_specs(specs))
     }
@@ -1159,12 +1159,12 @@ impl ServiceController {
             let mut running_replicas = 0usize;
             let mut published_replicas = 0usize;
             for task_id in dependency_task_ids {
-                let spec = self.task_manager.inspect_task(*task_id).await?;
+                let spec = self.workload_manager.inspect_workload(*task_id).await?;
                 match spec.state {
                     WorkloadPhase::Running => {
                         running_replicas = running_replicas.saturating_add(1);
                         if self
-                            .task_manager
+                            .workload_manager
                             .ensure_task_service_traffic_ready(*task_id)
                             .await?
                         {
@@ -1516,7 +1516,7 @@ impl ServiceController {
     ) -> Vec<ServiceReplicaAssignment> {
         let mut assignments = Vec::new();
         for task_id in task_ids {
-            match self.task_manager.inspect_task(*task_id).await {
+            match self.workload_manager.inspect_workload(*task_id).await {
                 Ok(spec) => {
                     if let Some((template, replica)) =
                         parse_template_and_replica(service_name, &spec.name)
@@ -1621,11 +1621,11 @@ impl ServiceController {
     /// Stops every locally owned task associated with the service, including stale rows that are
     /// no longer referenced by the current service spec task id list.
     async fn stop_local_service_tasks(&self, spec: &ServiceSpecValue, inventory: &TaskInventory) {
-        let spawn_stop_reconcile = |task_manager: crate::workload::manager::WorkloadManager,
+        let spawn_stop_reconcile = |workload_manager: crate::workload::manager::WorkloadManager,
                                     service_name: String,
                                     task_id: Uuid| {
             tokio::task::spawn_local(async move {
-                if let Err(err) = task_manager.reconcile_requested_stop(task_id).await {
+                if let Err(err) = workload_manager.reconcile_requested_stop(task_id).await {
                     tracing::warn!(
                         target: "services",
                         "failed to finish stop cleanup for task {task_id} in service {service_name}: {err}",
@@ -1644,17 +1644,17 @@ impl ServiceController {
             }
             if matches!(task.state, WorkloadPhase::Stopping | WorkloadPhase::Stopped) {
                 spawn_stop_reconcile(
-                    self.task_manager.clone(),
+                    self.workload_manager.clone(),
                     spec.service_name.clone(),
                     task_id,
                 );
                 continue;
             }
-            match self.task_manager.request_task_stop(task_id).await {
+            match self.workload_manager.request_workload_stop(task_id).await {
                 Ok(updated) => {
                     if updated.node_id == self.local_node_id {
                         spawn_stop_reconcile(
-                            self.task_manager.clone(),
+                            self.workload_manager.clone(),
                             spec.service_name.clone(),
                             task_id,
                         );
@@ -1689,7 +1689,11 @@ impl ServiceController {
         } else {
             false
         };
-        match self.task_manager.start_tasks_batch(requests.clone()).await {
+        match self
+            .workload_manager
+            .start_workloads_batch(requests.clone())
+            .await
+        {
             Ok(specs) => Ok(specs),
             Err(err) if has_targets && requires_pinned_targets => {
                 tracing::warn!(
@@ -1713,8 +1717,8 @@ impl ServiceController {
                 for request in &mut requests {
                     request.target_node = None;
                 }
-                self.task_manager
-                    .start_tasks_batch_with_scheduling_retry_limit(
+                self.workload_manager
+                    .start_workloads_batch_with_scheduling_retry_limit(
                         requests,
                         Some(SERVICE_FALLBACK_SCHEDULING_RETRY_MAX_ATTEMPTS),
                     )
@@ -1732,7 +1736,7 @@ impl ServiceController {
         task_id: Uuid,
         timeout: Duration,
     ) -> anyhow::Result<()> {
-        self.task_manager
+        self.workload_manager
             .publish_task_traffic_when_attachment_rows_exist(task_id, timeout)
             .await
             .map_err(|err| {
@@ -1750,7 +1754,7 @@ impl ServiceController {
     /// when no explicit rollout handoff is in flight.
     async fn publish_running_task_traffic_best_effort(&self, service_name: &str, task_id: Uuid) {
         match self
-            .task_manager
+            .workload_manager
             .set_task_traffic_published(task_id, true)
             .await
         {
@@ -1794,10 +1798,10 @@ impl ServiceController {
         }
         drop(guard);
 
-        let task_manager = self.task_manager.clone();
+        let workload_manager = self.workload_manager.clone();
         let waiters = self.inflight_traffic_publish_waiters.clone();
         tokio::task::spawn_local(async move {
-            let result = task_manager
+            let result = workload_manager
                 .publish_task_traffic_when_attachment_rows_exist(task_id, timeout)
                 .await;
             if let Err(err) = result {
@@ -2471,12 +2475,11 @@ mod tests {
     use super::*;
     use crate::services::types::TaskTemplateNetworkRequirement;
     use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
-    use crate::task::types::TaskServiceMetadata;
     use crate::volumes::types::{
         LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
         VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
     };
-    use crate::workload::model::ExecutionSubstrate;
+    use crate::workload::model::{ExecutionSubstrate, WorkloadServiceMetadata};
     use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2657,7 +2660,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
-            service_metadata: Some(TaskServiceMetadata::new(service_name, template)),
+            service_metadata: Some(WorkloadServiceMetadata::new(service_name, template)),
             job_metadata: None,
             agent_run_metadata: None,
             lease_id: None,

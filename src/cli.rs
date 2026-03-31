@@ -518,15 +518,15 @@ pub struct AgentsSubmitArgs {
     #[arg(index = 1, value_name = "NAME")]
     pub name: String,
 
-    /// Sandbox image to run for each agent turn
+    /// Runtime image to run for each agent turn
     #[arg(short = 'i', long = "image", value_name = "IMAGE")]
     pub image: String,
 
-    /// Command arguments for the sandbox entrypoint (repeat flag to add arguments)
+    /// Command arguments for the run entrypoint (repeat flag to add arguments)
     #[arg(short = 'c', long = "command", value_name = "ARG", action = ArgAction::Append)]
     pub command: Vec<String>,
 
-    /// Allocate a TTY for the sandbox entrypoint
+    /// Allocate a TTY for the run entrypoint
     #[arg(long = "tty", action = ArgAction::SetTrue)]
     pub tty: bool,
 
@@ -578,7 +578,7 @@ pub struct AgentsSubmitArgs {
     #[arg(long = "workspace", value_name = "MOUNT")]
     pub workspace: Option<String>,
 
-    /// Preferred working directory inside the sandbox
+    /// Preferred working directory inside each run
     #[arg(long = "workdir", value_name = "PATH")]
     pub workdir: Option<String>,
 
@@ -590,15 +590,15 @@ pub struct AgentsSubmitArgs {
     #[arg(long = "allow-tool", value_name = "TOOL", action = ArgAction::Append)]
     pub allowed_tools: Vec<String>,
 
-    /// Allow outbound network access inside the sandbox
+    /// Allow outbound network access inside agent runs
     #[arg(long = "allow-network", action = ArgAction::SetTrue)]
     pub allow_network: bool,
 
-    /// Allow pseudo-terminal allocation for sandbox tools
+    /// Allow pseudo-terminal allocation for agent tools
     #[arg(long = "allow-pty", action = ArgAction::SetTrue)]
     pub allow_pty: bool,
 
-    /// Allow filesystem writes initiated by sandbox tools
+    /// Allow filesystem writes initiated by agent tools
     #[arg(long = "allow-write", action = ArgAction::SetTrue)]
     pub allow_write: bool,
 
@@ -655,7 +655,7 @@ pub struct TasksLogsArgs {
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
 
-    /// Follow the log stream until the task/container stops
+    /// Follow the log stream until the task exits or the runtime stream closes
     #[arg(short = 'f', long = "follow", action = ArgAction::SetTrue)]
     pub follow: bool,
 
@@ -708,7 +708,7 @@ pub struct TasksAttachArgs {
     #[arg(long = "stderr", action = ArgAction::SetTrue)]
     pub stderr: bool,
 
-    /// Override Docker-style detach keys used to leave the task running (default `ctrl-p,ctrl-q`)
+    /// Override runtime detach keys using Docker-style key syntax (default `ctrl-p,ctrl-q`)
     ///
     /// The built-in local fallback `ctrl-]` is only active when using the default detach keys.
     #[arg(long = "detach-keys", value_name = "KEYS")]
@@ -737,11 +737,11 @@ pub struct TasksExecArgs {
     #[arg(long = "stderr", action = ArgAction::SetTrue)]
     pub stderr: bool,
 
-    /// Override Docker-style detach keys used to leave the exec process running
+    /// Override runtime detach keys using Docker-style key syntax
     #[arg(long = "detach-keys", value_name = "KEYS")]
     pub detach_keys: Option<String>,
 
-    /// Command and arguments to execute inside the running task container
+    /// Command and arguments to execute inside the running task
     #[arg(
         index = 2,
         required = true,

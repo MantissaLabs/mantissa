@@ -32,7 +32,7 @@ use crate::store::scheduler_store::open_scheduler_store;
 use crate::store::secret_store::open_secret_store;
 use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
 use crate::store::workload_store::open_workload_store;
-use crate::task::types::{TaskStateFilter, TaskStateKind, TaskValueDraft};
+use crate::task::types::{TaskStateFilter, TaskStateKind};
 use crate::topology::peers::PeerSchedulingState;
 use crate::volumes::VolumeRegistry;
 use crate::volumes::local::managed_volume_data_path;
@@ -41,7 +41,9 @@ use crate::volumes::types::{
     VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
 };
 use crate::workload::model::select_best_workload_value;
-use crate::workload::model::{ExecutionSubstrate, WorkloadStatus, WorkloadValue};
+use crate::workload::model::{
+    ExecutionSubstrate, WorkloadStatus, WorkloadValue, WorkloadValueDraft,
+};
 use crate::workload::types::{
     ResolvedExecutionSpec, WorkloadLivenessProbe, WorkloadLivenessProbeKind,
     WorkloadRestartPolicyKind,
@@ -879,7 +881,7 @@ async fn setup_manager_with_forwarding(
 
 /// Ensures task-manager teardown always removes node-scoped secret staging directories.
 #[tokio::test]
-async fn task_manager_drop_cleans_secret_runtime_root() {
+async fn workload_manager_drop_cleans_secret_runtime_root() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
     let runtime_root = manager.secrets.secret_runtime_root.clone();
     std::fs::create_dir_all(runtime_root.join("leftover")).expect("create staged marker");
@@ -1238,7 +1240,7 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
         .expect("reconcile draining running task");
 
     let latest = manager
-        .inspect_task(spec.id)
+        .inspect_workload(spec.id)
         .await
         .expect("inspect updated task");
     assert_eq!(
@@ -1311,7 +1313,7 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
         .expect("reconcile draining pending task");
 
     let latest = manager
-        .inspect_task(spec.id)
+        .inspect_workload(spec.id)
         .await
         .expect("inspect updated task");
     assert_eq!(
@@ -1980,7 +1982,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
     let node_a = Uuid::new_v4();
     let node_b = Uuid::new_v4();
 
-    let current = WorkloadValue::new(TaskValueDraft {
+    let current = WorkloadValue::new(WorkloadValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -2019,7 +2021,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         last_terminal_observed_launch: None,
     });
 
-    let lower_epoch = WorkloadValue::new(TaskValueDraft {
+    let lower_epoch = WorkloadValue::new(WorkloadValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -2062,7 +2064,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         "lower epoch must not override current assignment"
     );
 
-    let same_epoch_lower_phase = WorkloadValue::new(TaskValueDraft {
+    let same_epoch_lower_phase = WorkloadValue::new(WorkloadValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -2105,7 +2107,7 @@ fn compare_task_causality_prefers_epoch_then_phase_version() {
         "lower phase version must not override newer lifecycle state"
     );
 
-    let higher_epoch = WorkloadValue::new(TaskValueDraft {
+    let higher_epoch = WorkloadValue::new(WorkloadValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -2155,7 +2157,7 @@ fn select_best_workload_value_ignores_stale_timestamp_when_phase_is_older() {
     let id = Uuid::new_v4();
     let node = Uuid::new_v4();
 
-    let running_newer_phase = WorkloadValue::new(TaskValueDraft {
+    let running_newer_phase = WorkloadValue::new(WorkloadValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -2194,7 +2196,7 @@ fn select_best_workload_value_ignores_stale_timestamp_when_phase_is_older() {
         last_terminal_observed_launch: None,
     });
 
-    let stale_pending_later_timestamp = WorkloadValue::new(TaskValueDraft {
+    let stale_pending_later_timestamp = WorkloadValue::new(WorkloadValueDraft {
         id,
         name: "task".to_string(),
         image: "img".to_string(),
@@ -2353,7 +2355,7 @@ async fn reconcile_local_tasks_does_not_duplicate_batch_launch_in_progress() {
     let reconcile_manager = manager.clone();
     let attachment_for_wait = attachment.clone();
     let (launch_result, ()) = tokio::join!(
-        async move { manager.start_tasks_batch(vec![request]).await },
+        async move { manager.start_workloads_batch(vec![request]).await },
         async move {
             attachment_for_wait.wait_for_first_attempt().await;
             reconcile_manager
@@ -3358,7 +3360,7 @@ async fn request_task_stop_releases_slot_and_clears_resources() {
         .expect("start container");
 
     let requested = manager
-        .request_task_stop(spec.id)
+        .request_workload_stop(spec.id)
         .await
         .expect("request stop");
     assert!(matches!(requested.state, WorkloadPhase::Stopping));
@@ -3368,7 +3370,7 @@ async fn request_task_stop_releases_slot_and_clears_resources() {
         .await
         .expect("reconcile requested stop");
 
-    assert!(manager.inspect_task(spec.id).await.is_err());
+    assert!(manager.inspect_workload(spec.id).await.is_err());
 
     let created = mock_cm.created.lock().await.clone();
     assert_eq!(created.len(), 1);
@@ -3396,7 +3398,7 @@ async fn request_task_stop_uses_task_termination_grace_period() {
     manager.persist_spec(&spec).await.expect("persist update");
 
     let requested = manager
-        .request_task_stop(spec.id)
+        .request_workload_stop(spec.id)
         .await
         .expect("request stop");
     manager
@@ -3432,7 +3434,7 @@ async fn request_task_stop_uses_drain_task_stop_timeout_override() {
     set_local_drain_requested(&manager, true, Some(3)).await;
 
     let requested = manager
-        .request_task_stop(spec.id)
+        .request_workload_stop(spec.id)
         .await
         .expect("request stop");
     manager
@@ -3470,7 +3472,7 @@ async fn request_task_stop_runs_pre_stop_hook_with_shared_shutdown_budget() {
     *mock_cm.exec_delay.lock().await = Some(std::time::Duration::from_secs(2));
 
     let requested = manager
-        .request_task_stop(spec.id)
+        .request_workload_stop(spec.id)
         .await
         .expect("request stop");
     manager
@@ -3525,7 +3527,7 @@ async fn request_task_stop_continues_after_pre_stop_hook_failure() {
         .push_back(Err(RuntimeError::OperationFailed("boom".into())));
 
     let requested = manager
-        .request_task_stop(spec.id)
+        .request_workload_stop(spec.id)
         .await
         .expect("request stop");
     manager
@@ -3613,7 +3615,7 @@ async fn request_task_stop_uses_container_name_when_cache_missing() {
     manager.persist_spec(&spec).await.expect("persist update");
 
     let requested = manager
-        .request_task_stop(spec.id)
+        .request_workload_stop(spec.id)
         .await
         .expect("request stop");
     assert!(matches!(requested.state, WorkloadPhase::Stopping));
@@ -3649,7 +3651,7 @@ async fn request_task_stop_is_idempotent_while_stopping() {
     mock_cm.stopped.lock().await.clear();
 
     let current = manager
-        .request_task_stop(spec.id)
+        .request_workload_stop(spec.id)
         .await
         .expect("idempotent stop");
     assert!(matches!(current.state, WorkloadPhase::Stopping));
@@ -3792,7 +3794,7 @@ async fn request_task_stop_only_updates_replicated_state() {
     mock_cm.stopped.lock().await.clear();
 
     let requested = manager
-        .request_task_stop(spec.id)
+        .request_workload_stop(spec.id)
         .await
         .expect("request stop transition");
     assert!(matches!(requested.state, WorkloadPhase::Stopping));
@@ -4043,7 +4045,7 @@ async fn list_tasks_respects_filters() {
         .expect("start running");
 
     let requested = manager
-        .request_task_stop(running.id)
+        .request_workload_stop(running.id)
         .await
         .expect("request stop running");
     manager
@@ -4053,20 +4055,20 @@ async fn list_tasks_respects_filters() {
 
     let filter_running = TaskStateFilter::new([TaskStateKind::Running]);
     let running_tasks = manager
-        .list_tasks(&filter_running)
+        .list_workloads(&filter_running)
         .await
         .expect("list running");
     assert!(running_tasks.is_empty());
 
     let filter_stopped = TaskStateFilter::new([TaskStateKind::Stopped]);
     let stopped_tasks = manager
-        .list_tasks(&filter_stopped)
+        .list_workloads(&filter_stopped)
         .await
         .expect("list stopped");
     assert!(stopped_tasks.is_empty());
 
     let all_tasks = manager
-        .list_tasks(&TaskStateFilter::all())
+        .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list all");
     assert!(all_tasks.is_empty());
@@ -4088,7 +4090,7 @@ async fn resolve_task_id_accepts_unique_short_prefix() {
     manager.persist_spec(&spec).await.expect("persist task");
 
     let resolved = manager
-        .resolve_task_id("956bc5ba")
+        .resolve_workload_id("956bc5ba")
         .await
         .expect("resolve prefix");
 
@@ -4111,7 +4113,7 @@ async fn resolve_task_id_accepts_compact_prefix_across_hyphen_boundary() {
     manager.persist_spec(&spec).await.expect("persist task");
 
     let resolved = manager
-        .resolve_task_id("956bc5ba0f2c")
+        .resolve_workload_id("956bc5ba0f2c")
         .await
         .expect("resolve prefix");
 
@@ -4132,7 +4134,7 @@ async fn resolve_task_id_rejects_ambiguous_prefix() {
     manager.persist_spec(&second).await.expect("persist second");
 
     let error = manager
-        .resolve_task_id("956bc5ba")
+        .resolve_workload_id("956bc5ba")
         .await
         .expect_err("ambiguous prefix should fail");
 
@@ -4169,7 +4171,7 @@ async fn start_tasks_batch_reserves_every_slot() {
     scheduler.init_slots(slots).await.expect("init slots");
 
     let specs = manager
-        .start_tasks_batch(vec![
+        .start_workloads_batch(vec![
             WorkloadStartRequest {
                 name: "svc-a".into(),
                 execution: empty_resolved_execution("img"),
@@ -4233,7 +4235,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
         .expect("reserve slot");
 
     let specs = manager
-        .start_tasks_batch(vec![WorkloadStartRequest {
+        .start_workloads_batch(vec![WorkloadStartRequest {
             name: "svc-a".into(),
             execution: empty_resolved_execution("img"),
             execution_substrate: ExecutionSubstrate::Oci,
@@ -4276,13 +4278,13 @@ async fn task_owned_locally_detects_remote_entries() {
 
     assert!(
         manager
-            .task_owned_locally(local_spec.id)
+            .workload_owned_locally(local_spec.id)
             .await
             .expect("local ownership check")
     );
 
     let remote_id = Uuid::new_v4();
-    let remote_value = WorkloadValue::new(TaskValueDraft {
+    let remote_value = WorkloadValue::new(WorkloadValueDraft {
         id: remote_id,
         name: "remote".to_string(),
         image: "img".to_string(),
@@ -4329,7 +4331,7 @@ async fn task_owned_locally_detects_remote_entries() {
 
     assert!(
         !manager
-            .task_owned_locally(remote_id)
+            .workload_owned_locally(remote_id)
             .await
             .expect("remote ownership check")
     );
@@ -4406,7 +4408,7 @@ async fn stream_local_task_logs_forwards_frames_and_options() {
     };
     let (logs_tx, mut logs_rx) = tokio::sync::mpsc::channel(8);
     manager
-        .stream_local_task_logs(task_id, &options, logs_tx)
+        .stream_local_workload_logs(task_id, &options, logs_tx)
         .await
         .expect("stream local logs");
 
@@ -4530,7 +4532,7 @@ async fn attach_local_task_forwards_input_output_and_options() {
     drop(input_tx);
 
     manager
-        .attach_local_task(task_id, &options, output_tx, input_rx)
+        .attach_local_workload(task_id, &options, output_tx, input_rx)
         .await
         .expect("attach local task");
 
@@ -4648,7 +4650,7 @@ async fn attach_local_task_uses_runtime_tty_when_persisted_spec_is_stale() {
     drop(input_tx);
 
     manager
-        .attach_local_task(task_id, &options, output_tx, input_rx)
+        .attach_local_workload(task_id, &options, output_tx, input_rx)
         .await
         .expect("attach local task");
 
@@ -4750,7 +4752,7 @@ async fn exec_local_task_forwards_input_output_and_options() {
     drop(input_tx);
 
     let result = manager
-        .exec_local_task(task_id, &options, output_tx, input_rx)
+        .exec_local_workload(task_id, &options, output_tx, input_rx)
         .await
         .expect("exec local task");
 
@@ -4809,7 +4811,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
     let created_before = mock_cm.created.lock().await.len();
 
     let err = manager
-        .start_tasks_batch(vec![
+        .start_workloads_batch(vec![
             WorkloadStartRequest {
                 name: "svc-c".into(),
                 execution: empty_resolved_execution("img"),
@@ -4917,7 +4919,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
     };
 
     let mut specs = manager
-        .start_tasks_batch(vec![request])
+        .start_workloads_batch(vec![request])
         .await
         .expect("start batch with network");
     assert_eq!(specs.len(), 1);
@@ -4937,7 +4939,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
     assert_eq!(mock_cm.created.lock().await.len(), 1);
 
     let requested = manager
-        .request_task_stop(task_spec.id)
+        .request_workload_stop(task_spec.id)
         .await
         .expect("request stop networked task");
     manager
@@ -4950,7 +4952,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         .expect("list attachments after stop");
     assert!(attachments_after.is_empty());
 
-    assert!(manager.inspect_task(task_spec.id).await.is_err());
+    assert!(manager.inspect_workload(task_spec.id).await.is_err());
 }
 
 #[tokio::test]
@@ -5011,7 +5013,7 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
     };
 
     let mut specs = manager
-        .start_tasks_batch(vec![request])
+        .start_workloads_batch(vec![request])
         .await
         .expect("start service task");
     let task_spec = specs.pop().expect("service task created");
@@ -5042,7 +5044,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
     let task_id = Uuid::new_v4();
     let network_id = Uuid::new_v4();
     let now = Utc::now().to_rfc3339();
-    let value = WorkloadValue::new(TaskValueDraft {
+    let value = WorkloadValue::new(WorkloadValueDraft {
         id: task_id,
         name: "service-task".to_string(),
         image: "img".to_string(),
@@ -5127,7 +5129,7 @@ async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachme
 
     let task_id = Uuid::new_v4();
     let now = Utc::now().to_rfc3339();
-    let value = WorkloadValue::new(TaskValueDraft {
+    let value = WorkloadValue::new(WorkloadValueDraft {
         id: task_id,
         name: "service-task".to_string(),
         image: "img".to_string(),
@@ -5272,7 +5274,7 @@ async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
     };
 
     let mut specs = manager
-        .start_tasks_batch(vec![request])
+        .start_workloads_batch(vec![request])
         .await
         .expect("start standalone task");
     let task_spec = specs.pop().expect("standalone task created");
@@ -5289,7 +5291,7 @@ async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
     *mock_cm.stop_delay.lock().await = Some(std::time::Duration::from_millis(300));
 
     let requested = manager
-        .request_task_stop(task_spec.id)
+        .request_workload_stop(task_spec.id)
         .await
         .expect("request stop");
     let manager_for_stop = manager.clone();
@@ -5381,13 +5383,13 @@ async fn request_task_stop_cleans_up_after_teardown_failure() {
     };
 
     let mut specs = manager
-        .start_tasks_batch(vec![request])
+        .start_workloads_batch(vec![request])
         .await
         .expect("start batch with network");
     let task_spec = specs.remove(0);
 
     manager
-        .request_task_stop(task_spec.id)
+        .request_workload_stop(task_spec.id)
         .await
         .expect("request stop flaky networked task");
     let stopping = manager
@@ -5495,7 +5497,7 @@ async fn duplicate_remove_event_does_not_poison_future_epoch_upsert() {
         .expect("apply replacement upsert");
 
     let tasks = manager
-        .list_tasks(&TaskStateFilter::all())
+        .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list tasks after replacement");
     assert_eq!(
@@ -5625,7 +5627,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
         .await
         .expect("stale upsert should be handled");
     let after_stale = manager
-        .list_tasks(&TaskStateFilter::all())
+        .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list after stale upsert");
     assert!(
@@ -5643,7 +5645,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
         .await
         .expect("fresh upsert should be accepted");
     let after_fresh = manager
-        .list_tasks(&TaskStateFilter::all())
+        .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list after fresh upsert");
     assert_eq!(
@@ -5684,7 +5686,7 @@ async fn upsert_after_remove_without_watermark_is_accepted_for_reconvergence() {
         .await
         .expect("upsert should be handled");
     let after_upsert = manager
-        .list_tasks(&TaskStateFilter::all())
+        .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list after upsert");
     assert!(
@@ -5717,7 +5719,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
     manager.clear_remove_watermark(original.id).await;
 
     let remote_node = Uuid::new_v4();
-    let stale_delta = WorkloadValue::new(TaskValueDraft {
+    let stale_delta = WorkloadValue::new(WorkloadValueDraft {
         id: original.id,
         name: original.name.clone(),
         image: original.image.clone(),
@@ -5783,7 +5785,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         .expect("apply stale delta to local store");
 
     let after_stale = manager
-        .list_tasks(&TaskStateFilter::all())
+        .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list after stale delta");
     assert!(
@@ -6101,7 +6103,7 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         .await
         .expect("apply newer gossip upsert");
 
-    let stale_delta = WorkloadValue::new(TaskValueDraft {
+    let stale_delta = WorkloadValue::new(WorkloadValueDraft {
         id: task_id,
         name: "remote-task".to_string(),
         image: "img".to_string(),
@@ -6246,7 +6248,7 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
     let remote_node = Uuid::new_v4();
     let now = Utc::now().to_rfc3339();
 
-    let remote_value = WorkloadValue::new(TaskValueDraft {
+    let remote_value = WorkloadValue::new(WorkloadValueDraft {
         id: task_id,
         name: "remote-task".to_string(),
         image: "img".to_string(),
@@ -6386,7 +6388,7 @@ async fn attachment_ready_triggers_forwarding_event() {
     };
 
     let _specs = manager
-        .start_tasks_batch(vec![request])
+        .start_workloads_batch(vec![request])
         .await
         .expect("start networked task");
 
@@ -6483,7 +6485,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
     };
 
     let mut specs = manager
-        .start_tasks_batch(vec![request])
+        .start_workloads_batch(vec![request])
         .await
         .expect("start batch with two networks");
     let task_spec = specs
@@ -6577,7 +6579,7 @@ async fn runtime_attachments_retry_transient_provision_errors() {
     };
 
     let specs = manager
-        .start_tasks_batch(vec![request])
+        .start_workloads_batch(vec![request])
         .await
         .expect("task should converge after transient attachment race");
     assert_eq!(specs.len(), 1);
@@ -6674,7 +6676,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         target_node: None,
     };
 
-    let mut specs = match manager.start_tasks_batch(vec![request]).await {
+    let mut specs = match manager.start_workloads_batch(vec![request]).await {
         Ok(specs) => specs,
         Err(err) => {
             if err
@@ -6698,7 +6700,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
     assert_eq!(attachment.state, NetworkAttachmentState::Ready);
 
     let requested = manager
-        .request_task_stop(task_spec.id)
+        .request_workload_stop(task_spec.id)
         .await
         .expect("request stop real networked task");
     manager
@@ -6801,7 +6803,7 @@ async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        manager.start_tasks_batch_with_scheduling_retry_limit(vec![request], Some(1)),
+        manager.start_workloads_batch_with_scheduling_retry_limit(vec![request], Some(1)),
     )
     .await
     .expect("override should fail without waiting for the default retry window")
@@ -6840,7 +6842,7 @@ async fn start_tasks_batch_rejects_unsupported_local_execution_substrate() {
     };
 
     let result = manager
-        .start_tasks_batch(vec![request])
+        .start_workloads_batch(vec![request])
         .await
         .expect_err("unsupported local runtime class should fail");
 
@@ -6991,7 +6993,7 @@ async fn local_volume_wait_for_first_consumer_binds_on_first_start() {
     .await;
 
     let mut started = manager
-        .start_tasks_batch(vec![standalone_volume_task_request(
+        .start_workloads_batch(vec![standalone_volume_task_request(
             &volume,
             "/var/lib/data",
         )])
@@ -7072,7 +7074,7 @@ async fn task_restart_preserves_local_volume_mount() {
     .await;
 
     let mut started = manager
-        .start_tasks_batch(vec![standalone_volume_task_request(&volume, "/srv/data")])
+        .start_workloads_batch(vec![standalone_volume_task_request(&volume, "/srv/data")])
         .await
         .expect("start initial volume-backed task");
     let spec = started.pop().expect("started task");
@@ -7149,7 +7151,7 @@ async fn multi_volume_bound_node_conflict_rejected() {
     .await;
 
     let err = manager
-        .start_tasks_batch(vec![WorkloadStartRequest {
+        .start_workloads_batch(vec![WorkloadStartRequest {
             name: "conflict".into(),
             execution: ResolvedExecutionSpec {
                 cpu_millis: 100,

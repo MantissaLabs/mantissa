@@ -424,8 +424,8 @@ async fn start_standalone_volume_task(
     target: &str,
 ) -> mantissa::workload::model::WorkloadSpec {
     let mut started = node
-        .task_manager
-        .start_tasks_batch(vec![standalone_volume_task_request(
+        .workload_manager
+        .start_workloads_batch(vec![standalone_volume_task_request(
             volume_id,
             volume_name,
             target,
@@ -781,7 +781,7 @@ local_test!(task_restart_preserves_local_volume_mount, {
     );
 
     runtime.forget_runtime().await;
-    let mut runtime_manager = node.task_manager.clone();
+    let mut runtime_manager = node.workload_manager.clone();
     let runtime_handle = tokio::task::spawn_local(async move {
         runtime_manager.run().await;
     });
@@ -858,8 +858,8 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
         .expect("upsert right volume");
 
     let err = node
-        .task_manager
-        .start_tasks_batch(vec![WorkloadStartRequest {
+        .workload_manager
+        .start_workloads_batch(vec![WorkloadStartRequest {
             name: "conflict".into(),
             execution: ResolvedExecutionSpec {
                 image: "busybox:latest".into(),
@@ -950,8 +950,8 @@ local_test!(bound_local_volume_forces_scheduler_locality, {
 
     let mut started = cluster[0]
         .node
-        .task_manager
-        .start_tasks_batch(vec![standalone_volume_task_request(
+        .workload_manager
+        .start_workloads_batch(vec![standalone_volume_task_request(
             volume_id,
             "remote-volume",
             "/data",
@@ -1030,8 +1030,8 @@ local_test!(volume_delete_retain_preserves_local_path, {
         .local_path
         .expect("local path before retain delete");
 
-    node.task_manager
-        .request_task_stop(task.id)
+    node.workload_manager
+        .request_workload_stop(task.id)
         .await
         .expect("request task stop");
     wait_for_volume_published_tasks(&node, volume_id, &[]).await;
@@ -1080,8 +1080,8 @@ local_test!(volume_delete_delete_removes_managed_path, {
         .local_path
         .expect("local path before delete reclaim");
 
-    node.task_manager
-        .request_task_stop(task.id)
+    node.workload_manager
+        .request_workload_stop(task.id)
         .await
         .expect("request task stop");
     wait_for_volume_published_tasks(&node, volume_id, &[]).await;

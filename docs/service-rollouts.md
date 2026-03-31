@@ -94,7 +94,7 @@ Controls what happens when `max_failures` is exhausted.
 
 - Rollout strategy is service-wide. It applies to the whole manifest update, not
   to one task template in isolation.
-- `max_failures` counts rollout step failures, not container restart attempts.
+- `max_failures` counts rollout step failures, not runtime restart attempts.
 - A successful rollback is represented in replicated service state, so rollback
   convergence across nodes uses the same CRDT ordering as normal deployment.
 - `parallelism > 1` can temporarily increase the number of active replicas when

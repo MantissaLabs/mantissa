@@ -80,9 +80,9 @@ The important consequence is that names describe different axes:
 | `RuntimeBackend` | Which local engine actually implements the request |
 
 That is why Mantissa talks about `TaskStartRequest` at the public task
-boundary but `WorkloadStartRequest` inside the shared layer. The task request
-is task-oriented; the task service converts it into the generic workload
-request that is also reused by services, jobs, and agents.
+boundary but `WorkloadStartRequest` inside the shared layer. The task service
+converts the task-shaped request into the generic workload request that is
+also reused by services, jobs, and agents.
 
 ## Control-Plane Concepts
 
@@ -257,8 +257,8 @@ mean a MicroVM engine is already wired into the runtime layer.
 
 ## Networking Is Runtime-Neutral
 
-The networking layer no longer assumes that every schedulable execution is "a
-container identified by a PID". Instead it consumes a runtime attachment target
+The networking layer no longer assumes that every schedulable execution is "an
+OCI container identified by a PID". Instead it consumes a runtime attachment target
 published by the backend.
 
 Today the shared runtime model supports three attachment target forms:
@@ -269,7 +269,7 @@ Today the shared runtime model supports three attachment target forms:
 | `NetworkNamespacePath` | Backends that expose a network namespace path directly |
 | `TapDevice` | Backends that wire guest networking through a tap device, such as a MicroVM design |
 
-This is the piece that lets containers and future MicroVM-style backends share
+This is the piece that lets OCI backends and future MicroVM-style backends share
 the same attachment orchestration without pretending they expose identical
 network primitives.
 
@@ -364,7 +364,8 @@ flowchart LR
 ### `src/workload`
 
 `src/workload/model.rs` defines the generic model and terminology: workload
-kind, runtime class, workload identity, workload phases, generic state filters,
+kind, execution substrate, isolation mode, workload identity, workload phases,
+generic state filters,
 and the shared durable workload structures.
 
 `src/workload/types.rs` defines the shared execution-side types such as
@@ -372,7 +373,8 @@ and the shared durable workload structures.
 
 `src/workload/manager/` is the shared orchestration engine. This is where
 placement, reconciliation, runtime adoption, attachment repair, local runtime
-inventory handling, and task/workload start requests are implemented.
+inventory handling, public task start adaptation, and internal workload launch
+requests are implemented.
 
 ### `src/task`
 
@@ -380,9 +382,9 @@ inventory handling, and task/workload start requests are implemented.
 API remains a first-class operator interface while the generic orchestration
 core lives in `src/workload`.
 
-The types in `src/task/types.rs` are intentionally shallow aliases over the
-generic workload model rather than a second independent task orchestration
-stack.
+The types in `src/task/types.rs` are standalone-task projections and helpers
+over the generic workload model rather than a second independent task
+orchestration stack.
 
 ### `src/services`
 

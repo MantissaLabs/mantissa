@@ -35,7 +35,7 @@ pub struct AgentSubmission {
 /// Dependencies used to construct one agent controller.
 pub struct AgentControllerConfig {
     pub registry: AgentRegistry,
-    pub task_manager: WorkloadManager,
+    pub workload_manager: WorkloadManager,
     pub cluster_registry: Registry,
     pub gossip_tx: Sender<Message>,
     pub gossip_rx: Receiver<Message>,
@@ -47,7 +47,7 @@ pub struct AgentControllerConfig {
 #[derive(Clone)]
 pub struct AgentController {
     registry: AgentRegistry,
-    task_manager: WorkloadManager,
+    workload_manager: WorkloadManager,
     cluster_registry: Registry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
@@ -61,7 +61,7 @@ impl AgentController {
     pub fn new(config: AgentControllerConfig) -> Self {
         let AgentControllerConfig {
             registry,
-            task_manager,
+            workload_manager,
             cluster_registry,
             gossip_tx,
             gossip_rx,
@@ -70,7 +70,7 @@ impl AgentController {
         } = config;
         Self {
             registry,
-            task_manager,
+            workload_manager,
             cluster_registry,
             gossip_tx,
             gossip_rx,
@@ -330,7 +330,7 @@ impl AgentController {
         }
 
         let task_id = run.task_id.expect("checked task id");
-        let spec = match self.task_manager.inspect_task(task_id).await {
+        let spec = match self.workload_manager.inspect_workload(task_id).await {
             Ok(spec) => spec,
             Err(error) => {
                 let mut failed_run = run.clone();
@@ -468,7 +468,11 @@ impl AgentController {
             target_node: None,
         };
 
-        match self.task_manager.start_tasks_batch(vec![request]).await {
+        match self
+            .workload_manager
+            .start_workloads_batch(vec![request])
+            .await
+        {
             Ok(mut started) => {
                 let spec = started
                     .pop()

@@ -12,9 +12,8 @@ use crate::services::types::{
     ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
 };
 use crate::store::workload_store::WorkloadStore;
-use crate::task::types::TaskValue;
 use crate::workload::model::WorkloadPhase;
-use crate::workload::model::select_best_workload_value;
+use crate::workload::model::{WorkloadValue, select_best_workload_value};
 use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use crdt_store::uuid_key::UuidKey;
@@ -673,7 +672,7 @@ async fn resolve_service_backends(
     let attachments = registry
         .list_attachments(Some(network_id))
         .context("list attachments for discovery")?;
-    let mut cache: HashMap<Uuid, Option<TaskValue>> = HashMap::new();
+    let mut cache: HashMap<Uuid, Option<WorkloadValue>> = HashMap::new();
     let mut results = Vec::new();
 
     tracing::trace!(
@@ -856,7 +855,7 @@ async fn resolve_service_backends(
 }
 
 /// Load the most relevant task value so discovery follows the current scheduling decision.
-fn load_task(workloads: &WorkloadStore, id: Uuid) -> Option<TaskValue> {
+fn load_task(workloads: &WorkloadStore, id: Uuid) -> Option<WorkloadValue> {
     let key = UuidKey::from(id);
     let snapshot = workloads.get_snapshot(&key).ok()??;
     select_best_workload_value(snapshot.as_slice())
@@ -865,7 +864,7 @@ fn load_task(workloads: &WorkloadStore, id: Uuid) -> Option<TaskValue> {
 /// Decide whether an attachment should be trusted over a stale task record during convergence.
 fn attachment_is_newer_than_task(
     attachment: &crate::network::types::NetworkAttachmentValue,
-    task: &TaskValue,
+    task: &WorkloadValue,
 ) -> bool {
     let attachment_ts = attachment_revision_timestamp(attachment);
     let task_ts = task_revision_timestamp(task);
@@ -888,7 +887,7 @@ fn attachment_revision_timestamp(
 }
 
 /// Extract a comparable revision timestamp from a task to detect stale task records.
-fn task_revision_timestamp(task: &TaskValue) -> Option<chrono::DateTime<chrono::Utc>> {
+fn task_revision_timestamp(task: &WorkloadValue) -> Option<chrono::DateTime<chrono::Utc>> {
     parse_rfc3339(Some(&task.updated_at)).or_else(|| parse_rfc3339(Some(&task.created_at)))
 }
 
@@ -1963,8 +1962,9 @@ mod tests {
     };
     use crate::store::service_store::open_service_store;
     use crate::store::workload_store::{WorkloadStore, open_workload_store};
-    use crate::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
-    use crate::workload::model::WorkloadPhase;
+    use crate::workload::model::{
+        WorkloadPhase, WorkloadServiceMetadata, WorkloadValue, WorkloadValueDraft,
+    };
     use crate::workload::types::ExecutionSpec;
     use crdt_store::uuid_key::UuidKey;
     use std::sync::Arc;
@@ -2125,9 +2125,9 @@ mod tests {
         node_id: Uuid,
         service_name: &str,
         network_id: Uuid,
-    ) -> TaskValue {
+    ) -> WorkloadValue {
         let now = chrono::Utc::now().to_rfc3339();
-        TaskValue::new(TaskValueDraft {
+        WorkloadValue::new(WorkloadValueDraft {
             id: task_id,
             name: "backend".to_string(),
             image: "hashicorp/http-echo:1.0.0".to_string(),
@@ -2155,7 +2155,7 @@ mod tests {
             env: Vec::new(),
             secret_files: Vec::new(),
             volumes: Vec::new(),
-            service_metadata: Some(TaskServiceMetadata::new(service_name, "backend")),
+            service_metadata: Some(WorkloadServiceMetadata::new(service_name, "backend")),
             job_metadata: None,
             agent_run_metadata: None,
             lease_id: None,

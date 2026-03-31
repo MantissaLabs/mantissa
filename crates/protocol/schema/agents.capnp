@@ -24,13 +24,13 @@ struct AgentSessionSpec {
   # Human-facing session name.
 
   image @2 :Text;
-  # Runtime image reference for sandbox runs launched from this session.
+  # Runtime image reference for runs launched from this session.
 
   command @3 :List(Text);
   # Entrypoint command and arguments.
 
   tty @4 :Bool;
-  # Allocate a terminal for the sandbox entrypoint.
+  # Allocate a terminal for the run entrypoint.
 
   cpuMillis @5 :UInt64;
   # Requested CPU in milli-cores.
@@ -45,13 +45,13 @@ struct AgentSessionSpec {
   # Shared execution restart policy. Current controller rejects non-empty values.
 
   env @9 :List(WorkloadSchema.EnvironmentVar);
-  # Environment variables shared with sandbox execution.
+  # Environment variables shared with run execution.
 
   secretFiles @10 :List(WorkloadSchema.SecretFile);
   # Secret-backed file projections.
 
   volumes @11 :List(WorkloadSchema.VolumeMount);
-  # Named volumes mounted into the sandbox workload.
+  # Named volumes mounted into runs launched from this session.
 
   networks @12 :List(Data);
   # Overlay network UUIDs as 16-byte binary data.
@@ -108,7 +108,7 @@ struct AgentSessionSpec {
   # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
 
   preStopCommand @30 :List(Text);
-  # Optional command executed inside the sandbox before termination begins.
+  # Optional command executed inside the run before termination begins.
 
   liveness @31 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe evaluated by the hosting runtime.
@@ -131,7 +131,7 @@ struct AgentRunSpec {
   # Entrypoint command and arguments for this run.
 
   tty @5 :Bool;
-  # Allocate a terminal for the sandbox entrypoint.
+  # Allocate a terminal for the run entrypoint.
 
   cpuMillis @6 :UInt64;
   # Requested CPU in milli-cores.
@@ -146,13 +146,13 @@ struct AgentRunSpec {
   # Shared execution restart policy. Current controller rejects non-empty values.
 
   env @10 :List(WorkloadSchema.EnvironmentVar);
-  # Environment variables shared with sandbox execution.
+  # Environment variables shared with run execution.
 
   secretFiles @11 :List(WorkloadSchema.SecretFile);
   # Secret-backed file projections.
 
   volumes @12 :List(WorkloadSchema.VolumeMount);
-  # Named volumes mounted into the sandbox workload.
+  # Named volumes mounted into this run.
 
   networks @13 :List(Data);
   # Overlay network UUIDs as 16-byte binary data.
@@ -188,7 +188,7 @@ struct AgentRunSpec {
   # Structured user input that triggered this run, empty when none was queued.
 
   exitCode @24 :Int32;
-  # Last observed sandbox exit code. Value is meaningful only when hasExitCode is true.
+  # Last observed run exit code. Value is meaningful only when hasExitCode is true.
 
   hasExitCode @25 :Bool;
   # Distinguishes unset exit codes from an actual zero exit status.
@@ -203,7 +203,7 @@ struct AgentRunSpec {
   # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
 
   preStopCommand @29 :List(Text);
-  # Optional command executed inside the sandbox before termination begins.
+  # Optional command executed inside the run before termination begins.
 
   liveness @30 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe evaluated by the hosting runtime.
@@ -214,7 +214,7 @@ struct AgentWorkspacePolicy {
   # Optional workspace mount. Empty volumeId means "unset".
 
   workingDirectory @1 :Text;
-  # Preferred working directory inside the sandbox, empty when unset.
+  # Preferred working directory inside the run, empty when unset.
 
   persistent @2 :Bool;
   # Whether the workspace should persist across runs.
@@ -225,10 +225,10 @@ struct AgentToolPolicy {
   # Explicitly allowed tool identifiers.
 
   allowNetwork @1 :Bool;
-  # Whether outbound network access is allowed inside the sandbox.
+  # Whether outbound network access is allowed inside runs from this session.
 
   allowPty @2 :Bool;
-  # Whether pseudo-terminal allocation is allowed for tools inside the sandbox.
+  # Whether pseudo-terminal allocation is allowed for tools inside runs from this session.
 
   allowWrite @3 :Bool;
   # Whether tool-driven filesystem writes are allowed.
@@ -250,7 +250,7 @@ struct AgentInteractionPolicy {
   # Whether the controller should wait for explicit user input before launching another run.
 
   maxTurnsPerRun @1 :UInt16;
-  # Upper bound for autonomous turns inside one run before the sandbox should yield.
+  # Upper bound for autonomous turns inside one run before execution should yield.
 
   idleTimeoutSecs @2 :UInt32;
   # Optional idle timeout in seconds, 0 means unset.

@@ -626,7 +626,11 @@ impl ServiceController {
         started_specs: &[WorkloadSpec],
     ) {
         for started in started_specs {
-            if let Err(stop_err) = self.task_manager.request_task_stop(started.id).await {
+            if let Err(stop_err) = self
+                .workload_manager
+                .request_workload_stop(started.id)
+                .await
+            {
                 tracing::warn!(
                     target: "services",
                     "failed to stop unhealthy replacement task {} for service '{}': {stop_err}",
@@ -1097,7 +1101,10 @@ impl ServiceController {
             startup_timeout_secs,
             monitor_secs,
             || async {
-                let states = self.task_manager.task_state_snapshot(&[task_id]).await?;
+                let states = self
+                    .workload_manager
+                    .workload_phase_snapshot(&[task_id])
+                    .await?;
                 Ok(states
                     .first()
                     .and_then(|(_, state)| state.as_ref())
@@ -1127,7 +1134,10 @@ impl ServiceController {
                 ));
             }
 
-            let states = self.task_manager.task_state_snapshot(&[task_id]).await?;
+            let states = self
+                .workload_manager
+                .workload_phase_snapshot(&[task_id])
+                .await?;
             let state = states
                 .first()
                 .and_then(|(_, state)| state.as_ref())
@@ -1150,7 +1160,7 @@ impl ServiceController {
         rollback_old_tasks: &mut HashMap<Uuid, RollbackTaskRecord>,
     ) -> anyhow::Result<()> {
         if let Err(err) = self
-            .task_manager
+            .workload_manager
             .set_task_traffic_published(assignment.task_id, false)
             .await
         {
@@ -1162,8 +1172,8 @@ impl ServiceController {
             );
         }
 
-        self.task_manager
-            .request_task_stop(assignment.task_id)
+        self.workload_manager
+            .request_workload_stop(assignment.task_id)
             .await
             .map_err(|err| {
                 anyhow!(
@@ -1204,7 +1214,7 @@ impl ServiceController {
         rollback_old_tasks: &HashMap<Uuid, RollbackTaskRecord>,
     ) -> anyhow::Result<()> {
         for task_id in rollback_new_task_ids {
-            if let Err(err) = self.task_manager.request_task_stop(*task_id).await {
+            if let Err(err) = self.workload_manager.request_workload_stop(*task_id).await {
                 tracing::warn!(
                     target: "services",
                     "failed to stop replacement task {task_id} during rollback of '{}': {err}",
@@ -1307,7 +1317,10 @@ impl ServiceController {
             ));
         }
 
-        let states = self.task_manager.task_state_snapshot(replica_ids).await?;
+        let states = self
+            .workload_manager
+            .workload_phase_snapshot(replica_ids)
+            .await?;
         for (task_id, state) in states {
             match state {
                 Some(

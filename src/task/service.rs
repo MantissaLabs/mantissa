@@ -622,7 +622,7 @@ impl TaskService {
         if let Ok(id) = Uuid::parse_str(trimmed) {
             let spec = self
                 .manager
-                .inspect_task(id)
+                .inspect_workload(id)
                 .await
                 .map_err(|err| Error::failed(err.to_string()))?;
             project_task_spec(&spec)?;
@@ -631,7 +631,7 @@ impl TaskService {
 
         let workloads = self
             .manager
-            .list_tasks(&TaskStateFilter::all())
+            .list_workloads(&TaskStateFilter::all())
             .await
             .map_err(|err| Error::failed(err.to_string()))?;
         let ids = workloads
@@ -644,7 +644,7 @@ impl TaskService {
     async fn inspect_standalone_task(&self, id: Uuid) -> Result<TaskSpec, Error> {
         let spec = self
             .manager
-            .inspect_task(id)
+            .inspect_workload(id)
             .await
             .map_err(|err| Error::failed(err.to_string()))?;
         project_task_spec(&spec)
@@ -664,7 +664,7 @@ impl task::Server for TaskService {
 
         let mut specs = self
             .manager
-            .start_tasks_batch(vec![request])
+            .start_workloads_batch(vec![request])
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 
@@ -696,7 +696,7 @@ impl task::Server for TaskService {
 
         let specs = self
             .manager
-            .start_tasks_batch(requests)
+            .start_workloads_batch(requests)
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 
@@ -725,7 +725,7 @@ impl task::Server for TaskService {
 
         let spec = self
             .manager
-            .request_task_stop(id)
+            .request_workload_stop(id)
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
         let task_spec = project_task_spec(&spec)?;
@@ -768,7 +768,7 @@ impl task::Server for TaskService {
         let options_for_task = options.clone();
         let producer = tokio::task::spawn_local(async move {
             manager
-                .stream_local_task_logs(id, &options_for_task, logs_tx)
+                .stream_local_workload_logs(id, &options_for_task, logs_tx)
                 .await
         });
 
@@ -818,7 +818,7 @@ impl task::Server for TaskService {
         }
 
         self.manager
-            .ensure_local_task_attachable(id)
+            .ensure_local_workload_attachable(id)
             .await
             .map_err(|err| Error::failed(err.to_string()))?;
 
@@ -845,7 +845,7 @@ impl task::Server for TaskService {
             tokio::task::yield_now().await;
             let producer = tokio::task::spawn_local(async move {
                 manager
-                    .attach_local_task(id, &options_for_task, output_tx, input_rx)
+                    .attach_local_workload(id, &options_for_task, output_tx, input_rx)
                     .await
             });
             while let Some(frame) = output_rx.recv().await {
@@ -904,7 +904,7 @@ impl task::Server for TaskService {
         }
 
         self.manager
-            .ensure_local_task_executable(id)
+            .ensure_local_workload_executable(id)
             .await
             .map_err(|err| Error::failed(err.to_string()))?;
 
@@ -933,7 +933,7 @@ impl task::Server for TaskService {
             tokio::task::yield_now().await;
             let producer = tokio::task::spawn_local(async move {
                 manager
-                    .exec_local_task(id, &options_for_task, output_tx, input_rx)
+                    .exec_local_workload(id, &options_for_task, output_tx, input_rx)
                     .await
             });
             while let Some(frame) = output_rx.recv().await {
@@ -978,7 +978,7 @@ impl task::Server for TaskService {
 
         let specs = self
             .manager
-            .list_tasks(&filter)
+            .list_workloads(&filter)
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 

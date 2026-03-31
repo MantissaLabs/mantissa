@@ -17,7 +17,6 @@ use crate::store::cluster_view_store::ClusterNameRecord;
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, MasterKeyRecord};
 use crate::store::peer_store::PeersStore;
 use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains};
-use crate::task::types::TaskValue;
 use crate::topology::health::status_to_node_status;
 use crate::topology::operation::{
     ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
@@ -28,8 +27,7 @@ use crate::topology::peers::{
 };
 use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::types::VolumeDriver;
-use crate::workload::model::WorkloadPhase;
-use crate::workload::model::select_best_workload_value;
+use crate::workload::model::{WorkloadPhase, WorkloadValue, select_best_workload_value};
 use async_trait::async_trait;
 use capnp::Error;
 use capnp::data;
@@ -869,7 +867,10 @@ impl Topology {
     ///
     /// Drain validation uses the replicated workload store directly so blockers are determined from
     /// converged cluster state instead of the local runtime cache.
-    fn active_task_values_on_node(&self, node_id: Uuid) -> Result<Vec<TaskValue>, capnp::Error> {
+    fn active_task_values_on_node(
+        &self,
+        node_id: Uuid,
+    ) -> Result<Vec<WorkloadValue>, capnp::Error> {
         let (entries, _) = self
             .workloads
             .load_all()
@@ -896,7 +897,7 @@ impl Topology {
     fn local_volume_drain_blockers(
         &self,
         node_id: Uuid,
-        tasks: &[TaskValue],
+        tasks: &[WorkloadValue],
     ) -> Result<Vec<LocalVolumeDrainBlocker>, capnp::Error> {
         let volumes = VolumeRegistry::new(self.volumes.clone(), self.volume_nodes.clone());
         let mut seen = HashSet::new();
@@ -1096,7 +1097,7 @@ impl Topology {
     /// Detects service-state blockers that prevent remaining drained tasks from moving safely.
     fn drain_rollout_blocker(
         &self,
-        service_tasks: &[TaskValue],
+        service_tasks: &[WorkloadValue],
         service_by_name: &HashMap<String, crate::services::types::ServiceSpecValue>,
     ) -> Option<String> {
         for task in service_tasks {
@@ -1125,7 +1126,7 @@ impl Topology {
     async fn drain_capacity_blocker(
         &self,
         drained_node_id: Uuid,
-        service_tasks: &[TaskValue],
+        service_tasks: &[WorkloadValue],
     ) -> Option<String> {
         let replacement_nodes = self.schedulable_replacement_nodes(drained_node_id);
         if replacement_nodes.is_empty() {
@@ -1226,7 +1227,7 @@ impl Topology {
             .iter()
             .filter(|task| task.service_metadata.is_none())
             .count() as u32;
-        let service_tasks: Vec<TaskValue> = active_tasks
+        let service_tasks: Vec<WorkloadValue> = active_tasks
             .iter()
             .filter(|task| task.service_metadata.is_some())
             .cloned()

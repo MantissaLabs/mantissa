@@ -696,7 +696,7 @@ impl WorkloadManager {
     }
 
     /// Requests a remote peer to stop a task so the owner updates state and broadcasts it.
-    pub(super) async fn stop_remote_task(
+    pub(super) async fn stop_remote_workload(
         &self,
         spec: &WorkloadSpec,
     ) -> Result<WorkloadSpec, anyhow::Error> {
@@ -761,7 +761,7 @@ impl WorkloadManager {
                 continue;
             }
 
-            if let Err(err) = self.stop_remote_task(spec).await {
+            if let Err(err) = self.stop_remote_workload(spec).await {
                 warn!(
                     target: "task",
                     "failed to request remote stop for task {} on peer {}: {err}",

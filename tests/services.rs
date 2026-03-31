@@ -651,7 +651,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
             .expect("service should still be present");
         let mut task_details = Vec::new();
         for task_id in &current.replica_ids {
-            let detail = match node.node.task_manager.inspect_task(*task_id).await {
+            let detail = match node.node.workload_manager.inspect_workload(*task_id).await {
                 Ok(task) => format!("{}:{:?}:phase{}", task.id, task.state, task.phase_version),
                 Err(err) => format!("{task_id}:inspect-error:{err}"),
             };
@@ -752,7 +752,7 @@ local_test!(services_deployment_replicates_across_cluster, {
     for node in &cluster {
         assert!(
             wait_for_task_count(
-                &node.node.task_manager,
+                &node.node.workload_manager,
                 expected_count,
                 Duration::from_secs(10)
             )
@@ -764,8 +764,8 @@ local_test!(services_deployment_replicates_across_cluster, {
         let filter = TaskStateFilter::all();
         let specs = node
             .node
-            .task_manager
-            .list_tasks(&filter)
+            .workload_manager
+            .list_workloads(&filter)
             .await
             .expect("list tasks");
         let ids: BTreeSet<Uuid> = specs.iter().map(|spec| spec.id).collect();
@@ -827,7 +827,7 @@ local_test!(services_placement_startup_avoids_over_replication, {
 
     while Instant::now() < deadline {
         for node in &cluster {
-            let count = list_active_service_tasks(&node.node.task_manager, service_name)
+            let count = list_active_service_tasks(&node.node.workload_manager, service_name)
                 .await
                 .len();
             max_seen = max_seen.max(count);
@@ -931,8 +931,8 @@ local_test!(
         for task_id in &service_spec.replica_ids {
             let task = cluster[0]
                 .node
-                .task_manager
-                .inspect_task(*task_id)
+                .workload_manager
+                .inspect_workload(*task_id)
                 .await
                 .expect("inspect service task");
             assert!(
@@ -1070,7 +1070,7 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
 
     while Instant::now() < deadline {
         for node in &cluster {
-            let count = list_active_service_tasks(&node.node.task_manager, service_name)
+            let count = list_active_service_tasks(&node.node.workload_manager, service_name)
                 .await
                 .len();
             max_seen = max_seen.max(count);
@@ -1130,8 +1130,8 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
     for task_id in &final_spec.replica_ids {
         let task = cluster[0]
             .node
-            .task_manager
-            .inspect_task(*task_id)
+            .workload_manager
+            .inspect_workload(*task_id)
             .await
             .expect("inspect scaled task");
         *counts.entry(task.node_id).or_insert(0) += 1;
@@ -1216,7 +1216,7 @@ local_test!(services_large_deployment_converges_within_bound, {
     );
 
     for node in &cluster {
-        let tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
+        let tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
         assert_eq!(
             tasks.len(),
             expected_replicas,
@@ -1283,8 +1283,8 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
         .expect("running service should expose one task id");
     let original_task = node
         .node
-        .task_manager
-        .inspect_task(task_id)
+        .workload_manager
+        .inspect_workload(task_id)
         .await
         .expect("inspect running task");
 
@@ -1537,10 +1537,13 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
     while Instant::now() < distribution_deadline {
         let mut all_have_local_replica = true;
         for node in &cluster {
-            let local_count =
-                list_local_active_service_tasks(&node.node.task_manager, service_name, node.id())
-                    .await
-                    .len();
+            let local_count = list_local_active_service_tasks(
+                &node.node.workload_manager,
+                service_name,
+                node.id(),
+            )
+            .await
+            .len();
             if local_count == 0 {
                 all_have_local_replica = false;
                 break;
@@ -1583,10 +1586,13 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
         let local_drain_deadline = Instant::now() + Duration::from_secs(12);
         let mut local_drained = false;
         while Instant::now() < local_drain_deadline {
-            let local_count =
-                list_local_active_service_tasks(&node.node.task_manager, service_name, node.id())
-                    .await
-                    .len();
+            let local_count = list_local_active_service_tasks(
+                &node.node.workload_manager,
+                service_name,
+                node.id(),
+            )
+            .await
+            .len();
             if local_count == 0 {
                 local_drained = true;
                 break;
@@ -1657,8 +1663,8 @@ local_test!(services_node_drain_migrates_singleton_service, {
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
         .node
-        .task_manager
-        .inspect_task(task_id)
+        .workload_manager
+        .inspect_workload(task_id)
         .await
         .expect("inspect singleton task");
     let drained_node_id = initial_task.node_id;
@@ -1682,12 +1688,12 @@ local_test!(services_node_drain_migrates_singleton_service, {
         || async {
             let task = cluster[0]
                 .node
-                .task_manager
-                .inspect_task(task_id)
+                .workload_manager
+                .inspect_workload(task_id)
                 .await
                 .ok();
             let local_drained = list_local_active_service_tasks(
-                &drained_node.node.task_manager,
+                &drained_node.node.workload_manager,
                 service_name,
                 drained_node_id,
             )
@@ -1782,7 +1788,7 @@ local_test!(services_node_drain_migrates_multi_replica_service, {
         Duration::from_millis(100),
         || async {
             let local_empty = list_local_active_service_tasks(
-                &drained_node.node.task_manager,
+                &drained_node.node.workload_manager,
                 service_name,
                 drained_node.id(),
             )
@@ -1857,7 +1863,8 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
         Duration::from_millis(100),
         || async {
             for node in &cluster[..2] {
-                let tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
+                let tasks =
+                    list_active_service_tasks(&node.node.workload_manager, service_name).await;
                 if tasks.len() != 3
                     || tasks.iter().any(|task| {
                         task.node_id == down_node_id || task.state != WorkloadPhase::Running
@@ -1868,14 +1875,14 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
             }
 
             let local_tasks_left = list_local_active_service_tasks(
-                &cluster[0].node.task_manager,
+                &cluster[0].node.workload_manager,
                 service_name,
                 cluster[0].id(),
             )
             .await
             .len();
             let local_tasks_right = list_local_active_service_tasks(
-                &cluster[1].node.task_manager,
+                &cluster[1].node.workload_manager,
                 service_name,
                 cluster[1].id(),
             )
@@ -1897,7 +1904,7 @@ local_test!(services_node_drain_blocks_on_standalone_task, {
     let node = TestNode::new().await;
 
     node.node
-        .task_manager
+        .workload_manager
         .start_workload(
             "standalone",
             "ghcr.io/mantissa/demo:web",
@@ -1963,7 +1970,11 @@ local_test!(
                 .expect("load slow service")
                 && spec.status() == ServiceStatus::Deploying
                 && let Some(task_id) = spec.replica_ids.first().copied()
-                && let Ok(task) = cluster[0].node.task_manager.inspect_task(task_id).await
+                && let Ok(task) = cluster[0]
+                    .node
+                    .workload_manager
+                    .inspect_workload(task_id)
+                    .await
             {
                 deployment_target = Some((task.node_id, task_id));
                 break;
@@ -2013,12 +2024,12 @@ local_test!(
             || async {
                 let task = cluster[0]
                     .node
-                    .task_manager
-                    .inspect_task(task_id)
+                    .workload_manager
+                    .inspect_workload(task_id)
                     .await
                     .ok();
                 let local_drained = list_local_active_service_tasks(
-                    &drained_node.node.task_manager,
+                    &drained_node.node.workload_manager,
                     service_name,
                     drained_node_id,
                 )
@@ -2098,8 +2109,8 @@ local_test!(services_node_drain_reports_capacity_blocker, {
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
         .node
-        .task_manager
-        .inspect_task(task_id)
+        .workload_manager
+        .inspect_workload(task_id)
         .await
         .expect("inspect singleton task");
     assert_eq!(
@@ -2305,8 +2316,8 @@ local_test!(services_node_list_reports_drained_node_after_evacuation, {
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
         .node
-        .task_manager
-        .inspect_task(task_id)
+        .workload_manager
+        .inspect_workload(task_id)
         .await
         .expect("inspect singleton task");
     let drained_node_id = initial_task.node_id;
@@ -3143,8 +3154,8 @@ local_test!(services_sync_recovers_missing_entries, {
 
     let specs_after_remove = peer
         .node
-        .task_manager
-        .list_tasks(&TaskStateFilter::all())
+        .workload_manager
+        .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list tasks after removal");
     assert!(specs_after_remove.is_empty(), "peer tasks cleared");
@@ -3158,8 +3169,8 @@ local_test!(services_sync_recovers_missing_entries, {
 
     let restored_specs = peer
         .node
-        .task_manager
-        .list_tasks(&TaskStateFilter::all())
+        .workload_manager
+        .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list tasks after sync");
     let restored_ids: BTreeSet<Uuid> = restored_specs.iter().map(|spec| spec.id).collect();
@@ -3210,7 +3221,7 @@ local_test!(services_redeploy_scales_replicas, {
         "service should reach running state before redeploy"
     );
     assert!(
-        wait_for_task_count(&node.node.task_manager, 1, Duration::from_secs(5)).await,
+        wait_for_task_count(&node.node.workload_manager, 1, Duration::from_secs(5)).await,
         "initial deployment should launch a single replica"
     );
 
@@ -3265,7 +3276,7 @@ local_test!(services_redeploy_scales_replicas, {
         );
     }
     assert!(
-        wait_for_task_count(&node.node.task_manager, 3, Duration::from_secs(8)).await,
+        wait_for_task_count(&node.node.workload_manager, 3, Duration::from_secs(8)).await,
         "scaled service should eventually report three replicas"
     );
 
@@ -3331,7 +3342,7 @@ local_test!(services_redeploy_updates_resources, {
         "service should reach running state before resource update"
     );
     assert!(
-        wait_for_task_count(&node.node.task_manager, 1, Duration::from_secs(5)).await,
+        wait_for_task_count(&node.node.workload_manager, 1, Duration::from_secs(5)).await,
         "baseline deployment should launch a single replica"
     );
 
@@ -3404,8 +3415,8 @@ local_test!(services_redeploy_updates_resources, {
 
     let replacement_spec = node
         .node
-        .task_manager
-        .inspect_task(replacement_id)
+        .workload_manager
+        .inspect_workload(replacement_id)
         .await
         .expect("inspect updated task");
     assert_eq!(
@@ -3819,8 +3830,8 @@ local_test!(
         while Instant::now() < deadline {
             let tasks = node
                 .node
-                .task_manager
-                .list_tasks(&TaskStateFilter::all())
+                .workload_manager
+                .list_workloads(&TaskStateFilter::all())
                 .await
                 .expect("list tasks during stop-first rollout");
             let replacement_visible = tasks.iter().any(|task| {
@@ -3835,8 +3846,8 @@ local_test!(
             if replacement_visible {
                 let states = node
                     .node
-                    .task_manager
-                    .task_state_snapshot(&[old_task_id])
+                    .workload_manager
+                    .workload_phase_snapshot(&[old_task_id])
                     .await
                     .expect("snapshot old task state");
                 let old_state = states.first().and_then(|(_, state)| state.clone());
@@ -3951,7 +3962,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
             }
         }
 
-        let count = list_active_service_tasks(&node.node.task_manager, service_name)
+        let count = list_active_service_tasks(&node.node.workload_manager, service_name)
             .await
             .len();
         max_seen = max_seen.max(count);
@@ -4141,7 +4152,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
 
     assert!(
         wait_for_task_state(
-            &node.node.task_manager,
+            &node.node.workload_manager,
             task_id,
             WorkloadPhase::Running,
             Duration::from_secs(10)
@@ -4163,7 +4174,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
     );
     assert!(
         wait_for_task_state(
-            &node.node.task_manager,
+            &node.node.workload_manager,
             task_id,
             WorkloadPhase::VolumeUnavailable,
             Duration::from_secs(10)
@@ -4176,7 +4187,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
 
     assert!(
         wait_for_task_state(
-            &node.node.task_manager,
+            &node.node.workload_manager,
             task_id,
             WorkloadPhase::Running,
             Duration::from_secs(15)
@@ -4438,7 +4449,7 @@ local_test!(services_depends_on_waits_for_dependency_publication, {
     );
 
     let frontend_tasks = list_active_task_template_tasks(
-        &node.node.task_manager,
+        &node.node.workload_manager,
         "depends-on-publication",
         "frontend",
     )
@@ -4490,13 +4501,13 @@ local_test!(
         );
 
         let old_backend_task_ids: HashSet<Uuid> =
-            list_active_task_template_tasks(&node.node.task_manager, service_name, "backend")
+            list_active_task_template_tasks(&node.node.workload_manager, service_name, "backend")
                 .await
                 .into_iter()
                 .map(|task| task.id)
                 .collect();
         let old_frontend_task_ids: HashSet<Uuid> =
-            list_active_task_template_tasks(&node.node.task_manager, service_name, "frontend")
+            list_active_task_template_tasks(&node.node.workload_manager, service_name, "frontend")
                 .await
                 .into_iter()
                 .map(|task| task.id)
@@ -4770,7 +4781,7 @@ async fn collect_published_service_attachment_snapshot(
     network_id: Uuid,
     expected_task_count: usize,
 ) -> Option<Vec<(Uuid, Uuid)>> {
-    let mut tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
+    let mut tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
     if tasks.len() != expected_task_count {
         return None;
     }
@@ -4818,7 +4829,7 @@ async fn collect_service_attachment_publication_debug(
 ) -> String {
     let mut out = Vec::with_capacity(nodes.len());
     for node in nodes {
-        let tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
+        let tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
         let service_status =
             node.node
                 .service_controller
@@ -4901,7 +4912,7 @@ async fn list_active_service_tasks(
 ) -> Vec<WorkloadSpec> {
     let filter = TaskStateFilter::active_only();
     manager
-        .list_tasks(&filter)
+        .list_workloads(&filter)
         .await
         .expect("list active tasks during service placement checks")
         .into_iter()
@@ -4942,7 +4953,8 @@ async fn template_attachments_published(
     expected_task_count: usize,
 ) -> bool {
     let tasks =
-        list_active_task_template_tasks(&node.node.task_manager, service_name, template_name).await;
+        list_active_task_template_tasks(&node.node.workload_manager, service_name, template_name)
+            .await;
     if tasks.len() != expected_task_count {
         return false;
     }
@@ -4990,7 +5002,7 @@ async fn wait_for_template_launch_after_dependency_publication(
         )
         .await;
         let dependent_tasks = list_active_task_template_tasks(
-            &node.node.task_manager,
+            &node.node.workload_manager,
             service_name,
             dependent_template,
         )
@@ -5030,7 +5042,7 @@ async fn wait_for_template_replacement_after_dependency_publication(
 
     while Instant::now() < deadline {
         let dependency_tasks = list_active_task_template_tasks(
-            &node.node.task_manager,
+            &node.node.workload_manager,
             service_name,
             gate.dependency_template,
         )
@@ -5049,7 +5061,7 @@ async fn wait_for_template_replacement_after_dependency_publication(
             )
             .await;
         let dependent_tasks = list_active_task_template_tasks(
-            &node.node.task_manager,
+            &node.node.workload_manager,
             service_name,
             gate.dependent_template,
         )
@@ -5092,7 +5104,7 @@ async fn all_nodes_have_service_task_count(
     expected: usize,
 ) -> bool {
     for node in cluster {
-        let count = list_active_service_tasks(&node.node.task_manager, service_name)
+        let count = list_active_service_tasks(&node.node.workload_manager, service_name)
             .await
             .len();
         if count != expected {
@@ -5132,7 +5144,8 @@ async fn wait_for_service_running_tasks_stable_all(
         let mut healthy = true;
 
         for node in cluster {
-            let mut tasks = list_active_service_tasks(&node.node.task_manager, service_name).await;
+            let mut tasks =
+                list_active_service_tasks(&node.node.workload_manager, service_name).await;
             tasks.sort_by_key(|task| task.id);
             if tasks.len() != expected
                 || tasks
@@ -5177,10 +5190,13 @@ async fn wait_for_min_local_service_task_count_refs(
 ) -> bool {
     wait_until(timeout, Duration::from_millis(100), || async {
         for node in cluster {
-            let count =
-                list_local_active_service_tasks(&node.node.task_manager, service_name, node.id())
-                    .await
-                    .len();
+            let count = list_local_active_service_tasks(
+                &node.node.workload_manager,
+                service_name,
+                node.id(),
+            )
+            .await
+            .len();
             if count < min_expected {
                 return false;
             }
@@ -5507,10 +5523,13 @@ async fn wait_for_min_local_service_task_count(
 ) -> bool {
     wait_until(timeout, Duration::from_millis(100), || async {
         for node in cluster {
-            let count =
-                list_local_active_service_tasks(&node.node.task_manager, service_name, node.id())
-                    .await
-                    .len();
+            let count = list_local_active_service_tasks(
+                &node.node.workload_manager,
+                service_name,
+                node.id(),
+            )
+            .await
+            .len();
             if count < min_expected {
                 return false;
             }
@@ -6007,7 +6026,7 @@ async fn wait_for_task_count(
     let filter = TaskStateFilter::all();
     wait_until(timeout, Duration::from_millis(50), || async {
         let specs = manager
-            .list_tasks(&filter)
+            .list_workloads(&filter)
             .await
             .expect("task list during wait");
         if specs.len() == expected {
@@ -6025,7 +6044,7 @@ async fn wait_for_task_state(
     timeout: Duration,
 ) -> bool {
     wait_until(timeout, Duration::from_millis(50), || async {
-        match manager.inspect_task(task_id).await {
+        match manager.inspect_workload(task_id).await {
             Ok(spec) => spec.state == expected,
             Err(_) => false,
         }

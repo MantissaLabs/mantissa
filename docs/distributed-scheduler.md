@@ -24,7 +24,7 @@ In practice this means:
 - candidate discovery is local and digest-driven,
 - exact allocation is always local to the target node,
 - failed shortlist guesses are retried as cheap lease prepares,
-- task specs are only materialized after a target node has accepted capacity.
+- workload rows are only materialized after a target node has accepted capacity.
 
 ## Data Authority
 
@@ -69,7 +69,7 @@ Read the diagram top to bottom:
 
 - replicated state tells the owner what should run and which nodes look viable,
 - the target node alone chooses exact slots and GPUs,
-- the replicated task spec publishes the accepted decision to the cluster,
+- the replicated workload row publishes the accepted decision to the cluster,
 - the runtime either commits that prepared lease or the lease expires and
   returns capacity locally.
 
@@ -80,7 +80,7 @@ The scheduler does not replicate full slot maps.
 Replicated:
 
 - one compact digest per node,
-- task specs,
+- workload rows,
 - service specs,
 - readiness and topology inputs used to filter candidates.
 
@@ -128,11 +128,11 @@ sequenceDiagram
     PL->>TS: prepareLeases(batch)
     TS->>TS: Choose exact slots and GPUs locally
     TS-->>PL: lease ids + exact bindings
-    PL->>RS: Publish task specs with lease metadata
-    RT->>RS: Adopt replicated task spec
+    PL->>RS: Publish workload rows with lease metadata
+    RT->>RS: Adopt replicated workload row
     RT->>TS: commit_task_lease(...)
     TS-->>RT: Reservation promoted to task-owned
-    RT->>RT: Start container and manage lifecycle
+    RT->>RT: Start runtime instance and manage lifecycle
 ```
 
 ## Why One Generation Owner Matters
@@ -143,12 +143,12 @@ Service generations are not executed by every node that notices a new
 
 That owner:
 
-- resumes an incomplete initial deployment from persisted task ids,
+- resumes an incomplete initial deployment from persisted replica ids,
 - resumes a redeploy from the stored `previous_generation`,
-- waits for readiness once all task ids are assigned.
+- waits for readiness once all replica ids are assigned.
 
-This reduces competing rollout work and makes task sets settle earlier, which
-also helps task-root convergence after large deployments.
+This reduces competing rollout work and makes workload sets settle earlier,
+which also helps workload-root convergence after large deployments.
 
 ## Candidate Selection
 
@@ -180,7 +180,7 @@ flowchart TD
     F --> G[Update local digest cache immediately]
     F --> H[Apply short peer backoff]
     H --> I[Retry with next candidate]
-    E --> J[Publish replicated task spec]
+    E --> J[Publish replicated workload row]
 ```
 
 This is an important change. A stale shortlist miss is now a cheap rejection at
@@ -203,20 +203,21 @@ self-recover if the coordinator or runtime disappears.
 
 ## Why This Improved Post-deployment Stability
 
-One effect of this design is that task rows stop churning sooner after large
+One effect of this design is that workload rows stop churning sooner after large
 deployments.
 
 The main reasons are:
 
-1. remote placements do not materialize task specs until `prepareLeases`
+1. remote placements do not materialize workload rows until `prepareLeases`
    succeeds,
 2. the target node chooses exact bindings locally, so there are fewer stale
    slot-level retries,
 3. structured rejections refresh digests immediately,
 4. one deterministic owner executes each service generation.
 
-When the active task count is reached, nodes may still have different task
-roots because dissemination is incomplete, but the underlying task set is
+When the active workload count is reached, nodes may still have different
+workload roots because dissemination is incomplete, but the underlying
+workload set is
 usually already much more stable than before.
 
 ## Operational Implications

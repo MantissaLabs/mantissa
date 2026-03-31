@@ -92,7 +92,7 @@ pub(crate) struct RuntimeComponents {
     pub topology: Topology,
     pub topology_client: TopologyClient,
     pub sync_client: protocol::sync::sync::Client,
-    pub task_manager: WorkloadManager,
+    pub workload_manager: WorkloadManager,
     pub task_client: protocol::task::task::Client,
     workload_client: protocol::workload::workload::Client,
     pub job_controller: JobController,
@@ -441,7 +441,7 @@ async fn build_runtime_components(
     scheduler.set_digest_registry(scheduler_digest_registry);
     scheduler.publish_current_digest().await;
 
-    let task_manager = WorkloadManager::new(WorkloadManagerConfig {
+    let workload_manager = WorkloadManager::new(WorkloadManagerConfig {
         store: stores.workloads.clone(),
         tx: gossip_tx.clone(),
         rx: task_rx,
@@ -460,14 +460,15 @@ async fn build_runtime_components(
         local_volume_root,
         enforce_local_volume_capacity: config::local_volume_enforce_capacity(),
     });
-    let task_service = TaskService::new(task_manager.clone(), topology.clone(), registry.clone());
+    let task_service =
+        TaskService::new(workload_manager.clone(), topology.clone(), registry.clone());
     let task_client = capnp_rpc::new_client(task_service);
-    let workload_service = WorkloadService::new(task_manager.clone());
+    let workload_service = WorkloadService::new(workload_manager.clone());
     let workload_client = capnp_rpc::new_client(workload_service);
 
     let job_controller = JobController::new(JobControllerConfig {
         registry: job_registry,
-        task_manager: task_manager.clone(),
+        workload_manager: workload_manager.clone(),
         cluster_registry: registry.clone(),
         gossip_tx: gossip_tx.clone(),
         gossip_rx: job_rx,
@@ -479,7 +480,7 @@ async fn build_runtime_components(
 
     let agent_controller = AgentController::new(AgentControllerConfig {
         registry: agent_registry,
-        task_manager: task_manager.clone(),
+        workload_manager: workload_manager.clone(),
         cluster_registry: registry.clone(),
         gossip_tx: gossip_tx.clone(),
         gossip_rx: agent_rx,
@@ -491,7 +492,7 @@ async fn build_runtime_components(
 
     let service_controller = ServiceController::new(ServiceControllerConfig {
         registry: service_registry.clone(),
-        task_manager: task_manager.clone(),
+        workload_manager: workload_manager.clone(),
         cluster_registry: registry.clone(),
         volume_registry: volume_registry.clone(),
         gossip_tx: gossip_tx.clone(),
@@ -537,7 +538,7 @@ async fn build_runtime_components(
             topology,
             topology_client,
             sync_client,
-            task_manager,
+            workload_manager,
             task_client,
             workload_client,
             job_controller,
@@ -908,9 +909,9 @@ async fn spawn_runtime_tasks(
     let topology_for_gossip = components.topology.clone();
     let gossip_tick = topology_for_gossip.gossip_interval();
 
-    let mut task_runner = components.task_manager.clone();
+    let mut workload_runner = components.workload_manager.clone();
     tokio::task::spawn_local(async move {
-        task_runner.run().await;
+        workload_runner.run().await;
     });
 
     let mut job_runner = components.job_controller.clone();

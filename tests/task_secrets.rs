@@ -185,7 +185,7 @@ fn cleanup_secret_runtime_roots_for_node(node_id: Uuid) {
     }
 }
 
-async fn setup_task_manager() -> TestHarness {
+async fn setup_workload_manager() -> TestHarness {
     let actor = Uuid::new_v4();
 
     let scheduler_dir = tempdir().expect("scheduler tempdir");
@@ -350,8 +350,8 @@ async fn setup_task_manager() -> TestHarness {
     }
 }
 
-local_test!(task_manager_stages_secret_env_and_files, {
-    let harness = setup_task_manager().await;
+local_test!(workload_manager_stages_secret_env_and_files, {
+    let harness = setup_workload_manager().await;
     let _secret_runtime_cleanup = SecretRuntimeCleanupGuard::new(harness.node_id);
     let TestHarness {
         manager,
@@ -442,7 +442,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
     };
 
     let mut specs = manager
-        .start_tasks_batch(vec![request])
+        .start_workloads_batch(vec![request])
         .await
         .expect("start task batch");
     assert_eq!(specs.len(), 1);
@@ -512,7 +512,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
     });
 
     manager
-        .request_task_stop(spec.id)
+        .request_workload_stop(spec.id)
         .await
         .expect("request stop task to cleanup secrets");
 
@@ -531,8 +531,8 @@ local_test!(task_manager_stages_secret_env_and_files, {
     );
 });
 
-local_test!(task_manager_rejects_missing_secret_reference, {
-    let harness = setup_task_manager().await;
+local_test!(workload_manager_rejects_missing_secret_reference, {
+    let harness = setup_workload_manager().await;
     let _secret_runtime_cleanup = SecretRuntimeCleanupGuard::new(harness.node_id);
     let TestHarness {
         manager,
@@ -585,7 +585,7 @@ local_test!(task_manager_rejects_missing_secret_reference, {
     };
 
     let err = manager
-        .start_tasks_batch(vec![request])
+        .start_workloads_batch(vec![request])
         .await
         .expect_err("secret lookup should fail");
     let err_text = err.to_string();
@@ -602,7 +602,7 @@ local_test!(task_manager_rejects_missing_secret_reference, {
 });
 
 local_test!(rotate_master_key_rewraps_secrets, {
-    let harness = setup_task_manager().await;
+    let harness = setup_workload_manager().await;
     let _secret_runtime_cleanup = SecretRuntimeCleanupGuard::new(harness.node_id);
     let TestHarness {
         secret_registry,
