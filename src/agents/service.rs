@@ -615,7 +615,7 @@ fn read_agent_events(
 }
 
 fn write_optional_mount(
-    mut builder: protocol::task::volume_mount::Builder<'_>,
+    mut builder: protocol::workload::volume_mount::Builder<'_>,
     mount: Option<&crate::workload::model::WorkloadVolumeMount>,
 ) {
     if let Some(mount) = mount {
@@ -632,7 +632,7 @@ fn write_optional_mount(
 }
 
 fn read_optional_mount(
-    reader: protocol::task::volume_mount::Reader<'_>,
+    reader: protocol::workload::volume_mount::Reader<'_>,
 ) -> Result<Option<crate::workload::model::WorkloadVolumeMount>, Error> {
     let data = reader.get_volume_id()?;
     if data.is_empty() {

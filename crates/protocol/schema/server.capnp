@@ -7,6 +7,7 @@ using Node = import "node.capnp";
 using import "sync.capnp".Sync;
 using import "health.capnp".Health;
 using import "task.capnp".Task;
+using import "workload.capnp".Workload;
 using import "jobs.capnp".Jobs;
 using import "agents.capnp".Agents;
 using import "services.capnp".Services;
@@ -55,6 +56,9 @@ interface ClusterSession {
   getTask @6 () -> (task :Task);
   # Access the task control interface.
 
+  getWorkload @15 () -> (workload :Workload);
+  # Access the internal workload control interface.
+
   getScheduler @7 () -> (scheduler :Scheduler);
   # Access the scheduling interface.
 
@@ -98,6 +102,9 @@ struct Capabilities {
 
   task @5 :Task;
   # Task interface capability.
+
+  workload @14 :Workload;
+  # Internal workload interface capability.
 
   scheduler @6 :Scheduler;
   # Scheduler interface capability.

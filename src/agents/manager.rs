@@ -8,7 +8,9 @@ use crate::registry::Registry;
 use crate::workload::manager::workload_start_error_is_retryable;
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
 use crate::workload::model::WorkloadPhase;
-use crate::workload::model::{RuntimeClass, WorkloadEnvironmentVariable, WorkloadVolumeMount};
+use crate::workload::model::{
+    RuntimeClass, WorkloadAgentRunMetadata, WorkloadEnvironmentVariable, WorkloadVolumeMount,
+};
 use crate::workload::types::ResolvedExecutionSpec;
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
@@ -450,6 +452,12 @@ impl AgentController {
             id: Some(desired_task_id),
             slot_ids: Vec::new(),
             service_metadata: None,
+            job_metadata: None,
+            agent_run_metadata: Some(WorkloadAgentRunMetadata::new(
+                session.id,
+                session.name.clone(),
+                run.id,
+            )),
             target_node: None,
         };
 

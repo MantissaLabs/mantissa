@@ -427,6 +427,8 @@ impl TaskTemplateSpecValue {
             id: Some(desired_id),
             slot_ids: Vec::new(),
             service_metadata: Some(WorkloadServiceMetadata::new(service_name, &self.name)),
+            job_metadata: None,
+            agent_run_metadata: None,
             target_node,
         }
     }

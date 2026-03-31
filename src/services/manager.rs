@@ -11,14 +11,14 @@ use crate::services::types::{
     ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy,
     TaskTemplateSpecValue, compute_service_id,
 };
-use crate::task::types::{TaskSpec, TaskStateFilter, TaskVolumeMount};
+use crate::task::types::TaskStateFilter;
 use crate::volumes::types::VolumeDriver;
 use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
 use crate::workload::manager::WorkloadManager;
 use crate::workload::manager::{
     WorkloadStartRequest, WorkloadTrafficPublicationUpdate, workload_start_error_is_retryable,
 };
-use crate::workload::model::WorkloadPhase;
+use crate::workload::model::{WorkloadPhase, WorkloadSpec, WorkloadVolumeMount};
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -1677,7 +1677,7 @@ impl ServiceController {
         &self,
         mut requests: Vec<WorkloadStartRequest>,
         context: &str,
-    ) -> anyhow::Result<Vec<TaskSpec>> {
+    ) -> anyhow::Result<Vec<WorkloadSpec>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -1885,13 +1885,13 @@ where
 
 #[derive(Clone, Debug)]
 struct TaskInventory {
-    by_id: HashMap<Uuid, TaskSpec>,
+    by_id: HashMap<Uuid, WorkloadSpec>,
     by_service: HashMap<String, Vec<Uuid>>,
 }
 
 impl TaskInventory {
     /// Builds a task inventory snapshot for service-level reconciliation checks.
-    fn from_specs(specs: Vec<TaskSpec>) -> Self {
+    fn from_specs(specs: Vec<WorkloadSpec>) -> Self {
         let mut by_id = HashMap::with_capacity(specs.len());
         let mut by_service: HashMap<String, Vec<Uuid>> = HashMap::new();
 
@@ -1937,7 +1937,7 @@ impl ServiceReplicaSnapshot<'_> {
     }
 
     /// Iterates all currently observed tasks that advertise this service metadata.
-    fn observed_tasks(&self) -> impl Iterator<Item = &TaskSpec> {
+    fn observed_tasks(&self) -> impl Iterator<Item = &WorkloadSpec> {
         self.inventory
             .by_service
             .get(self.service_name)
@@ -1984,7 +1984,7 @@ fn rollout_task_stopped_or_absent(state: Option<&WorkloadPhase>) -> bool {
 }
 
 /// Returns true when a task has been running long enough to permit rebalancing.
-fn task_age_allows_rebalance(task: &TaskSpec) -> bool {
+fn task_age_allows_rebalance(task: &WorkloadSpec) -> bool {
     let Some(anchor) =
         parse_timestamp(&task.updated_at).or_else(|| parse_timestamp(&task.created_at))
     else {
@@ -1995,7 +1995,7 @@ fn task_age_allows_rebalance(task: &TaskSpec) -> bool {
 }
 
 /// Returns true when a task is old enough to be considered for cleanup.
-fn task_age_allows_cleanup(task: &TaskSpec) -> bool {
+fn task_age_allows_cleanup(task: &WorkloadSpec) -> bool {
     let Some(anchor) =
         parse_timestamp(&task.updated_at).or_else(|| parse_timestamp(&task.created_at))
     else {
@@ -2030,7 +2030,10 @@ fn should_drain_local_tasks(status: ServiceStatus) -> bool {
 ///
 /// We only fast-track restarts for terminal container states during deployment; unknown/missing
 /// observations still respect grace to avoid reacting to temporary gossip lag.
-fn should_restart_missing_slot_immediately(status: ServiceStatus, task: Option<&TaskSpec>) -> bool {
+fn should_restart_missing_slot_immediately(
+    status: ServiceStatus,
+    task: Option<&WorkloadSpec>,
+) -> bool {
     if status != ServiceStatus::Deploying {
         return false;
     }
@@ -2253,7 +2256,7 @@ fn compute_effective_slot_targets(
 /// Resolves one hard target node for a template when all mounted local volumes are already bound.
 fn resolve_template_volume_target(
     volume_registry: &VolumeRegistry,
-    mounts: &[TaskVolumeMount],
+    mounts: &[WorkloadVolumeMount],
 ) -> anyhow::Result<Option<Uuid>> {
     let mut bound_node: Option<Uuid> = None;
     for mount in mounts {
@@ -2283,7 +2286,7 @@ fn resolve_template_volume_target(
 /// Returns true when the mount list includes a bound node-local volume that cannot safely fall back.
 pub(super) fn mounted_local_volumes_require_pinned_target(
     volume_registry: &VolumeRegistry,
-    mounts: &[TaskVolumeMount],
+    mounts: &[WorkloadVolumeMount],
 ) -> anyhow::Result<bool> {
     for mount in mounts {
         let spec = volume_registry.get_spec(mount.volume_id)?.ok_or_else(|| {
@@ -2323,7 +2326,7 @@ pub(super) fn is_local_volume_unavailable_error(err: &anyhow::Error) -> bool {
 /// ordered service task id lists during dependency-ordered deployment.
 fn record_task_assignments(
     service_name: &str,
-    task_specs: &[TaskSpec],
+    task_specs: &[WorkloadSpec],
     assignments: &mut BTreeMap<(String, u16), Uuid>,
 ) {
     for spec in task_specs {
@@ -2576,7 +2579,7 @@ mod tests {
         WorkloadStartRequest {
             name: "demo-task".to_string(),
             execution: ResolvedExecutionSpec {
-                volumes: vec![TaskVolumeMount {
+                volumes: vec![WorkloadVolumeMount {
                     volume_id,
                     volume_name: volume_name.to_string(),
                     target: "/var/lib/app".to_string(),
@@ -2590,6 +2593,8 @@ mod tests {
             id: Some(Uuid::new_v4()),
             slot_ids: Vec::new(),
             service_metadata: None,
+            job_metadata: None,
+            agent_run_metadata: None,
             target_node,
         }
     }
@@ -2605,6 +2610,8 @@ mod tests {
             id: Some(Uuid::new_v4()),
             slot_ids: Vec::new(),
             service_metadata: None,
+            job_metadata: None,
+            agent_run_metadata: None,
             target_node,
         }
     }
@@ -2617,8 +2624,8 @@ mod tests {
         service_name: &str,
         template: &str,
         state: WorkloadPhase,
-    ) -> TaskSpec {
-        TaskSpec {
+    ) -> WorkloadSpec {
+        WorkloadSpec {
             id,
             name: format!("{service_name}-{template}-1-test"),
             image: "ghcr.io/demo/app:latest".to_string(),
@@ -2648,6 +2655,8 @@ mod tests {
             volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: Some(TaskServiceMetadata::new(service_name, template)),
+            job_metadata: None,
+            agent_run_metadata: None,
             lease_id: None,
             lease_coordinator_node_id: None,
             task_epoch: 0,

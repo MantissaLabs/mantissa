@@ -13,8 +13,9 @@ use crate::secrets::registry::SecretRegistry;
 use crate::store::workload_store::WorkloadStore;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
-    RuntimeClass, WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec,
-    WorkloadStateFilter, WorkloadStatus, WorkloadValue, should_replace_workload_event,
+    RuntimeClass, WorkloadAgentRunMetadata, WorkloadEvent, WorkloadJobMetadata, WorkloadPhase,
+    WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter, WorkloadStatus, WorkloadValue,
+    should_replace_workload_event,
 };
 pub(crate) use crate::workload::model::{
     merge_definition_into_value, merge_status_into_value, spec_to_status, spec_to_value,
@@ -331,6 +332,10 @@ pub struct WorkloadStartRequest {
     pub slot_ids: Vec<SlotId>,
     /// Optional service ownership metadata. Presence means this workload is a service replica.
     pub service_metadata: Option<WorkloadServiceMetadata>,
+    /// Optional job ownership metadata. Presence means this workload is one job attempt.
+    pub job_metadata: Option<WorkloadJobMetadata>,
+    /// Optional agent-run ownership metadata. Presence means this workload is one agent run.
+    pub agent_run_metadata: Option<WorkloadAgentRunMetadata>,
     /// Placement hint used by the scheduler when a task must land on a specific node.
     pub target_node: Option<Uuid>,
 }
@@ -594,6 +599,8 @@ impl WorkloadManager {
             id: None,
             slot_ids: Vec::new(),
             service_metadata: None,
+            job_metadata: None,
+            agent_run_metadata: None,
             target_node: None,
         };
 
@@ -1545,7 +1552,7 @@ fn wrap_start_error(task_name: &str, err: RuntimeError) -> anyhow::Error {
 }
 
 /// Matches one task identifier or prefix against a visible task-id set and returns a unique UUID.
-fn match_task_id_prefix(
+pub(crate) fn match_task_id_prefix(
     raw: &str,
     ids: impl IntoIterator<Item = Uuid>,
 ) -> Result<Uuid, anyhow::Error> {

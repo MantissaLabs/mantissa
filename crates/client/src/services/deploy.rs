@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use blake3::Hasher;
 use capnp::{Error as CapnpError, struct_list};
 use protocol::services::task_template;
-use protocol::task::{environment_var, secret_file, secret_ref, volume_mount};
+use protocol::workload::{environment_var, secret_file, secret_ref, volume_mount};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 

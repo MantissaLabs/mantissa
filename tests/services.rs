@@ -41,12 +41,13 @@ use mantissa::services::types::{
     TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind, TaskTemplateSpecValue,
 };
 use mantissa::task::types::{
-    TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskServiceMetadata, TaskSpec,
+    TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskServiceMetadata,
     TaskStateFilter, TaskValue, TaskVolumeMount,
 };
 use mantissa::topology_capnp::topology;
 use mantissa::workload::manager::WorkloadManager;
 use mantissa::workload::model::WorkloadPhase;
+use mantissa::workload::model::WorkloadSpec;
 use mantissa::workload::types::ExecutionSpec;
 use protocol::health::NodeStatus;
 use protocol::secrets::secrets;
@@ -4850,7 +4851,7 @@ fn debug_service_attachment_publication_state(
     node: &TestNode,
     service_name: &str,
     service_status: Option<ServiceStatus>,
-    tasks: &[TaskSpec],
+    tasks: &[WorkloadSpec],
     attachments: &[NetworkAttachmentValue],
 ) -> String {
     let attachment_summary = attachments
@@ -4894,7 +4895,10 @@ fn debug_service_attachment_publication_state(
 }
 
 /// Lists active tasks that belong to one service according to service metadata.
-async fn list_active_service_tasks(manager: &WorkloadManager, service_name: &str) -> Vec<TaskSpec> {
+async fn list_active_service_tasks(
+    manager: &WorkloadManager,
+    service_name: &str,
+) -> Vec<WorkloadSpec> {
     let filter = TaskStateFilter::active_only();
     manager
         .list_tasks(&filter)
@@ -4915,7 +4919,7 @@ async fn list_active_task_template_tasks(
     manager: &WorkloadManager,
     service_name: &str,
     template_name: &str,
-) -> Vec<TaskSpec> {
+) -> Vec<WorkloadSpec> {
     list_active_service_tasks(manager, service_name)
         .await
         .into_iter()
@@ -5073,7 +5077,7 @@ async fn list_local_active_service_tasks(
     manager: &WorkloadManager,
     service_name: &str,
     node_id: Uuid,
-) -> Vec<TaskSpec> {
+) -> Vec<WorkloadSpec> {
     list_active_service_tasks(manager, service_name)
         .await
         .into_iter()
@@ -5535,7 +5539,7 @@ async fn wait_for_reserved_slots(node: &TestNode, expected: usize, timeout: Dura
 }
 
 /// Converts a task spec into a replicated task value for store-level fault-injection tests.
-fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
+fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
     TaskValue {
         id: spec.id,
         name: spec.name.clone(),
@@ -5572,6 +5576,8 @@ fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
                 service_name: meta.service_name.clone(),
                 template: meta.template.clone(),
             }),
+        job_metadata: spec.job_metadata.clone(),
+        agent_run_metadata: spec.agent_run_metadata.clone(),
         lease_id: spec.lease_id,
         lease_coordinator_node_id: spec.lease_coordinator_node_id,
         task_epoch: spec.task_epoch,

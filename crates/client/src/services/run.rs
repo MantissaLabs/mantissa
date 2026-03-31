@@ -77,13 +77,15 @@ pub async fn run_many(cfg: &ClientConfig, tasks: Vec<TaskStartParams>) -> Result
             if let Some(policy) = &task.restart_policy {
                 let mut policy_builder = entry.reborrow().init_restart_policy();
                 let name = match policy.name {
-                    ManifestRestartPolicyName::No => protocol::task::RestartPolicyName::No,
-                    ManifestRestartPolicyName::Always => protocol::task::RestartPolicyName::Always,
+                    ManifestRestartPolicyName::No => protocol::workload::RestartPolicyName::No,
+                    ManifestRestartPolicyName::Always => {
+                        protocol::workload::RestartPolicyName::Always
+                    }
                     ManifestRestartPolicyName::OnFailure => {
-                        protocol::task::RestartPolicyName::OnFailure
+                        protocol::workload::RestartPolicyName::OnFailure
                     }
                     ManifestRestartPolicyName::UnlessStopped => {
-                        protocol::task::RestartPolicyName::UnlessStopped
+                        protocol::workload::RestartPolicyName::UnlessStopped
                     }
                 };
                 policy_builder.set_name(name);

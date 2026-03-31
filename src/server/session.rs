@@ -3,7 +3,7 @@ use crate::{cluster::ClusterViewId, topology::Topology};
 use protocol::{
     agents::agents, gossip::gossip, health::health, jobs::jobs, network::networks, node::node,
     scheduling::scheduler, secrets::secrets, server::cluster_session, services::services,
-    sync::sync, task::task, topology::topology, volumes::volumes,
+    sync::sync, task::task, topology::topology, volumes::volumes, workload::workload,
 };
 use std::rc::Rc;
 
@@ -18,6 +18,7 @@ pub struct ClusterSessionServices {
     pub gossip: gossip::Client,
     pub node: node::Client,
     pub task: task::Client,
+    pub workload: workload::Client,
     pub jobs: jobs::Client,
     pub agents: agents::Client,
     pub scheduler: scheduler::Client,
@@ -136,6 +137,7 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_sync(self.services.sync.clone());
         caps.set_health(self.health.clone());
         caps.set_task(self.services.task.clone());
+        caps.set_workload(self.services.workload.clone());
         caps.set_jobs(self.services.jobs.clone());
         caps.set_agents(self.services.agents.clone());
         caps.set_scheduler(self.services.scheduler.clone());
@@ -201,6 +203,18 @@ impl cluster_session::Server for ClusterSessionImpl {
         self.ensure_online()?;
 
         results.get().set_task(self.services.task.clone());
+        Ok(())
+    }
+
+    /// Returns the internal workload capability for peer-to-peer control paths.
+    async fn get_workload(
+        self: Rc<Self>,
+        _params: cluster_session::GetWorkloadParams,
+        mut results: cluster_session::GetWorkloadResults,
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
+
+        results.get().set_workload(self.services.workload.clone());
         Ok(())
     }
 

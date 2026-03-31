@@ -623,7 +623,7 @@ impl ServiceController {
     async fn stop_unhealthy_replacement_chunk_tasks(
         &self,
         service_name: &str,
-        started_specs: &[TaskSpec],
+        started_specs: &[WorkloadSpec],
     ) {
         for started in started_specs {
             if let Err(stop_err) = self.task_manager.request_task_stop(started.id).await {
@@ -713,7 +713,7 @@ impl ServiceController {
     /// Records newly started replacement tasks into rollback and active-assignment bookkeeping.
     fn record_started_replacement_tasks(
         replacements: &[&ReplicaReplacement],
-        started_specs: &[TaskSpec],
+        started_specs: &[WorkloadSpec],
         artifacts: &mut RolloutArtifacts,
     ) {
         for (replacement, spec) in replacements.iter().zip(started_specs.iter()) {
@@ -730,7 +730,7 @@ impl ServiceController {
     async fn wait_and_publish_replacement_chunk(
         &self,
         service_name: &str,
-        started_specs: &[TaskSpec],
+        started_specs: &[WorkloadSpec],
         settings: &RolloutSettings,
     ) -> anyhow::Result<()> {
         for spec in started_specs {
@@ -775,7 +775,7 @@ impl ServiceController {
         rollout: RolloutRunContext<'_>,
         progress: &mut RolloutProgress,
         service_name: &str,
-        started_specs: &[TaskSpec],
+        started_specs: &[WorkloadSpec],
         err: anyhow::Error,
     ) -> Result<ChunkProgress, anyhow::Error> {
         let failure_budget_exhausted = self

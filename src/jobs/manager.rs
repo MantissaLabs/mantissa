@@ -2,11 +2,9 @@ use crate::gossip::Message;
 use crate::jobs::registry::JobRegistry;
 use crate::jobs::types::{JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
 use crate::registry::Registry;
-use crate::task::types::TaskSpec;
 use crate::workload::manager::workload_start_error_is_retryable;
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
-use crate::workload::model::RuntimeClass;
-use crate::workload::model::WorkloadPhase;
+use crate::workload::model::{RuntimeClass, WorkloadJobMetadata, WorkloadPhase, WorkloadSpec};
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::Utc;
@@ -333,6 +331,8 @@ impl JobController {
             id: Some(task_id),
             slot_ids: Vec::new(),
             service_metadata: None,
+            job_metadata: Some(WorkloadJobMetadata::new(latest.id, latest.name.clone())),
+            agent_run_metadata: None,
             target_node: None,
         };
 
@@ -381,7 +381,7 @@ impl JobController {
     }
 
     /// Adopts one observed task state and projects it into the owning job lifecycle.
-    async fn adopt_observed_task(&self, spec: JobSpecValue, task: TaskSpec) -> Result<()> {
+    async fn adopt_observed_task(&self, spec: JobSpecValue, task: WorkloadSpec) -> Result<()> {
         let mut current = match self.registry.get(spec.id)? {
             Some(current) => current,
             None => return Ok(()),

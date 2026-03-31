@@ -410,6 +410,8 @@ fn standalone_volume_task_request(
         id: None,
         slot_ids: Vec::new(),
         service_metadata: None,
+        job_metadata: None,
+        agent_run_metadata: None,
         target_node: None,
     }
 }
@@ -419,7 +421,7 @@ async fn start_standalone_volume_task(
     volume_id: Uuid,
     volume_name: &str,
     target: &str,
-) -> mantissa::task::types::TaskSpec {
+) -> mantissa::workload::model::WorkloadSpec {
     let mut started = node
         .task_manager
         .start_tasks_batch(vec![standalone_volume_task_request(
@@ -893,6 +895,8 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
             id: None,
             slot_ids: Vec::new(),
             service_metadata: None,
+            job_metadata: None,
+            agent_run_metadata: None,
             target_node: None,
         }])
         .await

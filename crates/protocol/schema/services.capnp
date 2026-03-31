@@ -1,6 +1,6 @@
 @0xf934ee53cdab0910;
 
-using TaskSchema = import "task.capnp";
+using WorkloadSchema = import "workload.capnp";
 
 interface Services {
   list @0 () -> (services :List(ServiceSpec));
@@ -42,10 +42,10 @@ struct TaskTemplate {
   restartPolicy @6 :RestartPolicy;
   # Desired container restart behaviour (optional)
 
-  env @7 :List(TaskSchema.EnvironmentVar);
+  env @7 :List(WorkloadSchema.EnvironmentVar);
   # Environment variables (literal or secret-backed)
 
-  secretFiles @8 :List(TaskSchema.SecretFile);
+  secretFiles @8 :List(WorkloadSchema.SecretFile);
   # Secret-backed file projections
 
   networks @9 :List(TaskTemplateNetwork);
@@ -72,7 +72,7 @@ struct TaskTemplate {
   preStopCommand @16 :List(Text);
   # Optional command executed inside the container before termination begins.
 
-  volumes @17 :List(TaskSchema.VolumeMount);
+  volumes @17 :List(WorkloadSchema.VolumeMount);
   # Named volumes mounted into each replica of this template.
 
   tty @19 :Bool;

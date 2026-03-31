@@ -14,8 +14,9 @@ use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
 };
 use crate::workload::model::{
-    RuntimeClass, WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile,
-    WorkloadServiceMetadata, WorkloadVolumeMount as TaskVolumeMount,
+    RuntimeClass, WorkloadAgentRunMetadata, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
+    WorkloadJobMetadata, WorkloadSecretFile, WorkloadServiceMetadata,
+    WorkloadVolumeMount as TaskVolumeMount,
 };
 use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
 
@@ -87,6 +88,8 @@ pub(super) struct BatchStartPlan {
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
     pub(super) service_metadata: Option<WorkloadServiceMetadata>,
+    pub(super) job_metadata: Option<WorkloadJobMetadata>,
+    pub(super) agent_run_metadata: Option<WorkloadAgentRunMetadata>,
 }
 
 impl BatchStartPlan {
@@ -123,6 +126,8 @@ pub(super) struct StartIntent {
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
     pub(super) service_metadata: Option<WorkloadServiceMetadata>,
+    pub(super) job_metadata: Option<WorkloadJobMetadata>,
+    pub(super) agent_run_metadata: Option<WorkloadAgentRunMetadata>,
     pub(super) target_node: Option<Uuid>,
 }
 
@@ -555,6 +560,8 @@ pub(super) struct RemoteStartPlan {
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
     pub(super) service_metadata: Option<WorkloadServiceMetadata>,
+    pub(super) job_metadata: Option<WorkloadJobMetadata>,
+    pub(super) agent_run_metadata: Option<WorkloadAgentRunMetadata>,
 }
 
 #[derive(Clone)]
@@ -584,6 +591,8 @@ pub(super) struct PreparedRemoteStartPlan {
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
     pub(super) service_metadata: Option<WorkloadServiceMetadata>,
+    pub(super) job_metadata: Option<WorkloadJobMetadata>,
+    pub(super) agent_run_metadata: Option<WorkloadAgentRunMetadata>,
 }
 
 pub(super) struct Assignment {
@@ -654,8 +663,19 @@ impl WorkloadManager {
                 id,
                 slot_ids,
                 service_metadata,
+                job_metadata,
+                agent_run_metadata,
                 target_node,
             } = request;
+            let ownership_count = u8::from(service_metadata.is_some())
+                + u8::from(job_metadata.is_some())
+                + u8::from(agent_run_metadata.is_some());
+            if ownership_count > 1 {
+                return Err(anyhow!(
+                    "conflicting workload ownership metadata supplied for task {}",
+                    name
+                ));
+            }
             if !gpu_device_ids.is_empty() {
                 let mut seen = HashSet::with_capacity(gpu_device_ids.len());
                 for id in &gpu_device_ids {
@@ -716,6 +736,8 @@ impl WorkloadManager {
                 volumes: execution.volumes,
                 networks: execution.networks,
                 service_metadata,
+                job_metadata,
+                agent_run_metadata,
                 target_node,
             });
         }
@@ -992,6 +1014,8 @@ impl WorkloadManager {
                 volumes: intent.volumes.clone(),
                 networks: intent.networks.clone(),
                 service_metadata: intent.service_metadata.clone(),
+                job_metadata: intent.job_metadata.clone(),
+                agent_run_metadata: intent.agent_run_metadata.clone(),
             });
         }
 
@@ -1255,6 +1279,8 @@ impl WorkloadManager {
                             volumes: intent.volumes.clone(),
                             networks: intent.networks.clone(),
                             service_metadata: intent.service_metadata.clone(),
+                            job_metadata: intent.job_metadata.clone(),
+                            agent_run_metadata: intent.agent_run_metadata.clone(),
                         });
                     }
                     CandidateLocation::Remote { peer_id } => {
@@ -1280,6 +1306,8 @@ impl WorkloadManager {
                             volumes: intent.volumes.clone(),
                             networks: intent.networks.clone(),
                             service_metadata: intent.service_metadata.clone(),
+                            job_metadata: intent.job_metadata.clone(),
+                            agent_run_metadata: intent.agent_run_metadata.clone(),
                         });
                     }
                 }
@@ -1370,6 +1398,8 @@ impl WorkloadManager {
                         volumes: intent.volumes.clone(),
                         networks: intent.networks.clone(),
                         service_metadata: intent.service_metadata.clone(),
+                        job_metadata: intent.job_metadata.clone(),
+                        agent_run_metadata: intent.agent_run_metadata.clone(),
                     });
                 }
                 CandidateLocation::Remote { peer_id } => {
@@ -1395,6 +1425,8 @@ impl WorkloadManager {
                         volumes: intent.volumes.clone(),
                         networks: intent.networks.clone(),
                         service_metadata: intent.service_metadata.clone(),
+                        job_metadata: intent.job_metadata.clone(),
+                        agent_run_metadata: intent.agent_run_metadata.clone(),
                     });
                 }
             }
@@ -1444,6 +1476,8 @@ mod tests {
             volumes: Vec::new(),
             networks: vec![required_network],
             service_metadata: None,
+            job_metadata: None,
+            agent_run_metadata: None,
             target_node: None,
         };
         let digest = SchedulerDigestValue {
@@ -1513,6 +1547,8 @@ mod tests {
             volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: None,
+            job_metadata: None,
+            agent_run_metadata: None,
             target_node: None,
         };
         let digest = SchedulerDigestValue {

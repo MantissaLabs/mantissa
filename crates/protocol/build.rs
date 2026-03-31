@@ -8,6 +8,7 @@ fn main() {
         .file("schema/topology.capnp")
         .file("schema/scheduling.capnp")
         .file("schema/task.capnp")
+        .file("schema/workload.capnp")
         .file("schema/jobs.capnp")
         .file("schema/agents.capnp")
         .file("schema/services.capnp")

@@ -1,6 +1,6 @@
 @0xb69f5cf433c9f6d5;
 
-using TaskSchema = import "task.capnp";
+using WorkloadSchema = import "workload.capnp";
 
 interface Agents {
   submit @0 (session :AgentSessionSpec) -> (sessionId :Data);
@@ -41,16 +41,16 @@ struct AgentSessionSpec {
   gpuCount @7 :UInt32;
   # Requested GPU count.
 
-  restartPolicy @8 :TaskSchema.RestartPolicy;
+  restartPolicy @8 :WorkloadSchema.RestartPolicy;
   # Shared execution restart policy. Current controller rejects non-empty values.
 
-  env @9 :List(TaskSchema.EnvironmentVar);
+  env @9 :List(WorkloadSchema.EnvironmentVar);
   # Environment variables shared with sandbox execution.
 
-  secretFiles @10 :List(TaskSchema.SecretFile);
+  secretFiles @10 :List(WorkloadSchema.SecretFile);
   # Secret-backed file projections.
 
-  volumes @11 :List(TaskSchema.VolumeMount);
+  volumes @11 :List(WorkloadSchema.VolumeMount);
   # Named volumes mounted into the sandbox workload.
 
   networks @12 :List(Data);
@@ -104,7 +104,7 @@ struct AgentSessionSpec {
   preStopCommand @28 :List(Text);
   # Optional command executed inside the sandbox before termination begins.
 
-  liveness @29 :TaskSchema.LivenessProbe;
+  liveness @29 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe evaluated by the hosting runtime.
 }
 
@@ -136,16 +136,16 @@ struct AgentRunSpec {
   gpuCount @8 :UInt32;
   # Requested GPU count.
 
-  restartPolicy @9 :TaskSchema.RestartPolicy;
+  restartPolicy @9 :WorkloadSchema.RestartPolicy;
   # Shared execution restart policy. Current controller rejects non-empty values.
 
-  env @10 :List(TaskSchema.EnvironmentVar);
+  env @10 :List(WorkloadSchema.EnvironmentVar);
   # Environment variables shared with sandbox execution.
 
-  secretFiles @11 :List(TaskSchema.SecretFile);
+  secretFiles @11 :List(WorkloadSchema.SecretFile);
   # Secret-backed file projections.
 
-  volumes @12 :List(TaskSchema.VolumeMount);
+  volumes @12 :List(WorkloadSchema.VolumeMount);
   # Named volumes mounted into the sandbox workload.
 
   networks @13 :List(Data);
@@ -193,12 +193,12 @@ struct AgentRunSpec {
   preStopCommand @27 :List(Text);
   # Optional command executed inside the sandbox before termination begins.
 
-  liveness @28 :TaskSchema.LivenessProbe;
+  liveness @28 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe evaluated by the hosting runtime.
 }
 
 struct AgentWorkspacePolicy {
-  mount @0 :TaskSchema.VolumeMount;
+  mount @0 :WorkloadSchema.VolumeMount;
   # Optional workspace mount. Empty volumeId means "unset".
 
   workingDirectory @1 :Text;
@@ -229,7 +229,7 @@ struct AgentCheckpointPolicy {
   intervalSecs @1 :UInt32;
   # Checkpoint interval in seconds, 0 means unset.
 
-  mount @2 :TaskSchema.VolumeMount;
+  mount @2 :WorkloadSchema.VolumeMount;
   # Optional checkpoint mount. Empty volumeId means "unset".
 }
 

@@ -219,6 +219,8 @@ fn replicated_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str) -> Tas
         secret_files: Vec::new(),
         volumes: Vec::new(),
         service_metadata: None,
+        job_metadata: None,
+        agent_run_metadata: None,
         lease_id: None,
         lease_coordinator_node_id: None,
         task_epoch: 0,

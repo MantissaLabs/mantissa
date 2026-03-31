@@ -6,7 +6,7 @@ use crate::workload::types::{
     WorkloadRestartPolicyKind,
 };
 use capnp::{Error, struct_list};
-use protocol::task::{environment_var, secret_file, secret_ref, volume_mount};
+use protocol::workload::{environment_var, secret_file, secret_ref, volume_mount};
 use uuid::Uuid;
 
 /// Encodes one secret reference into the task schema payload.
@@ -153,13 +153,13 @@ pub fn decode_volume_mounts(
 
 /// Encodes one task liveness probe into the task wire payload.
 pub fn encode_task_liveness_probe(
-    mut builder: protocol::task::liveness_probe::Builder<'_>,
+    mut builder: protocol::workload::liveness_probe::Builder<'_>,
     probe: &WorkloadLivenessProbe,
 ) {
     let kind = match probe.kind {
-        WorkloadLivenessProbeKind::Exec => protocol::task::LivenessProbeKind::Exec,
-        WorkloadLivenessProbeKind::Http => protocol::task::LivenessProbeKind::Http,
-        WorkloadLivenessProbeKind::Tcp => protocol::task::LivenessProbeKind::Tcp,
+        WorkloadLivenessProbeKind::Exec => protocol::workload::LivenessProbeKind::Exec,
+        WorkloadLivenessProbeKind::Http => protocol::workload::LivenessProbeKind::Http,
+        WorkloadLivenessProbeKind::Tcp => protocol::workload::LivenessProbeKind::Tcp,
     };
     builder.set_kind(kind);
     let mut command_builder = builder.reborrow().init_command(probe.command.len() as u32);
@@ -176,12 +176,12 @@ pub fn encode_task_liveness_probe(
 
 /// Decodes one task liveness probe from the task wire payload.
 pub fn decode_task_liveness_probe(
-    reader: protocol::task::liveness_probe::Reader<'_>,
+    reader: protocol::workload::liveness_probe::Reader<'_>,
 ) -> Result<WorkloadLivenessProbe, Error> {
     let kind = match reader.get_kind()? {
-        protocol::task::LivenessProbeKind::Exec => WorkloadLivenessProbeKind::Exec,
-        protocol::task::LivenessProbeKind::Http => WorkloadLivenessProbeKind::Http,
-        protocol::task::LivenessProbeKind::Tcp => WorkloadLivenessProbeKind::Tcp,
+        protocol::workload::LivenessProbeKind::Exec => WorkloadLivenessProbeKind::Exec,
+        protocol::workload::LivenessProbeKind::Http => WorkloadLivenessProbeKind::Http,
+        protocol::workload::LivenessProbeKind::Tcp => WorkloadLivenessProbeKind::Tcp,
     };
     let mut command = Vec::new();
     for arg in reader.get_command()?.iter() {
@@ -259,15 +259,15 @@ pub fn decode_service_liveness_probe(
 
 /// Encodes one task restart policy into the task wire payload.
 pub fn encode_task_restart_policy(
-    mut builder: protocol::task::restart_policy::Builder<'_>,
+    mut builder: protocol::workload::restart_policy::Builder<'_>,
     policy: &WorkloadRestartPolicy,
 ) {
     let name = match policy.name {
-        WorkloadRestartPolicyKind::No => protocol::task::RestartPolicyName::No,
-        WorkloadRestartPolicyKind::Always => protocol::task::RestartPolicyName::Always,
-        WorkloadRestartPolicyKind::OnFailure => protocol::task::RestartPolicyName::OnFailure,
+        WorkloadRestartPolicyKind::No => protocol::workload::RestartPolicyName::No,
+        WorkloadRestartPolicyKind::Always => protocol::workload::RestartPolicyName::Always,
+        WorkloadRestartPolicyKind::OnFailure => protocol::workload::RestartPolicyName::OnFailure,
         WorkloadRestartPolicyKind::UnlessStopped => {
-            protocol::task::RestartPolicyName::UnlessStopped
+            protocol::workload::RestartPolicyName::UnlessStopped
         }
     };
     builder.set_name(name);
@@ -276,13 +276,13 @@ pub fn encode_task_restart_policy(
 
 /// Decodes one task restart policy from the task wire payload.
 pub fn decode_task_restart_policy(
-    reader: protocol::task::restart_policy::Reader<'_>,
+    reader: protocol::workload::restart_policy::Reader<'_>,
 ) -> Result<WorkloadRestartPolicy, Error> {
     let name = match reader.get_name()? {
-        protocol::task::RestartPolicyName::No => WorkloadRestartPolicyKind::No,
-        protocol::task::RestartPolicyName::Always => WorkloadRestartPolicyKind::Always,
-        protocol::task::RestartPolicyName::OnFailure => WorkloadRestartPolicyKind::OnFailure,
-        protocol::task::RestartPolicyName::UnlessStopped => {
+        protocol::workload::RestartPolicyName::No => WorkloadRestartPolicyKind::No,
+        protocol::workload::RestartPolicyName::Always => WorkloadRestartPolicyKind::Always,
+        protocol::workload::RestartPolicyName::OnFailure => WorkloadRestartPolicyKind::OnFailure,
+        protocol::workload::RestartPolicyName::UnlessStopped => {
             WorkloadRestartPolicyKind::UnlessStopped
         }
     };

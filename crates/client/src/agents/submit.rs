@@ -149,7 +149,7 @@ async fn resolve_optional_mount(
 
 /// Writes one list of resolved volume mounts into the agents submission payload.
 fn write_volume_mounts(
-    builder: &mut capnp::struct_list::Builder<protocol::task::volume_mount::Owned>,
+    builder: &mut capnp::struct_list::Builder<protocol::workload::volume_mount::Owned>,
     mounts: &[ResolvedVolumeMount],
 ) {
     for (index, mount) in mounts.iter().enumerate() {
@@ -160,7 +160,7 @@ fn write_volume_mounts(
 
 /// Writes one optional single mount into the workspace or checkpoint payload.
 fn write_optional_mount(
-    builder: protocol::task::volume_mount::Builder<'_>,
+    builder: protocol::workload::volume_mount::Builder<'_>,
     mount: Option<&ResolvedVolumeMount>,
 ) {
     match mount {
@@ -177,7 +177,7 @@ fn write_optional_mount(
 
 /// Writes one resolved volume mount into the corresponding protocol builder.
 fn write_mount(
-    mut builder: protocol::task::volume_mount::Builder<'_>,
+    mut builder: protocol::workload::volume_mount::Builder<'_>,
     mount: &ResolvedVolumeMount,
 ) {
     builder.set_volume_id(mount.volume_id.as_bytes());

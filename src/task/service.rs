@@ -3,26 +3,21 @@ use crate::runtime::types::{
     RuntimeAttachOptions, RuntimeExecOptions, RuntimeExecResult, RuntimeLogFrame, RuntimeLogStream,
     RuntimeLogsOptions,
 };
-use crate::task::types::{
-    TaskEvent, TaskServiceMetadata, TaskSpec, TaskStateFilter, TaskStateKind, TaskStatus,
-};
+use crate::task::types::{TaskProjectionError, TaskSpec, TaskStateFilter, TaskStateKind};
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
     decode_env_vars, decode_secret_files, decode_task_liveness_probe, decode_task_restart_policy,
     decode_volume_mounts, encode_env_vars, encode_secret_files, encode_task_liveness_probe,
     encode_task_restart_policy, encode_volume_mounts,
 };
-use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
-use crate::workload::model::RuntimeClass;
-use crate::workload::model::WorkloadPhase;
+use crate::workload::manager::{WorkloadManager, WorkloadStartRequest, match_task_id_prefix};
+use crate::workload::model::{RuntimeClass, WorkloadPhase, WorkloadSpec};
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
-use protocol::gossip::gossip_message;
 use protocol::task::{
     TaskLogStream as CapnpTaskLogStream, TaskStateFilter as CapnpTaskStateFilter, task,
-    task_attach_options, task_attach_session, task_event, task_exec_options, task_exec_session,
+    task_attach_options, task_attach_session, task_exec_options, task_exec_session,
     task_list_request, task_log_sink, task_logs_options, task_spec, task_start_request,
-    task_status,
 };
 use std::rc::Rc;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
@@ -68,136 +63,15 @@ fn state_from_str(input: &str) -> WorkloadPhase {
     }
 }
 
-/// Encodes optional service ownership metadata into a task wire payload.
-fn write_service_metadata(
-    mut builder: protocol::task::service_metadata::Builder<'_>,
-    metadata: Option<&TaskServiceMetadata>,
-) {
-    if let Some(metadata) = metadata {
-        builder.set_service_name(&metadata.service_name);
-        builder.set_template_name(&metadata.template);
-        return;
-    }
-
-    builder.set_service_name("");
-    builder.set_template_name("");
-}
-
-/// Decodes optional service ownership metadata from a task wire payload.
-fn read_service_metadata(
-    reader: protocol::task::service_metadata::Reader<'_>,
-) -> Result<Option<TaskServiceMetadata>, Error> {
-    let service_name = reader.get_service_name()?.to_str()?.to_string();
-    let template = reader.get_template_name()?.to_str()?.to_string();
-    if service_name.is_empty() || template.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(TaskServiceMetadata::new(service_name, template)))
-}
-
-pub fn add_event(
-    list: &mut capnp::struct_list::Builder<gossip_message::Owned>,
-    index: u32,
-    event: &TaskEvent,
-) {
-    let msg = list.reborrow().get(index);
-    let mut task = msg.init_workload();
-
-    match event {
-        TaskEvent::UpsertSpec(spec) => {
-            task.set_event(task_event::EventType::UpsertSpec);
-            write_spec(task.reborrow().init_spec(), spec.as_ref());
-        }
-        TaskEvent::UpsertStatus(status) => {
-            task.set_event(task_event::EventType::UpsertStatus);
-            write_status(task.reborrow().init_status(), status.as_ref());
-        }
-        TaskEvent::Remove { id } => {
-            task.set_event(task_event::EventType::Remove);
-            task.set_id(id.as_bytes());
-        }
-    }
-}
-
-pub fn read_event(reader: task_event::Reader) -> Result<TaskEvent, Error> {
-    let event = reader.get_event()?;
-
-    match event {
-        task_event::EventType::UpsertSpec => {
-            let spec_reader = reader.get_spec()?;
-            let spec = read_spec(spec_reader)?;
-            Ok(TaskEvent::UpsertSpec(Box::new(spec)))
-        }
-        task_event::EventType::UpsertStatus => {
-            let status_reader = reader.get_status()?;
-            let status = read_status(status_reader)?;
-            Ok(TaskEvent::UpsertStatus(Box::new(status)))
-        }
-        task_event::EventType::Remove => {
-            let id = read_id_from_data(reader.get_id()?)?;
-            Ok(TaskEvent::Remove { id })
-        }
-    }
-}
-
-/// Encodes one compact workload lifecycle status into the workload gossip payload.
-pub fn write_status(mut builder: task_status::Builder<'_>, status: &TaskStatus) {
-    builder.set_id(status.id.as_bytes());
-    builder.set_name(&status.name);
-    builder.set_image(&status.image);
-    builder.set_state(state_to_str(&status.state));
-    builder.set_created_at(&status.created_at);
-    builder.set_updated_at(&status.updated_at);
-    builder.set_node_id(status.node_id.as_bytes());
-    builder.set_node_name(&status.node_name);
-    write_service_metadata(
-        builder.reborrow().init_service_metadata(),
-        status.service_metadata.as_ref(),
-    );
-    builder.set_phase_reason(status.phase_reason.as_deref().unwrap_or(""));
-    builder.set_phase_progress(status.phase_progress.as_deref().unwrap_or(""));
-    builder.set_task_epoch(status.task_epoch);
-    builder.set_phase_version(status.phase_version);
-    builder.set_launch_attempt(status.launch_attempt);
-    builder.set_last_terminal_observed_launch(status.last_terminal_observed_launch.unwrap_or(0));
-    builder.set_runtime_class(status.runtime_class.as_str());
-    builder.set_sandbox_profile(status.sandbox_profile.as_deref().unwrap_or(""));
-}
-
-/// Decodes one compact workload lifecycle status from the workload gossip payload.
-pub fn read_status(reader: task_status::Reader<'_>) -> Result<TaskStatus, Error> {
-    Ok(TaskStatus {
-        id: read_id_from_data(reader.get_id()?)?,
-        name: reader.get_name()?.to_str()?.to_string(),
-        image: reader.get_image()?.to_str()?.to_string(),
-        state: state_from_str(reader.get_state()?.to_str()?),
-        phase_reason: {
-            let reason = reader.get_phase_reason()?.to_str()?.to_string();
-            (!reason.is_empty()).then_some(reason)
-        },
-        phase_progress: {
-            let progress = reader.get_phase_progress()?.to_str()?.to_string();
-            (!progress.is_empty()).then_some(progress)
-        },
-        created_at: reader.get_created_at()?.to_str()?.to_string(),
-        updated_at: reader.get_updated_at()?.to_str()?.to_string(),
-        node_id: read_id_from_data(reader.get_node_id()?)?,
-        node_name: reader.get_node_name()?.to_str()?.to_string(),
-        service_metadata: if reader.has_service_metadata() {
-            read_service_metadata(reader.get_service_metadata()?)?
-        } else {
-            None
-        },
-        task_epoch: reader.get_task_epoch(),
-        phase_version: reader.get_phase_version(),
-        launch_attempt: reader.get_launch_attempt(),
-        last_terminal_observed_launch: match reader.get_last_terminal_observed_launch() {
-            0 => None,
-            value => Some(value),
-        },
-        runtime_class: read_runtime_class(reader.get_runtime_class()?.to_str()?),
-        sandbox_profile: read_optional_text(reader.get_sandbox_profile()?),
+/// Projects one shared workload row into the public standalone-task view.
+fn project_task_spec(spec: &WorkloadSpec) -> Result<TaskSpec, Error> {
+    TaskSpec::try_from_workload_spec(spec).map_err(|err| match err {
+        TaskProjectionError::NotStandalone {
+            workload_id,
+            workload_name,
+        } => Error::failed(format!(
+            "workload {workload_name} ({workload_id}) is not a standalone task"
+        )),
     })
 }
 
@@ -284,12 +158,6 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     encode_secret_files(&mut files_builder, &spec.secret_files);
     let mut volume_builder = builder.reborrow().init_volumes(spec.volumes.len() as u32);
     encode_volume_mounts(&mut volume_builder, &spec.volumes);
-
-    if let Some(meta) = spec.service_metadata.as_ref() {
-        let mut meta_builder = builder.reborrow().init_service_metadata();
-        meta_builder.set_service_name(&meta.service_name);
-        meta_builder.set_template_name(&meta.template);
-    }
 }
 
 pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
@@ -394,19 +262,6 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         networks.push(Uuid::from_bytes(bytes));
     }
 
-    let service_metadata = if reader.has_service_metadata() {
-        let meta = reader.get_service_metadata()?;
-        let service_name = meta.get_service_name()?.to_str()?.to_string();
-        let template = meta.get_template_name()?.to_str()?.to_string();
-        if service_name.is_empty() || template.is_empty() {
-            None
-        } else {
-            Some(TaskServiceMetadata::new(service_name, template))
-        }
-    } else {
-        None
-    };
-
     let updated_at = if updated_at.is_empty() {
         created_at.clone()
     } else {
@@ -450,7 +305,6 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         secret_files,
         volumes,
         networks,
-        service_metadata,
         lease_id,
         lease_coordinator_node_id,
         task_epoch,
@@ -462,15 +316,6 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
 
 pub fn read_spec_id(reader: task_spec::Reader) -> Result<Uuid, Error> {
     let bytes = reader.get_id()?.to_owned();
-    let slice: [u8; 16] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::failed("invalid task id length".to_string()))?;
-    Ok(Uuid::from_bytes(slice))
-}
-
-fn read_id_from_data(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
-    let bytes = data.to_owned();
     let slice: [u8; 16] = bytes
         .as_slice()
         .try_into()
@@ -764,6 +609,44 @@ impl TaskService {
         let response = session.get_task_request().send().promise.await?;
         response.get()?.get_task()
     }
+
+    /// Resolves one operator-provided selector against standalone tasks only.
+    async fn resolve_standalone_task_id(&self, selector: &str) -> Result<Uuid, Error> {
+        let trimmed = selector.trim();
+        if trimmed.is_empty() {
+            return Err(Error::failed("task id must not be empty".to_string()));
+        }
+
+        if let Ok(id) = Uuid::parse_str(trimmed) {
+            let spec = self
+                .manager
+                .inspect_task(id)
+                .await
+                .map_err(|err| Error::failed(err.to_string()))?;
+            project_task_spec(&spec)?;
+            return Ok(id);
+        }
+
+        let workloads = self
+            .manager
+            .list_tasks(&TaskStateFilter::all())
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+        let ids = workloads
+            .iter()
+            .filter_map(|spec| TaskSpec::try_from_workload_spec(spec).ok().map(|_| spec.id));
+        match_task_id_prefix(trimmed, ids).map_err(|err| Error::failed(err.to_string()))
+    }
+
+    /// Loads one standalone task projection by durable identifier.
+    async fn inspect_standalone_task(&self, id: Uuid) -> Result<TaskSpec, Error> {
+        let spec = self
+            .manager
+            .inspect_task(id)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+        project_task_spec(&spec)
+    }
 }
 
 impl task::Server for TaskService {
@@ -786,10 +669,11 @@ impl task::Server for TaskService {
         let spec = specs
             .pop()
             .ok_or_else(|| Error::failed("start batch returned no spec".to_string()))?;
+        let task_spec = project_task_spec(&spec)?;
 
         let mut out = results.get();
         let spec_builder = out.reborrow().init_spec();
-        write_spec(spec_builder, &spec);
+        write_spec(spec_builder, &task_spec);
         Ok(())
     }
 
@@ -816,8 +700,9 @@ impl task::Server for TaskService {
 
         let mut list_builder = results.get().init_specs(specs.len() as u32);
         for (idx, spec) in specs.iter().enumerate() {
+            let task_spec = project_task_spec(spec)?;
             let builder = list_builder.reborrow().get(idx as u32);
-            write_spec(builder, spec);
+            write_spec(builder, &task_spec);
         }
 
         Ok(())
@@ -833,20 +718,19 @@ impl task::Server for TaskService {
 
         let req = params.get()?.get_request()?;
         let id = self
-            .manager
-            .resolve_task_id(req.get_selector()?.to_str()?)
-            .await
-            .map_err(|err| Error::failed(err.to_string()))?;
+            .resolve_standalone_task_id(req.get_selector()?.to_str()?)
+            .await?;
 
         let spec = self
             .manager
             .request_task_stop(id)
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
+        let task_spec = project_task_spec(&spec)?;
 
         let mut out = results.get();
         let spec_builder = out.reborrow().init_spec();
-        write_spec(spec_builder, &spec);
+        write_spec(spec_builder, &task_spec);
         Ok(())
     }
 
@@ -857,17 +741,11 @@ impl task::Server for TaskService {
     ) -> Result<(), Error> {
         let request = params.get()?.get_request()?;
         let id = self
-            .manager
-            .resolve_task_id(request.get_selector()?.to_str()?)
-            .await
-            .map_err(|err| Error::failed(err.to_string()))?;
+            .resolve_standalone_task_id(request.get_selector()?.to_str()?)
+            .await?;
         let options = read_logs_options(request.get_options()?)?;
         let sink = request.get_sink()?;
-        let spec = self
-            .manager
-            .inspect_task(id)
-            .await
-            .map_err(|err| Error::failed(err.to_string()))?;
+        let spec = self.inspect_standalone_task(id).await?;
 
         if spec.node_id != self.manager.local_node_id() {
             let remote = self.remote_task_client(spec.node_id).await?;
@@ -915,17 +793,11 @@ impl task::Server for TaskService {
     ) -> Result<(), Error> {
         let request = params.get()?.get_request()?;
         let id = self
-            .manager
-            .resolve_task_id(request.get_selector()?.to_str()?)
-            .await
-            .map_err(|err| Error::failed(err.to_string()))?;
+            .resolve_standalone_task_id(request.get_selector()?.to_str()?)
+            .await?;
         let options = read_attach_options(request.get_options()?)?;
         let sink = request.get_sink()?;
-        let spec = self
-            .manager
-            .inspect_task(id)
-            .await
-            .map_err(|err| Error::failed(err.to_string()))?;
+        let spec = self.inspect_standalone_task(id).await?;
 
         if spec.node_id != self.manager.local_node_id() {
             let remote = self.remote_task_client(spec.node_id).await?;
@@ -1007,17 +879,11 @@ impl task::Server for TaskService {
     ) -> Result<(), Error> {
         let request = params.get()?.get_request()?;
         let id = self
-            .manager
-            .resolve_task_id(request.get_selector()?.to_str()?)
-            .await
-            .map_err(|err| Error::failed(err.to_string()))?;
+            .resolve_standalone_task_id(request.get_selector()?.to_str()?)
+            .await?;
         let options = read_exec_options(request.get_options()?)?;
         let sink = request.get_sink()?;
-        let spec = self
-            .manager
-            .inspect_task(id)
-            .await
-            .map_err(|err| Error::failed(err.to_string()))?;
+        let spec = self.inspect_standalone_task(id).await?;
 
         if spec.node_id != self.manager.local_node_id() {
             let remote = self.remote_task_client(spec.node_id).await?;
@@ -1114,8 +980,13 @@ impl task::Server for TaskService {
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 
-        let mut list = results.get().init_tasks(specs.len() as u32);
-        for (idx, spec) in specs.iter().enumerate() {
+        let task_specs: Vec<TaskSpec> = specs
+            .iter()
+            .filter_map(|spec| TaskSpec::try_from_workload_spec(spec).ok())
+            .collect();
+
+        let mut list = results.get().init_tasks(task_specs.len() as u32);
+        for (idx, spec) in task_specs.iter().enumerate() {
             let builder = list.reborrow().get(idx as u32);
             write_spec(builder, spec);
         }
@@ -1243,6 +1114,8 @@ fn read_task_start_request(
         id,
         slot_ids,
         service_metadata: None,
+        job_metadata: None,
+        agent_run_metadata: None,
         target_node: None,
     })
 }

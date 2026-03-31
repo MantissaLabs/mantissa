@@ -16,7 +16,7 @@ use protocol::{
     agents::AgentsClient, gossip::GossipClient, jobs::JobsClient, network::NetworksClient,
     node::NodeClient, scheduling::scheduler::Client as SchedulerClient,
     secrets::secrets::Client as SecretsClient, services::ServicesClient, sync::SyncClient,
-    task::TaskClient, topology::TopologyClient, volumes::VolumesClient,
+    task::TaskClient, topology::TopologyClient, volumes::VolumesClient, workload::WorkloadClient,
 };
 
 pub mod auth;
@@ -347,6 +347,7 @@ pub struct ServerClients {
     pub sync_client: SyncClient,
     pub node_client: NodeClient,
     pub task_client: TaskClient,
+    pub workload_client: WorkloadClient,
     pub jobs_client: JobsClient,
     pub agents_client: AgentsClient,
     pub scheduler_client: SchedulerClient,
@@ -368,6 +369,7 @@ impl From<ServerClients> for ClusterSessionServices {
             gossip: clients.gossip_client,
             node: clients.node_client,
             task: clients.task_client,
+            workload: clients.workload_client,
             jobs: clients.jobs_client,
             agents: clients.agents_client,
             scheduler: clients.scheduler_client,

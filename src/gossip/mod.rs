@@ -21,13 +21,13 @@ use crate::secrets::service::{read_secret_event, write_secret_event};
 use crate::secrets::types::SecretEvent;
 use crate::services::service::{read_service_event, write_service_event};
 use crate::services::types::ServiceEvent;
-use crate::task::service as task_service;
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
 use crate::volumes::service::{read_volume_event, write_volume_event};
 use crate::volumes::types::VolumeEvent;
 use crate::workload::model::{WorkloadEvent, should_replace_workload_event, workload_event_id};
+use crate::workload::service as workload_service;
 use async_channel::{Receiver, Sender, TrySendError};
 use async_trait::async_trait;
 use capnp::Error;
@@ -605,7 +605,7 @@ impl gossip::Server for Gossip {
                 Topology(Err(e)) => {
                     eprintln!("Error reading topology: {e}");
                 }
-                Workload(Ok(reader)) => match task_service::read_event(reader) {
+                Workload(Ok(reader)) => match workload_service::read_event(reader) {
                     Ok(event) => {
                         let message = Message::Workload { id, event };
                         if should_relay_inbound_message(relay_inbound, &message) {
@@ -1138,7 +1138,7 @@ where
                 topology::add_event(&mut msgs, idx as u32, event, cluster_view);
             }
             Message::Workload { event, .. } => {
-                task_service::add_event(&mut msgs, idx as u32, event);
+                workload_service::add_event(&mut msgs, idx as u32, event);
             }
             Message::Job { event, .. } => {
                 let job_builder = builder.init_job();
@@ -1282,11 +1282,10 @@ mod tests {
         message_for_forwarding,
     };
     use crate::cluster::{ClusterId, ClusterViewId};
-    use crate::task::types::{TaskEvent, TaskSpec};
     use crate::topology::PeerHandle;
     use crate::topology::TopologyEvent;
     use crate::topology::peer_provider::PeerProvider;
-    use crate::workload::model::WorkloadPhase;
+    use crate::workload::model::{WorkloadEvent, WorkloadPhase, WorkloadSpec};
     use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
     use std::collections::HashSet;
@@ -1413,7 +1412,7 @@ mod tests {
         let node_id = Uuid::new_v4();
         let now = Utc::now();
 
-        let newer = TaskSpec {
+        let newer = WorkloadSpec {
             id: task_id,
             name: "task".to_string(),
             image: "img".to_string(),
@@ -1443,6 +1442,8 @@ mod tests {
             volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: None,
+            job_metadata: None,
+            agent_run_metadata: None,
             lease_id: None,
             lease_coordinator_node_id: None,
             task_epoch: 4,
@@ -1451,7 +1452,7 @@ mod tests {
             last_terminal_observed_launch: None,
         };
 
-        let stale = TaskSpec {
+        let stale = WorkloadSpec {
             id: task_id,
             name: "task".to_string(),
             image: "img".to_string(),
@@ -1481,6 +1482,8 @@ mod tests {
             volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: None,
+            job_metadata: None,
+            agent_run_metadata: None,
             lease_id: None,
             lease_coordinator_node_id: None,
             task_epoch: 4,
@@ -1492,11 +1495,11 @@ mod tests {
         let pending = vec![
             Message::Workload {
                 id: Uuid::new_v4(),
-                event: TaskEvent::UpsertSpec(Box::new(newer.clone())),
+                event: WorkloadEvent::UpsertSpec(Box::new(newer.clone())),
             },
             Message::Workload {
                 id: Uuid::new_v4(),
-                event: TaskEvent::UpsertSpec(Box::new(stale)),
+                event: WorkloadEvent::UpsertSpec(Box::new(stale)),
             },
         ];
 
@@ -1505,7 +1508,7 @@ mod tests {
         assert_eq!(coalesced.len(), 1);
         match &coalesced[0] {
             Message::Workload {
-                event: TaskEvent::UpsertSpec(spec),
+                event: WorkloadEvent::UpsertSpec(spec),
                 ..
             } => {
                 assert_eq!(spec.state, WorkloadPhase::Running);
@@ -1520,7 +1523,7 @@ mod tests {
     fn coalesce_pending_messages_prefers_task_remove() {
         let task_id = Uuid::new_v4();
         let now = Utc::now();
-        let upsert = TaskSpec {
+        let upsert = WorkloadSpec {
             id: task_id,
             name: "task".to_string(),
             image: "img".to_string(),
@@ -1550,6 +1553,8 @@ mod tests {
             volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: None,
+            job_metadata: None,
+            agent_run_metadata: None,
             lease_id: None,
             lease_coordinator_node_id: None,
             task_epoch: 2,
@@ -1561,11 +1566,11 @@ mod tests {
         let pending = vec![
             Message::Workload {
                 id: Uuid::new_v4(),
-                event: TaskEvent::UpsertSpec(Box::new(upsert)),
+                event: WorkloadEvent::UpsertSpec(Box::new(upsert)),
             },
             Message::Workload {
                 id: Uuid::new_v4(),
-                event: TaskEvent::Remove { id: task_id },
+                event: WorkloadEvent::Remove { id: task_id },
             },
         ];
 
@@ -1575,7 +1580,7 @@ mod tests {
         assert!(matches!(
             coalesced[0],
             Message::Workload {
-                event: TaskEvent::Remove { .. },
+                event: WorkloadEvent::Remove { .. },
                 ..
             }
         ));
@@ -1600,7 +1605,7 @@ mod tests {
                 WorkloadPhase::Pending
             };
 
-            let spec = TaskSpec {
+            let spec = WorkloadSpec {
                 id: task_id,
                 name: "task".to_string(),
                 image: "img".to_string(),
@@ -1630,6 +1635,8 @@ mod tests {
                 volumes: Vec::new(),
                 networks: Vec::new(),
                 service_metadata: None,
+                job_metadata: None,
+                agent_run_metadata: None,
                 lease_id: None,
                 lease_coordinator_node_id: None,
                 task_epoch: 2,
@@ -1639,7 +1646,7 @@ mod tests {
             };
             pending.push(Message::Workload {
                 id: Uuid::new_v4(),
-                event: TaskEvent::UpsertSpec(Box::new(spec)),
+                event: WorkloadEvent::UpsertSpec(Box::new(spec)),
             });
         }
 
@@ -1653,7 +1660,7 @@ mod tests {
             .iter()
             .find_map(|message| match message {
                 Message::Workload {
-                    event: TaskEvent::UpsertSpec(spec),
+                    event: WorkloadEvent::UpsertSpec(spec),
                     ..
                 } => Some(spec),
                 _ => None,

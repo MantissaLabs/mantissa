@@ -14,7 +14,7 @@ use mantissa::cluster::ClusterViewId;
 use protocol::health::NodeStatus;
 use protocol::services::ServiceStatus as ProtoServiceStatus;
 use protocol::sync::Domain;
-use protocol::task::TaskStateFilter as ProtoTaskStateFilter;
+use protocol::workload::WorkloadStateFilter as ProtoWorkloadStateFilter;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::net::TcpListener;
@@ -147,26 +147,26 @@ enum TaskFilterMode {
 }
 
 impl TaskFilterMode {
-    /// Encodes the selected lifecycle states into a task list request builder.
-    fn write(self, mut builder: protocol::task::task_list_request::Builder<'_>) {
-        let states: &[ProtoTaskStateFilter] = match self {
+    /// Encodes the selected lifecycle states into a workload list request builder.
+    fn write(self, mut builder: protocol::workload::workload_list_request::Builder<'_>) {
+        let states: &[ProtoWorkloadStateFilter] = match self {
             TaskFilterMode::Active => &[
-                ProtoTaskStateFilter::Pending,
-                ProtoTaskStateFilter::Creating,
-                ProtoTaskStateFilter::Running,
-                ProtoTaskStateFilter::Stopping,
+                ProtoWorkloadStateFilter::Pending,
+                ProtoWorkloadStateFilter::Creating,
+                ProtoWorkloadStateFilter::Running,
+                ProtoWorkloadStateFilter::Stopping,
             ],
-            TaskFilterMode::Running => &[ProtoTaskStateFilter::Running],
+            TaskFilterMode::Running => &[ProtoWorkloadStateFilter::Running],
             TaskFilterMode::All => &[
-                ProtoTaskStateFilter::Pending,
-                ProtoTaskStateFilter::Creating,
-                ProtoTaskStateFilter::Running,
-                ProtoTaskStateFilter::Paused,
-                ProtoTaskStateFilter::Stopping,
-                ProtoTaskStateFilter::Stopped,
-                ProtoTaskStateFilter::Failed,
-                ProtoTaskStateFilter::Exited,
-                ProtoTaskStateFilter::Unknown,
+                ProtoWorkloadStateFilter::Pending,
+                ProtoWorkloadStateFilter::Creating,
+                ProtoWorkloadStateFilter::Running,
+                ProtoWorkloadStateFilter::Paused,
+                ProtoWorkloadStateFilter::Stopping,
+                ProtoWorkloadStateFilter::Stopped,
+                ProtoWorkloadStateFilter::Failed,
+                ProtoWorkloadStateFilter::Exited,
+                ProtoWorkloadStateFilter::Unknown,
             ],
         };
 
@@ -695,29 +695,31 @@ impl ProcessNode {
         Ok(out)
     }
 
-    /// Lists tasks visible from this node with one server-side state filter applied.
+    /// Lists workloads visible from this node with one server-side state filter applied.
     async fn list_tasks(&self, filter: TaskFilterMode) -> Result<Vec<TaskSnapshot>> {
-        let task = self
+        let workload = self
             .session
-            .get_task_request()
+            .get_workload_request()
             .send()
             .promise
             .await
-            .context("fetch task capability")?
+            .context("fetch workload capability")?
             .get()
-            .context("read task capability result")?
-            .get_task()
-            .context("extract task capability")?;
+            .context("read workload capability result")?
+            .get_workload()
+            .context("extract workload capability")?;
 
-        let mut request = task.list_request();
+        let mut request = workload.list_request();
         {
             let inner = request.get().init_request();
             filter.write(inner);
         }
 
-        let response = request.send().promise.await.context("call task.list")?;
-        let reader = response.get().context("read task.list result")?;
-        let tasks = reader.get_tasks().context("read task list payload")?;
+        let response = request.send().promise.await.context("call workload.list")?;
+        let reader = response.get().context("read workload.list result")?;
+        let tasks = reader
+            .get_workloads()
+            .context("read workload list payload")?;
 
         let mut out = Vec::with_capacity(tasks.len() as usize);
         for task in tasks.iter() {

@@ -6,6 +6,7 @@ capnp::generated_code!(pub mod node_capnp);
 capnp::generated_code!(pub mod gossip_capnp);
 capnp::generated_code!(pub mod topology_capnp);
 capnp::generated_code!(pub mod scheduling_capnp);
+capnp::generated_code!(pub mod workload_capnp);
 capnp::generated_code!(pub mod info_capnp);
 capnp::generated_code!(pub mod sync_capnp);
 capnp::generated_code!(pub mod health_capnp);
@@ -77,6 +78,13 @@ pub mod task {
     pub use super::task_capnp::task::*;
     pub use super::task_capnp::*;
     pub type TaskClient = super::task_capnp::task::Client;
+}
+
+pub mod workload {
+    pub use super::workload_capnp::workload;
+    pub use super::workload_capnp::workload::*;
+    pub use super::workload_capnp::*;
+    pub type WorkloadClient = super::workload_capnp::workload::Client;
 }
 
 pub mod jobs {

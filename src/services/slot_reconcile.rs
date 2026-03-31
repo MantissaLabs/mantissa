@@ -10,8 +10,7 @@ use super::{
     task_state_healthy, task_state_rebalanceable,
 };
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
-use crate::task::types::TaskSpec;
-use crate::workload::model::WorkloadPhase;
+use crate::workload::model::{WorkloadPhase, WorkloadSpec};
 use anyhow::anyhow;
 use health::Status as HealthStatus;
 use std::collections::{HashMap, HashSet};
@@ -444,7 +443,7 @@ impl ServiceController {
         &self,
         spec: &ServiceSpecValue,
         slot: &ReplicaSlot,
-        task: &TaskSpec,
+        task: &WorkloadSpec,
         preferred_node: Uuid,
         key: &SlotKey,
     ) -> anyhow::Result<()> {

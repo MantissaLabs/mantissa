@@ -74,7 +74,7 @@ The important consequence is that names describe different axes:
 
 | Term | What it answers |
 | --- | --- |
-| `Task`, `ServiceReplica`, `Job`, `AgentSession`, `AgentRun` | Who owns the lifecycle semantics |
+| `Task`, `ServiceReplica`, `JobAttempt`, `AgentRun` | Which schedulable workload row this is |
 | `ExecutionSpec` | How the schedulable execution should run |
 | `RuntimeClass` | Which runtime family is requested |
 | `RuntimeBackend` | Which local engine actually implements the request |
@@ -124,7 +124,7 @@ reconciled as part of a service rollout.
 A job is a controller-level record for finite work. It owns retry and
 completion semantics above the runtime layer. A job may launch multiple
 underlying workload attempts over time, but those attempts still reuse the
-shared execution substrate.
+shared execution substrate and are recorded as `WorkloadKind::JobAttempt`.
 
 This is why a job is not simply another name for a service. A service wants to
 keep a desired replica set alive and routable. A job wants to produce a
@@ -142,8 +142,9 @@ capacity at all.
 
 An `AgentRun` is the schedulable execution slice created from that session. It
 is the thing that actually turns into an underlying workload and then into a
-runtime instance. This split lets Mantissa keep an idle session durable without
-pinning compute, which is important for human-in-the-loop workflows.
+runtime instance, and it is recorded in the shared substrate as
+`WorkloadKind::AgentRun`. This split lets Mantissa keep an idle session durable
+without pinning compute, which is important for human-in-the-loop workflows.
 
 ### Summary Table
 

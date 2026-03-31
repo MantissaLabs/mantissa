@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::scheduler::digest::{SchedulerDigestValue, read_scheduler_digest};
 use crate::scheduler::{GpuReservationRequest, SchedulerError, SlotId, SlotReservationRequest};
-use crate::task::service::read_spec;
 use crate::workload::model::{WorkloadEvent, WorkloadPhase, WorkloadSpec};
+use crate::workload::service::read_spec;
 
 use super::WorkloadManager;
 use super::planner::{BatchStartPlan, PreparedRemoteStartPlan, RemoteStartPlan};
@@ -516,6 +516,8 @@ impl WorkloadManager {
                                         volumes: plan.volumes.clone(),
                                         networks: plan.networks.clone(),
                                         service_metadata: plan.service_metadata.clone(),
+                                        job_metadata: plan.job_metadata.clone(),
+                                        agent_run_metadata: plan.agent_run_metadata.clone(),
                                     });
                                 }
 
@@ -710,21 +712,22 @@ impl WorkloadManager {
             .await
             .context(format!("no active session for peer {peer_id}"))?;
         let task_client = session
-            .get_task_request()
+            .get_workload_request()
             .send()
             .promise
             .await
-            .context(format!("failed to open task service with peer {peer_id}"))?
+            .context(format!(
+                "failed to open workload service with peer {peer_id}"
+            ))?
             .get()
-            .context(format!("invalid task response from peer {peer_id}"))?
-            .get_task()
-            .context(format!("missing task service for peer {peer_id}"))?;
+            .context(format!("invalid workload response from peer {peer_id}"))?
+            .get_workload()
+            .context(format!("missing workload service for peer {peer_id}"))?;
 
         let mut stop_req = task_client.stop_request();
         {
             let mut request = stop_req.get().init_request();
-            let selector = spec.id.to_string();
-            request.set_selector(&selector);
+            request.set_id(spec.id.as_bytes());
         }
         let response = stop_req
             .send()
@@ -827,6 +830,8 @@ impl WorkloadManager {
                 volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),
                 service_metadata: plan.service_metadata.clone(),
+                job_metadata: plan.job_metadata.clone(),
+                agent_run_metadata: plan.agent_run_metadata.clone(),
                 lease_id: Some(plan.lease_id),
                 lease_coordinator_node_id: Some(plan.lease_coordinator_node_id),
                 task_epoch,

@@ -12,8 +12,7 @@ use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
 /// Terminology:
 /// - `Task` means a standalone user-submitted execution with no higher-level controller.
 /// - `ServiceReplica` means one service-owned schedulable replica.
-/// - `Job` means a finite completion-oriented controller that launches workload attempts.
-/// - `AgentSession` is the durable agent identity/workspace/policy record.
+/// - `JobAttempt` means one schedulable workload attempt owned by a job controller.
 /// - `AgentRun` is one schedulable execution slice launched by an agent session.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
@@ -25,10 +24,8 @@ pub enum WorkloadKind {
     Task,
     /// One schedulable replica owned by the service controller.
     ServiceReplica,
-    /// Finite completion-oriented controller entry.
-    Job,
-    /// Durable agent control-plane session.
-    AgentSession,
+    /// One schedulable attempt owned by a finite job controller.
+    JobAttempt,
     /// One schedulable execution slice launched by an agent session.
     AgentRun,
 }
@@ -212,6 +209,42 @@ impl WorkloadServiceMetadata {
     }
 }
 
+/// Job-controller ownership metadata associated with one workload attempt.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkloadJobMetadata {
+    pub job_id: Uuid,
+    pub job_name: String,
+}
+
+impl WorkloadJobMetadata {
+    /// Builds one job-attempt ownership marker from controller identifiers.
+    pub fn new(job_id: Uuid, job_name: impl Into<String>) -> Self {
+        Self {
+            job_id,
+            job_name: job_name.into(),
+        }
+    }
+}
+
+/// Agent-controller ownership metadata associated with one schedulable run workload.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkloadAgentRunMetadata {
+    pub session_id: Uuid,
+    pub session_name: String,
+    pub run_id: Uuid,
+}
+
+impl WorkloadAgentRunMetadata {
+    /// Builds one agent-run ownership marker from controller identifiers.
+    pub fn new(session_id: Uuid, session_name: impl Into<String>, run_id: Uuid) -> Self {
+        Self {
+            session_id,
+            session_name: session_name.into(),
+            run_id,
+        }
+    }
+}
+
 /// Secret reference resolved by one workload environment variable or mounted secret file.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkloadSecretReference {
@@ -241,10 +274,9 @@ pub struct WorkloadSecretFile {
 
 /// Full persisted workload definition shared by the workload core.
 ///
-/// This is the generic durable definition underneath every schedulable execution. The public
-/// task surface still aliases this as `TaskSpec` for `WorkloadKind::Task`, which is why some
-/// task-facing APIs accept/return task names while the generic scheduler and runtime code speak
-/// in terms of workloads.
+/// This is the generic durable definition underneath every schedulable execution. Public
+/// controller-facing APIs project this into narrower views such as `TaskSpec`, while the
+/// scheduler, replication, and runtime layers operate directly on workload rows.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkloadSpec {
     pub id: Uuid,
@@ -296,6 +328,10 @@ pub struct WorkloadSpec {
     #[serde(default)]
     pub service_metadata: Option<WorkloadServiceMetadata>,
     #[serde(default)]
+    pub job_metadata: Option<WorkloadJobMetadata>,
+    #[serde(default)]
+    pub agent_run_metadata: Option<WorkloadAgentRunMetadata>,
+    #[serde(default)]
     pub lease_id: Option<Uuid>,
     #[serde(default)]
     pub lease_coordinator_node_id: Option<Uuid>,
@@ -321,7 +357,11 @@ impl WorkloadSpec {
 
     /// Returns the workload kind represented by this workload record.
     pub fn kind(&self) -> WorkloadKind {
-        infer_workload_kind(self.service_metadata.as_ref())
+        infer_workload_kind(
+            self.service_metadata.as_ref(),
+            self.job_metadata.as_ref(),
+            self.agent_run_metadata.as_ref(),
+        )
     }
 
     /// Returns the runtime class requested by this workload record.
@@ -356,6 +396,10 @@ pub struct WorkloadStatus {
     #[serde(default)]
     pub service_metadata: Option<WorkloadServiceMetadata>,
     #[serde(default)]
+    pub job_metadata: Option<WorkloadJobMetadata>,
+    #[serde(default)]
+    pub agent_run_metadata: Option<WorkloadAgentRunMetadata>,
+    #[serde(default)]
     pub task_epoch: u64,
     #[serde(default)]
     pub phase_version: u64,
@@ -382,6 +426,8 @@ impl WorkloadStatus {
             node_id: spec.node_id,
             node_name: spec.node_name.clone(),
             service_metadata: spec.service_metadata.clone(),
+            job_metadata: spec.job_metadata.clone(),
+            agent_run_metadata: spec.agent_run_metadata.clone(),
             task_epoch: spec.task_epoch,
             phase_version: spec.phase_version,
             launch_attempt: spec.launch_attempt,
@@ -400,7 +446,11 @@ impl WorkloadStatus {
 
     /// Returns the workload kind represented by this workload status record.
     pub fn kind(&self) -> WorkloadKind {
-        infer_workload_kind(self.service_metadata.as_ref())
+        infer_workload_kind(
+            self.service_metadata.as_ref(),
+            self.job_metadata.as_ref(),
+            self.agent_run_metadata.as_ref(),
+        )
     }
 
     /// Returns the runtime class requested by this workload status record.
@@ -472,6 +522,10 @@ pub struct WorkloadValue {
     #[serde(default)]
     pub service_metadata: Option<WorkloadServiceMetadata>,
     #[serde(default)]
+    pub job_metadata: Option<WorkloadJobMetadata>,
+    #[serde(default)]
+    pub agent_run_metadata: Option<WorkloadAgentRunMetadata>,
+    #[serde(default)]
     pub lease_id: Option<Uuid>,
     #[serde(default)]
     pub lease_coordinator_node_id: Option<Uuid>,
@@ -517,6 +571,8 @@ pub struct WorkloadValueDraft {
     pub secret_files: Vec<WorkloadSecretFile>,
     pub volumes: Vec<WorkloadVolumeMount>,
     pub service_metadata: Option<WorkloadServiceMetadata>,
+    pub job_metadata: Option<WorkloadJobMetadata>,
+    pub agent_run_metadata: Option<WorkloadAgentRunMetadata>,
     pub lease_id: Option<Uuid>,
     pub lease_coordinator_node_id: Option<Uuid>,
     pub task_epoch: u64,
@@ -559,6 +615,8 @@ impl WorkloadValue {
             secret_files: draft.secret_files,
             volumes: draft.volumes,
             service_metadata: draft.service_metadata,
+            job_metadata: draft.job_metadata,
+            agent_run_metadata: draft.agent_run_metadata,
             lease_id: draft.lease_id,
             lease_coordinator_node_id: draft.lease_coordinator_node_id,
             task_epoch: draft.task_epoch,
@@ -580,7 +638,11 @@ impl WorkloadValue {
 
     /// Returns the workload kind represented by this task-era workload projection.
     pub fn kind(&self) -> WorkloadKind {
-        infer_workload_kind(self.service_metadata.as_ref())
+        infer_workload_kind(
+            self.service_metadata.as_ref(),
+            self.job_metadata.as_ref(),
+            self.agent_run_metadata.as_ref(),
+        )
     }
 
     /// Returns the runtime class exposed by the current task-era workload projection.
@@ -595,9 +657,19 @@ fn default_workload_value_definition_complete() -> bool {
 }
 
 /// Infers the current workload kind from the task-era controller metadata carried by the value.
-fn infer_workload_kind(service_metadata: Option<&WorkloadServiceMetadata>) -> WorkloadKind {
+fn infer_workload_kind(
+    service_metadata: Option<&WorkloadServiceMetadata>,
+    job_metadata: Option<&WorkloadJobMetadata>,
+    agent_run_metadata: Option<&WorkloadAgentRunMetadata>,
+) -> WorkloadKind {
     if service_metadata.is_some() {
         return WorkloadKind::ServiceReplica;
+    }
+    if job_metadata.is_some() {
+        return WorkloadKind::JobAttempt;
+    }
+    if agent_run_metadata.is_some() {
+        return WorkloadKind::AgentRun;
     }
 
     WorkloadKind::Task
@@ -907,6 +979,8 @@ pub(crate) fn value_to_spec(id: Uuid, value: WorkloadValue) -> WorkloadSpec {
         volumes: value.volumes,
         networks: value.networks,
         service_metadata: value.service_metadata,
+        job_metadata: value.job_metadata,
+        agent_run_metadata: value.agent_run_metadata,
         lease_id: value.lease_id,
         lease_coordinator_node_id: value.lease_coordinator_node_id,
         task_epoch: value.task_epoch,
@@ -941,6 +1015,8 @@ pub(crate) fn merge_status_into_value(
         merged.node_id = status.node_id;
         merged.node_name = status.node_name.clone();
         merged.service_metadata = status.service_metadata.clone();
+        merged.job_metadata = status.job_metadata.clone();
+        merged.agent_run_metadata = status.agent_run_metadata.clone();
         merged.task_epoch = status.task_epoch;
         merged.phase_version = status.phase_version;
         merged.launch_attempt = status.launch_attempt;
@@ -976,6 +1052,8 @@ pub(crate) fn merge_status_into_value(
         secret_files: Vec::new(),
         volumes: Vec::new(),
         service_metadata: status.service_metadata.clone(),
+        job_metadata: status.job_metadata.clone(),
+        agent_run_metadata: status.agent_run_metadata.clone(),
         lease_id: None,
         lease_coordinator_node_id: None,
         task_epoch: status.task_epoch,
@@ -1035,6 +1113,8 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
         secret_files: spec.secret_files.clone(),
         volumes: spec.volumes.clone(),
         service_metadata: spec.service_metadata.clone(),
+        job_metadata: spec.job_metadata.clone(),
+        agent_run_metadata: spec.agent_run_metadata.clone(),
         lease_id: spec.lease_id,
         lease_coordinator_node_id: spec.lease_coordinator_node_id,
         task_epoch: spec.task_epoch,
@@ -1088,6 +1168,8 @@ mod tests {
             volumes: Vec::new(),
             networks: Vec::new(),
             service_metadata: None,
+            job_metadata: None,
+            agent_run_metadata: None,
             lease_id: None,
             lease_coordinator_node_id: None,
             task_epoch: 3,

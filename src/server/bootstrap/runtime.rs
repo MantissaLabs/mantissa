@@ -26,6 +26,7 @@ use crate::task::service::TaskService;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyStores};
 use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
 use crate::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadRuntimeConfig};
+use crate::workload::service::WorkloadService;
 use crate::{config, gossip, services};
 use async_channel::{Receiver, Sender};
 use protocol::agents::agents::Client as AgentsClient;
@@ -93,6 +94,7 @@ pub(crate) struct RuntimeComponents {
     pub sync_client: protocol::sync::sync::Client,
     pub task_manager: WorkloadManager,
     pub task_client: protocol::task::task::Client,
+    workload_client: protocol::workload::workload::Client,
     pub job_controller: JobController,
     pub jobs_client: JobsClient,
     pub agent_controller: AgentController,
@@ -460,6 +462,8 @@ async fn build_runtime_components(
     });
     let task_service = TaskService::new(task_manager.clone(), topology.clone(), registry.clone());
     let task_client = capnp_rpc::new_client(task_service);
+    let workload_service = WorkloadService::new(task_manager.clone());
+    let workload_client = capnp_rpc::new_client(workload_service);
 
     let job_controller = JobController::new(JobControllerConfig {
         registry: job_registry,
@@ -535,6 +539,7 @@ async fn build_runtime_components(
             sync_client,
             task_manager,
             task_client,
+            workload_client,
             job_controller,
             jobs_client,
             agent_controller,
@@ -824,6 +829,7 @@ fn build_server(
         sync_client: components.sync_client.clone(),
         node_client: ctx.node_client.clone(),
         task_client: components.task_client.clone(),
+        workload_client: components.workload_client.clone(),
         jobs_client: components.jobs_client.clone(),
         agents_client: components.agents_client.clone(),
         scheduler_client: components.scheduler_client.clone(),

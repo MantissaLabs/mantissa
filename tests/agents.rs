@@ -5,9 +5,10 @@ use chrono::Utc;
 use common::convergence::wait_until;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use crdt_store::uuid_key::UuidKey;
-use mantissa::task::types::{TaskSpec, TaskValue};
+use mantissa::task::types::TaskValue;
 use mantissa::workload::model::RuntimeClass;
 use mantissa::workload::model::WorkloadPhase;
+use mantissa::workload::model::WorkloadSpec;
 use protocol::agents::{
     AgentRunStatus as ProtoAgentRunStatus, AgentSessionStatus as ProtoAgentSessionStatus, agents,
 };
@@ -313,7 +314,7 @@ async fn mark_task_exited(node: &TestNode, task_id: Uuid, exit_code: i32) {
 }
 
 /// Rebuilds one workload-store value from the current task spec so tests can inject state transitions.
-fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
+fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
     TaskValue {
         id: spec.id,
         name: spec.name.clone(),
@@ -344,6 +345,8 @@ fn task_spec_to_value(spec: &TaskSpec) -> TaskValue {
         volumes: spec.volumes.clone(),
         networks: spec.networks.clone(),
         service_metadata: spec.service_metadata.clone(),
+        job_metadata: spec.job_metadata.clone(),
+        agent_run_metadata: spec.agent_run_metadata.clone(),
         lease_id: spec.lease_id,
         lease_coordinator_node_id: spec.lease_coordinator_node_id,
         task_epoch: spec.task_epoch,

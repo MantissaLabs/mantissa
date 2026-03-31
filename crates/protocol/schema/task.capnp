@@ -1,5 +1,7 @@
 @0xc040d5aebc3fbc7e;
 
+using WorkloadSchema = import "workload.capnp";
+
 interface Task {
   start @0 (request :TaskStartRequest) -> (spec :TaskSpec);
   # Start a new standalone task and return its durable task projection.
@@ -166,55 +168,10 @@ struct TaskLogFrame {
   # Raw bytes emitted by the runtime.
 }
 
-struct SecretRef {
-  name @0 :Text;
-  # Logical secret name.
-
-  versionId @1 :Data;
-  # 16-byte UUID for a specific version, empty = latest.
-}
-
-struct EnvironmentVar {
-  name @0 :Text;
-  # Environment variable name.
-
-  value @1 :Text;
-  # Optional literal value (empty when using secret).
-
-  secret @2 :SecretRef;
-  # Optional secret reference (used instead of literal value).
-}
-
-struct SecretFile {
-  path @0 :Text;
-  # Runtime filesystem path for the secret file.
-
-  secret @1 :SecretRef;
-  # Secret reference to materialize.
-
-  mode @2 :UInt32;
-  # POSIX file mode, 0 = default 0o600.
-}
-
-struct VolumeMount {
-  volumeId @0 :Data;
-  # Referenced volume UUID as 16 bytes.
-
-  volumeName @1 :Text;
-  # Logical volume name for operator-facing diagnostics.
-
-  target @2 :Text;
-  # Runtime filesystem path where the volume should be mounted.
-
-  readOnly @3 :Bool;
-  # Mount the volume read-only inside the container.
-}
-
 #
-# `TaskSpec` is the standalone-task projection of the generic workload definition.
-# Direct task submissions use this type as their durable/spec response, while service-owned
-# replicas, job attempts, and agent runs reuse the same underlying workload machinery but
-# are tracked by their own controllers.
+# `TaskSpec` is the standalone-task projection returned by the public task RPC.
+# It contains only direct-task fields. Shared workload ownership metadata stays in the
+# internal workload schema and is not exposed through the standalone task interface.
 struct TaskSpec {
   id @0 :Data;
   # Task UUID v4 as 16 bytes.
@@ -249,140 +206,71 @@ struct TaskSpec {
   memoryBytes @10 :UInt64;
   # Allocated memory in bytes.
 
-  restartPolicy @11 :RestartPolicy;
+  restartPolicy @11 :WorkloadSchema.RestartPolicy;
   # Restart behavior for the task.
 
-  env @12 :List(EnvironmentVar);
+  env @12 :List(WorkloadSchema.EnvironmentVar);
   # Environment variables injected into the task.
 
-  secretFiles @13 :List(SecretFile);
+  secretFiles @13 :List(WorkloadSchema.SecretFile);
   # Secret-backed files mounted into the task.
 
   networks @14 :List(Data);
   # Required network UUIDs (16 bytes each).
 
-  serviceMetadata @15 :ServiceMetadata;
-  # Optional service ownership metadata.
-  # When present, this task is a service-owned replica rather than a direct standalone task.
-
-  updatedAt @16 :Text;
+  updatedAt @15 :Text;
   # RFC3339 timestamp when the task was last updated.
 
-  gpuCount @17 :UInt32;
+  gpuCount @16 :UInt32;
   # Allocated GPU count.
 
-  gpuDeviceIds @18 :List(Text);
+  gpuDeviceIds @17 :List(Text);
   # Allocated GPU device identifiers (UUIDs preferred).
 
-  phaseReason @19 :Text;
+  phaseReason @18 :Text;
   # Optional current lifecycle phase reason (for example image pull retry/backoff details).
 
-  phaseProgress @20 :Text;
+  phaseProgress @19 :Text;
   # Optional current lifecycle phase progress marker.
 
-  taskEpoch @21 :UInt64;
+  taskEpoch @20 :UInt64;
   # Assignment generation for this task identity. Increments when ownership/placement changes.
 
-  phaseVersion @22 :UInt64;
+  phaseVersion @21 :UInt64;
   # Monotonic lifecycle version incremented on each task state transition.
 
-  launchAttempt @23 :UInt64;
+  launchAttempt @22 :UInt64;
   # Monotonic launch attempt for this task incarnation.
 
-  lastTerminalObservedLaunch @24 :UInt64;
+  lastTerminalObservedLaunch @23 :UInt64;
   # Last launch attempt observed as terminal, 0 means unset.
 
-  terminationGracePeriodSecs @25 :UInt32;
+  terminationGracePeriodSecs @24 :UInt32;
   # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
 
-  preStopCommand @26 :List(Text);
+  preStopCommand @25 :List(Text);
   # Optional command executed inside the runtime instance before termination begins.
 
-  volumes @27 :List(VolumeMount);
+  volumes @26 :List(WorkloadSchema.VolumeMount);
   # Named volumes mounted into the task runtime.
 
-  liveness @28 :LivenessProbe;
+  liveness @27 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe executed by the hosting runtime.
 
-  tty @29 :Bool;
+  tty @28 :Bool;
   # Whether the task runtime was created with an allocated terminal.
 
-  leaseId @30 :Data;
+  leaseId @29 :Data;
   # 16-byte UUID of the prepared scheduler lease, empty when the task is already committed.
 
-  leaseCoordinatorNodeId @31 :Data;
+  leaseCoordinatorNodeId @30 :Data;
   # 16-byte UUID of the node that coordinated the prepared lease, empty when unset.
 
-  runtimeClass @32 :Text;
+  runtimeClass @31 :Text;
   # Runtime class used to execute this workload.
 
-  sandboxProfile @33 :Text;
+  sandboxProfile @32 :Text;
   # Optional sandbox profile used when the workload targets sandbox execution.
-}
-
-#
-# `TaskStatus` is the compact hot-path status projection for standalone tasks.
-# It carries only the fields required for lifecycle propagation and listing, while the full
-# `TaskSpec` remains the richer task-facing projection of the generic workload definition.
-struct TaskStatus {
-  id @0 :Data;
-  # Task UUID v4 as 16 bytes.
-
-  name @1 :Text;
-  # Human-readable task name.
-
-  image @2 :Text;
-  # Execution image/binary identifier from the workload execution spec.
-
-  state @3 :Text;
-  # Current runtime state label.
-
-  createdAt @4 :Text;
-  # RFC3339 timestamp when the task was created.
-
-  updatedAt @5 :Text;
-  # RFC3339 timestamp when the task was last updated.
-
-  nodeId @6 :Data;
-  # 16-byte UUID of the node hosting the task.
-
-  nodeName @7 :Text;
-  # Human-readable name of the hosting node.
-
-  serviceMetadata @8 :ServiceMetadata;
-  # Optional service ownership metadata.
-
-  phaseReason @9 :Text;
-  # Optional current lifecycle phase reason.
-
-  phaseProgress @10 :Text;
-  # Optional current lifecycle phase progress marker.
-
-  taskEpoch @11 :UInt64;
-  # Assignment generation for this task identity.
-
-  phaseVersion @12 :UInt64;
-  # Monotonic lifecycle version incremented on each task state transition.
-
-  launchAttempt @13 :UInt64;
-  # Monotonic launch attempt for this task incarnation.
-
-  lastTerminalObservedLaunch @14 :UInt64;
-  # Last launch attempt observed as terminal, 0 means unset.
-
-  runtimeClass @15 :Text;
-  # Runtime class used to execute this workload.
-
-  sandboxProfile @16 :Text;
-  # Optional sandbox profile used when the workload targets sandbox execution.
-}
-
-struct ServiceMetadata {
-  serviceName @0 :Text;
-  # Name of the service that owns the task.
-
-  templateName @1 :Text;
-  # Task template name within the service.
 }
 
 struct TaskStartRequest {
@@ -409,13 +297,13 @@ struct TaskStartRequest {
   taskId @6 :Data;
   # Desired task/workload UUID (16 bytes) for the resulting standalone task.
 
-  restartPolicy @7 :RestartPolicy;
+  restartPolicy @7 :WorkloadSchema.RestartPolicy;
   # Restart behavior for the task.
 
-  env @8 :List(EnvironmentVar);
+  env @8 :List(WorkloadSchema.EnvironmentVar);
   # Environment variables injected into the task.
 
-  secretFiles @9 :List(SecretFile);
+  secretFiles @9 :List(WorkloadSchema.SecretFile);
   # Secret-backed files mounted into the task.
 
   networks @10 :List(Data);
@@ -433,10 +321,10 @@ struct TaskStartRequest {
   preStopCommand @14 :List(Text);
   # Optional command executed inside the runtime instance before termination begins.
 
-  volumes @15 :List(VolumeMount);
+  volumes @15 :List(WorkloadSchema.VolumeMount);
   # Named volumes mounted into the task runtime.
 
-  liveness @16 :LivenessProbe;
+  liveness @16 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe executed by the hosting runtime.
 
   runtimeClass @17 :Text;
@@ -444,43 +332,6 @@ struct TaskStartRequest {
 
   sandboxProfile @18 :Text;
   # Optional sandbox profile requested for sandboxed task execution.
-}
-
-struct LivenessProbe {
-  kind @0 :LivenessProbeKind;
-  # Local liveness probe transport kind.
-
-  command @1 :List(Text);
-  # Command executed inside the running runtime instance for exec probes.
-
-  port @2 :UInt16;
-  # Local runtime-instance port checked by HTTP/TCP probes.
-
-  path @3 :Text;
-  # HTTP request path, ignored for exec/TCP probes and "/" when empty.
-
-  intervalMs @4 :UInt64;
-  # Probe cadence in milliseconds.
-
-  timeoutMs @5 :UInt64;
-  # Per-attempt timeout in milliseconds.
-
-  failureThreshold @6 :UInt32;
-  # Consecutive failures required before restart.
-
-  startPeriodMs @7 :UInt64;
-  # Warm-up delay before failures count.
-}
-
-enum LivenessProbeKind {
-  exec @0;
-  # Execute one command inside the running runtime instance.
-
-  http @1;
-  # Probe the runtime instance over HTTP and require a 2xx response.
-
-  tcp @2;
-  # Probe the runtime instance by establishing a TCP connection.
 }
 
 struct TaskStopRequest {
@@ -523,51 +374,4 @@ enum TaskStateFilter {
 
   unknown @9;
   # Unknown task state.
-}
-
-struct TaskEvent {
-  event @0 :EventType;
-  # Type of task event.
-
-  spec @1 :TaskSpec;
-  # Full task definition payload.
-
-  status @2 :TaskStatus;
-  # Compact task lifecycle status payload.
-
-  id @3 :Data;
-  # Task identifier for remove events.
-
-  enum EventType {
-    upsertSpec @0;
-    # Task created or updated with the full task definition.
-
-    upsertStatus @1;
-    # Task lifecycle update carrying only the mutable status fields.
-
-    remove @2;
-    # Task removed.
-  }
-}
-
-enum RestartPolicyName {
-  no @0;
-  # Do not restart failed tasks.
-
-  always @1;
-  # Always restart when the task exits.
-
-  onFailure @2;
-  # Restart only on non-zero exit.
-
-  unlessStopped @3;
-  # Restart unless explicitly stopped.
-}
-
-struct RestartPolicy {
-  name @0 :RestartPolicyName;
-  # Restart policy selection.
-
-  maxRetryCount @1 :Int32;
-  # -1 indicates unset.
 }

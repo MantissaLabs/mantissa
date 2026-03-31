@@ -1,6 +1,6 @@
 @0xb843c4292f4d88d6;
 
-using TaskSchema = import "task.capnp";
+using WorkloadSchema = import "workload.capnp";
 
 interface Jobs {
   submit @0 (spec :JobSpec) -> (jobId :Data);
@@ -35,13 +35,13 @@ struct JobSpec {
   gpuCount @7 :UInt32;
   # Requested GPU count.
 
-  env @8 :List(TaskSchema.EnvironmentVar);
+  env @8 :List(WorkloadSchema.EnvironmentVar);
   # Environment variables shared with the execution template.
 
-  secretFiles @9 :List(TaskSchema.SecretFile);
+  secretFiles @9 :List(WorkloadSchema.SecretFile);
   # Secret-backed file projections.
 
-  volumes @10 :List(TaskSchema.VolumeMount);
+  volumes @10 :List(WorkloadSchema.VolumeMount);
   # Named volumes mounted into the job workload.
 
   networks @11 :List(Data);
