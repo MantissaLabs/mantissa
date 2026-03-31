@@ -12,7 +12,7 @@ use crate::workload::capnp_codec::{
     decode_service_restart_policy, decode_volume_mounts, encode_env_vars, encode_secret_files,
     encode_service_liveness_probe, encode_service_restart_policy, encode_volume_mounts,
 };
-use crate::workload::types::WorkloadExecutionSpec;
+use crate::workload::types::ExecutionSpec;
 use capnp::Error;
 use protocol::services::{service_event, service_spec, services, task_template};
 use std::collections::HashSet;
@@ -503,7 +503,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
 
     Ok(TaskTemplateSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             image: reader.get_image()?.to_str()?.to_string(),
             command,
             tty: reader.get_tty(),
@@ -813,7 +813,7 @@ mod tests {
     use crate::task::types::{
         TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskVolumeMount,
     };
-    use crate::workload::types::WorkloadExecutionSpec;
+    use crate::workload::types::ExecutionSpec;
     use capnp::message::Builder;
     use protocol::services::{service_spec, task_template};
     use uuid::Uuid;
@@ -824,7 +824,7 @@ mod tests {
         let network_id = Uuid::new_v4();
         let template = TaskTemplateSpecValue {
             name: "backend".to_string(),
-            execution: WorkloadExecutionSpec {
+            execution: ExecutionSpec {
                 image: "ghcr.io/example/backend:latest".to_string(),
                 command: Vec::new(),
                 tty: false,
@@ -878,7 +878,7 @@ mod tests {
 
         let template = TaskTemplateSpecValue {
             name: "frontend".to_string(),
-            execution: WorkloadExecutionSpec {
+            execution: ExecutionSpec {
                 image: "ghcr.io/example/frontend:v2".to_string(),
                 command: vec![
                     "serve".to_string(),
@@ -956,7 +956,7 @@ mod tests {
             "demo-service",
             vec![TaskTemplateSpecValue {
                 name: "backend".to_string(),
-                execution: WorkloadExecutionSpec {
+                execution: ExecutionSpec {
                     image: "ghcr.io/example/backend:v1".to_string(),
                     command: vec!["serve".to_string()],
                     tty: false,

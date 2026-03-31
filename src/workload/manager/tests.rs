@@ -45,7 +45,7 @@ use crate::volumes::types::{
 };
 use crate::workload::model::RuntimeClass;
 use crate::workload::model::select_best_workload_value;
-use crate::workload::types::TaskExecutionSpec;
+use crate::workload::types::ResolvedExecutionSpec;
 use ::health::HealthMonitor;
 use anyhow::{Result, anyhow};
 use async_channel::bounded;
@@ -1091,9 +1091,10 @@ fn test_task_spec(manager: &WorkloadManager, name: &str) -> TaskSpec {
     }
 }
 
-/// Builds one default execution spec so task-request tests only override relevant fields.
-fn empty_task_execution(image: &str) -> TaskExecutionSpec {
-    TaskExecutionSpec {
+/// Builds one default resolved execution spec so workload-start tests only
+/// override relevant fields.
+fn empty_resolved_execution(image: &str) -> ResolvedExecutionSpec {
+    ResolvedExecutionSpec {
         image: image.to_string(),
         command: Vec::new(),
         tty: false,
@@ -1115,14 +1116,14 @@ fn empty_task_execution(image: &str) -> TaskExecutionSpec {
 fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> WorkloadStartRequest {
     WorkloadStartRequest {
         name: "volume-task".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             volumes: vec![crate::task::types::TaskVolumeMount {
                 volume_id: volume.id,
                 volume_name: volume.name.clone(),
                 target: target.to_string(),
                 read_only: false,
             }],
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
@@ -2282,9 +2283,9 @@ async fn reconcile_local_tasks_does_not_duplicate_batch_launch_in_progress() {
 
     let request = WorkloadStartRequest {
         name: "launch-race".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             networks: vec![spec.id],
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
@@ -4114,7 +4115,7 @@ async fn start_tasks_batch_reserves_every_slot() {
         .start_tasks_batch(vec![
             WorkloadStartRequest {
                 name: "svc-a".into(),
-                execution: empty_task_execution("img"),
+                execution: empty_resolved_execution("img"),
                 runtime_class: RuntimeClass::Oci,
                 sandbox_profile: None,
                 gpu_device_ids: Vec::new(),
@@ -4125,7 +4126,7 @@ async fn start_tasks_batch_reserves_every_slot() {
             },
             WorkloadStartRequest {
                 name: "svc-b".into(),
-                execution: empty_task_execution("img"),
+                execution: empty_resolved_execution("img"),
                 runtime_class: RuntimeClass::Oci,
                 sandbox_profile: None,
                 gpu_device_ids: Vec::new(),
@@ -4171,7 +4172,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
     let specs = manager
         .start_tasks_batch(vec![WorkloadStartRequest {
             name: "svc-a".into(),
-            execution: empty_task_execution("img"),
+            execution: empty_resolved_execution("img"),
             runtime_class: RuntimeClass::Oci,
             sandbox_profile: None,
             gpu_device_ids: Vec::new(),
@@ -4730,7 +4731,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
         .start_tasks_batch(vec![
             WorkloadStartRequest {
                 name: "svc-c".into(),
-                execution: empty_task_execution("img"),
+                execution: empty_resolved_execution("img"),
                 runtime_class: RuntimeClass::Oci,
                 sandbox_profile: None,
                 gpu_device_ids: Vec::new(),
@@ -4741,7 +4742,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
             },
             WorkloadStartRequest {
                 name: "svc-d".into(),
-                execution: empty_task_execution("img"),
+                execution: empty_resolved_execution("img"),
                 runtime_class: RuntimeClass::Oci,
                 sandbox_profile: None,
                 gpu_device_ids: Vec::new(),
@@ -4812,9 +4813,9 @@ async fn runtime_attachments_created_and_removed_on_stop() {
 
     let request = WorkloadStartRequest {
         name: "with-net".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             networks: vec![spec.id],
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
@@ -4903,9 +4904,9 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
 
     let request = WorkloadStartRequest {
         name: "service-backend".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             networks: vec![spec.id],
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
@@ -5155,9 +5156,9 @@ async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
 
     let request = WorkloadStartRequest {
         name: "standalone-net".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             networks: vec![spec.id],
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
@@ -5261,9 +5262,9 @@ async fn request_task_stop_cleans_up_after_teardown_failure() {
 
     let request = WorkloadStartRequest {
         name: "flaky-task".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             networks: vec![spec.id],
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
@@ -6249,9 +6250,9 @@ async fn attachment_ready_triggers_forwarding_event() {
 
     let request = WorkloadStartRequest {
         name: "with-forwarding".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             networks: vec![spec.id],
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
@@ -6343,9 +6344,9 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
 
     let request = WorkloadStartRequest {
         name: "two-nets".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             networks: vec![spec_a.id, spec_b.id],
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
@@ -6434,9 +6435,9 @@ async fn runtime_attachments_retry_transient_provision_errors() {
 
     let request = WorkloadStartRequest {
         name: "retry-net-task".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             networks: vec![spec.id],
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
@@ -6529,9 +6530,9 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
 
     let request = WorkloadStartRequest {
         name: "real-net-task".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             networks: vec![spec.id],
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
@@ -6644,10 +6645,10 @@ async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
     let request = WorkloadStartRequest {
         name: "network-blocked".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             cpu_millis: 100,
             networks: vec![Uuid::new_v4()],
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::Oci,
         sandbox_profile: None,
@@ -6681,10 +6682,10 @@ async fn start_tasks_batch_rejects_unsupported_local_runtime_class() {
         .expect("init slots");
     let request = WorkloadStartRequest {
         name: "microvm-task".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             cpu_millis: 100,
             memory_bytes: 64 * 1_024 * 1_024,
-            ..empty_task_execution("img")
+            ..empty_resolved_execution("img")
         },
         runtime_class: RuntimeClass::MicroVm,
         sandbox_profile: Some("vm-default".into()),
@@ -7005,7 +7006,7 @@ async fn multi_volume_bound_node_conflict_rejected() {
     let err = manager
         .start_tasks_batch(vec![WorkloadStartRequest {
             name: "conflict".into(),
-            execution: TaskExecutionSpec {
+            execution: ResolvedExecutionSpec {
                 cpu_millis: 100,
                 volumes: vec![
                     crate::task::types::TaskVolumeMount {
@@ -7021,7 +7022,7 @@ async fn multi_volume_bound_node_conflict_rejected() {
                         read_only: false,
                     },
                 ],
-                ..empty_task_execution("img")
+                ..empty_resolved_execution("img")
             },
             runtime_class: RuntimeClass::Oci,
             sandbox_profile: None,

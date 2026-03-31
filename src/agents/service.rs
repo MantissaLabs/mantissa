@@ -10,7 +10,7 @@ use crate::workload::capnp_codec::{
     decode_volume_mounts, encode_env_vars, encode_secret_files, encode_task_liveness_probe,
     encode_task_restart_policy, encode_volume_mounts,
 };
-use crate::workload::types::TaskExecutionSpec;
+use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
 use protocol::agents::{
     agent_event, agent_event_entry, agent_run_spec, agent_session_spec, agents,
@@ -288,7 +288,7 @@ pub fn read_agent_run_spec(reader: agent_run_spec::Reader<'_>) -> Result<AgentRu
 
 fn write_session_execution(
     mut builder: agent_session_spec::Builder<'_>,
-    execution: &TaskExecutionSpec,
+    execution: &ResolvedExecutionSpec,
 ) {
     builder.set_image(&execution.image);
     let mut command = builder
@@ -344,8 +344,8 @@ fn write_session_execution(
 
 fn read_session_execution(
     reader: agent_session_spec::Reader<'_>,
-) -> Result<TaskExecutionSpec, Error> {
-    Ok(TaskExecutionSpec {
+) -> Result<ResolvedExecutionSpec, Error> {
+    Ok(ResolvedExecutionSpec {
         image: reader.get_image()?.to_str()?.to_string(),
         command: read_text_list(reader.get_command()?),
         tty: reader.get_tty(),
@@ -374,7 +374,10 @@ fn read_session_execution(
     })
 }
 
-fn write_run_execution(mut builder: agent_run_spec::Builder<'_>, execution: &TaskExecutionSpec) {
+fn write_run_execution(
+    mut builder: agent_run_spec::Builder<'_>,
+    execution: &ResolvedExecutionSpec,
+) {
     builder.set_image(&execution.image);
     let mut command = builder
         .reborrow()
@@ -427,8 +430,8 @@ fn write_run_execution(mut builder: agent_run_spec::Builder<'_>, execution: &Tas
     }
 }
 
-fn read_run_execution(reader: agent_run_spec::Reader<'_>) -> Result<TaskExecutionSpec, Error> {
-    Ok(TaskExecutionSpec {
+fn read_run_execution(reader: agent_run_spec::Reader<'_>) -> Result<ResolvedExecutionSpec, Error> {
+    Ok(ResolvedExecutionSpec {
         image: reader.get_image()?.to_str()?.to_string(),
         command: read_text_list(reader.get_command()?),
         tty: reader.get_tty(),

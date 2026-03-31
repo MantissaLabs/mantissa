@@ -2474,7 +2474,7 @@ mod tests {
         VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
     };
     use crate::workload::model::RuntimeClass;
-    use crate::workload::types::{TaskExecutionSpec, WorkloadExecutionSpec};
+    use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2527,9 +2527,9 @@ mod tests {
         })
     }
 
-    /// Builds one default direct-task execution spec for test request setup.
-    fn empty_task_execution(image: &str) -> TaskExecutionSpec {
-        TaskExecutionSpec {
+    /// Builds one default resolved execution spec for test request setup.
+    fn empty_resolved_execution(image: &str) -> ResolvedExecutionSpec {
+        ResolvedExecutionSpec {
             image: image.to_string(),
             command: Vec::new(),
             tty: false,
@@ -2548,10 +2548,8 @@ mod tests {
     }
 
     /// Builds one default service execution spec so test task templates only override meaningful fields.
-    fn empty_service_execution(
-        image: &str,
-    ) -> WorkloadExecutionSpec<TaskTemplateNetworkRequirement> {
-        WorkloadExecutionSpec {
+    fn empty_service_execution(image: &str) -> ExecutionSpec<TaskTemplateNetworkRequirement> {
+        ExecutionSpec {
             image: image.to_string(),
             command: Vec::new(),
             tty: false,
@@ -2577,14 +2575,14 @@ mod tests {
     ) -> WorkloadStartRequest {
         WorkloadStartRequest {
             name: "demo-task".to_string(),
-            execution: TaskExecutionSpec {
+            execution: ResolvedExecutionSpec {
                 volumes: vec![TaskVolumeMount {
                     volume_id,
                     volume_name: volume_name.to_string(),
                     target: "/var/lib/app".to_string(),
                     read_only: false,
                 }],
-                ..empty_task_execution("ghcr.io/demo/app:latest")
+                ..empty_resolved_execution("ghcr.io/demo/app:latest")
             },
             runtime_class: RuntimeClass::Oci,
             sandbox_profile: None,
@@ -2600,7 +2598,7 @@ mod tests {
     fn make_request(target_node: Option<Uuid>) -> WorkloadStartRequest {
         WorkloadStartRequest {
             name: "demo-task".to_string(),
-            execution: empty_task_execution("ghcr.io/demo/app:latest"),
+            execution: empty_resolved_execution("ghcr.io/demo/app:latest"),
             runtime_class: RuntimeClass::Oci,
             sandbox_profile: None,
             gpu_device_ids: Vec::new(),
@@ -2665,7 +2663,7 @@ mod tests {
         let desired_id = Uuid::new_v4();
         let template = TaskTemplateSpecValue {
             name: "api".into(),
-            execution: WorkloadExecutionSpec {
+            execution: ExecutionSpec {
                 termination_grace_period_secs: Some(42),
                 pre_stop_command: Some(vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()]),
                 ..empty_service_execution("ghcr.io/demo/api:latest")

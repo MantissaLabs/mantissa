@@ -118,13 +118,13 @@ pub(super) fn build_template_dependency_stages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workload::types::WorkloadExecutionSpec;
+    use crate::workload::types::ExecutionSpec;
 
     /// Builds a minimal task-template value for dependency graph tests.
     fn template(name: &str, depends_on: &[&str]) -> TaskTemplateSpecValue {
         TaskTemplateSpecValue {
             name: name.to_string(),
-            execution: WorkloadExecutionSpec {
+            execution: ExecutionSpec {
                 image: "ghcr.io/demo/image:latest".to_string(),
                 command: Vec::new(),
                 tty: false,

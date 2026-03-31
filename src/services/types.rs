@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::workload::manager::WorkloadStartRequest;
 use crate::workload::model::{RuntimeClass, WorkloadServiceMetadata};
-use crate::workload::types::{TaskExecutionSpec, WorkloadExecutionSpec};
+use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
 pub use crate::workload::types::{
     WorkloadLivenessProbe as ServiceLivenessProbe,
     WorkloadLivenessProbeKind as ServiceLivenessProbeKind,
@@ -341,7 +341,7 @@ pub struct TaskTemplateSpecValue {
     /// Template-local name used to identify one replica set within the service.
     pub name: String,
     /// Shared execution/runtime template reused by every replica of this task template.
-    pub execution: WorkloadExecutionSpec<TaskTemplateNetworkRequirement>,
+    pub execution: ExecutionSpec<TaskTemplateNetworkRequirement>,
     /// Template names within the same service that must be ready before this template starts.
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -392,8 +392,9 @@ impl TaskTemplateSpecValue {
         self.execution.liveness.as_ref()
     }
 
-    /// Builds the launch-time execution spec by resolving service network requirements to IDs.
-    pub fn launch_execution(&self) -> TaskExecutionSpec {
+    /// Builds the resolved execution spec by replacing service network
+    /// requirements with concrete network ids.
+    pub fn resolved_execution(&self) -> ResolvedExecutionSpec {
         self.execution.map_networks(|network| network.network_id)
     }
 
@@ -419,7 +420,7 @@ impl TaskTemplateSpecValue {
     ) -> WorkloadStartRequest {
         WorkloadStartRequest {
             name: format_replica_name(service_name, &self.name, replica, desired_id),
-            execution: self.launch_execution(),
+            execution: self.resolved_execution(),
             runtime_class: RuntimeClass::Oci,
             sandbox_profile: None,
             gpu_device_ids: Vec::new(),
@@ -462,7 +463,7 @@ fn short_id(id: &Uuid) -> String {
 }
 
 impl Deref for TaskTemplateSpecValue {
-    type Target = WorkloadExecutionSpec<TaskTemplateNetworkRequirement>;
+    type Target = ExecutionSpec<TaskTemplateNetworkRequirement>;
 
     /// Exposes the shared execution fields so service callers can keep using task-like accessors.
     fn deref(&self) -> &Self::Target {

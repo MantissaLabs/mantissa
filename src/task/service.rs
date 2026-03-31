@@ -15,7 +15,7 @@ use crate::workload::capnp_codec::{
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
 use crate::workload::model::RuntimeClass;
 use crate::workload::model::WorkloadPhase;
-use crate::workload::types::TaskExecutionSpec;
+use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
 use protocol::gossip::gossip_message;
 use protocol::task::{
@@ -1221,7 +1221,7 @@ fn read_task_start_request(
 
     Ok(WorkloadStartRequest {
         name,
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             image,
             command,
             tty: false,

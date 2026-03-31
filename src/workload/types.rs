@@ -15,7 +15,7 @@ use crate::workload::model::{
 ///   execution shape while differing in control-plane behavior.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(bound(serialize = "N: Serialize", deserialize = "N: Deserialize<'de>"))]
-pub struct WorkloadExecutionSpec<N> {
+pub struct ExecutionSpec<N> {
     pub image: String,
     #[serde(default)]
     pub command: Vec<String>,
@@ -43,13 +43,13 @@ pub struct WorkloadExecutionSpec<N> {
     pub networks: Vec<N>,
 }
 
-impl<N> WorkloadExecutionSpec<N> {
+impl<N> ExecutionSpec<N> {
     /// Rebuilds this execution spec while remapping the network entry type.
-    pub fn map_networks<M, F>(&self, mut mapper: F) -> WorkloadExecutionSpec<M>
+    pub fn map_networks<M, F>(&self, mut mapper: F) -> ExecutionSpec<M>
     where
         F: FnMut(&N) -> M,
     {
-        WorkloadExecutionSpec {
+        ExecutionSpec {
             image: self.image.clone(),
             command: self.command.clone(),
             tty: self.tty,
@@ -68,11 +68,9 @@ impl<N> WorkloadExecutionSpec<N> {
     }
 }
 
-/// Common execution spec used when the network list has already been resolved to UUIDs.
-///
-/// The alias keeps the `Task` name because direct task submission is still a first-class user
-/// surface, but the underlying type is the generic workload execution template.
-pub type TaskExecutionSpec = WorkloadExecutionSpec<Uuid>;
+/// Execution spec variant used after network references have already been
+/// resolved to concrete UUIDs.
+pub type ResolvedExecutionSpec = ExecutionSpec<Uuid>;
 
 /// Default liveness probe interval in milliseconds.
 fn default_liveness_interval_ms() -> u64 {

@@ -46,7 +46,7 @@ flowchart TB
     subgraph Workloads["Shared workload substrate"]
         TaskStart["TaskStartRequest"]
         Start["WorkloadStartRequest"]
-        Exec["WorkloadExecutionSpec"]
+        Exec["ExecutionSpec"]
         Manager["WorkloadManager"]
     end
 
@@ -75,7 +75,7 @@ The important consequence is that names describe different axes:
 | Term | What it answers |
 | --- | --- |
 | `Task`, `ServiceReplica`, `Job`, `AgentSession`, `AgentRun` | Who owns the lifecycle semantics |
-| `WorkloadExecutionSpec` | How the schedulable execution should run |
+| `ExecutionSpec` | How the schedulable execution should run |
 | `RuntimeClass` | Which runtime family is requested |
 | `RuntimeBackend` | Which local engine actually implements the request |
 
@@ -158,7 +158,7 @@ pinning compute, which is important for human-in-the-loop workflows.
 
 ## The Shared Execution Shape
 
-The shared execution shape lives in `WorkloadExecutionSpec`. This type answers
+The shared execution shape lives in `ExecutionSpec`. This type answers
 the narrow question, "if something is scheduled, how should it execute?" It is
 not supposed to answer higher-level questions such as "when is the rollout
 healthy?" or "how many times should a failed attempt be retried?"
@@ -183,7 +183,7 @@ By contrast, the following policy stays above the execution layer:
 | Restart policy and liveness | Job completion and retry policy |
 | Volumes, networks, env, secret files | Agent workspace, tools, checkpoints, and interaction rules |
 
-This is the key reason the code now prefers `WorkloadExecutionSpec` over
+This is the key reason the code now prefers `ExecutionSpec` over
 copying similar launch fields into every controller-specific type.
 
 ## Runtime Classes, Substrates, and Backends
@@ -362,7 +362,7 @@ kind, runtime class, workload identity, workload phases, generic state filters,
 and the shared durable workload structures.
 
 `src/workload/types.rs` defines the shared execution-side types such as
-`WorkloadExecutionSpec`, restart policy, and liveness probe.
+`ExecutionSpec`, restart policy, and liveness probe.
 
 `src/workload/manager/` is the shared orchestration engine. This is where
 placement, reconciliation, runtime adoption, attachment repair, local runtime

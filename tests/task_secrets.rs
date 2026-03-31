@@ -29,7 +29,7 @@ use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretR
 use mantissa::volumes::VolumeRegistry;
 use mantissa::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadStartRequest};
 use mantissa::workload::model::RuntimeClass;
-use mantissa::workload::types::TaskExecutionSpec;
+use mantissa::workload::types::ResolvedExecutionSpec;
 use net::noise::NoiseKeys;
 use protocol::secrets::secrets;
 use std::collections::HashMap;
@@ -399,7 +399,7 @@ local_test!(task_manager_stages_secret_env_and_files, {
 
     let request = WorkloadStartRequest {
         name: "with-secrets".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             image: "busybox:latest".into(),
             command: vec!["/bin/true".into()],
             tty: false,
@@ -546,7 +546,7 @@ local_test!(task_manager_rejects_missing_secret_reference, {
 
     let request = WorkloadStartRequest {
         name: "missing-secret".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             image: "busybox:latest".into(),
             command: vec!["/bin/false".into()],
             tty: false,

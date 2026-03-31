@@ -103,7 +103,7 @@ impl JobController {
     pub async fn submit(
         &self,
         name: impl Into<String>,
-        execution: crate::workload::types::TaskExecutionSpec,
+        execution: crate::workload::types::ResolvedExecutionSpec,
         retry_policy: JobRetryPolicy,
     ) -> Result<JobSubmission> {
         validate_job_execution(&execution)?;
@@ -500,7 +500,7 @@ impl JobController {
 }
 
 /// Rejects execution settings that conflict with the job controller's finite-run semantics.
-fn validate_job_execution(execution: &crate::workload::types::TaskExecutionSpec) -> Result<()> {
+fn validate_job_execution(execution: &crate::workload::types::ResolvedExecutionSpec) -> Result<()> {
     if execution.restart_policy.is_some() {
         return Err(anyhow!(
             "jobs do not support workload restart_policy; use job retry_policy instead"
@@ -566,13 +566,13 @@ fn job_owner_score(job_id: Uuid, node_id: Uuid) -> u128 {
 mod tests {
     use super::*;
     use crate::jobs::registry::select_best_job_spec;
-    use crate::workload::types::TaskExecutionSpec;
+    use crate::workload::types::ResolvedExecutionSpec;
 
     fn test_job() -> JobSpecValue {
         JobSpecValue::new(
             Uuid::new_v4(),
             "demo-job",
-            TaskExecutionSpec {
+            ResolvedExecutionSpec {
                 image: "ghcr.io/demo/job:latest".to_string(),
                 command: vec!["echo".to_string(), "hello".to_string()],
                 tty: false,

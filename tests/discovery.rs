@@ -22,7 +22,7 @@ use mantissa::store::service_store::open_service_store;
 use mantissa::store::task_store::open_task_store;
 use mantissa::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
 use mantissa::workload::model::WorkloadPhase;
-use mantissa::workload::types::WorkloadExecutionSpec;
+use mantissa::workload::types::ExecutionSpec;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -217,7 +217,7 @@ async fn upsert_service(
         service_name,
         vec![TaskTemplateSpecValue {
             name: "backend".to_string(),
-            execution: WorkloadExecutionSpec {
+            execution: ExecutionSpec {
                 image: "hashicorp/http-echo:1.0.0".to_string(),
                 command: Vec::new(),
                 tty: false,

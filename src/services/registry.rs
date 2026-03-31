@@ -98,7 +98,7 @@ mod tests {
     use crate::services::types::TaskTemplateSpecValue;
     use crate::services::types::{ServiceRolloutState, ServiceStatus};
     use crate::store::service_store::open_service_store;
-    use crate::workload::types::WorkloadExecutionSpec;
+    use crate::workload::types::ExecutionSpec;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use redb::Database;
     use std::cmp::Ordering;
@@ -123,7 +123,7 @@ mod tests {
             "demo-service",
             vec![TaskTemplateSpecValue {
                 name: "web".into(),
-                execution: WorkloadExecutionSpec {
+                execution: ExecutionSpec {
                     image: "ghcr.io/demo/web:latest".into(),
                     command: vec!["--port".into(), "8080".into()],
                     tty: false,
@@ -167,7 +167,7 @@ mod tests {
             "demo-service",
             vec![TaskTemplateSpecValue {
                 name: "web".into(),
-                execution: WorkloadExecutionSpec {
+                execution: ExecutionSpec {
                     image: "ghcr.io/demo/web:v2".into(),
                     command: vec![],
                     tty: false,
@@ -209,7 +209,7 @@ mod tests {
     ) -> ServiceSpecValue {
         let task_templates = vec![TaskTemplateSpecValue {
             name: "api".into(),
-            execution: WorkloadExecutionSpec {
+            execution: ExecutionSpec {
                 image: "ghcr.io/demo/api:latest".into(),
                 command: Vec::new(),
                 tty: false,

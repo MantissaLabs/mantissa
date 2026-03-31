@@ -19,7 +19,7 @@ use mantissa::volumes::types::{
 };
 use mantissa::workload::manager::{WorkloadRuntimeConfig, WorkloadStartRequest};
 use mantissa::workload::model::RuntimeClass;
-use mantissa::workload::types::TaskExecutionSpec;
+use mantissa::workload::types::ResolvedExecutionSpec;
 use protocol::topology::topology;
 use protocol::volumes::{LocalVolumeSourceKind, volumes};
 use std::collections::HashMap;
@@ -383,7 +383,7 @@ fn standalone_volume_task_request(
 ) -> WorkloadStartRequest {
     WorkloadStartRequest {
         name: "standalone-volume-task".into(),
-        execution: TaskExecutionSpec {
+        execution: ResolvedExecutionSpec {
             image: "busybox:latest".into(),
             command: vec!["/bin/true".into()],
             tty: false,
@@ -858,7 +858,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
         .task_manager
         .start_tasks_batch(vec![WorkloadStartRequest {
             name: "conflict".into(),
-            execution: TaskExecutionSpec {
+            execution: ResolvedExecutionSpec {
                 image: "busybox:latest".into(),
                 command: vec!["/bin/true".into()],
                 tty: false,

@@ -176,7 +176,7 @@ fn status_rank(status: ServiceStatus) -> u8 {
 mod tests {
     use super::*;
     use crate::services::types::TaskTemplateSpecValue;
-    use crate::workload::types::WorkloadExecutionSpec;
+    use crate::workload::types::ExecutionSpec;
     use chrono::{Duration as ChronoDuration, Utc};
     use uuid::Uuid;
 
@@ -189,7 +189,7 @@ mod tests {
     ) -> ServiceSpecValue {
         let task_templates = vec![TaskTemplateSpecValue {
             name: "api".into(),
-            execution: WorkloadExecutionSpec {
+            execution: ExecutionSpec {
                 image: "ghcr.io/demo/api:latest".into(),
                 command: Vec::new(),
                 tty: false,

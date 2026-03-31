@@ -1,4 +1,4 @@
-use crate::workload::types::TaskExecutionSpec;
+use crate::workload::types::ResolvedExecutionSpec;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 pub struct JobSpecValue {
     pub id: Uuid,
     pub name: String,
-    pub execution: TaskExecutionSpec,
+    pub execution: ResolvedExecutionSpec,
     pub updated_at: String,
     #[serde(default)]
     pub phase_version: u64,
@@ -41,7 +41,7 @@ impl JobSpecValue {
     pub fn new(
         id: Uuid,
         name: impl Into<String>,
-        execution: TaskExecutionSpec,
+        execution: ResolvedExecutionSpec,
         retry_policy: JobRetryPolicy,
     ) -> Self {
         Self {

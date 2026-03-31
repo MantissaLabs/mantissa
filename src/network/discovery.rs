@@ -1965,7 +1965,7 @@ mod tests {
     use crate::store::task_store::{TaskStore, open_task_store};
     use crate::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
     use crate::workload::model::WorkloadPhase;
-    use crate::workload::types::WorkloadExecutionSpec;
+    use crate::workload::types::ExecutionSpec;
     use crdt_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -2215,7 +2215,7 @@ mod tests {
             service_name,
             vec![TaskTemplateSpecValue {
                 name: "backend".to_string(),
-                execution: WorkloadExecutionSpec {
+                execution: ExecutionSpec {
                     image: "hashicorp/http-echo:1.0.0".to_string(),
                     command: Vec::new(),
                     tty: false,

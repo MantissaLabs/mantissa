@@ -1,5 +1,5 @@
 use crate::workload::model::{RuntimeClass, WorkloadVolumeMount};
-use crate::workload::types::TaskExecutionSpec;
+use crate::workload::types::ResolvedExecutionSpec;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -135,7 +135,7 @@ pub struct AgentSessionSpecValue {
     pub id: Uuid,
     pub name: String,
     /// Default execution template copied into new runs created from this session.
-    pub execution: TaskExecutionSpec,
+    pub execution: ResolvedExecutionSpec,
     #[serde(default = "default_agent_runtime_class")]
     pub runtime_class: RuntimeClass,
     #[serde(default)]
@@ -175,7 +175,7 @@ impl AgentSessionSpecValue {
     pub fn new(
         id: Uuid,
         name: impl Into<String>,
-        execution: TaskExecutionSpec,
+        execution: ResolvedExecutionSpec,
         sandbox_profile: Option<String>,
         workspace: AgentWorkspacePolicy,
         tools: AgentToolPolicy,
@@ -366,7 +366,7 @@ pub struct AgentRunSpecValue {
     pub session_id: Uuid,
     pub session_name: String,
     /// Execution template for this specific run.
-    pub execution: TaskExecutionSpec,
+    pub execution: ResolvedExecutionSpec,
     #[serde(default = "default_agent_runtime_class")]
     pub runtime_class: RuntimeClass,
     #[serde(default)]
@@ -399,7 +399,7 @@ impl AgentRunSpecValue {
         id: Uuid,
         session_id: Uuid,
         session_name: impl Into<String>,
-        execution: TaskExecutionSpec,
+        execution: ResolvedExecutionSpec,
         sandbox_profile: Option<String>,
         prompt: Option<String>,
     ) -> Self {

@@ -21,7 +21,7 @@ pub(crate) use crate::workload::model::{
     merge_definition_into_value, merge_status_into_value, spec_to_status, spec_to_value,
     value_to_spec,
 };
-use crate::workload::types::TaskExecutionSpec;
+use crate::workload::types::ResolvedExecutionSpec;
 use crate::workload::types::WorkloadRestartPolicy as TaskRestartPolicy;
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
@@ -319,7 +319,7 @@ pub struct WorkloadStartRequest {
     /// Human-readable name for the resulting workload instance.
     pub name: String,
     /// Shared execution/runtime template describing how the workload should run.
-    pub execution: TaskExecutionSpec,
+    pub execution: ResolvedExecutionSpec,
     /// Runtime family requested by the caller.
     pub runtime_class: RuntimeClass,
     /// Optional sandbox/isolation profile interpreted by the chosen runtime class.
@@ -337,7 +337,7 @@ pub struct WorkloadStartRequest {
 }
 
 impl Deref for WorkloadStartRequest {
-    type Target = TaskExecutionSpec;
+    type Target = ResolvedExecutionSpec;
 
     /// Exposes shared execution fields directly because this request is mostly execution data.
     fn deref(&self) -> &Self::Target {
@@ -573,7 +573,7 @@ impl WorkloadManager {
     ) -> Result<TaskSpec, anyhow::Error> {
         let request = WorkloadStartRequest {
             name: name.into(),
-            execution: TaskExecutionSpec {
+            execution: ResolvedExecutionSpec {
                 image: image.into(),
                 command,
                 tty: false,

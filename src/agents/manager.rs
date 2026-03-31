@@ -9,7 +9,7 @@ use crate::workload::manager::workload_start_error_is_retryable;
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
 use crate::workload::model::WorkloadPhase;
 use crate::workload::model::{RuntimeClass, WorkloadEnvironmentVariable, WorkloadVolumeMount};
-use crate::workload::types::TaskExecutionSpec;
+use crate::workload::types::ResolvedExecutionSpec;
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use health::{HealthMonitor, Status as HealthStatus};
@@ -106,7 +106,7 @@ impl AgentController {
     pub async fn submit(
         &self,
         name: impl Into<String>,
-        execution: TaskExecutionSpec,
+        execution: ResolvedExecutionSpec,
         sandbox_profile: Option<String>,
         workspace: AgentWorkspacePolicy,
         tools: AgentToolPolicy,
@@ -528,7 +528,7 @@ impl AgentController {
 }
 
 /// Rejects execution settings that conflict with the durable agent-session model.
-fn validate_agent_execution(execution: &TaskExecutionSpec) -> Result<()> {
+fn validate_agent_execution(execution: &ResolvedExecutionSpec) -> Result<()> {
     if execution.restart_policy.is_some() {
         return Err(anyhow!(
             "agent sessions do not support workload restart_policy; create a new run from the session instead"
@@ -608,7 +608,7 @@ fn build_agent_run_execution(
     session: &AgentSessionSpecValue,
     run_id: Uuid,
     prompt: Option<String>,
-) -> TaskExecutionSpec {
+) -> ResolvedExecutionSpec {
     let mut execution = session.execution.clone();
     append_literal_env(
         &mut execution.env,

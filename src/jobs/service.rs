@@ -5,7 +5,7 @@ use crate::workload::capnp_codec::{
     decode_env_vars, decode_secret_files, decode_volume_mounts, encode_env_vars,
     encode_secret_files, encode_volume_mounts,
 };
-use crate::workload::types::TaskExecutionSpec;
+use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
 use protocol::gossip::gossip_message;
 use protocol::jobs::{job_event, job_spec, jobs};
@@ -202,7 +202,7 @@ pub fn read_job_spec(reader: job_spec::Reader<'_>) -> Result<JobSpecValue, Error
     let mut value = JobSpecValue::new(
         id,
         name,
-        TaskExecutionSpec {
+        ResolvedExecutionSpec {
             image: reader.get_image()?.to_str()?.to_string(),
             command,
             tty: reader.get_tty(),

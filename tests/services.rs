@@ -47,7 +47,7 @@ use mantissa::task::types::{
 use mantissa::topology_capnp::topology;
 use mantissa::workload::manager::WorkloadManager;
 use mantissa::workload::model::WorkloadPhase;
-use mantissa::workload::types::WorkloadExecutionSpec;
+use mantissa::workload::types::ExecutionSpec;
 use protocol::health::NodeStatus;
 use protocol::secrets::secrets;
 use protocol::services::services;
@@ -169,7 +169,7 @@ local_test!(services_gossip_propagates_across_peers, {
             SERVICE_NAME,
             vec![TaskTemplateSpecValue {
                 name: "web".into(),
-                execution: WorkloadExecutionSpec {
+                execution: ExecutionSpec {
                     command: vec!["--serve".into()],
                     env: vec![TaskEnvironmentVariable {
                         name: "DEMO_SECRET".into(),
@@ -263,7 +263,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
 
     let tasks = vec![TaskTemplateSpecValue {
         name: "web".into(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             command: vec!["--serve".into()],
             env: vec![TaskEnvironmentVariable {
                 name: "ACK_SECRET".into(),
@@ -347,7 +347,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
             "capacity-starved",
             vec![TaskTemplateSpecValue {
                 name: "heavy".into(),
-                execution: WorkloadExecutionSpec {
+                execution: ExecutionSpec {
                     command: vec!["--serve".into()],
                     cpu_millis: 500_000,
                     memory_bytes: 8 * 1024 * 1024 * 1024,
@@ -417,7 +417,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
             "capacity-starved",
             vec![TaskTemplateSpecValue {
                 name: "heavy".into(),
-                execution: WorkloadExecutionSpec {
+                execution: ExecutionSpec {
                     command: vec!["--serve".into()],
                     cpu_millis: 200,
                     memory_bytes: 128 * 1024 * 1024,
@@ -488,7 +488,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
             vec![
                 TaskTemplateSpecValue {
                     name: "backend".into(),
-                    execution: WorkloadExecutionSpec {
+                    execution: ExecutionSpec {
                         command: vec!["serve".into()],
                         cpu_millis: 100,
                         memory_bytes: 64 * 1024 * 1024,
@@ -502,7 +502,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
                 },
                 TaskTemplateSpecValue {
                     name: "frontend".into(),
-                    execution: WorkloadExecutionSpec {
+                    execution: ExecutionSpec {
                         command: vec!["serve".into()],
                         cpu_millis: 100,
                         memory_bytes: 64 * 1024 * 1024,
@@ -609,7 +609,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
             "missing-runtime",
             vec![TaskTemplateSpecValue {
                 name: "api".into(),
-                execution: WorkloadExecutionSpec {
+                execution: ExecutionSpec {
                     command: vec![
                         "sh".into(),
                         "-c".into(),
@@ -3175,7 +3175,7 @@ local_test!(services_redeploy_scales_replicas, {
 
     let mut tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             command: vec![
                 "sh".into(),
                 "-c".into(),
@@ -3296,7 +3296,7 @@ local_test!(services_redeploy_updates_resources, {
 
     let mut tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             command: vec![
                 "sh".into(),
                 "-c".into(),
@@ -3426,7 +3426,7 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
 
     let tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             command: vec![
                 "sh".into(),
                 "-c".into(),
@@ -3542,7 +3542,7 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
 
     let tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             command: vec![
                 "sh".into(),
                 "-c".into(),
@@ -3632,7 +3632,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
 
     let tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             command: vec![
                 "sh".into(),
                 "-c".into(),
@@ -3755,7 +3755,7 @@ local_test!(
 
         let mut tasks = vec![TaskTemplateSpecValue {
             name: "echo".into(),
-            execution: WorkloadExecutionSpec {
+            execution: ExecutionSpec {
                 command: vec![
                     "sh".into(),
                     "-c".into(),
@@ -3884,7 +3884,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
 
     let mut tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             command: vec![
                 "sh".into(),
                 "-c".into(),
@@ -3984,7 +3984,7 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
 
     let tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             command: vec![
                 "sh".into(),
                 "-c".into(),
@@ -4086,7 +4086,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
     let manifest_name = "volume-unavailable-service";
     let tasks = vec![TaskTemplateSpecValue {
         name: "db".into(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             command: vec![
                 "sh".into(),
                 "-c".into(),
@@ -4204,7 +4204,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
 
     let tasks = vec![TaskTemplateSpecValue {
         name: "echo".into(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             command: vec![
                 "sh".into(),
                 "-c".into(),
@@ -4285,8 +4285,8 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
 });
 
 /// Builds a lightweight backend template used by placement-focused integration tests.
-fn empty_service_execution(image: &str) -> WorkloadExecutionSpec<TaskTemplateNetworkRequirement> {
-    WorkloadExecutionSpec {
+fn empty_service_execution(image: &str) -> ExecutionSpec<TaskTemplateNetworkRequirement> {
+    ExecutionSpec {
         image: image.to_string(),
         command: Vec::new(),
         tty: false,
@@ -4308,7 +4308,7 @@ fn empty_service_execution(image: &str) -> WorkloadExecutionSpec<TaskTemplateNet
 fn demo_backend_task_template(name: &str, replicas: u16) -> TaskTemplateSpecValue {
     TaskTemplateSpecValue {
         name: name.to_string(),
-        execution: WorkloadExecutionSpec {
+        execution: ExecutionSpec {
             command: vec![
                 "-listen".to_string(),
                 ":8000".to_string(),
@@ -5851,7 +5851,7 @@ fn manifest_to_task_templates(manifest: &ServiceManifest) -> Vec<TaskTemplateSpe
 
             TaskTemplateSpecValue {
                 name: task.name.clone(),
-                execution: WorkloadExecutionSpec {
+                execution: ExecutionSpec {
                     image: task.image.clone(),
                     command: task.command.clone(),
                     tty: false,

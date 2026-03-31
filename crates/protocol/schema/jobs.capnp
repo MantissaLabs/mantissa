@@ -36,7 +36,7 @@ struct JobSpec {
   # Requested GPU count.
 
   env @8 :List(TaskSchema.EnvironmentVar);
-  # Environment variables shared with task execution.
+  # Environment variables shared with the execution template.
 
   secretFiles @9 :List(TaskSchema.SecretFile);
   # Secret-backed file projections.
