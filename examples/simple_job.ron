@@ -1,0 +1,21 @@
+(
+    name: "simple-job",
+    execution_substrate: "oci",
+    isolation_mode: "standard",
+    execution: (
+        image: "alpine:3.20",
+        command: [
+            "sh",
+            "-lc",
+            "echo 'hello from Mantissa'; echo 'job finished successfully'",
+        ],
+        resources: (
+            cpu_millis: 250,
+            memory_mb: 128,
+        ),
+    ),
+    retry_policy: (
+        max_retries: 0,
+        backoff_secs: 2,
+    ),
+)

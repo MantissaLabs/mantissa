@@ -142,6 +142,9 @@ fields such as `active_workload_id`, `last_workload_id`, and
 `successful_workload_id`. Those identifiers point to shared workload rows, not
 to a separate job-specific execution store.
 
+For the operator-facing jobs surface, manifest format, and day-to-day job
+commands, see [docs/jobs.md](/Users/abronan/hack/mantissa/docs/jobs.md).
+
 ### Agent Session and Agent Run
 
 Agents are deliberately split in two.

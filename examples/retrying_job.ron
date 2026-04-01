@@ -1,0 +1,21 @@
+(
+    name: "retrying-job",
+    execution_substrate: "oci",
+    isolation_mode: "standard",
+    execution: (
+        image: "alpine:3.20",
+        command: [
+            "sh",
+            "-lc",
+            "echo 'simulated failing attempt'; exit 1",
+        ],
+        resources: (
+            cpu_millis: 250,
+            memory_mb: 128,
+        ),
+    ),
+    retry_policy: (
+        max_retries: 3,
+        backoff_secs: 5,
+    ),
+)

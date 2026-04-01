@@ -701,4 +701,15 @@ mod tests {
             "unexpected error: {error:#}"
         );
     }
+
+    /// Keeps the repository job examples aligned with the manifest contract.
+    #[test]
+    fn repository_job_examples_parse() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        for name in ["simple_job.ron", "retrying_job.ron", "job_with_volume.ron"] {
+            let path = root.join(name);
+            load_manifest_from_path(&path)
+                .unwrap_or_else(|error| panic!("failed to parse {}: {error:#}", path.display()));
+        }
+    }
 }
