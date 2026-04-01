@@ -124,9 +124,9 @@ The repository ships three job manifests in `examples/`:
 Submit them with:
 
 ```sh
-cargo run -- jobs run --file examples/simple_job.ron
-cargo run -- jobs run --file examples/retrying_job.ron
-cargo run -- jobs run --file examples/job_with_volume.ron
+mantissa jobs run --file examples/simple_job.ron
+mantissa jobs run --file examples/retrying_job.ron
+mantissa jobs run --file examples/job_with_volume.ron
 ```
 
 The examples are also parsed in the unit test suite so they stay aligned with
@@ -177,10 +177,10 @@ The jobs surface is meant to be usable without manually discovering workload ids
 for everyday operations.
 
 ```sh
-cargo run -- jobs list
-cargo run -- jobs inspect <JOB_ID>
-cargo run -- jobs wait <JOB_ID>
-cargo run -- jobs logs <JOB_ID> -f
+mantissa jobs list
+mantissa jobs inspect <JOB_ID>
+mantissa jobs wait <JOB_ID>
+mantissa jobs logs <JOB_ID> -f
 ```
 
 `jobs list` shows the controller summary for each durable job: name, status,
@@ -208,8 +208,8 @@ Jobs are explicit control-plane objects, so cancellation and cleanup happen at
 the jobs layer rather than by deleting workload rows directly.
 
 ```sh
-cargo run -- jobs cancel <JOB_ID>
-cargo run -- jobs delete <JOB_ID>
+mantissa jobs cancel <JOB_ID>
+mantissa jobs delete <JOB_ID>
 ```
 
 Cancellation is controller intent. The job first moves into `cancelling`, then

@@ -9,7 +9,7 @@ terminal result and may launch multiple workload attempts over time.
 ## Deploy the replicated service manifest
 
 ```sh
-cargo run -- services run examples/replicated_service.ron
+mantissa services run examples/replicated_service.ron
 ```
 
 This manifest defines two services:
@@ -18,12 +18,12 @@ This manifest defines two services:
 
 Each task uses the `resources` block to express CPU in milli-cores and memory in MiB via the `memory_mb` field.
 
-You can tweak the RON file to adjust container images, commands, or replica counts; deploy the updated service after stopping the previous deployment with `cargo run -- services stop <SERVICE_ID>`.
+You can tweak the RON file to adjust container images, commands, or replica counts; deploy the updated service after stopping the previous deployment with `mantissa services stop <SERVICE_ID>`.
 
 ## Deploy the rollout strategy example
 
 ```sh
-cargo run -- services run examples/rolling_update.ron
+mantissa services run examples/rolling_update.ron
 ```
 
 This manifest shows the full `update.rolling` surface:
@@ -40,7 +40,7 @@ See `docs/service-rollouts.md` for field semantics and defaults.
 ## Submit a simple finite job
 
 ```sh
-cargo run -- jobs run --file examples/simple_job.ron
+mantissa jobs run --file examples/simple_job.ron
 ```
 
 This manifest runs one short-lived Alpine container that prints two lines and
@@ -54,15 +54,15 @@ surface:
 Once submitted, inspect the job with:
 
 ```sh
-cargo run -- jobs list
-cargo run -- jobs inspect <JOB_ID>
-cargo run -- jobs wait <JOB_ID>
+mantissa jobs list
+mantissa jobs inspect <JOB_ID>
+mantissa jobs wait <JOB_ID>
 ```
 
 ## Submit a retrying job
 
 ```sh
-cargo run -- jobs run --file examples/retrying_job.ron
+mantissa jobs run --file examples/retrying_job.ron
 ```
 
 This manifest exits with a non-zero status on every attempt and asks the job
@@ -74,14 +74,14 @@ observing the controller-owned retry lifecycle:
 - `retrying` while waiting for the next backoff deadline
 - `failed` when the retry budget is exhausted
 
-Use `cargo run -- jobs inspect <JOB_ID>` to see the derived workload attempts
-and the retry deadline, or `cargo run -- jobs logs <JOB_ID> -f` to follow the
+Use `mantissa jobs inspect <JOB_ID>` to see the derived workload attempts
+and the retry deadline, or `mantissa jobs logs <JOB_ID> -f` to follow the
 active attempt directly from the jobs surface.
 
 ## Submit a job with a managed volume
 
 ```sh
-cargo run -- jobs run --file examples/job_with_volume.ron
+mantissa jobs run --file examples/job_with_volume.ron
 ```
 
 This manifest demonstrates the production-shaped job path where the client
@@ -102,11 +102,11 @@ The jobs surface is meant to be operable without manually digging through
 replicated workload rows for common tasks:
 
 ```sh
-cargo run -- jobs inspect <JOB_ID>
-cargo run -- jobs wait <JOB_ID>
-cargo run -- jobs logs <JOB_ID> -f
-cargo run -- jobs cancel <JOB_ID>
-cargo run -- jobs delete <JOB_ID>
+mantissa jobs inspect <JOB_ID>
+mantissa jobs wait <JOB_ID>
+mantissa jobs logs <JOB_ID> -f
+mantissa jobs cancel <JOB_ID>
+mantissa jobs delete <JOB_ID>
 ```
 
 For a deeper explanation of how jobs map to workload attempts, how retries

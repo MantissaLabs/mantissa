@@ -32,7 +32,7 @@ The system needs to be:
 ## Build, Test, and Development Commands
 
 - Build: `cargo build` (requires Cap’n Proto tooling: `capnp`, `libcapnp-dev`).
-- Run CLI: `cargo run -- init` | `cargo run -- nodes list` | `cargo run -- link --anchor 127.0.0.1:6578 --join-token <TOKEN>`
+- Run CLI: `mantissa init` | `mantissa nodes list` | `mantissa link --anchor 127.0.0.1:6578 --join-token <TOKEN>`
 - Tests: `cargo test` (verbose logs: `RUST_LOG=debug cargo test -- --nocapture`).
 
 ## Coding Style & Naming Conventions
@@ -63,5 +63,5 @@ The system needs to be:
 
 ## Security & Configuration Tips
 
-- Join tokens are secrets: never commit or paste them in PRs; rotate with `cargo run -- token rotate`.
+- Join tokens are secrets: never commit or paste them in PRs; rotate with `mantissa token rotate`.
 - Prefer localhost or private networks for TCP tests; avoid exposing ports publicly.
