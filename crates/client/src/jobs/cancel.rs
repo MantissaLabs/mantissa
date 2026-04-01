@@ -1,6 +1,6 @@
 use crate::config::ClientConfig;
 use crate::jobs::inspect::parse_job_id;
-use crate::jobs::snapshot::{cancel_job, render_job_detail};
+use crate::jobs::snapshot::{cancel_job, render_job_snapshot};
 use crate::output;
 use anyhow::Result;
 
@@ -10,7 +10,7 @@ pub async fn cancel(cfg: &ClientConfig, id: &str) -> Result<()> {
     let snapshot = cancel_job(cfg, job_id).await?;
     output::emit_block(format!(
         "job cancellation requested:\n{}",
-        render_job_detail(&snapshot)?
+        render_job_snapshot(&snapshot)?
     ));
     Ok(())
 }

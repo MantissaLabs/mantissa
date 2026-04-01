@@ -222,6 +222,21 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             JobsCommand::List => {
                 local.run_until(client::jobs::list(&cfg)).await?;
             }
+            JobsCommand::Logs(args) => {
+                local
+                    .run_until(client::jobs::logs(
+                        &cfg,
+                        &args.id,
+                        &client::jobs::JobLogsOptions {
+                            follow: args.follow,
+                            tail: &args.tail,
+                            stdout: args.stdout,
+                            stderr: args.stderr,
+                            timestamps: args.timestamps,
+                        },
+                    ))
+                    .await?;
+            }
             JobsCommand::Inspect(args) => {
                 local
                     .run_until(client::jobs::inspect(&cfg, &args.id))

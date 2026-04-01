@@ -1,6 +1,6 @@
 use crate::config::ClientConfig;
 use crate::jobs::inspect::parse_job_id;
-use crate::jobs::snapshot::{inspect_job, render_job_detail};
+use crate::jobs::snapshot::{inspect_job_detail, render_job_detail};
 use crate::output;
 use anyhow::{Result, anyhow};
 use std::time::Duration;
@@ -15,19 +15,19 @@ pub async fn wait(cfg: &ClientConfig, id: &str, timeout: Option<Duration>) -> Re
     let started = tokio::time::Instant::now();
 
     loop {
-        let snapshot = inspect_job(cfg, job_id).await?;
-        if snapshot.status.is_terminal() {
+        let detail = inspect_job_detail(cfg, job_id).await?;
+        if detail.snapshot.status.is_terminal() {
             output::emit_block(format!(
                 "job reached a terminal state:\n{}",
-                render_job_detail(&snapshot)?
+                render_job_detail(&detail)?
             ));
-            if snapshot.status.is_success() {
+            if detail.snapshot.status.is_success() {
                 return Ok(());
             }
             return Err(anyhow!(
                 "job {} ({job_id}) finished with status {}",
-                snapshot.name,
-                snapshot.status.as_str(),
+                detail.snapshot.name,
+                detail.snapshot.status.as_str(),
             ));
         }
 
@@ -36,7 +36,7 @@ pub async fn wait(cfg: &ClientConfig, id: &str, timeout: Option<Duration>) -> Re
         {
             return Err(anyhow!(
                 "timed out waiting for job {job_id} to finish; last observed status: {}",
-                snapshot.status.as_str(),
+                detail.snapshot.status.as_str(),
             ));
         }
 

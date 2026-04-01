@@ -9,8 +9,8 @@ interface Jobs {
   list @1 () -> (jobs :List(JobSnapshot));
   # List all first-class jobs with their current replicated state.
 
-  inspect @2 (id :Data) -> (job :JobSnapshot);
-  # Inspect one first-class job by its 16-byte UUID.
+  inspect @2 (id :Data) -> (job :JobDetail);
+  # Inspect one first-class job by its 16-byte UUID, including derived attempt summaries.
 
   cancel @3 (id :Data) -> (job :JobSnapshot);
   # Request cancellation for one first-class job and return its updated snapshot.
@@ -127,6 +127,64 @@ struct JobSnapshot {
 
   terminalExitCode @15 :Int32;
   # Exit code from the terminal workload attempt, or -1 when no exit code applies.
+}
+
+struct JobAttemptSnapshot {
+  workloadId @0 :Data;
+  # Workload identifier for one derived job attempt.
+
+  workloadName @1 :Text;
+  # Human-facing workload name for this attempt.
+
+  state @2 :Text;
+  # Current workload runtime phase label.
+
+  phaseReason @3 :Text;
+  # Optional workload phase reason.
+
+  phaseProgress @4 :Text;
+  # Optional workload phase progress marker.
+
+  nodeId @5 :Data;
+  # UUID of the node currently hosting this workload attempt.
+
+  nodeName @6 :Text;
+  # Human-facing name of the node currently hosting this workload attempt.
+
+  createdAt @7 :Text;
+  # RFC3339 timestamp when this workload attempt row was created.
+
+  updatedAt @8 :Text;
+  # RFC3339 timestamp when this workload attempt row was last updated.
+
+  terminalExitCode @9 :Int32;
+  # Exit code when this attempt has exited, or -1 when no exit code applies.
+
+  executionSubstrate @10 :Text;
+  # Execution substrate currently requested for this workload attempt.
+
+  isolationMode @11 :Text;
+  # Isolation contract currently requested for this workload attempt.
+
+  isolationProfile @12 :Text;
+  # Optional isolation profile requested for this workload attempt.
+
+  isActive @13 :Bool;
+  # Whether this attempt matches the job's current active workload id.
+
+  isLast @14 :Bool;
+  # Whether this attempt matches the job's last workload id.
+
+  isSuccessful @15 :Bool;
+  # Whether this attempt matches the job's successful workload id.
+}
+
+struct JobDetail {
+  snapshot @0 :JobSnapshot;
+  # Public controller snapshot for this job.
+
+  attempts @1 :List(JobAttemptSnapshot);
+  # Derived workload attempts currently visible in the shared workload store.
 }
 
 struct JobRecord {

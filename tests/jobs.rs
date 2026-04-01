@@ -22,12 +22,21 @@ local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
     let inspected = inspect_job(&node.node.jobs_client, job_id)
         .await
         .expect("inspect submitted job");
-    assert_eq!(inspected.id, job_id);
+    assert_eq!(inspected.snapshot.id, job_id);
 
     let active_workload_id =
         wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
             .await
             .expect("job should launch one workload");
+    let inspected = inspect_job(&node.node.jobs_client, job_id)
+        .await
+        .expect("inspect running job");
+    assert!(
+        inspected.attempts.iter().any(|attempt| {
+            attempt.workload_id == active_workload_id && attempt.is_active && attempt.is_last
+        }),
+        "inspect should expose the active workload attempt through the jobs surface"
+    );
 
     let mut task = node
         .node
@@ -230,6 +239,19 @@ struct JobSnapshot {
     active_workload_id: Option<Uuid>,
 }
 
+#[derive(Clone, Debug)]
+struct JobAttemptSnapshot {
+    workload_id: Uuid,
+    is_active: bool,
+    is_last: bool,
+}
+
+#[derive(Clone, Debug)]
+struct JobDetail {
+    snapshot: JobSnapshot,
+    attempts: Vec<JobAttemptSnapshot>,
+}
+
 /// Submits one first-class job through the jobs capability and returns the generated id.
 async fn submit_job(
     client: &jobs::Client,
@@ -277,16 +299,28 @@ async fn list_jobs(client: &jobs::Client) -> Result<Vec<JobSnapshot>, capnp::Err
 }
 
 /// Loads one replicated job snapshot by its durable identifier.
-async fn inspect_job(client: &jobs::Client, job_id: Uuid) -> Result<JobSnapshot, capnp::Error> {
+async fn inspect_job(client: &jobs::Client, job_id: Uuid) -> Result<JobDetail, capnp::Error> {
     let mut request = client.inspect_request();
     request.get().set_id(job_id.as_bytes());
     let response = request.send().promise.await?;
     let reader = response.get()?.get_job()?;
-    Ok(JobSnapshot {
-        id: read_uuid(reader.get_id()?)?,
-        status: reader.get_status()?,
-        attempts_started: reader.get_attempts_started(),
-        active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
+    let snapshot = reader.get_snapshot()?;
+    let mut attempts = Vec::new();
+    for attempt in reader.get_attempts()?.iter() {
+        attempts.push(JobAttemptSnapshot {
+            workload_id: read_uuid(attempt.get_workload_id()?)?,
+            is_active: attempt.get_is_active(),
+            is_last: attempt.get_is_last(),
+        });
+    }
+    Ok(JobDetail {
+        snapshot: JobSnapshot {
+            id: read_uuid(snapshot.get_id()?)?,
+            status: snapshot.get_status()?,
+            attempts_started: snapshot.get_attempts_started(),
+            active_workload_id: read_optional_uuid(snapshot.get_active_workload_id()?),
+        },
+        attempts,
     })
 }
 

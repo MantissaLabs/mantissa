@@ -382,6 +382,9 @@ pub enum JobsCommand {
     #[command(alias = "ls")]
     List,
 
+    /// Stream logs for the active or last known workload attempt of a job
+    Logs(JobsLogsArgs),
+
     /// Inspect one first-class job
     Inspect(JobsInspectArgs),
 
@@ -568,6 +571,39 @@ pub struct JobsInspectArgs {
     /// Durable UUID of the job to inspect
     #[arg(index = 1, value_name = "JOB_ID")]
     pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct JobsLogsArgs {
+    /// Durable UUID of the job to stream logs for
+    #[arg(index = 1, value_name = "JOB_ID")]
+    pub id: String,
+
+    /// Follow the log stream until the selected workload attempt exits
+    #[arg(short = 'f', long = "follow", action = ArgAction::SetTrue)]
+    pub follow: bool,
+
+    /// Number of lines to show from the end of the log, or `all`
+    #[arg(
+        short = 'n',
+        long = "tail",
+        value_name = "LINES",
+        default_value = "all",
+        value_parser = parse_log_tail
+    )]
+    pub tail: String,
+
+    /// Include stdout log frames
+    #[arg(long = "stdout", action = ArgAction::SetTrue)]
+    pub stdout: bool,
+
+    /// Include stderr log frames
+    #[arg(long = "stderr", action = ArgAction::SetTrue)]
+    pub stderr: bool,
+
+    /// Prefix log lines with timestamps when the runtime provides them
+    #[arg(long = "timestamps", action = ArgAction::SetTrue)]
+    pub timestamps: bool,
 }
 
 #[derive(Args, Debug)]

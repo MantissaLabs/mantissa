@@ -6,7 +6,7 @@ use crate::workload::manager::workload_start_error_is_retryable;
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
 use crate::workload::model::{
     ExecutionSubstrate, IsolationMode, WorkloadJobMetadata, WorkloadOwner, WorkloadPhase,
-    WorkloadSpec,
+    WorkloadSpec, WorkloadStateFilter,
 };
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
@@ -125,6 +125,21 @@ impl JobController {
     /// Returns the canonical current job value for one replicated identifier.
     pub fn inspect_job(&self, job_id: Uuid) -> Result<Option<JobSpecValue>> {
         self.registry.get(job_id)
+    }
+
+    /// Lists workload rows currently visible for one job by derived ownership metadata.
+    pub async fn list_job_attempt_workloads(&self, job_id: Uuid) -> Result<Vec<WorkloadSpec>> {
+        let mut workloads = self
+            .workload_manager
+            .list_workloads(&WorkloadStateFilter::all())
+            .await?;
+        workloads.retain(|workload| {
+            workload
+                .job_owner()
+                .is_some_and(|owner| owner.job_id == job_id)
+        });
+        workloads.sort_by(compare_job_attempt_workloads);
+        Ok(workloads)
     }
 
     /// Requests cancellation for one job and returns its updated controller snapshot.
@@ -673,6 +688,15 @@ impl JobController {
             peer_states,
         )
     }
+}
+
+/// Orders job-owned workload attempts from newest to oldest for operator-facing inspection.
+fn compare_job_attempt_workloads(left: &WorkloadSpec, right: &WorkloadSpec) -> std::cmp::Ordering {
+    right
+        .created_at
+        .cmp(&left.created_at)
+        .then_with(|| right.updated_at.cmp(&left.updated_at))
+        .then_with(|| right.id.cmp(&left.id))
 }
 
 /// Rejects execution settings that conflict with the job controller's finite-run semantics.

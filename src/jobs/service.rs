@@ -5,11 +5,13 @@ use crate::workload::capnp_codec::{
     decode_env_vars, decode_secret_files, decode_task_liveness_probe, decode_volume_mounts,
     encode_env_vars, encode_secret_files, encode_task_liveness_probe, encode_volume_mounts,
 };
+use crate::workload::model::{WorkloadPhase, WorkloadSpec};
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
 use protocol::gossip::gossip_message;
 use protocol::jobs::{
-    job_event, job_execution, job_record, job_retry_policy, job_snapshot, job_submit_spec, jobs,
+    job_attempt_snapshot, job_detail, job_event, job_execution, job_record, job_retry_policy,
+    job_snapshot, job_submit_spec, jobs,
 };
 use std::rc::Rc;
 use uuid::Uuid;
@@ -86,7 +88,12 @@ impl jobs::Server for JobsRpc {
             .inspect_job(job_id)
             .map_err(|error| Error::failed(error.to_string()))?
             .ok_or_else(|| Error::failed(format!("unknown job {job_id}")))?;
-        write_job_snapshot(results.get().init_job(), &value)?;
+        let attempts = self
+            .manager
+            .list_job_attempt_workloads(job_id)
+            .await
+            .map_err(|error| Error::failed(error.to_string()))?;
+        write_job_detail(results.get().init_job(), &value, &attempts)?;
         Ok(())
     }
 
@@ -416,6 +423,44 @@ fn write_job_snapshot(
     Ok(())
 }
 
+/// Encodes one public job inspect payload with derived workload attempt summaries.
+fn write_job_detail(
+    mut builder: job_detail::Builder<'_>,
+    value: &JobSpecValue,
+    attempts: &[WorkloadSpec],
+) -> Result<(), Error> {
+    write_job_snapshot(builder.reborrow().init_snapshot(), value)?;
+    let mut attempt_list = builder.reborrow().init_attempts(attempts.len() as u32);
+    for (index, attempt) in attempts.iter().enumerate() {
+        write_job_attempt_snapshot(attempt_list.reborrow().get(index as u32), value, attempt);
+    }
+    Ok(())
+}
+
+/// Encodes one derived workload attempt summary into the public job inspect payload.
+fn write_job_attempt_snapshot(
+    mut builder: job_attempt_snapshot::Builder<'_>,
+    job: &JobSpecValue,
+    attempt: &WorkloadSpec,
+) {
+    builder.set_workload_id(attempt.id.as_bytes());
+    builder.set_workload_name(&attempt.name);
+    builder.set_state(workload_phase_label(&attempt.state));
+    builder.set_phase_reason(attempt.phase_reason.as_deref().unwrap_or(""));
+    builder.set_phase_progress(attempt.phase_progress.as_deref().unwrap_or(""));
+    builder.set_node_id(attempt.node_id.as_bytes());
+    builder.set_node_name(&attempt.node_name);
+    builder.set_created_at(&attempt.created_at);
+    builder.set_updated_at(&attempt.updated_at);
+    builder.set_terminal_exit_code(workload_phase_exit_code(&attempt.state).unwrap_or(-1));
+    builder.set_execution_substrate(attempt.execution_substrate.as_str());
+    builder.set_isolation_mode(attempt.isolation_mode.as_str());
+    builder.set_isolation_profile(attempt.isolation_profile.as_deref().unwrap_or(""));
+    builder.set_is_active(job.active_workload_id == Some(attempt.id));
+    builder.set_is_last(job.last_workload_id == Some(attempt.id));
+    builder.set_is_successful(job.successful_workload_id == Some(attempt.id));
+}
+
 /// Decodes one public job submission payload from the jobs RPC.
 fn read_job_submit_spec(
     reader: job_submit_spec::Reader<'_>,
@@ -470,4 +515,38 @@ fn read_optional_uuid(data: &[u8]) -> Option<Uuid> {
         bytes.copy_from_slice(data);
         Uuid::from_bytes(bytes)
     })
+}
+
+/// Projects one workload phase into the stable public label used by job attempt summaries.
+fn workload_phase_label(state: &WorkloadPhase) -> &'static str {
+    match state {
+        WorkloadPhase::Pending => "pending",
+        WorkloadPhase::Pulling => "pulling",
+        WorkloadPhase::Creating => "creating",
+        WorkloadPhase::VolumeUnavailable => "volume_unavailable",
+        WorkloadPhase::Running => "running",
+        WorkloadPhase::Paused => "paused",
+        WorkloadPhase::Stopping => "stopping",
+        WorkloadPhase::Stopped => "stopped",
+        WorkloadPhase::Failed => "failed",
+        WorkloadPhase::Exited(_) => "exited",
+        WorkloadPhase::Unknown => "unknown",
+    }
+}
+
+/// Returns the terminal exit code from one workload phase when that concept applies.
+fn workload_phase_exit_code(state: &WorkloadPhase) -> Option<i32> {
+    match state {
+        WorkloadPhase::Exited(code) => Some(*code),
+        WorkloadPhase::Pending
+        | WorkloadPhase::Pulling
+        | WorkloadPhase::Creating
+        | WorkloadPhase::VolumeUnavailable
+        | WorkloadPhase::Running
+        | WorkloadPhase::Paused
+        | WorkloadPhase::Stopping
+        | WorkloadPhase::Stopped
+        | WorkloadPhase::Failed
+        | WorkloadPhase::Unknown => None,
+    }
 }

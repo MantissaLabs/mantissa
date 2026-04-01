@@ -3,7 +3,7 @@ use crate::connection;
 use crate::tasks::uuid_to_string;
 use anyhow::Result;
 use capnp::Error as CapnpError;
-use protocol::jobs::{JobStatus as ProtoJobStatus, job_snapshot};
+use protocol::jobs::{JobStatus as ProtoJobStatus, job_attempt_snapshot, job_detail, job_snapshot};
 use std::io::Write;
 use tabwriter::TabWriter;
 use uuid::Uuid;
@@ -126,6 +126,99 @@ impl JobSnapshotView {
     }
 }
 
+/// One derived workload-attempt view returned by public job inspection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobAttemptView {
+    pub workload_id: Uuid,
+    pub workload_name: String,
+    pub state: String,
+    pub phase_reason: Option<String>,
+    pub phase_progress: Option<String>,
+    pub node_id: Uuid,
+    pub node_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub terminal_exit_code: Option<i32>,
+    pub execution_substrate: String,
+    pub isolation_mode: String,
+    pub isolation_profile: Option<String>,
+    pub is_active: bool,
+    pub is_last: bool,
+    pub is_successful: bool,
+}
+
+impl JobAttemptView {
+    /// Decodes one protocol job-attempt summary into the shared client-side view.
+    pub fn from_reader(reader: job_attempt_snapshot::Reader<'_>) -> Result<Self, CapnpError> {
+        Ok(Self {
+            workload_id: read_uuid(reader.get_workload_id()?)?,
+            workload_name: reader.get_workload_name()?.to_str()?.to_string(),
+            state: reader.get_state()?.to_str()?.to_string(),
+            phase_reason: read_optional_text(reader.get_phase_reason()?),
+            phase_progress: read_optional_text(reader.get_phase_progress()?),
+            node_id: read_uuid(reader.get_node_id()?)?,
+            node_name: reader.get_node_name()?.to_str()?.to_string(),
+            created_at: reader.get_created_at()?.to_str()?.to_string(),
+            updated_at: reader.get_updated_at()?.to_str()?.to_string(),
+            terminal_exit_code: (reader.get_terminal_exit_code() >= 0)
+                .then(|| reader.get_terminal_exit_code()),
+            execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+            isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
+            isolation_profile: read_optional_text(reader.get_isolation_profile()?),
+            is_active: reader.get_is_active(),
+            is_last: reader.get_is_last(),
+            is_successful: reader.get_is_successful(),
+        })
+    }
+
+    /// Returns the stable CLI label set describing this attempt's role within the job.
+    pub fn roles_label(&self) -> String {
+        let mut roles = Vec::new();
+        if self.is_active {
+            roles.push("active");
+        }
+        if self.is_last {
+            roles.push("last");
+        }
+        if self.is_successful {
+            roles.push("successful");
+        }
+        if roles.is_empty() {
+            "-".to_string()
+        } else {
+            roles.join(",")
+        }
+    }
+}
+
+/// Full public job-inspection view composed of controller summary plus derived attempts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobDetailView {
+    pub snapshot: JobSnapshotView,
+    pub attempts: Vec<JobAttemptView>,
+}
+
+impl JobDetailView {
+    /// Decodes one protocol job detail payload into the shared client-side view.
+    pub fn from_reader(reader: job_detail::Reader<'_>) -> Result<Self, CapnpError> {
+        let snapshot = JobSnapshotView::from_reader(reader.get_snapshot()?)?;
+        let attempts_reader = reader.get_attempts()?;
+        let mut attempts = Vec::with_capacity(attempts_reader.len() as usize);
+        for entry in attempts_reader.iter() {
+            attempts.push(JobAttemptView::from_reader(entry)?);
+        }
+        Ok(Self { snapshot, attempts })
+    }
+
+    /// Returns the workload id that should be preferred for convenience log streaming.
+    pub fn preferred_logs_workload_id(&self) -> Option<Uuid> {
+        self.snapshot
+            .active_workload_id
+            .or(self.snapshot.last_workload_id)
+            .or(self.snapshot.successful_workload_id)
+    }
+}
+
 /// Loads every public job snapshot currently exposed by the jobs capability.
 pub async fn fetch_jobs(cfg: &ClientConfig) -> Result<Vec<JobSnapshotView>> {
     let session = connection::get_local_session(cfg).await?;
@@ -141,15 +234,15 @@ pub async fn fetch_jobs(cfg: &ClientConfig) -> Result<Vec<JobSnapshotView>> {
     Ok(rows)
 }
 
-/// Loads one public job snapshot by its durable identifier.
-pub async fn inspect_job(cfg: &ClientConfig, job_id: Uuid) -> Result<JobSnapshotView> {
+/// Loads one public job detail payload by its durable identifier.
+pub async fn inspect_job_detail(cfg: &ClientConfig, job_id: Uuid) -> Result<JobDetailView> {
     let session = connection::get_local_session(cfg).await?;
     let request = session.get_jobs_request();
     let jobs = request.send().pipeline.get_jobs();
     let mut request = jobs.inspect_request();
     request.get().set_id(job_id.as_bytes());
     let response = request.send().promise.await?;
-    JobSnapshotView::from_reader(response.get()?.get_job()?).map_err(Into::into)
+    JobDetailView::from_reader(response.get()?.get_job()?).map_err(Into::into)
 }
 
 /// Requests cancellation for one job and returns the updated public snapshot.
@@ -174,8 +267,8 @@ pub async fn delete_job(cfg: &ClientConfig, job_id: Uuid) -> Result<JobSnapshotV
     JobSnapshotView::from_reader(response.get()?.get_job()?).map_err(Into::into)
 }
 
-/// Renders one detailed public job snapshot for inspect, wait, cancel, and delete output.
-pub fn render_job_detail(snapshot: &JobSnapshotView) -> Result<String> {
+/// Renders one detailed public job snapshot for commands that only return controller state.
+pub fn render_job_snapshot(snapshot: &JobSnapshotView) -> Result<String> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(&mut tw, "FIELD\tVALUE")?;
     writeln!(&mut tw, "id\t{}", snapshot.id)?;
@@ -247,6 +340,52 @@ pub fn render_job_detail(snapshot: &JobSnapshotView) -> Result<String> {
     )?;
     tw.flush()?;
     Ok(String::from_utf8(tw.into_inner()?)?)
+}
+
+/// Renders one full public job inspection with derived workload attempts.
+pub fn render_job_detail(detail: &JobDetailView) -> Result<String> {
+    let mut rendered = String::new();
+    rendered.push_str(&render_job_snapshot(&detail.snapshot)?);
+
+    if let Some(workload_id) = detail.preferred_logs_workload_id() {
+        rendered.push_str("\nlogs target\t");
+        rendered.push_str(&workload_id.to_string());
+        rendered.push('\n');
+    }
+
+    if !detail.attempts.is_empty() {
+        let mut tw = TabWriter::new(Vec::new());
+        writeln!(
+            &mut tw,
+            "WORKLOAD ID\tROLES\tSTATE\tNODE\tCREATED\tUPDATED\tEXIT\tSUBSTRATE\tISOLATION"
+        )?;
+        for attempt in &detail.attempts {
+            writeln!(
+                &mut tw,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                attempt.workload_id,
+                attempt.roles_label(),
+                attempt.state,
+                attempt.node_name,
+                attempt.created_at,
+                attempt.updated_at,
+                attempt
+                    .terminal_exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                attempt.execution_substrate,
+                attempt.isolation_profile.as_deref().map_or_else(
+                    || attempt.isolation_mode.clone(),
+                    |profile| format!("{} ({profile})", attempt.isolation_mode),
+                ),
+            )?;
+        }
+        tw.flush()?;
+        rendered.push_str("\nattempts:\n");
+        rendered.push_str(&String::from_utf8(tw.into_inner()?)?);
+    }
+
+    Ok(rendered)
 }
 
 /// Formats one optional UUID field for operator-facing output.
