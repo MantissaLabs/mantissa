@@ -4,6 +4,9 @@ use crate::jobs::manifest::{
     EnvironmentVariable, JobManifest, LivenessKind, LivenessProbe, SecretFileProjection,
     SecretReference, load_manifest_from_path,
 };
+use crate::jobs::runtime::{
+    normalize_execution_substrate, normalize_isolation_mode, normalize_isolation_profile,
+};
 use crate::output;
 use crate::tasks::uuid_to_string;
 use crate::volumes::{self, ResolvedVolumeMount};
@@ -46,6 +49,9 @@ pub struct JobRunOptions<'a> {
     pub gpu_count: Option<u32>,
     pub max_retries: Option<u32>,
     pub retry_backoff_secs: Option<u32>,
+    pub execution_substrate: &'a str,
+    pub isolation_mode: &'a str,
+    pub isolation_profile: Option<&'a str>,
     pub volumes: &'a [String],
 }
 
@@ -54,6 +60,9 @@ struct PreparedJobSubmitSpec {
     name: String,
     execution: PreparedJobExecution,
     retry_policy: PreparedJobRetryPolicy,
+    execution_substrate: String,
+    isolation_mode: String,
+    isolation_profile: Option<String>,
 }
 
 /// One prepared execution template ready for jobs wire encoding.
@@ -102,16 +111,22 @@ pub async fn run(cfg: &ClientConfig, options: &JobRunOptions<'_>) -> Result<()> 
     let job_id = uuid_to_string(reader.get_job_id()?)?;
 
     let mut tw = tabwriter::TabWriter::new(Vec::new());
-    writeln!(&mut tw, "ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tGPU\tRETRIES")?;
     writeln!(
         &mut tw,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tGPU\tSUBSTRATE\tMODE\tPROFILE\tRETRIES"
+    )?;
+    writeln!(
+        &mut tw,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         job_id,
         prepared.name,
         prepared.execution.image,
         prepared.execution.cpu_millis,
         prepared.execution.memory_bytes / (1024 * 1024),
         prepared.execution.gpu_count,
+        prepared.execution_substrate,
+        prepared.isolation_mode,
+        prepared.isolation_profile.as_deref().unwrap_or("default"),
         prepared.retry_policy.max_retries,
     )?;
     tw.flush()?;
@@ -150,6 +165,9 @@ async fn prepare_raw_submit_spec(
         .ok_or_else(|| anyhow!("jobs run requires --image unless --file is used"))?;
 
     let resolved_volumes = volumes::resolve_cli_volume_mounts(cfg, options.volumes).await?;
+    let execution_substrate = normalize_execution_substrate(options.execution_substrate)?;
+    let isolation_mode = normalize_isolation_mode(options.isolation_mode)?;
+    let isolation_profile = normalize_isolation_profile(options.isolation_profile);
 
     Ok(PreparedJobSubmitSpec {
         name: name.to_string(),
@@ -177,6 +195,9 @@ async fn prepare_raw_submit_spec(
                 .retry_backoff_secs
                 .unwrap_or(DEFAULT_RETRY_BACKOFF_SECS),
         },
+        execution_substrate,
+        isolation_mode,
+        isolation_profile,
     })
 }
 
@@ -196,6 +217,9 @@ async fn prepare_manifest_submit_spec(
             max_retries: manifest.retry_policy.max_retries,
             backoff_secs: manifest.retry_policy.backoff_secs,
         },
+        execution_substrate: manifest.execution_substrate.clone(),
+        isolation_mode: manifest.isolation_mode.clone(),
+        isolation_profile: manifest.isolation_profile.clone(),
     })
 }
 
@@ -261,6 +285,9 @@ fn write_job_submit_spec(
     builder.set_name(&spec.name);
     write_job_execution(builder.reborrow().init_execution(), &spec.execution)?;
     write_job_retry_policy(builder.reborrow().init_retry_policy(), &spec.retry_policy);
+    builder.set_execution_substrate(&spec.execution_substrate);
+    builder.set_isolation_mode(&spec.isolation_mode);
+    builder.set_isolation_profile(spec.isolation_profile.as_deref().unwrap_or(""));
     Ok(())
 }
 

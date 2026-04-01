@@ -6,8 +6,7 @@ use common::convergence::wait_until;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use crdt_store::uuid_key::UuidKey;
 use mantissa::task::types::{TaskStateFilter, TaskValue};
-use mantissa::workload::model::WorkloadPhase;
-use mantissa::workload::model::WorkloadSpec;
+use mantissa::workload::model::{ExecutionSubstrate, IsolationMode, WorkloadPhase, WorkloadSpec};
 use protocol::jobs::{JobStatus as ProtoJobStatus, jobs};
 use std::time::Duration;
 use uuid::Uuid;
@@ -231,12 +230,69 @@ local_test!(jobs_delete_requires_terminal_state_and_removes_job, {
     );
 });
 
-#[derive(Clone, Copy, Debug)]
+local_test!(jobs_runtime_selection_reaches_workload_attempts, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let job_id = submit_job_with_runtime(
+        &node.node.jobs_client,
+        "sandboxed-job",
+        0,
+        0,
+        "oci",
+        "sandboxed",
+        Some("oci-default"),
+    )
+    .await
+    .expect("submit sandboxed job");
+
+    let inspected = inspect_job(&node.node.jobs_client, job_id)
+        .await
+        .expect("inspect submitted sandboxed job");
+    assert_eq!(inspected.snapshot.execution_substrate, "oci");
+    assert_eq!(inspected.snapshot.isolation_mode, "sandboxed");
+    assert_eq!(
+        inspected.snapshot.isolation_profile.as_deref(),
+        Some("oci-default")
+    );
+
+    let active_workload_id =
+        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
+            .await
+            .expect("job should launch one sandboxed workload");
+    let workload = node
+        .node
+        .workload_manager
+        .inspect_workload(active_workload_id)
+        .await
+        .expect("inspect sandboxed job workload");
+    assert_eq!(workload.execution_substrate, ExecutionSubstrate::Oci);
+    assert_eq!(workload.isolation_mode, IsolationMode::Sandboxed);
+    assert_eq!(workload.isolation_profile.as_deref(), Some("oci-default"));
+
+    let inspected = inspect_job(&node.node.jobs_client, job_id)
+        .await
+        .expect("inspect launched sandboxed job");
+    assert!(
+        inspected.attempts.iter().any(|attempt| {
+            attempt.workload_id == active_workload_id
+                && attempt.execution_substrate == "oci"
+                && attempt.isolation_mode == "sandboxed"
+                && attempt.isolation_profile.as_deref() == Some("oci-default")
+        }),
+        "derived attempt summaries should expose the requested runtime selection"
+    );
+});
+
+#[derive(Clone, Debug)]
 struct JobSnapshot {
     id: Uuid,
     status: ProtoJobStatus,
     attempts_started: u32,
     active_workload_id: Option<Uuid>,
+    execution_substrate: String,
+    isolation_mode: String,
+    isolation_profile: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -244,6 +300,9 @@ struct JobAttemptSnapshot {
     workload_id: Uuid,
     is_active: bool,
     is_last: bool,
+    execution_substrate: String,
+    isolation_mode: String,
+    isolation_profile: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -259,10 +318,35 @@ async fn submit_job(
     max_retries: u32,
     retry_backoff_secs: u32,
 ) -> Result<Uuid, capnp::Error> {
+    submit_job_with_runtime(
+        client,
+        name,
+        max_retries,
+        retry_backoff_secs,
+        "oci",
+        "standard",
+        None,
+    )
+    .await
+}
+
+/// Submits one first-class job with explicit runtime selection and returns the generated id.
+async fn submit_job_with_runtime(
+    client: &jobs::Client,
+    name: &str,
+    max_retries: u32,
+    retry_backoff_secs: u32,
+    execution_substrate: &str,
+    isolation_mode: &str,
+    isolation_profile: Option<&str>,
+) -> Result<Uuid, capnp::Error> {
     let mut request = client.submit_request();
     {
         let mut builder = request.get().init_spec();
         builder.set_name(name);
+        builder.set_execution_substrate(execution_substrate);
+        builder.set_isolation_mode(isolation_mode);
+        builder.set_isolation_profile(isolation_profile.unwrap_or_default());
         let mut execution = builder.reborrow().init_execution();
         execution.set_image("ghcr.io/mantissa/demo-job:latest");
         execution.set_tty(false);
@@ -293,6 +377,9 @@ async fn list_jobs(client: &jobs::Client) -> Result<Vec<JobSnapshot>, capnp::Err
             status: reader.get_status()?,
             attempts_started: reader.get_attempts_started(),
             active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
+            execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+            isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
+            isolation_profile: read_optional_text(reader.get_isolation_profile()?.to_str()?),
         });
     }
     Ok(snapshots)
@@ -311,6 +398,9 @@ async fn inspect_job(client: &jobs::Client, job_id: Uuid) -> Result<JobDetail, c
             workload_id: read_uuid(attempt.get_workload_id()?)?,
             is_active: attempt.get_is_active(),
             is_last: attempt.get_is_last(),
+            execution_substrate: attempt.get_execution_substrate()?.to_str()?.to_string(),
+            isolation_mode: attempt.get_isolation_mode()?.to_str()?.to_string(),
+            isolation_profile: read_optional_text(attempt.get_isolation_profile()?.to_str()?),
         });
     }
     Ok(JobDetail {
@@ -319,6 +409,9 @@ async fn inspect_job(client: &jobs::Client, job_id: Uuid) -> Result<JobDetail, c
             status: snapshot.get_status()?,
             attempts_started: snapshot.get_attempts_started(),
             active_workload_id: read_optional_uuid(snapshot.get_active_workload_id()?),
+            execution_substrate: snapshot.get_execution_substrate()?.to_str()?.to_string(),
+            isolation_mode: snapshot.get_isolation_mode()?.to_str()?.to_string(),
+            isolation_profile: read_optional_text(snapshot.get_isolation_profile()?.to_str()?),
         },
         attempts,
     })
@@ -335,6 +428,9 @@ async fn cancel_job(client: &jobs::Client, job_id: Uuid) -> Result<JobSnapshot, 
         status: reader.get_status()?,
         attempts_started: reader.get_attempts_started(),
         active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
+        execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+        isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
+        isolation_profile: read_optional_text(reader.get_isolation_profile()?.to_str()?),
     })
 }
 
@@ -349,6 +445,9 @@ async fn delete_job(client: &jobs::Client, job_id: Uuid) -> Result<JobSnapshot, 
         status: reader.get_status()?,
         attempts_started: reader.get_attempts_started(),
         active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
+        execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+        isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
+        isolation_profile: read_optional_text(reader.get_isolation_profile()?.to_str()?),
     })
 }
 
@@ -454,4 +553,10 @@ fn read_optional_uuid(data: capnp::data::Reader<'_>) -> Option<Uuid> {
         bytes.copy_from_slice(bytes_owned.as_slice());
         Uuid::from_bytes(bytes)
     })
+}
+
+/// Decodes one optional text field from the public jobs schema.
+fn read_optional_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }

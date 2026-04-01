@@ -5,7 +5,7 @@ use crate::workload::capnp_codec::{
     decode_env_vars, decode_secret_files, decode_task_liveness_probe, decode_volume_mounts,
     encode_env_vars, encode_secret_files, encode_task_liveness_probe, encode_volume_mounts,
 };
-use crate::workload::model::{WorkloadPhase, WorkloadSpec};
+use crate::workload::model::{ExecutionSubstrate, IsolationMode, WorkloadPhase, WorkloadSpec};
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
 use protocol::gossip::gossip_message;
@@ -26,6 +26,9 @@ pub struct JobsRpc {
 struct DecodedJobSubmitSpec {
     name: String,
     execution: ResolvedExecutionSpec,
+    execution_substrate: ExecutionSubstrate,
+    isolation_mode: IsolationMode,
+    isolation_profile: Option<String>,
     retry_policy: JobRetryPolicy,
 }
 
@@ -50,7 +53,14 @@ impl jobs::Server for JobsRpc {
         let spec = read_job_submit_spec(reader)?;
         let JobSubmission { job_id } = self
             .manager
-            .submit(spec.name, spec.execution, spec.retry_policy)
+            .submit(
+                spec.name,
+                spec.execution,
+                spec.execution_substrate,
+                spec.isolation_mode,
+                spec.isolation_profile,
+                spec.retry_policy,
+            )
             .await
             .map_err(|error| Error::failed(error.to_string()))?;
 
@@ -337,6 +347,9 @@ fn write_job_record(
     );
     builder.set_retry_not_before(value.retry_not_before.as_deref().unwrap_or(""));
     builder.set_terminal_exit_code(value.terminal_exit_code.unwrap_or(-1));
+    builder.set_execution_substrate(value.execution_substrate.as_str());
+    builder.set_isolation_mode(value.isolation_mode.as_str());
+    builder.set_isolation_profile(value.isolation_profile.as_deref().unwrap_or(""));
 
     Ok(())
 }
@@ -348,7 +361,15 @@ fn read_job_record(reader: job_record::Reader<'_>) -> Result<JobSpecValue, Error
     let execution = read_job_execution(reader.get_execution()?)?;
     let retry_policy = read_job_retry_policy(reader.get_retry_policy()?);
 
-    let mut value = JobSpecValue::new(id, name, execution, retry_policy);
+    let mut value = JobSpecValue::new(
+        id,
+        name,
+        execution,
+        parse_execution_substrate(reader.get_execution_substrate()?.to_str()?)?,
+        parse_isolation_mode(reader.get_isolation_mode()?.to_str()?)?,
+        read_optional_text(reader.get_isolation_profile()?.to_str()?),
+        retry_policy,
+    );
     value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
     value.created_at = reader.get_created_at()?.to_str()?.to_string();
     value.started_at = {
@@ -420,6 +441,9 @@ fn write_job_snapshot(
     );
     builder.set_retry_not_before(value.retry_not_before.as_deref().unwrap_or(""));
     builder.set_terminal_exit_code(value.terminal_exit_code.unwrap_or(-1));
+    builder.set_execution_substrate(value.execution_substrate.as_str());
+    builder.set_isolation_mode(value.isolation_mode.as_str());
+    builder.set_isolation_profile(value.isolation_profile.as_deref().unwrap_or(""));
     Ok(())
 }
 
@@ -468,6 +492,11 @@ fn read_job_submit_spec(
     Ok(DecodedJobSubmitSpec {
         name: reader.get_name()?.to_str()?.to_string(),
         execution: read_job_execution(reader.get_execution()?)?,
+        execution_substrate: parse_execution_substrate(
+            reader.get_execution_substrate()?.to_str()?,
+        )?,
+        isolation_mode: parse_isolation_mode(reader.get_isolation_mode()?.to_str()?)?,
+        isolation_profile: read_optional_text(reader.get_isolation_profile()?.to_str()?),
         retry_policy: read_job_retry_policy(reader.get_retry_policy()?),
     })
 }
@@ -515,6 +544,30 @@ fn read_optional_uuid(data: &[u8]) -> Option<Uuid> {
         bytes.copy_from_slice(data);
         Uuid::from_bytes(bytes)
     })
+}
+
+/// Parses one execution-substrate text identifier from the public jobs schema.
+fn parse_execution_substrate(raw: &str) -> Result<ExecutionSubstrate, Error> {
+    raw.parse().map_err(|()| {
+        Error::failed(format!(
+            "invalid execution substrate '{raw}'; expected 'oci' or 'microvm'"
+        ))
+    })
+}
+
+/// Parses one isolation-mode text identifier from the public jobs schema.
+fn parse_isolation_mode(raw: &str) -> Result<IsolationMode, Error> {
+    raw.parse().map_err(|()| {
+        Error::failed(format!(
+            "invalid isolation mode '{raw}'; expected 'standard' or 'sandboxed'"
+        ))
+    })
+}
+
+/// Trims one optional text field from the jobs schema, treating empty text as absent.
+fn read_optional_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Projects one workload phase into the stable public label used by job attempt summaries.

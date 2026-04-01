@@ -77,6 +77,15 @@ struct JobSubmitSpec {
 
   retryPolicy @2 :JobRetryPolicy;
   # Controller-owned retry policy.
+
+  executionSubstrate @3 :Text;
+  # Execution substrate requested for each workload attempt (`oci` or `microvm`).
+
+  isolationMode @4 :Text;
+  # Isolation contract requested for each workload attempt (`standard` or `sandboxed`).
+
+  isolationProfile @5 :Text;
+  # Optional isolation profile requested for each workload attempt.
 }
 
 struct JobSnapshot {
@@ -127,6 +136,15 @@ struct JobSnapshot {
 
   terminalExitCode @15 :Int32;
   # Exit code from the terminal workload attempt, or -1 when no exit code applies.
+
+  executionSubstrate @16 :Text;
+  # Execution substrate requested for each workload attempt.
+
+  isolationMode @17 :Text;
+  # Isolation contract requested for each workload attempt.
+
+  isolationProfile @18 :Text;
+  # Optional isolation profile requested for each workload attempt.
 }
 
 struct JobAttemptSnapshot {
@@ -238,6 +256,15 @@ struct JobRecord {
 
   terminalExitCode @16 :Int32;
   # Exit code from the terminal workload attempt, or -1 when no exit code applies.
+
+  executionSubstrate @17 :Text;
+  # Execution substrate requested for each workload attempt.
+
+  isolationMode @18 :Text;
+  # Isolation contract requested for each workload attempt.
+
+  isolationProfile @19 :Text;
+  # Optional isolation profile requested for each workload attempt.
 }
 
 enum JobStatus {

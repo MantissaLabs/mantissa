@@ -1,3 +1,4 @@
+use crate::workload::model::{ExecutionSubstrate, IsolationMode};
 use crate::workload::types::ResolvedExecutionSpec;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
@@ -6,13 +7,17 @@ use uuid::Uuid;
 /// Value stored in the replicated job store describing one finite workload submission.
 ///
 /// A job is a controller-level object. It owns retry/completion semantics and may launch one or
-/// more underlying workload attempts over time. Those attempts still use the shared task/workload
+/// more underlying workload attempts over time. Those attempts still use the shared workload
 /// execution substrate.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobSpecValue {
     pub id: Uuid,
     pub name: String,
     pub execution: ResolvedExecutionSpec,
+    pub execution_substrate: ExecutionSubstrate,
+    pub isolation_mode: IsolationMode,
+    #[serde(default)]
+    pub isolation_profile: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -49,6 +54,9 @@ impl JobSpecValue {
         id: Uuid,
         name: impl Into<String>,
         execution: ResolvedExecutionSpec,
+        execution_substrate: ExecutionSubstrate,
+        isolation_mode: IsolationMode,
+        isolation_profile: Option<String>,
         retry_policy: JobRetryPolicy,
     ) -> Self {
         let now = current_timestamp();
@@ -56,6 +64,9 @@ impl JobSpecValue {
             id,
             name: name.into(),
             execution,
+            execution_substrate,
+            isolation_mode,
+            isolation_profile,
             created_at: now.clone(),
             updated_at: now,
             started_at: None,
@@ -120,7 +131,7 @@ impl JobSpecValue {
         self.touch();
     }
 
-    /// Marks one reserved or adopted task as the current running attempt.
+    /// Marks one reserved or adopted workload as the current running attempt.
     pub fn mark_running(&mut self, workload_id: Uuid, detail: Option<String>) {
         self.phase_version = self.phase_version.saturating_add(1);
         self.status = JobStatus::Running;
@@ -153,7 +164,7 @@ impl JobSpecValue {
         deadline
     }
 
-    /// Marks the job as completed successfully by one terminal task.
+    /// Marks the job as completed successfully by one terminal workload.
     pub fn mark_succeeded(&mut self, workload_id: Uuid, detail: Option<String>) {
         self.phase_version = self.phase_version.saturating_add(1);
         self.status = JobStatus::Succeeded;
@@ -324,6 +335,9 @@ mod tests {
                 volumes: Vec::new(),
                 networks: Vec::new(),
             },
+            ExecutionSubstrate::Oci,
+            IsolationMode::Standard,
+            None,
             JobRetryPolicy::default(),
         );
 
@@ -373,6 +387,9 @@ mod tests {
                 volumes: Vec::new(),
                 networks: Vec::new(),
             },
+            ExecutionSubstrate::Oci,
+            IsolationMode::Standard,
+            None,
             JobRetryPolicy::default(),
         );
 

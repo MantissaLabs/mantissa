@@ -18,16 +18,21 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tIMAGE\tSTATUS\tATTEMPTS\tACTIVE WORKLOAD\tSTARTED\tCOMPLETED\tEXIT"
+        "ID\tNAME\tIMAGE\tSTATUS\tSUBSTRATE\tISOLATION\tATTEMPTS\tACTIVE WORKLOAD\tSTARTED\tCOMPLETED\tEXIT"
     )?;
     for row in rows {
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.id,
             row.name,
             row.image,
             row.status.as_str(),
+            row.execution_substrate,
+            row.isolation_profile.as_deref().map_or_else(
+                || row.isolation_mode.clone(),
+                |profile| format!("{} ({profile})", row.isolation_mode),
+            ),
             row.attempts_started,
             format_optional_uuid(row.active_workload_id),
             row.started_at.unwrap_or_else(|| "-".to_string()),

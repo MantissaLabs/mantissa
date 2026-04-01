@@ -556,6 +556,32 @@ pub struct JobsRunArgs {
     )]
     pub retry_backoff_secs: Option<u32>,
 
+    /// Execution substrate requested for job attempts (`oci` or `microvm`)
+    #[arg(
+        long = "execution-substrate",
+        value_name = "SUBSTRATE",
+        default_value = "oci",
+        conflicts_with = "manifest"
+    )]
+    pub execution_substrate: String,
+
+    /// Isolation contract requested for job attempts (`standard` or `sandboxed`)
+    #[arg(
+        long = "isolation-mode",
+        value_name = "MODE",
+        default_value = "standard",
+        conflicts_with = "manifest"
+    )]
+    pub isolation_mode: String,
+
+    /// Optional isolation profile requested for the job runtime
+    #[arg(
+        long = "isolation-profile",
+        value_name = "PROFILE",
+        conflicts_with = "manifest"
+    )]
+    pub isolation_profile: Option<String>,
+
     /// Named volume mount in SOURCE:TARGET[:ro|rw] form (repeat flag to add multiple mounts)
     #[arg(
         long = "volume",

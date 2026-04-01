@@ -262,6 +262,9 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                             gpu_count: args.gpu_count,
                             max_retries: args.max_retries,
                             retry_backoff_secs: args.retry_backoff_secs,
+                            execution_substrate: &args.execution_substrate,
+                            isolation_mode: &args.isolation_mode,
+                            isolation_profile: args.isolation_profile.as_deref(),
                             volumes: &args.volumes,
                         },
                     ))

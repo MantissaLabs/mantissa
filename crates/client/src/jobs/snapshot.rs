@@ -78,6 +78,9 @@ pub struct JobSnapshotView {
     pub successful_workload_id: Option<Uuid>,
     pub retry_not_before: Option<String>,
     pub terminal_exit_code: Option<i32>,
+    pub execution_substrate: String,
+    pub isolation_mode: String,
+    pub isolation_profile: Option<String>,
 }
 
 impl JobSnapshotView {
@@ -122,6 +125,9 @@ impl JobSnapshotView {
             retry_not_before: read_optional_text(reader.get_retry_not_before()?),
             terminal_exit_code: (reader.get_terminal_exit_code() >= 0)
                 .then(|| reader.get_terminal_exit_code()),
+            execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+            isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
+            isolation_profile: read_optional_text(reader.get_isolation_profile()?),
         })
     }
 }
@@ -292,6 +298,19 @@ pub fn render_job_snapshot(snapshot: &JobSnapshotView) -> Result<String> {
     writeln!(&mut tw, "cpu (m)\t{}", snapshot.cpu_millis)?;
     writeln!(&mut tw, "memory (bytes)\t{}", snapshot.memory_bytes)?;
     writeln!(&mut tw, "gpu count\t{}", snapshot.gpu_count)?;
+    writeln!(
+        &mut tw,
+        "execution substrate\t{}",
+        snapshot.execution_substrate
+    )?;
+    writeln!(
+        &mut tw,
+        "isolation\t{}",
+        snapshot.isolation_profile.as_deref().map_or_else(
+            || snapshot.isolation_mode.clone(),
+            |profile| format!("{} ({profile})", snapshot.isolation_mode),
+        )
+    )?;
     writeln!(
         &mut tw,
         "retry policy\t{} retries, {}s backoff",

@@ -1,3 +1,7 @@
+use crate::jobs::runtime::{
+    DEFAULT_EXECUTION_SUBSTRATE, DEFAULT_ISOLATION_MODE, normalize_execution_substrate,
+    normalize_isolation_mode, normalize_isolation_profile,
+};
 use crate::workload_submit::{DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -10,6 +14,12 @@ use uuid::Uuid;
 #[derive(Debug, Deserialize, Clone)]
 pub struct JobManifest {
     pub name: String,
+    #[serde(default = "default_execution_substrate")]
+    pub execution_substrate: String,
+    #[serde(default = "default_isolation_mode")]
+    pub isolation_mode: String,
+    #[serde(default)]
+    pub isolation_profile: Option<String>,
     #[serde(default)]
     pub volumes: Vec<JobVolumeSpec>,
     pub execution: JobExecutionSpec,
@@ -235,6 +245,9 @@ impl JobManifest {
             return Err(anyhow!("job manifest must specify execution.image"));
         }
 
+        normalize_execution_substrate(&self.execution_substrate)?;
+        normalize_isolation_mode(&self.isolation_mode)?;
+
         let declared_volume_names = validate_declared_volumes(&self.volumes)?;
         validate_execution(&self.execution, &declared_volume_names)?;
         Ok(())
@@ -289,8 +302,11 @@ pub fn load_manifest_from_path(path: &Path) -> Result<JobManifest> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read manifest {}", path.display()))?;
 
-    let manifest: JobManifest = ron::from_str(&raw)
+    let mut manifest: JobManifest = ron::from_str(&raw)
         .with_context(|| format!("failed to parse manifest {} as RON", path.display()))?;
+    manifest.execution_substrate = normalize_execution_substrate(&manifest.execution_substrate)?;
+    manifest.isolation_mode = normalize_isolation_mode(&manifest.isolation_mode)?;
+    manifest.isolation_profile = normalize_isolation_profile(manifest.isolation_profile.as_deref());
     manifest.validate()?;
     Ok(manifest)
 }
@@ -546,6 +562,14 @@ fn default_retry_backoff_secs() -> u32 {
     2
 }
 
+fn default_execution_substrate() -> String {
+    DEFAULT_EXECUTION_SUBSTRATE.to_string()
+}
+
+fn default_isolation_mode() -> String {
+    DEFAULT_ISOLATION_MODE.to_string()
+}
+
 fn default_volume_access_mode() -> VolumeAccessMode {
     VolumeAccessMode::ReadWriteOnce
 }
@@ -581,6 +605,9 @@ mod tests {
     fn base_manifest() -> JobManifest {
         JobManifest {
             name: "demo-job".to_string(),
+            execution_substrate: default_execution_substrate(),
+            isolation_mode: default_isolation_mode(),
+            isolation_profile: None,
             volumes: vec![JobVolumeSpec {
                 name: "workspace".to_string(),
                 driver: VolumeDriver::Local(LocalVolumeSpec {
@@ -656,6 +683,21 @@ mod tests {
             error
                 .to_string()
                 .contains("references network 'jobs' multiple times"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// Rejects unknown execution substrate values before submission.
+    #[test]
+    fn manifest_rejects_unknown_execution_substrate() {
+        let mut manifest = base_manifest();
+        manifest.execution_substrate = "baremetal".to_string();
+
+        let error = manifest
+            .validate()
+            .expect_err("unknown execution substrate must fail");
+        assert!(
+            error.to_string().contains("invalid execution substrate"),
             "unexpected error: {error:#}"
         );
     }

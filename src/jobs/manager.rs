@@ -40,7 +40,7 @@ pub struct JobControllerConfig {
     pub health_monitor: Arc<HealthMonitor>,
 }
 
-/// Finite workload controller that turns durable job specs into one task attempt at a time.
+/// Finite workload controller that turns durable job specs into one workload attempt at a time.
 #[derive(Clone)]
 pub struct JobController {
     registry: JobRegistry,
@@ -105,11 +105,22 @@ impl JobController {
         &self,
         name: impl Into<String>,
         execution: crate::workload::types::ResolvedExecutionSpec,
+        execution_substrate: ExecutionSubstrate,
+        isolation_mode: IsolationMode,
+        isolation_profile: Option<String>,
         retry_policy: JobRetryPolicy,
     ) -> Result<JobSubmission> {
         validate_job_execution(&execution)?;
 
-        let spec = JobSpecValue::new(Uuid::new_v4(), name, execution, retry_policy);
+        let spec = JobSpecValue::new(
+            Uuid::new_v4(),
+            name,
+            execution,
+            execution_substrate,
+            isolation_mode,
+            isolation_profile,
+            retry_policy,
+        );
         self.apply_upsert(spec.clone()).await?;
         self.broadcast(JobEvent::Upsert(Box::new(spec.clone())))
             .await?;
@@ -508,9 +519,9 @@ impl JobController {
         let request = WorkloadStartRequest {
             name: format!("{}-attempt-{}", latest.name, latest.attempts_started),
             execution: latest.execution.clone(),
-            execution_substrate: ExecutionSubstrate::Oci,
-            isolation_mode: IsolationMode::Standard,
-            isolation_profile: None,
+            execution_substrate: latest.execution_substrate,
+            isolation_mode: latest.isolation_mode,
+            isolation_profile: latest.isolation_profile.clone(),
             gpu_device_ids: Vec::new(),
             id: Some(workload_id),
             slot_ids: Vec::new(),
@@ -796,6 +807,9 @@ mod tests {
                 volumes: Vec::new(),
                 networks: Vec::new(),
             },
+            ExecutionSubstrate::Oci,
+            IsolationMode::Standard,
+            None,
             JobRetryPolicy::default(),
         )
     }
