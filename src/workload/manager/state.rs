@@ -103,15 +103,12 @@ impl WorkloadManager {
                             "running task instance exited; restarting task runtime per restart policy"
                         );
                     } else {
-                        let mut reason = format!(
-                            "instance exited with status code {exit_code} while task was running"
-                        );
-                        if let Some(exit_error) = exit_error {
-                            reason.push_str(": ");
-                            reason.push_str(exit_error.trim());
-                        }
-                        let _ = self
-                            .mark_task_failed(working.clone(), anyhow!(reason))
+                        let detail = exit_error
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToOwned::to_owned);
+                        self.mark_task_exited(working.clone(), exit_code, detail)
                             .await;
                         return Ok(true);
                     }
@@ -1667,6 +1664,114 @@ impl WorkloadManager {
 
         self.cleanup_orphaned_slots().await;
         error
+    }
+
+    /// Marks a task as exited with one terminal process exit code and frees any owned resources.
+    pub(super) async fn mark_task_exited(
+        &self,
+        mut spec: WorkloadSpec,
+        exit_code: i32,
+        detail: Option<String>,
+    ) {
+        let task_id = spec.id;
+        let mut reason = format!("marking task as exited with status code {exit_code}");
+        if let Some(detail) = detail.as_deref() {
+            reason.push_str(": ");
+            reason.push_str(detail);
+        }
+        warn!(
+            target: "task",
+            task = %spec.name,
+            task_id = %task_id,
+            exit_code,
+            "{reason}"
+        );
+
+        {
+            let mut guard = self.local_state.local_instances.lock().await;
+            guard.remove(&task_id);
+        }
+
+        self.cleanup_secret_artifacts(task_id).await;
+        if let Err(err) = self.unpublish_task_volume_mounts(&spec).await {
+            warn!(
+                target: "task",
+                task = %task_id,
+                "failed to unpublish local volume mounts after exit: {err:#}"
+            );
+        }
+
+        if let Err(err) = self
+            .teardown_runtime_attachments(task_id, HashSet::new(), false)
+            .await
+        {
+            warn!(
+                target: "task",
+                "failed to teardown attachments after exit of {}: {err}",
+                task_id
+            );
+        }
+
+        if !spec.slot_ids.is_empty() {
+            for slot_id in &spec.slot_ids {
+                if let Err(err) = self.release_slot(*slot_id).await {
+                    warn!(
+                        target: "task",
+                        "failed to release slot {} after exit of {}: {err}",
+                        slot_id,
+                        task_id
+                    );
+                }
+            }
+            spec.slot_ids.clear();
+            spec.slot_id = None;
+        }
+
+        if let Ok(current) = self.load_spec(task_id).await {
+            if matches!(current.state, WorkloadPhase::Exited(current_code) if current_code == exit_code)
+                && current.last_terminal_observed_launch == Some(current.launch_attempt)
+                && current.launch_attempt >= spec.launch_attempt
+            {
+                return;
+            }
+            if current.phase_version > spec.phase_version {
+                spec.phase_version = current.phase_version;
+            }
+            if current.launch_attempt > spec.launch_attempt {
+                spec.launch_attempt = current.launch_attempt;
+            }
+            if spec.last_terminal_observed_launch.is_none() {
+                spec.last_terminal_observed_launch = current.last_terminal_observed_launch;
+            }
+        }
+        spec.phase_version = spec.phase_version.saturating_add(1);
+        spec.state = WorkloadPhase::Exited(exit_code);
+        spec.last_terminal_observed_launch = Some(spec.launch_attempt);
+        spec.phase_reason = detail.and_then(|detail| {
+            let trimmed = detail.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+        spec.phase_progress = None;
+        spec.updated_at = Utc::now().to_rfc3339();
+
+        if let Err(err) = self.persist_spec(&spec).await {
+            warn!(
+                target: "task",
+                "failed to persist exited state for task {}: {err}",
+                task_id
+            );
+        } else if let Err(err) = self
+            .enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
+            .await
+        {
+            warn!(
+                target: "task",
+                "failed to broadcast exited state for task {}: {err}",
+                task_id
+            );
+        }
+
+        self.cleanup_orphaned_slots().await;
     }
 
     /// Marks a task as blocked on local volume availability while preserving its reservations.

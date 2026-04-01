@@ -1,18 +1,35 @@
 #[macro_use]
 mod common;
 
-use chrono::Utc;
+use async_trait::async_trait;
 use common::convergence::wait_until;
-use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
-use crdt_store::uuid_key::UuidKey;
-use mantissa::task::types::{TaskStateFilter, TaskValue};
-use mantissa::workload::model::{ExecutionSubstrate, IsolationMode, WorkloadPhase, WorkloadSpec};
+use common::testkit::{
+    ClusterConfig, InMemoryRuntimeBackend, RuntimeBackendOverrideGuard, TestNode,
+};
+use mantissa::runtime::types::{
+    RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeEvent,
+    RuntimeInfo,
+};
+use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport};
+use mantissa::task::types::TaskStateFilter;
+use mantissa::workload::model::{ExecutionSubstrate, IsolationMode};
+use net::noise::NoiseKeys;
 use protocol::jobs::{JobStatus as ProtoJobStatus, jobs};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
+use tempfile::tempdir;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::sleep;
 use uuid::Uuid;
 
 local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
-    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let backend = Arc::new(ControllableExitRuntimeBackend::default());
+    let _guard = RuntimeBackendOverrideGuard::install(backend.clone());
     let node = TestNode::new().await;
 
     let job_id = submit_job(&node.node.jobs_client, "demo-job", 0, 0)
@@ -37,22 +54,10 @@ local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
         "inspect should expose the active workload attempt through the jobs surface"
     );
 
-    let mut task = node
-        .node
-        .workload_manager
-        .inspect_workload(active_workload_id)
+    backend
+        .signal_workload_exit(active_workload_id, 0)
         .await
-        .expect("inspect job workload");
-    task.state = WorkloadPhase::Exited(0);
-    task.updated_at = Utc::now().to_rfc3339();
-    node.node
-        .workloads
-        .upsert(
-            &UuidKey::from(active_workload_id),
-            task_spec_to_value(&task),
-        )
-        .await
-        .expect("persist successful workload state");
+        .expect("emit successful runtime exit");
 
     assert!(
         wait_for_job_status(
@@ -67,7 +72,8 @@ local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
 });
 
 local_test!(jobs_retry_after_failed_task, {
-    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let backend = Arc::new(ControllableExitRuntimeBackend::default());
+    let _guard = RuntimeBackendOverrideGuard::install(backend.clone());
     let node = TestNode::new().await;
 
     let job_id = submit_job(&node.node.jobs_client, "retry-job", 1, 0)
@@ -79,19 +85,10 @@ local_test!(jobs_retry_after_failed_task, {
             .await
             .expect("job should launch first workload");
 
-    let mut task = node
-        .node
-        .workload_manager
-        .inspect_workload(first_workload_id)
+    backend
+        .signal_workload_exit(first_workload_id, 1)
         .await
-        .expect("inspect first job workload");
-    task.state = WorkloadPhase::Exited(1);
-    task.updated_at = Utc::now().to_rfc3339();
-    node.node
-        .workloads
-        .upsert(&UuidKey::from(first_workload_id), task_spec_to_value(&task))
-        .await
-        .expect("persist failed workload state");
+        .expect("emit failed runtime exit");
 
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
@@ -163,7 +160,8 @@ local_test!(jobs_cancel_running_job_reaches_cancelled, {
 });
 
 local_test!(jobs_delete_requires_terminal_state_and_removes_job, {
-    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let backend = Arc::new(ControllableExitRuntimeBackend::default());
+    let _guard = RuntimeBackendOverrideGuard::install(backend.clone());
     let node = TestNode::new().await;
 
     let job_id = submit_job(&node.node.jobs_client, "delete-job", 0, 0)
@@ -183,22 +181,10 @@ local_test!(jobs_delete_requires_terminal_state_and_removes_job, {
             .await
             .expect("job should launch one workload");
 
-    let mut task = node
-        .node
-        .workload_manager
-        .inspect_workload(active_workload_id)
+    backend
+        .signal_workload_exit(active_workload_id, 0)
         .await
-        .expect("inspect job workload");
-    task.state = WorkloadPhase::Exited(0);
-    task.updated_at = Utc::now().to_rfc3339();
-    node.node
-        .workloads
-        .upsert(
-            &UuidKey::from(active_workload_id),
-            task_spec_to_value(&task),
-        )
-        .await
-        .expect("persist successful workload state");
+        .expect("emit successful runtime exit");
 
     assert!(
         wait_for_job_status(
@@ -281,6 +267,212 @@ local_test!(jobs_runtime_selection_reaches_workload_attempts, {
                 && attempt.isolation_profile.as_deref() == Some("oci-default")
         }),
         "derived attempt summaries should expose the requested runtime selection"
+    );
+});
+
+local_test!(jobs_retry_backoff_survives_controller_restart, {
+    let state_dir = tempdir().expect("state dir");
+    let db_path = state_dir.path().join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+    let self_id = Uuid::new_v4();
+    let noise_keys = Arc::new(NoiseKeys::from_private_bytes([0x21; 32]));
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[0x31; 32]);
+    let local_volume_root = state_dir.path().join("volumes");
+    let runtime = Arc::new(ControllableExitRuntimeBackend::default());
+
+    let mut node = create_restartable_job_node(
+        db.clone(),
+        self_id,
+        HeadlessKeys::new(noise_keys.clone(), signing.clone()),
+        runtime.clone(),
+        local_volume_root.clone(),
+    )
+    .await;
+
+    let job_id = submit_job(&node.jobs_client, "restartable-job", 1, 3)
+        .await
+        .expect("submit restartable job");
+
+    let first_workload_id =
+        wait_for_active_workload(&node.jobs_client, job_id, Duration::from_secs(5))
+            .await
+            .expect("job should launch first workload before restart");
+    runtime
+        .signal_workload_exit(first_workload_id, 1)
+        .await
+        .expect("emit failed runtime exit");
+
+    assert!(
+        wait_for_job_status(
+            &node.jobs_client,
+            job_id,
+            ProtoJobStatus::Retrying,
+            Duration::from_secs(10)
+        )
+        .await,
+        "job should enter retrying before restart"
+    );
+
+    node.stop().await.expect("stop restartable node");
+    drop(node);
+
+    let restarted = create_restartable_job_node(
+        db,
+        self_id,
+        HeadlessKeys::new(noise_keys, signing),
+        runtime.clone(),
+        local_volume_root,
+    )
+    .await;
+
+    assert!(
+        !wait_until(Duration::from_secs(1), Duration::from_millis(100), || {
+            let client = restarted.jobs_client.clone();
+            async move {
+                let jobs = list_jobs(&client).await.expect("list jobs after restart");
+                jobs.iter().any(|job| {
+                    job.id == job_id
+                        && job.attempts_started >= 2
+                        && job
+                            .active_workload_id
+                            .is_some_and(|workload_id| workload_id != first_workload_id)
+                })
+            }
+        })
+        .await,
+        "job should not launch the retry immediately after restart while backoff is still active"
+    );
+
+    let second_workload_id = wait_for_active_workload_transition(
+        &restarted.jobs_client,
+        job_id,
+        Some(first_workload_id),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("job should launch retry attempt after persisted backoff");
+
+    runtime
+        .signal_workload_exit(second_workload_id, 0)
+        .await
+        .expect("emit successful runtime exit after restart");
+
+    assert!(
+        wait_for_job_status(
+            &restarted.jobs_client,
+            job_id,
+            ProtoJobStatus::Succeeded,
+            Duration::from_secs(10)
+        )
+        .await,
+        "restarted controller should complete the retried job successfully"
+    );
+});
+
+local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
+    let backends: Vec<Arc<ControllableExitRuntimeBackend>> = (0..3)
+        .map(|_| Arc::new(ControllableExitRuntimeBackend::default()))
+        .collect();
+    let next_backend = Arc::new(AtomicUsize::new(0));
+    let backend_sequence = backends.clone();
+    let _guard = RuntimeBackendOverrideGuard::install_factory(Arc::new(move || {
+        let index = next_backend.fetch_add(1, Ordering::Relaxed);
+        let backend: Arc<dyn RuntimeBackend + Send + Sync> = backend_sequence
+            .get(index)
+            .expect("runtime backend for cluster node")
+            .clone();
+        backend
+    }));
+    let cluster = TestNode::new_cluster_inproc_with_config(
+        3,
+        ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            ..ClusterConfig::default()
+        },
+    )
+    .await
+    .expect("create jobs failover cluster");
+
+    let job_id = submit_job(&cluster[0].node.jobs_client, "failover-job", 1, 2)
+        .await
+        .expect("submit failover job");
+    let first_workload_id =
+        wait_for_active_workload(&cluster[0].node.jobs_client, job_id, Duration::from_secs(5))
+            .await
+            .expect("job should launch first workload");
+    let first_attempt = cluster[0]
+        .node
+        .workload_manager
+        .inspect_workload(first_workload_id)
+        .await
+        .expect("inspect first workload");
+    let first_backend = backend_for_node(&cluster, &backends, first_attempt.node_id);
+    first_backend
+        .signal_workload_exit(first_workload_id, 1)
+        .await
+        .expect("emit failed first workload exit");
+
+    assert!(
+        wait_for_job_status(
+            &cluster[0].node.jobs_client,
+            job_id,
+            ProtoJobStatus::Retrying,
+            Duration::from_secs(10)
+        )
+        .await,
+        "job should enter retrying before owner failover"
+    );
+
+    let owner_id = select_job_owner_for_test(job_id, &cluster_ids(&cluster)).expect("job owner");
+    let owner_index = cluster
+        .iter()
+        .position(|node| node.id() == owner_id)
+        .expect("owner index");
+    cluster[owner_index].leave().await.expect("owner leave");
+
+    for (index, node) in cluster.iter().enumerate() {
+        if index != owner_index {
+            node.assert_cluster_size(2, "remaining nodes should converge after owner leave")
+                .await;
+        }
+    }
+
+    let observer = cluster
+        .iter()
+        .enumerate()
+        .find_map(|(index, node)| (index != owner_index).then_some(node))
+        .expect("remaining observer");
+    let second_workload_id = wait_for_active_workload_transition(
+        &observer.node.jobs_client,
+        job_id,
+        Some(first_workload_id),
+        Duration::from_secs(12),
+    )
+    .await
+    .expect("remaining owner should launch retry attempt after failover");
+
+    let second_attempt = observer
+        .node
+        .workload_manager
+        .inspect_workload(second_workload_id)
+        .await
+        .expect("inspect second workload");
+    let second_backend = backend_for_node(&cluster, &backends, second_attempt.node_id);
+    second_backend
+        .signal_workload_exit(second_workload_id, 0)
+        .await
+        .expect("emit successful retry exit after failover");
+
+    assert!(
+        wait_for_job_status(
+            &observer.node.jobs_client,
+            job_id,
+            ProtoJobStatus::Succeeded,
+            Duration::from_secs(10)
+        )
+        .await,
+        "remaining cluster should complete the job after owner failover"
     );
 });
 
@@ -492,49 +684,6 @@ async fn wait_for_job_status(
     .await
 }
 
-/// Rebuilds one workload-store value from the current task spec so tests can inject state transitions.
-fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
-    TaskValue {
-        id: spec.id,
-        name: spec.name.clone(),
-        image: spec.image.clone(),
-        execution_substrate: spec.execution_substrate,
-        isolation_mode: spec.isolation_mode,
-        isolation_profile: spec.isolation_profile.clone(),
-        state: spec.state.clone(),
-        phase_reason: spec.phase_reason.clone(),
-        phase_progress: spec.phase_progress.clone(),
-        created_at: spec.created_at.clone(),
-        updated_at: spec.updated_at.clone(),
-        command: spec.command.clone(),
-        tty: spec.tty,
-        node_id: spec.node_id,
-        node_name: spec.node_name.clone(),
-        slot_ids: spec.slot_ids.clone(),
-        slot_id: spec.slot_id,
-        cpu_millis: spec.cpu_millis,
-        memory_bytes: spec.memory_bytes,
-        gpu_count: spec.gpu_count,
-        gpu_device_ids: spec.gpu_device_ids.clone(),
-        restart_policy: spec.restart_policy.clone(),
-        termination_grace_period_secs: spec.termination_grace_period_secs,
-        pre_stop_command: spec.pre_stop_command.clone(),
-        liveness: spec.liveness.clone(),
-        env: spec.env.clone(),
-        secret_files: spec.secret_files.clone(),
-        volumes: spec.volumes.clone(),
-        networks: spec.networks.clone(),
-        owner: spec.owner.clone(),
-        lease_id: spec.lease_id,
-        lease_coordinator_node_id: spec.lease_coordinator_node_id,
-        task_epoch: spec.task_epoch,
-        phase_version: spec.phase_version,
-        launch_attempt: spec.launch_attempt,
-        last_terminal_observed_launch: spec.last_terminal_observed_launch,
-        definition_complete: true,
-    }
-}
-
 /// Decodes one required UUID from a 16-byte protocol field.
 fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, capnp::Error> {
     let bytes = data.to_owned();
@@ -559,4 +708,246 @@ fn read_optional_uuid(data: capnp::data::Reader<'_>) -> Option<Uuid> {
 fn read_optional_text(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Waits until a job exposes a different active workload than one optional previous attempt.
+async fn wait_for_active_workload_transition(
+    client: &jobs::Client,
+    job_id: Uuid,
+    previous: Option<Uuid>,
+    timeout: Duration,
+) -> Option<Uuid> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let jobs = list_jobs(client).await.expect("list jobs");
+        if let Some(workload_id) = jobs
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .and_then(|job| job.active_workload_id)
+            .filter(|workload_id| Some(*workload_id) != previous)
+        {
+            return Some(workload_id);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Returns the deterministic rendezvous owner for one job from the provided cluster node ids.
+fn select_job_owner_for_test(job_id: Uuid, candidates: &[Uuid]) -> Option<Uuid> {
+    let mut best: Option<(Uuid, u128)> = None;
+    for node_id in candidates {
+        let score = job_owner_score_for_test(job_id, *node_id);
+        match best {
+            None => best = Some((*node_id, score)),
+            Some((_, best_score)) if score > best_score => best = Some((*node_id, score)),
+            _ => {}
+        }
+    }
+    best.map(|(node_id, _)| node_id)
+}
+
+/// Computes the same rendezvous score used by the job controller to select one owner.
+fn job_owner_score_for_test(job_id: Uuid, node_id: Uuid) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"job-owner");
+    hasher.update(job_id.as_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
+}
+
+/// Returns the cluster node ids in a deterministic slice order.
+fn cluster_ids(cluster: &[TestNode]) -> Vec<Uuid> {
+    cluster.iter().map(TestNode::id).collect()
+}
+
+/// Resolves the controllable runtime backend hosting one workload by node id.
+fn backend_for_node<'a>(
+    cluster: &'a [TestNode],
+    backends: &'a [Arc<ControllableExitRuntimeBackend>],
+    node_id: Uuid,
+) -> Arc<ControllableExitRuntimeBackend> {
+    let index = cluster
+        .iter()
+        .position(|node| node.id() == node_id)
+        .expect("backend node");
+    backends[index].clone()
+}
+
+/// Creates one restartable headless node backed by the provided durable state and runtime.
+async fn create_restartable_job_node(
+    db: Arc<redb::Database>,
+    self_id: Uuid,
+    keys: HeadlessKeys,
+    runtime_backend: Arc<dyn RuntimeBackend + Send + Sync>,
+    local_volume_root: PathBuf,
+) -> HeadlessNode {
+    HeadlessNode::new_with(
+        db,
+        self_id,
+        keys,
+        HeadlessConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            transport: HeadlessTransport::Inproc,
+            sync_tick: Some(Duration::from_millis(100)),
+            sync_fanout: None,
+            global_metadata_sync_tick: Some(Duration::from_millis(100)),
+            global_metadata_sync_fanout: None,
+            gossip_tick: Some(Duration::from_millis(100)),
+            gossip_fanout: None,
+            gossip_channel_capacity: None,
+            task_runtime: None,
+            runtime_backend: Some(runtime_backend),
+            local_volume_root: Some(local_volume_root),
+        },
+    )
+    .await
+    .expect("start restartable job node")
+}
+
+#[derive(Default)]
+/// Emits controllable runtime exit events for started workloads.
+///
+/// Jobs need real runtime-backed terminal transitions for success, retry, and
+/// restart coverage. This backend keeps the shared in-memory runtime behavior
+/// but lets tests inject one explicit exit signal for a chosen workload id.
+struct ControllableExitRuntimeBackend {
+    inner: InMemoryRuntimeBackend,
+    runtime_ids_by_workload: AsyncMutex<HashMap<Uuid, String>>,
+    runtime_events_tx: AsyncMutex<Option<tokio::sync::mpsc::UnboundedSender<RuntimeEvent>>>,
+    pending_runtime_events: AsyncMutex<Vec<RuntimeEvent>>,
+}
+
+impl ControllableExitRuntimeBackend {
+    /// Emits one explicit task-exit event for the selected workload id.
+    async fn signal_workload_exit(
+        &self,
+        workload_id: Uuid,
+        exit_code: i32,
+    ) -> Result<(), RuntimeError> {
+        if let Some(runtime_id) = self
+            .runtime_ids_by_workload
+            .lock()
+            .await
+            .get(&workload_id)
+            .cloned()
+        {
+            self.inner.stop_instance(&runtime_id, None).await?;
+        }
+        let event = RuntimeEvent::TaskExited {
+            task_id: workload_id,
+            exit_code,
+        };
+        let sender = self.runtime_events_tx.lock().await.clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(event);
+        } else {
+            self.pending_runtime_events.lock().await.push(event);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RuntimeBackend for ControllableExitRuntimeBackend {
+    async fn create_instance(&self, request: RuntimeCreateRequest) -> Result<String, RuntimeError> {
+        let workload_id = request
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("mantissa.workload_id"))
+            .and_then(|raw| Uuid::parse_str(raw).ok());
+        let runtime_id = self.inner.create_instance(request).await?;
+        if let Some(workload_id) = workload_id {
+            self.runtime_ids_by_workload
+                .lock()
+                .await
+                .insert(workload_id, runtime_id.clone());
+        }
+        Ok(runtime_id)
+    }
+
+    async fn start_instance(&self, runtime_id: &str) -> Result<(), RuntimeError> {
+        self.inner.start_instance(runtime_id).await
+    }
+
+    async fn stop_instance(
+        &self,
+        runtime_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<(), RuntimeError> {
+        self.inner.stop_instance(runtime_id, timeout).await
+    }
+
+    async fn restart_instance(
+        &self,
+        runtime_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<(), RuntimeError> {
+        self.inner.restart_instance(runtime_id, timeout).await
+    }
+
+    async fn remove_instance(
+        &self,
+        runtime_id: &str,
+        force: bool,
+        remove_volumes: bool,
+    ) -> Result<(), RuntimeError> {
+        if let Some(workload_id) = self.runtime_ids_by_workload.lock().await.iter().find_map(
+            |(workload_id, current_runtime_id)| {
+                (current_runtime_id == runtime_id).then_some(*workload_id)
+            },
+        ) {
+            self.runtime_ids_by_workload
+                .lock()
+                .await
+                .remove(&workload_id);
+        }
+        self.inner
+            .remove_instance(runtime_id, force, remove_volumes)
+            .await
+    }
+
+    async fn list_instances(
+        &self,
+        filters: Option<HashMap<String, Vec<String>>>,
+    ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
+        self.inner.list_instances(filters).await
+    }
+
+    async fn inspect_instance(&self, runtime_id: &str) -> Result<RuntimeInfo, RuntimeError> {
+        self.inner.inspect_instance(runtime_id).await
+    }
+
+    async fn pull_image(&self, image: &str) -> Result<(), RuntimeError> {
+        self.inner.pull_image(image).await
+    }
+
+    fn capabilities(&self) -> RuntimeCapabilities {
+        let mut capabilities = self.inner.capabilities();
+        capabilities.lifecycle_events = true;
+        capabilities
+    }
+
+    async fn watch_runtime_events(
+        &self,
+        events_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<(), RuntimeError> {
+        let pending = {
+            let mut pending = self.pending_runtime_events.lock().await;
+            std::mem::take(&mut *pending)
+        };
+        *self.runtime_events_tx.lock().await = Some(events_tx.clone());
+        for event in pending {
+            let _ = events_tx.send(event);
+        }
+        while !events_tx.is_closed() {
+            sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
 }

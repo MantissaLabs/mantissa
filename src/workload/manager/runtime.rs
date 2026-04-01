@@ -448,7 +448,7 @@ impl WorkloadManager {
             return Ok(());
         }
 
-        let _ = self.mark_task_failed(spec, anyhow::anyhow!(reason)).await;
+        self.mark_task_exited(spec, exit_code, Some(reason)).await;
         Ok(())
     }
 

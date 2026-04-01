@@ -2390,7 +2390,7 @@ async fn reconcile_running_task_restarts_when_container_is_missing() {
 }
 
 #[tokio::test]
-async fn reconcile_running_task_marks_failed_when_container_exits_without_restart_policy() {
+async fn reconcile_running_task_marks_exited_when_container_exits_without_restart_policy() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -2434,15 +2434,15 @@ async fn reconcile_running_task_marks_failed_when_container_exits_without_restar
     manager
         .reconcile_local_task(spec.clone())
         .await
-        .expect("reconcile should mark terminal exit as failed");
+        .expect("reconcile should mark terminal exit as exited");
 
     let refreshed = manager
         .load_spec(spec.id)
         .await
         .expect("load refreshed spec");
     assert!(
-        matches!(refreshed.state, WorkloadPhase::Failed),
-        "task should transition to failed after terminal container exit"
+        matches!(refreshed.state, WorkloadPhase::Exited(255)),
+        "task should transition to exited after terminal container exit"
     );
     assert_eq!(
         mock_cm.created.lock().await.len(),
@@ -2459,7 +2459,7 @@ async fn reconcile_running_task_marks_failed_when_container_exits_without_restar
         .expect("slot entry");
     assert!(
         matches!(slot.state, SlotState::Free),
-        "failed task should release its reserved slot"
+        "exited task should release its reserved slot"
     );
 }
 
