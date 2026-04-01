@@ -5,6 +5,10 @@ short-lived service and it is not just a renamed direct task. A job is a
 durable controller record that owns retry, cancellation, and terminal outcome
 semantics for one repeated execution template.
 
+For the controller architecture, ownership model, failover behavior, and code
+layout behind that operator surface, see
+[docs/jobs-control-plane.md](/Users/abronan/hack/mantissa/docs/jobs-control-plane.md).
+
 The simplest way to read the model is:
 
 - a job is the durable controller object,
