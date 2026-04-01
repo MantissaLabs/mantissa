@@ -19,6 +19,10 @@ local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
     let job_id = submit_job(&node.node.jobs_client, "demo-job", 0, 0)
         .await
         .expect("submit job");
+    let inspected = inspect_job(&node.node.jobs_client, job_id)
+        .await
+        .expect("inspect submitted job");
+    assert_eq!(inspected.id, job_id);
 
     let active_workload_id =
         wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
@@ -112,7 +116,113 @@ local_test!(jobs_retry_after_failed_task, {
     );
 });
 
-#[derive(Clone, Copy)]
+local_test!(jobs_cancel_running_job_reaches_cancelled, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let job_id = submit_job(&node.node.jobs_client, "cancel-job", 0, 0)
+        .await
+        .expect("submit cancellable job");
+
+    let active_workload_id =
+        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
+            .await
+            .expect("job should launch one workload before cancellation");
+
+    let snapshot = cancel_job(&node.node.jobs_client, job_id)
+        .await
+        .expect("cancel job");
+    assert_eq!(snapshot.id, job_id);
+    assert!(
+        matches!(
+            snapshot.status,
+            ProtoJobStatus::Cancelling | ProtoJobStatus::Cancelled
+        ),
+        "cancel should move the job into cancelling or cancelled state"
+    );
+    assert_eq!(snapshot.active_workload_id, Some(active_workload_id));
+
+    assert!(
+        wait_for_job_status(
+            &node.node.jobs_client,
+            job_id,
+            ProtoJobStatus::Cancelled,
+            Duration::from_secs(10)
+        )
+        .await,
+        "job should converge to cancelled after the active workload is stopped"
+    );
+});
+
+local_test!(jobs_delete_requires_terminal_state_and_removes_job, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let job_id = submit_job(&node.node.jobs_client, "delete-job", 0, 0)
+        .await
+        .expect("submit deletable job");
+
+    let delete_error = delete_job(&node.node.jobs_client, job_id)
+        .await
+        .expect_err("non-terminal delete should fail");
+    assert!(
+        delete_error.to_string().contains("not terminal"),
+        "delete error should explain that the job must be terminal first"
+    );
+
+    let active_workload_id =
+        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
+            .await
+            .expect("job should launch one workload");
+
+    let mut task = node
+        .node
+        .workload_manager
+        .inspect_workload(active_workload_id)
+        .await
+        .expect("inspect job workload");
+    task.state = WorkloadPhase::Exited(0);
+    task.updated_at = Utc::now().to_rfc3339();
+    node.node
+        .workloads
+        .upsert(
+            &UuidKey::from(active_workload_id),
+            task_spec_to_value(&task),
+        )
+        .await
+        .expect("persist successful workload state");
+
+    assert!(
+        wait_for_job_status(
+            &node.node.jobs_client,
+            job_id,
+            ProtoJobStatus::Succeeded,
+            Duration::from_secs(10)
+        )
+        .await,
+        "job should converge to succeeded before delete"
+    );
+
+    let removed = delete_job(&node.node.jobs_client, job_id)
+        .await
+        .expect("delete terminal job");
+    assert_eq!(removed.id, job_id);
+    assert_eq!(removed.status, ProtoJobStatus::Succeeded);
+
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+            let client = node.node.jobs_client.clone();
+            async move {
+                let jobs = list_jobs(&client).await.expect("list jobs");
+                jobs.into_iter().all(|job| job.id != job_id)
+            }
+        })
+        .await,
+        "deleted job should disappear from the replicated jobs surface"
+    );
+});
+
+#[derive(Clone, Copy, Debug)]
 struct JobSnapshot {
     id: Uuid,
     status: ProtoJobStatus,
@@ -164,6 +274,48 @@ async fn list_jobs(client: &jobs::Client) -> Result<Vec<JobSnapshot>, capnp::Err
         });
     }
     Ok(snapshots)
+}
+
+/// Loads one replicated job snapshot by its durable identifier.
+async fn inspect_job(client: &jobs::Client, job_id: Uuid) -> Result<JobSnapshot, capnp::Error> {
+    let mut request = client.inspect_request();
+    request.get().set_id(job_id.as_bytes());
+    let response = request.send().promise.await?;
+    let reader = response.get()?.get_job()?;
+    Ok(JobSnapshot {
+        id: read_uuid(reader.get_id()?)?,
+        status: reader.get_status()?,
+        attempts_started: reader.get_attempts_started(),
+        active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
+    })
+}
+
+/// Requests cancellation for one job through the jobs capability.
+async fn cancel_job(client: &jobs::Client, job_id: Uuid) -> Result<JobSnapshot, capnp::Error> {
+    let mut request = client.cancel_request();
+    request.get().set_id(job_id.as_bytes());
+    let response = request.send().promise.await?;
+    let reader = response.get()?.get_job()?;
+    Ok(JobSnapshot {
+        id: read_uuid(reader.get_id()?)?,
+        status: reader.get_status()?,
+        attempts_started: reader.get_attempts_started(),
+        active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
+    })
+}
+
+/// Deletes one terminal job through the jobs capability.
+async fn delete_job(client: &jobs::Client, job_id: Uuid) -> Result<JobSnapshot, capnp::Error> {
+    let mut request = client.delete_request();
+    request.get().set_id(job_id.as_bytes());
+    let response = request.send().promise.await?;
+    let reader = response.get()?.get_job()?;
+    Ok(JobSnapshot {
+        id: read_uuid(reader.get_id()?)?,
+        status: reader.get_status()?,
+        attempts_started: reader.get_attempts_started(),
+        active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
+    })
 }
 
 /// Waits until the selected job exposes one active workload identifier.

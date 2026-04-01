@@ -122,6 +122,93 @@ impl JobController {
         self.registry.list()
     }
 
+    /// Returns the canonical current job value for one replicated identifier.
+    pub fn inspect_job(&self, job_id: Uuid) -> Result<Option<JobSpecValue>> {
+        self.registry.get(job_id)
+    }
+
+    /// Requests cancellation for one job and returns its updated controller snapshot.
+    ///
+    /// Cancellation first records controller intent so stale owners stop launching new attempts,
+    /// then asks the shared workload manager to stop the active workload when one exists.
+    pub async fn cancel_job(&self, job_id: Uuid) -> Result<JobSpecValue> {
+        let spec = self
+            .registry
+            .get(job_id)?
+            .ok_or_else(|| anyhow!("unknown job {job_id}"))?;
+        if spec.is_terminal() {
+            return Ok(spec);
+        }
+
+        if let Some(workload_id) = spec.active_workload_id
+            && let Ok(workload) = self.workload_manager.inspect_workload(workload_id).await
+            && workload_phase_is_terminal(&workload.state)
+        {
+            self.adopt_observed_task(spec, workload).await?;
+            return self.registry.get(job_id)?.ok_or_else(|| {
+                anyhow!("job {job_id} disappeared while adopting terminal workload state")
+            });
+        }
+
+        let mut updated = self.registry.get(job_id)?.ok_or_else(|| {
+            anyhow!("job {job_id} disappeared before cancellation could be recorded")
+        })?;
+        if updated.is_terminal() {
+            return Ok(updated);
+        }
+
+        let active_workload_id = updated.active_workload_id;
+        if active_workload_id.is_some() {
+            updated.mark_cancelling(Some("cancellation requested".to_string()));
+        } else {
+            updated.mark_cancelled(
+                updated.last_workload_id,
+                Some("cancelled before launching a workload attempt".to_string()),
+            );
+        }
+
+        self.apply_upsert(updated.clone()).await?;
+        self.broadcast(JobEvent::Upsert(Box::new(updated.clone())))
+            .await?;
+
+        if let Some(workload_id) = active_workload_id {
+            if let Err(error) = self
+                .workload_manager
+                .request_workload_stop(workload_id)
+                .await
+            {
+                warn!(
+                    target: "jobs",
+                    job_id = %updated.id,
+                    workload_id = %workload_id,
+                    "failed to request workload stop while cancelling job '{}': {error:#}",
+                    updated.name,
+                );
+            }
+            self.maybe_spawn_reconcile_for_job(updated.id).await;
+        }
+
+        Ok(updated)
+    }
+
+    /// Deletes one terminal job record from the replicated controller store.
+    pub async fn delete_job(&self, job_id: Uuid) -> Result<JobSpecValue> {
+        let spec = self
+            .registry
+            .get(job_id)?
+            .ok_or_else(|| anyhow!("unknown job {job_id}"))?;
+        if !spec.is_terminal() {
+            return Err(anyhow!(
+                "job {} ({job_id}) is not terminal; cancel it and wait for completion before deleting",
+                spec.name
+            ));
+        }
+
+        self.apply_remove(job_id).await?;
+        self.broadcast(JobEvent::Remove { id: job_id }).await?;
+        Ok(spec)
+    }
+
     /// Applies one inbound job gossip event to the durable registry.
     async fn handle_event(&self, event: JobEvent) -> Result<()> {
         match event {
@@ -245,10 +332,8 @@ impl JobController {
             JobStatus::Pending => self.reconcile_pending_job(spec).await,
             JobStatus::Running => self.reconcile_running_job(spec).await,
             JobStatus::Retrying => self.reconcile_retrying_job(spec).await,
-            JobStatus::Cancelling
-            | JobStatus::Succeeded
-            | JobStatus::Failed
-            | JobStatus::Cancelled => Ok(()),
+            JobStatus::Cancelling => self.reconcile_cancelling_job(spec).await,
+            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled => Ok(()),
         }
     }
 
@@ -320,13 +405,88 @@ impl JobController {
         }
     }
 
+    /// Reconciles one cancelling job until its active workload attempt has fully stopped.
+    async fn reconcile_cancelling_job(&self, spec: JobSpecValue) -> Result<()> {
+        let Some(workload_id) = spec.active_workload_id else {
+            let mut current = match self.registry.get(spec.id)? {
+                Some(current) => current,
+                None => return Ok(()),
+            };
+            if current.is_terminal() || current.status != JobStatus::Cancelling {
+                return Ok(());
+            }
+            current.mark_cancelled(current.last_workload_id, Some("cancelled".to_string()));
+            self.apply_upsert(current.clone()).await?;
+            self.broadcast(JobEvent::Upsert(Box::new(current))).await?;
+            return Ok(());
+        };
+
+        match self.workload_manager.inspect_workload(workload_id).await {
+            Ok(workload) => {
+                if workload_phase_is_terminal(&workload.state) {
+                    let mut current = match self.registry.get(spec.id)? {
+                        Some(current) => current,
+                        None => return Ok(()),
+                    };
+                    if current.is_terminal()
+                        || current.status != JobStatus::Cancelling
+                        || current.active_workload_id != Some(workload_id)
+                    {
+                        return Ok(());
+                    }
+                    current.mark_cancelled(Some(workload_id), Some("cancelled".to_string()));
+                    self.apply_upsert(current.clone()).await?;
+                    self.broadcast(JobEvent::Upsert(Box::new(current))).await?;
+                    return Ok(());
+                }
+
+                if let Err(error) = self
+                    .workload_manager
+                    .request_workload_stop(workload_id)
+                    .await
+                {
+                    warn!(
+                        target: "jobs",
+                        job_id = %spec.id,
+                        workload_id = %workload_id,
+                        "failed to keep cancelling job '{}' while stopping workload: {error:#}",
+                        spec.name,
+                    );
+                }
+                Ok(())
+            }
+            Err(_) => {
+                let mut current = match self.registry.get(spec.id)? {
+                    Some(current) => current,
+                    None => return Ok(()),
+                };
+                if current.is_terminal()
+                    || current.status != JobStatus::Cancelling
+                    || current.active_workload_id != Some(workload_id)
+                {
+                    return Ok(());
+                }
+                current.mark_cancelled(
+                    Some(workload_id),
+                    Some("cancelled after the workload attempt disappeared".to_string()),
+                );
+                self.apply_upsert(current.clone()).await?;
+                self.broadcast(JobEvent::Upsert(Box::new(current))).await?;
+                Ok(())
+            }
+        }
+    }
+
     /// Launches one previously reserved workload attempt using the shared workload manager.
     async fn launch_reserved_attempt(&self, spec: JobSpecValue, workload_id: Uuid) -> Result<()> {
         let latest = match self.registry.get(spec.id)? {
             Some(current) => current,
             None => return Ok(()),
         };
-        if latest.is_terminal() || latest.active_workload_id != Some(workload_id) {
+        if latest.is_terminal()
+            || latest.status != JobStatus::Pending
+            || latest.active_workload_id != Some(workload_id)
+        {
             return Ok(());
         }
 
@@ -530,6 +690,14 @@ fn node_is_down(node_id: Uuid, health_snapshot: &HashMap<Uuid, HealthStatus>) ->
     matches!(health_snapshot.get(&node_id), Some(HealthStatus::Down))
 }
 
+/// Returns whether one workload phase already represents a terminal job-attempt outcome.
+fn workload_phase_is_terminal(phase: &WorkloadPhase) -> bool {
+    matches!(
+        phase,
+        WorkloadPhase::Exited(_) | WorkloadPhase::Failed | WorkloadPhase::Stopped
+    )
+}
+
 /// Builds the deterministic set of nodes eligible to own one job reconciliation loop.
 fn build_eligible_nodes<I>(
     local_node_id: Uuid,
@@ -620,6 +788,23 @@ mod tests {
         let selected = select_best_job_spec(&[stale, latest.clone()]).expect("selected latest job");
         assert_eq!(selected.attempts_started, latest.attempts_started);
         assert_eq!(selected.active_workload_id, latest.active_workload_id);
+    }
+
+    /// Ensures a later cancellation update wins over the earlier pending reservation.
+    #[test]
+    fn later_cancelling_state_beats_reserved_pending_launch() {
+        let workload_id = Uuid::new_v4();
+
+        let mut pending = test_job();
+        pending.reserve_attempt(workload_id);
+
+        let mut cancelling = pending.clone();
+        cancelling.mark_cancelling(Some("operator requested cancellation".to_string()));
+
+        let selected =
+            select_best_job_spec(&[pending, cancelling.clone()]).expect("selected cancelling job");
+        assert_eq!(selected.status, JobStatus::Cancelling);
+        assert_eq!(selected.active_workload_id, Some(workload_id));
     }
 
     /// Ensures owner selection stays deterministic regardless of candidate ordering.

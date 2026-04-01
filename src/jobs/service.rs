@@ -73,6 +73,60 @@ impl jobs::Server for JobsRpc {
         }
         Ok(())
     }
+
+    /// Inspects one replicated first-class job by its durable identifier.
+    async fn inspect(
+        self: Rc<Self>,
+        params: jobs::InspectParams,
+        mut results: jobs::InspectResults,
+    ) -> Result<(), Error> {
+        let job_id = read_uuid(params.get()?.get_id()?)?;
+        let value = self
+            .manager
+            .inspect_job(job_id)
+            .map_err(|error| Error::failed(error.to_string()))?
+            .ok_or_else(|| Error::failed(format!("unknown job {job_id}")))?;
+        write_job_snapshot(results.get().init_job(), &value)?;
+        Ok(())
+    }
+
+    /// Requests cancellation for one job and returns the updated controller snapshot.
+    async fn cancel(
+        self: Rc<Self>,
+        params: jobs::CancelParams,
+        mut results: jobs::CancelResults,
+    ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("cancel jobs")?;
+
+        let job_id = read_uuid(params.get()?.get_id()?)?;
+        let value = self
+            .manager
+            .cancel_job(job_id)
+            .await
+            .map_err(|error| Error::failed(error.to_string()))?;
+        write_job_snapshot(results.get().init_job(), &value)?;
+        Ok(())
+    }
+
+    /// Deletes one terminal job record and returns the removed public snapshot.
+    async fn delete(
+        self: Rc<Self>,
+        params: jobs::DeleteParams,
+        mut results: jobs::DeleteResults,
+    ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("delete jobs")?;
+
+        let job_id = read_uuid(params.get()?.get_id()?)?;
+        let value = self
+            .manager
+            .delete_job(job_id)
+            .await
+            .map_err(|error| Error::failed(error.to_string()))?;
+        write_job_snapshot(results.get().init_job(), &value)?;
+        Ok(())
+    }
 }
 
 /// Encodes one job event into the shared gossip message union payload.

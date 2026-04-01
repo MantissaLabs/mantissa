@@ -222,6 +222,16 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             JobsCommand::List => {
                 local.run_until(client::jobs::list(&cfg)).await?;
             }
+            JobsCommand::Inspect(args) => {
+                local
+                    .run_until(client::jobs::inspect(&cfg, &args.id))
+                    .await?;
+            }
+            JobsCommand::Wait(args) => {
+                local
+                    .run_until(client::jobs::wait(&cfg, &args.id, args.timeout))
+                    .await?;
+            }
             JobsCommand::Run(args) => {
                 local
                     .run_until(client::jobs::run(
@@ -238,6 +248,16 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                             volumes: &args.volumes,
                         },
                     ))
+                    .await?;
+            }
+            JobsCommand::Cancel(args) => {
+                local
+                    .run_until(client::jobs::cancel(&cfg, &args.id))
+                    .await?;
+            }
+            JobsCommand::Delete(args) => {
+                local
+                    .run_until(client::jobs::delete(&cfg, &args.id))
                     .await?;
             }
         },

@@ -382,9 +382,22 @@ pub enum JobsCommand {
     #[command(alias = "ls")]
     List,
 
+    /// Inspect one first-class job
+    Inspect(JobsInspectArgs),
+
+    /// Wait until one first-class job reaches a terminal state
+    Wait(JobsWaitArgs),
+
     /// Submit one finite job
     #[command(alias = "run")]
     Run(JobsRunArgs),
+
+    /// Request cancellation for one first-class job
+    Cancel(JobsCancelArgs),
+
+    /// Delete one terminal first-class job
+    #[command(alias = "rm")]
+    Delete(JobsDeleteArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -510,6 +523,42 @@ pub struct JobsRunArgs {
     /// Named volume mount in SOURCE:TARGET[:ro|rw] form (repeat flag to add multiple mounts)
     #[arg(long = "volume", value_name = "MOUNT", action = ArgAction::Append)]
     pub volumes: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct JobsInspectArgs {
+    /// Durable UUID of the job to inspect
+    #[arg(index = 1, value_name = "JOB_ID")]
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct JobsWaitArgs {
+    /// Durable UUID of the job to wait for
+    #[arg(index = 1, value_name = "JOB_ID")]
+    pub id: String,
+
+    /// Optional maximum time to wait before returning an error
+    #[arg(
+        long = "timeout",
+        value_name = "DURATION",
+        value_parser = parse_cli_duration
+    )]
+    pub timeout: Option<Duration>,
+}
+
+#[derive(Args, Debug)]
+pub struct JobsCancelArgs {
+    /// Durable UUID of the job to cancel
+    #[arg(index = 1, value_name = "JOB_ID")]
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct JobsDeleteArgs {
+    /// Durable UUID of the terminal job to delete
+    #[arg(index = 1, value_name = "JOB_ID")]
+    pub id: String,
 }
 
 #[derive(Args, Debug)]

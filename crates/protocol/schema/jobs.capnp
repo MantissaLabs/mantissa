@@ -8,6 +8,15 @@ interface Jobs {
 
   list @1 () -> (jobs :List(JobSnapshot));
   # List all first-class jobs with their current replicated state.
+
+  inspect @2 (id :Data) -> (job :JobSnapshot);
+  # Inspect one first-class job by its 16-byte UUID.
+
+  cancel @3 (id :Data) -> (job :JobSnapshot);
+  # Request cancellation for one first-class job and return its updated snapshot.
+
+  delete @4 (id :Data) -> (job :JobSnapshot);
+  # Delete one terminal first-class job and return the removed snapshot.
 }
 
 struct JobExecution {
