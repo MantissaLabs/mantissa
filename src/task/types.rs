@@ -1,7 +1,7 @@
 //! Public standalone-task types.
 //!
 //! The task API is a public standalone-task surface layered on top of the
-//! shared workload substrate. These types intentionally expose only
+//! shared workload layer. These types intentionally expose only
 //! standalone-task fields, while the internal workload model keeps controller
 //! ownership metadata for service replicas, job attempts, and agent runs.
 

@@ -113,7 +113,7 @@ pub async fn run(cfg: &ClientConfig, options: &JobRunOptions<'_>) -> Result<()> 
     let mut tw = tabwriter::TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tGPU\tSUBSTRATE\tMODE\tPROFILE\tRETRIES"
+        "ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tGPU\tPLATFORM\tMODE\tPROFILE\tRETRIES"
     )?;
     writeln!(
         &mut tw,

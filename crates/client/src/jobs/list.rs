@@ -18,7 +18,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tIMAGE\tSTATUS\tSUBSTRATE\tISOLATION\tATTEMPTS\tACTIVE WORKLOAD\tSTARTED\tCOMPLETED\tEXIT"
+        "ID\tNAME\tIMAGE\tSTATUS\tPLATFORM\tISOLATION\tATTEMPTS\tACTIVE WORKLOAD\tSTARTED\tCOMPLETED\tEXIT"
     )?;
     for row in rows {
         writeln!(

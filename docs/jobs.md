@@ -37,7 +37,7 @@ A direct task is one standalone execution requested by an operator. A service is
 desired state for long-lived replicated work. A job sits between those two
 ideas: it is finite like a task, but it is controller-owned like a service.
 
-The shared workload substrate underneath them stays the same. What changes is
+The shared workload layer underneath them stays the same. What changes is
 the owning controller and the policy above the execution layer.
 
 | Concept | Owns retries and completion? | Owns replica counts and readiness? | Consumes runtime directly? |

@@ -114,7 +114,7 @@ pub async fn submit(cfg: &ClientConfig, options: &AgentSubmitOptions<'_>) -> Res
     let mut tw = tabwriter::TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "SESSION ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tGPU\tSUBSTRATE\tMODE\tPROFILE"
+        "SESSION ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tGPU\tPLATFORM\tMODE\tPROFILE"
     )?;
     writeln!(
         &mut tw,

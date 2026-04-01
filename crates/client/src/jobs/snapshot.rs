@@ -376,7 +376,7 @@ pub fn render_job_detail(detail: &JobDetailView) -> Result<String> {
         let mut tw = TabWriter::new(Vec::new());
         writeln!(
             &mut tw,
-            "WORKLOAD ID\tROLES\tSTATE\tNODE\tCREATED\tUPDATED\tEXIT\tSUBSTRATE\tISOLATION"
+            "WORKLOAD ID\tROLES\tSTATE\tNODE\tCREATED\tUPDATED\tEXIT\tPLATFORM\tISOLATION"
         )?;
         for attempt in &detail.attempts {
             writeln!(

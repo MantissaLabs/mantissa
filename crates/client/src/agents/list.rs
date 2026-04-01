@@ -30,7 +30,7 @@ pub async fn list_sessions(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tSTATUS\tACTIVE RUN\tLAST RUN\tSUBSTRATE\tMODE\tPROFILE\tUPDATED"
+        "ID\tNAME\tSTATUS\tACTIVE RUN\tLAST RUN\tPLATFORM\tMODE\tPROFILE\tUPDATED"
     )?;
     for row in rows {
         writeln!(

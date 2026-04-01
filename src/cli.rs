@@ -392,7 +392,6 @@ pub enum JobsCommand {
     Wait(JobsWaitArgs),
 
     /// Submit one finite job
-    #[command(alias = "run")]
     Run(JobsRunArgs),
 
     /// Request cancellation for one first-class job
@@ -559,7 +558,7 @@ pub struct JobsRunArgs {
     /// Execution platform requested for job attempts (`oci` or `microvm`)
     #[arg(
         long = "execution-platform",
-        value_name = "SUBSTRATE",
+        value_name = "PLATFORM",
         default_value = "oci",
         conflicts_with = "manifest"
     )]
@@ -698,7 +697,7 @@ pub struct AgentsSubmitArgs {
     /// Execution platform requested for agent runs (`oci` or `microvm`)
     #[arg(
         long = "execution-platform",
-        value_name = "SUBSTRATE",
+        value_name = "PLATFORM",
         default_value = "oci"
     )]
     pub execution_platform: String,

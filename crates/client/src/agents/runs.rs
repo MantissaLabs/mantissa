@@ -42,7 +42,7 @@ pub async fn list_runs(cfg: &ClientConfig, session_id: Option<Uuid>) -> Result<(
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "RUN ID\tSESSION\tSTATUS\tWORKLOAD\tEXIT\tSUBSTRATE\tMODE\tPROFILE\tUPDATED"
+        "RUN ID\tSESSION\tSTATUS\tWORKLOAD\tEXIT\tPLATFORM\tMODE\tPROFILE\tUPDATED"
     )?;
     for row in rows {
         writeln!(

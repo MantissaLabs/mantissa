@@ -1,7 +1,7 @@
 # Examples
 
 Mantissa keeps service and job examples side by side because they exercise
-different controller semantics on top of the same shared workload substrate.
+different controller semantics on top of the same shared workload layer.
 
 Services keep long-lived replica sets running. Jobs run finite work to a
 terminal result and may launch multiple workload attempts over time.

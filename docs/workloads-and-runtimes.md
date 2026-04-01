@@ -1,4 +1,4 @@
-# Workloads and Runtime Substrates
+# Workloads and Runtime Platforms
 
 Mantissa schedules *workloads*. A workload is the generic schedulable unit in
 the control plane, but that does not mean every user-facing concept collapsed
@@ -26,7 +26,7 @@ decides whether something is a direct task, a service that should keep a
 replica set alive, a job that should run to completion with retries, or an
 agent session that may pause for input and later resume.
 
-In the middle sits the shared workload substrate. This is where the scheduler,
+In the middle sits the shared workload layer. This is where the scheduler,
 runtime orchestration, attachment repair, placement, and generic lifecycle
 handling live. It is deliberately indifferent to whether a workload belongs to
 a service rollout or to an agent controller.
@@ -43,7 +43,7 @@ flowchart TB
         Agent["Agent controller"]
     end
 
-    subgraph Workloads["Shared workload substrate"]
+    subgraph Workloads["Shared workload layer"]
         TaskStart["TaskStartRequest"]
         Start["WorkloadStartRequest"]
         Exec["ExecutionSpec"]
@@ -156,7 +156,7 @@ capacity at all.
 
 An `AgentRun` is the schedulable execution slice created from that session. It
 is the thing that actually turns into an underlying workload and then into a
-runtime instance, and it is recorded in the shared substrate as
+runtime instance, and it is recorded in the shared workload layer as
 `WorkloadKind::AgentRun`. This split lets Mantissa keep an idle session durable
 without pinning compute, which is important for human-in-the-loop workflows.
 
@@ -340,7 +340,7 @@ flowchart LR
         Agents["src/agents"]
     end
 
-    subgraph Shared["Shared workload substrate"]
+    subgraph Shared["Shared workload layer"]
         Model["src/workload/model.rs"]
         Types["src/workload/types.rs"]
         Manager["src/workload/manager/"]
@@ -450,7 +450,7 @@ useful:
 | If you mean... | Prefer this term |
 | --- | --- |
 | A standalone user-submitted execution | Task |
-| The generic schedulable substrate beneath tasks, replicas, jobs, and runs | Workload |
+| The generic schedulable layer beneath tasks, replicas, jobs, and runs | Workload |
 | One service-owned schedulable execution | Service replica |
 | The durable finite-work controller record | Job |
 | The durable agent record that can wait for input | Agent session |
