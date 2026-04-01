@@ -4,7 +4,7 @@ use crate::output;
 use crate::tasks::uuid_to_string;
 use anyhow::Result;
 use capnp::Error as CapnpError;
-use protocol::jobs::{JobStatus as ProtoJobStatus, job_spec};
+use protocol::jobs::{JobStatus as ProtoJobStatus, job_snapshot};
 use std::io::Write;
 use tabwriter::TabWriter;
 
@@ -63,11 +63,12 @@ struct JobRow {
 
 impl JobRow {
     /// Decodes one protocol job spec into a printable list row.
-    fn from_reader(reader: job_spec::Reader<'_>) -> Result<Self, CapnpError> {
+    fn from_reader(reader: job_snapshot::Reader<'_>) -> Result<Self, CapnpError> {
+        let execution = reader.get_execution()?;
         Ok(Self {
             id: uuid_to_string(reader.get_id()?)?,
             name: reader.get_name()?.to_str()?.to_string(),
-            image: reader.get_image()?.to_str()?.to_string(),
+            image: execution.get_image()?.to_str()?.to_string(),
             status: match reader.get_status()? {
                 ProtoJobStatus::Pending => "pending",
                 ProtoJobStatus::Running => "running",

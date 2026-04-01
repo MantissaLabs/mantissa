@@ -31,22 +31,21 @@ pub async fn run(cfg: &ClientConfig, options: &JobRunOptions<'_>) -> Result<()> 
     {
         let mut builder = request.get().init_spec();
         builder.set_name(options.name);
-        builder.set_image(options.image);
-        builder.set_tty(false);
-        builder.set_cpu_millis(options.cpu_millis);
-        builder.set_memory_bytes(options.memory_bytes);
-        builder.set_gpu_count(options.gpu_count);
-        builder.set_max_retries(options.max_retries);
-        builder.set_retry_backoff_secs(options.retry_backoff_secs);
+        let mut execution = builder.reborrow().init_execution();
+        execution.set_image(options.image);
+        execution.set_tty(false);
+        execution.set_cpu_millis(options.cpu_millis);
+        execution.set_memory_bytes(options.memory_bytes);
+        execution.set_gpu_count(options.gpu_count);
 
-        let mut command = builder
+        let mut command = execution
             .reborrow()
             .init_command(options.command.len() as u32);
         for (index, arg) in options.command.iter().enumerate() {
             command.set(index as u32, arg);
         }
 
-        let mut volumes = builder
+        let mut volumes = execution
             .reborrow()
             .init_volumes(resolved_volumes.len() as u32);
         for (index, mount) in resolved_volumes.iter().enumerate() {
@@ -57,9 +56,13 @@ pub async fn run(cfg: &ClientConfig, options: &JobRunOptions<'_>) -> Result<()> 
             entry.set_read_only(mount.read_only);
         }
 
-        builder.reborrow().init_env(0);
-        builder.reborrow().init_secret_files(0);
-        builder.reborrow().init_networks(0);
+        execution.reborrow().init_env(0);
+        execution.reborrow().init_secret_files(0);
+        execution.reborrow().init_networks(0);
+
+        let mut retry_policy = builder.reborrow().init_retry_policy();
+        retry_policy.set_max_retries(options.max_retries);
+        retry_policy.set_backoff_secs(options.retry_backoff_secs);
     }
 
     let response = request.send().promise.await?;

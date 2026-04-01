@@ -3,81 +3,140 @@
 using WorkloadSchema = import "workload.capnp";
 
 interface Jobs {
-  submit @0 (spec :JobSpec) -> (jobId :Data);
+  submit @0 (spec :JobSubmitSpec) -> (jobId :Data);
   # Submit one new finite job and return its generated identifier.
 
-  list @1 () -> (jobs :List(JobSpec));
+  list @1 () -> (jobs :List(JobSnapshot));
   # List all first-class jobs with their current replicated state.
 }
 
-struct JobSpec {
+struct JobExecution {
+  image @0 :Text;
+  # Runtime image reference.
+
+  command @1 :List(Text);
+  # Entrypoint command and arguments.
+
+  tty @2 :Bool;
+  # Allocate a terminal for the workload entrypoint.
+
+  cpuMillis @3 :UInt64;
+  # Requested CPU in milli-cores.
+
+  memoryBytes @4 :UInt64;
+  # Requested memory in bytes.
+
+  gpuCount @5 :UInt32;
+  # Requested GPU count.
+
+  env @6 :List(WorkloadSchema.EnvironmentVar);
+  # Environment variables shared with the execution template.
+
+  secretFiles @7 :List(WorkloadSchema.SecretFile);
+  # Secret-backed file projections.
+
+  volumes @8 :List(WorkloadSchema.VolumeMount);
+  # Named volumes mounted into the job workload.
+
+  networks @9 :List(Data);
+  # Overlay network UUIDs as 16-byte binary data.
+}
+
+struct JobRetryPolicy {
+  maxRetries @0 :UInt32;
+  # Maximum number of controller-owned retries after the initial attempt.
+
+  backoffSecs @1 :UInt32;
+  # Backoff delay before the next retry attempt.
+}
+
+struct JobSubmitSpec {
+  name @0 :Text;
+  # Human-facing job name.
+
+  execution @1 :JobExecution;
+  # Shared execution template for each job attempt.
+
+  retryPolicy @2 :JobRetryPolicy;
+  # Controller-owned retry policy.
+}
+
+struct JobSnapshot {
   id @0 :Data;
-  # Job UUID as 16-byte binary data. Empty on submit means "generate one".
+  # Job UUID as 16-byte binary data.
 
   name @1 :Text;
   # Human-facing job name.
 
-  image @2 :Text;
-  # Runtime image reference.
+  execution @2 :JobExecution;
+  # Shared execution template used by each job attempt.
 
-  command @3 :List(Text);
-  # Entrypoint command and arguments.
-
-  tty @4 :Bool;
-  # Allocate a terminal for the workload entrypoint.
-
-  cpuMillis @5 :UInt64;
-  # Requested CPU in milli-cores.
-
-  memoryBytes @6 :UInt64;
-  # Requested memory in bytes.
-
-  gpuCount @7 :UInt32;
-  # Requested GPU count.
-
-  env @8 :List(WorkloadSchema.EnvironmentVar);
-  # Environment variables shared with the execution template.
-
-  secretFiles @9 :List(WorkloadSchema.SecretFile);
-  # Secret-backed file projections.
-
-  volumes @10 :List(WorkloadSchema.VolumeMount);
-  # Named volumes mounted into the job workload.
-
-  networks @11 :List(Data);
-  # Overlay network UUIDs as 16-byte binary data.
-
-  updatedAt @12 :Text;
+  updatedAt @3 :Text;
   # Last replicated update timestamp.
 
-  phaseVersion @13 :UInt64;
-  # Monotonic causal version for lifecycle mutations.
-
-  status @14 :JobStatus;
+  status @4 :JobStatus;
   # Current coarse lifecycle status.
 
-  statusDetail @15 :Text;
+  statusDetail @5 :Text;
   # Optional human-facing detail for the current status.
 
-  maxRetries @16 :UInt32;
-  # Maximum number of controller-owned retries after the initial attempt.
+  retryPolicy @6 :JobRetryPolicy;
+  # Controller-owned retry policy.
 
-  retryBackoffSecs @17 :UInt32;
-  # Backoff delay before the next retry attempt.
-
-  attemptsStarted @18 :UInt32;
+  attemptsStarted @7 :UInt32;
   # Number of controller-issued workload attempts so far.
 
-  activeWorkloadId @19 :Data;
+  activeWorkloadId @8 :Data;
   # Currently active workload identifier, empty when idle.
 
-  lastWorkloadId @20 :Data;
+  lastWorkloadId @9 :Data;
   # Last workload identifier issued for this job.
 
-  successfulWorkloadId @21 :Data;
+  successfulWorkloadId @10 :Data;
   # Workload identifier that completed successfully, empty until success.
 
-  retryNotBefore @22 :Text;
+  retryNotBefore @11 :Text;
+  # Retry deadline as RFC3339 text, empty when no retry is pending.
+}
+
+struct JobRecord {
+  id @0 :Data;
+  # Job UUID as 16-byte binary data.
+
+  name @1 :Text;
+  # Human-facing job name.
+
+  execution @2 :JobExecution;
+  # Shared execution template used by each job attempt.
+
+  updatedAt @3 :Text;
+  # Last replicated update timestamp.
+
+  phaseVersion @4 :UInt64;
+  # Monotonic causal version for lifecycle mutations.
+
+  status @5 :JobStatus;
+  # Current coarse lifecycle status.
+
+  statusDetail @6 :Text;
+  # Optional human-facing detail for the current status.
+
+  retryPolicy @7 :JobRetryPolicy;
+  # Controller-owned retry policy.
+
+  attemptsStarted @8 :UInt32;
+  # Number of controller-issued workload attempts so far.
+
+  activeWorkloadId @9 :Data;
+  # Currently active workload identifier, empty when idle.
+
+  lastWorkloadId @10 :Data;
+  # Last workload identifier issued for this job.
+
+  successfulWorkloadId @11 :Data;
+  # Workload identifier that completed successfully, empty until success.
+
+  retryNotBefore @12 :Text;
   # Retry deadline as RFC3339 text, empty when no retry is pending.
 }
 
@@ -102,7 +161,7 @@ struct JobEvent {
   event @0 :EventType;
   # Replicated lifecycle event discriminator.
 
-  spec @1 :JobSpec;
+  record @1 :JobRecord;
   # Present for upsert events.
 
   id @2 :Data;
@@ -111,8 +170,8 @@ struct JobEvent {
 
 enum EventType {
   upsert @0;
-  # Upsert one job spec.
+  # Upsert one job record.
 
   remove @1;
-  # Remove one job spec by identifier.
+  # Remove one job record by identifier.
 }

@@ -8,7 +8,9 @@ use crate::workload::capnp_codec::{
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
 use protocol::gossip::gossip_message;
-use protocol::jobs::{job_event, job_spec, jobs};
+use protocol::jobs::{
+    job_event, job_execution, job_record, job_retry_policy, job_snapshot, job_submit_spec, jobs,
+};
 use std::rc::Rc;
 use uuid::Uuid;
 
@@ -16,6 +18,13 @@ use uuid::Uuid;
 pub struct JobsRpc {
     manager: JobController,
     topology: Topology,
+}
+
+/// Decoded public submit payload passed from the RPC layer into the job controller.
+struct DecodedJobSubmitSpec {
+    name: String,
+    execution: ResolvedExecutionSpec,
+    retry_policy: JobRetryPolicy,
 }
 
 impl JobsRpc {
@@ -36,7 +45,7 @@ impl jobs::Server for JobsRpc {
             .ensure_no_active_cluster_operation("submit jobs")?;
 
         let reader = params.get()?.get_spec()?;
-        let spec = read_job_spec(reader)?;
+        let spec = read_job_submit_spec(reader)?;
         let JobSubmission { job_id } = self
             .manager
             .submit(spec.name, spec.execution, spec.retry_policy)
@@ -60,7 +69,7 @@ impl jobs::Server for JobsRpc {
 
         let mut list = results.get().init_jobs(values.len() as u32);
         for (index, value) in values.iter().enumerate() {
-            write_job_spec(list.reborrow().get(index as u32), value)?;
+            write_job_snapshot(list.reborrow().get(index as u32), value)?;
         }
         Ok(())
     }
@@ -71,7 +80,7 @@ pub fn write_job_event(mut builder: job_event::Builder<'_>, event: &JobEvent) ->
     match event {
         JobEvent::Upsert(spec) => {
             builder.set_event(protocol::jobs::EventType::Upsert);
-            write_job_spec(builder.reborrow().init_spec(), spec.as_ref())?;
+            write_job_record(builder.reborrow().init_record(), spec.as_ref())?;
         }
         JobEvent::Remove { id } => {
             builder.set_event(protocol::jobs::EventType::Remove);
@@ -84,8 +93,8 @@ pub fn write_job_event(mut builder: job_event::Builder<'_>, event: &JobEvent) ->
 /// Decodes one job event from the shared gossip message union payload.
 pub fn read_job_event(reader: job_event::Reader<'_>) -> Result<JobEvent, Error> {
     match reader.get_event()? {
-        protocol::jobs::EventType::Upsert => Ok(JobEvent::Upsert(Box::new(read_job_spec(
-            reader.get_spec()?,
+        protocol::jobs::EventType::Upsert => Ok(JobEvent::Upsert(Box::new(read_job_record(
+            reader.get_record()?,
         )?))),
         protocol::jobs::EventType::Remove => {
             let data = reader.get_id()?;
@@ -105,32 +114,110 @@ pub fn add_event(
     write_job_event(list.reborrow().get(index).init_job(), event)
 }
 
-/// Encodes one replicated job spec into the job RPC wire payload.
-pub fn write_job_spec(
-    mut builder: job_spec::Builder<'_>,
+/// Encodes one shared execution template into the jobs wire payload.
+fn write_job_execution(
+    mut builder: job_execution::Builder<'_>,
+    execution: &ResolvedExecutionSpec,
+) -> Result<(), Error> {
+    builder.set_image(&execution.image);
+
+    let mut command = builder
+        .reborrow()
+        .init_command(execution.command.len() as u32);
+    for (index, arg) in execution.command.iter().enumerate() {
+        command.set(index as u32, arg);
+    }
+
+    builder.set_tty(execution.tty);
+    builder.set_cpu_millis(execution.cpu_millis);
+    builder.set_memory_bytes(execution.memory_bytes);
+    builder.set_gpu_count(execution.gpu_count);
+
+    let mut env = builder.reborrow().init_env(execution.env.len() as u32);
+    encode_env_vars(&mut env, &execution.env);
+
+    let mut secret_files = builder
+        .reborrow()
+        .init_secret_files(execution.secret_files.len() as u32);
+    encode_secret_files(&mut secret_files, &execution.secret_files);
+
+    let mut volumes = builder
+        .reborrow()
+        .init_volumes(execution.volumes.len() as u32);
+    encode_volume_mounts(&mut volumes, &execution.volumes);
+
+    let mut networks = builder
+        .reborrow()
+        .init_networks(execution.networks.len() as u32);
+    for (index, network_id) in execution.networks.iter().enumerate() {
+        networks.set(index as u32, network_id.as_bytes());
+    }
+
+    Ok(())
+}
+
+/// Decodes one shared execution template from the jobs wire payload.
+fn read_job_execution(reader: job_execution::Reader<'_>) -> Result<ResolvedExecutionSpec, Error> {
+    let mut command = Vec::new();
+    for arg in reader.get_command()?.iter() {
+        command.push(arg?.to_str()?.to_string());
+    }
+    let env = decode_env_vars(reader.get_env()?)?;
+    let secret_files = decode_secret_files(reader.get_secret_files()?)?;
+    let volumes = decode_volume_mounts(reader.get_volumes()?)?;
+    let mut networks = Vec::new();
+    for entry in reader.get_networks()?.iter() {
+        networks.push(read_uuid(entry?)?);
+    }
+
+    Ok(ResolvedExecutionSpec {
+        image: reader.get_image()?.to_str()?.to_string(),
+        command,
+        tty: reader.get_tty(),
+        cpu_millis: reader.get_cpu_millis(),
+        memory_bytes: reader.get_memory_bytes(),
+        gpu_count: reader.get_gpu_count(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env,
+        secret_files,
+        volumes,
+        networks,
+    })
+}
+
+/// Encodes one controller-owned retry policy into the jobs wire payload.
+fn write_job_retry_policy(
+    mut builder: job_retry_policy::Builder<'_>,
+    retry_policy: &JobRetryPolicy,
+) {
+    builder.set_max_retries(retry_policy.max_retries);
+    builder.set_backoff_secs(retry_policy.backoff_secs);
+}
+
+/// Decodes one controller-owned retry policy from the jobs wire payload.
+fn read_job_retry_policy(reader: job_retry_policy::Reader<'_>) -> JobRetryPolicy {
+    JobRetryPolicy {
+        max_retries: reader.get_max_retries(),
+        backoff_secs: reader.get_backoff_secs(),
+    }
+}
+
+/// Encodes one replicated job record into the internal jobs wire payload.
+fn write_job_record(
+    mut builder: job_record::Builder<'_>,
     value: &JobSpecValue,
 ) -> Result<(), Error> {
     builder.set_id(value.id.as_bytes());
     builder.set_name(&value.name);
-    builder.set_image(&value.execution.image);
-
-    let mut command = builder
-        .reborrow()
-        .init_command(value.execution.command.len() as u32);
-    for (index, arg) in value.execution.command.iter().enumerate() {
-        command.set(index as u32, arg);
-    }
-
-    builder.set_tty(value.execution.tty);
-    builder.set_cpu_millis(value.execution.cpu_millis);
-    builder.set_memory_bytes(value.execution.memory_bytes);
-    builder.set_gpu_count(value.execution.gpu_count);
+    write_job_execution(builder.reborrow().init_execution(), &value.execution)?;
     builder.set_updated_at(&value.updated_at);
     builder.set_phase_version(value.phase_version);
     builder.set_status(job_status_to_proto(value.status));
     builder.set_status_detail(value.status_detail.as_deref().unwrap_or(""));
-    builder.set_max_retries(value.retry_policy.max_retries);
-    builder.set_retry_backoff_secs(value.retry_policy.backoff_secs);
+    write_job_retry_policy(builder.reborrow().init_retry_policy(), &value.retry_policy);
     builder.set_attempts_started(value.attempts_started);
     builder.set_active_workload_id(
         value
@@ -158,71 +245,17 @@ pub fn write_job_spec(
     );
     builder.set_retry_not_before(value.retry_not_before.as_deref().unwrap_or(""));
 
-    let mut env = builder
-        .reborrow()
-        .init_env(value.execution.env.len() as u32);
-    encode_env_vars(&mut env, &value.execution.env);
-
-    let mut secret_files = builder
-        .reborrow()
-        .init_secret_files(value.execution.secret_files.len() as u32);
-    encode_secret_files(&mut secret_files, &value.execution.secret_files);
-
-    let mut volumes = builder
-        .reborrow()
-        .init_volumes(value.execution.volumes.len() as u32);
-    encode_volume_mounts(&mut volumes, &value.execution.volumes);
-
-    let mut networks = builder
-        .reborrow()
-        .init_networks(value.execution.networks.len() as u32);
-    for (index, network_id) in value.execution.networks.iter().enumerate() {
-        networks.set(index as u32, network_id.as_bytes());
-    }
-
     Ok(())
 }
 
-/// Decodes one replicated job spec from the job RPC wire payload.
-pub fn read_job_spec(reader: job_spec::Reader<'_>) -> Result<JobSpecValue, Error> {
-    let id = read_optional_uuid(reader.get_id()?).unwrap_or_else(Uuid::new_v4);
+/// Decodes one replicated job record from the internal jobs wire payload.
+fn read_job_record(reader: job_record::Reader<'_>) -> Result<JobSpecValue, Error> {
+    let id = read_uuid(reader.get_id()?)?;
     let name = reader.get_name()?.to_str()?.to_string();
-    let mut command = Vec::new();
-    for arg in reader.get_command()?.iter() {
-        command.push(arg?.to_str()?.to_string());
-    }
-    let env = decode_env_vars(reader.get_env()?)?;
-    let secret_files = decode_secret_files(reader.get_secret_files()?)?;
-    let volumes = decode_volume_mounts(reader.get_volumes()?)?;
-    let mut networks = Vec::new();
-    for entry in reader.get_networks()?.iter() {
-        networks.push(read_uuid(entry?)?);
-    }
+    let execution = read_job_execution(reader.get_execution()?)?;
+    let retry_policy = read_job_retry_policy(reader.get_retry_policy()?);
 
-    let mut value = JobSpecValue::new(
-        id,
-        name,
-        ResolvedExecutionSpec {
-            image: reader.get_image()?.to_str()?.to_string(),
-            command,
-            tty: reader.get_tty(),
-            cpu_millis: reader.get_cpu_millis(),
-            memory_bytes: reader.get_memory_bytes(),
-            gpu_count: reader.get_gpu_count(),
-            restart_policy: None,
-            termination_grace_period_secs: None,
-            pre_stop_command: None,
-            liveness: None,
-            env,
-            secret_files,
-            volumes,
-            networks,
-        },
-        JobRetryPolicy {
-            max_retries: reader.get_max_retries(),
-            backoff_secs: reader.get_retry_backoff_secs(),
-        },
-    );
+    let mut value = JobSpecValue::new(id, name, execution, retry_policy);
     value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
     value.phase_version = reader.get_phase_version();
     value.status = proto_to_job_status(reader.get_status()?);
@@ -239,6 +272,58 @@ pub fn read_job_spec(reader: job_spec::Reader<'_>) -> Result<JobSpecValue, Error
         (!raw.is_empty()).then_some(raw)
     };
     Ok(value)
+}
+
+/// Encodes one public job snapshot exposed by list calls.
+fn write_job_snapshot(
+    mut builder: job_snapshot::Builder<'_>,
+    value: &JobSpecValue,
+) -> Result<(), Error> {
+    builder.set_id(value.id.as_bytes());
+    builder.set_name(&value.name);
+    write_job_execution(builder.reborrow().init_execution(), &value.execution)?;
+    builder.set_updated_at(&value.updated_at);
+    builder.set_status(job_status_to_proto(value.status));
+    builder.set_status_detail(value.status_detail.as_deref().unwrap_or(""));
+    write_job_retry_policy(builder.reborrow().init_retry_policy(), &value.retry_policy);
+    builder.set_attempts_started(value.attempts_started);
+    builder.set_active_workload_id(
+        value
+            .active_workload_id
+            .as_ref()
+            .map(Uuid::as_bytes)
+            .map(|bytes| bytes.as_slice())
+            .unwrap_or(&[]),
+    );
+    builder.set_last_workload_id(
+        value
+            .last_workload_id
+            .as_ref()
+            .map(Uuid::as_bytes)
+            .map(|bytes| bytes.as_slice())
+            .unwrap_or(&[]),
+    );
+    builder.set_successful_workload_id(
+        value
+            .successful_workload_id
+            .as_ref()
+            .map(Uuid::as_bytes)
+            .map(|bytes| bytes.as_slice())
+            .unwrap_or(&[]),
+    );
+    builder.set_retry_not_before(value.retry_not_before.as_deref().unwrap_or(""));
+    Ok(())
+}
+
+/// Decodes one public job submission payload from the jobs RPC.
+fn read_job_submit_spec(
+    reader: job_submit_spec::Reader<'_>,
+) -> Result<DecodedJobSubmitSpec, Error> {
+    Ok(DecodedJobSubmitSpec {
+        name: reader.get_name()?.to_str()?.to_string(),
+        execution: read_job_execution(reader.get_execution()?)?,
+        retry_policy: read_job_retry_policy(reader.get_retry_policy()?),
+    })
 }
 
 /// Maps one internal job status to the schema enum used by jobs RPCs.

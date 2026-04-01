@@ -131,18 +131,20 @@ async fn submit_job(
     {
         let mut builder = request.get().init_spec();
         builder.set_name(name);
-        builder.set_image("ghcr.io/mantissa/demo-job:latest");
-        builder.set_tty(false);
-        builder.set_cpu_millis(250);
-        builder.set_memory_bytes(128 * 1024 * 1024);
-        builder.set_gpu_count(0);
-        builder.set_max_retries(max_retries);
-        builder.set_retry_backoff_secs(retry_backoff_secs);
-        builder.reborrow().init_command(0);
-        builder.reborrow().init_env(0);
-        builder.reborrow().init_secret_files(0);
-        builder.reborrow().init_volumes(0);
-        builder.reborrow().init_networks(0);
+        let mut execution = builder.reborrow().init_execution();
+        execution.set_image("ghcr.io/mantissa/demo-job:latest");
+        execution.set_tty(false);
+        execution.set_cpu_millis(250);
+        execution.set_memory_bytes(128 * 1024 * 1024);
+        execution.set_gpu_count(0);
+        execution.reborrow().init_command(0);
+        execution.reborrow().init_env(0);
+        execution.reborrow().init_secret_files(0);
+        execution.reborrow().init_volumes(0);
+        execution.reborrow().init_networks(0);
+        let mut retry_policy = builder.reborrow().init_retry_policy();
+        retry_policy.set_max_retries(max_retries);
+        retry_policy.set_backoff_secs(retry_backoff_secs);
     }
     let response = request.send().promise.await?;
     read_uuid(response.get()?.get_job_id()?)
