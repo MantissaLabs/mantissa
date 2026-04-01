@@ -245,7 +245,10 @@ impl JobController {
             JobStatus::Pending => self.reconcile_pending_job(spec).await,
             JobStatus::Running => self.reconcile_running_job(spec).await,
             JobStatus::Retrying => self.reconcile_retrying_job(spec).await,
-            JobStatus::Succeeded | JobStatus::Failed => Ok(()),
+            JobStatus::Cancelling
+            | JobStatus::Succeeded
+            | JobStatus::Failed
+            | JobStatus::Cancelled => Ok(()),
         }
     }
 
@@ -382,7 +385,7 @@ impl JobController {
                 if current.can_retry() && workload_start_error_is_retryable(&error) {
                     current.mark_retrying(Some(detail), Utc::now());
                 } else {
-                    current.mark_failed(Some(workload_id), Some(detail));
+                    current.mark_failed(Some(workload_id), Some(detail), None);
                 }
                 self.apply_upsert(current.clone()).await?;
                 self.broadcast(JobEvent::Upsert(Box::new(current))).await?;
@@ -411,13 +414,13 @@ impl JobController {
                     current.attempts_started
                 );
                 return self
-                    .fail_or_retry_task(current, Some(task.id), detail)
+                    .fail_or_retry_task(current, Some(task.id), detail, Some(code))
                     .await;
             }
             WorkloadPhase::Failed => {
                 let detail = format!("attempt {} failed", current.attempts_started);
                 return self
-                    .fail_or_retry_task(current, Some(task.id), detail)
+                    .fail_or_retry_task(current, Some(task.id), detail, None)
                     .await;
             }
             WorkloadPhase::Stopped => {
@@ -426,7 +429,7 @@ impl JobController {
                     current.attempts_started
                 );
                 return self
-                    .fail_or_retry_task(current, Some(task.id), detail)
+                    .fail_or_retry_task(current, Some(task.id), detail, None)
                     .await;
             }
             WorkloadPhase::Pending
@@ -458,11 +461,12 @@ impl JobController {
         mut spec: JobSpecValue,
         workload_id: Option<Uuid>,
         detail: String,
+        exit_code: Option<i32>,
     ) -> Result<()> {
         if spec.can_retry() {
             spec.mark_retrying(Some(detail), Utc::now());
         } else {
-            spec.mark_failed(workload_id, Some(detail));
+            spec.mark_failed(workload_id, Some(detail), exit_code);
         }
         self.apply_upsert(spec.clone()).await?;
         self.broadcast(JobEvent::Upsert(Box::new(spec))).await?;
@@ -475,7 +479,8 @@ impl JobController {
         spec: JobSpecValue,
         detail: impl Into<String>,
     ) -> Result<()> {
-        self.fail_or_retry_task(spec, None, detail.into()).await
+        self.fail_or_retry_task(spec, None, detail.into(), None)
+            .await
     }
 
     /// Builds the deterministic set of nodes eligible to host job reconciliation ownership.
@@ -607,7 +612,7 @@ mod tests {
     #[test]
     fn job_registry_prefers_later_attempt() {
         let mut stale = test_job();
-        stale.mark_failed(None, Some("first attempt failed".to_string()));
+        stale.mark_failed(None, Some("first attempt failed".to_string()), None);
 
         let mut latest = stale.clone();
         latest.reserve_attempt(Uuid::new_v4());

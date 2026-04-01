@@ -13,7 +13,12 @@ pub struct JobSpecValue {
     pub id: Uuid,
     pub name: String,
     pub execution: ResolvedExecutionSpec,
+    pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
     #[serde(default)]
     pub phase_version: u64,
     #[serde(default)]
@@ -34,6 +39,8 @@ pub struct JobSpecValue {
     pub attempts_started: u32,
     #[serde(default)]
     pub retry_not_before: Option<String>,
+    #[serde(default)]
+    pub terminal_exit_code: Option<i32>,
 }
 
 impl JobSpecValue {
@@ -44,11 +51,15 @@ impl JobSpecValue {
         execution: ResolvedExecutionSpec,
         retry_policy: JobRetryPolicy,
     ) -> Self {
+        let now = current_timestamp();
         Self {
             id,
             name: name.into(),
             execution,
-            updated_at: current_timestamp(),
+            created_at: now.clone(),
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
             phase_version: 0,
             status: JobStatus::Pending,
             status_detail: None,
@@ -59,6 +70,7 @@ impl JobSpecValue {
             successful_workload_id: None,
             attempts_started: 0,
             retry_not_before: None,
+            terminal_exit_code: None,
         }
     }
 
@@ -69,7 +81,10 @@ impl JobSpecValue {
 
     /// Returns whether this job already reached one terminal lifecycle state.
     pub fn is_terminal(&self) -> bool {
-        matches!(self.status, JobStatus::Succeeded | JobStatus::Failed)
+        matches!(
+            self.status,
+            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+        )
     }
 
     /// Returns whether the configured retry policy allows another workload attempt.
@@ -100,6 +115,8 @@ impl JobSpecValue {
         self.active_workload_id = Some(workload_id);
         self.last_workload_id = Some(workload_id);
         self.retry_not_before = None;
+        self.completed_at = None;
+        self.terminal_exit_code = None;
         self.touch();
     }
 
@@ -109,6 +126,11 @@ impl JobSpecValue {
         self.status = JobStatus::Running;
         self.status_detail = normalize_detail(detail);
         self.retry_not_before = None;
+        if self.started_at.is_none() {
+            self.started_at = Some(current_timestamp());
+        }
+        self.completed_at = None;
+        self.terminal_exit_code = None;
         self.active_workload_id = Some(workload_id);
         if self.last_workload_id != Some(workload_id) {
             self.attempts_started = self.attempts_started.saturating_add(1);
@@ -123,6 +145,8 @@ impl JobSpecValue {
         self.status = JobStatus::Retrying;
         self.status_detail = normalize_detail(detail);
         self.active_workload_id = None;
+        self.completed_at = None;
+        self.terminal_exit_code = None;
         let deadline = now + ChronoDuration::seconds(i64::from(self.retry_policy.backoff_secs));
         self.retry_not_before = Some(deadline.to_rfc3339());
         self.touch();
@@ -138,11 +162,18 @@ impl JobSpecValue {
         self.successful_workload_id = Some(workload_id);
         self.last_workload_id = Some(workload_id);
         self.retry_not_before = None;
+        self.completed_at = Some(current_timestamp());
+        self.terminal_exit_code = Some(0);
         self.touch();
     }
 
     /// Marks the job as terminally failed with no retries remaining.
-    pub fn mark_failed(&mut self, workload_id: Option<Uuid>, detail: Option<String>) {
+    pub fn mark_failed(
+        &mut self,
+        workload_id: Option<Uuid>,
+        detail: Option<String>,
+        exit_code: Option<i32>,
+    ) {
         self.phase_version = self.phase_version.saturating_add(1);
         self.status = JobStatus::Failed;
         self.status_detail = normalize_detail(detail);
@@ -151,6 +182,34 @@ impl JobSpecValue {
             self.last_workload_id = Some(workload_id);
         }
         self.retry_not_before = None;
+        self.completed_at = Some(current_timestamp());
+        self.terminal_exit_code = exit_code;
+        self.touch();
+    }
+
+    /// Marks the job as stopping one active workload attempt due to cancellation.
+    pub fn mark_cancelling(&mut self, detail: Option<String>) {
+        self.phase_version = self.phase_version.saturating_add(1);
+        self.status = JobStatus::Cancelling;
+        self.status_detail = normalize_detail(detail);
+        self.retry_not_before = None;
+        self.completed_at = None;
+        self.terminal_exit_code = None;
+        self.touch();
+    }
+
+    /// Marks the job as explicitly cancelled before successful completion.
+    pub fn mark_cancelled(&mut self, workload_id: Option<Uuid>, detail: Option<String>) {
+        self.phase_version = self.phase_version.saturating_add(1);
+        self.status = JobStatus::Cancelled;
+        self.status_detail = normalize_detail(detail);
+        self.active_workload_id = None;
+        if let Some(workload_id) = workload_id {
+            self.last_workload_id = Some(workload_id);
+        }
+        self.retry_not_before = None;
+        self.completed_at = Some(current_timestamp());
+        self.terminal_exit_code = None;
         self.touch();
     }
 }
@@ -168,8 +227,10 @@ pub enum JobStatus {
     Pending,
     Running,
     Retrying,
+    Cancelling,
     Succeeded,
     Failed,
+    Cancelled,
 }
 
 /// Completion strategy for one finite job.
@@ -235,4 +296,94 @@ pub fn normalize_detail(detail: Option<String>) -> Option<String> {
         let trimmed = detail.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tracks the first running timestamp and terminal summary across one job lifecycle.
+    #[test]
+    fn job_lifecycle_captures_started_completed_and_exit_code() {
+        let mut job = JobSpecValue::new(
+            Uuid::new_v4(),
+            "demo-job",
+            ResolvedExecutionSpec {
+                image: "ghcr.io/demo/job:latest".to_string(),
+                command: vec!["echo".to_string(), "hello".to_string()],
+                tty: false,
+                cpu_millis: 0,
+                memory_bytes: 0,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+            },
+            JobRetryPolicy::default(),
+        );
+
+        let workload_id = Uuid::new_v4();
+        job.reserve_attempt(workload_id);
+        assert!(job.started_at.is_none());
+        assert!(job.completed_at.is_none());
+        assert_eq!(job.terminal_exit_code, None);
+
+        job.mark_running(workload_id, Some("attempt active".to_string()));
+        let started_at = job.started_at.clone();
+        assert!(started_at.is_some());
+        assert!(job.completed_at.is_none());
+        assert_eq!(job.terminal_exit_code, None);
+
+        job.mark_failed(
+            Some(workload_id),
+            Some("attempt failed".to_string()),
+            Some(17),
+        );
+        assert!(job.is_terminal());
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(job.started_at, started_at);
+        assert!(job.completed_at.is_some());
+        assert_eq!(job.terminal_exit_code, Some(17));
+    }
+
+    /// Treats explicit cancellation as a terminal controller outcome.
+    #[test]
+    fn cancelled_jobs_are_terminal() {
+        let mut job = JobSpecValue::new(
+            Uuid::new_v4(),
+            "demo-job",
+            ResolvedExecutionSpec {
+                image: "ghcr.io/demo/job:latest".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 0,
+                memory_bytes: 0,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+            },
+            JobRetryPolicy::default(),
+        );
+
+        job.mark_cancelling(Some("operator requested cancellation".to_string()));
+        assert_eq!(job.status, JobStatus::Cancelling);
+        assert!(!job.is_terminal());
+
+        job.mark_cancelled(None, Some("cancelled".to_string()));
+        assert_eq!(job.status, JobStatus::Cancelled);
+        assert!(job.is_terminal());
+        assert!(job.completed_at.is_some());
+        assert_eq!(job.terminal_exit_code, None);
+    }
 }

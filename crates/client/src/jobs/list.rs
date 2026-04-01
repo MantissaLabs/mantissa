@@ -30,19 +30,23 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tIMAGE\tSTATUS\tATTEMPTS\tACTIVE WORKLOAD\tUPDATED"
+        "ID\tNAME\tIMAGE\tSTATUS\tATTEMPTS\tACTIVE WORKLOAD\tSTARTED\tCOMPLETED\tEXIT"
     )?;
     for row in rows {
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.id,
             row.name,
             row.image,
             row.status,
             row.attempts_started,
             row.active_workload_id.unwrap_or_else(|| "-".to_string()),
-            row.updated_at,
+            row.started_at.unwrap_or_else(|| "-".to_string()),
+            row.completed_at.unwrap_or_else(|| "-".to_string()),
+            row.terminal_exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".to_string()),
         )?;
     }
     tw.flush()?;
@@ -58,7 +62,9 @@ struct JobRow {
     status: &'static str,
     attempts_started: u32,
     active_workload_id: Option<String>,
-    updated_at: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    terminal_exit_code: Option<i32>,
 }
 
 impl JobRow {
@@ -73,8 +79,10 @@ impl JobRow {
                 ProtoJobStatus::Pending => "pending",
                 ProtoJobStatus::Running => "running",
                 ProtoJobStatus::Retrying => "retrying",
+                ProtoJobStatus::Cancelling => "cancelling",
                 ProtoJobStatus::Succeeded => "succeeded",
                 ProtoJobStatus::Failed => "failed",
+                ProtoJobStatus::Cancelled => "cancelled",
             },
             attempts_started: reader.get_attempts_started(),
             active_workload_id: {
@@ -83,7 +91,16 @@ impl JobRow {
                     .then(|| uuid_to_string(data))
                     .transpose()?
             },
-            updated_at: reader.get_updated_at()?.to_str()?.to_string(),
+            started_at: {
+                let raw = reader.get_started_at()?.to_str()?.trim().to_string();
+                (!raw.is_empty()).then_some(raw)
+            },
+            completed_at: {
+                let raw = reader.get_completed_at()?.to_str()?.trim().to_string();
+                (!raw.is_empty()).then_some(raw)
+            },
+            terminal_exit_code: (reader.get_terminal_exit_code() >= 0)
+                .then(|| reader.get_terminal_exit_code()),
         })
     }
 }

@@ -74,29 +74,41 @@ struct JobSnapshot {
   updatedAt @3 :Text;
   # Last replicated update timestamp.
 
-  status @4 :JobStatus;
+  createdAt @4 :Text;
+  # RFC3339 timestamp when the job controller record was first created.
+
+  startedAt @5 :Text;
+  # RFC3339 timestamp when the job first entered running state, empty until then.
+
+  completedAt @6 :Text;
+  # RFC3339 timestamp when the job reached a terminal controller state, empty until then.
+
+  status @7 :JobStatus;
   # Current coarse lifecycle status.
 
-  statusDetail @5 :Text;
+  statusDetail @8 :Text;
   # Optional human-facing detail for the current status.
 
-  retryPolicy @6 :JobRetryPolicy;
+  retryPolicy @9 :JobRetryPolicy;
   # Controller-owned retry policy.
 
-  attemptsStarted @7 :UInt32;
+  attemptsStarted @10 :UInt32;
   # Number of controller-issued workload attempts so far.
 
-  activeWorkloadId @8 :Data;
+  activeWorkloadId @11 :Data;
   # Currently active workload identifier, empty when idle.
 
-  lastWorkloadId @9 :Data;
+  lastWorkloadId @12 :Data;
   # Last workload identifier issued for this job.
 
-  successfulWorkloadId @10 :Data;
+  successfulWorkloadId @13 :Data;
   # Workload identifier that completed successfully, empty until success.
 
-  retryNotBefore @11 :Text;
+  retryNotBefore @14 :Text;
   # Retry deadline as RFC3339 text, empty when no retry is pending.
+
+  terminalExitCode @15 :Int32;
+  # Exit code from the terminal workload attempt, or -1 when no exit code applies.
 }
 
 struct JobRecord {
@@ -112,32 +124,44 @@ struct JobRecord {
   updatedAt @3 :Text;
   # Last replicated update timestamp.
 
-  phaseVersion @4 :UInt64;
+  createdAt @4 :Text;
+  # RFC3339 timestamp when the job controller record was first created.
+
+  startedAt @5 :Text;
+  # RFC3339 timestamp when the job first entered running state, empty until then.
+
+  completedAt @6 :Text;
+  # RFC3339 timestamp when the job reached a terminal controller state, empty until then.
+
+  phaseVersion @7 :UInt64;
   # Monotonic causal version for lifecycle mutations.
 
-  status @5 :JobStatus;
+  status @8 :JobStatus;
   # Current coarse lifecycle status.
 
-  statusDetail @6 :Text;
+  statusDetail @9 :Text;
   # Optional human-facing detail for the current status.
 
-  retryPolicy @7 :JobRetryPolicy;
+  retryPolicy @10 :JobRetryPolicy;
   # Controller-owned retry policy.
 
-  attemptsStarted @8 :UInt32;
+  attemptsStarted @11 :UInt32;
   # Number of controller-issued workload attempts so far.
 
-  activeWorkloadId @9 :Data;
+  activeWorkloadId @12 :Data;
   # Currently active workload identifier, empty when idle.
 
-  lastWorkloadId @10 :Data;
+  lastWorkloadId @13 :Data;
   # Last workload identifier issued for this job.
 
-  successfulWorkloadId @11 :Data;
+  successfulWorkloadId @14 :Data;
   # Workload identifier that completed successfully, empty until success.
 
-  retryNotBefore @12 :Text;
+  retryNotBefore @15 :Text;
   # Retry deadline as RFC3339 text, empty when no retry is pending.
+
+  terminalExitCode @16 :Int32;
+  # Exit code from the terminal workload attempt, or -1 when no exit code applies.
 }
 
 enum JobStatus {
@@ -150,11 +174,17 @@ enum JobStatus {
   retrying @2;
   # Job is waiting for its retry backoff deadline.
 
-  succeeded @3;
+  cancelling @3;
+  # Job is stopping its active workload attempt after a cancellation request.
+
+  succeeded @4;
   # Job completed successfully.
 
-  failed @4;
+  failed @5;
   # Job failed permanently with no retries remaining.
+
+  cancelled @6;
+  # Job was explicitly cancelled before successful completion.
 }
 
 struct JobEvent {

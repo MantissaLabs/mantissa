@@ -106,8 +106,10 @@ pub fn compare_job_specs(left: &JobSpecValue, right: &JobSpecValue) -> Ordering 
 /// Returns one stable precedence ranking used to break ties between concurrent job states.
 fn status_rank(value: &JobSpecValue) -> u8 {
     match value.status {
-        crate::jobs::types::JobStatus::Failed => 5,
-        crate::jobs::types::JobStatus::Succeeded => 4,
+        crate::jobs::types::JobStatus::Failed => 7,
+        crate::jobs::types::JobStatus::Cancelled => 6,
+        crate::jobs::types::JobStatus::Succeeded => 5,
+        crate::jobs::types::JobStatus::Cancelling => 4,
         crate::jobs::types::JobStatus::Running => 3,
         crate::jobs::types::JobStatus::Retrying => 2,
         crate::jobs::types::JobStatus::Pending => 1,

@@ -214,6 +214,9 @@ fn write_job_record(
     builder.set_name(&value.name);
     write_job_execution(builder.reborrow().init_execution(), &value.execution)?;
     builder.set_updated_at(&value.updated_at);
+    builder.set_created_at(&value.created_at);
+    builder.set_started_at(value.started_at.as_deref().unwrap_or(""));
+    builder.set_completed_at(value.completed_at.as_deref().unwrap_or(""));
     builder.set_phase_version(value.phase_version);
     builder.set_status(job_status_to_proto(value.status));
     builder.set_status_detail(value.status_detail.as_deref().unwrap_or(""));
@@ -244,6 +247,7 @@ fn write_job_record(
             .unwrap_or(&[]),
     );
     builder.set_retry_not_before(value.retry_not_before.as_deref().unwrap_or(""));
+    builder.set_terminal_exit_code(value.terminal_exit_code.unwrap_or(-1));
 
     Ok(())
 }
@@ -257,6 +261,15 @@ fn read_job_record(reader: job_record::Reader<'_>) -> Result<JobSpecValue, Error
 
     let mut value = JobSpecValue::new(id, name, execution, retry_policy);
     value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
+    value.created_at = reader.get_created_at()?.to_str()?.to_string();
+    value.started_at = {
+        let raw = reader.get_started_at()?.to_str()?.trim().to_string();
+        (!raw.is_empty()).then_some(raw)
+    };
+    value.completed_at = {
+        let raw = reader.get_completed_at()?.to_str()?.trim().to_string();
+        (!raw.is_empty()).then_some(raw)
+    };
     value.phase_version = reader.get_phase_version();
     value.status = proto_to_job_status(reader.get_status()?);
     value.status_detail = {
@@ -271,6 +284,8 @@ fn read_job_record(reader: job_record::Reader<'_>) -> Result<JobSpecValue, Error
         let raw = reader.get_retry_not_before()?.to_str()?.trim().to_string();
         (!raw.is_empty()).then_some(raw)
     };
+    value.terminal_exit_code =
+        (reader.get_terminal_exit_code() >= 0).then(|| reader.get_terminal_exit_code());
     Ok(value)
 }
 
@@ -283,6 +298,9 @@ fn write_job_snapshot(
     builder.set_name(&value.name);
     write_job_execution(builder.reborrow().init_execution(), &value.execution)?;
     builder.set_updated_at(&value.updated_at);
+    builder.set_created_at(&value.created_at);
+    builder.set_started_at(value.started_at.as_deref().unwrap_or(""));
+    builder.set_completed_at(value.completed_at.as_deref().unwrap_or(""));
     builder.set_status(job_status_to_proto(value.status));
     builder.set_status_detail(value.status_detail.as_deref().unwrap_or(""));
     write_job_retry_policy(builder.reborrow().init_retry_policy(), &value.retry_policy);
@@ -312,6 +330,7 @@ fn write_job_snapshot(
             .unwrap_or(&[]),
     );
     builder.set_retry_not_before(value.retry_not_before.as_deref().unwrap_or(""));
+    builder.set_terminal_exit_code(value.terminal_exit_code.unwrap_or(-1));
     Ok(())
 }
 
@@ -332,8 +351,10 @@ fn job_status_to_proto(status: JobStatus) -> protocol::jobs::JobStatus {
         JobStatus::Pending => protocol::jobs::JobStatus::Pending,
         JobStatus::Running => protocol::jobs::JobStatus::Running,
         JobStatus::Retrying => protocol::jobs::JobStatus::Retrying,
+        JobStatus::Cancelling => protocol::jobs::JobStatus::Cancelling,
         JobStatus::Succeeded => protocol::jobs::JobStatus::Succeeded,
         JobStatus::Failed => protocol::jobs::JobStatus::Failed,
+        JobStatus::Cancelled => protocol::jobs::JobStatus::Cancelled,
     }
 }
 
@@ -343,8 +364,10 @@ fn proto_to_job_status(status: protocol::jobs::JobStatus) -> JobStatus {
         protocol::jobs::JobStatus::Pending => JobStatus::Pending,
         protocol::jobs::JobStatus::Running => JobStatus::Running,
         protocol::jobs::JobStatus::Retrying => JobStatus::Retrying,
+        protocol::jobs::JobStatus::Cancelling => JobStatus::Cancelling,
         protocol::jobs::JobStatus::Succeeded => JobStatus::Succeeded,
         protocol::jobs::JobStatus::Failed => JobStatus::Failed,
+        protocol::jobs::JobStatus::Cancelled => JobStatus::Cancelled,
     }
 }
 
