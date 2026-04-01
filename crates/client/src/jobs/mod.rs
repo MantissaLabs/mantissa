@@ -2,6 +2,7 @@ pub mod cancel;
 pub mod delete;
 pub mod inspect;
 pub mod list;
+pub mod manifest;
 pub mod run;
 pub mod snapshot;
 pub mod wait;

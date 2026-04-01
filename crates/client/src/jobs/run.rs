@@ -1,69 +1,101 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::jobs::manifest::{
+    EnvironmentVariable, JobManifest, LivenessKind, LivenessProbe, SecretFileProjection,
+    SecretReference, load_manifest_from_path,
+};
 use crate::output;
 use crate::tasks::uuid_to_string;
-use crate::volumes;
-use anyhow::Result;
+use crate::volumes::{self, ResolvedVolumeMount};
+use crate::workload_submit::{
+    ResolvedDeclaredVolume, compute_network_id, ensure_declared_volumes, ensure_named_networks,
+};
+use anyhow::{Result, anyhow};
+use capnp::struct_list;
+use protocol::jobs::{job_execution, job_retry_policy, job_submit_spec};
+use protocol::workload::{environment_var, liveness_probe, secret_file, secret_ref, volume_mount};
+use std::collections::HashMap;
 use std::io::Write;
+use std::path::Path;
+use uuid::Uuid;
+
+/// Default CPU request used by the raw `jobs run` CLI flow.
+const DEFAULT_CPU_MILLIS: u64 = 1_000;
+
+/// Default memory request used by the raw `jobs run` CLI flow.
+const DEFAULT_MEMORY_BYTES: u64 = 536_870_912;
+
+/// Default GPU request used by the raw `jobs run` CLI flow.
+const DEFAULT_GPU_COUNT: u32 = 0;
+
+/// Default controller retry count used by the raw `jobs run` CLI flow.
+const DEFAULT_MAX_RETRIES: u32 = 0;
+
+/// Default controller retry backoff used by the raw `jobs run` CLI flow.
+const DEFAULT_RETRY_BACKOFF_SECS: u32 = 2;
 
 /// Options accepted by `mantissa jobs run`.
 pub struct JobRunOptions<'a> {
-    pub name: &'a str,
-    pub image: &'a str,
+    pub manifest_path: Option<&'a Path>,
+    pub name: Option<&'a str>,
+    pub image: Option<&'a str>,
     pub command: &'a [String],
-    pub cpu_millis: u64,
-    pub memory_bytes: u64,
-    pub gpu_count: u32,
-    pub max_retries: u32,
-    pub retry_backoff_secs: u32,
+    pub tty: bool,
+    pub cpu_millis: Option<u64>,
+    pub memory_bytes: Option<u64>,
+    pub gpu_count: Option<u32>,
+    pub max_retries: Option<u32>,
+    pub retry_backoff_secs: Option<u32>,
     pub volumes: &'a [String],
+}
+
+/// One prepared jobs submission after CLI and manifest normalization.
+struct PreparedJobSubmitSpec {
+    name: String,
+    execution: PreparedJobExecution,
+    retry_policy: PreparedJobRetryPolicy,
+}
+
+/// One prepared execution template ready for jobs wire encoding.
+struct PreparedJobExecution {
+    image: String,
+    command: Vec<String>,
+    tty: bool,
+    cpu_millis: u64,
+    memory_bytes: u64,
+    gpu_count: u32,
+    termination_grace_period_secs: Option<u32>,
+    pre_stop_command: Option<Vec<String>>,
+    env: Vec<EnvironmentVariable>,
+    secret_files: Vec<SecretFileProjection>,
+    volumes: Vec<PreparedVolumeMount>,
+    networks: Vec<Uuid>,
+    liveness: Option<LivenessProbe>,
+}
+
+/// One prepared controller retry policy ready for jobs wire encoding.
+struct PreparedJobRetryPolicy {
+    max_retries: u32,
+    backoff_secs: u32,
+}
+
+/// One prepared named volume mount resolved to the cluster volume identity.
+struct PreparedVolumeMount {
+    volume_id: Uuid,
+    volume_name: String,
+    target: String,
+    read_only: bool,
 }
 
 /// Submits one first-class job through the jobs control-plane capability.
 pub async fn run(cfg: &ClientConfig, options: &JobRunOptions<'_>) -> Result<()> {
-    let resolved_volumes = volumes::resolve_cli_volume_mounts(cfg, options.volumes).await?;
+    let prepared = prepare_submit_spec(cfg, options).await?;
     let session = connection::get_local_session(cfg).await?;
 
     let request = session.get_jobs_request();
     let jobs = request.send().pipeline.get_jobs();
     let mut request = jobs.submit_request();
-
-    {
-        let mut builder = request.get().init_spec();
-        builder.set_name(options.name);
-        let mut execution = builder.reborrow().init_execution();
-        execution.set_image(options.image);
-        execution.set_tty(false);
-        execution.set_cpu_millis(options.cpu_millis);
-        execution.set_memory_bytes(options.memory_bytes);
-        execution.set_gpu_count(options.gpu_count);
-
-        let mut command = execution
-            .reborrow()
-            .init_command(options.command.len() as u32);
-        for (index, arg) in options.command.iter().enumerate() {
-            command.set(index as u32, arg);
-        }
-
-        let mut volumes = execution
-            .reborrow()
-            .init_volumes(resolved_volumes.len() as u32);
-        for (index, mount) in resolved_volumes.iter().enumerate() {
-            let mut entry = volumes.reborrow().get(index as u32);
-            entry.set_volume_id(mount.volume_id.as_bytes());
-            entry.set_volume_name(&mount.volume_name);
-            entry.set_target(&mount.target);
-            entry.set_read_only(mount.read_only);
-        }
-
-        execution.reborrow().init_env(0);
-        execution.reborrow().init_secret_files(0);
-        execution.reborrow().init_networks(0);
-
-        let mut retry_policy = builder.reborrow().init_retry_policy();
-        retry_policy.set_max_retries(options.max_retries);
-        retry_policy.set_backoff_secs(options.retry_backoff_secs);
-    }
+    write_job_submit_spec(request.get().init_spec(), &prepared)?;
 
     let response = request.send().promise.await?;
     let reader = response.get()?;
@@ -75,16 +107,300 @@ pub async fn run(cfg: &ClientConfig, options: &JobRunOptions<'_>) -> Result<()> 
         &mut tw,
         "{}\t{}\t{}\t{}\t{}\t{}\t{}",
         job_id,
-        options.name,
-        options.image,
-        options.cpu_millis,
-        options.memory_bytes / (1024 * 1024),
-        options.gpu_count,
-        options.max_retries,
+        prepared.name,
+        prepared.execution.image,
+        prepared.execution.cpu_millis,
+        prepared.execution.memory_bytes / (1024 * 1024),
+        prepared.execution.gpu_count,
+        prepared.retry_policy.max_retries,
     )?;
     tw.flush()?;
 
     let output = String::from_utf8(tw.into_inner()?)?;
     output::emit_block(format!("submitted job:\n{output}"));
     Ok(())
+}
+
+/// Normalizes one job CLI invocation into the public submit contract.
+async fn prepare_submit_spec(
+    cfg: &ClientConfig,
+    options: &JobRunOptions<'_>,
+) -> Result<PreparedJobSubmitSpec> {
+    if let Some(path) = options.manifest_path {
+        return prepare_manifest_submit_spec(cfg, path).await;
+    }
+
+    prepare_raw_submit_spec(cfg, options).await
+}
+
+/// Normalizes one raw-flag job submission into the public jobs submit contract.
+async fn prepare_raw_submit_spec(
+    cfg: &ClientConfig,
+    options: &JobRunOptions<'_>,
+) -> Result<PreparedJobSubmitSpec> {
+    let name = options
+        .name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("jobs run requires NAME unless --file is used"))?;
+    let image = options
+        .image
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("jobs run requires --image unless --file is used"))?;
+
+    let resolved_volumes = volumes::resolve_cli_volume_mounts(cfg, options.volumes).await?;
+
+    Ok(PreparedJobSubmitSpec {
+        name: name.to_string(),
+        execution: PreparedJobExecution {
+            image: image.to_string(),
+            command: options.command.to_vec(),
+            tty: options.tty,
+            cpu_millis: options.cpu_millis.unwrap_or(DEFAULT_CPU_MILLIS),
+            memory_bytes: options.memory_bytes.unwrap_or(DEFAULT_MEMORY_BYTES),
+            gpu_count: options.gpu_count.unwrap_or(DEFAULT_GPU_COUNT),
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: resolved_volumes
+                .iter()
+                .map(prepared_volume_mount_from_resolved)
+                .collect(),
+            networks: Vec::new(),
+            liveness: None,
+        },
+        retry_policy: PreparedJobRetryPolicy {
+            max_retries: options.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
+            backoff_secs: options
+                .retry_backoff_secs
+                .unwrap_or(DEFAULT_RETRY_BACKOFF_SECS),
+        },
+    })
+}
+
+/// Normalizes one manifest-backed job submission into the public jobs submit contract.
+async fn prepare_manifest_submit_spec(
+    cfg: &ClientConfig,
+    path: &Path,
+) -> Result<PreparedJobSubmitSpec> {
+    let manifest = load_manifest_from_path(path)?;
+    ensure_named_networks(cfg, manifest.execution.networks.clone()).await?;
+    let resolved_volumes = ensure_declared_volumes(cfg, &manifest.declared_volume_specs()).await?;
+
+    Ok(PreparedJobSubmitSpec {
+        name: manifest.name.clone(),
+        execution: prepared_execution_from_manifest(&manifest, &resolved_volumes)?,
+        retry_policy: PreparedJobRetryPolicy {
+            max_retries: manifest.retry_policy.max_retries,
+            backoff_secs: manifest.retry_policy.backoff_secs,
+        },
+    })
+}
+
+/// Resolves one job manifest execution template into a submit-ready execution payload.
+fn prepared_execution_from_manifest(
+    manifest: &JobManifest,
+    resolved_volumes: &HashMap<String, ResolvedDeclaredVolume>,
+) -> Result<PreparedJobExecution> {
+    let execution = &manifest.execution;
+    let mut prepared_volumes = Vec::with_capacity(execution.volumes.len());
+    for mount in &execution.volumes {
+        let source = mount.source.trim();
+        let resolved = resolved_volumes.get(source).ok_or_else(|| {
+            anyhow!(
+                "job manifest references unresolved volume '{}'",
+                mount.source
+            )
+        })?;
+        prepared_volumes.push(PreparedVolumeMount {
+            volume_id: resolved.volume_id,
+            volume_name: resolved.volume_name.clone(),
+            target: mount.target.clone(),
+            read_only: mount.read_only,
+        });
+    }
+
+    Ok(PreparedJobExecution {
+        image: execution.image.clone(),
+        command: execution.command.clone(),
+        tty: execution.tty,
+        cpu_millis: execution.resources.cpu_millis,
+        memory_bytes: execution.resources.memory_bytes(),
+        gpu_count: execution.resources.gpu_count,
+        termination_grace_period_secs: execution.termination_grace_period_secs,
+        pre_stop_command: execution.pre_stop_command.clone(),
+        env: execution.env.clone(),
+        secret_files: execution.secret_files.clone(),
+        volumes: prepared_volumes,
+        networks: execution
+            .networks
+            .iter()
+            .map(|network| compute_network_id(network.trim()))
+            .collect(),
+        liveness: execution.liveness.clone(),
+    })
+}
+
+/// Rebuilds one resolved CLI volume mount into the generic jobs submit payload shape.
+fn prepared_volume_mount_from_resolved(mount: &ResolvedVolumeMount) -> PreparedVolumeMount {
+    PreparedVolumeMount {
+        volume_id: mount.volume_id,
+        volume_name: mount.volume_name.clone(),
+        target: mount.target.clone(),
+        read_only: mount.read_only,
+    }
+}
+
+/// Encodes one prepared jobs submit payload into the jobs wire builder.
+fn write_job_submit_spec(
+    mut builder: job_submit_spec::Builder<'_>,
+    spec: &PreparedJobSubmitSpec,
+) -> Result<()> {
+    builder.set_name(&spec.name);
+    write_job_execution(builder.reborrow().init_execution(), &spec.execution)?;
+    write_job_retry_policy(builder.reborrow().init_retry_policy(), &spec.retry_policy);
+    Ok(())
+}
+
+/// Encodes one prepared jobs execution template into the jobs wire builder.
+fn write_job_execution(
+    mut builder: job_execution::Builder<'_>,
+    execution: &PreparedJobExecution,
+) -> Result<()> {
+    builder.set_image(&execution.image);
+    builder.set_tty(execution.tty);
+    builder.set_cpu_millis(execution.cpu_millis);
+    builder.set_memory_bytes(execution.memory_bytes);
+    builder.set_gpu_count(execution.gpu_count);
+    builder.set_termination_grace_period_secs(execution.termination_grace_period_secs.unwrap_or(0));
+
+    let mut command = builder
+        .reborrow()
+        .init_command(execution.command.len() as u32);
+    for (index, arg) in execution.command.iter().enumerate() {
+        command.set(index as u32, arg);
+    }
+
+    let pre_stop = execution.pre_stop_command.as_deref().unwrap_or(&[]);
+    let mut pre_stop_builder = builder
+        .reborrow()
+        .init_pre_stop_command(pre_stop.len() as u32);
+    for (index, arg) in pre_stop.iter().enumerate() {
+        pre_stop_builder.set(index as u32, arg);
+    }
+
+    let mut env = builder.reborrow().init_env(execution.env.len() as u32);
+    write_env_vars(&mut env, &execution.env)?;
+
+    let mut secret_files = builder
+        .reborrow()
+        .init_secret_files(execution.secret_files.len() as u32);
+    write_secret_files(&mut secret_files, &execution.secret_files)?;
+
+    let mut volumes = builder
+        .reborrow()
+        .init_volumes(execution.volumes.len() as u32);
+    write_volume_mounts(&mut volumes, &execution.volumes);
+
+    let mut networks = builder
+        .reborrow()
+        .init_networks(execution.networks.len() as u32);
+    for (index, network_id) in execution.networks.iter().enumerate() {
+        networks.set(index as u32, network_id.as_bytes());
+    }
+
+    if let Some(liveness) = execution.liveness.as_ref() {
+        write_liveness_probe(builder.reborrow().init_liveness(), liveness);
+    }
+
+    Ok(())
+}
+
+/// Encodes one prepared jobs retry policy into the jobs wire builder.
+fn write_job_retry_policy(
+    mut builder: job_retry_policy::Builder<'_>,
+    retry_policy: &PreparedJobRetryPolicy,
+) {
+    builder.set_max_retries(retry_policy.max_retries);
+    builder.set_backoff_secs(retry_policy.backoff_secs);
+}
+
+/// Encodes one manifest secret reference into the workload wire builder.
+fn write_secret_reference(mut builder: secret_ref::Builder<'_>, reference: &SecretReference) {
+    builder.set_name(&reference.name);
+    if let Some(version) = reference.version {
+        builder.set_version_id(version.as_bytes());
+    } else {
+        builder.set_version_id(&[]);
+    }
+}
+
+/// Encodes one manifest environment variable list into the workload wire builder.
+fn write_env_vars(
+    builder: &mut struct_list::Builder<environment_var::Owned>,
+    vars: &[EnvironmentVariable],
+) -> Result<()> {
+    for (index, var) in vars.iter().enumerate() {
+        let mut entry = builder.reborrow().get(index as u32);
+        entry.set_name(&var.name);
+        if let Some(value) = var.value.as_deref() {
+            entry.set_value(value);
+        }
+        if let Some(secret) = var.secret.as_ref() {
+            write_secret_reference(entry.reborrow().init_secret(), secret);
+        }
+    }
+    Ok(())
+}
+
+/// Encodes one manifest secret file list into the workload wire builder.
+fn write_secret_files(
+    builder: &mut struct_list::Builder<secret_file::Owned>,
+    files: &[SecretFileProjection],
+) -> Result<()> {
+    for (index, file) in files.iter().enumerate() {
+        let mut entry = builder.reborrow().get(index as u32);
+        entry.set_path(&file.path);
+        write_secret_reference(entry.reborrow().init_secret(), &file.secret);
+        entry.set_mode(file.mode.unwrap_or(0));
+    }
+    Ok(())
+}
+
+/// Encodes one resolved volume mount list into the workload wire builder.
+fn write_volume_mounts(
+    builder: &mut struct_list::Builder<volume_mount::Owned>,
+    mounts: &[PreparedVolumeMount],
+) {
+    for (index, mount) in mounts.iter().enumerate() {
+        let mut entry = builder.reborrow().get(index as u32);
+        entry.set_volume_id(mount.volume_id.as_bytes());
+        entry.set_volume_name(&mount.volume_name);
+        entry.set_target(&mount.target);
+        entry.set_read_only(mount.read_only);
+    }
+}
+
+/// Encodes one manifest liveness probe into the workload wire builder.
+fn write_liveness_probe(mut builder: liveness_probe::Builder<'_>, probe: &LivenessProbe) {
+    let kind = match probe.kind {
+        LivenessKind::Exec => protocol::workload::LivenessProbeKind::Exec,
+        LivenessKind::Http => protocol::workload::LivenessProbeKind::Http,
+        LivenessKind::Tcp => protocol::workload::LivenessProbeKind::Tcp,
+    };
+    builder.set_kind(kind);
+
+    let mut command = builder.reborrow().init_command(probe.command.len() as u32);
+    for (index, arg) in probe.command.iter().enumerate() {
+        command.set(index as u32, arg);
+    }
+
+    builder.set_port(probe.port);
+    builder.set_path(probe.path.as_deref().unwrap_or(""));
+    builder.set_interval_ms(probe.interval_ms);
+    builder.set_timeout_ms(probe.timeout_ms);
+    builder.set_failure_threshold(probe.failure_threshold);
+    builder.set_start_period_ms(probe.start_period_ms);
 }

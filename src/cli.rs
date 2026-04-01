@@ -484,44 +484,82 @@ pub struct TasksStartArgs {
 
 #[derive(Args, Debug)]
 pub struct JobsRunArgs {
+    /// Path to one job manifest in RON format
+    #[arg(short = 'f', long = "file", value_name = "PATH")]
+    pub manifest: Option<PathBuf>,
+
     /// Friendly name for the job
-    #[arg(index = 1, value_name = "NAME")]
-    pub name: String,
+    #[arg(
+        index = 1,
+        value_name = "NAME",
+        required_unless_present = "manifest",
+        conflicts_with = "manifest"
+    )]
+    pub name: Option<String>,
 
     /// Container image to run
-    #[arg(short = 'i', long = "image", value_name = "IMAGE")]
-    pub image: String,
+    #[arg(
+        short = 'i',
+        long = "image",
+        value_name = "IMAGE",
+        required_unless_present = "manifest",
+        conflicts_with = "manifest"
+    )]
+    pub image: Option<String>,
 
     /// Command arguments for the job workload (repeat flag to add arguments)
-    #[arg(short = 'c', long = "command", value_name = "ARG", action = ArgAction::Append)]
+    #[arg(
+        short = 'c',
+        long = "command",
+        value_name = "ARG",
+        action = ArgAction::Append,
+        conflicts_with = "manifest"
+    )]
     pub command: Vec<String>,
 
+    /// Allocate a TTY for the job workload entrypoint
+    #[arg(long = "tty", action = ArgAction::SetTrue, conflicts_with = "manifest")]
+    pub tty: bool,
+
     /// CPU requested in milli-CPUs (e.g. 500 = 0.5 vCPU)
-    #[arg(long = "cpu-millis", value_name = "MCPU", default_value = "1000")]
-    pub cpu_millis: u64,
+    #[arg(long = "cpu-millis", value_name = "MCPU", conflicts_with = "manifest")]
+    pub cpu_millis: Option<u64>,
 
     /// Memory requested in bytes
     #[arg(
         long = "memory-bytes",
         value_name = "BYTES",
-        default_value = "536870912"
+        conflicts_with = "manifest"
     )]
-    pub memory_bytes: u64,
+    pub memory_bytes: Option<u64>,
 
     /// GPU count requested
-    #[arg(long = "gpu-count", value_name = "COUNT", default_value = "0")]
-    pub gpu_count: u32,
+    #[arg(long = "gpu-count", value_name = "COUNT", conflicts_with = "manifest")]
+    pub gpu_count: Option<u32>,
 
     /// Maximum number of retries after the initial attempt fails
-    #[arg(long = "max-retries", value_name = "COUNT", default_value = "0")]
-    pub max_retries: u32,
+    #[arg(
+        long = "max-retries",
+        value_name = "COUNT",
+        conflicts_with = "manifest"
+    )]
+    pub max_retries: Option<u32>,
 
     /// Backoff delay before the next retry attempt in seconds
-    #[arg(long = "retry-backoff-secs", value_name = "SECS", default_value = "2")]
-    pub retry_backoff_secs: u32,
+    #[arg(
+        long = "retry-backoff-secs",
+        value_name = "SECS",
+        conflicts_with = "manifest"
+    )]
+    pub retry_backoff_secs: Option<u32>,
 
     /// Named volume mount in SOURCE:TARGET[:ro|rw] form (repeat flag to add multiple mounts)
-    #[arg(long = "volume", value_name = "MOUNT", action = ArgAction::Append)]
+    #[arg(
+        long = "volume",
+        value_name = "MOUNT",
+        action = ArgAction::Append,
+        conflicts_with = "manifest"
+    )]
     pub volumes: Vec<String>,
 }
 

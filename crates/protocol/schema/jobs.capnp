@@ -49,6 +49,15 @@ struct JobExecution {
 
   networks @9 :List(Data);
   # Overlay network UUIDs as 16-byte binary data.
+
+  terminationGracePeriodSecs @10 :UInt32;
+  # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
+
+  preStopCommand @11 :List(Text);
+  # Optional command executed inside the runtime instance before termination begins.
+
+  liveness @12 :WorkloadSchema.LivenessProbe;
+  # Optional local liveness probe executed by the hosting runtime.
 }
 
 struct JobRetryPolicy {

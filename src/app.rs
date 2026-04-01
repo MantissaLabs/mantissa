@@ -237,9 +237,11 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     .run_until(client::jobs::run(
                         &cfg,
                         &client::jobs::JobRunOptions {
-                            name: &args.name,
-                            image: &args.image,
+                            manifest_path: args.manifest.as_deref(),
+                            name: args.name.as_deref(),
+                            image: args.image.as_deref(),
                             command: &args.command,
+                            tty: args.tty,
                             cpu_millis: args.cpu_millis,
                             memory_bytes: args.memory_bytes,
                             gpu_count: args.gpu_count,

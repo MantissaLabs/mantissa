@@ -2,8 +2,8 @@ use crate::jobs::manager::{JobController, JobSubmission};
 use crate::jobs::types::{JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_secret_files, decode_volume_mounts, encode_env_vars,
-    encode_secret_files, encode_volume_mounts,
+    decode_env_vars, decode_secret_files, decode_task_liveness_probe, decode_volume_mounts,
+    encode_env_vars, encode_secret_files, encode_task_liveness_probe, encode_volume_mounts,
 };
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
@@ -207,6 +207,18 @@ fn write_job_execution(
         networks.set(index as u32, network_id.as_bytes());
     }
 
+    builder.set_termination_grace_period_secs(execution.termination_grace_period_secs.unwrap_or(0));
+    let pre_stop = execution.pre_stop_command.as_deref().unwrap_or(&[]);
+    let mut pre_stop_builder = builder
+        .reborrow()
+        .init_pre_stop_command(pre_stop.len() as u32);
+    for (index, arg) in pre_stop.iter().enumerate() {
+        pre_stop_builder.set(index as u32, arg);
+    }
+    if let Some(liveness) = execution.liveness.as_ref() {
+        encode_task_liveness_probe(builder.reborrow().init_liveness(), liveness);
+    }
+
     Ok(())
 }
 
@@ -216,6 +228,13 @@ fn read_job_execution(reader: job_execution::Reader<'_>) -> Result<ResolvedExecu
     for arg in reader.get_command()?.iter() {
         command.push(arg?.to_str()?.to_string());
     }
+    let mut pre_stop_command = Vec::new();
+    for arg in reader.get_pre_stop_command()?.iter() {
+        let text = arg?.to_str()?.trim().to_string();
+        if !text.is_empty() {
+            pre_stop_command.push(text);
+        }
+    }
     let env = decode_env_vars(reader.get_env()?)?;
     let secret_files = decode_secret_files(reader.get_secret_files()?)?;
     let volumes = decode_volume_mounts(reader.get_volumes()?)?;
@@ -223,6 +242,15 @@ fn read_job_execution(reader: job_execution::Reader<'_>) -> Result<ResolvedExecu
     for entry in reader.get_networks()?.iter() {
         networks.push(read_uuid(entry?)?);
     }
+    let termination_grace_period_secs = match reader.get_termination_grace_period_secs() {
+        0 => None,
+        value => Some(value),
+    };
+    let liveness = if reader.has_liveness() {
+        Some(decode_task_liveness_probe(reader.get_liveness()?)?)
+    } else {
+        None
+    };
 
     Ok(ResolvedExecutionSpec {
         image: reader.get_image()?.to_str()?.to_string(),
@@ -232,9 +260,9 @@ fn read_job_execution(reader: job_execution::Reader<'_>) -> Result<ResolvedExecu
         memory_bytes: reader.get_memory_bytes(),
         gpu_count: reader.get_gpu_count(),
         restart_policy: None,
-        termination_grace_period_secs: None,
-        pre_stop_command: None,
-        liveness: None,
+        termination_grace_period_secs,
+        pre_stop_command: (!pre_stop_command.is_empty()).then_some(pre_stop_command),
+        liveness,
         env,
         secret_files,
         volumes,
