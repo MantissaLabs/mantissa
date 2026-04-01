@@ -177,6 +177,46 @@ impl WireGuardPeerValue {
     }
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash,
+)]
+pub enum PeerMembershipState {
+    Left,
+    #[default]
+    Active,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash,
+)]
+pub struct PeerMembership {
+    pub incarnation: u64,
+    pub state: PeerMembershipState,
+}
+
+impl PeerMembership {
+    /// Builds one active membership projection for the provided incarnation.
+    pub fn active(incarnation: u64) -> Self {
+        Self {
+            incarnation,
+            state: PeerMembershipState::Active,
+        }
+    }
+
+    /// Builds one left-membership projection for the provided incarnation.
+    pub fn left(incarnation: u64) -> Self {
+        Self {
+            incarnation,
+            state: PeerMembershipState::Left,
+        }
+    }
+
+    /// Returns true when the membership still represents an active peer.
+    pub fn is_active(self) -> bool {
+        matches!(self.state, PeerMembershipState::Active)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct PeerValue {
     pub address: String,
@@ -202,6 +242,10 @@ pub struct PeerValue {
     /// Cluster-visible runtime support metadata used by workload placement.
     #[serde(default)]
     pub runtime_support: RuntimeSupportProfile,
+
+    /// Membership state used to causally order graceful leave and rejoin for one node identity.
+    #[serde(default)]
+    pub membership: PeerMembership,
 }
 
 #[async_trait(?Send)]
@@ -236,11 +280,30 @@ impl PeerProvider for Topology {
 }
 
 impl PeerValue {
+    /// Returns true when this peer row still represents an active member.
+    pub fn is_active(&self) -> bool {
+        self.membership.is_active()
+    }
+
     /// Selects one deterministic winner from the concurrent values stored for one peer row.
     pub fn select(values: &[PeerValue]) -> Option<PeerValue> {
         if values.is_empty() {
             return None;
         }
+
+        let winning_membership = values
+            .iter()
+            .map(|value| value.membership)
+            .max_by_key(|membership| {
+                (
+                    membership.incarnation,
+                    match membership.state {
+                        PeerMembershipState::Left => 0u8,
+                        PeerMembershipState::Active => 1u8,
+                    },
+                )
+            })
+            .unwrap_or_default();
 
         let mut address: Option<&str> = None;
         let mut hostname: Option<&str> = None;
@@ -252,6 +315,10 @@ impl PeerValue {
         let mut runtime_support: Option<RuntimeSupportProfile> = None;
 
         for value in values {
+            if value.membership != winning_membership {
+                continue;
+            }
+
             if !value.address.is_empty() {
                 address = match address {
                     None => Some(value.address.as_str()),
@@ -304,6 +371,7 @@ impl PeerValue {
             wireguard,
             scheduling: scheduling.unwrap_or_default(),
             runtime_support: runtime_support.unwrap_or_default(),
+            membership: winning_membership,
         })
     }
 
@@ -397,6 +465,7 @@ impl PeerValue {
             wireguard,
             scheduling,
             runtime_support,
+            membership: PeerMembership::active(ni.get_incarnation()),
         })
     }
 }
@@ -526,6 +595,7 @@ mod tests {
                 reason: None,
                 drain_task_stop_timeout_secs: None,
             },
+            membership: super::PeerMembership::active(10),
         };
         let mut newer = older.clone();
         newer.scheduling = PeerSchedulingState {
@@ -567,5 +637,28 @@ mod tests {
         assert!(selected.enabled);
         assert_eq!(selected.port, 7777);
         assert_eq!(selected.public_key, [1u8; 32]);
+    }
+
+    /// A rejoin with the same membership incarnation must beat a stale left state.
+    #[test]
+    fn peer_select_prefers_active_rejoin_over_same_incarnation_left() {
+        let node_id = Uuid::from_bytes([5u8; 16]);
+        let active = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(node_id),
+            membership: super::PeerMembership::active(42),
+        };
+        let mut left = active.clone();
+        left.membership = super::PeerMembership::left(42);
+
+        let selected = PeerValue::select(&[left, active.clone()]).expect("selected peer value");
+        assert!(selected.is_active());
+        assert_eq!(selected.membership, active.membership);
     }
 }

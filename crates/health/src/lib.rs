@@ -110,6 +110,19 @@ impl HealthMonitor {
         self.local_incarnation.load(Ordering::SeqCst)
     }
 
+    /// Advances the local incarnation for one explicit membership transition.
+    pub fn advance_local_incarnation(&self) -> u64 {
+        let next = self
+            .local_incarnation
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+
+        let mut peers = lock_or_recover(&self.peers, "health.peers");
+        let state = peers.entry(self.local_id).or_default();
+        state.incarnation = state.incarnation.max(next);
+        next
+    }
+
     /// # Description:
     ///
     /// Chooses the next probe index for one candidate list using a deterministic round-robin cursor.

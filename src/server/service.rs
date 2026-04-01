@@ -5,7 +5,7 @@ use crate::node::id;
 use crate::node::identity::{pubkey_from_slice, verify_peer_identity};
 use crate::server::credential::ClusterCredential;
 use crate::topology::TopologyEvent;
-use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
+use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use std::rc::Rc;
 use tracing::debug;
 use x25519_dalek::PublicKey;
@@ -130,6 +130,7 @@ impl JoinRequest {
                     })
                     .collect::<Vec<_>>(),
             ),
+            membership: PeerMembership::active(info.get_incarnation()),
         };
 
         Ok(Self {

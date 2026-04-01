@@ -23,7 +23,9 @@ use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
 use crate::store::workload_store::WorkloadStore;
 use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains, sync_selected_domains};
 use crate::token::TokenStore;
-use crate::topology::peers::{PeerSchedulingState, PeerValue, write_runtime_support_to_node_info};
+use crate::topology::peers::{
+    PeerMembership, PeerSchedulingState, PeerValue, write_runtime_support_to_node_info,
+};
 use ::health::HealthMonitor;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
@@ -756,6 +758,7 @@ impl Topology {
             wireguard,
             scheduling: self.current_scheduling_state(),
             runtime_support: self.runtime_support.clone(),
+            membership: PeerMembership::active(self.swim_local_incarnation()),
         })
     }
 
@@ -960,7 +963,12 @@ impl Topology {
         // any peer != self in the MST?
         let (actives, _) = self.peers.load_all()?;
         let me = self.node.id;
-        Ok(actives.iter().any(|(k, _)| k.to_uuid() != me))
+        Ok(actives.iter().any(|(k, snapshot)| {
+            k.to_uuid() != me
+                && PeerValue::select(snapshot.as_slice())
+                    .map(|value| value.is_active())
+                    .unwrap_or(false)
+        }))
     }
 
     /// Spawns periodic anti-entropy loops (idempotent). Restartable after `stop_periodic_sync()`.
@@ -1052,6 +1060,7 @@ impl Topology {
                                 wireguard: wireguard.clone(),
                                 scheduling: scheduling.as_ref().clone(),
                                 runtime_support: runtime_support.as_ref().clone(),
+                                membership: PeerMembership::active(incarnation),
                             };
 
                             if let Err(e) = self.register_peer(id, &v, client.clone()).await {
@@ -1061,10 +1070,10 @@ impl Topology {
                             self.swim_record_join(id, incarnation);
                         }
 
-                        TopologyEvent::Leave { id } => {
+                        TopologyEvent::Leave { id, incarnation } => {
                             info!(target: "topology", "Node left: {id}");
 
-                            if let Err(e) = self.remove_peer(id).await {
+                            if let Err(e) = self.mark_peer_left(id, incarnation).await {
                                 error!("Failed to remove peer: {e}");
                                 continue;
                             }
@@ -1218,9 +1227,53 @@ impl Topology {
         Ok(())
     }
 
-    /// Return true if the peer `id` already exists in the peers store.
+    /// Marks one peer as gracefully left without tombstoning the reusable identity row.
+    pub async fn mark_peer_left(
+        &self,
+        id: Uuid,
+        incarnation: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let current = self.registry.peer_value_unscoped(id);
+        let stale_against_current = current
+            .as_ref()
+            .map(|value| {
+                value.membership.incarnation > incarnation
+                    || (value.membership.incarnation == incarnation && value.membership.is_active())
+            })
+            .unwrap_or(false);
+        if stale_against_current {
+            return Ok(());
+        }
+
+        let mut value = current.unwrap_or_else(|| PeerValue {
+            address: String::new(),
+            hostname: String::new(),
+            noise_static_pub: [0u8; 32],
+            signing_pub: [0u8; 32],
+            identity_sig: Vec::new(),
+            wireguard: None,
+            scheduling: PeerSchedulingState::schedulable_default(id),
+            runtime_support: RuntimeSupportProfile::default(),
+            membership: PeerMembership::left(incarnation),
+        });
+        value.membership = PeerMembership::left(incarnation);
+        self.peers.upsert(&UuidKey::from(id), value).await?;
+        self.registry.remove_peer(id).await;
+        self.health_monitor.remove_peer(id);
+        Ok(())
+    }
+
+    /// Return true if the peer `id` currently exists as an active member.
     pub fn peer_exists(&self, id: Uuid) -> io::Result<bool> {
-        self.peers.exists(&UuidKey::from(id)).map_err(Into::into)
+        let snapshot = self
+            .peers
+            .get_snapshot(&UuidKey::from(id))
+            .map_err(io::Error::other)?;
+        Ok(snapshot
+            .as_ref()
+            .and_then(|values| PeerValue::select(values.as_slice()))
+            .map(|value| value.is_active())
+            .unwrap_or(false))
     }
 
     pub async fn remove_peer(&self, id: Uuid) -> Result<(), Box<dyn std::error::Error>> {
@@ -1734,7 +1787,7 @@ impl Topology {
 
         // Find the MVReg snapshot for this UUID and deterministically select one converged value.
         let snap = actives.into_iter().find(|(k, _)| k.to_uuid() == peer_id)?.1;
-        let last = PeerValue::select(snap.as_slice())?;
+        let last = PeerValue::select(snap.as_slice()).filter(|value| value.is_active())?;
 
         // Convert the stored 32-byte pk -> ed25519_dalek::VerifyingKey
         let arr: [u8; 32] = last.signing_pub.as_slice().try_into().ok()?;
@@ -2038,6 +2091,7 @@ mod tests {
                 wireguard: None,
                 runtime_support: RuntimeSupportProfile::default(),
                 scheduling: PeerSchedulingState::schedulable_default(peer_id),
+                membership: crate::topology::peers::PeerMembership::active(1),
             }),
         }
     }

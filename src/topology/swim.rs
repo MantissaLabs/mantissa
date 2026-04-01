@@ -13,6 +13,11 @@ impl Topology {
         self.health_monitor.local_incarnation()
     }
 
+    /// Advances the local incarnation for one explicit membership transition.
+    pub fn swim_advance_local_incarnation(&self) -> u64 {
+        self.health_monitor.advance_local_incarnation()
+    }
+
     /// # Description:
     ///
     /// Records that a peer joined the membership and seeds detector state as alive.

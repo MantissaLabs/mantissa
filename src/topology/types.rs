@@ -58,6 +58,7 @@ pub enum TopologyEvent {
     },
     Leave {
         id: Uuid,
+        incarnation: u64,
     },
     Alive {
         id: Uuid,

@@ -614,10 +614,10 @@ impl Registry {
         let mut values_by_peer = HashMap::with_capacity(actives.len());
         for (key, snapshot) in actives {
             let peer_id = key.to_uuid();
-            if !snapshot.as_slice().is_empty() {
+            if let Some(value) =
+                PeerValue::select(snapshot.as_slice()).filter(|value| value.is_active())
+            {
                 active_peer_ids.push(peer_id);
-            }
-            if let Some(value) = PeerValue::select(snapshot.as_slice()) {
                 values_by_peer.insert(peer_id, value.clone());
                 peer_values.push((peer_id, value));
             }
@@ -686,6 +686,7 @@ impl Registry {
                 wireguard: None,
                 scheduling: PeerSchedulingState::schedulable_default(self.node_id),
                 runtime_support: RuntimeSupportProfile::default(),
+                membership: crate::topology::peers::PeerMembership::active(0),
             }
         };
 
@@ -765,7 +766,8 @@ impl Registry {
                 continue;
             }
 
-            let Some(val) = PeerValue::select(snap.as_slice()) else {
+            let Some(val) = PeerValue::select(snap.as_slice()).filter(|value| value.is_active())
+            else {
                 continue;
             };
             let addr = val.address.clone();
@@ -809,7 +811,9 @@ impl Registry {
                     continue;
                 }
 
-                if let Some(val) = PeerValue::select(snap.as_slice()) {
+                if let Some(val) =
+                    PeerValue::select(snap.as_slice()).filter(|value| value.is_active())
+                {
                     if val.address == local_addr {
                         continue;
                     }

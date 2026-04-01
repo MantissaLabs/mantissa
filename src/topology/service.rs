@@ -23,7 +23,8 @@ use crate::topology::operation::{
     SplitNetworkPolicy, SplitServicePolicy,
 };
 use crate::topology::peers::{
-    PeerSchedulingState, PeerValue, WireGuardPeerValue, write_runtime_support_to_node_info,
+    PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
+    write_runtime_support_to_node_info,
 };
 use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::types::VolumeDriver;
@@ -107,6 +108,7 @@ fn peer_value_from_join_payload(payload: &JoinPayload) -> PeerValue {
         wireguard: payload.wireguard.clone(),
         scheduling: payload.scheduling.clone(),
         runtime_support: payload.runtime_support.clone(),
+        membership: PeerMembership::active(payload.incarnation),
     }
 }
 
@@ -677,6 +679,53 @@ impl Topology {
         }
 
         Ok(())
+    }
+
+    /// Broadcasts one topology event immediately to the currently known active peers.
+    async fn broadcast_topology_event_now(&self, event: &TopologyEvent) {
+        let Some(snapshot) = self.peer_snapshot().await else {
+            return;
+        };
+        let cluster_view = self.active_cluster_view();
+
+        for entry in snapshot.entries.iter() {
+            if entry.peer_id == self.node.id {
+                continue;
+            }
+
+            let gossip_cap = match self
+                .registry
+                .gossip_client_for(entry.peer_id, cluster_view)
+                .await
+            {
+                Ok(Some(cap)) => cap,
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(
+                        target: "topology",
+                        peer_id = %entry.peer_id,
+                        "leave: failed to resolve gossip capability for immediate broadcast: {err}"
+                    );
+                    continue;
+                }
+            };
+
+            let mut request = gossip_cap.gossip_request();
+            let list = request.get().init_messages();
+            let mut messages = list.init_messages(1);
+            let mut message = messages.reborrow().get(0);
+            message.set_id(Uuid::new_v4().as_bytes());
+            cluster_view.write_capnp(message.reborrow().init_view());
+            add_event(&mut messages, 0, event, cluster_view);
+
+            if let Err(err) = request.send().promise.await {
+                warn!(
+                    target: "topology",
+                    peer_id = %entry.peer_id,
+                    "leave: immediate topology broadcast failed: {err}"
+                );
+            }
+        }
     }
 
     /// Resolves the split target index selected for the local node in a split operation.
@@ -1639,11 +1688,16 @@ impl topology::Server for Topology {
         }
 
         let self_id = self.node.id;
-
-        self.peers
-            .remove(&UuidKey::from(self_id))
+        let leave_incarnation = self.swim_advance_local_incarnation();
+        self.mark_peer_left(self_id, leave_incarnation)
             .await
-            .map_err(|e| capnp::Error::failed(format!("leave: tombstone failed: {e}")))?;
+            .map_err(|e| capnp::Error::failed(format!("leave: mark-left failed: {e}")))?;
+        let leave_event = TopologyEvent::Leave {
+            id: self_id,
+            incarnation: leave_incarnation,
+        };
+        self.broadcast_topology_event_now(&leave_event).await;
+        self.gossip_topology_event(leave_event).await?;
 
         self.registry.clear().await;
 
@@ -1696,7 +1750,12 @@ impl topology::Server for Topology {
                 .cloned()
                 .unwrap_or(::health::Status::Unknown);
             let node_status = status_to_node_status(health_status);
-            scoped_nodes.push((id, PeerValue::select(snap.as_slice()), node_status));
+            let Some(selected) =
+                PeerValue::select(snap.as_slice()).filter(|value| value.is_active())
+            else {
+                continue;
+            };
+            scoped_nodes.push((id, Some(selected), node_status));
         }
 
         scoped_nodes.sort_by_key(|(id, _, _)| *id);
@@ -2431,7 +2490,10 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
         EventType::Remove => {
             let node = reader.get_node()?;
             let id = read_node_id(node.get_id()?)?;
-            TopologyEvent::Leave { id }
+            TopologyEvent::Leave {
+                id,
+                incarnation: node.get_incarnation(),
+            }
         }
         EventType::Alive => {
             let node = reader.get_node()?;
@@ -2563,12 +2625,13 @@ pub fn add_event(
             }
         }
 
-        TopologyEvent::Leave { id } => {
+        TopologyEvent::Leave { id, incarnation } => {
             let mut topo = msg.init_topology();
             topo.set_event(topology_event::EventType::Remove);
             let mut node = topo.init_node();
             set_node_id(node.reborrow().init_id(), id);
             cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
+            node.set_incarnation(*incarnation);
         }
 
         TopologyEvent::Alive { id, incarnation } => {
@@ -2640,7 +2703,9 @@ pub fn add_event(
 mod tests {
     use super::restored_local_peer_value;
     use crate::runtime::types::RuntimeSupportProfile;
-    use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
+    use crate::topology::peers::{
+        PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
+    };
     use uuid::Uuid;
 
     /// Build one synthetic self row matching the conservative join-time snapshot.
@@ -2666,6 +2731,7 @@ mod tests {
                 reason: None,
                 drain_task_stop_timeout_secs: None,
             },
+            membership: PeerMembership::active(10),
         }
     }
 
@@ -2707,6 +2773,7 @@ mod tests {
                 reason: Some("maintenance".to_string()),
                 drain_task_stop_timeout_secs: Some(30),
             },
+            membership: PeerMembership::active(20),
         };
 
         let restored = restored_local_peer_value(Some(&current), payload.clone());
