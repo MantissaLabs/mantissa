@@ -7,7 +7,7 @@ use crate::runtime::types::{
     ResourceLimits, RestartPolicyConfig, RestartPolicyType, RuntimeCreateRequest,
 };
 use crate::workload::model::{
-    ExecutionSubstrate, IsolationMode, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
+    ExecutionPlatform, IsolationMode, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
     WorkloadSecretFile, WorkloadVolumeMount as TaskVolumeMount,
 };
 use crate::workload::types::{WorkloadRestartPolicy, WorkloadRestartPolicyKind};
@@ -24,7 +24,7 @@ pub(super) struct InstanceLaunchRequest<'a> {
     pub task_name: &'a str,
     pub instance_name: &'a str,
     pub image: &'a str,
-    pub execution_substrate: ExecutionSubstrate,
+    pub execution_platform: ExecutionPlatform,
     pub isolation_mode: IsolationMode,
     pub isolation_profile: Option<&'a str>,
     pub command: &'a [String],
@@ -128,8 +128,8 @@ impl WorkloadManager {
                 request.task_id.to_string(),
             ),
             (
-                "mantissa.execution_substrate".to_string(),
-                request.execution_substrate.as_str().to_string(),
+                "mantissa.execution_platform".to_string(),
+                request.execution_platform.as_str().to_string(),
             ),
             (
                 "mantissa.isolation_mode".to_string(),
@@ -148,7 +148,7 @@ impl WorkloadManager {
         let create_request = RuntimeCreateRequest {
             name: request.instance_name.to_string(),
             image: request.image.to_string(),
-            execution_substrate: request.execution_substrate,
+            execution_platform: request.execution_platform,
             isolation_mode: request.isolation_mode,
             isolation_profile: request.isolation_profile.map(str::to_string),
             labels: Some(labels),

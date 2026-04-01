@@ -28,7 +28,7 @@ use crate::runtime::types::{
     RuntimeCreateRequest, RuntimeError, RuntimeEvent, RuntimeExecOptions, RuntimeExecResult,
     RuntimeInfo, RuntimeLogFrame, RuntimeLogsOptions, RuntimeResult, RuntimeSupportProfile,
 };
-use crate::workload::model::ExecutionSubstrate;
+use crate::workload::model::ExecutionPlatform;
 
 use super::conversions::{
     classify_runtime_error, runtime_info_from_inspect, runtime_info_from_list_entry,
@@ -45,7 +45,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
         let RuntimeCreateRequest {
             name,
             image,
-            execution_substrate: _execution_substrate,
+            execution_platform: _execution_platform,
             isolation_mode: _isolation_mode,
             isolation_profile: _isolation_profile,
             labels,
@@ -477,7 +477,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
     /// Advertises Docker-backed OCI execution in both standard and sandboxed isolation modes.
     fn advertised_support(&self) -> RuntimeSupportProfile {
         RuntimeSupportProfile::new(
-            [ExecutionSubstrate::Oci],
+            [ExecutionPlatform::Oci],
             [
                 crate::workload::model::IsolationMode::Standard,
                 crate::workload::model::IsolationMode::Sandboxed,

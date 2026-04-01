@@ -28,7 +28,7 @@ use mantissa::store::workload_store::open_workload_store;
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use mantissa::volumes::VolumeRegistry;
 use mantissa::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadStartRequest};
-use mantissa::workload::model::ExecutionSubstrate;
+use mantissa::workload::model::ExecutionPlatform;
 use mantissa::workload::types::ResolvedExecutionSpec;
 use net::noise::NoiseKeys;
 use protocol::secrets::secrets;
@@ -429,7 +429,7 @@ local_test!(workload_manager_stages_secret_env_and_files, {
             volumes: Vec::new(),
             networks: Vec::new(),
         },
-        execution_substrate: ExecutionSubstrate::Oci,
+        execution_platform: ExecutionPlatform::Oci,
         isolation_mode: mantissa::workload::model::IsolationMode::Standard,
         isolation_profile: None,
         gpu_device_ids: Vec::new(),
@@ -570,7 +570,7 @@ local_test!(workload_manager_rejects_missing_secret_reference, {
             volumes: Vec::new(),
             networks: Vec::new(),
         },
-        execution_substrate: ExecutionSubstrate::Oci,
+        execution_platform: ExecutionPlatform::Oci,
         isolation_mode: mantissa::workload::model::IsolationMode::Standard,
         isolation_profile: None,
         gpu_device_ids: Vec::new(),

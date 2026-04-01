@@ -2120,7 +2120,7 @@ impl WorkloadManager {
                 task_name: &working.name,
                 instance_name: &instance_name,
                 image: &working.image,
-                execution_substrate: working.execution_substrate,
+                execution_platform: working.execution_platform,
                 isolation_mode: working.isolation_mode,
                 isolation_profile: working.isolation_profile.as_deref(),
                 command: &working.command,

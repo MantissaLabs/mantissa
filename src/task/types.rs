@@ -6,7 +6,7 @@
 //! ownership metadata for service replicas, job attempts, and agent runs.
 
 use crate::workload::model::{
-    ExecutionSubstrate, IsolationMode, WorkloadPhase, WorkloadSpec, WorkloadStateFilter,
+    ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec, WorkloadStateFilter,
     WorkloadStateKind,
 };
 use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
@@ -35,7 +35,7 @@ pub struct TaskSpec {
     pub name: String,
     pub image: String,
     #[serde(default)]
-    pub execution_substrate: ExecutionSubstrate,
+    pub execution_platform: ExecutionPlatform,
     #[serde(default)]
     pub isolation_mode: IsolationMode,
     #[serde(default)]
@@ -107,7 +107,7 @@ impl TaskSpec {
             id: spec.id,
             name: spec.name.clone(),
             image: spec.image.clone(),
-            execution_substrate: spec.execution_substrate,
+            execution_platform: spec.execution_platform,
             isolation_mode: spec.isolation_mode,
             isolation_profile: spec.isolation_profile.clone(),
             state: spec.state.clone(),

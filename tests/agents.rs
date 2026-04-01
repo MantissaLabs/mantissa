@@ -8,7 +8,7 @@ use crdt_store::uuid_key::UuidKey;
 use mantissa::task::types::TaskValue;
 use mantissa::workload::model::WorkloadPhase;
 use mantissa::workload::model::WorkloadSpec;
-use mantissa::workload::model::{ExecutionSubstrate, IsolationMode};
+use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
 use protocol::agents::{
     AgentRunStatus as ProtoAgentRunStatus, AgentSessionStatus as ProtoAgentSessionStatus, agents,
 };
@@ -38,7 +38,7 @@ local_test!(
             .inspect_workload(workload_id)
             .await
             .expect("inspect agent workload");
-        assert_eq!(task.execution_substrate, ExecutionSubstrate::Oci);
+        assert_eq!(task.execution_platform, ExecutionPlatform::Oci);
         assert_eq!(task.isolation_mode, IsolationMode::Sandboxed);
         assert_eq!(task.isolation_profile.as_deref(), Some("oci-default"));
 
@@ -323,7 +323,7 @@ fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
         id: spec.id,
         name: spec.name.clone(),
         image: spec.image.clone(),
-        execution_substrate: spec.execution_substrate,
+        execution_platform: spec.execution_platform,
         isolation_mode: spec.isolation_mode,
         isolation_profile: spec.isolation_profile.clone(),
         state: spec.state.clone(),

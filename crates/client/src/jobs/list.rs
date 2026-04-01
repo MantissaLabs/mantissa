@@ -28,7 +28,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             row.name,
             row.image,
             row.status.as_str(),
-            row.execution_substrate,
+            row.execution_platform,
             row.isolation_profile.as_deref().map_or_else(
                 || row.isolation_mode.clone(),
                 |profile| format!("{} ({profile})", row.isolation_mode),

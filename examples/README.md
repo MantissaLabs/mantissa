@@ -47,7 +47,7 @@ This manifest runs one short-lived Alpine container that prints two lines and
 exits successfully. It is the smallest complete example of the declarative jobs
 surface:
 
-- top-level runtime selection through `execution_substrate` and `isolation_mode`
+- top-level runtime selection through `execution_platform` and `isolation_mode`
 - one shared execution template under `execution`
 - controller-owned retry policy under `retry_policy`
 

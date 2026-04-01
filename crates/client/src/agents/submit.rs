@@ -15,7 +15,7 @@ pub struct AgentSubmitOptions<'a> {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
     pub gpu_count: u32,
-    pub execution_substrate: &'a str,
+    pub execution_platform: &'a str,
     pub isolation_mode: &'a str,
     pub isolation_profile: Option<&'a str>,
     pub volumes: &'a [String],
@@ -54,7 +54,7 @@ pub async fn submit(cfg: &ClientConfig, options: &AgentSubmitOptions<'_>) -> Res
         builder.set_cpu_millis(options.cpu_millis);
         builder.set_memory_bytes(options.memory_bytes);
         builder.set_gpu_count(options.gpu_count);
-        builder.set_execution_substrate(options.execution_substrate);
+        builder.set_execution_platform(options.execution_platform);
         builder.set_isolation_mode(options.isolation_mode);
         builder.set_isolation_profile(options.isolation_profile.unwrap_or_default());
         builder.set_pending_input(options.initial_input.unwrap_or_default());
@@ -125,7 +125,7 @@ pub async fn submit(cfg: &ClientConfig, options: &AgentSubmitOptions<'_>) -> Res
         options.cpu_millis,
         options.memory_bytes / (1024 * 1024),
         options.gpu_count,
-        options.execution_substrate,
+        options.execution_platform,
         options.isolation_mode,
         options.isolation_profile.unwrap_or("default"),
     )?;

@@ -2442,7 +2442,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 wireguard,
                 scheduling: Box::new(scheduling),
                 runtime_support: Box::new(RuntimeSupportProfile::new(
-                    node.get_execution_substrates()?
+                    node.get_execution_platforms()?
                         .iter()
                         .filter_map(|value| {
                             value
@@ -2450,7 +2450,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                                 .and_then(|value| value.to_str().ok())
                                 .and_then(|value| {
                                     value
-                                        .parse::<crate::workload::model::ExecutionSubstrate>()
+                                        .parse::<crate::workload::model::ExecutionPlatform>()
                                         .ok()
                                 })
                         })

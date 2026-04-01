@@ -5,7 +5,7 @@ use crate::registry::Registry;
 use crate::workload::manager::workload_start_error_is_retryable;
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
 use crate::workload::model::{
-    ExecutionSubstrate, IsolationMode, WorkloadJobMetadata, WorkloadOwner, WorkloadPhase,
+    ExecutionPlatform, IsolationMode, WorkloadJobMetadata, WorkloadOwner, WorkloadPhase,
     WorkloadSpec, WorkloadStateFilter,
 };
 use anyhow::{Result, anyhow};
@@ -105,7 +105,7 @@ impl JobController {
         &self,
         name: impl Into<String>,
         execution: crate::workload::types::ResolvedExecutionSpec,
-        execution_substrate: ExecutionSubstrate,
+        execution_platform: ExecutionPlatform,
         isolation_mode: IsolationMode,
         isolation_profile: Option<String>,
         retry_policy: JobRetryPolicy,
@@ -116,7 +116,7 @@ impl JobController {
             Uuid::new_v4(),
             name,
             execution,
-            execution_substrate,
+            execution_platform,
             isolation_mode,
             isolation_profile,
             retry_policy,
@@ -519,7 +519,7 @@ impl JobController {
         let request = WorkloadStartRequest {
             name: format!("{}-attempt-{}", latest.name, latest.attempts_started),
             execution: latest.execution.clone(),
-            execution_substrate: latest.execution_substrate,
+            execution_platform: latest.execution_platform,
             isolation_mode: latest.isolation_mode,
             isolation_profile: latest.isolation_profile.clone(),
             gpu_device_ids: Vec::new(),
@@ -807,7 +807,7 @@ mod tests {
                 volumes: Vec::new(),
                 networks: Vec::new(),
             },
-            ExecutionSubstrate::Oci,
+            ExecutionPlatform::Oci,
             IsolationMode::Standard,
             None,
             JobRetryPolicy::default(),

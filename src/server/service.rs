@@ -87,7 +87,7 @@ impl JoinRequest {
                 },
             ),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::new(
-                info.get_execution_substrates()?
+                info.get_execution_platforms()?
                     .iter()
                     .filter_map(|value| {
                         value
@@ -95,7 +95,7 @@ impl JoinRequest {
                             .and_then(|value| value.to_str().ok())
                             .and_then(|value| {
                                 value
-                                    .parse::<crate::workload::model::ExecutionSubstrate>()
+                                    .parse::<crate::workload::model::ExecutionPlatform>()
                                     .ok()
                             })
                     })

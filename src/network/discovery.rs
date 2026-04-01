@@ -2131,7 +2131,7 @@ mod tests {
             id: task_id,
             name: "backend".to_string(),
             image: "hashicorp/http-echo:1.0.0".to_string(),
-            execution_substrate: crate::workload::model::ExecutionSubstrate::Oci,
+            execution_platform: crate::workload::model::ExecutionPlatform::Oci,
             isolation_mode: crate::workload::model::IsolationMode::Standard,
             isolation_profile: None,
             state: WorkloadPhase::Running,

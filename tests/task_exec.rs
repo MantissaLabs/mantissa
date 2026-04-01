@@ -195,7 +195,7 @@ fn replicated_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str) -> Tas
         id: task_id,
         name: "demo-task".to_string(),
         image: "img".to_string(),
-        execution_substrate: mantissa::workload::model::ExecutionSubstrate::Oci,
+        execution_platform: mantissa::workload::model::ExecutionPlatform::Oci,
         isolation_mode: mantissa::workload::model::IsolationMode::Standard,
         isolation_profile: None,
         state: WorkloadPhase::Running,

@@ -12,7 +12,7 @@ use mantissa::runtime::types::{
 };
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport};
 use mantissa::task::types::TaskStateFilter;
-use mantissa::workload::model::{ExecutionSubstrate, IsolationMode};
+use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
 use net::noise::NoiseKeys;
 use protocol::jobs::{JobStatus as ProtoJobStatus, jobs};
 use std::collections::HashMap;
@@ -235,7 +235,7 @@ local_test!(jobs_runtime_selection_reaches_workload_attempts, {
     let inspected = inspect_job(&node.node.jobs_client, job_id)
         .await
         .expect("inspect submitted sandboxed job");
-    assert_eq!(inspected.snapshot.execution_substrate, "oci");
+    assert_eq!(inspected.snapshot.execution_platform, "oci");
     assert_eq!(inspected.snapshot.isolation_mode, "sandboxed");
     assert_eq!(
         inspected.snapshot.isolation_profile.as_deref(),
@@ -252,7 +252,7 @@ local_test!(jobs_runtime_selection_reaches_workload_attempts, {
         .inspect_workload(active_workload_id)
         .await
         .expect("inspect sandboxed job workload");
-    assert_eq!(workload.execution_substrate, ExecutionSubstrate::Oci);
+    assert_eq!(workload.execution_platform, ExecutionPlatform::Oci);
     assert_eq!(workload.isolation_mode, IsolationMode::Sandboxed);
     assert_eq!(workload.isolation_profile.as_deref(), Some("oci-default"));
 
@@ -262,7 +262,7 @@ local_test!(jobs_runtime_selection_reaches_workload_attempts, {
     assert!(
         inspected.attempts.iter().any(|attempt| {
             attempt.workload_id == active_workload_id
-                && attempt.execution_substrate == "oci"
+                && attempt.execution_platform == "oci"
                 && attempt.isolation_mode == "sandboxed"
                 && attempt.isolation_profile.as_deref() == Some("oci-default")
         }),
@@ -482,7 +482,7 @@ struct JobSnapshot {
     status: ProtoJobStatus,
     attempts_started: u32,
     active_workload_id: Option<Uuid>,
-    execution_substrate: String,
+    execution_platform: String,
     isolation_mode: String,
     isolation_profile: Option<String>,
 }
@@ -492,7 +492,7 @@ struct JobAttemptSnapshot {
     workload_id: Uuid,
     is_active: bool,
     is_last: bool,
-    execution_substrate: String,
+    execution_platform: String,
     isolation_mode: String,
     isolation_profile: Option<String>,
 }
@@ -528,7 +528,7 @@ async fn submit_job_with_runtime(
     name: &str,
     max_retries: u32,
     retry_backoff_secs: u32,
-    execution_substrate: &str,
+    execution_platform: &str,
     isolation_mode: &str,
     isolation_profile: Option<&str>,
 ) -> Result<Uuid, capnp::Error> {
@@ -536,7 +536,7 @@ async fn submit_job_with_runtime(
     {
         let mut builder = request.get().init_spec();
         builder.set_name(name);
-        builder.set_execution_substrate(execution_substrate);
+        builder.set_execution_platform(execution_platform);
         builder.set_isolation_mode(isolation_mode);
         builder.set_isolation_profile(isolation_profile.unwrap_or_default());
         let mut execution = builder.reborrow().init_execution();
@@ -569,7 +569,7 @@ async fn list_jobs(client: &jobs::Client) -> Result<Vec<JobSnapshot>, capnp::Err
             status: reader.get_status()?,
             attempts_started: reader.get_attempts_started(),
             active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
-            execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+            execution_platform: reader.get_execution_platform()?.to_str()?.to_string(),
             isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
             isolation_profile: read_optional_text(reader.get_isolation_profile()?.to_str()?),
         });
@@ -590,7 +590,7 @@ async fn inspect_job(client: &jobs::Client, job_id: Uuid) -> Result<JobDetail, c
             workload_id: read_uuid(attempt.get_workload_id()?)?,
             is_active: attempt.get_is_active(),
             is_last: attempt.get_is_last(),
-            execution_substrate: attempt.get_execution_substrate()?.to_str()?.to_string(),
+            execution_platform: attempt.get_execution_platform()?.to_str()?.to_string(),
             isolation_mode: attempt.get_isolation_mode()?.to_str()?.to_string(),
             isolation_profile: read_optional_text(attempt.get_isolation_profile()?.to_str()?),
         });
@@ -601,7 +601,7 @@ async fn inspect_job(client: &jobs::Client, job_id: Uuid) -> Result<JobDetail, c
             status: snapshot.get_status()?,
             attempts_started: snapshot.get_attempts_started(),
             active_workload_id: read_optional_uuid(snapshot.get_active_workload_id()?),
-            execution_substrate: snapshot.get_execution_substrate()?.to_str()?.to_string(),
+            execution_platform: snapshot.get_execution_platform()?.to_str()?.to_string(),
             isolation_mode: snapshot.get_isolation_mode()?.to_str()?.to_string(),
             isolation_profile: read_optional_text(snapshot.get_isolation_profile()?.to_str()?),
         },
@@ -620,7 +620,7 @@ async fn cancel_job(client: &jobs::Client, job_id: Uuid) -> Result<JobSnapshot, 
         status: reader.get_status()?,
         attempts_started: reader.get_attempts_started(),
         active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
-        execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+        execution_platform: reader.get_execution_platform()?.to_str()?.to_string(),
         isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
         isolation_profile: read_optional_text(reader.get_isolation_profile()?.to_str()?),
     })
@@ -637,7 +637,7 @@ async fn delete_job(client: &jobs::Client, job_id: Uuid) -> Result<JobSnapshot, 
         status: reader.get_status()?,
         attempts_started: reader.get_attempts_started(),
         active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
-        execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+        execution_platform: reader.get_execution_platform()?.to_str()?.to_string(),
         isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
         isolation_profile: read_optional_text(reader.get_isolation_profile()?.to_str()?),
     })

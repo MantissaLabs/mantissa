@@ -251,8 +251,8 @@ struct WorkloadSpec {
   leaseCoordinatorNodeId @31 :Data;
   # 16-byte UUID of the node that coordinated the prepared lease, empty when unset.
 
-  executionSubstrate @32 :Text;
-  # Execution substrate used to host this workload.
+  executionPlatform @32 :Text;
+  # Execution platform used to host this workload.
 
   isolationMode @33 :Text;
   # Isolation contract used to host this workload.
@@ -308,8 +308,8 @@ struct WorkloadStatus {
   lastTerminalObservedLaunch @14 :UInt64;
   # Last launch attempt observed as terminal, 0 means unset.
 
-  executionSubstrate @15 :Text;
-  # Execution substrate used to host this workload.
+  executionPlatform @15 :Text;
+  # Execution platform used to host this workload.
 
   isolationMode @16 :Text;
   # Isolation contract used to host this workload.

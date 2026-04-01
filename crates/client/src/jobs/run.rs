@@ -5,7 +5,7 @@ use crate::jobs::manifest::{
     SecretReference, load_manifest_from_path,
 };
 use crate::jobs::runtime::{
-    normalize_execution_substrate, normalize_isolation_mode, normalize_isolation_profile,
+    normalize_execution_platform, normalize_isolation_mode, normalize_isolation_profile,
 };
 use crate::output;
 use crate::tasks::uuid_to_string;
@@ -49,7 +49,7 @@ pub struct JobRunOptions<'a> {
     pub gpu_count: Option<u32>,
     pub max_retries: Option<u32>,
     pub retry_backoff_secs: Option<u32>,
-    pub execution_substrate: &'a str,
+    pub execution_platform: &'a str,
     pub isolation_mode: &'a str,
     pub isolation_profile: Option<&'a str>,
     pub volumes: &'a [String],
@@ -60,7 +60,7 @@ struct PreparedJobSubmitSpec {
     name: String,
     execution: PreparedJobExecution,
     retry_policy: PreparedJobRetryPolicy,
-    execution_substrate: String,
+    execution_platform: String,
     isolation_mode: String,
     isolation_profile: Option<String>,
 }
@@ -124,7 +124,7 @@ pub async fn run(cfg: &ClientConfig, options: &JobRunOptions<'_>) -> Result<()> 
         prepared.execution.cpu_millis,
         prepared.execution.memory_bytes / (1024 * 1024),
         prepared.execution.gpu_count,
-        prepared.execution_substrate,
+        prepared.execution_platform,
         prepared.isolation_mode,
         prepared.isolation_profile.as_deref().unwrap_or("default"),
         prepared.retry_policy.max_retries,
@@ -165,7 +165,7 @@ async fn prepare_raw_submit_spec(
         .ok_or_else(|| anyhow!("jobs run requires --image unless --file is used"))?;
 
     let resolved_volumes = volumes::resolve_cli_volume_mounts(cfg, options.volumes).await?;
-    let execution_substrate = normalize_execution_substrate(options.execution_substrate)?;
+    let execution_platform = normalize_execution_platform(options.execution_platform)?;
     let isolation_mode = normalize_isolation_mode(options.isolation_mode)?;
     let isolation_profile = normalize_isolation_profile(options.isolation_profile);
 
@@ -195,7 +195,7 @@ async fn prepare_raw_submit_spec(
                 .retry_backoff_secs
                 .unwrap_or(DEFAULT_RETRY_BACKOFF_SECS),
         },
-        execution_substrate,
+        execution_platform,
         isolation_mode,
         isolation_profile,
     })
@@ -217,7 +217,7 @@ async fn prepare_manifest_submit_spec(
             max_retries: manifest.retry_policy.max_retries,
             backoff_secs: manifest.retry_policy.backoff_secs,
         },
-        execution_substrate: manifest.execution_substrate.clone(),
+        execution_platform: manifest.execution_platform.clone(),
         isolation_mode: manifest.isolation_mode.clone(),
         isolation_profile: manifest.isolation_profile.clone(),
     })
@@ -285,7 +285,7 @@ fn write_job_submit_spec(
     builder.set_name(&spec.name);
     write_job_execution(builder.reborrow().init_execution(), &spec.execution)?;
     write_job_retry_policy(builder.reborrow().init_retry_policy(), &spec.retry_policy);
-    builder.set_execution_substrate(&spec.execution_substrate);
+    builder.set_execution_platform(&spec.execution_platform);
     builder.set_isolation_mode(&spec.isolation_mode);
     builder.set_isolation_profile(spec.isolation_profile.as_deref().unwrap_or(""));
     Ok(())

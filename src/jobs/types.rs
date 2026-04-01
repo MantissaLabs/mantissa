@@ -1,4 +1,4 @@
-use crate::workload::model::{ExecutionSubstrate, IsolationMode};
+use crate::workload::model::{ExecutionPlatform, IsolationMode};
 use crate::workload::types::ResolvedExecutionSpec;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
@@ -8,13 +8,13 @@ use uuid::Uuid;
 ///
 /// A job is a controller-level object. It owns retry/completion semantics and may launch one or
 /// more underlying workload attempts over time. Those attempts still use the shared workload
-/// execution substrate.
+/// execution platform.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobSpecValue {
     pub id: Uuid,
     pub name: String,
     pub execution: ResolvedExecutionSpec,
-    pub execution_substrate: ExecutionSubstrate,
+    pub execution_platform: ExecutionPlatform,
     pub isolation_mode: IsolationMode,
     #[serde(default)]
     pub isolation_profile: Option<String>,
@@ -54,7 +54,7 @@ impl JobSpecValue {
         id: Uuid,
         name: impl Into<String>,
         execution: ResolvedExecutionSpec,
-        execution_substrate: ExecutionSubstrate,
+        execution_platform: ExecutionPlatform,
         isolation_mode: IsolationMode,
         isolation_profile: Option<String>,
         retry_policy: JobRetryPolicy,
@@ -64,7 +64,7 @@ impl JobSpecValue {
             id,
             name: name.into(),
             execution,
-            execution_substrate,
+            execution_platform,
             isolation_mode,
             isolation_profile,
             created_at: now.clone(),
@@ -335,7 +335,7 @@ mod tests {
                 volumes: Vec::new(),
                 networks: Vec::new(),
             },
-            ExecutionSubstrate::Oci,
+            ExecutionPlatform::Oci,
             IsolationMode::Standard,
             None,
             JobRetryPolicy::default(),
@@ -387,7 +387,7 @@ mod tests {
                 volumes: Vec::new(),
                 networks: Vec::new(),
             },
-            ExecutionSubstrate::Oci,
+            ExecutionPlatform::Oci,
             IsolationMode::Standard,
             None,
             JobRetryPolicy::default(),

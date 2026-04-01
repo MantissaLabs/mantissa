@@ -266,8 +266,8 @@ struct TaskSpec {
   leaseCoordinatorNodeId @30 :Data;
   # 16-byte UUID of the node that coordinated the prepared lease, empty when unset.
 
-  executionSubstrate @31 :Text;
-  # Execution substrate used to host this task.
+  executionPlatform @31 :Text;
+  # Execution platform used to host this task.
 
   isolationMode @32 :Text;
   # Isolation contract used to host this task.
@@ -330,8 +330,8 @@ struct TaskStartRequest {
   liveness @16 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe executed by the hosting runtime.
 
-  executionSubstrate @17 :Text;
-  # Execution substrate requested for this task.
+  executionPlatform @17 :Text;
+  # Execution platform requested for this task.
 
   isolationMode @18 :Text;
   # Isolation contract requested for this task.

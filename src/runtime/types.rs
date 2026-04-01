@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender};
 
-use crate::workload::model::{ExecutionSubstrate, IsolationMode};
+use crate::workload::model::{ExecutionPlatform, IsolationMode};
 
 /// Errors returned by runtime backends.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -179,7 +179,7 @@ impl Default for RuntimeExecOptions {
 pub struct RuntimeCreateRequest {
     pub name: String,
     pub image: String,
-    pub execution_substrate: ExecutionSubstrate,
+    pub execution_platform: ExecutionPlatform,
     pub isolation_mode: IsolationMode,
     pub isolation_profile: Option<String>,
     pub labels: Option<HashMap<String, String>>,
@@ -346,8 +346,8 @@ impl RuntimeCapabilities {
 /// Cluster-visible runtime support metadata advertised by one node.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct RuntimeSupportProfile {
-    #[serde(default = "default_execution_substrates")]
-    pub execution_substrates: Vec<ExecutionSubstrate>,
+    #[serde(default = "default_execution_platforms")]
+    pub execution_platforms: Vec<ExecutionPlatform>,
     #[serde(default = "default_isolation_modes")]
     pub isolation_modes: Vec<IsolationMode>,
     #[serde(default)]
@@ -360,7 +360,7 @@ impl Default for RuntimeSupportProfile {
     /// Builds the current task-era default node profile for legacy or test rows.
     fn default() -> Self {
         Self::new(
-            [ExecutionSubstrate::Oci],
+            [ExecutionPlatform::Oci],
             [IsolationMode::Standard],
             Vec::<String>::new(),
             RuntimeCapabilities {
@@ -378,25 +378,25 @@ impl Default for RuntimeSupportProfile {
 impl RuntimeSupportProfile {
     /// Normalizes one runtime support profile into a deterministic, deduplicated form.
     pub fn new<I, J, K, L>(
-        execution_substrates: I,
+        execution_platforms: I,
         isolation_modes: J,
         isolation_profiles: K,
         feature_flags: L,
     ) -> Self
     where
-        I: IntoIterator<Item = ExecutionSubstrate>,
+        I: IntoIterator<Item = ExecutionPlatform>,
         J: IntoIterator<Item = IsolationMode>,
         K: IntoIterator,
         K::Item: Into<String>,
         L: IntoIterator,
         L::Item: Into<String>,
     {
-        let mut execution_substrates: Vec<ExecutionSubstrate> =
-            execution_substrates.into_iter().collect();
-        execution_substrates.sort_unstable();
-        execution_substrates.dedup();
-        if execution_substrates.is_empty() {
-            execution_substrates.push(ExecutionSubstrate::Oci);
+        let mut execution_platforms: Vec<ExecutionPlatform> =
+            execution_platforms.into_iter().collect();
+        execution_platforms.sort_unstable();
+        execution_platforms.dedup();
+        if execution_platforms.is_empty() {
+            execution_platforms.push(ExecutionPlatform::Oci);
         }
 
         let mut isolation_modes: Vec<IsolationMode> = isolation_modes.into_iter().collect();
@@ -425,7 +425,7 @@ impl RuntimeSupportProfile {
         feature_flags.dedup();
 
         Self {
-            execution_substrates,
+            execution_platforms,
             isolation_modes,
             isolation_profiles,
             feature_flags,
@@ -435,7 +435,7 @@ impl RuntimeSupportProfile {
     /// Builds the default profile for one OCI runtime backend from its feature flags.
     pub fn from_oci_capabilities(capabilities: RuntimeCapabilities) -> Self {
         Self::new(
-            [ExecutionSubstrate::Oci],
+            [ExecutionPlatform::Oci],
             [IsolationMode::Standard],
             Vec::<String>::new(),
             capabilities.feature_flags(),
@@ -443,8 +443,8 @@ impl RuntimeSupportProfile {
     }
 
     /// Returns true when this node advertises support for the requested runtime family.
-    pub fn supports_execution_substrate(&self, execution_substrate: ExecutionSubstrate) -> bool {
-        self.execution_substrates.contains(&execution_substrate)
+    pub fn supports_execution_platform(&self, execution_platform: ExecutionPlatform) -> bool {
+        self.execution_platforms.contains(&execution_platform)
     }
 
     /// Returns true when this node advertises the requested isolation mode.
@@ -475,12 +475,12 @@ impl RuntimeSupportProfile {
     /// Returns true when this profile satisfies the requested runtime requirements.
     pub fn supports_requirements(
         &self,
-        execution_substrate: ExecutionSubstrate,
+        execution_platform: ExecutionPlatform,
         isolation_mode: IsolationMode,
         isolation_profile: Option<&str>,
         feature_flags: &[String],
     ) -> bool {
-        self.supports_execution_substrate(execution_substrate)
+        self.supports_execution_platform(execution_platform)
             && self.supports_isolation_mode(isolation_mode)
             && self.supports_isolation_profile(isolation_profile)
             && self.supports_feature_flags(feature_flags)
@@ -493,7 +493,7 @@ impl RuntimeSupportProfile {
             usize,
             usize,
             usize,
-            &'a Vec<ExecutionSubstrate>,
+            &'a Vec<ExecutionPlatform>,
             &'a Vec<IsolationMode>,
             &'a Vec<String>,
             &'a Vec<String>,
@@ -501,11 +501,11 @@ impl RuntimeSupportProfile {
 
         fn precedence_key(value: &RuntimeSupportProfile) -> PrecedenceKey<'_> {
             (
-                value.execution_substrates.len(),
+                value.execution_platforms.len(),
                 value.isolation_modes.len(),
                 value.isolation_profiles.len(),
                 value.feature_flags.len(),
-                &value.execution_substrates,
+                &value.execution_platforms,
                 &value.isolation_modes,
                 &value.isolation_profiles,
                 &value.feature_flags,
@@ -527,8 +527,8 @@ impl RuntimeSupportProfile {
     }
 }
 
-fn default_execution_substrates() -> Vec<ExecutionSubstrate> {
-    vec![ExecutionSubstrate::Oci]
+fn default_execution_platforms() -> Vec<ExecutionPlatform> {
+    vec![ExecutionPlatform::Oci]
 }
 
 fn default_isolation_modes() -> Vec<IsolationMode> {

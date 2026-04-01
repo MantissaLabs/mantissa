@@ -255,8 +255,8 @@ struct NodeInfo {
   drainTaskStopTimeoutSecs @21 :UInt32;
   # Optional drain-only override for task stop timeout in seconds, 0 uses task defaults.
 
-  executionSubstrates @22 :List(Text);
-  # Execution substrates this node can host, for example "oci" or "microvm".
+  executionPlatforms @22 :List(Text);
+  # Execution platforms this node can host, for example "oci" or "microvm".
 
   isolationModes @23 :List(Text);
   # Isolation contracts this node can satisfy, for example "standard" or "sandboxed".

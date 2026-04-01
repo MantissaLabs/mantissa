@@ -78,7 +78,7 @@ pub struct JobSnapshotView {
     pub successful_workload_id: Option<Uuid>,
     pub retry_not_before: Option<String>,
     pub terminal_exit_code: Option<i32>,
-    pub execution_substrate: String,
+    pub execution_platform: String,
     pub isolation_mode: String,
     pub isolation_profile: Option<String>,
 }
@@ -125,7 +125,7 @@ impl JobSnapshotView {
             retry_not_before: read_optional_text(reader.get_retry_not_before()?),
             terminal_exit_code: (reader.get_terminal_exit_code() >= 0)
                 .then(|| reader.get_terminal_exit_code()),
-            execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+            execution_platform: reader.get_execution_platform()?.to_str()?.to_string(),
             isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
             isolation_profile: read_optional_text(reader.get_isolation_profile()?),
         })
@@ -145,7 +145,7 @@ pub struct JobAttemptView {
     pub created_at: String,
     pub updated_at: String,
     pub terminal_exit_code: Option<i32>,
-    pub execution_substrate: String,
+    pub execution_platform: String,
     pub isolation_mode: String,
     pub isolation_profile: Option<String>,
     pub is_active: bool,
@@ -168,7 +168,7 @@ impl JobAttemptView {
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),
             terminal_exit_code: (reader.get_terminal_exit_code() >= 0)
                 .then(|| reader.get_terminal_exit_code()),
-            execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+            execution_platform: reader.get_execution_platform()?.to_str()?.to_string(),
             isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
             isolation_profile: read_optional_text(reader.get_isolation_profile()?),
             is_active: reader.get_is_active(),
@@ -300,8 +300,8 @@ pub fn render_job_snapshot(snapshot: &JobSnapshotView) -> Result<String> {
     writeln!(&mut tw, "gpu count\t{}", snapshot.gpu_count)?;
     writeln!(
         &mut tw,
-        "execution substrate\t{}",
-        snapshot.execution_substrate
+        "execution platform\t{}",
+        snapshot.execution_platform
     )?;
     writeln!(
         &mut tw,
@@ -392,7 +392,7 @@ pub fn render_job_detail(detail: &JobDetailView) -> Result<String> {
                     .terminal_exit_code
                     .map(|code| code.to_string())
                     .unwrap_or_else(|| "-".to_string()),
-                attempt.execution_substrate,
+                attempt.execution_platform,
                 attempt.isolation_profile.as_deref().map_or_else(
                     || attempt.isolation_mode.clone(),
                     |profile| format!("{} ({profile})", attempt.isolation_mode),

@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::workload::manager::WorkloadStartRequest;
 use crate::workload::model::{
-    ExecutionSubstrate, IsolationMode, WorkloadOwner, WorkloadServiceMetadata,
+    ExecutionPlatform, IsolationMode, WorkloadOwner, WorkloadServiceMetadata,
 };
 use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
 pub use crate::workload::types::{
@@ -423,7 +423,7 @@ impl TaskTemplateSpecValue {
         WorkloadStartRequest {
             name: format_replica_name(service_name, &self.name, replica, desired_id),
             execution: self.resolved_execution(),
-            execution_substrate: ExecutionSubstrate::Oci,
+            execution_platform: ExecutionPlatform::Oci,
             isolation_mode: IsolationMode::Standard,
             isolation_profile: None,
             gpu_device_ids: Vec::new(),

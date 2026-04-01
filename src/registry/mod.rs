@@ -3,7 +3,7 @@ use crate::runtime::types::RuntimeSupportProfile;
 use crate::store::local::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
-use crate::workload::model::{ExecutionSubstrate, IsolationMode};
+use crate::workload::model::{ExecutionPlatform, IsolationMode};
 use ::health::HealthMonitor;
 use anyhow::{Result as AnyResult, anyhow};
 use crdt_store::uuid_key::UuidKey;
@@ -484,10 +484,10 @@ impl Registry {
     }
 
     /// Returns true when the provided node advertises support for the requested runtime family.
-    pub fn peer_supports_execution_substrate(
+    pub fn peer_supports_execution_platform(
         &self,
         peer_id: Uuid,
-        execution_substrate: ExecutionSubstrate,
+        execution_platform: ExecutionPlatform,
     ) -> bool {
         if self.peer_is_excluded(peer_id) {
             return false;
@@ -497,10 +497,10 @@ impl Registry {
             .map(|value| {
                 value
                     .runtime_support
-                    .supports_execution_substrate(execution_substrate)
+                    .supports_execution_platform(execution_platform)
             })
             .unwrap_or_else(|| {
-                RuntimeSupportProfile::default().supports_execution_substrate(execution_substrate)
+                RuntimeSupportProfile::default().supports_execution_platform(execution_platform)
             })
     }
 
@@ -508,7 +508,7 @@ impl Registry {
     pub fn peer_supports_runtime_requirements(
         &self,
         peer_id: Uuid,
-        execution_substrate: ExecutionSubstrate,
+        execution_platform: ExecutionPlatform,
         isolation_mode: IsolationMode,
         isolation_profile: Option<&str>,
         feature_flags: &[String],
@@ -520,7 +520,7 @@ impl Registry {
         self.peer_latest_value_unscoped(peer_id)
             .map(|value| {
                 value.runtime_support.supports_requirements(
-                    execution_substrate,
+                    execution_platform,
                     isolation_mode,
                     isolation_profile,
                     feature_flags,
@@ -528,7 +528,7 @@ impl Registry {
             })
             .unwrap_or_else(|| {
                 RuntimeSupportProfile::default().supports_requirements(
-                    execution_substrate,
+                    execution_platform,
                     isolation_mode,
                     isolation_profile,
                     feature_flags,

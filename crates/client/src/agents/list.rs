@@ -41,7 +41,7 @@ pub async fn list_sessions(cfg: &ClientConfig) -> Result<()> {
             row.status,
             row.active_run_id.unwrap_or_else(|| "-".to_string()),
             row.last_run_id.unwrap_or_else(|| "-".to_string()),
-            row.execution_substrate,
+            row.execution_platform,
             row.isolation_mode,
             row.isolation_profile
                 .unwrap_or_else(|| "default".to_string()),
@@ -60,7 +60,7 @@ struct AgentSessionRow {
     status: &'static str,
     active_run_id: Option<String>,
     last_run_id: Option<String>,
-    execution_substrate: String,
+    execution_platform: String,
     isolation_mode: String,
     isolation_profile: Option<String>,
     updated_at: String,
@@ -87,7 +87,7 @@ impl AgentSessionRow {
                 let data = reader.get_last_run_id()?;
                 (!data.is_empty()).then(|| uuid_short(data)).transpose()?
             },
-            execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+            execution_platform: reader.get_execution_platform()?.to_str()?.to_string(),
             isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
             isolation_profile: {
                 let profile = reader.get_isolation_profile()?.to_str()?.trim().to_string();

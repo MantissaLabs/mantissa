@@ -5,9 +5,9 @@ use crate::workload::capnp_codec::{
 };
 use crate::workload::manager::WorkloadManager;
 use crate::workload::model::{
-    ExecutionSubstrate, IsolationMode, WorkloadAgentRunMetadata, WorkloadEvent,
-    WorkloadJobMetadata, WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec,
-    WorkloadStateFilter, WorkloadStateKind, WorkloadStatus,
+    ExecutionPlatform, IsolationMode, WorkloadAgentRunMetadata, WorkloadEvent, WorkloadJobMetadata,
+    WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter,
+    WorkloadStateKind, WorkloadStatus,
 };
 use capnp::Error;
 use protocol::gossip::gossip_message;
@@ -130,7 +130,7 @@ pub fn write_status(mut builder: workload_status::Builder<'_>, status: &Workload
     builder.set_phase_version(status.phase_version);
     builder.set_launch_attempt(status.launch_attempt);
     builder.set_last_terminal_observed_launch(status.last_terminal_observed_launch.unwrap_or(0));
-    builder.set_execution_substrate(status.execution_substrate.as_str());
+    builder.set_execution_platform(status.execution_platform.as_str());
     builder.set_isolation_mode(status.isolation_mode.as_str());
     builder.set_isolation_profile(status.isolation_profile.as_deref().unwrap_or(""));
 }
@@ -156,7 +156,7 @@ pub fn read_status(reader: workload_status::Reader<'_>) -> Result<WorkloadStatus
             0 => None,
             value => Some(value),
         },
-        execution_substrate: read_execution_substrate(reader.get_execution_substrate()?.to_str()?),
+        execution_platform: read_execution_platform(reader.get_execution_platform()?.to_str()?),
         isolation_mode: read_isolation_mode(reader.get_isolation_mode()?.to_str()?),
         isolation_profile: read_optional_text(reader.get_isolation_profile()?),
     })
@@ -177,7 +177,7 @@ pub fn write_spec(mut builder: workload_spec::Builder<'_>, spec: &WorkloadSpec) 
     builder.set_phase_version(spec.phase_version);
     builder.set_launch_attempt(spec.launch_attempt);
     builder.set_last_terminal_observed_launch(spec.last_terminal_observed_launch.unwrap_or(0));
-    builder.set_execution_substrate(spec.execution_substrate.as_str());
+    builder.set_execution_platform(spec.execution_platform.as_str());
     builder.set_isolation_mode(spec.isolation_mode.as_str());
     builder.set_isolation_profile(spec.isolation_profile.as_deref().unwrap_or(""));
     builder.set_lease_id(
@@ -311,7 +311,7 @@ pub fn read_spec(reader: workload_spec::Reader<'_>) -> Result<WorkloadSpec, Erro
         id,
         name: reader.get_name()?.to_str()?.to_string(),
         image: reader.get_image()?.to_str()?.to_string(),
-        execution_substrate: read_execution_substrate(reader.get_execution_substrate()?.to_str()?),
+        execution_platform: read_execution_platform(reader.get_execution_platform()?.to_str()?),
         isolation_mode: read_isolation_mode(reader.get_isolation_mode()?.to_str()?),
         isolation_profile: read_optional_text(reader.get_isolation_profile()?),
         state: state_from_str(reader.get_state()?.to_str()?),
@@ -546,9 +546,9 @@ fn state_from_str(input: &str) -> WorkloadPhase {
     }
 }
 
-/// Parses one execution-substrate identifier from the wire format.
-fn read_execution_substrate(value: &str) -> ExecutionSubstrate {
-    value.parse().unwrap_or(ExecutionSubstrate::Oci)
+/// Parses one execution-platform identifier from the wire format.
+fn read_execution_platform(value: &str) -> ExecutionPlatform {
+    value.parse().unwrap_or(ExecutionPlatform::Oci)
 }
 
 /// Parses one isolation-mode identifier from the wire format.

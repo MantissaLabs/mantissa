@@ -56,8 +56,8 @@ struct AgentSessionSpec {
   networks @12 :List(Data);
   # Overlay network UUIDs as 16-byte binary data.
 
-  executionSubstrate @13 :Text;
-  # Execution substrate requested for runs launched from this session.
+  executionPlatform @13 :Text;
+  # Execution platform requested for runs launched from this session.
 
   isolationMode @14 :Text;
   # Isolation contract requested for runs launched from this session.
@@ -157,8 +157,8 @@ struct AgentRunSpec {
   networks @13 :List(Data);
   # Overlay network UUIDs as 16-byte binary data.
 
-  executionSubstrate @14 :Text;
-  # Execution substrate requested for this run.
+  executionPlatform @14 :Text;
+  # Execution platform requested for this run.
 
   isolationMode @15 :Text;
   # Isolation contract requested for this run.

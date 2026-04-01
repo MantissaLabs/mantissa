@@ -1,5 +1,5 @@
 use crate::jobs::runtime::{
-    DEFAULT_EXECUTION_SUBSTRATE, DEFAULT_ISOLATION_MODE, normalize_execution_substrate,
+    DEFAULT_EXECUTION_PLATFORM, DEFAULT_ISOLATION_MODE, normalize_execution_platform,
     normalize_isolation_mode, normalize_isolation_profile,
 };
 use crate::workload_submit::{DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec};
@@ -14,8 +14,8 @@ use uuid::Uuid;
 #[derive(Debug, Deserialize, Clone)]
 pub struct JobManifest {
     pub name: String,
-    #[serde(default = "default_execution_substrate")]
-    pub execution_substrate: String,
+    #[serde(default = "default_execution_platform")]
+    pub execution_platform: String,
     #[serde(default = "default_isolation_mode")]
     pub isolation_mode: String,
     #[serde(default)]
@@ -245,7 +245,7 @@ impl JobManifest {
             return Err(anyhow!("job manifest must specify execution.image"));
         }
 
-        normalize_execution_substrate(&self.execution_substrate)?;
+        normalize_execution_platform(&self.execution_platform)?;
         normalize_isolation_mode(&self.isolation_mode)?;
 
         let declared_volume_names = validate_declared_volumes(&self.volumes)?;
@@ -304,7 +304,7 @@ pub fn load_manifest_from_path(path: &Path) -> Result<JobManifest> {
 
     let mut manifest: JobManifest = ron::from_str(&raw)
         .with_context(|| format!("failed to parse manifest {} as RON", path.display()))?;
-    manifest.execution_substrate = normalize_execution_substrate(&manifest.execution_substrate)?;
+    manifest.execution_platform = normalize_execution_platform(&manifest.execution_platform)?;
     manifest.isolation_mode = normalize_isolation_mode(&manifest.isolation_mode)?;
     manifest.isolation_profile = normalize_isolation_profile(manifest.isolation_profile.as_deref());
     manifest.validate()?;
@@ -562,8 +562,8 @@ fn default_retry_backoff_secs() -> u32 {
     2
 }
 
-fn default_execution_substrate() -> String {
-    DEFAULT_EXECUTION_SUBSTRATE.to_string()
+fn default_execution_platform() -> String {
+    DEFAULT_EXECUTION_PLATFORM.to_string()
 }
 
 fn default_isolation_mode() -> String {
@@ -605,7 +605,7 @@ mod tests {
     fn base_manifest() -> JobManifest {
         JobManifest {
             name: "demo-job".to_string(),
-            execution_substrate: default_execution_substrate(),
+            execution_platform: default_execution_platform(),
             isolation_mode: default_isolation_mode(),
             isolation_profile: None,
             volumes: vec![JobVolumeSpec {
@@ -687,17 +687,17 @@ mod tests {
         );
     }
 
-    /// Rejects unknown execution substrate values before submission.
+    /// Rejects unknown execution platform values before submission.
     #[test]
-    fn manifest_rejects_unknown_execution_substrate() {
+    fn manifest_rejects_unknown_execution_platform() {
         let mut manifest = base_manifest();
-        manifest.execution_substrate = "baremetal".to_string();
+        manifest.execution_platform = "baremetal".to_string();
 
         let error = manifest
             .validate()
-            .expect_err("unknown execution substrate must fail");
+            .expect_err("unknown execution platform must fail");
         assert!(
-            error.to_string().contains("invalid execution substrate"),
+            error.to_string().contains("invalid execution platform"),
             "unexpected error: {error:#}"
         );
     }

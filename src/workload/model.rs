@@ -30,37 +30,37 @@ pub enum WorkloadKind {
     AgentRun,
 }
 
-/// Execution substrates that may host one workload instance.
+/// Execution platforms that may host one workload instance.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum ExecutionSubstrate {
+pub enum ExecutionPlatform {
     #[default]
-    /// OCI/container-style execution substrate.
+    /// OCI/container-style execution platform.
     Oci,
-    /// MicroVM-style execution substrate.
+    /// MicroVM-style execution platform.
     MicroVm,
 }
 
-impl ExecutionSubstrate {
-    /// Returns the canonical cluster-visible identifier for this execution substrate.
+impl ExecutionPlatform {
+    /// Returns the canonical cluster-visible identifier for this execution platform.
     pub fn as_str(self) -> &'static str {
         match self {
-            ExecutionSubstrate::Oci => "oci",
-            ExecutionSubstrate::MicroVm => "microvm",
+            ExecutionPlatform::Oci => "oci",
+            ExecutionPlatform::MicroVm => "microvm",
         }
     }
 }
 
-impl std::str::FromStr for ExecutionSubstrate {
+impl std::str::FromStr for ExecutionPlatform {
     type Err = ();
 
-    /// Parses one cluster-visible execution-substrate identifier.
+    /// Parses one cluster-visible execution-platform identifier.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "oci" => Ok(ExecutionSubstrate::Oci),
-            "microvm" => Ok(ExecutionSubstrate::MicroVm),
+            "oci" => Ok(ExecutionPlatform::Oci),
+            "microvm" => Ok(ExecutionPlatform::MicroVm),
             _ => Err(()),
         }
     }
@@ -73,9 +73,9 @@ impl std::str::FromStr for ExecutionSubstrate {
 #[serde(rename_all = "snake_case")]
 pub enum IsolationMode {
     #[default]
-    /// Standard substrate execution without an elevated sandbox contract.
+    /// Standard execution without an elevated sandbox contract.
     Standard,
-    /// Sandboxed execution, potentially backed by OCI or MicroVM substrates.
+    /// Sandboxed execution, potentially backed by OCI or MicroVM platforms.
     Sandboxed,
 }
 
@@ -360,7 +360,7 @@ pub struct WorkloadSpec {
     pub name: String,
     pub image: String,
     #[serde(default)]
-    pub execution_substrate: ExecutionSubstrate,
+    pub execution_platform: ExecutionPlatform,
     #[serde(default)]
     pub isolation_mode: IsolationMode,
     #[serde(default)]
@@ -435,9 +435,9 @@ impl WorkloadSpec {
         infer_workload_kind(self.owner.as_ref())
     }
 
-    /// Returns the execution substrate requested by this workload record.
-    pub fn execution_substrate(&self) -> ExecutionSubstrate {
-        self.execution_substrate
+    /// Returns the execution platform requested by this workload record.
+    pub fn execution_platform(&self) -> ExecutionPlatform {
+        self.execution_platform
     }
 
     /// Returns the isolation contract requested by this workload record.
@@ -473,7 +473,7 @@ pub struct WorkloadStatus {
     pub name: String,
     pub image: String,
     #[serde(default)]
-    pub execution_substrate: ExecutionSubstrate,
+    pub execution_platform: ExecutionPlatform,
     #[serde(default)]
     pub isolation_mode: IsolationMode,
     #[serde(default)]
@@ -507,7 +507,7 @@ impl WorkloadStatus {
             id: spec.id,
             name: spec.name.clone(),
             image: spec.image.clone(),
-            execution_substrate: spec.execution_substrate,
+            execution_platform: spec.execution_platform,
             isolation_mode: spec.isolation_mode,
             isolation_profile: spec.isolation_profile.clone(),
             state: spec.state.clone(),
@@ -539,9 +539,9 @@ impl WorkloadStatus {
         infer_workload_kind(self.owner.as_ref())
     }
 
-    /// Returns the execution substrate requested by this workload status record.
-    pub fn execution_substrate(&self) -> ExecutionSubstrate {
-        self.execution_substrate
+    /// Returns the execution platform requested by this workload status record.
+    pub fn execution_platform(&self) -> ExecutionPlatform {
+        self.execution_platform
     }
 
     /// Returns the isolation contract requested by this workload status record.
@@ -585,7 +585,7 @@ pub struct WorkloadValue {
     pub name: String,
     pub image: String,
     #[serde(default)]
-    pub execution_substrate: ExecutionSubstrate,
+    pub execution_platform: ExecutionPlatform,
     #[serde(default)]
     pub isolation_mode: IsolationMode,
     #[serde(default)]
@@ -653,7 +653,7 @@ pub struct WorkloadValueDraft {
     pub id: Uuid,
     pub name: String,
     pub image: String,
-    pub execution_substrate: ExecutionSubstrate,
+    pub execution_platform: ExecutionPlatform,
     pub isolation_mode: IsolationMode,
     pub isolation_profile: Option<String>,
     pub state: WorkloadPhase,
@@ -694,7 +694,7 @@ impl WorkloadValue {
             id: draft.id,
             name: draft.name,
             image: draft.image,
-            execution_substrate: draft.execution_substrate,
+            execution_platform: draft.execution_platform,
             isolation_mode: draft.isolation_mode,
             isolation_profile: draft.isolation_profile,
             state: draft.state,
@@ -745,9 +745,9 @@ impl WorkloadValue {
         infer_workload_kind(self.owner.as_ref())
     }
 
-    /// Returns the execution substrate exposed by the current task-era workload projection.
-    pub fn execution_substrate(&self) -> ExecutionSubstrate {
-        self.execution_substrate
+    /// Returns the execution platform exposed by the current task-era workload projection.
+    pub fn execution_platform(&self) -> ExecutionPlatform {
+        self.execution_platform
     }
 
     /// Returns the isolation contract exposed by the current workload projection.
@@ -1061,7 +1061,7 @@ pub(crate) fn value_to_spec(id: Uuid, value: WorkloadValue) -> WorkloadSpec {
         id,
         name: value.name,
         image: value.image,
-        execution_substrate: value.execution_substrate,
+        execution_platform: value.execution_platform,
         isolation_mode: value.isolation_mode,
         isolation_profile: value.isolation_profile,
         state: value.state,
@@ -1112,7 +1112,7 @@ pub(crate) fn merge_status_into_value(
         merged.id = status.id;
         merged.name = status.name.clone();
         merged.image = status.image.clone();
-        merged.execution_substrate = status.execution_substrate;
+        merged.execution_platform = status.execution_platform;
         merged.isolation_mode = status.isolation_mode;
         merged.isolation_profile = status.isolation_profile.clone();
         merged.state = status.state.clone();
@@ -1134,7 +1134,7 @@ pub(crate) fn merge_status_into_value(
         id: status.id,
         name: status.name.clone(),
         image: status.image.clone(),
-        execution_substrate: status.execution_substrate,
+        execution_platform: status.execution_platform,
         isolation_mode: status.isolation_mode,
         isolation_profile: status.isolation_profile.clone(),
         state: status.state.clone(),
@@ -1194,7 +1194,7 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
         id: spec.id,
         name: spec.name.clone(),
         image: spec.image.clone(),
-        execution_substrate: spec.execution_substrate,
+        execution_platform: spec.execution_platform,
         isolation_mode: spec.isolation_mode,
         isolation_profile: spec.isolation_profile.clone(),
         state: spec.state.clone(),
@@ -1234,7 +1234,7 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutionSubstrate, IsolationMode, WorkloadPhase, WorkloadSpec,
+        ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec,
         compare_workload_spec_causality,
     };
     use chrono::Utc;
@@ -1249,7 +1249,7 @@ mod tests {
             id: Uuid::new_v4(),
             name: "task".to_string(),
             image: "img".to_string(),
-            execution_substrate: ExecutionSubstrate::Oci,
+            execution_platform: ExecutionPlatform::Oci,
             isolation_mode: IsolationMode::Standard,
             isolation_profile: None,
             state: WorkloadPhase::Running,

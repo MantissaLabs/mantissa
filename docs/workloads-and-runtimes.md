@@ -76,7 +76,7 @@ The important consequence is that names describe different axes:
 | --- | --- |
 | `Task`, `ServiceReplica`, `JobAttempt`, `AgentRun` | Which schedulable workload row this is |
 | `ExecutionSpec` | How the schedulable execution should run |
-| `ExecutionSubstrate` | Which runtime family is requested |
+| `ExecutionPlatform` | Which runtime family is requested |
 | `RuntimeBackend` | Which local engine actually implements the request |
 
 That is why Mantissa talks about `TaskStartRequest` at the public task
@@ -130,7 +130,7 @@ job-owned at the same time".
 A job is a controller-level record for finite work. It owns retry and
 completion semantics above the runtime layer. A job may launch multiple
 underlying workload attempts over time, but those attempts still reuse the
-shared execution substrate and are recorded as `WorkloadKind::JobAttempt`.
+shared execution platform and are recorded as `WorkloadKind::JobAttempt`.
 
 This is why a job is not simply another name for a service. A service wants to
 keep a desired replica set alive and routable. A job wants to produce a
@@ -205,12 +205,12 @@ By contrast, the following policy stays above the execution layer:
 This is the key reason the code now prefers `ExecutionSpec` over
 copying similar launch fields into every controller-specific type.
 
-## Execution Substrates, Isolation, and Backends
+## Execution Platforms, Isolation, and Backends
 
 Mantissa uses four related ideas that are easy to conflate: execution
-substrate, isolation mode, runtime backend, and isolation profile.
+platform, isolation mode, runtime backend, and isolation profile.
 
-An `ExecutionSubstrate` is the cluster-visible family requested by a workload.
+An `ExecutionPlatform` is the cluster-visible family requested by a workload.
 Today the shared model recognizes `oci` and `microvm`.
 
 An `IsolationMode` is the higher-level isolation contract requested by a
@@ -222,7 +222,7 @@ streaming, exec, and event watching where supported.
 
 An isolation profile is an optional named policy exposed to the scheduler and
 the runtime support profile. It is not the same thing as a physical
-substrate.
+platform.
 
 ### OCI, MicroVM, and Sandboxed Isolation
 
@@ -233,22 +233,22 @@ family is Docker.
 support profile can express it, but there is no production MicroVM backend in
 the tree yet.
 
-`sandboxed` is an isolation contract, not a third substrate. A workload that
-requests `ExecutionSubstrate::Oci` with `IsolationMode::Sandboxed` is asking
+`sandboxed` is an isolation contract, not a third platform. A workload that
+requests `ExecutionPlatform::Oci` with `IsolationMode::Sandboxed` is asking
 for container-backed sandboxing. A workload that requests
-`ExecutionSubstrate::MicroVm` with `IsolationMode::Sandboxed` is asking for a
+`ExecutionPlatform::MicroVm` with `IsolationMode::Sandboxed` is asking for a
 MicroVM-backed sandbox. Today only OCI-backed sandboxing is implemented.
 
 That is why "sandbox" and "MicroVM" are not synonyms. A sandbox may be
 implemented on top of OCI or on top of a MicroVM backend. The execution
-substrate expresses where the workload runs; the isolation mode expresses how
+platform expresses where the workload runs; the isolation mode expresses how
 strongly isolated that execution should be; the backend expresses how that
 request is actually fulfilled on a node.
 
 ### Capabilities and Support Profiles
 
 Nodes advertise their runtime support with `RuntimeSupportProfile`. The profile
-contains four kinds of information: which execution substrates a node
+contains four kinds of information: which execution platforms a node
 supports, which isolation modes it exposes, which named isolation profiles it
 supports, and which optional runtime features are available.
 
@@ -262,14 +262,14 @@ lifecycle events as capabilities rather than as universal assumptions.
 The runtime model is broader than the set of backends currently implemented.
 This table reflects what exists in the repository today.
 
-| Backend | Status | Advertised execution substrates | Isolation modes | Isolation profiles | Exec | Interactive exec | Logs | Attach | Lifecycle events | Primary code |
+| Backend | Status | Advertised execution platforms | Isolation modes | Isolation profiles | Exec | Interactive exec | Logs | Attach | Lifecycle events | Primary code |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Docker runtime backend | Production backend | `oci` | `standard`, `sandboxed` | `default`, `oci-default` | Yes | Yes | Yes | Yes | Yes | `src/runtime/oci/docker/` |
 | In-memory runtime backend | Test and local harness backend | `oci` | `standard`, `sandboxed` | `default`, `oci-default` | Yes | Yes | Yes | No | No | `src/runtime/testing/in_memory.rs` |
 | MicroVM backend | Not implemented yet | None in code today | None in code today | None in code today | N/A | N/A | N/A | N/A | N/A | Not present |
 
 The important reading of this table is that support is advertised per backend,
-not implied by the shared model. The presence of `ExecutionSubstrate::MicroVm` in the
+not implied by the shared model. The presence of `ExecutionPlatform::MicroVm` in the
 model means the scheduler and runtime APIs can express that family; it does not
 mean a MicroVM engine is already wired into the runtime layer.
 
@@ -382,7 +382,7 @@ flowchart LR
 ### `src/workload`
 
 `src/workload/model.rs` defines the generic model and terminology: workload
-kind, execution substrate, isolation mode, workload identity, workload phases,
+kind, execution platform, isolation mode, workload identity, workload phases,
 generic state filters,
 and the shared durable workload structures.
 
@@ -415,7 +415,7 @@ service-owned replica start requests and hands them to the workload layer.
 
 `src/jobs` owns finite completion-oriented controller state. The job controller
 tracks attempts, retry windows, and terminal success or failure. The actual
-attempts still reuse the shared workload execution substrate.
+attempts still reuse the shared workload execution platform.
 
 ### `src/agents`
 
@@ -455,7 +455,7 @@ useful:
 | The durable finite-work controller record | Job |
 | The durable agent record that can wait for input | Agent session |
 | The schedulable execution created from an agent session | Agent run |
-| The family requested by the workload (`oci` or `microvm`) | Execution substrate |
+| The family requested by the workload (`oci` or `microvm`) | Execution platform |
 | The requested isolation contract (`standard` or `sandboxed`) | Isolation mode |
 | The local engine implementation | Runtime backend |
 | An optional named isolation policy such as `oci-default` | Isolation profile |

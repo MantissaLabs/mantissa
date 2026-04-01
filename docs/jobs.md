@@ -67,7 +67,7 @@ The top-level job manifest separates controller fields from execution fields.
 ```ron
 (
     name: "simple-job",
-    execution_substrate: "oci",
+    execution_platform: "oci",
     isolation_mode: "standard",
     execution: (
         image: "alpine:3.20",
@@ -89,7 +89,7 @@ The top level answers controller and runtime questions:
 | Field | Meaning |
 | --- | --- |
 | `name` | Human-facing durable job name |
-| `execution_substrate` | Requested execution family, currently `oci` or `microvm` |
+| `execution_platform` | Requested execution family, currently `oci` or `microvm` |
 | `isolation_mode` | Requested isolation contract, currently `standard` or `sandboxed` |
 | `isolation_profile` | Optional named isolation profile |
 | `volumes` | Declared volumes to provision before submission |
@@ -108,7 +108,7 @@ The nested `execution` block answers execution-template questions:
 | `liveness` | Optional local liveness probe |
 
 One design rule is worth keeping in mind: runtime selection is not embedded
-inside `execution`. It stays at the top level because substrate and isolation
+inside `execution`. It stays at the top level because platform and isolation
 belong to controller intent, not to the reusable execution payload itself.
 
 ## Example Manifests
@@ -136,7 +136,7 @@ the current manifest contract.
 
 Jobs use the same runtime model as the rest of the workload system.
 
-`execution_substrate` answers where the workload should run. Today the shared
+`execution_platform` answers where the workload should run. Today the shared
 model recognizes `oci` and `microvm`.
 
 `isolation_mode` answers how strongly the attempt should be isolated. Today the
@@ -195,7 +195,7 @@ workload store. Each attempt includes:
 - node placement,
 - creation and update timestamps,
 - terminal exit code when present,
-- substrate and isolation for that attempt,
+- platform and isolation for that attempt,
 - whether the attempt is the current active, last, or successful attempt.
 
 `jobs logs` is a convenience command layered on top of `jobs inspect`. It

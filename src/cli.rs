@@ -556,14 +556,14 @@ pub struct JobsRunArgs {
     )]
     pub retry_backoff_secs: Option<u32>,
 
-    /// Execution substrate requested for job attempts (`oci` or `microvm`)
+    /// Execution platform requested for job attempts (`oci` or `microvm`)
     #[arg(
-        long = "execution-substrate",
+        long = "execution-platform",
         value_name = "SUBSTRATE",
         default_value = "oci",
         conflicts_with = "manifest"
     )]
-    pub execution_substrate: String,
+    pub execution_platform: String,
 
     /// Isolation contract requested for job attempts (`standard` or `sandboxed`)
     #[arg(
@@ -695,13 +695,13 @@ pub struct AgentsSubmitArgs {
     #[arg(long = "gpu-count", value_name = "COUNT", default_value = "0")]
     pub gpu_count: u32,
 
-    /// Execution substrate requested for agent runs (`oci` or `microvm`)
+    /// Execution platform requested for agent runs (`oci` or `microvm`)
     #[arg(
-        long = "execution-substrate",
+        long = "execution-platform",
         value_name = "SUBSTRATE",
         default_value = "oci"
     )]
-    pub execution_substrate: String,
+    pub execution_platform: String,
 
     /// Isolation contract requested for agent runs (`standard` or `sandboxed`)
     #[arg(

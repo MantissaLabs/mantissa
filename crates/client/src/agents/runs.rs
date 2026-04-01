@@ -55,7 +55,7 @@ pub async fn list_runs(cfg: &ClientConfig, session_id: Option<Uuid>) -> Result<(
             row.exit_code
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string()),
-            row.execution_substrate,
+            row.execution_platform,
             row.isolation_mode,
             row.isolation_profile
                 .unwrap_or_else(|| "default".to_string()),
@@ -74,7 +74,7 @@ struct AgentRunRow {
     status: &'static str,
     workload_id: Option<String>,
     exit_code: Option<i32>,
-    execution_substrate: String,
+    execution_platform: String,
     isolation_mode: String,
     isolation_profile: Option<String>,
     updated_at: String,
@@ -98,7 +98,7 @@ impl AgentRunRow {
                 (!data.is_empty()).then(|| uuid_short(data)).transpose()?
             },
             exit_code: reader.get_has_exit_code().then_some(reader.get_exit_code()),
-            execution_substrate: reader.get_execution_substrate()?.to_str()?.to_string(),
+            execution_platform: reader.get_execution_platform()?.to_str()?.to_string(),
             isolation_mode: reader.get_isolation_mode()?.to_str()?.to_string(),
             isolation_profile: {
                 let profile = reader.get_isolation_profile()?.to_str()?.trim().to_string();

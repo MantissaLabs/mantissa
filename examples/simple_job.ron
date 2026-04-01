@@ -1,6 +1,6 @@
 (
     name: "simple-job",
-    execution_substrate: "oci",
+    execution_platform: "oci",
     isolation_mode: "standard",
     execution: (
         image: "alpine:3.20",

@@ -11,7 +11,7 @@ use crate::workload::capnp_codec::{
     encode_task_restart_policy, encode_volume_mounts,
 };
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest, match_task_id_prefix};
-use crate::workload::model::{ExecutionSubstrate, IsolationMode, WorkloadPhase, WorkloadSpec};
+use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
 use protocol::task::{
@@ -89,7 +89,7 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
     builder.set_phase_version(spec.phase_version);
     builder.set_launch_attempt(spec.launch_attempt);
     builder.set_last_terminal_observed_launch(spec.last_terminal_observed_launch.unwrap_or(0));
-    builder.set_execution_substrate(spec.execution_substrate.as_str());
+    builder.set_execution_platform(spec.execution_platform.as_str());
     builder.set_isolation_mode(spec.isolation_mode.as_str());
     builder.set_isolation_profile(spec.isolation_profile.as_deref().unwrap_or(""));
     builder.set_lease_id(
@@ -273,7 +273,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         id,
         name,
         image,
-        execution_substrate: read_execution_substrate(reader.get_execution_substrate()?.to_str()?),
+        execution_platform: read_execution_platform(reader.get_execution_platform()?.to_str()?),
         isolation_mode: read_isolation_mode(reader.get_isolation_mode()?.to_str()?),
         isolation_profile: read_optional_text(reader.get_isolation_profile()?),
         state: state_from_str(state),
@@ -997,8 +997,8 @@ impl task::Server for TaskService {
     }
 }
 
-fn read_execution_substrate(value: &str) -> ExecutionSubstrate {
-    value.parse().unwrap_or(ExecutionSubstrate::Oci)
+fn read_execution_platform(value: &str) -> ExecutionPlatform {
+    value.parse().unwrap_or(ExecutionPlatform::Oci)
 }
 
 fn read_isolation_mode(value: &str) -> IsolationMode {
@@ -1114,7 +1114,7 @@ fn read_task_start_request(
             volumes,
             networks,
         },
-        execution_substrate: read_execution_substrate(reader.get_execution_substrate()?.to_str()?),
+        execution_platform: read_execution_platform(reader.get_execution_platform()?.to_str()?),
         isolation_mode: read_isolation_mode(reader.get_isolation_mode()?.to_str()?),
         isolation_profile: read_optional_text(reader.get_isolation_profile()?),
         gpu_device_ids,

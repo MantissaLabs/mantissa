@@ -1,4 +1,4 @@
-use crate::workload::model::{ExecutionSubstrate, IsolationMode, WorkloadVolumeMount};
+use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadVolumeMount};
 use crate::workload::types::ResolvedExecutionSpec;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -136,8 +136,8 @@ pub struct AgentSessionSpecValue {
     pub name: String,
     /// Default execution template copied into new runs created from this session.
     pub execution: ResolvedExecutionSpec,
-    #[serde(default = "default_agent_execution_substrate")]
-    pub execution_substrate: ExecutionSubstrate,
+    #[serde(default = "default_agent_execution_platform")]
+    pub execution_platform: ExecutionPlatform,
     #[serde(default = "default_agent_isolation_mode")]
     pub isolation_mode: IsolationMode,
     #[serde(default)]
@@ -178,7 +178,7 @@ impl AgentSessionSpecValue {
         id: Uuid,
         name: impl Into<String>,
         execution: ResolvedExecutionSpec,
-        execution_substrate: ExecutionSubstrate,
+        execution_platform: ExecutionPlatform,
         isolation_mode: IsolationMode,
         isolation_profile: Option<String>,
         workspace: AgentWorkspacePolicy,
@@ -192,7 +192,7 @@ impl AgentSessionSpecValue {
             id,
             name: name.into(),
             execution,
-            execution_substrate,
+            execution_platform,
             isolation_mode,
             isolation_profile: normalize_optional_text(isolation_profile),
             created_at: created_at.clone(),
@@ -372,8 +372,8 @@ pub struct AgentRunSpecValue {
     pub session_name: String,
     /// Execution template for this specific run.
     pub execution: ResolvedExecutionSpec,
-    #[serde(default = "default_agent_execution_substrate")]
-    pub execution_substrate: ExecutionSubstrate,
+    #[serde(default = "default_agent_execution_platform")]
+    pub execution_platform: ExecutionPlatform,
     #[serde(default = "default_agent_isolation_mode")]
     pub isolation_mode: IsolationMode,
     #[serde(default)]
@@ -408,7 +408,7 @@ impl AgentRunSpecValue {
         session_id: Uuid,
         session_name: impl Into<String>,
         execution: ResolvedExecutionSpec,
-        execution_substrate: ExecutionSubstrate,
+        execution_platform: ExecutionPlatform,
         isolation_mode: IsolationMode,
         isolation_profile: Option<String>,
         prompt: Option<String>,
@@ -419,7 +419,7 @@ impl AgentRunSpecValue {
             session_id,
             session_name: session_name.into(),
             execution,
-            execution_substrate,
+            execution_platform,
             isolation_mode,
             isolation_profile: normalize_optional_text(isolation_profile),
             created_at: created_at.clone(),
@@ -526,8 +526,8 @@ pub fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
-fn default_agent_execution_substrate() -> ExecutionSubstrate {
-    ExecutionSubstrate::Oci
+fn default_agent_execution_platform() -> ExecutionPlatform {
+    ExecutionPlatform::Oci
 }
 
 fn default_agent_isolation_mode() -> IsolationMode {

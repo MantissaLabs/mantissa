@@ -475,11 +475,11 @@ pub fn write_runtime_support_to_node_info(
     mut info: node_info_capnp::Builder<'_>,
     runtime_support: &RuntimeSupportProfile,
 ) {
-    let mut execution_substrates = info
+    let mut execution_platforms = info
         .reborrow()
-        .init_execution_substrates(runtime_support.execution_substrates.len() as u32);
-    for (idx, execution_substrate) in runtime_support.execution_substrates.iter().enumerate() {
-        execution_substrates.set(idx as u32, execution_substrate.as_str());
+        .init_execution_platforms(runtime_support.execution_platforms.len() as u32);
+    for (idx, execution_platform) in runtime_support.execution_platforms.iter().enumerate() {
+        execution_platforms.set(idx as u32, execution_platform.as_str());
     }
 
     let mut isolation_modes = info
@@ -508,16 +508,16 @@ pub fn write_runtime_support_to_node_info(
 fn runtime_support_from_node_info(
     ni: node_info_capnp::Reader<'_>,
 ) -> Result<RuntimeSupportProfile, CapnpError> {
-    let execution_substrates = read_text_list(ni.get_execution_substrates()?)?;
+    let execution_platforms = read_text_list(ni.get_execution_platforms()?)?;
     let isolation_modes = read_text_list(ni.get_isolation_modes()?)?;
     let isolation_profiles = read_text_list(ni.get_isolation_profiles()?)?;
     let feature_flags = read_text_list(ni.get_runtime_feature_flags()?)?;
 
-    let execution_substrates = execution_substrates
+    let execution_platforms = execution_platforms
         .into_iter()
         .filter_map(|value| {
             value
-                .parse::<crate::workload::model::ExecutionSubstrate>()
+                .parse::<crate::workload::model::ExecutionPlatform>()
                 .ok()
         })
         .collect::<Vec<_>>();
@@ -527,7 +527,7 @@ fn runtime_support_from_node_info(
         .collect::<Vec<_>>();
 
     Ok(RuntimeSupportProfile::new(
-        execution_substrates,
+        execution_platforms,
         isolation_modes,
         isolation_profiles,
         feature_flags,

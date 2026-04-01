@@ -13,7 +13,7 @@ use crate::secrets::registry::SecretRegistry;
 use crate::store::workload_store::WorkloadStore;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
-    ExecutionSubstrate, IsolationMode, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadSpec,
+    ExecutionPlatform, IsolationMode, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadSpec,
     WorkloadStateFilter, WorkloadStatus, WorkloadValue, should_replace_workload_event,
 };
 pub(crate) use crate::workload::model::{
@@ -318,11 +318,11 @@ pub struct WorkloadStartRequest {
     pub name: String,
     /// Shared execution/runtime template describing how the workload should run.
     pub execution: ResolvedExecutionSpec,
-    /// Execution substrate requested by the caller.
-    pub execution_substrate: ExecutionSubstrate,
+    /// Execution platform requested by the caller.
+    pub execution_platform: ExecutionPlatform,
     /// Isolation contract requested by the caller.
     pub isolation_mode: IsolationMode,
-    /// Optional named isolation profile interpreted by the chosen substrate/mode pair.
+    /// Optional named isolation profile interpreted by the chosen platform/mode pair.
     pub isolation_profile: Option<String>,
     /// Optional concrete GPU device identifiers requested by the caller.
     pub gpu_device_ids: Vec<String>,
@@ -589,7 +589,7 @@ impl WorkloadManager {
                 volumes: Vec::new(),
                 networks: Vec::new(),
             },
-            execution_substrate: ExecutionSubstrate::Oci,
+            execution_platform: ExecutionPlatform::Oci,
             isolation_mode: IsolationMode::Standard,
             isolation_profile: None,
             gpu_device_ids: Vec::new(),

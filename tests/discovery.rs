@@ -133,7 +133,7 @@ fn running_task(task_id: Uuid, node_id: Uuid, service_name: &str, network_id: Uu
         id: task_id,
         name: "backend".to_string(),
         image: "hashicorp/http-echo:1.0.0".to_string(),
-        execution_substrate: mantissa::workload::model::ExecutionSubstrate::Oci,
+        execution_platform: mantissa::workload::model::ExecutionPlatform::Oci,
         isolation_mode: mantissa::workload::model::IsolationMode::Standard,
         isolation_profile: None,
         state: WorkloadPhase::Running,

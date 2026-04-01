@@ -5560,7 +5560,7 @@ fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
         id: spec.id,
         name: spec.name.clone(),
         image: spec.image.clone(),
-        execution_substrate: spec.execution_substrate,
+        execution_platform: spec.execution_platform,
         isolation_mode: spec.isolation_mode,
         isolation_profile: spec.isolation_profile.clone(),
         state: spec.state.clone(),
