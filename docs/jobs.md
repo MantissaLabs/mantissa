@@ -244,6 +244,9 @@ The current `examples/job_with_volume.ron` example shows the intended pattern:
 - let `wait_for_first_consumer` binding choose the first hosting node at launch
   time.
 
+For the storage model, drain interaction, and delete semantics behind those
+volumes, see `docs/volumes.md`.
+
 ## Failure and Recovery Model
 
 Jobs are durable replicated controller objects. The current controller behavior

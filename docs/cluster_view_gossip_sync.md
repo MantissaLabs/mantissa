@@ -9,6 +9,9 @@ two-layer replication strategy:
 1. Fast propagation through gossip.
 2. Guaranteed repair through anti-entropy sync.
 
+For the broader replicated-state model, see `docs/data-replication.md`.
+For merge and split workflows, see `docs/cluster-views-and-operations.md`.
+
 The design keeps high-volume control-plane traffic view-scoped while allowing
 selected low-rate metadata to cross cluster view boundaries.
 

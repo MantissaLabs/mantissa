@@ -220,6 +220,20 @@ workload roots because dissemination is incomplete, but the underlying
 workload set is
 usually already much more stable than before.
 
+## Rebalance Handoff
+
+Replica rebalance also uses a start-first handoff.
+
+When a running slot is healthy but lives on the wrong node, Mantissa starts the
+replacement on the preferred node first and only then lets the stale local
+runtime drain away through reconciliation.
+
+That ordering matters for networked services. The older stop-then-start flow
+could temporarily remove a healthy attachment row before the replacement had
+actually converged, which made backend attachment counts dip during retries.
+Start-first handoff keeps the slot represented in attachment state throughout
+the move and avoids a visible control-plane gap.
+
 ## Operational Implications
 
 - `summary` is still available for operator diagnostics, but not for planning.
@@ -257,4 +271,5 @@ Replication wiring:
 
 - `docs/service-rollouts.md`
 - `docs/cluster_view_gossip_sync.md`
+- `docs/data-replication.md`
 - `docs/stress-test.md`

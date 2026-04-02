@@ -74,6 +74,10 @@ See `docs/quickstart.md` for the full local and multi-VM workflow.
 - `docs/gpu-setup.md` - NVIDIA GPU setup + container runtime wiring
 - `docs/secrets.md` - secrets management and manifest usage
 - `docs/service-rollouts.md` - service manifest rollout strategy
+- `docs/data-replication.md` - replicated state model, gossip, and anti-entropy
+- `docs/cluster-views-and-operations.md` - cluster lineage, split, and merge behavior
+- `docs/volumes.md` - local volume model and CLI usage
+- `docs/node-maintenance.md` - node drain, resume, and maintenance semantics
 - `docs/cli.md` - CLI reference and common commands
 - `docs/permissions.md` - running as root vs unprivileged
 - `docs/repo-layout.md` - repository structure

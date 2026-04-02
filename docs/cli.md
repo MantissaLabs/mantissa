@@ -7,16 +7,24 @@ Common commands:
 - `mantissa link --anchor <addr> --join-token <token>` - join an existing cluster
 - `mantissa leave` - gracefully leave the cluster
 - `mantissa nodes list [cluster-id]` - inspect known peers
+- `mantissa nodes drain <node-id> [--reason <text>]` - fence a node and evacuate service work
+- `mantissa nodes status <node-id>` - inspect detailed drain progress and blockers
+- `mantissa nodes resume <node-id>` - clear a maintenance fence
 - `mantissa clusters list` - list known clusters and node counts
-- `mantissa merge <source-cluster-id> <destination-cluster-id>` - merge one cluster lineage into another
-- `mantissa split --cluster <cluster-id> --by gpu-vendor --values NVIDIA,AMD` - split a cluster with simple filter values
-- `mantissa split --filter-per-gpu NVIDIA,AMD` - shortcut split by GPU vendor on the local active cluster
-- `mantissa split --interactive --left-name blue --right-name green` - interactive left/right node picker with hover details
+- `mantissa clusters name <cluster-id> <name>` - assign a friendly lineage name
+- `mantissa clusters merge <source-cluster-id> <destination-cluster-id>` - merge one cluster lineage into another
+- `mantissa clusters split --cluster <cluster-id> --by gpu-vendor --values NVIDIA,AMD` - split a cluster with simple filter values
+- `mantissa clusters split --filter-per-gpu NVIDIA,AMD` - shortcut split by GPU vendor on the local active cluster
+- `mantissa clusters split --interactive --left-name blue --right-name green` - interactive left/right node picker with hover details
 - `mantissa tasks list --state running` - filter tasks by lifecycle state
 - `mantissa tasks start <name> --image <img> --command <arg>...` - launch a task
 - `mantissa scheduler slots [peer-id] --details` - inspect reserved slots
 - `mantissa services run|list|stop ...` - manage RON service manifests
+- `mantissa volumes create|import|list|inspect|status|delete ...` - manage named local volumes
 - `mantissa info` - emit local system and capacity diagnostics
 - `mantissa config show|validate|path` - inspect configuration
 
 For rollout fields and manifest examples, see `docs/service-rollouts.md`.
+For node drain behavior, see `docs/node-maintenance.md`.
+For volume semantics, see `docs/volumes.md`.
+For cluster view operations, see `docs/cluster-views-and-operations.md`.
