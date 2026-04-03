@@ -112,7 +112,7 @@ impl Drop for RuntimeBackendOverrideGuard {
 /// By default this uses the **in-process transport** (no sockets, very fast).
 /// If you want to validate the full network + Noise path, use `TestNode::new_tcp()`.
 pub struct TestNode {
-    pub node: HeadlessNode,
+    pub node: Box<HeadlessNode>,
 }
 
 impl TestNode {
@@ -155,7 +155,9 @@ impl TestNode {
         ))
         .await
         .expect("headless inproc node");
-        Self { node }
+        Self {
+            node: Box::new(node),
+        }
     }
 
     pub async fn new_with_fanout(fanout: usize) -> Self {
@@ -164,7 +166,9 @@ impl TestNode {
         ))
         .await
         .expect("headless inproc node (custom fanout)");
-        Self { node }
+        Self {
+            node: Box::new(node),
+        }
     }
 
     /// Start a node that listens on a random TCP port (Noise + Cap'n Proto over TCP).
@@ -181,7 +185,9 @@ impl TestNode {
                 ..HeadlessConfig::default()
             }))
             .await?;
-        Ok(Self { node })
+        Ok(Self {
+            node: Box::new(node),
+        })
     }
 
     /// Start a node with in-process transport and a custom periodic sync tick.
@@ -191,7 +197,9 @@ impl TestNode {
         ))
         .await
         .expect("headless inproc node (with tick)");
-        Self { node }
+        Self {
+            node: Box::new(node),
+        }
     }
 
     /// Start a TCP node with a custom periodic sync tick.
@@ -212,7 +220,9 @@ impl TestNode {
                 ..HeadlessConfig::default()
             }))
             .await?;
-        Ok(Self { node })
+        Ok(Self {
+            node: Box::new(node),
+        })
     }
 
     /// Ask this node to join the cluster whose **anchor** is `anchor`.
@@ -666,7 +676,9 @@ impl TestNode {
         assert!(n >= 1, "cluster size must be >= 1");
 
         let anchor_node = build_inproc_node_with_config(cfg).await;
-        let anchor = TestNode { node: anchor_node };
+        let anchor = TestNode {
+            node: Box::new(anchor_node),
+        };
         let anchor_addr = anchor.addr();
         let join_token = anchor.current_join_token().await?;
 
@@ -675,7 +687,9 @@ impl TestNode {
 
         for _ in 1..n {
             let node = build_inproc_node_with_config(cfg).await;
-            let test_node = TestNode { node };
+            let test_node = TestNode {
+                node: Box::new(node),
+            };
             test_node
                 .node
                 .join_anchor_addr(&anchor_addr, &join_token)

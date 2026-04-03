@@ -312,6 +312,30 @@ impl RuntimeSet {
         }
     }
 
+    /// Builds one backend-qualified runtime reference from a deterministic instance name.
+    ///
+    /// This preserves name-addressable workflows such as log streaming after daemon restarts
+    /// while still selecting the backend from the exact execution contract instead of guessing.
+    pub fn named_runtime_ref(
+        &self,
+        name: &str,
+        execution_platform: ExecutionPlatform,
+        isolation_mode: IsolationMode,
+        isolation_profile: Option<&str>,
+        feature_flags: &[String],
+    ) -> RuntimeResult<RuntimeInstanceRef> {
+        let entry = self.select_backend_for_requirements(
+            execution_platform,
+            isolation_mode,
+            isolation_profile,
+            feature_flags,
+        )?;
+        Ok(RuntimeInstanceRef::new(
+            entry.kind.clone(),
+            name.to_string(),
+        ))
+    }
+
     /// Lists runtime inventory across every registered backend.
     pub async fn list_instances(
         &self,

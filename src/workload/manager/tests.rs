@@ -6841,6 +6841,56 @@ async fn workload_start_retryable_includes_capacity_shortage_for_controllers() {
 }
 
 #[tokio::test]
+async fn workload_start_service_requeue_excludes_capacity_shortage() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 256 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+    let snapshot = scheduler.snapshot().await.expect("scheduler snapshot");
+    scheduler
+        .reserve_slots(
+            snapshot.version,
+            vec![SlotReservationRequest {
+                slot_id: 1,
+                owner: manager.local_node_id,
+                task_id: Some(Uuid::new_v4()),
+            }],
+        )
+        .await
+        .expect("reserve the only slot");
+    let request = WorkloadStartRequest {
+        name: "capacity-blocked".into(),
+        execution: ResolvedExecutionSpec {
+            cpu_millis: 100,
+            memory_bytes: 64 * 1_024 * 1_024,
+            ..empty_resolved_execution("img")
+        },
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: crate::workload::model::IsolationMode::Standard,
+        isolation_profile: None,
+        gpu_device_ids: Vec::new(),
+        id: Some(Uuid::new_v4()),
+        slot_ids: Vec::new(),
+        owner: None,
+        target_node: None,
+    };
+
+    let result = manager
+        .start_workloads_batch(vec![request])
+        .await
+        .expect_err("capacity-blocked start should fail without slots");
+
+    assert!(
+        !workload_start_error_requires_service_requeue(&result),
+        "services should consume rollout failure budget for pure capacity starvation"
+    );
+}
+
+#[tokio::test]
 async fn start_tasks_batch_rejects_unsupported_local_execution_platform() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
     scheduler

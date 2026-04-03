@@ -894,6 +894,26 @@ impl WorkloadManager {
         )
     }
 
+    /// Builds the deterministic backend-qualified runtime reference for one locally named workload.
+    ///
+    /// This keeps name-addressable runtime operations available when the in-memory instance cache
+    /// is empty and the backend does not surface enough inventory for rediscovery.
+    fn named_runtime_ref_for_spec(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> Result<RuntimeInstanceRef, anyhow::Error> {
+        self.runtime
+            .runtime_set
+            .named_runtime_ref(
+                &format!("mantissa-{}", spec.id),
+                spec.execution_platform,
+                spec.isolation_mode,
+                spec.isolation_profile.as_deref(),
+                &[],
+            )
+            .map_err(|err| anyhow!("failed to resolve runtime backend for {}: {err}", spec.id))
+    }
+
     /// Resolves one backend-qualified runtime reference for a locally owned workload.
     async fn resolve_local_runtime_for_spec(
         &self,
@@ -945,9 +965,23 @@ impl WorkloadManager {
             return Err(anyhow!("runtime backend does not support log streaming"));
         }
 
-        let runtime = self
-            .resolve_local_runtime_for_spec(&spec, "log streaming")
-            .await?;
+        let runtime = match self.resolve_live_instance_ref_for_task(&spec).await {
+            Ok(Some(runtime)) => {
+                self.local_state
+                    .local_instances
+                    .lock()
+                    .await
+                    .insert(spec.id, runtime.clone());
+                runtime
+            }
+            Ok(None) => self.named_runtime_ref_for_spec(&spec)?,
+            Err(err) => {
+                return Err(anyhow!(
+                    "workload log streaming preflight failed for {}: {err}",
+                    spec.id
+                ));
+            }
+        };
 
         self.runtime
             .runtime_set
@@ -1436,6 +1470,23 @@ pub(crate) fn workload_start_error_is_retryable(err: &anyhow::Error) -> bool {
                     | SchedulingError::NoCapacityAcrossCluster
                     | SchedulingError::InsufficientCapacityForBatch
                     | SchedulingError::InsufficientCapacityOnTarget { .. }
+                    | SchedulingError::NetworksBlocked { .. }
+                    | SchedulingError::LocalNetworksBlocked { .. }
+            )
+        })
+}
+
+/// Returns true when a service deployment should stay in `Deploying` and wait for convergence.
+///
+/// Services already have explicit rollout failure semantics, so pure capacity shortages should
+/// consume that controller budget instead of leaving the service indefinitely pending.
+pub(crate) fn workload_start_error_requires_service_requeue(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .is_some_and(|cause| {
+            matches!(
+                cause,
+                SchedulingError::SnapshotMissing
                     | SchedulingError::NetworksBlocked { .. }
                     | SchedulingError::LocalNetworksBlocked { .. }
             )

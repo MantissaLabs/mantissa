@@ -16,7 +16,8 @@ use crate::volumes::types::VolumeDriver;
 use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
 use crate::workload::manager::WorkloadManager;
 use crate::workload::manager::{
-    WorkloadStartRequest, WorkloadTrafficPublicationUpdate, workload_start_error_is_retryable,
+    WorkloadStartRequest, WorkloadTrafficPublicationUpdate,
+    workload_start_error_requires_service_requeue,
 };
 use crate::workload::model::{WorkloadPhase, WorkloadSpec, WorkloadVolumeMount};
 use anyhow::anyhow;
@@ -744,7 +745,7 @@ impl ServiceController {
                     service_name
                 );
 
-                if workload_start_error_is_retryable(&err) {
+                if workload_start_error_requires_service_requeue(&err) {
                     tracing::info!(
                         target: "services",
                         "deferring deployment retry for '{}' until scheduling prerequisites converge",
@@ -1362,7 +1363,7 @@ impl ServiceController {
             deployment.service_name
         );
 
-        if workload_start_error_is_retryable(err) {
+        if workload_start_error_requires_service_requeue(err) {
             tracing::info!(
                 target: "services",
                 "deferring deployment retry for '{}' until scheduling prerequisites converge",

@@ -585,7 +585,9 @@ local_test!(services_deploying_generation_resumes_after_restart, {
         "restart should resume the deploying generation from persisted task ids"
     );
 
-    let restarted = TestNode { node: restarted };
+    let restarted = TestNode {
+        node: Box::new(restarted),
+    };
     assert!(
         wait_for_service_task_count_all(
             std::slice::from_ref(&restarted),
